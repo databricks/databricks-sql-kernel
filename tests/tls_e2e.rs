@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! End-to-end TLS configuration tests for the Databricks ADBC driver.
 //!
 //! These tests verify that TLS configuration parameters work correctly by
@@ -57,7 +59,7 @@
 
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Connection as _, Driver as _, Optionable, Statement as _};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 /// Helper function to get required environment variable with clear error message.
 fn get_env_var(name: &str) -> String {
@@ -74,7 +76,7 @@ fn get_env_var(name: &str) -> String {
 ///
 /// All traffic goes through mitmproxy on port 8080 so that TLS interception
 /// occurs. TLS-specific options are configured by the individual tests.
-fn create_database_with_mitmproxy() -> databricks_sql_kernel::Database {
+fn create_database_with_mitmproxy() -> databricks_sql_kernel::adbc::database::Database {
     let host = get_env_var("DATABRICKS_HOST");
     let host = if host.starts_with("https://") || host.starts_with("http://") {
         host
@@ -141,7 +143,7 @@ fn create_database_with_mitmproxy() -> databricks_sql_kernel::Database {
 }
 
 /// Execute a simple query and verify it succeeds.
-fn execute_select_1(database: &databricks_sql_kernel::Database) {
+fn execute_select_1(database: &databricks_sql_kernel::adbc::database::Database) {
     use adbc_core::Database as _;
 
     let mut connection = database

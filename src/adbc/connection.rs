@@ -14,17 +14,17 @@
 
 //! Connection implementation for the Databricks ADBC driver.
 
-use crate::client::DatabricksClient;
-use crate::error::DatabricksErrorHelper;
-use crate::metadata::builder::{
+use crate::adbc::metadata_builder::{
     build_get_objects_all, build_get_objects_catalogs, build_get_objects_schemas,
     build_get_objects_tables, collect_reader, filter_by_pattern, group_schemas_by_catalog,
     group_tables_and_columns, group_tables_by_catalog_schema,
 };
+use crate::adbc::statement::Statement;
+use crate::client::DatabricksClient;
+use crate::error::DatabricksErrorHelper;
 use crate::metadata::parse::{
     parse_catalogs, parse_columns, parse_columns_as_fields, parse_schemas, parse_tables,
 };
-use crate::statement::Statement;
 use adbc_core::error::Result;
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
 use adbc_core::schemas::GET_TABLE_TYPES_SCHEMA;

@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! E2E tests for all metadata operations: catalogs, schemas, tables, columns,
 //! primary keys, foreign keys, cross-references, procedures, and procedure columns.
 //!
@@ -37,7 +39,7 @@ use adbc_core::Driver as _;
 use adbc_core::Optionable;
 use adbc_core::Statement as _;
 use arrow_array::{Array, RecordBatchReader, StringArray};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 /// getProcedures SQL for cross-catalog (NULL catalog → system).
 const PROCEDURES_SQL_CROSS_CATALOG: &str = "\

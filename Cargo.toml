@@ -83,10 +83,49 @@ adbc_driver_manager = "0.22"
 tempfile = "3"
 
 [features]
-default = []
-ffi = ["adbc_ffi"]
-metadata-ffi = ["ffi", "dep:arrow"]
+default = ["legacy-adbc"]
+# Legacy ADBC trait surface (Driver/Database/Connection/Statement) plus
+# the existing ADBC-shaped FFI exports. Scheduled for removal once the
+# v0 Kernel API is fully wired (see docs/spec-v0.md).
+legacy-adbc = []
+ffi = ["adbc_ffi", "legacy-adbc"]
+metadata-ffi = ["ffi", "dep:arrow", "legacy-adbc"]
 
 [lib]
 name = "databricks_sql_kernel"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+# Existing examples target the legacy ADBC API. They will be migrated to
+# the v0 Kernel API in PR 8 of the staged refactor; until then they are
+# gated on the `legacy-adbc` feature.
+[[example]]
+name = "ffi_query"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "inline_results_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "large_chunk_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "logging_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "metadata_propagation_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "metadata_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "multi_chunk_test"
+required-features = ["legacy-adbc"]
+
+[[example]]
+name = "slow_consumer_test"
+required-features = ["legacy-adbc"]

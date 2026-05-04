@@ -12,13 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! Integration tests for the Databricks ADBC driver.
 
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::Database as _;
 use adbc_core::Driver as _;
 use adbc_core::Optionable;
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 #[test]
 fn test_database_configuration() {
@@ -154,10 +156,10 @@ fn test_adbc_traits_implemented() {
     fn assert_connection<T: adbc_core::Connection>() {}
     fn assert_statement<T: adbc_core::Statement>() {}
 
-    assert_driver::<databricks_sql_kernel::Driver>();
-    assert_database::<databricks_sql_kernel::Database>();
-    assert_connection::<databricks_sql_kernel::Connection>();
-    assert_statement::<databricks_sql_kernel::Statement>();
+    assert_driver::<databricks_sql_kernel::adbc::driver::Driver>();
+    assert_database::<databricks_sql_kernel::adbc::database::Database>();
+    assert_connection::<databricks_sql_kernel::adbc::connection::Connection>();
+    assert_statement::<databricks_sql_kernel::adbc::statement::Statement>();
 }
 
 // End-to-end tests that require a real Databricks connection

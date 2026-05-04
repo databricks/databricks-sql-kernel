@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! End-to-end proxy tests for the Databricks ADBC driver.
 //!
 //! These tests verify that HTTP requests are correctly routed through a proxy.
@@ -51,7 +53,7 @@
 
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Connection as _, Driver as _, Optionable, Statement as _};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 /// Helper function to get required environment variable with clear error message.
 fn get_env_var(name: &str) -> String {
@@ -74,7 +76,7 @@ fn create_database_with_proxy(
     proxy_username: Option<&str>,
     proxy_password: Option<&str>,
     bypass_hosts: Option<&str>,
-) -> databricks_sql_kernel::Database {
+) -> databricks_sql_kernel::adbc::database::Database {
     let host = get_env_var("DATABRICKS_HOST");
     // CI secret may not include the scheme — ensure it's a full URL
     let host = if host.starts_with("https://") || host.starts_with("http://") {
@@ -167,7 +169,7 @@ fn create_database_with_proxy(
 }
 
 /// Execute a simple query and verify it succeeds.
-fn execute_select_1(database: &databricks_sql_kernel::Database) {
+fn execute_select_1(database: &databricks_sql_kernel::adbc::database::Database) {
     use adbc_core::Database as _;
 
     let mut connection = database

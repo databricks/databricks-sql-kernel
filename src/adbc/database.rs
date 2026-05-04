@@ -14,6 +14,7 @@
 
 //! Database implementation for the Databricks ADBC driver.
 
+use crate::adbc::connection::{Connection, ConnectionConfig};
 use crate::auth::config::{AuthConfig, AuthType};
 use crate::auth::{AuthProvider, AuthorizationCodeProvider, PersonalAccessToken};
 use crate::client::retry::{
@@ -22,7 +23,6 @@ use crate::client::retry::{
 use crate::client::{
     DatabricksClient, DatabricksClientConfig, DatabricksHttpClient, HttpClientConfig, SeaClient,
 };
-use crate::connection::{Connection, ConnectionConfig};
 use crate::error::DatabricksErrorHelper;
 use crate::logging::{self, LogConfig};
 use crate::reader::ResultReaderFactory;

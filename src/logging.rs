@@ -35,6 +35,8 @@
 //! database.set_option("databricks.log_file", "/tmp/adbc.log")?;
 //! ```
 
+#![cfg_attr(not(feature = "legacy-adbc"), allow(dead_code))]
+
 use std::sync::OnceLock;
 use tracing_subscriber::{
     fmt::{self, time::SystemTime},
@@ -84,7 +86,10 @@ pub(crate) fn init_logging(config: &LogConfig) {
             {
                 Ok(f) => f,
                 Err(e) => {
-                    eprintln!("databricks-sql-kernel: failed to open log file {}: {}", path, e);
+                    eprintln!(
+                        "databricks-sql-kernel: failed to open log file {}: {}",
+                        path, e
+                    );
                     return;
                 }
             };

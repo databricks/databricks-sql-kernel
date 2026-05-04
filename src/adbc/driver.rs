@@ -14,7 +14,7 @@
 
 //! ADBC Driver implementation for Databricks.
 
-use crate::database::Database;
+use crate::adbc::database::Database;
 use adbc_core::error::Result;
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::Optionable;

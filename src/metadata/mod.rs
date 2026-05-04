@@ -12,15 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Metadata support for the Databricks ADBC driver.
+//! Shared metadata utilities used by all kernel surfaces.
 //!
-//! This module provides:
+//! This module provides protocol-neutral building blocks:
 //! - `SqlCommandBuilder`: Builds SHOW SQL commands for metadata queries
 //! - Result parsing: Parses `ExecuteResult` readers into intermediate structs
-//! - Arrow builder: Constructs nested Arrow structs for `get_objects` response
 //! - Type mapping: Maps Databricks types to Arrow/XDBC types
+//!
+//! The ADBC-specific Arrow builder for `get_objects` lives at
+//! `crate::adbc::metadata_builder` and is gated on the `legacy-adbc` feature.
 
-pub mod builder;
 pub mod parse;
 pub mod sql;
 pub mod type_mapping;
