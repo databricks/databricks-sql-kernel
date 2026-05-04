@@ -1,4 +1,4 @@
-# Copyright (c) 2025 ADBC Drivers Contributors
+# Copyright (c) 2026 Databricks, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -19,13 +19,13 @@ on:
     branches:
       - main
     paths:
-      - "rust/**"
+      - "src/**"
       - .github/workflows/rust-e2e.yml
   pull_request:
     branches:
       - main
     paths:
-      - "rust/**"
+      - "src/**"
       - .github/workflows/rust-e2e.yml
 
 concurrency:
@@ -64,8 +64,8 @@ jobs:
         run: |
           docker run -d --name squid-auth \
             -p 3129:3128 \
-            -v ${{ github.workspace }}/rust/ci/proxy/squid-auth.conf:/etc/squid/squid.conf \
-            -v ${{ github.workspace }}/rust/ci/proxy/htpasswd:/etc/squid/htpasswd \
+            -v ${{ github.workspace }}/ci/proxy/squid-auth.conf:/etc/squid/squid.conf \
+            -v ${{ github.workspace }}/ci/proxy/htpasswd:/etc/squid/htpasswd \
             ubuntu/squid:latest@sha256:6a097f68bae708cedbabd6188d68c7e2e7a38cedd05a176e1cc0ba29e3bbe029
           # Wait for squid to be ready
           for i in $(seq 1 10); do
@@ -80,7 +80,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
 
       - name: Run proxy E2E tests
-        working-directory: rust
         run: cargo test --test proxy_e2e -- --ignored --nocapture
 
       - name: Verify proxy was used (unauthenticated)
@@ -144,7 +143,6 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
 
       - name: Run TLS E2E tests
-        working-directory: rust
         run: cargo test --test tls_e2e -- --ignored --nocapture
 
       - name: Verify traffic flowed through mitmproxy

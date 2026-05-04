@@ -1,5 +1,5 @@
 <!--
-  Copyright (c) 2025 ADBC Drivers Contributors
+  Copyright (c) 2026 Databricks, Inc.
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -373,7 +373,7 @@ pub struct DatabricksClientConfig {
 5. Remove `reader_factory` from Statement
 6. Simplify Connection (no longer passes http_client/cloudfetch_config to Statement)
 
-Metadata methods on `DatabricksClient` are covered in the [connection metadata design](rust/spec/connection-metadata-design.md) and will be implemented separately after this refactor lands.
+Metadata methods on `DatabricksClient` are covered in the [connection metadata design](docs/designs/connection-metadata-design.md) and will be implemented separately after this refactor lands.
 
 ## Alternatives Considered
 
@@ -410,5 +410,5 @@ Metadata methods on `DatabricksClient` are covered in the [connection metadata d
 - [Current DatabricksClient trait](rust/src/client/mod.rs)
 - [Current Statement implementation](rust/src/statement.rs)
 - [ResultReaderFactory](rust/src/reader/mod.rs)
-- [Connection metadata design](rust/spec/connection-metadata-design.md)
+- [Connection metadata design](docs/designs/connection-metadata-design.md)
 - [databricks-jdbc IDatabricksMetadataClient](~/databricks-jdbc/src/main/java/com/databricks/jdbc/dbclient/IDatabricksMetadataClient.java)

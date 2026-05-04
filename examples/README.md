@@ -1,5 +1,5 @@
 <!--
-  Copyright (c) 2025 ADBC Drivers Contributors
+  Copyright (c) 2026 Databricks, Inc.
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -20,7 +20,7 @@ Integration examples that run queries against a live Databricks SQL warehouse.
 
 ## Setup
 
-Credentials are configured in `rust/.cargo/config.toml` (gitignored). Set the
+Credentials are configured in `.cargo/config.toml` (gitignored). Set the
 following environment variables there:
 
 ```toml

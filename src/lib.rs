@@ -1,4 +1,4 @@
-// Copyright (c) 2025 ADBC Drivers Contributors
+// Copyright (c) 2026 Databricks, Inc.
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -12,18 +12,23 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Databricks ADBC Driver for Rust
+//! Databricks SQL Kernel
 //!
-//! This crate provides an ADBC (Arrow Database Connectivity) driver for
-//! connecting to Databricks SQL endpoints.
+//! Rust client core for Databricks SQL — the shared engine that powers the
+//! Databricks ODBC, Python, Go, and Node.js drivers, and is also exposed
+//! today as an ADBC driver.
 //!
 //! ## Overview
 //!
-//! The driver implements the standard ADBC traits from `adbc_core`:
+//! ADBC is currently the primary surface: the kernel implements the standard
+//! traits from `adbc_core`:
 //! - [`Driver`] - Entry point for creating database connections
 //! - [`Database`] - Holds connection configuration
 //! - [`Connection`] - Active connection to Databricks
 //! - [`Statement`] - SQL statement execution
+//!
+//! A native (non-ADBC) Rust API and a stable C ABI for ODBC/Go are planned;
+//! see the kernel-strategy plan doc for the staged rollout.
 //!
 //! ## Features
 //!

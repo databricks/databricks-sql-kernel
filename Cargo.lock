@@ -477,7 +477,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "databricks-adbc"
+name = "databricks-sql-kernel"
 version = "0.1.0"
 dependencies = [
  "adbc_core",

@@ -1,5 +1,5 @@
 <!--
-  Copyright (c) 2025 ADBC Drivers Contributors
+  Copyright (c) 2026 Databricks, Inc.
 
   Licensed under the Apache License, Version 2.0 (the "License");
   you may not use this file except in compliance with the License.
@@ -266,4 +266,4 @@ The Rust driver uses `databricks.http.tls.*` while the C# driver uses `adbc.http
 | `rust/Cargo.toml` | Add `native-tls` feature to reqwest |
 | `rust/tests/tls_e2e.rs` | E2E TLS test cases (marked `#[ignore]`) |
 | `.github/workflows/rust-e2e.yml` | Add TLS job with mitmproxy sidecar |
-| `rust/spec/tls-config-design.md` | This design doc |
+| `docs/designs/tls-config-design.md` | This design doc |

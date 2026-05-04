@@ -1,4 +1,4 @@
-# Copyright (c) 2026 ADBC Drivers Contributors
+# Copyright (c) 2026 Databricks, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,9 +12,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# TODO(kernel): Remove this ADBC driver manifest once the kernel surfaces its
+# own non-ADBC FFI and ADBC becomes one of several optional adapters rather
+# than the primary identity. Kept for now so `adbc-driver-manager` can still
+# discover the kernel as an ADBC driver during the transition.
+
 name = "Databricks Driver"
-description = "An ADBC driver for Databricks developed by the ADBC Driver Foundry"
-publisher = "ADBC Drivers Contributors"
+description = "Databricks SQL Kernel — exposed via the ADBC trait layer"
+publisher = "Databricks, Inc."
 license = "Apache-2.0"
 
 [ADBC]
