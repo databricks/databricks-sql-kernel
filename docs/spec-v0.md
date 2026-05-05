@@ -449,3 +449,83 @@ impl<'s> Metadata<'s> {
 
 ## Error Handling
 
+---
+
+# Kernel addenda
+
+This section captures decisions that have been agreed in the kernel
+implementation but are not yet reflected in the upstream Google Doc. When
+upstream is updated, these notes fold back into the relevant section above
+and the addendum is removed.
+
+## A1. `Statement` is immutable; `StatementBuilder` is the mutable handle
+
+**Status:** approved 2026-05-05.
+
+Databricks server-side, a statement is immutable once created — it has a
+`statement_id` and a single SQL text bound to it. The driver-side abstraction
+in the spec body collapses both phases (build + executed) into one
+`Statement<'s>` type. This addendum splits them so the kernel mirrors the
+server contract.
+
+```rust
+pub struct StatementBuilder<'s> { /* sql, params, conf, result_format,
+                                     plus an Option<Statement<'s>> tracking
+                                     the last-issued statement so re-execute
+                                     can implicitly close it */ }
+
+impl<'s> StatementBuilder<'s> {
+    // Setters — mutate in place. All builder methods take &mut self.
+    pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self;
+    pub fn param(&mut self, ordinal: usize, value: TypedValue) -> &mut Self;
+    pub fn param_named(&mut self, name: impl Into<String>, value: TypedValue) -> &mut Self;
+    pub fn statement_conf(&mut self, conf: HashMap<String, String>) -> &mut Self;
+    pub fn result_format(&mut self, fmt: ResultFormat) -> &mut Self;
+
+    /// Wait-for-result execution. If a prior `Statement` from this builder
+    /// is still live, it is auto-cancelled and closed before the new
+    /// ExecuteStatement is sent. Returns a fresh, immutable `Statement`.
+    pub async fn execute(&mut self) -> Result<Statement<'s>>;
+
+    /// Submit-and-return. Same auto-cancel-and-close semantics as execute().
+    pub async fn submit(&mut self) -> Result<Statement<'s>>;
+}
+
+pub struct Statement<'s> { /* statement_id, session ref */ }
+
+impl<'s> Statement<'s> {
+    pub fn statement_id(&self) -> &str;
+
+    // Lifecycle / inspection. Statement is immutable — no setters, no
+    // re-execute. Re-binding parameters or running another SQL requires
+    // going back to the builder.
+    pub async fn status(&self) -> Result<StatementStatus>;
+    pub async fn await_result(&self) -> Result<ResultStream>;
+    pub async fn fetch_result(&self) -> Result<ResultStream>;
+    pub async fn cancel(&self) -> Result<()>;
+    pub async fn close(self) -> Result<()>;
+}
+
+impl<'s> Drop for Statement<'s> {
+    fn drop(&mut self) {
+        // Fire-and-forget CloseStatement if close() wasn't called.
+    }
+}
+```
+
+**Re-execute semantics.** Calling `execute()` or `submit()` on a
+`StatementBuilder` that has previously produced a `Statement` will:
+
+1. If the prior statement's status is `Pending` or `Running`, send
+   CancelStatement.
+2. Send CloseStatement to release server resources.
+3. Send the new ExecuteStatement (or submit) with the builder's current
+   sql/params/conf.
+
+The prior `Statement` handle, if still held by the caller, becomes invalid
+— subsequent calls on it return `ErrorCode::InvalidStatementHandle`.
+
+**`Session::statement()`** returns `StatementBuilder<'_>`, not
+`Statement<'_>`. The "Public Rust API → Session" code block above is
+superseded for that one method.
+
