@@ -458,74 +458,159 @@ implementation but are not yet reflected in the upstream Google Doc. When
 upstream is updated, these notes fold back into the relevant section above
 and the addendum is removed.
 
-## A1. `Statement` is immutable; `StatementBuilder` is the mutable handle
+## A1. StatementSpec, Statement, ExecutedStatement, ExecutedAsyncStatement
 
 **Status:** approved 2026-05-05.
 
 Databricks server-side, a statement is immutable once created — it has a
-`statement_id` and a single SQL text bound to it. The driver-side abstraction
-in the spec body collapses both phases (build + executed) into one
-`Statement<'s>` type. This addendum splits them so the kernel mirrors the
-server contract.
+`statement_id` and a single SQL text bound to it. The spec body's single
+`Statement<'s>` type collapses three concerns: the *what* (SQL, params,
+conf), the *lifecycle owner* (mutable handle that can be re-executed), and
+the *executed handle* (immutable, has `statement_id`). This addendum
+splits them into four types so the kernel mirrors the server contract and
+the executed phase carves cleanly into sync vs async consumption.
+
+Four types:
+
+- `StatementSpec` — plain data. SQL, positional/named params, statement
+  conf overlay, result format. No `Session` reference. Constructible in
+  isolation; testable; cheaply cloneable.
+- `Statement` — lifecycle owner, returned by `Session::statement()`. Owns
+  one `StatementSpec` and at most one live executed handle. Exposes the
+  spec via `spec(&mut self) -> &mut StatementSpec` for mutation, and
+  `execute()` / `submit()` to produce executed handles.
+- `ExecutedStatement` — immutable, returned by `Statement::execute()`. The
+  kernel has already polled to completion; results are ready to consume.
+- `ExecutedAsyncStatement` — immutable, returned by `Statement::submit()`.
+  The kernel returned without driving polling; the caller owns polling via
+  `status()` / `await_result()`.
+
+`Statement` is reusable. Calling `execute()` or `submit()` again on the
+same `Statement` auto-cancels + closes any prior executed handle it
+produced. The spec persists; only the executed handle is replaced. The
+prior handle becomes invalid; subsequent calls on it return
+`ErrorCode::InvalidStatementHandle`.
 
 ```rust
-pub struct StatementBuilder<'s> { /* sql, params, conf, result_format,
-                                     plus an Option<Statement<'s>> tracking
-                                     the last-issued statement so re-execute
-                                     can implicitly close it */ }
+// === StatementSpec (plain data, mutable, reusable) ===
 
-impl<'s> StatementBuilder<'s> {
-    // Setters — mutate in place. All builder methods take &mut self.
+#[derive(Default, Clone)]
+pub struct StatementSpec {
+    pub sql: Option<String>,
+    pub positional_params: Vec<TypedValue>,
+    pub named_params: HashMap<String, TypedValue>,
+    pub statement_conf: HashMap<String, String>,
+    pub result_format: ResultFormat,    // Default: Arrow
+}
+
+impl StatementSpec {
+    pub fn new() -> Self;
+
+    // Fluent setters for ergonomics. All take &mut self.
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self;
     pub fn param(&mut self, ordinal: usize, value: TypedValue) -> &mut Self;
     pub fn param_named(&mut self, name: impl Into<String>, value: TypedValue) -> &mut Self;
     pub fn statement_conf(&mut self, conf: HashMap<String, String>) -> &mut Self;
     pub fn result_format(&mut self, fmt: ResultFormat) -> &mut Self;
-
-    /// Wait-for-result execution. If a prior `Statement` from this builder
-    /// is still live, it is auto-cancelled and closed before the new
-    /// ExecuteStatement is sent. Returns a fresh, immutable `Statement`.
-    pub async fn execute(&mut self) -> Result<Statement<'s>>;
-
-    /// Submit-and-return. Same auto-cancel-and-close semantics as execute().
-    pub async fn submit(&mut self) -> Result<Statement<'s>>;
 }
 
-pub struct Statement<'s> { /* statement_id, session ref */ }
+
+// === Statement (lifecycle owner, mutable, reusable) ===
+
+pub struct Statement<'s> { /* spec: StatementSpec, last_handle, session ref */ }
 
 impl<'s> Statement<'s> {
+    /// Mutable access to the spec. Mutate before calling execute/submit.
+    pub fn spec(&mut self) -> &mut StatementSpec;
+
+    /// Read-only access (e.g. for logging or assertion).
+    pub fn spec_ref(&self) -> &StatementSpec;
+
+    /// Wait-for-result execution. Auto-cancels + closes any prior handle.
+    /// Spec is unchanged after the call; can be re-executed.
+    pub async fn execute(&mut self) -> Result<ExecutedStatement<'s>>;
+
+    /// Submit-and-return. Auto-cancels + closes any prior handle.
+    pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement<'s>>;
+}
+
+
+// === Shared trait for both executed handles ===
+
+pub trait ExecutedStatementHandle {
+    fn statement_id(&self) -> &str;
+    async fn cancel(&self) -> Result<()>;
+    async fn close(self) -> Result<()>;
+}
+
+
+// === ExecutedStatement (sync consumption) ===
+
+pub struct ExecutedStatement<'s> { /* statement_id, ResultStream */ }
+
+impl<'s> ExecutedStatement<'s> {
     pub fn statement_id(&self) -> &str;
 
-    // Lifecycle / inspection. Statement is immutable — no setters, no
-    // re-execute. Re-binding parameters or running another SQL requires
-    // going back to the builder.
-    pub async fn status(&self) -> Result<StatementStatus>;
-    pub async fn await_result(&self) -> Result<ResultStream>;
-    pub async fn fetch_result(&self) -> Result<ResultStream>;
+    /// Borrow the result stream. Non-consuming — JDBC/ODBC parity, the
+    /// caller separates "done iterating" from "done with statement".
+    pub fn result_stream(&self) -> &ResultStream;
+    pub fn result_stream_mut(&mut self) -> &mut ResultStream;
+
     pub async fn cancel(&self) -> Result<()>;
     pub async fn close(self) -> Result<()>;
 }
 
-impl<'s> Drop for Statement<'s> {
-    fn drop(&mut self) {
-        // Fire-and-forget CloseStatement if close() wasn't called.
-    }
+
+// === ExecutedAsyncStatement (async consumption) ===
+
+pub struct ExecutedAsyncStatement<'s> { /* statement_id */ }
+
+impl<'s> ExecutedAsyncStatement<'s> {
+    pub fn statement_id(&self) -> &str;
+
+    pub async fn status(&self) -> Result<StatementStatus>;
+    pub async fn await_result(&self) -> Result<ResultStream>;
+    pub async fn fetch_result(&self) -> Result<ResultStream>;
+
+    pub async fn cancel(&self) -> Result<()>;
+    pub async fn close(self) -> Result<()>;
 }
+
+// Both ExecutedStatement and ExecutedAsyncStatement fire fire-and-forget
+// CloseStatement on Drop if close() wasn't called explicitly.
 ```
 
-**Re-execute semantics.** Calling `execute()` or `submit()` on a
-`StatementBuilder` that has previously produced a `Statement` will:
+**Typical flow:**
 
-1. If the prior statement's status is `Pending` or `Running`, send
-   CancelStatement.
+```rust
+let mut stmt = session.statement();
+stmt.spec()
+    .sql("SELECT * FROM t WHERE id = ?")
+    .param(1, TypedValue::Int(42));
+
+let exec = stmt.execute().await?;
+while let Some(batch) = exec.result_stream_mut().next_batch().await? { ... }
+exec.close().await?;
+
+// Re-execute with different params — spec persists, only param changes.
+stmt.spec().param(1, TypedValue::Int(43));
+let exec = stmt.execute().await?;
+// ...
+```
+
+**Re-execute semantics.** When `execute()` or `submit()` is called on a
+`Statement` that has previously produced an executed handle:
+
+1. If the prior handle's server-side status is `Pending` or `Running`,
+   send CancelStatement.
 2. Send CloseStatement to release server resources.
-3. Send the new ExecuteStatement (or submit) with the builder's current
-   sql/params/conf.
+3. Send the new ExecuteStatement (or submit) using the current
+   `StatementSpec`.
 
-The prior `Statement` handle, if still held by the caller, becomes invalid
-— subsequent calls on it return `ErrorCode::InvalidStatementHandle`.
+The prior handle, if still held by the caller, returns
+`ErrorCode::InvalidStatementHandle` on subsequent calls.
 
-**`Session::statement()`** returns `StatementBuilder<'_>`, not
-`Statement<'_>`. The "Public Rust API → Session" code block above is
-superseded for that one method.
+**`Session::statement()`** continues to return `Statement<'_>`; the
+docstring is updated to clarify it is the mutable lifecycle owner whose
+spec the user mutates before executing.
 
