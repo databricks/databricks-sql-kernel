@@ -34,7 +34,7 @@ use adbc_core::Driver as DriverTrait;
 use adbc_core::Optionable;
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, RecordBatchReader, StructArray};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 use std::time::Instant;
 
 /// The 8 TPC-H tables in `samples.tpch`, in alphabetical order.

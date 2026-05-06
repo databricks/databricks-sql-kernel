@@ -84,9 +84,6 @@
 
 pub mod auth;
 pub mod client;
-pub mod connection;
-pub mod database;
-pub mod driver;
 pub mod error;
 pub(crate) mod logging;
 pub mod metadata;
@@ -96,12 +93,17 @@ pub mod statement;
 pub mod telemetry;
 pub mod types;
 
-// Re-export main types
-pub use connection::Connection;
-pub use database::Database;
-pub use driver::Driver;
+// === v0 Kernel spec surface (skeleton — populated in subsequent PRs) ===
+pub mod config;
+pub mod kernel_error;
+pub mod session;
+
+// New custom C ABI for ODBC/Go consumers (replaces ADBC FFI).
+pub mod ffi;
+
+// Re-export shared error types (driverbase-based; replaced by `kernel_error`
+// in the final removal PR).
 pub use error::{DatabricksErrorHelper, Error, Result};
-pub use statement::Statement;
 
 // Re-export client types for advanced users
 pub use client::{DatabricksClient, DatabricksHttpClient, HttpClientConfig, SeaClient};
@@ -109,12 +111,23 @@ pub use client::{DatabricksClient, DatabricksHttpClient, HttpClientConfig, SeaCl
 // Re-export configuration types
 pub use types::cloudfetch::CloudFetchConfig;
 
-// Metadata FFI — additional extern "C" functions for catalog metadata
-// when built with `cargo build --features metadata-ffi`
-#[cfg(feature = "metadata-ffi")]
-pub(crate) mod ffi;
+// === Legacy ADBC surface (gated, scheduled for removal) ===
+#[cfg(feature = "legacy-adbc")]
+pub mod adbc;
+
+// Re-export ADBC main types at the crate root for backwards compatibility
+// during the kernel-v0 migration. New code should import from
+// `crate::adbc::*` directly.
+#[cfg(feature = "legacy-adbc")]
+pub use adbc::connection::Connection;
+#[cfg(feature = "legacy-adbc")]
+pub use adbc::database::Database;
+#[cfg(feature = "legacy-adbc")]
+pub use adbc::driver::Driver;
+#[cfg(feature = "legacy-adbc")]
+pub use adbc::statement::Statement;
 
 // FFI export — produces AdbcDatabricksInit and AdbcDriverInit symbols
 // when built with `cargo build --features ffi`
-#[cfg(feature = "ffi")]
-adbc_ffi::export_driver!(AdbcDatabricksInit, crate::driver::Driver);
+#[cfg(all(feature = "ffi", feature = "legacy-adbc"))]
+adbc_ffi::export_driver!(AdbcDatabricksInit, crate::adbc::driver::Driver);

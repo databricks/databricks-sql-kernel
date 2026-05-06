@@ -23,11 +23,11 @@
 //! 6. Export result via `FFI_ArrowArrayStream`
 //! 7. Return status code; on error, set thread-local error buffer
 
-use crate::ffi::error::{clear_last_error, set_error_from_result, set_last_error, FfiStatus};
+use crate::adbc::connection::Connection;
+use crate::adbc::ffi::error::{clear_last_error, set_error_from_result, set_last_error, FfiStatus};
 use crate::metadata::sql::SqlCommandBuilder;
 use crate::reader::{EmptyReader, ResultReader, ResultReaderAdapter};
 use crate::types::sea::{ExecuteParams, ResultManifest};
-use crate::Connection;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use arrow_array::RecordBatchReader;
 use arrow_schema::Schema;
@@ -515,7 +515,7 @@ pub unsafe extern "C" fn metadata_get_procedure_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ffi::error::FfiError;
+    use crate::adbc::ffi::error::FfiError;
     use crate::reader::test_utils::{MockReader, SchemaErrorReader};
     use arrow_array::{RecordBatch, StringArray};
     use arrow_schema::{DataType, Field, Schema};
@@ -582,7 +582,7 @@ mod tests {
         assert_eq!(status, FfiStatus::Error);
 
         let mut err = FfiError::default();
-        unsafe { crate::ffi::error::metadata_get_last_error(&mut err) };
+        unsafe { crate::adbc::ffi::error::metadata_get_last_error(&mut err) };
         let msg: String = err
             .message
             .iter()
@@ -599,7 +599,7 @@ mod tests {
         assert_eq!(status, FfiStatus::Error);
 
         let mut err = FfiError::default();
-        unsafe { crate::ffi::error::metadata_get_last_error(&mut err) };
+        unsafe { crate::adbc::ffi::error::metadata_get_last_error(&mut err) };
         let msg: String = err
             .message
             .iter()
@@ -616,7 +616,7 @@ mod tests {
         assert_eq!(status, FfiStatus::Error);
 
         let mut err = FfiError::default();
-        unsafe { crate::ffi::error::metadata_get_last_error(&mut err) };
+        unsafe { crate::adbc::ffi::error::metadata_get_last_error(&mut err) };
         let msg: String = err
             .message
             .iter()
@@ -634,7 +634,7 @@ mod tests {
 
         // Error should be set
         let mut err = FfiError::default();
-        unsafe { crate::ffi::error::metadata_get_last_error(&mut err) };
+        unsafe { crate::adbc::ffi::error::metadata_get_last_error(&mut err) };
         let msg: String = err
             .message
             .iter()
@@ -677,14 +677,14 @@ mod tests {
     #[test]
     fn test_clear_error_on_entry() {
         // Set an error, then call a function that clears it at entry
-        crate::ffi::error::set_last_error("stale error", "HY000", -1);
+        crate::adbc::ffi::error::set_last_error("stale error", "HY000", -1);
 
         // Call with null connection — clears the error first, then sets a new one
         let mut stream = FFI_ArrowArrayStream::empty();
         let _status = unsafe { metadata_get_catalogs(std::ptr::null(), &mut stream) };
 
         let mut err = FfiError::default();
-        unsafe { crate::ffi::error::metadata_get_last_error(&mut err) };
+        unsafe { crate::adbc::ffi::error::metadata_get_last_error(&mut err) };
         let msg: String = err
             .message
             .iter()

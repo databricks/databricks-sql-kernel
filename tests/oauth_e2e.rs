@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! End-to-end OAuth integration tests for M2M and U2M flows.
 //!
 //! These tests connect to a real Databricks workspace and verify the complete
@@ -68,7 +70,7 @@
 
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Connection as _, Database as _, Driver as _, Optionable, Statement as _};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 /// Helper function to get required environment variable with clear error message.
 fn get_env_var(name: &str) -> String {

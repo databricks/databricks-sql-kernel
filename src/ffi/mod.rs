@@ -12,22 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! FFI layer for catalog metadata operations.
+//! Custom C ABI for the v0 Kernel — for ODBC and Go consumers that cannot
+//! link the Rust crate directly.
 //!
-//! This module provides `extern "C"` functions that expose the driver's
-//! metadata capabilities via the Arrow C Data Interface. It is conditionally
-//! compiled with the `metadata-ffi` feature flag.
+//! Per the spec (`docs/spec-v0.md`, "Architecture"), this layer is a thin
+//! shim over the async kernel core: it owns a process-wide tokio runtime,
+//! marshals C strings / structs into `SessionConfig`, and exposes opaque
+//! handles for `Session`, `Statement`, and `ResultStream`.
 //!
-//! ## Usage from C/C++
+//! Populated incrementally by PRs 7a–7d in the staged refactor. The header
+//! at `include/databricks_kernel.h` is the C-side contract.
 //!
-//! ```c
-//! // 1. Get Connection* from adbc_connection_.private_data
-//! // 2. Call metadata functions directly
-//! FFI_ArrowArrayStream stream;
-//! FfiStatus status = metadata_get_tables(conn_ptr, "main", NULL, "%", NULL, &stream);
-//!
-//! // 3. Process Arrow stream...
-//! ```
+//! Distinct from the legacy `crate::adbc::ffi` module, which exposes the
+//! ADBC-shaped metadata-FFI and is gated on `legacy-adbc`.
 
-pub mod error;
-pub mod metadata;
+#![allow(dead_code)]

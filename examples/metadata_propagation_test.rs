@@ -29,7 +29,7 @@ use adbc_core::Driver as DriverTrait;
 use adbc_core::Optionable;
 use adbc_core::Statement as StatementTrait;
 use arrow_array::RecordBatchReader;
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 const DATABRICKS_TYPE_NAME: &str = "databricks.type_name";
 const DATABRICKS_TYPE_TEXT: &str = "databricks.type_text";

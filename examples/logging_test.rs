@@ -35,7 +35,7 @@ use adbc_core::Database as _;
 use adbc_core::Driver as _;
 use adbc_core::Optionable;
 use adbc_core::Statement as _;
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 
 fn main() {
     let host =
@@ -45,7 +45,8 @@ fn main() {
     let token =
         std::env::var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN environment variable required");
 
-    let log_file = std::env::var("LOG_FILE").unwrap_or_else(|_| "/tmp/databricks-sql-kernel.log".into());
+    let log_file =
+        std::env::var("LOG_FILE").unwrap_or_else(|_| "/tmp/databricks-sql-kernel.log".into());
 
     println!("=== Logging Configuration Example ===\n");
     println!("Log level : DEBUG");

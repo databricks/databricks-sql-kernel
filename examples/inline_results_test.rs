@@ -39,7 +39,7 @@ use adbc_core::Driver as DriverTrait;
 use adbc_core::Optionable;
 use adbc_core::Statement as StatementTrait;
 use arrow_array::{RecordBatch, RecordBatchReader};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 use std::time::Instant;
 
 fn main() {

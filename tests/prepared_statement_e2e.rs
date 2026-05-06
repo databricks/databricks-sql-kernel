@@ -12,6 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+#![cfg(feature = "legacy-adbc")]
+
 //! E2E tests for prepared statement and parameter binding support.
 //!
 //! These tests require a real Databricks connection and are marked with `#[ignore]`.
@@ -43,7 +45,7 @@ use arrow_array::{
     StringArray,
 };
 use arrow_schema::{DataType, Field, Schema};
-use databricks_sql_kernel::Driver;
+use databricks_sql_kernel::adbc::driver::Driver;
 use std::sync::Arc;
 
 fn get_env(name: &str) -> String {
