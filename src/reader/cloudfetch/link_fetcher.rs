@@ -15,7 +15,7 @@
 //! ChunkLinkFetcher trait and implementations.
 //!
 //! This module provides a statement-scoped abstraction for fetching chunk links.
-//! The `ChunkLinkFetcher` trait wraps a `DatabricksClient` and binds it to a
+//! The `ChunkLinkFetcher` trait wraps a `Transport` and binds it to a
 //! specific statement, providing a simpler interface for `StreamingCloudFetchProvider`.
 //!
 //! ## Prefetch Architecture
@@ -40,12 +40,11 @@
 //! 3. Check if prefetch should be triggered (async, non-blocking)
 //! 4. Background task fetches links and caches them
 
-use crate::client::{ChunkLinkFetchResult, DatabricksClient};
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::client::{ChunkLinkFetchResult, Transport};
+use crate::kernel_error::{Error, Result};
 use crate::types::cloudfetch::CloudFetchLink;
 use async_trait::async_trait;
 use dashmap::DashMap;
-use driverbase::error::ErrorHelper;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
@@ -53,9 +52,9 @@ use tracing::{debug, error};
 
 /// Statement-scoped abstraction for fetching chunk links.
 ///
-/// This trait wraps a `DatabricksClient` and binds it to a specific statement,
+/// This trait wraps a `Transport` and binds it to a specific statement,
 /// providing a simpler interface for `StreamingCloudFetchProvider`. Each
-/// implementation delegates to `DatabricksClient::get_result_chunks()` but
+/// implementation delegates to `Transport::get_result_chunks()` but
 /// handles protocol-specific details (e.g., which continuation parameter to use).
 ///
 /// # Design Note
@@ -66,7 +65,7 @@ use tracing::{debug, error};
 ///
 /// Both parameters are passed to methods; implementations use the relevant one.
 #[async_trait]
-pub trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
+pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
     /// Fetch the next batch of chunk links.
     ///
     /// # Parameters
@@ -104,9 +103,9 @@ pub trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
 /// 4. This ensures links are ready before they're needed
 ///
 /// Uses `chunk_index` for pagination (ignores `row_offset`).
-pub struct SeaChunkLinkFetcher {
+pub(crate) struct SeaChunkLinkFetcher {
     /// Databricks client for making API calls
-    client: Arc<dyn DatabricksClient>,
+    client: Arc<dyn Transport>,
     /// Statement ID this fetcher is bound to
     statement_id: String,
     /// Cached links by chunk index
@@ -168,8 +167,8 @@ impl SeaChunkLinkFetcher {
     /// * `total_chunk_count` - Total number of chunks from result manifest
     /// * `link_prefetch_window` - Number of chunks to prefetch ahead of consumer
     /// * `runtime_handle` - Tokio runtime handle for spawning prefetch tasks
-    pub fn new(
-        client: Arc<dyn DatabricksClient>,
+    pub(crate) fn new(
+        client: Arc<dyn Transport>,
         statement_id: impl Into<String>,
         initial_links: &[CloudFetchLink],
         total_chunk_count: Option<i64>,
@@ -222,17 +221,20 @@ impl SeaChunkLinkFetcher {
     }
 
     /// Check if a link is cached.
-    pub fn has_link(&self, chunk_index: i64) -> bool {
+    #[allow(dead_code, reason = "wired into the v0 path in PR 2")]
+    pub(crate) fn has_link(&self, chunk_index: i64) -> bool {
         self.links.contains_key(&chunk_index)
     }
 
     /// Get a cached link if available.
-    pub fn get_link(&self, chunk_index: i64) -> Option<CloudFetchLink> {
+    #[allow(dead_code, reason = "wired into the v0 path in PR 2")]
+    pub(crate) fn get_link(&self, chunk_index: i64) -> Option<CloudFetchLink> {
         self.links.get(&chunk_index).map(|r| r.clone())
     }
 
     /// Check if all links have been fetched.
-    pub fn all_links_fetched(&self) -> bool {
+    #[allow(dead_code, reason = "wired into the v0 path in PR 2")]
+    pub(crate) fn all_links_fetched(&self) -> bool {
         self.all_links_fetched.load(Ordering::Acquire)
     }
 
@@ -376,7 +378,7 @@ impl SeaChunkLinkFetcher {
 ///
 /// Since the trait takes `&self`, we need a way to get an `Arc<Self>` to spawn
 /// the background prefetch task. This wrapper holds the Arc internally.
-pub struct SeaChunkLinkFetcherHandle {
+pub(crate) struct SeaChunkLinkFetcherHandle {
     inner: Arc<SeaChunkLinkFetcher>,
 }
 
@@ -391,7 +393,7 @@ impl SeaChunkLinkFetcherHandle {
     ///
     /// Immediately triggers async prefetch to start fetching links proactively,
     /// giving the prefetch task a head start before the consumer starts reading.
-    pub fn new(fetcher: SeaChunkLinkFetcher) -> Self {
+    pub(crate) fn new(fetcher: SeaChunkLinkFetcher) -> Self {
         let handle = Self {
             inner: Arc::new(fetcher),
         };
@@ -530,7 +532,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             .into_iter()
             .find(|l| l.chunk_index == chunk_index)
             .ok_or_else(|| {
-                DatabricksErrorHelper::invalid_state()
+                Error::invalid_state()
                     .message(format!("Link not found for chunk_index {}", chunk_index))
             })?;
 
@@ -550,7 +552,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Arc as StdArc;
 
-    /// Mock DatabricksClient for testing
+    /// Mock Transport for testing
     #[derive(Debug)]
     struct MockDatabricksClient {
         chunks: Vec<Vec<CloudFetchLink>>,
@@ -563,7 +565,7 @@ mod tests {
     }
 
     #[async_trait]
-    impl DatabricksClient for MockDatabricksClient {
+    impl Transport for MockDatabricksClient {
         async fn create_session(
             &self,
             _catalog: Option<&str>,

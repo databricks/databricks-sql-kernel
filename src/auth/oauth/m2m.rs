@@ -32,8 +32,7 @@ use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{AuthUrl, ClientId, ClientSecret, Scope, TokenResponse, TokenUrl};
 use std::sync::Arc;
@@ -249,11 +248,11 @@ impl AuthProvider for ClientCredentialsProvider {
                     let oauth_client = BasicClient::new(ClientId::new(client_id))
                         .set_client_secret(ClientSecret::new(client_secret))
                         .set_auth_uri(AuthUrl::new(auth_endpoint).map_err(|e| {
-                            DatabricksErrorHelper::invalid_argument()
+                            Error::invalid_argument()
                                 .message(format!("Invalid authorization endpoint URL: {}", e))
                         })?)
                         .set_token_uri(TokenUrl::new(token_endpoint).map_err(|e| {
-                            DatabricksErrorHelper::invalid_argument()
+                            Error::invalid_argument()
                                 .message(format!("Invalid token endpoint URL: {}", e))
                         })?);
 
@@ -268,7 +267,7 @@ impl AuthProvider for ClientCredentialsProvider {
                         .request_async(http_client.inner())
                         .await
                         .map_err(|e| {
-                            DatabricksErrorHelper::io()
+                            Error::io()
                                 .message(format!("M2M token exchange failed: {}", e))
                                 .context("client credentials grant")
                         })?;

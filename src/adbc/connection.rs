@@ -20,7 +20,7 @@ use crate::adbc::metadata_builder::{
     group_tables_and_columns, group_tables_by_catalog_schema,
 };
 use crate::adbc::statement::Statement;
-use crate::client::DatabricksClient;
+use crate::client::Transport;
 use crate::error::DatabricksErrorHelper;
 use crate::metadata::parse::{
     parse_catalogs, parse_columns, parse_columns_as_fields, parse_schemas, parse_tables,
@@ -38,12 +38,12 @@ use tracing::span::EnteredSpan;
 use tracing::{debug, info_span, Span};
 
 /// Configuration passed from Database to Connection.
-pub struct ConnectionConfig {
+pub(crate) struct ConnectionConfig {
     pub host: String,
     pub warehouse_id: String,
     pub catalog: Option<String>,
     pub schema: Option<String>,
-    pub client: Arc<dyn DatabricksClient>,
+    pub client: Arc<dyn Transport>,
 }
 
 /// Represents an active connection to a Databricks SQL endpoint.
@@ -58,7 +58,7 @@ pub struct Connection {
     warehouse_id: String,
 
     // Databricks client (trait object for backend flexibility)
-    client: Arc<dyn DatabricksClient>,
+    client: Arc<dyn Transport>,
 
     // Session ID (created on connection initialization)
     session_id: String,
@@ -77,9 +77,9 @@ type EmptyReader =
 impl Connection {
     /// Called by Database::new_connection().
     ///
-    /// Connection receives the DatabricksClient and runtime from Database.
+    /// Connection receives the Transport and runtime from Database.
     /// The runtime is created by Database so it can share the handle with
-    /// SeaClient and ResultReaderFactory before Connection is created.
+    /// SeaRestTransport and ResultReaderFactory before Connection is created.
     pub(crate) fn new_with_runtime(
         config: ConnectionConfig,
         runtime: tokio::runtime::Runtime,
@@ -130,7 +130,7 @@ impl Connection {
 
     /// Returns a reference to the Databricks client.
     #[cfg(feature = "metadata-ffi")]
-    pub(crate) fn client(&self) -> &Arc<dyn DatabricksClient> {
+    pub(crate) fn client(&self) -> &Arc<dyn Transport> {
         &self.client
     }
 
@@ -517,6 +517,6 @@ impl Drop for Connection {
 
 #[cfg(test)]
 mod tests {
-    // Note: Full connection tests require mock DatabricksClient
+    // Note: Full connection tests require mock Transport
     // Integration tests should be added in a separate test module
 }

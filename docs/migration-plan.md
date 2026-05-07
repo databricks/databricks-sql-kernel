@@ -783,7 +783,74 @@ decisions so future PRs don't relitigate.
   prove the kernel internals work; the wrapper rewrites are
   mechanical once the v0 surface lands.
 
-## 7. Estimated scope
+## 7. Follow-ups carried by later PRs
+
+Tracking deferred work that came up during a PR but didn't land in
+that PR. Each item names the PR it landed in and the PR that should
+clear it.
+
+### From PR 1 (Foundations)
+
+- **Drop `#![allow(dead_code)]` at the top of `src/client/transport.rs`.**
+  Added in PR 1 because `TransportConfig`, `SessionInfo`,
+  `ChunkLinkFetchResult::end_of_stream`, and the
+  `next_chunk_index` / `cloudfetch_config` fields aren't reached
+  from the v0 path yet under the default feature build. PR 2's
+  `Session::open` wires them; remove the file-level allow at that
+  point and let rustc reverify.
+- **Drop `#[allow(dead_code, …)]` on `SeaChunkLinkFetcher::has_link`
+  / `get_link` / `all_links_fetched`.** Same reason; PR 2 wires the
+  v0 result-stream plumbing through these. The annotations carry a
+  `reason = "wired into the v0 path in PR 2"` so they're easy to
+  grep for at cleanup time.
+- **Drop `#[allow(dead_code, …)]` on `SqlCommandBuilder::escape_sql_string`,
+  `resolve_catalog_prefix`, `build_get_procedures`,
+  `build_get_procedure_columns` in `src/metadata/sql.rs`.** Reached
+  only under feature `metadata-ffi` today. PR 3's `Metadata`
+  wiring calls these from the v0 path; drop the allows there.
+- **Triage `Error::io()` call sites.** PR 1 introduced `Error::io()`
+  as a sibling of `Error::network_error()`. Today it maps to
+  `ErrorCode::Internal`; many of the call sites that currently use
+  `Error::io()` for HTTP body-read / TCP handshake failures should
+  use `Error::network_error()` instead so wrappers see a retryable
+  `NetworkError` (with `retryable=true`) rather than a non-retryable
+  `Internal`. PR 2 (Session) is the natural home for this triage —
+  it owns the HTTP path, and it's where retry policy meets the typed
+  error model.
+- **Wiremock end-to-end test for the HTTP status → `ErrorCode`
+  mapping.** PR 1 added unit tests for `Error::from_http_status`
+  but did **not** add a wiremock test that drives a real
+  `Transport::*` call against a stubbed Databricks server and
+  asserts the mapped `ErrorCode`. PR 2 should ship that test as
+  part of `Session::open`'s wiremock coverage — `Session::open` is
+  the natural place to exercise 401/403/503/429 responses end to
+  end.
+- **Refine the legacy `kernel_error::Error → adbc_core::error::Error`
+  status mapping.** PR 1 maps `ResourceExhausted`, `Unavailable`,
+  `NetworkError` → `adbc_core::Status::IO` and `SqlError` →
+  `Status::Internal` because ADBC's status enum is coarser than
+  `ErrorCode`. ADBC consumers see less detail than the v0 surface
+  exposes. Acceptable through PR 7 (which deletes the legacy ADBC
+  layer entirely); no fix needed before then.
+- **`extract_sqlstate_from_message` signature divergence.** PR 1's
+  `kernel_error::extract_sqlstate_from_message` returns
+  `Option<String>`. The legacy `crate::error::extract_sqlstate_from_message`
+  returns `Option<[c_char; 5]>` and is no longer publicly used —
+  only `error.rs::From<kernel_error::Error>` reaches its private
+  `sqlstate_to_array` helper. Both go away in PR 7.
+- **`Error::not_implemented()` maps to `InvalidArgument`.** v0's
+  `ErrorCode` has no `NotImplemented` variant. The constructor name
+  matches driverbase's parity for the swap, but the underlying code
+  is `InvalidArgument`. Addendum A8's variant expansion may add a
+  proper `Unimplemented` (or `NotImplemented`) variant; revisit then.
+- **Tighten `SeaChunkLinkFetcher` visibility.** PR 1 removed the
+  `pub use SeaChunkLinkFetcher` re-export from
+  `src/reader/cloudfetch/mod.rs` because the type is now
+  `pub(crate)`. No external callers touched it — the symbol was
+  only ever surfaced for in-crate convenience. PR 2 may want to
+  restore a `pub(crate)` re-export if the v0 wiring grows a need.
+
+## 8. Estimated scope
 
 | PR | LoC est | Risk    | Notes                                                                  |
 |---:|--------:|---------|------------------------------------------------------------------------|

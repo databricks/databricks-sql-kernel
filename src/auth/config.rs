@@ -17,8 +17,7 @@
 //! This module defines the enums and configuration struct used to configure
 //! authentication when creating a new database connection.
 
-use crate::error::DatabricksErrorHelper;
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::Error;
 
 /// Authentication type -- single selector for the authentication method.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -32,14 +31,14 @@ pub enum AuthType {
 }
 
 impl TryFrom<&str> for AuthType {
-    type Error = crate::error::Error;
+    type Error = crate::kernel_error::Error;
 
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
         match value {
             "access_token" => Ok(AuthType::AccessToken),
             "oauth_m2m" => Ok(AuthType::OAuthM2m),
             "oauth_u2m" => Ok(AuthType::OAuthU2m),
-            _ => Err(DatabricksErrorHelper::invalid_argument().message(format!(
+            _ => Err(Error::invalid_argument().message(format!(
                 "Invalid auth type: '{}'. Valid values: 'access_token', 'oauth_m2m', 'oauth_u2m'",
                 value
             ))),
@@ -78,9 +77,9 @@ impl AuthConfig {
     /// This checks that:
     /// - An auth type is specified
     /// - Required fields are present for the chosen auth type
-    pub fn validate(&self, access_token: &Option<String>) -> crate::error::Result<AuthType> {
+    pub fn validate(&self, access_token: &Option<String>) -> crate::kernel_error::Result<AuthType> {
         let auth_type = self.auth_type.ok_or_else(|| {
-            DatabricksErrorHelper::invalid_argument().message(
+            Error::invalid_argument().message(
                 "databricks.auth.type is required. Valid values: 'access_token', 'oauth_m2m', 'oauth_u2m'",
             )
         })?;
@@ -88,19 +87,19 @@ impl AuthConfig {
         match auth_type {
             AuthType::AccessToken => {
                 if access_token.is_none() {
-                    return Err(DatabricksErrorHelper::invalid_argument().message(
+                    return Err(Error::invalid_argument().message(
                         "databricks.access_token is required when auth type is 'access_token'",
                     ));
                 }
             }
             AuthType::OAuthM2m => {
                 if self.client_id.is_none() {
-                    return Err(DatabricksErrorHelper::invalid_argument().message(
+                    return Err(Error::invalid_argument().message(
                         "databricks.auth.client_id is required when auth type is 'oauth_m2m'",
                     ));
                 }
                 if self.client_secret.is_none() {
-                    return Err(DatabricksErrorHelper::invalid_argument().message(
+                    return Err(Error::invalid_argument().message(
                         "databricks.auth.client_secret is required when auth type is 'oauth_m2m'",
                     ));
                 }

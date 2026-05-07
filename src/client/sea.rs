@@ -14,15 +14,15 @@
 
 //! SEA (Statement Execution API) client implementation.
 //!
-//! This module implements the `DatabricksClient` trait using the Databricks
+//! This module implements the `Transport` trait using the Databricks
 //! SQL Statement Execution API (REST-based).
 
 use crate::client::retry::RequestType;
 use crate::client::{
-    ChunkLinkFetchResult, DatabricksClient, DatabricksClientConfig, DatabricksHttpClient,
-    ExecuteResponse, ExecuteResult, ExecuteResultData, SessionInfo,
+    ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult, ExecuteResultData,
+    SessionInfo, Transport, TransportConfig,
 };
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::metadata::sql::SqlCommandBuilder;
 use crate::reader::ResultReaderFactory;
 use crate::types::cloudfetch::CloudFetchLink;
@@ -31,7 +31,6 @@ use crate::types::sea::{
     GetChunksResponse, StatementExecutionResponse, StatementState,
 };
 use async_trait::async_trait;
-use driverbase::error::ErrorHelper;
 use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -40,22 +39,22 @@ use tracing::debug;
 
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
-/// This client implements the `DatabricksClient` trait using REST endpoints.
+/// This client implements the `Transport` trait using REST endpoints.
 /// The `reader_factory` is set after construction via `set_reader_factory()` because
-/// `ResultReaderFactory` needs `Arc<dyn DatabricksClient>` which requires wrapping
-/// `SeaClient` in `Arc` first.
-pub struct SeaClient {
+/// `ResultReaderFactory` needs `Arc<dyn Transport>` which requires wrapping
+/// `SeaRestTransport` in `Arc` first.
+pub(crate) struct SeaRestTransport {
     http_client: Arc<DatabricksHttpClient>,
     host: String,
     warehouse_id: String,
-    config: DatabricksClientConfig,
+    config: TransportConfig,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
 
-impl std::fmt::Debug for SeaClient {
+impl std::fmt::Debug for SeaRestTransport {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SeaClient")
+        f.debug_struct("SeaRestTransport")
             .field("host", &self.host)
             .field("warehouse_id", &self.warehouse_id)
             .field("config", &self.config)
@@ -71,17 +70,17 @@ impl std::fmt::Debug for SeaClient {
     }
 }
 
-impl SeaClient {
+impl SeaRestTransport {
     /// Create a new SEA client.
     ///
     /// After construction, call `set_reader_factory()` to enable result reader creation.
     /// This two-step initialization is required because `ResultReaderFactory` needs
-    /// `Arc<dyn DatabricksClient>`, which is only available after wrapping in `Arc`.
+    /// `Arc<dyn Transport>`, which is only available after wrapping in `Arc`.
     pub fn new(
         http_client: Arc<DatabricksHttpClient>,
         host: impl Into<String>,
         warehouse_id: impl Into<String>,
-        config: DatabricksClientConfig,
+        config: TransportConfig,
     ) -> Self {
         Self {
             http_client,
@@ -105,8 +104,7 @@ impl SeaClient {
 
     fn reader_factory(&self) -> Result<&ResultReaderFactory> {
         self.reader_factory.get().ok_or_else(|| {
-            DatabricksErrorHelper::invalid_state()
-                .message("SeaClient reader_factory not initialized")
+            Error::invalid_state().message("SeaRestTransport reader_factory not initialized")
         })
     }
 
@@ -145,21 +143,20 @@ impl SeaClient {
             .inner()
             .request(Method::GET, &url)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         let response = self
             .http_client
             .execute(request, RequestType::GetStatementStatus)
             .await?;
-        let body = response.text().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read response: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
 
         let sea_response: StatementExecutionResponse =
             serde_json::from_str(&body).map_err(|e| {
-                DatabricksErrorHelper::io().message(format!(
+                Error::io().message(format!(
                     "Failed to parse status response: {} - body: {}",
                     e, body
                 ))
@@ -187,43 +184,32 @@ impl SeaClient {
                         .and_then(|e| e.message.clone())
                         .unwrap_or_else(|| "Unknown error".to_string());
 
-                    // Create error with message
-                    let mut error = DatabricksErrorHelper::io().message(&error_msg);
+                    // Server-reported execution error → SqlError with the
+                    // structured fields populated from the envelope.
+                    let mut error = Error::sql_error()
+                        .message(&error_msg)
+                        .with_query_id(&current_response.statement_id);
 
-                    // Try to set SQLSTATE from server error in order of preference:
-                    // 1. sql_state field if present
-                    // 2. Extract from error message (server includes "SQLSTATE: XXXXX")
+                    // SQLSTATE: prefer the structured field; fall back to
+                    // parsing the message ("SQLSTATE: XXXXX" pattern).
                     if let Some(err) = service_error {
-                        let mut sqlstate_set = false;
-
-                        // Check if server provides sql_state field
-                        if let Some(ref sql_state) = err.sql_state {
-                            if sql_state.len() == 5 {
-                                if let Some(sqlstate) =
-                                    crate::error::sqlstate_str_to_array(sql_state)
-                                {
-                                    error = error.sqlstate(sqlstate);
-                                    sqlstate_set = true;
-                                }
-                            }
-                        }
-
-                        // If not, try to extract from error message
-                        if !sqlstate_set {
-                            if let Some(sqlstate) =
-                                crate::error::extract_sqlstate_from_message(&error_msg)
-                            {
-                                error = error.sqlstate(sqlstate);
-                            }
+                        let sqlstate = err
+                            .sql_state
+                            .as_ref()
+                            .filter(|s| s.len() == 5)
+                            .cloned()
+                            .or_else(|| {
+                                crate::kernel_error::extract_sqlstate_from_message(&error_msg)
+                            });
+                        if let Some(s) = sqlstate {
+                            error = error.with_sql_state(s);
                         }
                     }
 
                     return Err(error);
                 }
                 StatementState::Canceled => {
-                    return Err(
-                        DatabricksErrorHelper::invalid_state().message("Statement was canceled")
-                    );
+                    return Err(Error::invalid_state().message("Statement was canceled"));
                 }
                 StatementState::Closed => {
                     // Closed with result data is valid for inline results — the server
@@ -233,15 +219,11 @@ impl SeaClient {
                         debug!("Statement closed with inline result data - treating as success");
                         return Ok(current_response);
                     }
-                    return Err(
-                        DatabricksErrorHelper::invalid_state().message("Statement was closed")
-                    );
+                    return Err(Error::invalid_state().message("Statement was closed"));
                 }
                 StatementState::Pending | StatementState::Running => {
                     if start.elapsed() > self.config.poll_timeout {
-                        return Err(
-                            DatabricksErrorHelper::io().message("Statement execution timed out")
-                        );
+                        return Err(Error::io().message("Statement execution timed out"));
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
@@ -294,18 +276,17 @@ impl SeaClient {
             .header("Content-Type", "application/json")
             .json(&request_body)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         let response = self.http_client.execute(request, request_type).await?;
-        let body = response.text().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read response: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
 
         let sea_response: StatementExecutionResponse =
             serde_json::from_str(&body).map_err(|e| {
-                DatabricksErrorHelper::io().message(format!(
+                Error::io().message(format!(
                     "Failed to parse execute response: {} - body: {}",
                     e, body
                 ))
@@ -362,7 +343,7 @@ impl SeaClient {
 }
 
 #[async_trait]
-impl DatabricksClient for SeaClient {
+impl Transport for SeaRestTransport {
     async fn create_session(
         &self,
         catalog: Option<&str>,
@@ -387,20 +368,19 @@ impl DatabricksClient for SeaClient {
             .header("Content-Type", "application/json")
             .json(&request_body)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         let response = self
             .http_client
             .execute(request, RequestType::CreateSession)
             .await?;
-        let body = response.text().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read response: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
 
         let session_response: CreateSessionResponse = serde_json::from_str(&body).map_err(|e| {
-            DatabricksErrorHelper::io().message(format!(
+            Error::io().message(format!(
                 "Failed to parse session response: {} - body: {}",
                 e, body
             ))
@@ -423,9 +403,7 @@ impl DatabricksClient for SeaClient {
             .inner()
             .request(Method::DELETE, &url)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         // Ignore errors on session deletion (best effort cleanup)
         let _ = self
@@ -470,20 +448,19 @@ impl DatabricksClient for SeaClient {
             .inner()
             .request(Method::GET, &url)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         let response = self
             .http_client
             .execute(request, RequestType::GetResultChunks)
             .await?;
-        let body = response.text().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read response: {}", e))
-        })?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
 
         let chunks_response: GetChunksResponse = serde_json::from_str(&body).map_err(|e| {
-            DatabricksErrorHelper::io().message(format!(
+            Error::io().message(format!(
                 "Failed to parse chunks response: {} - body: {}",
                 e, body
             ))
@@ -538,9 +515,7 @@ impl DatabricksClient for SeaClient {
             .inner()
             .request(Method::POST, &url)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         self.http_client
             .execute(request, RequestType::CancelStatement)
@@ -561,9 +536,7 @@ impl DatabricksClient for SeaClient {
             .inner()
             .request(Method::DELETE, &url)
             .build()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
         // Ignore errors on statement close (best effort cleanup)
         let _ = self
@@ -717,18 +690,18 @@ mod tests {
     use crate::client::retry::{build_retry_configs, RetryConfig};
     use crate::client::HttpClientConfig;
 
-    fn create_test_client() -> SeaClient {
+    fn create_test_client() -> SeaRestTransport {
         let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
         let http_client = Arc::new(
             DatabricksHttpClient::new(HttpClientConfig::default(), retry_configs).unwrap(),
         );
         let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
         http_client.set_auth_provider(auth);
-        SeaClient::new(
+        SeaRestTransport::new(
             http_client,
             "https://test.databricks.com",
             "warehouse-123",
-            DatabricksClientConfig::default(),
+            TransportConfig::default(),
         )
     }
 
@@ -746,11 +719,11 @@ mod tests {
         );
         let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
         http_client.set_auth_provider(auth);
-        let client = SeaClient::new(
+        let client = SeaRestTransport::new(
             http_client,
             "https://test.databricks.com/",
             "warehouse-123",
-            DatabricksClientConfig::default(),
+            TransportConfig::default(),
         );
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
     }
@@ -769,7 +742,7 @@ mod tests {
             attachment: None,
         };
 
-        let converted = SeaClient::convert_result_data(&result).unwrap();
+        let converted = SeaRestTransport::convert_result_data(&result).unwrap();
         assert!(converted.external_links.is_none());
         assert!(converted.inline_arrow_data.is_none());
     }
@@ -789,7 +762,7 @@ mod tests {
             attachment: Some(test_data.clone()),
         };
 
-        let converted = SeaClient::convert_result_data(&result).unwrap();
+        let converted = SeaRestTransport::convert_result_data(&result).unwrap();
         assert!(converted.inline_arrow_data.is_some());
         assert_eq!(converted.inline_arrow_data.unwrap(), test_data);
     }

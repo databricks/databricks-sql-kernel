@@ -20,12 +20,11 @@
 
 use crate::client::retry::RequestType;
 use crate::client::DatabricksHttpClient;
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::arrow_parser::parse_arrow_ipc;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
-use driverbase::error::ErrorHelper;
 use reqwest::Method;
 use std::sync::Arc;
 use std::time::Instant;
@@ -86,9 +85,9 @@ impl ChunkDownloader {
             request_builder = request_builder.header(key, value);
         }
 
-        let request = request_builder.build().map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to build download request: {}", e))
-        })?;
+        let request = request_builder
+            .build()
+            .map_err(|e| Error::io().message(format!("Failed to build download request: {}", e)))?;
 
         // Execute without auth (presigned URLs have their own auth)
         let response = self
@@ -97,9 +96,10 @@ impl ChunkDownloader {
             .await?;
 
         // Read response body
-        let bytes = response.bytes().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read download response: {}", e))
-        })?;
+        let bytes = response
+            .bytes()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read download response: {}", e)))?;
 
         let elapsed = start.elapsed();
         let size_mb = bytes.len() as f64 / 1024.0 / 1024.0;

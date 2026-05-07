@@ -14,11 +14,10 @@
 
 //! Shared mock `ResultReader` implementations for tests.
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
-use driverbase::error::ErrorHelper;
 use std::sync::Arc;
 
 /// A simple mock reader that returns predefined batches.
@@ -70,7 +69,7 @@ impl ResultReader for ErrorReader {
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        Err(DatabricksErrorHelper::io().message("simulated read error"))
+        Err(Error::io().message("simulated read error"))
     }
 }
 
@@ -79,7 +78,7 @@ pub struct SchemaErrorReader;
 
 impl ResultReader for SchemaErrorReader {
     fn schema(&self) -> Result<SchemaRef> {
-        Err(DatabricksErrorHelper::io().message("schema unavailable"))
+        Err(Error::io().message("schema unavailable"))
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {

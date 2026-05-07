@@ -14,7 +14,7 @@
 
 //! Result set handling for query results.
 
-use crate::error::Result;
+use crate::kernel_error::Result;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 

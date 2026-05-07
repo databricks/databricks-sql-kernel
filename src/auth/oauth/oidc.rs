@@ -21,8 +21,7 @@
 
 use crate::client::http::DatabricksHttpClient;
 use crate::client::retry::RequestType;
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use serde::Deserialize;
 use std::sync::Arc;
 
@@ -107,8 +106,7 @@ impl OidcEndpoints {
             .get(&discovery_url)
             .build()
             .map_err(|e| {
-                DatabricksErrorHelper::io()
-                    .message(format!("Failed to build OIDC discovery request: {}", e))
+                Error::io().message(format!("Failed to build OIDC discovery request: {}", e))
             })?;
 
         // Execute the request without authentication (discovery endpoint is public)
@@ -120,7 +118,7 @@ impl OidcEndpoints {
         let status = response.status();
         if !status.is_success() {
             let error_body = response.text().await.unwrap_or_default();
-            return Err(DatabricksErrorHelper::io().message(format!(
+            return Err(Error::io().message(format!(
                 "OIDC discovery failed with HTTP {}: {}",
                 status.as_u16(),
                 error_body
@@ -129,7 +127,7 @@ impl OidcEndpoints {
 
         // Parse the JSON response
         let discovery_response: OidcDiscoveryResponse = response.json().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!(
+            Error::io().message(format!(
                 "Failed to parse OIDC discovery response as JSON: {}",
                 e
             ))

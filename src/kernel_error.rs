@@ -19,6 +19,21 @@
 //! wrappers can surface them verbatim without reparsing strings.
 //! `ErrorCode` is the discriminator drivers branch on.
 //!
+//! ## Construction
+//!
+//! Two equivalent forms:
+//!
+//! ```ignore
+//! // Long form — explicit code + message:
+//! Error::new(ErrorCode::InvalidArgument, "bad host URL")
+//!
+//! // Short form — categorised constructor + chainable message:
+//! Error::invalid_argument().message("bad host URL")
+//! ```
+//!
+//! The short form mirrors the driverbase `ErrorHelper` API the legacy
+//! ADBC layer uses, which keeps the swap mechanical and readable.
+//!
 //! ## What's `#[non_exhaustive]` and what isn't
 //!
 //! - `ErrorCode` **is** `#[non_exhaustive]`: v0 ships 13 variants and
@@ -28,20 +43,22 @@
 //!   when the enum grows.
 //! - `Error` **is not** `#[non_exhaustive]`: wrappers want to
 //!   pattern-match (`let Error { code, message, sql_state, .. }`) for
-//!   logging and host-language exception mapping. New fields go through
-//!   `Error::new(...).with_*(...)`, so adding a field is non-breaking
-//!   without the marker. Keeping the marker would block useful
-//!   pattern-matches for no real benefit.
+//!   logging and host-language exception mapping. New fields go
+//!   through `Error::new(...).with_*(...)`, so adding a field is
+//!   non-breaking without the marker. Keeping the marker would block
+//!   useful pattern-matches for no real benefit.
 
 #![allow(dead_code)]
+
+use std::fmt::Write;
 
 /// Discriminator for [`Error`].
 ///
 /// `#[non_exhaustive]`: addendum A8 expands the variant set in a
 /// follow-on PR (AlreadyExists, FailedPrecondition, Aborted,
 /// Unimplemented, plus an `ErrorCategory` tri-state). Wrappers writing
-/// `match` against `ErrorCode` must include a `_ =>` arm so growing the
-/// enum stays non-breaking.
+/// `match` against `ErrorCode` must include a `_ =>` arm so growing
+/// the enum stays non-breaking.
 ///
 /// Each variant doc names the meaning, the typical SQLSTATE / HTTP
 /// mapping (when applicable), and whether the kernel treats it as
@@ -64,7 +81,8 @@ pub enum ErrorCode {
     PermissionDenied,
 
     /// Object not found — catalog, schema, table, or `statement_id`.
-    /// Server returned HTTP 404 or `STATEMENT_NOT_FOUND`. Not retryable.
+    /// Server returned HTTP 404 or `STATEMENT_NOT_FOUND`. Not
+    /// retryable.
     NotFound,
 
     /// Quota or rate limit exceeded. Server returned HTTP 429 (or a
@@ -96,10 +114,10 @@ pub enum ErrorCode {
     Internal,
 
     /// Statement handle is invalid — usually because the parent
-    /// `Statement` was re-executed (the validity flag flipped) or the
-    /// handle was already closed. Distinct from `NotFound` because the
-    /// handle once existed; the *server* still has its record. Local
-    /// short-circuit; no wire call. Not retryable.
+    /// `Statement` was re-executed (the validity flag flipped) or
+    /// the handle was already closed. Distinct from `NotFound`
+    /// because the handle once existed; the *server* still has its
+    /// record. Local short-circuit; no wire call. Not retryable.
     InvalidStatementHandle,
 
     /// Transport-layer failure — DNS resolution, TCP handshake, TLS
@@ -110,8 +128,8 @@ pub enum ErrorCode {
     /// Server-reported SQL execution error. `sql_state` and
     /// `vendor_code` carry the structured detail per Databricks
     /// SQLSTATE conventions. Retryability depends on the SQLSTATE
-    /// class — `40xxx` (transient) vs `42xxx` (syntactic / semantic);
-    /// the addendum-A8 `ErrorCategory` will encode this.
+    /// class — `40xxx` (transient) vs `42xxx` (syntactic /
+    /// semantic); the addendum-A8 `ErrorCategory` will encode this.
     SqlError,
 }
 
@@ -121,15 +139,15 @@ pub enum ErrorCode {
 /// may wrap a `NetworkError` if the failure originated below the SEA
 /// layer.
 ///
-/// **Construction.** Build via [`Error::new`] and chain `with_*`
-/// setters. **Pattern-matching is supported** — wrappers writing a
-/// comprehensive logger or host-language exception adapter can do
-/// `let Error { code, message, sql_state, .. } = err;`. New fields
-/// land through additive setters on `Error::new`, not via struct
-/// literals from external crates, so the type does not need
-/// `#[non_exhaustive]` (and the marker would block the
+/// **Construction.** Build via [`Error::new`] (or one of the
+/// categorised constructors like [`Error::invalid_argument`]) and
+/// chain `with_*` setters. **Pattern-matching is supported** —
+/// wrappers writing a comprehensive logger or host-language exception
+/// adapter can do `let Error { code, message, sql_state, .. } = err;`.
+/// New fields land through additive setters, so the type does not
+/// need `#[non_exhaustive]` (and the marker would block the
 /// pattern-matching wrappers actually want).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Error {
     pub code: ErrorCode,
     pub message: String,
@@ -150,11 +168,18 @@ pub struct Error {
     /// Server-issued statement / query identifier, when known.
     pub query_id: Option<String>,
 
+    /// Source-code location, attached for `Internal` errors so kernel
+    /// bugs surface where they happened. Free-form `file:line` string;
+    /// not parsed.
+    pub location: Option<String>,
+
     /// Underlying cause. Boxed to keep the struct stack-friendly.
     pub cause: Option<Box<Error>>,
 }
 
 impl Error {
+    // ─── Core constructors ──────────────────────────────────────────
+
     /// Construct a fresh error with the given code and message. All
     /// other fields default to `None` / `false`.
     pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
@@ -166,8 +191,169 @@ impl Error {
             http_status: None,
             retryable: false,
             query_id: None,
+            location: None,
             cause: None,
         }
+    }
+
+    /// Construct a fresh error with the given code and an empty
+    /// message. Used by the categorised constructors below; callers
+    /// chain [`Error::message`] to populate.
+    fn empty(code: ErrorCode) -> Self {
+        Self::new(code, "")
+    }
+
+    // ─── Categorised constructors (driverbase parity) ───────────────
+    //
+    // These mirror `driverbase::error::ErrorHelper::*` so the swap
+    // from `DatabricksErrorHelper::xxx()` to `Error::xxx()` is a
+    // mechanical text replacement at every call site.
+
+    /// `ErrorCode::InvalidArgument`. Caller passed a malformed
+    /// argument.
+    pub fn invalid_argument() -> Self {
+        Self::empty(ErrorCode::InvalidArgument)
+    }
+
+    /// `ErrorCode::InvalidArgument`. The kernel's analogue of ADBC's
+    /// `InvalidState` — the object isn't in a state where this call
+    /// is valid (e.g. statement not prepared). v0 collapses
+    /// "invalid args" and "invalid state" into one code; the
+    /// distinction adds an A8 variant later if drivers need it.
+    pub fn invalid_state() -> Self {
+        Self::empty(ErrorCode::InvalidArgument)
+    }
+
+    /// `ErrorCode::Unauthenticated`.
+    pub fn unauthenticated() -> Self {
+        Self::empty(ErrorCode::Unauthenticated)
+    }
+
+    /// `ErrorCode::PermissionDenied`.
+    pub fn permission_denied() -> Self {
+        Self::empty(ErrorCode::PermissionDenied)
+    }
+
+    /// `ErrorCode::NotFound`.
+    pub fn not_found() -> Self {
+        Self::empty(ErrorCode::NotFound)
+    }
+
+    /// `ErrorCode::ResourceExhausted`. Default `retryable=true`
+    /// per the plan's status-mapping table.
+    pub fn resource_exhausted() -> Self {
+        Self::empty(ErrorCode::ResourceExhausted).with_retryable(true)
+    }
+
+    /// `ErrorCode::Unavailable`. Default `retryable=true`.
+    pub fn unavailable() -> Self {
+        Self::empty(ErrorCode::Unavailable).with_retryable(true)
+    }
+
+    /// `ErrorCode::Timeout`. Default `retryable=true`.
+    pub fn timeout() -> Self {
+        Self::empty(ErrorCode::Timeout).with_retryable(true)
+    }
+
+    /// `ErrorCode::Cancelled`.
+    pub fn cancelled() -> Self {
+        Self::empty(ErrorCode::Cancelled)
+    }
+
+    /// `ErrorCode::DataLoss`.
+    pub fn data_loss() -> Self {
+        Self::empty(ErrorCode::DataLoss)
+    }
+
+    /// `ErrorCode::Internal`. The kernel hit an unexpected state —
+    /// kernel bug, unreachable branch, dropped invariant. Caller
+    /// should attach a `location()` to surface where.
+    pub fn internal() -> Self {
+        Self::empty(ErrorCode::Internal)
+    }
+
+    /// `ErrorCode::Internal` with a source-code `location` already
+    /// attached. Mirror of `driverbase`'s `internal(location)`.
+    pub fn internal_at(location: impl AsRef<str>) -> Self {
+        Self::internal().location(location)
+    }
+
+    /// `ErrorCode::InvalidStatementHandle`.
+    pub fn invalid_statement_handle() -> Self {
+        Self::empty(ErrorCode::InvalidStatementHandle)
+    }
+
+    /// `ErrorCode::NetworkError`. Default `retryable=true`.
+    pub fn network_error() -> Self {
+        Self::empty(ErrorCode::NetworkError).with_retryable(true)
+    }
+
+    /// `ErrorCode::SqlError`. Server-reported execution error;
+    /// caller fills `sql_state` / `vendor_code` from the response
+    /// envelope.
+    pub fn sql_error() -> Self {
+        Self::empty(ErrorCode::SqlError)
+    }
+
+    /// I/O error — maps to `Internal` because Databricks-side I/O
+    /// failures are kernel internals (chunk download decoding,
+    /// Arrow IPC parse). Network-layer I/O uses
+    /// [`Error::network_error`] instead.
+    pub fn io() -> Self {
+        Self::empty(ErrorCode::Internal)
+    }
+
+    /// "Not implemented" — there is no `ErrorCode::NotImplemented`
+    /// in the v0 surface (addendum A8 may add one). For now this
+    /// maps to `InvalidArgument` with a clear message; callers
+    /// chain `.message("foo not yet implemented")`.
+    pub fn not_implemented() -> Self {
+        Self::empty(ErrorCode::InvalidArgument)
+    }
+
+    // ─── Builder API (driverbase parity) ────────────────────────────
+
+    /// Append to the error message. Driverbase joins clauses with
+    /// `; `; we do the same.
+    pub fn message(mut self, msg: impl AsRef<str>) -> Self {
+        if !self.message.is_empty() {
+            self.message.push_str("; ");
+        }
+        self.message.push_str(msg.as_ref());
+        self
+    }
+
+    /// Wrap the error with a context phrase. Driverbase formats
+    /// these as `could not <CONTEXT>: <ERROR>` at display time; we
+    /// inline that into the message at call time so the typed
+    /// `Error` doesn't need a separate field.
+    pub fn context(mut self, ctx: impl AsRef<str>) -> Self {
+        let ctx = ctx.as_ref();
+        if self.message.is_empty() {
+            self.message = format!("could not {ctx}");
+        } else {
+            self.message = format!("could not {ctx}: {}", self.message);
+        }
+        self
+    }
+
+    /// Append a `format_args!` clause to the message. Mirrors
+    /// driverbase's `format(...)` so call sites that use the macro
+    /// form swap one-for-one.
+    pub fn format(mut self, args: std::fmt::Arguments) -> Self {
+        if !self.message.is_empty() {
+            self.message.push_str("; ");
+        }
+        write!(&mut self.message, "{args}").expect("format into String");
+        self
+    }
+
+    /// Attach a source-code location. Most callers pass
+    /// `concat!(file!(), ":", line!())` or similar; the kernel
+    /// doesn't impose a format.
+    pub fn location(mut self, loc: impl AsRef<str>) -> Self {
+        self.location = Some(loc.as_ref().to_owned());
+        self
     }
 
     pub fn with_sql_state(mut self, sql_state: impl Into<String>) -> Self {
@@ -199,16 +385,121 @@ impl Error {
         self.cause = Some(Box::new(cause));
         self
     }
+
+    // ─── Option-helper constructors (ADBC config parsing) ────────────
+    //
+    // The legacy ADBC config layer in `src/adbc/database.rs` uses
+    // `set_unknown_option` / `set_invalid_option` / `option_as_int` /
+    // `option_as_string` heavily. The kernel-internal modules (auth,
+    // client, etc.) use them when validating their *own* string-keyed
+    // option maps before the v0 typed config takes over in PR 2.
+
+    /// Error for when a user requests an unknown option.
+    pub fn get_unknown_option<K: std::fmt::Debug>(key: &K) -> Self {
+        Self::not_found().format(format_args!("unknown option {key:?}"))
+    }
+
+    /// Error for when a user sets an unknown option.
+    pub fn set_unknown_option<K: std::fmt::Debug>(key: &K) -> Self {
+        Self::invalid_argument().format(format_args!("unknown option {key:?}"))
+    }
+
+    /// Error for when a user sets an option to an invalid value.
+    pub fn set_invalid_option<K: std::fmt::Debug>(
+        key: &K,
+        value: &adbc_core::options::OptionValue,
+    ) -> Self {
+        Self::invalid_argument().context(format!("invalid option {key:?}={value:?}"))
+    }
+
+    /// Unwrap an option value as an integer.
+    pub fn option_as_int<K: std::fmt::Debug>(
+        key: &K,
+        value: &adbc_core::options::OptionValue,
+    ) -> Result<i64> {
+        match value {
+            adbc_core::options::OptionValue::String(s) => s
+                .parse::<i64>()
+                .map_err(|_| Self::set_invalid_option(key, value).message("must be an integer")),
+            adbc_core::options::OptionValue::Int(v) => Ok(*v),
+            v => Err(Self::set_invalid_option(key, v).message("must be an integer")),
+        }
+    }
+
+    /// Unwrap an option value as a string.
+    pub fn option_as_string<'v, K: std::fmt::Debug>(
+        key: &K,
+        value: &'v adbc_core::options::OptionValue,
+    ) -> Result<&'v str> {
+        match value {
+            adbc_core::options::OptionValue::String(s) => Ok(s.as_ref()),
+            v => Err(Self::set_invalid_option(key, v).message("must be a string")),
+        }
+    }
+
+    // ─── HTTP / wire mapping ────────────────────────────────────────
+
+    /// Map an HTTP status code to the categorised constructor per
+    /// the migration plan's mapping table. Returns an error with no
+    /// message; caller chains `.message(...)` and `.with_http_status(s)`.
+    ///
+    /// Status codes outside the table fall back to `Internal` for
+    /// 5xx (server-side bug or unexpected envelope) and
+    /// `InvalidArgument` for 4xx (client-side bug).
+    pub fn from_http_status(status: u16) -> Self {
+        let err = match status {
+            401 => Self::unauthenticated(),
+            403 => Self::permission_denied(),
+            404 => Self::not_found(),
+            429 => Self::resource_exhausted(),
+            503 => Self::unavailable(),
+            504 => Self::timeout(),
+            400..=499 => Self::invalid_argument(),
+            500..=599 => Self::internal(),
+            _ => Self::internal(),
+        };
+        err.with_http_status(status)
+    }
+
+    // ─── ADBC interop (legacy shim) ─────────────────────────────────
+
+    /// Convert this typed kernel error into the ADBC trait surface's
+    /// `adbc_core::error::Error`. Used by `src/adbc/*` to feed the
+    /// ADBC `Result<T>` back to consumers.
+    ///
+    /// Removed in PR 7 alongside `src/adbc/`.
+    pub fn to_adbc(self) -> adbc_core::error::Error {
+        let status = error_code_to_adbc_status(self.code);
+        let message = format_message_for_adbc(&self);
+        let sqlstate = sqlstate_str_to_array(self.sql_state.as_deref()).unwrap_or([0; 5]);
+        adbc_core::error::Error {
+            message,
+            status,
+            vendor_code: self.vendor_code.unwrap_or(0),
+            sqlstate,
+            details: None,
+        }
+    }
 }
+
+// ─── std trait impls ────────────────────────────────────────────────
 
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}: {}", self.code, self.message)?;
+        write!(f, "{:?}: ", self.code)?;
+        if self.message.is_empty() {
+            f.write_str("(no message)")?;
+        } else {
+            f.write_str(&self.message)?;
+        }
         if let Some(s) = &self.sql_state {
             write!(f, " [SQLSTATE {s}]")?;
         }
         if let Some(c) = self.vendor_code {
             write!(f, " [vendor {c}]")?;
+        }
+        if let Some(loc) = &self.location {
+            write!(f, " (at {loc})")?;
         }
         Ok(())
     }
@@ -222,5 +513,345 @@ impl std::error::Error for Error {
     }
 }
 
+impl From<Error> for adbc_core::error::Error {
+    fn from(value: Error) -> Self {
+        value.to_adbc()
+    }
+}
+
+impl From<arrow_schema::ArrowError> for Error {
+    fn from(err: arrow_schema::ArrowError) -> Self {
+        // Mirrors driverbase's `from_arrow` mapping. Arrow errors are
+        // mostly internal (parse / cast / IPC), with a few that map
+        // to data-quality (`DataLoss`) or invalid-argument categories.
+        match err {
+            arrow_schema::ArrowError::NotYetImplemented(msg) => {
+                Self::not_implemented().format(format_args!("{msg}"))
+            }
+            arrow_schema::ArrowError::ExternalError(error) => {
+                Self::internal().format(format_args!("{error}"))
+            }
+            arrow_schema::ArrowError::CastError(msg) => {
+                Self::internal().format(format_args!("cast error: {msg}"))
+            }
+            arrow_schema::ArrowError::MemoryError(msg) => {
+                Self::internal().format(format_args!("memory error: {msg}"))
+            }
+            arrow_schema::ArrowError::ParseError(msg) => {
+                Self::internal().format(format_args!("parse error: {msg}"))
+            }
+            arrow_schema::ArrowError::SchemaError(msg) => {
+                Self::internal().format(format_args!("schema error: {msg}"))
+            }
+            arrow_schema::ArrowError::ComputeError(msg) => {
+                Self::internal().format(format_args!("compute error: {msg}"))
+            }
+            arrow_schema::ArrowError::DivideByZero => {
+                Self::data_loss().format(format_args!("divide by zero"))
+            }
+            arrow_schema::ArrowError::ArithmeticOverflow(msg) => {
+                Self::data_loss().format(format_args!("arithmetic overflow: {msg}"))
+            }
+            arrow_schema::ArrowError::CsvError(msg) => {
+                Self::invalid_argument().format(format_args!("CSV error: {msg}"))
+            }
+            arrow_schema::ArrowError::JsonError(msg) => {
+                Self::invalid_argument().format(format_args!("JSON error: {msg}"))
+            }
+            arrow_schema::ArrowError::IoError(msg, error) => {
+                Self::io().format(format_args!("I/O error: {msg}: {error}"))
+            }
+            arrow_schema::ArrowError::IpcError(msg) => {
+                Self::io().format(format_args!("IPC error: {msg}"))
+            }
+            arrow_schema::ArrowError::InvalidArgumentError(msg) => {
+                Self::invalid_argument().message(msg)
+            }
+            arrow_schema::ArrowError::ParquetError(msg) => {
+                Self::io().format(format_args!("Parquet error: {msg}"))
+            }
+            arrow_schema::ArrowError::CDataInterface(msg) => {
+                Self::io().format(format_args!("C Data interface error: {msg}"))
+            }
+            arrow_schema::ArrowError::DictionaryKeyOverflowError => {
+                Self::data_loss().message("dictionary key overflowed")
+            }
+            arrow_schema::ArrowError::RunEndIndexOverflowError => {
+                Self::data_loss().message("run end index overflowed")
+            }
+            arrow_schema::ArrowError::OffsetOverflowError(size) => {
+                Self::data_loss().format(format_args!("offset overflowed at size {size}"))
+            }
+            other => Self::internal().format(format_args!("{other}")),
+        }
+    }
+}
+
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ─── ADBC interop helpers ───────────────────────────────────────────
+
+fn error_code_to_adbc_status(code: ErrorCode) -> adbc_core::error::Status {
+    use adbc_core::error::Status;
+    match code {
+        ErrorCode::InvalidArgument => Status::InvalidArguments,
+        ErrorCode::Unauthenticated => Status::Unauthenticated,
+        ErrorCode::PermissionDenied => Status::Unauthorized,
+        ErrorCode::NotFound => Status::NotFound,
+        ErrorCode::ResourceExhausted => Status::IO,
+        ErrorCode::Unavailable => Status::IO,
+        ErrorCode::Timeout => Status::Timeout,
+        ErrorCode::Cancelled => Status::Cancelled,
+        ErrorCode::DataLoss => Status::InvalidData,
+        ErrorCode::Internal => Status::Internal,
+        ErrorCode::InvalidStatementHandle => Status::InvalidState,
+        ErrorCode::NetworkError => Status::IO,
+        ErrorCode::SqlError => Status::Internal,
+    }
+}
+
+fn format_message_for_adbc(err: &Error) -> String {
+    let mut out = format!(
+        "[Databricks] {}",
+        if err.message.is_empty() {
+            "(no message)"
+        } else {
+            err.message.as_str()
+        }
+    );
+    if let Some(loc) = &err.location {
+        write!(&mut out, " (at {loc})").ok();
+    }
+    if let Some(cause) = &err.cause {
+        write!(
+            &mut out,
+            ". While handling error: {}",
+            if cause.message.is_empty() {
+                "(no message)"
+            } else {
+                cause.message.as_str()
+            }
+        )
+        .ok();
+    }
+    out
+}
+
+// ─── SQLSTATE extraction helpers ────────────────────────────────────
+
+/// Extract a SQLSTATE from a free-form error message.
+///
+/// Many Databricks error envelopes include `SQLSTATE: XXXXX` in the
+/// human-readable text in addition to (or instead of) a structured
+/// field. This is the fallback when the structured field is absent.
+pub fn extract_sqlstate_from_message(message: &str) -> Option<String> {
+    let pat = "SQLSTATE:";
+    let idx = message.find(pat)?;
+    let after = message[idx + pat.len()..].trim_start();
+    if after.len() < 5 {
+        return None;
+    }
+    let candidate = &after[..5];
+    if candidate.chars().all(|c| c.is_ascii_alphanumeric()) {
+        Some(candidate.to_owned())
+    } else {
+        None
+    }
+}
+
+/// Convert a 5-character SQLSTATE string into the `[c_char; 5]`
+/// representation `adbc_core::error::Error::sqlstate` expects.
+fn sqlstate_str_to_array(sqlstate: Option<&str>) -> Option<[std::os::raw::c_char; 5]> {
+    let s = sqlstate?;
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    Some([
+        bytes[0] as std::os::raw::c_char,
+        bytes[1] as std::os::raw::c_char,
+        bytes[2] as std::os::raw::c_char,
+        bytes[3] as std::os::raw::c_char,
+        bytes[4] as std::os::raw::c_char,
+    ])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_carries_code_and_message() {
+        let e = Error::new(ErrorCode::NotFound, "missing");
+        assert_eq!(e.code, ErrorCode::NotFound);
+        assert_eq!(e.message, "missing");
+        assert!(e.sql_state.is_none());
+        assert!(!e.retryable);
+    }
+
+    #[test]
+    fn categorised_constructors_pick_correct_codes() {
+        assert_eq!(Error::invalid_argument().code, ErrorCode::InvalidArgument);
+        assert_eq!(Error::unauthenticated().code, ErrorCode::Unauthenticated);
+        assert_eq!(Error::permission_denied().code, ErrorCode::PermissionDenied);
+        assert_eq!(Error::not_found().code, ErrorCode::NotFound);
+        assert_eq!(
+            Error::resource_exhausted().code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(Error::unavailable().code, ErrorCode::Unavailable);
+        assert_eq!(Error::timeout().code, ErrorCode::Timeout);
+        assert_eq!(Error::cancelled().code, ErrorCode::Cancelled);
+        assert_eq!(Error::data_loss().code, ErrorCode::DataLoss);
+        assert_eq!(Error::internal().code, ErrorCode::Internal);
+        assert_eq!(
+            Error::invalid_statement_handle().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        assert_eq!(Error::network_error().code, ErrorCode::NetworkError);
+        assert_eq!(Error::sql_error().code, ErrorCode::SqlError);
+    }
+
+    #[test]
+    fn retryable_defaults_match_plan_table() {
+        assert!(Error::resource_exhausted().retryable);
+        assert!(Error::unavailable().retryable);
+        assert!(Error::timeout().retryable);
+        assert!(Error::network_error().retryable);
+        assert!(!Error::invalid_argument().retryable);
+        assert!(!Error::not_found().retryable);
+    }
+
+    #[test]
+    fn message_appends_with_separator() {
+        let e = Error::invalid_argument()
+            .message("bad host")
+            .message("must be https://");
+        assert_eq!(e.message, "bad host; must be https://");
+    }
+
+    #[test]
+    fn message_on_empty_does_not_prepend_separator() {
+        let e = Error::invalid_argument().message("first");
+        assert_eq!(e.message, "first");
+    }
+
+    #[test]
+    fn context_wraps_existing_message() {
+        let e = Error::io()
+            .message("connection refused")
+            .context("connect to server");
+        assert_eq!(e.message, "could not connect to server: connection refused");
+    }
+
+    #[test]
+    fn context_on_empty_just_says_could_not() {
+        let e = Error::io().context("connect");
+        assert_eq!(e.message, "could not connect");
+    }
+
+    #[test]
+    fn format_appends_via_format_args() {
+        let e = Error::invalid_argument().format(format_args!("count={}", 42));
+        assert_eq!(e.message, "count=42");
+    }
+
+    #[test]
+    fn from_http_status_picks_correct_codes() {
+        assert_eq!(
+            Error::from_http_status(401).code,
+            ErrorCode::Unauthenticated
+        );
+        assert_eq!(
+            Error::from_http_status(403).code,
+            ErrorCode::PermissionDenied
+        );
+        assert_eq!(Error::from_http_status(404).code, ErrorCode::NotFound);
+        assert_eq!(
+            Error::from_http_status(429).code,
+            ErrorCode::ResourceExhausted
+        );
+        assert_eq!(Error::from_http_status(503).code, ErrorCode::Unavailable);
+        assert_eq!(Error::from_http_status(504).code, ErrorCode::Timeout);
+        assert_eq!(
+            Error::from_http_status(400).code,
+            ErrorCode::InvalidArgument
+        );
+        assert_eq!(Error::from_http_status(500).code, ErrorCode::Internal);
+    }
+
+    #[test]
+    fn from_http_status_attaches_status_field() {
+        let e = Error::from_http_status(429);
+        assert_eq!(e.http_status, Some(429));
+        assert!(e.retryable);
+    }
+
+    #[test]
+    fn extract_sqlstate_with_space() {
+        let msg = "Error. SQLSTATE: 42601 (line 1)";
+        assert_eq!(extract_sqlstate_from_message(msg), Some("42601".to_owned()));
+    }
+
+    #[test]
+    fn extract_sqlstate_without_space() {
+        let msg = "boom. SQLSTATE:42S02 more";
+        assert_eq!(extract_sqlstate_from_message(msg), Some("42S02".to_owned()));
+    }
+
+    #[test]
+    fn extract_sqlstate_absent_returns_none() {
+        assert_eq!(extract_sqlstate_from_message("nope"), None);
+    }
+
+    #[test]
+    fn display_includes_code_message_and_sqlstate() {
+        let e = Error::sql_error()
+            .message("syntax error near `FROM`")
+            .with_sql_state("42601")
+            .with_vendor_code(1234);
+        let s = format!("{e}");
+        assert!(s.contains("SqlError"));
+        assert!(s.contains("syntax error"));
+        assert!(s.contains("[SQLSTATE 42601]"));
+        assert!(s.contains("[vendor 1234]"));
+    }
+
+    #[test]
+    fn to_adbc_maps_status_correctly() {
+        use adbc_core::error::Status;
+        let e = Error::invalid_argument().message("bad option");
+        let adbc = e.to_adbc();
+        assert_eq!(adbc.status, Status::InvalidArguments);
+        assert!(adbc.message.contains("Databricks"));
+        assert!(adbc.message.contains("bad option"));
+    }
+
+    #[test]
+    fn to_adbc_carries_sqlstate_and_vendor_code() {
+        let e = Error::sql_error()
+            .message("syntax")
+            .with_sql_state("42601")
+            .with_vendor_code(7);
+        let adbc = e.to_adbc();
+        assert_eq!(adbc.vendor_code, 7);
+        assert_eq!(
+            std::str::from_utf8(unsafe {
+                std::slice::from_raw_parts(adbc.sqlstate.as_ptr() as *const u8, 5)
+            })
+            .unwrap(),
+            "42601"
+        );
+    }
+
+    #[test]
+    fn arrow_error_conversion_categorises() {
+        let e: Error = arrow_schema::ArrowError::SchemaError("missing".into()).into();
+        assert_eq!(e.code, ErrorCode::Internal);
+        assert!(e.message.contains("missing"));
+
+        let e: Error = arrow_schema::ArrowError::InvalidArgumentError("bad".into()).into();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+}

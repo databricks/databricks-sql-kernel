@@ -20,7 +20,7 @@
 //! - Memory management via chunk limits
 //! - Consumer API via RecordBatchReader trait
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
 use crate::types::cloudfetch::{
@@ -30,7 +30,6 @@ use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use dashmap::DashMap;
-use driverbase::error::ErrorHelper;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -93,9 +92,8 @@ fn flush_pending(schema: &SchemaRef, pending: &mut Vec<RecordBatch>) -> Result<R
     if pending.len() == 1 {
         return Ok(pending.drain(..).next().unwrap());
     }
-    let merged = concat_batches(schema, &*pending).map_err(|e| {
-        DatabricksErrorHelper::invalid_state().message(format!("Failed to merge batches: {}", e))
-    })?;
+    let merged = concat_batches(schema, &*pending)
+        .map_err(|e| Error::invalid_state().message(format!("Failed to merge batches: {}", e)))?;
     pending.clear();
     Ok(merged)
 }
@@ -162,7 +160,7 @@ impl StreamingCloudFetchProvider {
     ///   that already has initial links cached and handles prefetching)
     /// * `chunk_downloader` - For downloading chunks from cloud storage
     /// * `runtime_handle` - Tokio runtime handle for spawning background tasks
-    pub fn new(
+    pub(crate) fn new(
         config: CloudFetchConfig,
         link_fetcher: Arc<dyn ChunkLinkFetcher>,
         chunk_downloader: Arc<ChunkDownloader>,
@@ -245,7 +243,7 @@ impl StreamingCloudFetchProvider {
     pub async fn next_batch(&self) -> Result<Option<RecordBatch>> {
         // Check for cancellation
         if self.cancel_token.is_cancelled() {
-            return Err(DatabricksErrorHelper::invalid_state().message("Operation cancelled"));
+            return Err(Error::invalid_state().message("Operation cancelled"));
         }
 
         // Drain batch buffer first
@@ -302,8 +300,7 @@ impl StreamingCloudFetchProvider {
             return Ok(None);
         }
 
-        Err(DatabricksErrorHelper::invalid_state()
-            .message(format!("Chunk {} not found after wait", chunk_index)))
+        Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
     }
 
     /// Cancel all pending operations.
@@ -495,7 +492,7 @@ impl StreamingCloudFetchProvider {
 
         loop {
             if cancel_token.is_cancelled() {
-                return Err(DatabricksErrorHelper::invalid_state().message("Download cancelled"));
+                return Err(Error::invalid_state().message("Download cancelled"));
             }
 
             // Get link (may need to refetch if expired)
@@ -549,30 +546,25 @@ impl StreamingCloudFetchProvider {
         loop {
             // Check cancellation
             if self.cancel_token.is_cancelled() {
-                return Err(DatabricksErrorHelper::invalid_state().message("Operation cancelled"));
+                return Err(Error::invalid_state().message("Operation cancelled"));
             }
 
             // Check if chunk is ready
             if let Some(entry) = self.chunks.get(&chunk_index) {
                 match &entry.state {
                     ChunkState::Downloaded => return Ok(()),
-                    ChunkState::DownloadFailed(e) => {
-                        return Err(DatabricksErrorHelper::io().message(e.clone()))
-                    }
-                    ChunkState::ProcessingFailed(e) => {
-                        return Err(DatabricksErrorHelper::io().message(e.clone()))
-                    }
+                    ChunkState::DownloadFailed(e) => return Err(Error::io().message(e.clone())),
+                    ChunkState::ProcessingFailed(e) => return Err(Error::io().message(e.clone())),
                     ChunkState::Cancelled => {
-                        return Err(
-                            DatabricksErrorHelper::invalid_state().message("Operation cancelled")
-                        )
+                        return Err(Error::invalid_state().message("Operation cancelled"))
                     }
                     _ => {} // Keep waiting
                 }
             } else if self.end_of_stream.load(Ordering::Acquire) {
                 // Chunk doesn't exist and we're at end of stream
-                return Err(DatabricksErrorHelper::invalid_state()
-                    .message(format!("Chunk {} not available", chunk_index)));
+                return Err(
+                    Error::invalid_state().message(format!("Chunk {} not available", chunk_index))
+                );
             }
 
             // Wait for any chunk state change with timeout
@@ -585,7 +577,7 @@ impl StreamingCloudFetchProvider {
 
             tokio::select! {
                 _ = self.cancel_token.cancelled() => {
-                    return Err(DatabricksErrorHelper::invalid_state().message("Operation cancelled"));
+                    return Err(Error::invalid_state().message("Operation cancelled"));
                 }
                 _ = self.chunk_state_changed.notified() => {
                     // State changed, loop to check
@@ -624,7 +616,7 @@ impl StreamingCloudFetchProvider {
             }
         }
 
-        Err(DatabricksErrorHelper::invalid_state().message("Unable to determine schema"))
+        Err(Error::invalid_state().message("Unable to determine schema"))
     }
 }
 
@@ -699,7 +691,7 @@ mod tests {
                 .get(&chunk_index)
                 .cloned()
                 .ok_or_else(|| {
-                    DatabricksErrorHelper::invalid_state()
+                    Error::invalid_state()
                         .message(format!("Link not found for chunk {}", chunk_index))
                 })
         }

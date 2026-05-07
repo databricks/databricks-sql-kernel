@@ -20,14 +20,13 @@
 //! - Databricks type name to/from Arrow DataType mapping
 //! - `DESCRIBE QUERY` result parsing for `execute_schema()`
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::metadata::type_mapping::{arrow_type_to_databricks, databricks_type_to_arrow};
 use crate::types::sea::StatementParameter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
 use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, TimeUnit};
-use driverbase::error::ErrorHelper;
 
 // ---------------------------------------------------------------------------
 // SQL parameter marker parsing
@@ -170,7 +169,7 @@ pub fn replace_parameter_markers_with_literals(sql: &str) -> String {
 /// Null values are sent with `value: None` (JSON null).
 pub fn record_batch_to_sea_parameters(batch: &RecordBatch) -> Result<Vec<StatementParameter>> {
     if batch.num_rows() != 1 {
-        return Err(DatabricksErrorHelper::invalid_argument().message(format!(
+        return Err(Error::invalid_argument().message(format!(
             "bind() expects a single-row RecordBatch, got {} rows",
             batch.num_rows()
         )));
@@ -262,7 +261,7 @@ fn arrow_value_to_string(array: &dyn Array, index: usize) -> Result<String> {
         }
         _ => {
             // Fallback: use Debug representation
-            Err(DatabricksErrorHelper::invalid_argument().message(format!(
+            Err(Error::invalid_argument().message(format!(
                 "Unsupported Arrow type for parameter binding: {:?}",
                 array.data_type()
             )))
@@ -294,17 +293,17 @@ fn format_decimal128(raw: i128, scale: i8) -> String {
 /// Each row becomes a field in the output schema.
 pub fn describe_result_to_schema(
     reader: impl arrow_array::RecordBatchReader,
-) -> crate::error::Result<Schema> {
+) -> crate::kernel_error::Result<Schema> {
     let mut fields = Vec::new();
 
     for batch_result in reader {
         let batch = batch_result.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Error reading DESCRIBE QUERY result: {e}"))
+            Error::io().message(format!("Error reading DESCRIBE QUERY result: {e}"))
         })?;
 
         // DESCRIBE QUERY returns at least 2 columns: col_name, data_type
         if batch.num_columns() < 2 {
-            return Err(DatabricksErrorHelper::io().message(format!(
+            return Err(Error::io().message(format!(
                 "DESCRIBE QUERY returned {} columns, expected at least 2",
                 batch.num_columns()
             )));
@@ -315,8 +314,7 @@ pub fn describe_result_to_schema(
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .ok_or_else(|| {
-                DatabricksErrorHelper::io()
-                    .message("DESCRIBE QUERY col_name column is not a StringArray")
+                Error::io().message("DESCRIBE QUERY col_name column is not a StringArray")
             })?;
 
         let types = batch
@@ -324,8 +322,7 @@ pub fn describe_result_to_schema(
             .as_any()
             .downcast_ref::<arrow_array::StringArray>()
             .ok_or_else(|| {
-                DatabricksErrorHelper::io()
-                    .message("DESCRIBE QUERY data_type column is not a StringArray")
+                Error::io().message("DESCRIBE QUERY data_type column is not a StringArray")
             })?;
 
         for row in 0..batch.num_rows() {

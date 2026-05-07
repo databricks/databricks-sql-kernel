@@ -24,8 +24,8 @@ pub mod inline;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-use crate::client::{DatabricksClient, DatabricksHttpClient, ExecuteResponse};
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::client::{DatabricksHttpClient, ExecuteResponse, Transport};
+use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::{SeaChunkLinkFetcher, SeaChunkLinkFetcherHandle};
 use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
@@ -34,7 +34,6 @@ use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
-use driverbase::error::ErrorHelper;
 use std::sync::Arc;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
@@ -42,11 +41,11 @@ pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
 /// Factory that creates the appropriate reader based on the response type.
 ///
 /// Encapsulates the decision of CloudFetch vs inline vs other result formats.
-/// Uses `DatabricksClient` trait for backend flexibility - works with SeaClient
+/// Uses `Transport` trait for backend flexibility - works with SeaRestTransport
 /// or any future backend implementation.
 #[derive(Debug)]
-pub struct ResultReaderFactory {
-    client: Arc<dyn DatabricksClient>,
+pub(crate) struct ResultReaderFactory {
+    client: Arc<dyn Transport>,
     http_client: Arc<DatabricksHttpClient>,
     config: CloudFetchConfig,
     runtime_handle: tokio::runtime::Handle,
@@ -54,8 +53,8 @@ pub struct ResultReaderFactory {
 
 impl ResultReaderFactory {
     /// Create a new result reader factory.
-    pub fn new(
-        client: Arc<dyn DatabricksClient>,
+    pub(crate) fn new(
+        client: Arc<dyn Transport>,
         http_client: Arc<DatabricksHttpClient>,
         config: CloudFetchConfig,
         runtime_handle: tokio::runtime::Handle,
@@ -140,7 +139,7 @@ impl ResultReaderFactory {
 
             // Internal links without external = CloudFetch not available
             if result.next_chunk_internal_link.is_some() {
-                return Err(DatabricksErrorHelper::not_implemented()
+                return Err(Error::not_implemented()
                     .message("CloudFetch not available. Internal links not supported."));
             }
         }
@@ -158,10 +157,8 @@ impl ResultReaderFactory {
                 let schema = self.extract_schema_from_manifest(response.manifest.as_ref())?;
                 Ok(Box::new(EmptyReader::new(schema)))
             }
-            StatementState::Pending | StatementState::Running => {
-                Err(DatabricksErrorHelper::invalid_state()
-                    .message("Statement is still executing. Poll for completion first."))
-            }
+            StatementState::Pending | StatementState::Running => Err(Error::invalid_state()
+                .message("Statement is still executing. Poll for completion first.")),
             StatementState::Failed => {
                 let error_msg = response
                     .status
@@ -169,11 +166,9 @@ impl ResultReaderFactory {
                     .as_ref()
                     .and_then(|e| e.message.as_deref())
                     .unwrap_or("Unknown error");
-                Err(DatabricksErrorHelper::io().message(format!("Statement failed: {}", error_msg)))
+                Err(Error::io().message(format!("Statement failed: {}", error_msg)))
             }
-            StatementState::Canceled => {
-                Err(DatabricksErrorHelper::io().message("Statement was canceled"))
-            }
+            StatementState::Canceled => Err(Error::io().message("Statement was canceled")),
         }
     }
 
@@ -342,9 +337,9 @@ impl InlineArrowReader {
 
 impl ResultReader for InlineArrowReader {
     fn schema(&self) -> Result<SchemaRef> {
-        self.schema.clone().ok_or_else(|| {
-            DatabricksErrorHelper::invalid_state().message("Schema not available for inline result")
-        })
+        self.schema
+            .clone()
+            .ok_or_else(|| Error::invalid_state().message("Schema not available for inline result"))
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {

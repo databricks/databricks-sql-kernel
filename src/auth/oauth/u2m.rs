@@ -37,8 +37,7 @@ use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, RefreshToken,
@@ -305,12 +304,12 @@ impl AuthProvider for AuthorizationCodeProvider {
                             // Build OAuth client
                             let oauth_client = BasicClient::new(ClientId::new(client_id.clone()))
                                 .set_auth_uri(AuthUrl::new(auth_endpoint.clone()).map_err(|e| {
-                                    DatabricksErrorHelper::invalid_argument()
+                                    Error::invalid_argument()
                                         .message(format!("Invalid authorization endpoint URL: {}", e))
                                 })?)
                                 .set_token_uri(TokenUrl::new(token_endpoint.clone()).map_err(
                                     |e| {
-                                        DatabricksErrorHelper::invalid_argument()
+                                        Error::invalid_argument()
                                             .message(format!("Invalid token endpoint URL: {}", e))
                                     },
                                 )?);
@@ -383,16 +382,16 @@ impl AuthProvider for AuthorizationCodeProvider {
                     // Build OAuth client
                     let oauth_client = BasicClient::new(ClientId::new(client_id.clone()))
                         .set_auth_uri(AuthUrl::new(auth_endpoint.clone()).map_err(|e| {
-                            DatabricksErrorHelper::invalid_argument()
+                            Error::invalid_argument()
                                 .message(format!("Invalid authorization endpoint URL: {}", e))
                         })?)
                         .set_token_uri(TokenUrl::new(token_endpoint.clone()).map_err(|e| {
-                            DatabricksErrorHelper::invalid_argument()
+                            Error::invalid_argument()
                                 .message(format!("Invalid token endpoint URL: {}", e))
                         })?)
                         .set_redirect_uri(RedirectUrl::new(redirect_uri.clone()).map_err(
                             |e| {
-                                DatabricksErrorHelper::invalid_argument()
+                                Error::invalid_argument()
                                     .message(format!("Invalid redirect URI: {}", e))
                             },
                         )?);
@@ -431,7 +430,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                         .request_async(http_client.inner())
                         .await
                         .map_err(|e| {
-                            DatabricksErrorHelper::io()
+                            Error::io()
                                 .message(format!("U2M authorization code exchange failed: {}", e))
                                 .context("authorization code grant")
                         })?;

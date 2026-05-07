@@ -34,8 +34,7 @@
 //! concurrent callers. This is coordinated via an `AtomicBool` flag.
 
 use crate::auth::oauth::token::OAuthToken;
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 
@@ -144,7 +143,7 @@ impl TokenStore {
         // Fast path: check if we have a FRESH token (read lock only, no contention)
         {
             let token = self.token.read().map_err(|e| {
-                DatabricksErrorHelper::invalid_state()
+                Error::invalid_state()
                     .message("token store lock poisoned")
                     .context(format!("read lock error: {}", e))
             })?;
@@ -161,7 +160,7 @@ impl TokenStore {
         // Check state again under read lock to determine action
         let token_state = {
             let token = self.token.read().map_err(|e| {
-                DatabricksErrorHelper::invalid_state()
+                Error::invalid_state()
                     .message("token store lock poisoned")
                     .context(format!("read lock error: {}", e))
             })?;
@@ -220,7 +219,7 @@ impl TokenStore {
             // Store the new token if successful
             if let Ok(ref new_token) = result {
                 let mut token = self.token.write().map_err(|e| {
-                    DatabricksErrorHelper::invalid_state()
+                    Error::invalid_state()
                         .message("token store lock poisoned")
                         .context(format!("write lock error: {}", e))
                 })?;
@@ -291,14 +290,13 @@ impl TokenStore {
 
         // Read the refreshed token
         let token = self.token.read().map_err(|e| {
-            DatabricksErrorHelper::invalid_state()
+            Error::invalid_state()
                 .message("token store lock poisoned")
                 .context(format!("read lock error: {}", e))
         })?;
 
         token.clone().ok_or_else(|| {
-            DatabricksErrorHelper::invalid_state()
-                .message("token refresh failed: no token available after refresh")
+            Error::invalid_state().message("token refresh failed: no token available after refresh")
         })
     }
 }
@@ -512,7 +510,7 @@ mod tests {
 
         // Refresh function that fails
         let result = store.get_or_refresh(|| {
-            Err(DatabricksErrorHelper::io()
+            Err(Error::io()
                 .message("network error")
                 .context("token refresh"))
         });

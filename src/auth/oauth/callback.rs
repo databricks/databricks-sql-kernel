@@ -22,8 +22,7 @@
 //! - Returns a simple HTML page to the browser
 //! - Times out after a configurable duration (default 120s)
 
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::time::Duration;
@@ -127,12 +126,11 @@ impl CallbackServer {
     /// Returns `io()` error if the server cannot bind to the specified port.
     pub async fn new(port: u16) -> Result<Self> {
         let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().map_err(|e| {
-            DatabricksErrorHelper::invalid_argument()
-                .message(format!("Invalid port number {}: {}", port, e))
+            Error::invalid_argument().message(format!("Invalid port number {}: {}", port, e))
         })?;
 
         let listener = TcpListener::bind(addr).await.map_err(|e| {
-            DatabricksErrorHelper::io()
+            Error::io()
                 .message(format!("Failed to bind callback server to {}: {}", addr, e))
                 .context("OAuth callback server")
         })?;
@@ -140,9 +138,7 @@ impl CallbackServer {
         // Get the actual port (in case port 0 was specified for automatic assignment)
         let actual_port = listener
             .local_addr()
-            .map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to get local address: {}", e))
-            })?
+            .map_err(|e| Error::io().message(format!("Failed to get local address: {}", e)))?
             .port();
 
         // Create channel for callback result
@@ -195,15 +191,16 @@ impl CallbackServer {
         expected_state: &str,
         timeout: Duration,
     ) -> Result<String> {
-        let result_rx = self.result_rx.take().ok_or_else(|| {
-            DatabricksErrorHelper::io().message("Callback receiver already consumed")
-        })?;
+        let result_rx = self
+            .result_rx
+            .take()
+            .ok_or_else(|| Error::io().message("Callback receiver already consumed"))?;
 
         // Wait for callback or timeout
         let callback_result = tokio::time::timeout(timeout, result_rx)
             .await
             .map_err(|_| {
-                DatabricksErrorHelper::io()
+                Error::io()
                     .message(format!(
                         "OAuth callback timeout after {} seconds. No response received from browser.",
                         timeout.as_secs()
@@ -211,7 +208,7 @@ impl CallbackServer {
                     .context("OAuth callback server")
             })?
             .map_err(|_| {
-                DatabricksErrorHelper::io()
+                Error::io()
                     .message("Callback channel closed unexpectedly")
             })?;
 
@@ -225,7 +222,7 @@ impl CallbackServer {
             CallbackResult::Success { code, state } => {
                 // Validate state parameter (CSRF protection)
                 if state != expected_state {
-                    return Err(DatabricksErrorHelper::io()
+                    return Err(Error::io()
                         .message(format!(
                             "OAuth state mismatch (CSRF protection). Expected '{}', received '{}'",
                             expected_state, state
@@ -240,9 +237,7 @@ impl CallbackServer {
                 } else {
                     format!("OAuth authorization failed: {}", error)
                 };
-                Err(DatabricksErrorHelper::io()
-                    .message(msg)
-                    .context("OAuth authorization"))
+                Err(Error::io().message(msg).context("OAuth authorization"))
             }
         }
     }
@@ -280,9 +275,10 @@ impl CallbackServer {
 
         // Read the HTTP request (up to 8KB)
         let mut buffer = vec![0u8; 8192];
-        let n = stream.read(&mut buffer).await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read callback request: {}", e))
-        })?;
+        let n = stream
+            .read(&mut buffer)
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to read callback request: {}", e)))?;
 
         let request = String::from_utf8_lossy(&buffer[..n]);
 
@@ -292,7 +288,7 @@ impl CallbackServer {
 
         if parts.len() < 2 {
             Self::send_response(stream, 400, ERROR_HTML).await?;
-            return Err(DatabricksErrorHelper::io().message("Invalid HTTP request format"));
+            return Err(Error::io().message("Invalid HTTP request format"));
         }
 
         let path_and_query = parts[1];
@@ -316,13 +312,13 @@ impl CallbackServer {
         }
 
         // Extract code and state
-        let code = query_params.get("code").ok_or_else(|| {
-            DatabricksErrorHelper::io().message("Missing 'code' parameter in OAuth callback")
-        })?;
+        let code = query_params
+            .get("code")
+            .ok_or_else(|| Error::io().message("Missing 'code' parameter in OAuth callback"))?;
 
-        let state = query_params.get("state").ok_or_else(|| {
-            DatabricksErrorHelper::io().message("Missing 'state' parameter in OAuth callback")
-        })?;
+        let state = query_params
+            .get("state")
+            .ok_or_else(|| Error::io().message("Missing 'state' parameter in OAuth callback"))?;
 
         // Send success response to browser
         Self::send_response(stream, 200, SUCCESS_HTML).await?;
@@ -354,13 +350,15 @@ impl CallbackServer {
             status, status_text, body.len(), body
         );
 
-        stream.write_all(response.as_bytes()).await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to send HTTP response: {}", e))
-        })?;
+        stream
+            .write_all(response.as_bytes())
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to send HTTP response: {}", e)))?;
 
-        stream.flush().await.map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to flush response: {}", e))
-        })?;
+        stream
+            .flush()
+            .await
+            .map_err(|e| Error::io().message(format!("Failed to flush response: {}", e)))?;
 
         Ok(())
     }

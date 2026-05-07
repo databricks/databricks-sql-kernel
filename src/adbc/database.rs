@@ -21,7 +21,7 @@ use crate::client::retry::{
     build_retry_configs, RequestCategory, RetryConfig, RetryConfigOverrides,
 };
 use crate::client::{
-    DatabricksClient, DatabricksClientConfig, DatabricksHttpClient, HttpClientConfig, SeaClient,
+    DatabricksHttpClient, HttpClientConfig, SeaRestTransport, Transport, TransportConfig,
 };
 use crate::error::DatabricksErrorHelper;
 use crate::logging::{self, LogConfig};
@@ -908,23 +908,23 @@ impl adbc_core::Database for Database {
         http_client.set_auth_provider(auth_provider);
 
         // Two-step initialization required because ResultReaderFactory needs
-        // Arc<dyn DatabricksClient>, which requires wrapping SeaClient in Arc first.
+        // Arc<dyn Transport>, which requires wrapping SeaRestTransport in Arc first.
         //
-        // 1. Create SeaClient (without reader_factory — uses OnceLock)
-        // 2. Wrap in Arc<SeaClient>, coerce to Arc<dyn DatabricksClient>
+        // 1. Create SeaRestTransport (without reader_factory — uses OnceLock)
+        // 2. Wrap in Arc<SeaRestTransport>, coerce to Arc<dyn Transport>
         // 3. Create ResultReaderFactory with that Arc
-        // 4. Set the factory on SeaClient via OnceLock::set()
-        let client_config = DatabricksClientConfig {
+        // 4. Set the factory on SeaRestTransport via OnceLock::set()
+        let client_config = TransportConfig {
             cloudfetch_config: self.cloudfetch_config.clone(),
             ..Default::default()
         };
-        let sea_client = Arc::new(SeaClient::new(
+        let sea_client = Arc::new(SeaRestTransport::new(
             http_client.clone(),
             host,
             warehouse_id,
             client_config,
         ));
-        let client: Arc<dyn DatabricksClient> = sea_client.clone();
+        let client: Arc<dyn Transport> = sea_client.clone();
 
         let reader_factory = ResultReaderFactory::new(
             client.clone(),
