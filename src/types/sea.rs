@@ -15,7 +15,7 @@
 //! SEA (Statement Execution API) request/response types.
 //!
 //! These types map directly to the JSON structures used by the Databricks
-//! SQL Statement Execution API. They are primarily used by `SeaClient`.
+//! SQL Statement Execution API. They are primarily used by `SeaRestTransport`.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::{Deserialize, Deserializer, Serialize};

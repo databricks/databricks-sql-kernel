@@ -15,7 +15,7 @@
 //! Personal Access Token (PAT) authentication.
 
 use super::AuthProvider;
-use crate::error::Result;
+use crate::kernel_error::Result;
 
 /// Personal Access Token authentication provider.
 ///

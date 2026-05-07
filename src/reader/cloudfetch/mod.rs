@@ -27,5 +27,5 @@ pub mod streaming_provider;
 
 pub use arrow_parser::parse_arrow_ipc;
 pub use chunk_downloader::ChunkDownloader;
-pub use link_fetcher::{ChunkLinkFetcher, SeaChunkLinkFetcher};
+pub(crate) use link_fetcher::ChunkLinkFetcher;
 pub use streaming_provider::StreamingCloudFetchProvider;

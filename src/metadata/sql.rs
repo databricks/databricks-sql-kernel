@@ -189,6 +189,10 @@ impl SqlCommandBuilder {
     ///
     /// Order matters: backslashes must be escaped first, then quotes.
     /// Reversing the order would double-escape `\'` → `\''` → `\\''`.
+    #[allow(
+        dead_code,
+        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
+    )]
     fn escape_sql_string(value: &str) -> String {
         value.replace('\\', "\\\\").replace('\'', "''")
     }
@@ -200,6 +204,10 @@ impl SqlCommandBuilder {
     ///
     /// Empty string catalog must be handled by the caller before reaching
     /// the SQL builder (return an empty result at the FFI/client layer).
+    #[allow(
+        dead_code,
+        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
+    )]
     fn resolve_catalog_prefix(catalog: Option<&str>) -> String {
         match catalog {
             None => "system".to_string(),
@@ -217,6 +225,10 @@ impl SqlCommandBuilder {
     /// at the FFI/client layer) before calling this method.
     ///
     /// Schema and procedure patterns use SQL LIKE syntax directly (no Hive conversion).
+    #[allow(
+        dead_code,
+        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
+    )]
     pub fn build_get_procedures(
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
@@ -252,6 +264,10 @@ impl SqlCommandBuilder {
     /// `information_schema.routines` for getProcedureColumns.
     ///
     /// Same catalog resolution as `build_get_procedures`.
+    #[allow(
+        dead_code,
+        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
+    )]
     pub fn build_get_procedure_columns(
         catalog: Option<&str>,
         schema_pattern: Option<&str>,

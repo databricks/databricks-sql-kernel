@@ -95,9 +95,12 @@ pub(crate) fn set_last_error(message: &str, sql_state: &str, native_error: i32) 
     });
 }
 
-/// Set error from a Rust Error type and return the appropriate status code.
-pub(crate) fn set_error_from_result(err: &crate::error::Error) -> FfiStatus {
-    set_last_error(&format!("{}", err), "HY000", -1);
+/// Set error from any `Display`-formatted error and return the
+/// appropriate status code. Generic over the error type so this
+/// helper accepts both legacy driverbase errors and the new
+/// `kernel_error::Error` during the v0 migration.
+pub(crate) fn set_error_from_result<E: std::fmt::Display>(err: &E) -> FfiStatus {
+    set_last_error(&format!("{err}"), "HY000", -1);
     FfiStatus::Error
 }
 

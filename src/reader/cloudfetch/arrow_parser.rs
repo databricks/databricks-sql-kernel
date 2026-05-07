@@ -20,11 +20,10 @@
 //!
 //! Supports optional LZ4 decompression based on the result manifest.
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
-use driverbase::error::ErrorHelper;
 use lz4_flex::frame::FrameDecoder;
 use std::io::{Cursor, Read};
 
@@ -55,9 +54,9 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
         CompressionCodec::Lz4Frame => {
             let mut decoder = FrameDecoder::new(Cursor::new(data));
             let mut buf = Vec::new();
-            decoder.read_to_end(&mut buf).map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("LZ4 decompression failed: {}", e))
-            })?;
+            decoder
+                .read_to_end(&mut buf)
+                .map_err(|e| Error::io().message(format!("LZ4 decompression failed: {}", e)))?;
             decompressed = buf;
             &decompressed
         }
@@ -66,17 +65,14 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
 
     // 2. Parse Arrow IPC stream
     let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None).map_err(|e| {
-        DatabricksErrorHelper::io().message(format!("Failed to create Arrow IPC reader: {}", e))
-    })?;
+    let reader = StreamReader::try_new(cursor, None)
+        .map_err(|e| Error::io().message(format!("Failed to create Arrow IPC reader: {}", e)))?;
 
     // 3. Collect all batches from the stream
     let batches: Vec<RecordBatch> = reader
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to read Arrow batches: {}", e))
-        })?;
+        .map_err(|e| Error::io().message(format!("Failed to read Arrow batches: {}", e)))?;
 
     Ok(batches)
 }

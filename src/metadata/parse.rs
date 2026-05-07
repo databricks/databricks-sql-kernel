@@ -19,12 +19,11 @@
 //! Column names match the verified result schemas from live Databricks queries.
 
 use crate::client::ExecuteResult;
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::metadata::type_mapping::databricks_type_to_arrow;
 use arrow_array::cast::AsArray;
 use arrow_array::RecordBatch;
 use arrow_schema::{DataType, Field};
-use driverbase::error::ErrorHelper;
 
 /// Parsed catalog info from SHOW CATALOGS.
 #[derive(Debug, Clone)]
@@ -70,8 +69,7 @@ pub struct ColumnInfo {
 /// Get the index of a column by name, or return an error.
 fn column_index(batch: &RecordBatch, name: &str) -> Result<usize> {
     batch.schema().index_of(name).map_err(|_| {
-        DatabricksErrorHelper::invalid_state()
-            .message(format!("Expected column '{}' in metadata result", name))
+        Error::invalid_state().message(format!("Expected column '{}' in metadata result", name))
     })
 }
 
@@ -84,8 +82,7 @@ fn get_string_value(batch: &RecordBatch, col_idx: usize, row: usize) -> Result<S
     match array.data_type() {
         DataType::Utf8 => Ok(array.as_string::<i32>().value(row).to_string()),
         DataType::LargeUtf8 => Ok(array.as_string::<i64>().value(row).to_string()),
-        dt => Err(DatabricksErrorHelper::invalid_state()
-            .message(format!("Expected string column, got {:?}", dt))),
+        dt => Err(Error::invalid_state().message(format!("Expected string column, got {:?}", dt))),
     }
 }
 
@@ -127,14 +124,13 @@ fn get_optional_int32_value(
                 .unwrap()
                 .value(row) as i32,
         )),
-        dt => Err(DatabricksErrorHelper::invalid_state()
-            .message(format!("Expected int column, got {:?}", dt))),
+        dt => Err(Error::invalid_state().message(format!("Expected int column, got {:?}", dt))),
     }
 }
 
 /// Parse catalogs from SHOW CATALOGS result.
 /// Result columns: `catalog: Utf8`
-pub fn parse_catalogs(result: ExecuteResult) -> Result<Vec<CatalogInfo>> {
+pub(crate) fn parse_catalogs(result: ExecuteResult) -> Result<Vec<CatalogInfo>> {
     let mut catalogs = Vec::new();
     let mut reader = result.reader;
 
@@ -157,7 +153,7 @@ pub fn parse_catalogs(result: ExecuteResult) -> Result<Vec<CatalogInfo>> {
 ///
 /// When the `catalog` column is missing, `fallback_catalog` is used instead.
 /// This matches the JDBC driver behavior (MetadataResultSetBuilder.getRowsForSchemas).
-pub fn parse_schemas(
+pub(crate) fn parse_schemas(
     result: ExecuteResult,
     fallback_catalog: Option<&str>,
 ) -> Result<Vec<SchemaInfo>> {
@@ -185,7 +181,7 @@ pub fn parse_schemas(
 /// Parse tables from SHOW TABLES result.
 /// Result columns: `namespace: Utf8`, `tableName: Utf8`, `isTemporary: Boolean`,
 ///                 `information: Utf8?`, `catalogName: Utf8`, `tableType: Utf8`, `remarks: Utf8?`
-pub fn parse_tables(result: ExecuteResult) -> Result<Vec<TableInfo>> {
+pub(crate) fn parse_tables(result: ExecuteResult) -> Result<Vec<TableInfo>> {
     let mut tables = Vec::new();
     let mut reader = result.reader;
 
@@ -219,7 +215,7 @@ pub fn parse_tables(result: ExecuteResult) -> Result<Vec<TableInfo>> {
 ///                 `decimalDigits: Int32?`, `radix: Int32?`, `isNullable: Utf8?`,
 ///                 `remarks: Utf8?`, `ordinalPosition: Int32?`,
 ///                 `isAutoIncrement: Utf8?`, `isGenerated: Utf8?`
-pub fn parse_columns(result: ExecuteResult) -> Result<Vec<ColumnInfo>> {
+pub(crate) fn parse_columns(result: ExecuteResult) -> Result<Vec<ColumnInfo>> {
     let mut columns = Vec::new();
     let mut reader = result.reader;
 
@@ -279,7 +275,7 @@ pub fn parse_columns(result: ExecuteResult) -> Result<Vec<ColumnInfo>> {
 
 /// Parse columns directly into Arrow Fields for `get_table_schema`.
 /// Uses `col_name`, `columnType`, and `isNullable` to build the schema.
-pub fn parse_columns_as_fields(result: ExecuteResult) -> Result<Vec<Field>> {
+pub(crate) fn parse_columns_as_fields(result: ExecuteResult) -> Result<Vec<Field>> {
     let mut fields = Vec::new();
     let mut reader = result.reader;
 

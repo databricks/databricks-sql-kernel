@@ -17,7 +17,7 @@
 //! Supports prepared statements with parameter binding via the SEA API's
 //! positional parameters. See `crate::statement::params` for conversion utilities.
 
-use crate::client::DatabricksClient;
+use crate::client::Transport;
 use crate::error::DatabricksErrorHelper;
 use crate::reader::ResultReaderAdapter;
 use crate::statement::params::{
@@ -44,7 +44,7 @@ pub struct Statement {
     /// The SQL query to execute.
     query: Option<String>,
     /// Databricks client for executing queries.
-    client: Arc<dyn DatabricksClient>,
+    client: Arc<dyn Transport>,
     /// Session ID for this statement's connection.
     session_id: String,
     /// Tokio runtime handle for async operations.
@@ -78,7 +78,7 @@ impl std::fmt::Debug for Statement {
 impl Statement {
     /// Creates a new Statement.
     pub(crate) fn new(
-        client: Arc<dyn DatabricksClient>,
+        client: Arc<dyn Transport>,
         session_id: String,
         runtime_handle: RuntimeHandle,
     ) -> Self {
@@ -423,6 +423,6 @@ impl Drop for Statement {
 
 #[cfg(test)]
 mod tests {
-    // Note: Full statement tests require mock DatabricksClient
+    // Note: Full statement tests require mock Transport
     // Integration tests should be added in a separate test module
 }

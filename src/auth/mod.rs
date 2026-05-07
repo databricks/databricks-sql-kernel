@@ -22,7 +22,7 @@ pub use config::{AuthConfig, AuthType};
 pub use oauth::{AuthorizationCodeProvider, ClientCredentialsProvider};
 pub use pat::PersonalAccessToken;
 
-use crate::error::Result;
+use crate::kernel_error::Result;
 use std::fmt::Debug;
 
 /// Trait for authentication providers.

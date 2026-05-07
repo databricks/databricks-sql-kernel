@@ -14,12 +14,11 @@
 
 //! InlineArrowProvider for handling inline Arrow results.
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::parse_arrow_ipc;
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
-use driverbase::error::ErrorHelper;
 use std::collections::VecDeque;
 
 /// Provider for inline Arrow results.
@@ -71,7 +70,7 @@ impl InlineArrowProvider {
 
         // Reuse the shared Arrow IPC parser (same format as CloudFetch)
         let batches = parse_arrow_ipc(&attachment, compression).map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to parse inline Arrow data: {}", e))
+            Error::io().message(format!("Failed to parse inline Arrow data: {}", e))
         })?;
 
         let schema = batches.first().map(|b| b.schema());

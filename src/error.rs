@@ -36,6 +36,72 @@ pub type Error = driverbase::error::Error<DatabricksErrorHelper>;
 /// A convenient alias for Results with Databricks errors.
 pub type Result<T> = std::result::Result<T, Error>;
 
+// ─── kernel_error → driverbase boundary conversion ─────────────────
+//
+// Internal modules (`auth/`, `client/`, `reader/`, `metadata/`,
+// `statement/params.rs`, `types/`) now return `kernel_error::Result`.
+// The legacy ADBC layer in `src/adbc/` still returns
+// `driverbase::Error` (via `crate::error::Result`) so the ADBC trait
+// impls compile against `adbc_core`. The `?` operator across the
+// internal → ADBC boundary needs this `From` impl to bridge.
+//
+// Removed in PR 7 alongside `src/adbc/`.
+impl From<crate::kernel_error::Error> for Error {
+    fn from(value: crate::kernel_error::Error) -> Self {
+        let mut e = DatabricksErrorHelper::status(map_status(value.code)).message(
+            if value.message.is_empty() {
+                "(no message)"
+            } else {
+                value.message.as_str()
+            },
+        );
+        if let Some(code) = value.vendor_code {
+            e = e.vendor_code(code);
+        }
+        if let Some(s) = value.sql_state.as_deref().and_then(sqlstate_to_array) {
+            e = e.sqlstate(s);
+        }
+        if let Some(loc) = value.location.as_deref() {
+            e = e.location(loc);
+        }
+        e
+    }
+}
+
+fn map_status(code: crate::kernel_error::ErrorCode) -> adbc_core::error::Status {
+    use crate::kernel_error::ErrorCode;
+    use adbc_core::error::Status;
+    match code {
+        ErrorCode::InvalidArgument => Status::InvalidArguments,
+        ErrorCode::Unauthenticated => Status::Unauthenticated,
+        ErrorCode::PermissionDenied => Status::Unauthorized,
+        ErrorCode::NotFound => Status::NotFound,
+        ErrorCode::ResourceExhausted => Status::IO,
+        ErrorCode::Unavailable => Status::IO,
+        ErrorCode::Timeout => Status::Timeout,
+        ErrorCode::Cancelled => Status::Cancelled,
+        ErrorCode::DataLoss => Status::InvalidData,
+        ErrorCode::Internal => Status::Internal,
+        ErrorCode::InvalidStatementHandle => Status::InvalidState,
+        ErrorCode::NetworkError => Status::IO,
+        ErrorCode::SqlError => Status::Internal,
+    }
+}
+
+fn sqlstate_to_array(s: &str) -> Option<[std::os::raw::c_char; 5]> {
+    let bytes = s.as_bytes();
+    if bytes.len() != 5 {
+        return None;
+    }
+    Some([
+        bytes[0] as std::os::raw::c_char,
+        bytes[1] as std::os::raw::c_char,
+        bytes[2] as std::os::raw::c_char,
+        bytes[3] as std::os::raw::c_char,
+        bytes[4] as std::os::raw::c_char,
+    ])
+}
+
 /// Extract SQLSTATE from error message text.
 ///
 /// Many Databricks error messages include "SQLSTATE: XXXXX" in the text.

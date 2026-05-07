@@ -26,8 +26,7 @@ use crate::auth::AuthProvider;
 use crate::client::retry::{
     calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
 };
-use crate::error::{DatabricksErrorHelper, Result};
-use driverbase::error::ErrorHelper;
+use crate::kernel_error::{Error, Result};
 use reqwest::{Client, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -198,13 +197,13 @@ impl DatabricksHttpClient {
 
         if let Some(ref cert_path) = config.tls.trusted_certificate_path {
             let pem = std::fs::read(cert_path).map_err(|e| {
-                DatabricksErrorHelper::invalid_argument().message(format!(
+                Error::invalid_argument().message(format!(
                     "Failed to read TLS certificate '{}': {}",
                     cert_path, e
                 ))
             })?;
             let cert = reqwest::Certificate::from_pem(&pem).map_err(|e| {
-                DatabricksErrorHelper::invalid_argument()
+                Error::invalid_argument()
                     .message(format!("Invalid PEM certificate '{}': {}", cert_path, e))
             })?;
             builder = builder.add_root_certificate(cert);
@@ -215,14 +214,14 @@ impl DatabricksHttpClient {
         if let Some(ref proxy_url) = config.proxy.url {
             // Validate proxy URL scheme
             if !proxy_url.starts_with("http://") && !proxy_url.starts_with("https://") {
-                return Err(DatabricksErrorHelper::invalid_argument().message(format!(
+                return Err(Error::invalid_argument().message(format!(
                     "Proxy URL must use http:// or https:// scheme, got: '{}'",
                     proxy_url
                 )));
             }
 
             let mut proxy = Proxy::all(proxy_url).map_err(|e| {
-                DatabricksErrorHelper::invalid_argument()
+                Error::invalid_argument()
                     .message(format!("Invalid proxy URL '{}': {}", proxy_url, e))
             })?;
 
@@ -267,9 +266,9 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
-        let client = builder.build().map_err(|e| {
-            DatabricksErrorHelper::io().message(format!("Failed to create HTTP client: {}", e))
-        })?;
+        let client = builder
+            .build()
+            .map_err(|e| Error::io().message(format!("Failed to create HTTP client: {}", e)))?;
 
         Ok(Self {
             client,
@@ -315,8 +314,7 @@ impl DatabricksHttpClient {
     /// Returns an error if the auth provider has not been set via `set_auth_provider()`.
     pub fn auth_header(&self) -> Result<String> {
         let provider = self.auth_provider.get().ok_or_else(|| {
-            DatabricksErrorHelper::invalid_state()
-                .message("Auth provider not set. Call set_auth_provider() first.")
+            Error::invalid_state().message("Auth provider not set. Call set_auth_provider() first.")
         })?;
         provider.get_auth_header()
     }
@@ -394,9 +392,9 @@ impl DatabricksHttpClient {
                 req_builder = req_builder.body(body.clone());
             }
 
-            let request = req_builder.build().map_err(|e| {
-                DatabricksErrorHelper::io().message(format!("Failed to build request: {}", e))
-            })?;
+            let request = req_builder
+                .build()
+                .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
 
             debug!(
                 "{:?}: {} {} (attempt {}/{})",
@@ -443,7 +441,7 @@ impl DatabricksHttpClient {
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
-                            return Err(DatabricksErrorHelper::io().message(format!(
+                            return Err(Error::io().message(format!(
                                 "HTTP {} — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 status.as_u16(),
                                 attempts,
@@ -474,7 +472,7 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         status.as_u16()
                     );
-                    return Err(DatabricksErrorHelper::io().message(format!(
+                    return Err(Error::io().message(format!(
                         "HTTP {} - {}",
                         status.as_u16(),
                         error_body
@@ -492,7 +490,7 @@ impl DatabricksHttpClient {
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
-                            return Err(DatabricksErrorHelper::io().message(format!(
+                            return Err(Error::io().message(format!(
                                 "HTTP request failed — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 attempts,
                                 elapsed.as_secs_f64(),
@@ -520,7 +518,7 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         e
                     );
-                    return Err(DatabricksErrorHelper::io().message(format!(
+                    return Err(Error::io().message(format!(
                         "HTTP request failed after {} attempts: {}",
                         attempts,
                         last_error.unwrap_or_else(|| e.to_string())

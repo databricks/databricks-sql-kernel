@@ -17,11 +17,10 @@
 //! These types are used by `StreamingCloudFetchProvider` and related components
 //! for downloading Arrow data from cloud storage via presigned URLs.
 
-use crate::error::{DatabricksErrorHelper, Result};
+use crate::kernel_error::{Error, Result};
 use crate::types::sea::ExternalLink;
 use arrow_array::RecordBatch;
 use chrono::{DateTime, Utc};
-use driverbase::error::ErrorHelper;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -112,8 +111,7 @@ impl CloudFetchLink {
     pub fn from_external_link(link: &ExternalLink) -> Result<Self> {
         let expiration = DateTime::parse_from_rfc3339(&link.expiration)
             .map_err(|e| {
-                DatabricksErrorHelper::invalid_state()
-                    .message(format!("Invalid expiration timestamp: {}", e))
+                Error::invalid_state().message(format!("Invalid expiration timestamp: {}", e))
             })?
             .with_timezone(&Utc);
 
