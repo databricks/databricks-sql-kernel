@@ -23,20 +23,10 @@
 //! transport via the `SessionConfig.transport: Option<TransportMode>`
 //! enum, which the kernel resolves to a concrete `Transport` impl
 //! internally.
-//!
-//! Some methods and value-type fields are unused in the v0 build
-//! today (e.g. `end_of_stream()`, `cloudfetch_config`,
-//! `next_chunk_index`) but reach back to the legacy ADBC layer in
-//! the `metadata-ffi`-gated build. PR 2 wires them into the v0
-//! `Session::open` path; PR 7 deletes the legacy callers. The
-//! `#![allow(dead_code)]` below is the v0-skeleton convention used
-//! by `kernel_error.rs` and the spec skeleton modules.
-
-#![allow(dead_code)]
 
 use crate::kernel_error::Result;
 use crate::reader::ResultReader;
-use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
+use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{ExecuteParams, ResultManifest, StatementStatus};
 use async_trait::async_trait;
 use std::collections::HashMap;
@@ -46,16 +36,16 @@ use std::time::Duration;
 
 /// Backend-agnostic configuration for [`Transport`] implementations.
 ///
-/// Contains polling and CloudFetch settings shared across SEA REST,
-/// SEA gRPC, and Thrift backends.
+/// Contains polling settings shared across SEA REST, SEA gRPC, and
+/// Thrift backends. CloudFetch tuning lives on
+/// [`crate::reader::ResultReaderFactory`] instead — the transport
+/// never reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConfig {
     /// Maximum time to wait for statement completion (default: 600s).
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,
-    /// CloudFetch configuration.
-    pub cloudfetch_config: CloudFetchConfig,
 }
 
 impl Default for TransportConfig {
@@ -63,7 +53,6 @@ impl Default for TransportConfig {
         Self {
             poll_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_millis(500),
-            cloudfetch_config: CloudFetchConfig::default(),
         }
     }
 }
@@ -120,6 +109,10 @@ pub(crate) struct ChunkLinkFetchResult {
     pub links: Vec<CloudFetchLink>,
     pub has_more: bool,
     /// For chunk-index based backends (SEA).
+    #[allow(
+        dead_code,
+        reason = "consumed by ResultStream chunk pagination in PR 4"
+    )]
     pub next_chunk_index: Option<i64>,
     /// For row-offset based backends (Thrift).
     pub next_row_offset: Option<i64>,
@@ -127,6 +120,10 @@ pub(crate) struct ChunkLinkFetchResult {
 
 impl ChunkLinkFetchResult {
     /// Create an empty result indicating end of stream.
+    #[allow(
+        dead_code,
+        reason = "called by Transport impls handling exhausted chunk streams in PR 4"
+    )]
     pub fn end_of_stream() -> Self {
         Self {
             links: vec![],
@@ -241,6 +238,10 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// Uses `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`.
     /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
     /// When catalog is empty string, returns empty result.
+    #[allow(
+        dead_code,
+        reason = "wired into the v0 Metadata::procedures call in PR 3"
+    )]
     async fn list_procedures(
         &self,
         session_id: &str,
@@ -255,6 +256,10 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// filtered by `routine_type = 'PROCEDURE'`.
     /// When catalog is None, queries `system.information_schema` (cross-catalog).
     /// When catalog is empty string, returns empty result.
+    #[allow(
+        dead_code,
+        reason = "wired into the v0 Metadata::procedures call in PR 3"
+    )]
     async fn list_procedure_columns(
         &self,
         session_id: &str,

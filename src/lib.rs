@@ -109,7 +109,7 @@ pub use config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
     ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
 };
-pub use kernel_error::{Error, ErrorCode};
+pub use kernel_error::{Error, ErrorCode, Result};
 pub use metadata_v0::{Identifier, LikePattern, Metadata};
 pub use result_stream::{ResultBatch, ResultStream, Row, SchemaRef};
 pub use session::{Session, SessionBuilder};
