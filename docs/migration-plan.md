@@ -171,17 +171,19 @@ and the renamed transport trait.
   (`auth/`, `client/`, `reader/`, `metadata/`, `statement/params.rs`,
   `types/`) switch their `Result<T>` alias from the driverbase-backed
   `crate::error::Result` to `crate::kernel_error::Result`. HTTP/SEA-error
-  decoding produces `Error { code, message, sql_state, vendor_code,
-  http_status, retryable, query_id, cause }` directly. Initial
-  status mapping (refined as later PRs expose new failure paths):
+  decoding produces `Error { code, message, sql_state, error_code,
+  vendor_code, http_status, retryable, query_id, cause }` directly.
+  Initial status mapping (refined as later PRs expose new failure
+  paths):
   - `429` → `ResourceExhausted`, `retryable=true`
   - `503` → `Unavailable`, `retryable=true`
   - `504` → `Timeout`, `retryable=true`
   - `401` → `Unauthenticated`
   - `403` → `PermissionDenied`
   - `404` → `NotFound`
-  - SEA `error_code` envelope → `SqlError` with `sql_state` /
-    `vendor_code` populated from the envelope
+  - SEA `ServiceError` envelope → `SqlError` with `sql_state`,
+    `error_code` (string slug — see spec addendum A9), and
+    `query_id` populated from the envelope
   - DNS/TCP/TLS → `NetworkError`
   - Internal panics caught at FFI / `block_on` edge → `Internal`
   - Validation failures (`invalid_argument`, `invalid_state`) →

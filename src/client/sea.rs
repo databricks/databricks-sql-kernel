@@ -190,9 +190,9 @@ impl SeaRestTransport {
                         .message(&error_msg)
                         .with_query_id(&current_response.statement_id);
 
-                    // SQLSTATE: prefer the structured field; fall back to
-                    // parsing the message ("SQLSTATE: XXXXX" pattern).
                     if let Some(err) = service_error {
+                        // SQLSTATE: prefer the structured field; fall back
+                        // to parsing the message ("SQLSTATE: XXXXX" pattern).
                         let sqlstate = err
                             .sql_state
                             .as_ref()
@@ -203,6 +203,14 @@ impl SeaRestTransport {
                             });
                         if let Some(s) = sqlstate {
                             error = error.with_sql_state(s);
+                        }
+
+                        // Databricks-specific error code slug
+                        // (`STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`, …).
+                        // Wrappers branch on this to map host-language
+                        // exception taxonomies.
+                        if let Some(ec) = err.error_code.as_deref().filter(|s| !s.is_empty()) {
+                            error = error.with_error_code(ec);
                         }
                     }
 

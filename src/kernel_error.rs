@@ -155,7 +155,21 @@ pub struct Error {
     /// 5-character SQLSTATE if the server returned one.
     pub sql_state: Option<String>,
 
-    /// Databricks vendor code if the server returned one.
+    /// Databricks-specific error identifier from the SEA
+    /// `ServiceError.error_code` envelope — a stable string slug like
+    /// `STATEMENT_NOT_FOUND` or `WAREHOUSE_STOPPED` that wrappers can
+    /// branch on to map to host-language exceptions (PySQL's
+    /// `OperationalError` taxonomy, JDBC's `SQLException` subclasses).
+    /// Distinct from the JDBC-style numeric [`Error::vendor_code`]:
+    /// Databricks ships string slugs on the wire today, not integers.
+    pub error_code: Option<String>,
+
+    /// Numeric vendor code in the JDBC `SQLException.getErrorCode()` /
+    /// ODBC `SQLGetDiagRec` sense. Reserved for transports that ship
+    /// integer error codes (currently none — SEA REST always uses the
+    /// string [`Error::error_code`]). Wrappers that need to populate
+    /// JDBC's numeric `vendor_code` slot today should hash or look up
+    /// the string `error_code` themselves.
     pub vendor_code: Option<i32>,
 
     /// HTTP status for transport-layer errors.
@@ -187,6 +201,7 @@ impl Error {
             code,
             message: message.into(),
             sql_state: None,
+            error_code: None,
             vendor_code: None,
             http_status: None,
             retryable: false,
@@ -361,6 +376,13 @@ impl Error {
         self
     }
 
+    /// Attach the Databricks-specific [`Error::error_code`] string slug
+    /// (e.g. `STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`).
+    pub fn with_error_code(mut self, error_code: impl Into<String>) -> Self {
+        self.error_code = Some(error_code.into());
+        self
+    }
+
     pub fn with_vendor_code(mut self, vendor_code: i32) -> Self {
         self.vendor_code = Some(vendor_code);
         self
@@ -495,6 +517,9 @@ impl std::fmt::Display for Error {
         if let Some(s) = &self.sql_state {
             write!(f, " [SQLSTATE {s}]")?;
         }
+        if let Some(ec) = &self.error_code {
+            write!(f, " [error_code {ec}]")?;
+        }
         if let Some(c) = self.vendor_code {
             write!(f, " [vendor {c}]")?;
         }
@@ -620,6 +645,13 @@ fn format_message_for_adbc(err: &Error) -> String {
             err.message.as_str()
         }
     );
+    // adbc_core::error::Error has no string-shaped slot for the
+    // Databricks error_code slug, so we surface it in the message
+    // string instead. Lossy bridge — wrappers reading the typed
+    // kernel_error::Error directly get the structured field.
+    if let Some(ec) = &err.error_code {
+        write!(&mut out, " [error_code {ec}]").ok();
+    }
     if let Some(loc) = &err.location {
         write!(&mut out, " (at {loc})").ok();
     }
@@ -853,5 +885,42 @@ mod tests {
 
         let e: Error = arrow_schema::ArrowError::InvalidArgumentError("bad".into()).into();
         assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn with_error_code_populates_string_slug() {
+        let e = Error::sql_error()
+            .message("statement gone")
+            .with_error_code("STATEMENT_NOT_FOUND");
+        assert_eq!(e.error_code.as_deref(), Some("STATEMENT_NOT_FOUND"));
+        // vendor_code is independent and stays unset
+        assert!(e.vendor_code.is_none());
+    }
+
+    #[test]
+    fn display_surfaces_error_code() {
+        let e = Error::sql_error()
+            .message("statement gone")
+            .with_error_code("STATEMENT_NOT_FOUND")
+            .with_sql_state("42P01");
+        let s = format!("{e}");
+        assert!(s.contains("[error_code STATEMENT_NOT_FOUND]"));
+        assert!(s.contains("[SQLSTATE 42P01]"));
+    }
+
+    #[test]
+    fn to_adbc_surfaces_error_code_in_message() {
+        // ADBC has no string-shaped vendor slot; the slug lives in the
+        // formatted message. Wrappers that need typed access read the
+        // kernel_error::Error directly.
+        let e = Error::sql_error()
+            .message("warehouse stopped")
+            .with_error_code("WAREHOUSE_STOPPED");
+        let adbc = e.to_adbc();
+        assert!(
+            adbc.message.contains("[error_code WAREHOUSE_STOPPED]"),
+            "ADBC message lost error_code slug: {}",
+            adbc.message
+        );
     }
 }

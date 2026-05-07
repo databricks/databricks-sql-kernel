@@ -351,7 +351,8 @@ pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub sql_state: Option<String>,           // 5-char SQLSTATE
-    pub vendor_code: Option<i32>,            // Databricks vendor code
+    pub error_code: Option<String>,          // Databricks string slug (STATEMENT_NOT_FOUND, …)
+    pub vendor_code: Option<i32>,            // numeric vendor code (JDBC/ODBC convention; reserved)
     pub http_status: Option<u16>,            // for transport-layer errors
     pub retryable: bool,
     pub query_id: Option<String>,
@@ -483,7 +484,8 @@ pub struct Error {
     pub code: ErrorCode,
     pub message: String,
     pub sql_state: Option<String>,           // 5-char SQLSTATE
-    pub vendor_code: Option<i32>,            // Databricks vendor code
+    pub error_code: Option<String>,          // Databricks string slug (STATEMENT_NOT_FOUND, …)
+    pub vendor_code: Option<i32>,            // numeric vendor code (JDBC/ODBC convention; reserved)
     pub http_status: Option<u16>,            // for transport-layer errors
     pub retryable: bool,
     pub query_id: Option<String>,
@@ -912,4 +914,40 @@ shape decision worth its own discussion thread. The current
 `ExecutedAsyncStatement::fetch_result` docstring uses
 `ErrorCode::InvalidArgument` as a placeholder until A8 lands and
 introduces the right variant.
+
+## A9. `Error::error_code` (string slug) added alongside `vendor_code`
+
+**Status:** approved 2026-05-08 (PR #5 review).
+
+The spec body's `Error` struct originally had only
+`vendor_code: Option<i32>` to preserve server-side error
+identifiers. That assumed JDBC/ODBC's numeric vendor-code
+convention. Databricks SEA actually ships **string slugs** in
+`ServiceError.error_code` — values like `STATEMENT_NOT_FOUND`,
+`WAREHOUSE_STOPPED`, `WAREHOUSE_NOT_FOUND`. Hashing the slug into
+an `i32` would lose the identifier; appending it to the message
+string would force every wrapper to re-parse.
+
+The fix splits the two concerns:
+
+```rust
+pub struct Error {
+    // …
+    pub error_code: Option<String>,   // Databricks slug; populated from SEA
+    pub vendor_code: Option<i32>,     // numeric (JDBC/ODBC); reserved
+    // …
+}
+```
+
+Wrappers that map error taxonomies (PySQL's `OperationalError`
+taxonomy, JDBC's `SQLException` subclasses, ODBC's
+`SQLGetDiagRec`) check `error_code` for the string match and fill
+their numeric `vendor_code` slot themselves (typically by hashing
+or looking up the slug in a wrapper-local table).
+
+The `to_adbc()` legacy shim surfaces `error_code` in the message
+string (`[error_code STATEMENT_NOT_FOUND]`) since
+`adbc_core::error::Error` has no string-shaped slot for it. Lossy
+bridge — wrappers that consume `kernel_error::Error` directly
+(PyO3, napi-rs, the C ABI) get the structured field.
 
