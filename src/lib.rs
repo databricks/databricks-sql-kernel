@@ -14,73 +14,66 @@
 
 //! Databricks SQL Kernel
 //!
-//! Rust client core for Databricks SQL — the shared engine that powers the
-//! Databricks ODBC, Python, Go, and Node.js drivers, and is also exposed
-//! today as an ADBC driver.
+//! Rust client core for Databricks SQL — the shared engine that powers
+//! the Databricks ODBC, Python, Go, and Node.js drivers.
 //!
 //! ## Overview
 //!
-//! ADBC is currently the primary surface: the kernel implements the standard
-//! traits from `adbc_core`:
-//! - [`Driver`] - Entry point for creating database connections
-//! - [`Database`] - Holds connection configuration
-//! - [`Connection`] - Active connection to Databricks
-//! - [`Statement`] - SQL statement execution
+//! The v0 Kernel API surfaces a Databricks-native, async-first
+//! interface (see `docs/spec-v0.md`):
 //!
-//! A native (non-ADBC) Rust API and a stable C ABI for ODBC/Go are planned;
-//! see the kernel-strategy plan doc for the staged rollout.
+//! - [`Session`] — stateful authenticated handle (collapses ADBC's
+//!   `Database` + `Connection`).
+//! - [`Statement`] — mutable lifecycle owner; produces immutable
+//!   executed handles via `execute()` / `submit()`.
+//! - [`ExecutedStatement`] / [`ExecutedAsyncStatement`] — sync /
+//!   async-consumption executed handles, sharing the
+//!   [`ExecutedStatementHandle`] trait.
+//! - [`Metadata`] — flat per-method catalog metadata API.
+//! - [`ResultStream`] — paginated result with a borrowed `Row<'a>`
+//!   cursor.
 //!
-//! ## Features
+//! Two consumer surfaces:
 //!
-//! - **CloudFetch**: High-performance result streaming via cloud storage
-//! - **SEA (Statement Execution API)**: REST-based query execution
-//! - **Arrow IPC**: Native Arrow data format with optional LZ4 compression
+//! - **Direct Rust crate** for PyO3 / napi-rs wrappers (Python and
+//!   Node.js).
+//! - **Custom C ABI** under `crate::ffi` for ODBC / Go consumers
+//!   that cannot link the Rust crate directly.
 //!
-//! ## Example
+//! The legacy ADBC trait surface lives at `crate::adbc::*` (gated on
+//! the `legacy-adbc` feature) and is scheduled for removal in an
+//! upcoming PR.
+//!
+//! ## Example (v0 spec — bodies land in PRs 4–7)
 //!
 //! ```ignore
-//! use databricks_sql_kernel::Driver;
-//! use adbc_core::driver::Driver as _;
-//! use adbc_core::options::{OptionDatabase, OptionValue};
-//! use adbc_core::Optionable;
+//! // PR 4a: switch from `ignore` to `no_run` once Session::open lands.
+//! use databricks_sql_kernel::{
+//!     AuthConfig, ConnectionConfig, Session, TypedValue,
+//! };
 //!
-//! let driver = Driver::new();
-//! let mut database = driver.new_database()?;
-//! database.set_option(OptionDatabase::Uri, OptionValue::String("https://my-workspace.databricks.com".into()))?;
-//! database.set_option(OptionDatabase::Other("databricks.http_path".into()), OptionValue::String("/sql/1.0/warehouses/abc123".into()))?;
-//! database.set_option(OptionDatabase::Other("databricks.access_token".into()), OptionValue::String("dapi...".into()))?;
+//! let session = Session::builder()
+//!     .connection(ConnectionConfig::new(
+//!         "https://my-workspace.databricks.com",
+//!         "abc123",
+//!     ))
+//!     .auth(AuthConfig::Pat { token: "dapi...".into() })
+//!     .open()
+//!     .await?;
 //!
-//! let mut connection = database.new_connection()?;
-//! let mut statement = connection.new_statement()?;
-//! statement.set_sql_query("SELECT * FROM my_table")?;
-//! let result = statement.execute()?;
+//! let mut stmt = session.statement();
+//! stmt.spec()
+//!     .sql("SELECT * FROM my_table WHERE id = ?")
+//!     .param(1, TypedValue::Null)?;
+//!
+//! let mut exec = stmt.execute().await?;
+//! while let Some(_batch) = exec.result_stream_mut().next_batch().await? {
+//!     while let Some(_row) = exec.result_stream_mut().next_row_in_batch() {
+//!         // process row
+//!     }
+//! }
+//! exec.close().await?;
 //! ```
-//!
-//! ## Configuration Options
-//!
-//! ### Database Options
-//!
-//! | Option | Description |
-//! |--------|-------------|
-//! | `uri` | Databricks workspace URL |
-//! | `databricks.http_path` | SQL warehouse HTTP path (extracts warehouse_id) |
-//! | `databricks.warehouse_id` | SQL warehouse ID directly |
-//! | `databricks.access_token` | Personal access token |
-//! | `databricks.catalog` | Default catalog |
-//! | `databricks.schema` | Default schema |
-//! | `databricks.log_level` | Log level: `off`, `error`, `warn`, `info`, `debug`, `trace` |
-//! | `databricks.log_file` | Log file path. If unset, logs go to stderr |
-//!
-//! ### CloudFetch Options
-//!
-//! | Option | Default | Description |
-//! |--------|---------|-------------|
-//! | `databricks.cloudfetch.enabled` | true | Enable CloudFetch |
-//! | `databricks.cloudfetch.link_prefetch_window` | 10 | Links to prefetch |
-//! | `databricks.cloudfetch.max_chunks_in_memory` | 4 | Memory limit (controls parallelism) |
-//! | `databricks.cloudfetch.max_retries` | 5 | Download retry attempts |
-//! | `databricks.cloudfetch.retry_delay_ms` | 1500 | Retry delay in ms |
-//! | `databricks.cloudfetch.speed_threshold_mbps` | 0.1 | Slow download warning threshold |
 
 pub mod auth;
 pub mod client;
@@ -96,36 +89,78 @@ pub mod types;
 // === v0 Kernel spec surface (skeleton — populated in subsequent PRs) ===
 pub mod config;
 pub mod kernel_error;
+pub mod metadata_v0;
+pub mod result_stream;
 pub mod session;
 
 // New custom C ABI for ODBC/Go consumers (replaces ADBC FFI).
 pub mod ffi;
 
-// Re-export shared error types (driverbase-based; replaced by `kernel_error`
-// in the final removal PR).
-pub use error::{DatabricksErrorHelper, Error, Result};
+// === v0 Kernel public re-exports ===
+//
+// New code targets these crate-root paths. The driverbase-backed
+// `crate::error::*` and `crate::client::*` re-exports are intentionally
+// **not** here: when `kernel_error.rs` is renamed to `error.rs` in the
+// removal PR, a crate-root `Result` would silently swap types, which
+// could change wrapper behaviour without a compile error. Wrappers use
+// the explicit `crate::kernel_error::Result` (later just
+// `crate::error::Result`) during the migration.
+pub use config::{
+    AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
+    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
+};
+pub use kernel_error::{Error, ErrorCode};
+pub use metadata_v0::{Identifier, LikePattern, Metadata};
+pub use result_stream::{ResultBatch, ResultStream, Row, SchemaRef};
+pub use session::{Session, SessionBuilder};
+pub use statement::executed::ExecutedStatement;
+pub use statement::executed_async::{ExecutedAsyncStatement, StatementStatus};
+pub use statement::handle::ExecutedStatementHandle;
+pub use statement::mutable::Statement;
+pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};
 
-// Re-export client types for advanced users
-pub use client::{DatabricksClient, DatabricksHttpClient, HttpClientConfig, SeaClient};
+// === Compile-time guarantees on auto-traits ===
+//
+// Public handles MUST be `Send + Sync` so wrappers (PyO3 `pyclass`,
+// napi-rs resource wrappers, the C ABI) can move them across threads.
+// Today `Arc<SessionInner>` derives both trivially, but the moment PR
+// 4a adds `transport: Arc<dyn Transport>` (or any non-`Send` field) the
+// auto-traits silently regress. These assertions catch that at the
+// build that introduces it. Same idiom Tokio / hyper / sqlx use.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
 
-// Re-export configuration types
-pub use types::cloudfetch::CloudFetchConfig;
+    // Stateful handles
+    assert_send_sync::<Session>();
+    assert_send_sync::<SessionBuilder>();
+    assert_send_sync::<Statement>();
+    assert_send_sync::<ExecutedStatement>();
+    assert_send_sync::<ExecutedAsyncStatement>();
+    assert_send_sync::<Metadata>();
+    assert_send_sync::<ResultStream>();
+
+    // Plain-data / value types
+    assert_send_sync::<StatementSpec>();
+    assert_send_sync::<Error>();
+    assert_send_sync::<ErrorCode>();
+    assert_send_sync::<ResultBatch>();
+    assert_send_sync::<ResultFormat>();
+    assert_send_sync::<TypedValue>();
+
+    // Newtypes carry a lifetime; assert against the `'static` instantiation
+    // (the borrow lifetime is not what determines auto-trait status).
+    assert_send_sync::<Identifier<'static>>();
+    assert_send_sync::<LikePattern<'static>>();
+};
 
 // === Legacy ADBC surface (gated, scheduled for removal) ===
+//
+// Callers explicitly use `crate::adbc::*`; no convenience re-exports at
+// the crate root. The crate-root paths now belong to the v0 surface
+// (above). Gated on `legacy-adbc`; scheduled for deletion in the
+// upcoming ADBC-cleanup PR.
 #[cfg(feature = "legacy-adbc")]
 pub mod adbc;
-
-// Re-export ADBC main types at the crate root for backwards compatibility
-// during the kernel-v0 migration. New code should import from
-// `crate::adbc::*` directly.
-#[cfg(feature = "legacy-adbc")]
-pub use adbc::connection::Connection;
-#[cfg(feature = "legacy-adbc")]
-pub use adbc::database::Database;
-#[cfg(feature = "legacy-adbc")]
-pub use adbc::driver::Driver;
-#[cfg(feature = "legacy-adbc")]
-pub use adbc::statement::Statement;
 
 // FFI export — produces AdbcDatabricksInit and AdbcDriverInit symbols
 // when built with `cargo build --features ffi`

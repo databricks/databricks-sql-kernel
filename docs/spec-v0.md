@@ -272,6 +272,17 @@ Config is grouped by concern, not flattened into a string bag. Wrappers fluently
 
 ## Statement
 
+> **⚠️ Superseded by addendum A1.** Every signature below — the
+> `Statement<'s>` lifetime, `Statement::sql(self) -> Self` chained-by-
+> consumption setters, `pub async fn execute(self) -> ResultStream`,
+> the `Err(InvalidState)` doc references on transactions — is **not the
+> contract the kernel ships**. A1 (with refinements through A8) is
+> canonical. Read the addenda first; this block is kept verbatim only
+> because it mirrors the upstream Google Doc and will be folded into
+> A1 once upstream is updated.
+>
+> **Do not derive code or wrapper bindings from this section.**
+
 ```rust
 
 // === Statement ===
@@ -387,8 +398,11 @@ impl ResultStream {
     /// column. Works regardless of the wire format.
     pub async fn next_row(&mut self) -> Result<Option<Row>>;
 
-    pub async fn cancel(&mut self) -> Result<()>;
-    pub async fn close(self) -> Result<()>;
+    /// Free client-side resources (buffered chunks, link prefetcher,
+    /// in-flight downloaders). Local-only — no server RPC. To cancel
+    /// the underlying statement, call `cancel()` on the executed
+    /// handle. Drop performs the same cleanup if not called explicitly.
+    pub fn close(self);
 }
 
 // Internal: ResultStream is implemented over a ResultReader trait.
@@ -426,6 +440,16 @@ impl ResultBatch {
 
 ## Metadata
 
+> **⚠️ Superseded by addendum A2.** Every signature below — `Metadata<'s>`
+> with a Rust lifetime, `Option<&str>` for catalog/schema/table/column
+> parameters — is **not the contract the kernel ships**. A2 introduces
+> the `Identifier<'a>` and `LikePattern<'a>` newtypes and drops the
+> handle's lifetime. A2 is canonical; this block is kept verbatim only
+> because it mirrors the upstream Google Doc and will be folded into A2
+> once upstream is updated.
+>
+> **Do not derive code or wrapper bindings from this section.**
+
 The Kernel would have explicit spec for metadata operations. Most drivers except for Go have dedicated support for metadata operations. Having explicit metadata spec will help in avoiding redundant metadata code in individual drivers.
 
 ```rust
@@ -449,6 +473,46 @@ impl<'s> Metadata<'s> {
 
 ## Error Handling
 
+The kernel surfaces a typed [`Error`] / [`ErrorCode`] pair so wrappers
+don't reparse strings. The shapes below mirror upstream verbatim; see
+`src/kernel_error.rs` for the implementation and addendum A8 for the
+v0.1 taxonomy expansion that's tracked.
+
+```rust
+pub struct Error {
+    pub code: ErrorCode,
+    pub message: String,
+    pub sql_state: Option<String>,           // 5-char SQLSTATE
+    pub vendor_code: Option<i32>,            // Databricks vendor code
+    pub http_status: Option<u16>,            // for transport-layer errors
+    pub retryable: bool,
+    pub query_id: Option<String>,
+    pub cause: Option<Box<Error>>,
+}
+
+pub enum ErrorCode {
+    InvalidArgument,
+    Unauthenticated,
+    PermissionDenied,
+    NotFound,
+    ResourceExhausted,        // 429
+    Unavailable,              // 503
+    Timeout,
+    Cancelled,
+    DataLoss,
+    Internal,
+    InvalidStatementHandle,   // INVALID_HANDLE_STATUS — distinct
+    NetworkError,
+    SqlError,                 // server-reported execution error
+}
+```
+
+> **Note:** the `// === Errors ===` block at the bottom of the
+> superseded `## Statement` section is the same content as above. It
+> survives there only because it sits inside the upstream-mirrored
+> code block; future doc-cleanup PRs will collapse the duplication
+> when the upstream Google Doc is updated.
+
 ---
 
 # Kernel addenda
@@ -459,8 +523,6 @@ upstream is updated, these notes fold back into the relevant section above
 and the addendum is removed.
 
 ## A1. StatementSpec, Statement, ExecutedStatement, ExecutedAsyncStatement
-
-**Status:** approved 2026-05-05.
 
 Databricks server-side, a statement is immutable once created — it has a
 `statement_id` and a single SQL text bound to it. The spec body's single
@@ -477,19 +539,68 @@ Four types:
   isolation; testable; cheaply cloneable.
 - `Statement` — lifecycle owner, returned by `Session::statement()`. Owns
   one `StatementSpec` and at most one live executed handle. Exposes the
-  spec via `spec(&mut self) -> &mut StatementSpec` for mutation, and
-  `execute()` / `submit()` to produce executed handles.
+  spec via `spec(&mut self) -> &mut StatementSpec` and `spec_ref(&self)
+  -> &StatementSpec`; produces handles via `execute()` / `submit()`.
 - `ExecutedStatement` — immutable, returned by `Statement::execute()`. The
   kernel has already polled to completion; results are ready to consume.
 - `ExecutedAsyncStatement` — immutable, returned by `Statement::submit()`.
   The kernel returned without driving polling; the caller owns polling via
   `status()` / `await_result()`.
 
-`Statement` is reusable. Calling `execute()` or `submit()` again on the
-same `Statement` auto-cancels + closes any prior executed handle it
-produced. The spec persists; only the executed handle is replaced. The
-prior handle becomes invalid; subsequent calls on it return
-`ErrorCode::InvalidStatementHandle`.
+### Why no Rust lifetimes on the handles
+
+`Statement`, `ExecutedStatement`, `ExecutedAsyncStatement`, and `Metadata`
+are all `'static` (no lifetime parameter). Wrappers that wrap kernel types
+in `pyclass` (PyO3) or `napi` (napi-rs) opaque handles require host-wrapped
+types to be `'static` — Rust lifetimes cannot cross the FFI boundary
+without unsafe lifetime laundering.
+
+The shared session state lives behind `Arc<SessionInner>`. Each child
+handle holds its own clone. Cheap (one pointer + one atomic refcount
+bump per handle).
+
+### Cancellation
+
+Cancellation lives on the executed handle, not on `Statement`. Two
+cases cover the lifetime of a query:
+
+- **Before `execute()` / `submit()` returns**: the caller has the
+  future. They cancel by dropping it (`tokio::select!`, timeout
+  wrapper, etc.). The future's `Drop` guard fires-and-forgets
+  `CancelStatement` against the in-flight `statement_id`, so the
+  server stops charging DBUs even though no handle was ever returned.
+- **After `execute()` / `submit()` returns**: the caller has an
+  `ExecutedStatement` / `ExecutedAsyncStatement` and calls `cancel()`
+  on the handle (via `ExecutedStatementHandle`).
+
+There is intentionally no `Statement::cancel`. Every cancellable state
+has a more specific receiver, and adding a method here would only
+introduce ambiguity about which `cancel()` to call. Consequently
+`Statement`'s methods take `&mut self` — Rust's borrow checker is fine
+with this since there is no concurrent-cancel use case to support.
+
+### Validity flag for zombie handles
+
+Each `ExecutedStatement` / `ExecutedAsyncStatement` shares an
+`Arc<AtomicBool>` validity flag with its parent `Statement`. The
+plumbing:
+
+- Each successful `execute()` / `submit()` allocates a fresh
+  `Arc::new(AtomicBool::new(true))`. The handle returned to the caller
+  owns one clone; `Statement` keeps the producer-side clone in a
+  `last_valid: Option<Arc<AtomicBool>>` field.
+- On re-execute, `Statement` flips the prior `last_valid` to `false`
+  *before* sending CancelStatement / CloseStatement. The slot is then
+  overwritten with the new handle's flag.
+- `impl Drop for Statement` flips `last_valid` to `false` so any
+  outliving executed handle short-circuits on its next call.
+
+The next call on a stale handle reads `valid.load(Acquire)`, observes
+`false`, and returns `ErrorCode::InvalidStatementHandle` locally — no
+network round-trip — because the server has already received the prior
+CloseStatement and a wire call would be wasted.
+
+### Code shape
 
 ```rust
 // === StatementSpec (plain data, mutable, reusable) ===
@@ -515,85 +626,101 @@ impl StatementSpec {
 }
 
 
-// === Statement (lifecycle owner, mutable, reusable) ===
+// === Statement (lifecycle owner, 'static, &mut self methods) ===
 
-pub struct Statement<'s> { /* spec: StatementSpec, last_handle, session ref */ }
+pub struct Statement {
+    /* session: Arc<SessionInner>,
+       spec: StatementSpec,
+       last_statement_id: Option<String>,
+       last_valid: Option<Arc<AtomicBool>>,  // shared with current executed handle */
+}
 
-impl<'s> Statement<'s> {
+impl Statement {
     /// Mutable access to the spec. Mutate before calling execute/submit.
     pub fn spec(&mut self) -> &mut StatementSpec;
 
-    /// Read-only access (e.g. for logging or assertion).
+    /// Read-only access (for logging or assertion).
     pub fn spec_ref(&self) -> &StatementSpec;
 
     /// Wait-for-result execution. Auto-cancels + closes any prior handle.
     /// Spec is unchanged after the call; can be re-executed.
-    pub async fn execute(&mut self) -> Result<ExecutedStatement<'s>>;
+    pub async fn execute(&mut self) -> Result<ExecutedStatement>;
 
     /// Submit-and-return. Auto-cancels + closes any prior handle.
-    pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement<'s>>;
+    pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement>;
 }
 
 
 // === Shared trait for both executed handles ===
+//
+// `close` takes `&self` (not `self`) so the trait is object-safe —
+// `Box<dyn ExecutedStatementHandle>` is the C ABI's expected pattern.
+// Implementations make `close` idempotent: a second call is a no-op
+// success. Uses `#[async_trait]` for object safety until native async-fn
+// dyn-trait support stabilises.
 
-pub trait ExecutedStatementHandle {
+#[async_trait]
+pub trait ExecutedStatementHandle: Send + Sync {
     fn statement_id(&self) -> &str;
     async fn cancel(&self) -> Result<()>;
-    async fn close(self) -> Result<()>;
+    async fn close(&self) -> Result<()>;
 }
 
 
 // === ExecutedStatement (sync consumption) ===
 
-pub struct ExecutedStatement<'s> { /* statement_id, ResultStream */ }
+pub struct ExecutedStatement {
+    /* Arc<SessionInner>, statement_id, Arc<AtomicBool> validity, ResultStream */
+}
 
-impl<'s> ExecutedStatement<'s> {
-    pub fn statement_id(&self) -> &str;
-
+impl ExecutedStatement {
     /// Borrow the result stream. Non-consuming — JDBC/ODBC parity, the
     /// caller separates "done iterating" from "done with statement".
     pub fn result_stream(&self) -> &ResultStream;
     pub fn result_stream_mut(&mut self) -> &mut ResultStream;
-
-    pub async fn cancel(&self) -> Result<()>;
-    pub async fn close(self) -> Result<()>;
 }
+
+// `statement_id`, `cancel`, `close` come from `ExecutedStatementHandle`.
 
 
 // === ExecutedAsyncStatement (async consumption) ===
 
-pub struct ExecutedAsyncStatement<'s> { /* statement_id */ }
+pub struct ExecutedAsyncStatement {
+    /* Arc<SessionInner>, statement_id, Arc<AtomicBool> validity */
+}
 
-impl<'s> ExecutedAsyncStatement<'s> {
-    pub fn statement_id(&self) -> &str;
-
+impl ExecutedAsyncStatement {
     pub async fn status(&self) -> Result<StatementStatus>;
     pub async fn await_result(&self) -> Result<ResultStream>;
     pub async fn fetch_result(&self) -> Result<ResultStream>;
-
-    pub async fn cancel(&self) -> Result<()>;
-    pub async fn close(self) -> Result<()>;
 }
+
+// `statement_id`, `cancel`, `close` come from `ExecutedStatementHandle`.
 
 // Both ExecutedStatement and ExecutedAsyncStatement fire fire-and-forget
 // CloseStatement on Drop if close() wasn't called explicitly.
+//
+// Session also has impl Drop with fire-and-forget DeleteSession when the
+// last Arc<SessionInner> reference is dropped.
 ```
 
 **Typical flow:**
 
 ```rust
+use databricks_sql_kernel::ExecutedStatementHandle;  // brings cancel/close into scope
+
 let mut stmt = session.statement();
 stmt.spec()
     .sql("SELECT * FROM t WHERE id = ?")
-    .param(1, TypedValue::Int(42));
+    .param(1, TypedValue::Int(42))?;     // `param` is fallible (rejects ordinal 0)
 
-let exec = stmt.execute().await?;
-while let Some(batch) = exec.result_stream_mut().next_batch().await? { ... }
+let mut exec = stmt.execute().await?;
+while let Some(_batch) = exec.result_stream_mut().next_batch().await? { /* ... */ }
 exec.close().await?;
 
-// Re-execute with different params — spec persists, only param changes.
-stmt.spec().param(1, TypedValue::Int(43));
+// Re-execute with different params — spec persists; the prior executed
+// handle (above) was already closed when we returned to stmt.
+stmt.spec().param(1, TypedValue::Int(43))?;
 let exec = stmt.execute().await?;
 // ...
 ```
@@ -601,16 +728,188 @@ let exec = stmt.execute().await?;
 **Re-execute semantics.** When `execute()` or `submit()` is called on a
 `Statement` that has previously produced an executed handle:
 
-1. If the prior handle's server-side status is `Pending` or `Running`,
+1. Flip the prior handle's `Arc<AtomicBool>` validity flag to `false`.
+2. If the prior handle's server-side status is `Pending` or `Running`,
    send CancelStatement.
-2. Send CloseStatement to release server resources.
-3. Send the new ExecuteStatement (or submit) using the current
+3. Send CloseStatement to release server resources.
+4. Send the new ExecuteStatement (or submit) using the current
    `StatementSpec`.
 
-The prior handle, if still held by the caller, returns
-`ErrorCode::InvalidStatementHandle` on subsequent calls.
+A stale prior handle, if still held by the caller, returns
+`ErrorCode::InvalidStatementHandle` on subsequent calls — sourced from
+the validity flag, no network round-trip.
 
-**`Session::statement()`** continues to return `Statement<'_>`; the
-docstring is updated to clarify it is the mutable lifecycle owner whose
-spec the user mutates before executing.
+## A2. Identifier and LikePattern newtypes for Metadata
+
+ODBC metadata calls distinguish *identifiers* (exact catalog/schema/
+table/column names) from *LIKE patterns* (with `%` and `_` wildcards).
+The same `&str` shape conveys neither at the type level, leading to
+injection bugs and ambiguous escaping. The kernel surfaces the
+distinction with two newtypes:
+
+```rust
+pub struct Identifier<'a>(&'a str);     // exact name, backtick-escaped
+pub struct LikePattern<'a>(&'a str);   // LIKE pattern, wildcards preserved
+
+impl<'a> Identifier<'a>  { pub fn new(s: &'a str) -> Result<Self>; pub fn as_str(&self) -> &'a str; }
+impl<'a> LikePattern<'a> { pub fn new(s: &'a str) -> Result<Self>; pub fn as_str(&self) -> &'a str; pub fn all() -> Self; }
+```
+
+The lifetime is fine here: it spans only the call. Wrappers convert
+their host-language string to a Rust `String`, then construct the
+newtype borrowing it for the duration of the `await`. The lifetime
+never leaks into a stored type.
+
+Each `Metadata` method below is annotated for which params take which:
+
+| Method | catalog | schema | name | other |
+|---|---|---|---|---|
+| `list_catalogs()` | — | — | — | — |
+| `list_schemas` | `Identifier` | `LikePattern` (schema_pattern) | — | — |
+| `list_tables` | `Identifier` | `LikePattern` (schema_pattern) | `LikePattern` (table_pattern) | `Option<&[&str]>` table_types |
+| `list_columns` | `Identifier` | `LikePattern` (schema_pattern) | `LikePattern` (table_pattern) | `LikePattern` (column_pattern) |
+| `primary_keys` | `Identifier` (opt) | `Identifier` (opt) | `Identifier` (required) | — |
+| `foreign_keys` | `Identifier` × 2 sides | `Identifier` × 2 sides | `Identifier` × 2 sides | — |
+| `functions` | `Identifier` | `LikePattern` | `LikePattern` (name_pattern) | — |
+| `procedures` | `Identifier` | `LikePattern` | `LikePattern` (name_pattern) | — |
+| `type_info`, `table_types` | — | — | — | — |
+
+ODBC reference: `SQLPrimaryKeys` and `SQLForeignKeys` do not accept
+patterns; everything else does for the schema/name fields.
+
+## A3. ResultStream split: async batch + sync row cursor
+
+For a 10M-row scan, returning each row through
+`async fn next_row(&mut self) -> Future<Owned Row>` is expensive: each
+owned `Row` requires at least one heap allocation per row (~70M for a
+5-string-column query); each `Future` is a state machine the compiler
+may keep alive per row.
+
+The kernel splits the API:
+
+```rust
+pub struct Row<'a> { /* batch ref + row index */ }
+
+impl<'a> Row<'a> {
+    pub fn num_columns(&self) -> usize;
+    pub fn schema(&self) -> &Schema;
+    pub fn get_str(&self, col: usize) -> Result<Option<&'a str>>;     // borrowed
+    pub fn get_i64(&self, col: usize) -> Result<Option<i64>>;
+    pub fn get_f64(&self, col: usize) -> Result<Option<f64>>;
+    pub fn get_bool(&self, col: usize) -> Result<Option<bool>>;
+    pub fn get_bytes(&self, col: usize) -> Result<Option<&'a [u8]>>;  // borrowed
+    // … get_decimal, get_date, get_timestamp, …
+}
+
+impl ResultStream {
+    /// Async: pulls the next batch over the network, replaces the
+    /// internal buffer, resets the row cursor.
+    ///
+    /// Borrowed (zero-alloc per batch) and format-neutral (the
+    /// `#[non_exhaustive] enum ResultBatch` envelope keeps v1+
+    /// non-Arrow variants additive).
+    pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>>;
+
+    /// Sync: walks the already-fetched batch with O(1) array indexing.
+    /// Returns None when the current batch is exhausted; the caller
+    /// then awaits next_batch() to resume.
+    pub fn next_row_in_batch(&mut self) -> Option<Row<'_>>;
+
+    /// Free client-side resources (buffered chunks, link prefetcher,
+    /// in-flight downloaders). Local-only — no server RPC.
+    pub fn close(self);
+}
+```
+
+The hot loop:
+
+```rust
+while let Some(_batch) = stream.next_batch().await? {
+    while let Some(row) = stream.next_row_in_batch() {
+        process(row);   // zero allocation per row
+    }
+}
+```
+
+Network I/O happens once per batch (typically 10K rows). Within a
+batch the loop is tight, allocation-free, and CPU-cache-friendly.
+
+**No row-stream adapter in v0.** A signature like
+`fn into_rows(&mut self) -> impl Stream<Item = Result<Row<'_>>>` is a
+*lending stream* — `Stream::Item` cannot depend on `&mut self` of the
+producer, and the standard `futures::Stream` cannot express it. The
+realistic alternatives are (a) a custom public trait (own design
+exercise), or (b) yielding `OwnedRow` (re-introduces the per-row
+allocation we deliberately removed). v0 ships the dual
+`next_batch` / `next_row_in_batch` API; an adapter lands in a future
+PR once consumers ask for one and we know which trade-off they want.
+
+## A4. ResultConfig (renamed from CloudFetchConfig)
+
+The session config bucket previously named `CloudFetchConfig` is renamed
+to `ResultConfig`. CloudFetch is one knob among many that may land here
+— chunk-size hints, decompression strategy, max-row buffers, etc. The
+struct stays `#[non_exhaustive]`; today's CloudFetch fields are
+prefixed `cloudfetch_*` so the naming convention scales when other
+result-management knobs land.
+
+`SessionBuilder::cloudfetch(...)` is renamed to `SessionBuilder::result(...)`
+to match.
+
+## A5. Transactions deferred to v0.1
+
+`Session::set_autocommit` / `autocommit` / `commit` / `rollback` are
+**not** shipped in v0. The Databricks server-side semantics for
+autocommit (which sessions support it, what transaction isolation
+applies, how it interacts with concurrent statements on the same
+session) are still being settled. Shipping a signature now would lock
+the kernel into a shape we may need to break.
+
+The methods will be added once the server contract stabilises. The
+spec body's `// === Session ===` block above is superseded for these
+four methods only.
+
+## A6. `SessionBuilder::cloudfetch` → `SessionBuilder::result`
+
+(Folded into A4 — listed separately here for grep-ability of the
+builder rename.)
+
+## A7. `Session::statement()` returns `Statement` (no lifetime)
+
+(Folded into A1 — listed separately here for grep-ability of the
+signature change.)
+
+## A8. ErrorCode taxonomy expansion deferred to a later PR
+
+**Status:** tracked 2026-05-07 (R2-H8). Not blocking PR #3.
+
+The 13-variant `ErrorCode` enum in v0 is the spec body's literal list.
+Wrappers will need at least four more categories before they can map
+the kernel's errors to their host language's exception classes
+correctly:
+
+- `AlreadyExists` — DDL `CREATE TABLE` collisions (SQLSTATE `42710`),
+  distinct from generic `SqlError`.
+- `FailedPrecondition` — workspace state errors ("warehouse stopped",
+  "cluster terminating") that drivers retry differently from
+  `Unavailable`. Also the right home for "called `fetch_result` before
+  status reached `Succeeded`" (currently the docstring on
+  `ExecutedAsyncStatement::fetch_result` references this).
+- `Aborted` — transaction conflict / deadlock retry path. Lumping
+  into `Cancelled` breaks JDBC `SQLTransientException` mapping.
+- `Unimplemented` / `NotSupported` — kernel saying "this feature is
+  off in v0" (e.g., non-Arrow `ResultFormat`). Currently flattened
+  into `InvalidArgument`; wrappers can't distinguish "user error"
+  from "v0 limitation."
+
+A retry-category tri-state — `ErrorCode::category(&self) ->
+ErrorCategory::{Permanent, Transient, Security}` (or similar) — is
+also tracked here. Without it, every wrapper's retry policy is wrong
+in a different way.
+
+Deferred from PR #3 by design: the enum expansion is a public-API
+shape decision worth its own discussion thread. The current
+`ExecutedAsyncStatement::fetch_result` docstring uses
+`ErrorCode::InvalidArgument` as a placeholder until A8 lands and
+introduces the right variant.
 
