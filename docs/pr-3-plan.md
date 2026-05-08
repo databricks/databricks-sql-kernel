@@ -46,6 +46,41 @@ needing PR 4's `Statement` work to land first. Drivers (PySQL,
 Node.js, Go, future ODBC) drop their own metadata-reshaping code and
 consume the kernel's output as-is.
 
+### How "statement-free" actually works
+
+Metadata still executes SQL on the wire — `SHOW CATALOGS`, `SHOW
+TABLES`, etc. — but it does **not** go through the public `Statement`
+API. The split is:
+
+```
+Metadata::list_tables()
+  └─ session.transport.list_tables(...)         ← Transport (pub(crate))
+      └─ execute_and_read("SHOW TABLES ...")    ← already merged
+          └─ ExecuteResult { reader, statement_id, schema, … }
+              → ResultStream::from_reader(reader)
+                  → reshape adapter (Databricks Arrow → JDBC schema)
+                      → public ResultStream
+```
+
+`Transport::list_catalogs / list_schemas / list_tables / list_columns`
+already exist and already call `execute_and_read()` end-to-end (PR 1
+landed them as `pub(crate)`). What PR 3 adds at the transport layer
+is three peer methods (`list_primary_keys`, `list_foreign_keys`,
+`list_functions`) using the same pattern.
+
+Public `Statement` (`StatementBuilder`, `ExecutedStatement`, cancel,
+parameter binding, async polling, chunked-reader exposure) is what
+*callers* use to run **arbitrary** SQL. Metadata only needs fixed
+`SHOW`/`DESC` queries with no parameters, no caller-driven cancel,
+and no exposure of the underlying `ResultReader`. The kernel already
+has a complete internal execute pipeline at the `Transport` level —
+PR 3 reshapes its output and exposes the result via `ResultStream`.
+
+The `pub(crate) ResultStream::from_reader` adapter is the seam: it
+wraps a `Box<dyn ResultReader + Send>` (the same trait the
+`Transport` returns) into the public `ResultStream` type. PR 4 will
+also use it from the `Statement` path.
+
 ## 2. Why JDBC/ODBC-conforming output (not Databricks-native)
 
 The kernel exists to centralize code shared by all drivers. Metadata
