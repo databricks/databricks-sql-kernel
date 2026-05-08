@@ -872,14 +872,17 @@ clear it.
   callers to pass a `dyn TokenProvider` across the FFI boundary.
   Tracked as v0.1 work.
 - **`Drop` semantics for `SessionInner` use a `closed` AtomicBool.**
-  `Session::close()` flips the flag before awaiting `delete_session`;
-  `Drop` skips its fire-and-forget cleanup if the flag is already
-  set. This double-close protection works for the common case
-  (close-then-drop) but races could in principle let two `delete_session`
-  calls fire if `close()` is racing concurrent clones. Acceptable —
-  `delete_session` is idempotent server-side; the second call gets a
-  404 which is swallowed. Worth a closer look in PR 4 if the
-  Statement re-execute path stresses the same pattern.
+  `Session::close()` flips the flag **after** a successful
+  `delete_session` await — on `Err` or future cancellation the
+  flag stays `false` so `Drop`'s fire-and-forget retry path picks
+  up the slack and the server-side session doesn't leak (per
+  gopalldb's PR 6 review). Double-close protection works for the
+  common case (close-then-drop) but races could in principle let
+  two `delete_session` calls fire if `close()` is racing
+  concurrent clones. Acceptable — `delete_session` is idempotent
+  server-side; the second call gets a 404 which the SEA impl
+  swallows. Worth a closer look in PR 4 if the Statement
+  re-execute path stresses the same pattern.
 - **HTTP retry config is hardcoded to legacy defaults.** PR 2 wires
   the global `RetryConfig::default()` plus the auth-specific
   30s/3-retries override. The public `HttpConfig` doesn't expose

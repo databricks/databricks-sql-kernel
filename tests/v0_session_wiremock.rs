@@ -235,3 +235,52 @@ async fn malformed_http_path_surfaces_at_open() {
     assert_eq!(err.code, ErrorCode::InvalidArgument);
     assert!(err.message.contains("/not/a/sql/path"));
 }
+
+#[tokio::test]
+async fn connection_setter_clears_prior_http_path_parse_error() {
+    // Footgun guard: a prior failed `.http_path(...)` left a sentinel;
+    // a subsequent `.connection(...)` must clear it so `open()`
+    // doesn't reject the now-valid override.
+    let server = MockServer::start().await;
+    mock_create_session_returns(
+        &server,
+        200,
+        r#"{"session_id":"sess-after-override","warehouse_id":"test_wh"}"#,
+    )
+    .await;
+
+    let session = Session::builder()
+        .http_path("https://h", "/garbage")
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("override path"),
+        )
+        .auth(AuthConfig::Pat { token: "x".into() })
+        .open()
+        .await
+        .expect("override should win — open() must succeed");
+    assert_eq!(session.session_id(), "sess-after-override");
+}
+
+#[tokio::test]
+async fn http_path_setter_clears_prior_parse_error_on_success() {
+    // Symmetric: a prior failed `.http_path("/garbage")` followed by
+    // a successful `.http_path("/sql/1.0/warehouses/x")` should
+    // clear the sentinel.
+    let server = MockServer::start().await;
+    mock_create_session_returns(
+        &server,
+        200,
+        r#"{"session_id":"sess-recover","warehouse_id":"test_wh"}"#,
+    )
+    .await;
+
+    let session = Session::builder()
+        .http_path("https://h", "/garbage")
+        .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+        .auth(AuthConfig::Pat { token: "x".into() })
+        .open()
+        .await
+        .expect("recovery http_path call should clear the sentinel");
+    assert_eq!(session.session_id(), "sess-recover");
+}

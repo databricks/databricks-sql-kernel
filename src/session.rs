@@ -99,9 +99,14 @@ pub(crate) struct SessionInner {
     /// so log lines tied to a session are visibly grouped.
     log_span: Span,
 
-    /// Flips to `true` once [`Session::close`] has awaited the
-    /// `delete_session` call. Tells [`Drop`] to skip its
-    /// fire-and-forget cleanup so we don't double-fire.
+    /// Flips to `true` only after [`Session::close`] has
+    /// **successfully** awaited the `delete_session` call. Tells
+    /// [`Drop`] to skip its fire-and-forget cleanup so a successful
+    /// explicit close doesn't trigger a redundant retry. On `close`
+    /// returning `Err` (or being cancelled mid-await) the flag stays
+    /// `false`, so [`Drop`] retries via its fire-and-forget path —
+    /// transient `delete_session` failures don't leak the server-
+    /// side session.
     closed: std::sync::atomic::AtomicBool,
 }
 
@@ -276,25 +281,30 @@ impl Session {
     /// cleanup if `close()` wasn't called explicitly, but `close()`
     /// is the only way to *await* the result and surface a failure.
     ///
-    /// If the close swap succeeds, [`Drop`] sees the `closed` flag
-    /// and skips its own cleanup so we don't double-fire
-    /// `delete_session`. If a concurrent caller already invoked
-    /// `close()` (or it's the second call after the first set the
-    /// flag), this returns `Ok(())` without a wire call.
+    /// The `closed` flag flips **after** a successful `delete_session`
+    /// — only then does [`Drop`] skip its own cleanup. So:
+    ///
+    /// - On `Err`: flag stays false, [`Drop`]'s fire-and-forget
+    ///   retry path runs as a fallback so transient failures don't
+    ///   leak the server-side session.
+    /// - On future cancellation (e.g. `tokio::select!` losing a
+    ///   race): flag stays false, [`Drop`] picks up the slack.
+    /// - On `Ok`: flag flips, [`Drop`] is a no-op.
     pub async fn close(self) -> Result<()> {
-        // Race-free close: only one caller wins the flip.
-        let already_closed = self
-            .inner
-            .closed
-            .swap(true, std::sync::atomic::Ordering::AcqRel);
-        if already_closed {
+        // Bail early if a concurrent caller already finished a
+        // successful close — no point hitting the wire twice.
+        if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
         let _g = self.inner.log_span.clone().entered();
         self.inner
             .transport
             .delete_session(&self.inner.session_id)
-            .await
+            .await?;
+        self.inner
+            .closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 }
 
@@ -330,8 +340,14 @@ impl SessionBuilder {
     }
 
     /// Required: workspace host + warehouse identity.
+    ///
+    /// Clears any prior [`SessionBuilder::http_path`] parse error —
+    /// the user has explicitly overridden the connection identity, so
+    /// an old parse failure on a stale path should not block
+    /// [`SessionBuilder::open`].
     pub fn connection(mut self, conn: ConnectionConfig) -> Self {
         self.connection = Some(conn);
+        self.parse_error = None;
         self
     }
 

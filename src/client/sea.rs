@@ -418,13 +418,26 @@ impl Transport for SeaRestTransport {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
             })?;
 
-        // Ignore errors on session deletion (best effort cleanup)
-        let _ = self
+        // Best-effort cleanup. The HTTP client already retries the
+        // global Sea-category ceiling (900s / 5 attempts) before
+        // surfacing a final error here; once we're past that, the
+        // session was probably already torn down by an idle timeout
+        // or the network is hard down. Log so failures aren't
+        // invisible, but don't propagate — the caller has no
+        // useful recovery path.
+        if let Err(e) = self
             .http_client
             .execute(request, RequestType::CloseSession)
-            .await;
-
-        debug!("Deleted session: {}", session_id);
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "delete_session failed after HTTP retries; server-side session will be reclaimed by idle timeout"
+            );
+        } else {
+            debug!("Deleted session: {}", session_id);
+        }
 
         Ok(())
     }
