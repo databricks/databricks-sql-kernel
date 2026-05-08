@@ -176,6 +176,13 @@ pub struct ResultStream {
     /// Owned by the stream so the borrowed `&ResultBatch` stays valid
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
+
+    /// Flips to `true` once the wrapped reader returns its first
+    /// `None`. Subsequent `next_batch` calls short-circuit to
+    /// `Ok(None)` without re-entering the reader — saves a wasted
+    /// call on readers whose `next_batch` is non-trivial (CloudFetch
+    /// in particular checks state and may take a runtime tick).
+    exhausted: bool,
 }
 
 impl ResultStream {
@@ -195,6 +202,7 @@ impl ResultStream {
             reader,
             schema,
             current: None,
+            exhausted: false,
         })
     }
 
@@ -226,6 +234,9 @@ impl ResultStream {
     /// **forward-compatible** API the spec mandates; PR 5 swaps the
     /// body for a real async path without breaking callers.
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
+        if self.exhausted {
+            return Ok(None);
+        }
         match self.reader.next_batch()? {
             Some(rb) => {
                 self.current = Some(ResultBatch::Arrow(rb));
@@ -233,6 +244,7 @@ impl ResultStream {
             }
             None => {
                 self.current = None;
+                self.exhausted = true;
                 Ok(None)
             }
         }

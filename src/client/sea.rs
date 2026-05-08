@@ -750,12 +750,17 @@ impl Transport for SeaRestTransport {
         foreign_schema: &str,
         foreign_table: &str,
     ) -> Result<ExecuteResult> {
-        // Databricks `SHOW FOREIGN KEYS IN ...` is single-sided —
-        // it always queries the foreign-key-bearing table. The
-        // parent-side filter is applied client-side by the reshape
-        // layer (today: not yet wired; the result already includes
-        // the parent linkage, so wrappers can filter further if
-        // needed).
+        // ODBC `SQLForeignKeys` and JDBC `getImportedKeys` /
+        // `getCrossReference` collapse into one Transport call here:
+        // the foreign side identifies the table, the parent side (if
+        // provided) is a post-fetch filter on the result's `parent*`
+        // columns. Databricks `SHOW FOREIGN KEYS IN ...` is
+        // server-side single-sided — it queries by the foreign
+        // (FK-bearing) table only and returns the parent linkage as
+        // result columns. The kernel passes those columns through
+        // unchanged; wrappers narrow on `parentCatalogName` /
+        // `parentNamespace` / `parentTableName` if the caller
+        // provided a parent-side filter.
         let sql = SqlCommandBuilder::build_show_foreign_keys(
             foreign_catalog,
             foreign_schema,
