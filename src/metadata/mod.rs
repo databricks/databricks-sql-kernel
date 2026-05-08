@@ -23,5 +23,8 @@
 //! `crate::adbc::metadata_builder` and is gated on the `legacy-adbc` feature.
 
 pub mod parse;
+pub(crate) mod schemas;
+pub(crate) mod shape;
 pub mod sql;
+pub(crate) mod static_data;
 pub mod type_mapping;

@@ -283,7 +283,14 @@ impl ResultReaderFactory {
 }
 
 /// Trait for result readers.
-pub trait ResultReader: Send {
+///
+/// Readers are `Send + Sync` so a `Box<dyn ResultReader>` can live
+/// inside a `Send + !Sync` public handle (`ResultStream` /
+/// `ExecutedStatement`) and still satisfy the `&self`-future-is-Send
+/// expectation of `async_trait` methods on the surrounding
+/// `ExecutedStatementHandle`. Practically every existing impl is
+/// already Sync (their state is `Arc`s or owned `Vec`s).
+pub trait ResultReader: Send + Sync {
     /// Get the schema of the result.
     fn schema(&self) -> Result<SchemaRef>;
 
@@ -345,6 +352,116 @@ impl ResultReader for InlineArrowReader {
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
     }
+}
+
+/// In-memory result reader.
+///
+/// Yields a fixed `Vec<RecordBatch>` from memory, one batch per call
+/// to [`InMemoryReader::next_batch`]. Backs the static
+/// `Metadata::type_info` and `Metadata::table_types` streams — both
+/// return data without ever touching the wire.
+pub struct InMemoryReader {
+    schema: SchemaRef,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl InMemoryReader {
+    /// Build a reader over the given batches. The schema is taken
+    /// from the caller (rather than inferred from the first batch)
+    /// so an empty `batches` slice still produces a typed empty
+    /// stream.
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into_iter(),
+        }
+    }
+}
+
+impl ResultReader for InMemoryReader {
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(self.batches.next())
+    }
+}
+
+/// Reader that reshapes each `RecordBatch` from an inner reader
+/// through a caller-supplied function.
+///
+/// Used by `Metadata::*` to translate Databricks' raw
+/// `SHOW CATALOGS` / `SHOW TABLES` / etc. shape into the JDBC/ODBC
+/// columns the kernel exposes. The reshape closure runs lazily
+/// per-batch — large metadata results stream without buffering.
+///
+/// The schema is computed eagerly at construction by reshaping a
+/// zero-row batch built from the inner reader's schema, so
+/// [`ResultReader::schema`] is non-fallible for the wrapped stream.
+pub struct ReshapingReader<F>
+where
+    F: Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+{
+    inner: Box<dyn ResultReader>,
+    reshape: F,
+    schema: SchemaRef,
+}
+
+impl<F> ReshapingReader<F>
+where
+    F: Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+{
+    /// Build a reshaping reader. Computes the post-reshape schema
+    /// eagerly by running `reshape` against a zero-row batch — the
+    /// schema must be available before the first `next_batch` call
+    /// to satisfy [`crate::result_stream::ResultStream::schema`].
+    ///
+    /// Returns the reshape closure's error (e.g.
+    /// `InvalidArgument`) if the input schema is malformed —
+    /// surfaced at call time rather than buried inside the first
+    /// `next_batch().await`.
+    pub fn new(inner: Box<dyn ResultReader>, reshape: F) -> Result<Self> {
+        let inner_schema = inner.schema()?;
+        let probe = empty_batch(&inner_schema)?;
+        let reshaped = reshape(probe)?;
+        let schema = reshaped.schema();
+        Ok(Self {
+            inner,
+            reshape,
+            schema,
+        })
+    }
+}
+
+impl<F> ResultReader for ReshapingReader<F>
+where
+    F: Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+{
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.inner.next_batch()? {
+            Some(rb) => Ok(Some((self.reshape)(rb)?)),
+            None => Ok(None),
+        }
+    }
+}
+
+/// Build a zero-row `RecordBatch` matching the given schema. Used
+/// internally to probe a reshape function for its output schema
+/// before any real data has been pulled.
+fn empty_batch(schema: &SchemaRef) -> Result<RecordBatch> {
+    let columns: Vec<arrow_array::ArrayRef> = schema
+        .fields()
+        .iter()
+        .map(|f| arrow_array::new_empty_array(f.data_type()))
+        .collect();
+    RecordBatch::try_new(schema.clone(), columns).map_err(|e| {
+        Error::invalid_state().message(format!("Failed to build empty probe batch: {e}"))
+    })
 }
 
 /// Empty reader for queries with no results.

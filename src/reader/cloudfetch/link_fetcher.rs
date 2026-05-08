@@ -691,6 +691,42 @@ mod tests {
                 .await
         }
 
+        async fn list_functions(
+            &self,
+            _session_id: &str,
+            _catalog: Option<&str>,
+            _schema_pattern: Option<&str>,
+            _function_pattern: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
+        async fn list_primary_keys(
+            &self,
+            _session_id: &str,
+            _catalog: &str,
+            _schema: &str,
+            _table: &str,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
+        async fn list_foreign_keys(
+            &self,
+            _session_id: &str,
+            _parent_catalog: Option<&str>,
+            _parent_schema: Option<&str>,
+            _parent_table: Option<&str>,
+            _foreign_catalog: &str,
+            _foreign_schema: &str,
+            _foreign_table: &str,
+        ) -> Result<ExecuteResult> {
+            self.execute_statement("", "", &ExecuteParams::default())
+                .await
+        }
+
         fn list_table_types(&self) -> Vec<String> {
             vec!["TABLE".to_string()]
         }

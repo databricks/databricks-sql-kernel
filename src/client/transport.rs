@@ -238,10 +238,6 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// Uses `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`.
     /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
     /// When catalog is empty string, returns empty result.
-    #[allow(
-        dead_code,
-        reason = "wired into the v0 Metadata::procedures call in PR 3"
-    )]
     async fn list_procedures(
         &self,
         session_id: &str,
@@ -258,7 +254,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// When catalog is empty string, returns empty result.
     #[allow(
         dead_code,
-        reason = "wired into the v0 Metadata::procedures call in PR 3"
+        reason = "kept for legacy ADBC FFI compatibility; v0 Metadata does not expose procedure columns"
     )]
     async fn list_procedure_columns(
         &self,
@@ -267,6 +263,47 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         schema_pattern: Option<&str>,
         procedure_pattern: Option<&str>,
         column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List functions, optionally filtered by catalog, schema pattern, and function name pattern.
+    ///
+    /// Uses `information_schema.routines` filtered by `routine_type = 'FUNCTION'`.
+    /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
+    async fn list_functions(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        function_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List primary-key columns for the given table. Catalog, schema,
+    /// and table are required (Databricks `SHOW KEYS` requires full
+    /// qualification).
+    async fn list_primary_keys(
+        &self,
+        session_id: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<ExecuteResult>;
+
+    /// List foreign-key columns referencing the given table. The
+    /// foreign side is required; the parent side is optional (matches
+    /// "any parent" when omitted).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "JDBC `getImportedKeys` / ODBC `SQLForeignKeys` mandates this surface"
+    )]
+    async fn list_foreign_keys(
+        &self,
+        session_id: &str,
+        parent_catalog: Option<&str>,
+        parent_schema: Option<&str>,
+        parent_table: Option<&str>,
+        foreign_catalog: &str,
+        foreign_schema: &str,
+        foreign_table: &str,
     ) -> Result<ExecuteResult>;
 
     /// List supported table types (static, no SQL executed).

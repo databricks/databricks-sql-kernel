@@ -704,6 +704,73 @@ impl Transport for SeaRestTransport {
         .await
     }
 
+    async fn list_functions(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        function_pattern: Option<&str>,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_get_functions(catalog, schema_pattern, function_pattern);
+        debug!("list_functions: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
+    async fn list_primary_keys(
+        &self,
+        session_id: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_show_primary_keys(catalog, schema, table);
+        debug!("list_primary_keys: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
+    async fn list_foreign_keys(
+        &self,
+        session_id: &str,
+        _parent_catalog: Option<&str>,
+        _parent_schema: Option<&str>,
+        _parent_table: Option<&str>,
+        foreign_catalog: &str,
+        foreign_schema: &str,
+        foreign_table: &str,
+    ) -> Result<ExecuteResult> {
+        // Databricks `SHOW FOREIGN KEYS IN ...` is single-sided —
+        // it always queries the foreign-key-bearing table. The
+        // parent-side filter is applied client-side by the reshape
+        // layer (today: not yet wired; the result already includes
+        // the parent linkage, so wrappers can filter further if
+        // needed).
+        let sql = SqlCommandBuilder::build_show_foreign_keys(
+            foreign_catalog,
+            foreign_schema,
+            foreign_table,
+        );
+        debug!("list_foreign_keys: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
     fn list_table_types(&self) -> Vec<String> {
         vec![
             "SYSTEM TABLE".to_string(),
