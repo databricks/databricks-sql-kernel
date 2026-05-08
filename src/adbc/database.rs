@@ -914,10 +914,7 @@ impl adbc_core::Database for Database {
         // 2. Wrap in Arc<SeaRestTransport>, coerce to Arc<dyn Transport>
         // 3. Create ResultReaderFactory with that Arc
         // 4. Set the factory on SeaRestTransport via OnceLock::set()
-        let client_config = TransportConfig {
-            cloudfetch_config: self.cloudfetch_config.clone(),
-            ..Default::default()
-        };
+        let client_config = TransportConfig::default();
         let sea_client = Arc::new(SeaRestTransport::new(
             http_client.clone(),
             host,

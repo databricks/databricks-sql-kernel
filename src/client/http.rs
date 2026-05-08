@@ -266,9 +266,9 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
-        let client = builder
-            .build()
-            .map_err(|e| Error::io().message(format!("Failed to create HTTP client: {}", e)))?;
+        let client = builder.build().map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
+        })?;
 
         Ok(Self {
             client,
@@ -392,9 +392,9 @@ impl DatabricksHttpClient {
                 req_builder = req_builder.body(body.clone());
             }
 
-            let request = req_builder
-                .build()
-                .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            let request = req_builder.build().map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
             debug!(
                 "{:?}: {} {} (attempt {}/{})",
@@ -441,7 +441,7 @@ impl DatabricksHttpClient {
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
-                            return Err(Error::io().message(format!(
+                            return Err(Error::from_http_status(status.as_u16()).message(format!(
                                 "HTTP {} — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 status.as_u16(),
                                 attempts,
@@ -472,7 +472,7 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         status.as_u16()
                     );
-                    return Err(Error::io().message(format!(
+                    return Err(Error::from_http_status(status.as_u16()).message(format!(
                         "HTTP {} - {}",
                         status.as_u16(),
                         error_body
@@ -490,7 +490,7 @@ impl DatabricksHttpClient {
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
-                            return Err(Error::io().message(format!(
+                            return Err(Error::network_error().message(format!(
                                 "HTTP request failed — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 attempts,
                                 elapsed.as_secs_f64(),
@@ -518,7 +518,7 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         e
                     );
-                    return Err(Error::io().message(format!(
+                    return Err(Error::network_error().message(format!(
                         "HTTP request failed after {} attempts: {}",
                         attempts,
                         last_error.unwrap_or_else(|| e.to_string())

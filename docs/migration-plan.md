@@ -793,40 +793,42 @@ clear it.
 
 ### From PR 1 (Foundations)
 
-- **Drop `#![allow(dead_code)]` at the top of `src/client/transport.rs`.**
-  Added in PR 1 because `TransportConfig`, `SessionInfo`,
-  `ChunkLinkFetchResult::end_of_stream`, and the
-  `next_chunk_index` / `cloudfetch_config` fields aren't reached
-  from the v0 path yet under the default feature build. PR 2's
-  `Session::open` wires them; remove the file-level allow at that
-  point and let rustc reverify.
+- **~~Drop `#![allow(dead_code)]` at the top of `src/client/transport.rs`.~~**
+  Done in PR 2. Removed the file-level allow; the `cloudfetch_config`
+  field on `TransportConfig` was actually dead (never read by either
+  the legacy or v0 path) and got deleted; remaining `#[allow(dead_code)]`
+  attributes on `list_procedures` / `list_procedure_columns` /
+  `ChunkLinkFetchResult::end_of_stream` / `next_chunk_index` carry
+  per-item `reason = "wired into ... in PR N"` so each is independently
+  greppable at cleanup time.
+- **~~Triage `Error::io()` call sites.~~** Done in PR 2.
+  `client/http.rs`'s response-status arms now call
+  `Error::from_http_status(s)` (typed code + `retryable=true` for the
+  retryable codes); body-read / TCP failures use
+  `Error::network_error()`; URL/header build failures use
+  `Error::invalid_argument()`. `client/sea.rs`'s `Error::io()` calls
+  triaged similarly: build-request → `invalid_argument`, body-read →
+  `network_error`, parse-response → `data_loss`, statement timeout →
+  `timeout`. The `Error::io()` constructor stays in `kernel_error`
+  for callers that genuinely want "I/O" without a more specific
+  category; today nothing inside the kernel uses it.
+- **~~Wiremock end-to-end test for the HTTP status → `ErrorCode`
+  mapping.~~** Done in PR 2 (`tests/v0_session_wiremock.rs`). 13
+  tests cover 200 / 400 / 401 / 403 / 404 / 429 / 500 / 503 / 504
+  via `Session::open` end-to-end, plus builder validation
+  (missing required fields, malformed http_path).
 - **Drop `#[allow(dead_code, …)]` on `SeaChunkLinkFetcher::has_link`
-  / `get_link` / `all_links_fetched`.** Same reason; PR 2 wires the
-  v0 result-stream plumbing through these. The annotations carry a
-  `reason = "wired into the v0 path in PR 2"` so they're easy to
-  grep for at cleanup time.
+  / `get_link` / `all_links_fetched`.** Originally tagged for PR 2,
+  but on closer inspection these public methods aren't reached even
+  under PR 2's `ResultReaderFactory` wiring — the *fields* are read
+  via direct field access (`self.all_links_fetched.load(...)`), not
+  these accessor methods. Either delete the methods (likely) or wire
+  them in PR 4's ResultStream surface. Deferred to PR 4.
 - **Drop `#[allow(dead_code, …)]` on `SqlCommandBuilder::escape_sql_string`,
   `resolve_catalog_prefix`, `build_get_procedures`,
   `build_get_procedure_columns` in `src/metadata/sql.rs`.** Reached
   only under feature `metadata-ffi` today. PR 3's `Metadata`
   wiring calls these from the v0 path; drop the allows there.
-- **Triage `Error::io()` call sites.** PR 1 introduced `Error::io()`
-  as a sibling of `Error::network_error()`. Today it maps to
-  `ErrorCode::Internal`; many of the call sites that currently use
-  `Error::io()` for HTTP body-read / TCP handshake failures should
-  use `Error::network_error()` instead so wrappers see a retryable
-  `NetworkError` (with `retryable=true`) rather than a non-retryable
-  `Internal`. PR 2 (Session) is the natural home for this triage —
-  it owns the HTTP path, and it's where retry policy meets the typed
-  error model.
-- **Wiremock end-to-end test for the HTTP status → `ErrorCode`
-  mapping.** PR 1 added unit tests for `Error::from_http_status`
-  but did **not** add a wiremock test that drives a real
-  `Transport::*` call against a stubbed Databricks server and
-  asserts the mapped `ErrorCode`. PR 2 should ship that test as
-  part of `Session::open`'s wiremock coverage — `Session::open` is
-  the natural place to exercise 401/403/503/429 responses end to
-  end.
 - **Refine the legacy `kernel_error::Error → adbc_core::error::Error`
   status mapping.** PR 1 maps `ResourceExhausted`, `Unavailable`,
   `NetworkError` → `adbc_core::Status::IO` and `SqlError` →
@@ -849,8 +851,55 @@ clear it.
   `pub use SeaChunkLinkFetcher` re-export from
   `src/reader/cloudfetch/mod.rs` because the type is now
   `pub(crate)`. No external callers touched it — the symbol was
-  only ever surfaced for in-crate convenience. PR 2 may want to
+  only ever surfaced for in-crate convenience. PR 4 may want to
   restore a `pub(crate)` re-export if the v0 wiring grows a need.
+
+### From PR 2 (Session)
+
+- **`SessionBuilder::http_path` defers parse errors to `open()`.** PR 2
+  stores a `parse_error: Option<String>` sentinel on the builder
+  rather than returning a `Result` from the setter (which would
+  break the fluent infallible-builder pattern). The error surfaces
+  on `open()`. An alternative would be a fallible builder that
+  short-circuits via `Result<SessionBuilder, Error>` chaining, but
+  that's a larger ergonomic shift. Reconsider if/when other setters
+  grow validation.
+- **`AuthConfig::OAuthFederation` and `AuthConfig::External` are
+  reserved.** PR 2 defines the field shape but `Session::open`
+  rejects both with `InvalidArgument`. OAuthFederation needs the
+  actual RFC 8693 token-exchange flow implementation in
+  `auth/oauth/`. `External` needs the C ABI to surface a way for
+  callers to pass a `dyn TokenProvider` across the FFI boundary.
+  Tracked as v0.1 work.
+- **`Drop` semantics for `SessionInner` use a `closed` AtomicBool.**
+  `Session::close()` flips the flag **after** a successful
+  `delete_session` await — on `Err` or future cancellation the
+  flag stays `false` so `Drop`'s fire-and-forget retry path picks
+  up the slack and the server-side session doesn't leak (per
+  gopalldb's PR 6 review). Double-close protection works for the
+  common case (close-then-drop) but races could in principle let
+  two `delete_session` calls fire if `close()` is racing
+  concurrent clones. Acceptable — `delete_session` is idempotent
+  server-side; the second call gets a 404 which the SEA impl
+  swallows. Worth a closer look in PR 4 if the Statement
+  re-execute path stresses the same pattern.
+- **HTTP retry config is hardcoded to legacy defaults.** PR 2 wires
+  the global `RetryConfig::default()` plus the auth-specific
+  30s/3-retries override. The public `HttpConfig` doesn't expose
+  retry knobs; if a wrapper needs to tune retries (e.g. a tighter
+  ceiling for interactive UIs), they'd need to land later. Captured
+  as a follow-up for whichever PR exposes `HttpConfig` retry fields.
+- **`Session::statement()` and `Session::metadata()` return handles
+  whose methods still `unimplemented!()`.** Those bodies land in PRs
+  4 and 3 respectively. Today calling either returns a constructable
+  handle that panics on use — wrappers won't hit this in the typical
+  flow because they don't call those handles' methods until the
+  feature lands.
+- **No `tracing::Span::enter` on most `Session` methods yet.**
+  `close()` enters the per-session span. Other methods land in PRs
+  3-4 and need to enter the span explicitly so log lines tied to a
+  session are visibly grouped (matches the legacy ADBC layer's
+  `_log_span` pattern).
 
 ## 8. Estimated scope
 

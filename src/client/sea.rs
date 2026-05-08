@@ -143,7 +143,9 @@ impl SeaRestTransport {
             .inner()
             .request(Method::GET, &url)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         let response = self
             .http_client
@@ -152,13 +154,12 @@ impl SeaRestTransport {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let sea_response: StatementExecutionResponse =
             serde_json::from_str(&body).map_err(|e| {
-                Error::io().message(format!(
-                    "Failed to parse status response: {} - body: {}",
-                    e, body
+                Error::data_loss().message(format!(
+                    "Failed to parse status response: {e} - body: {body}"
                 ))
             })?;
 
@@ -231,7 +232,7 @@ impl SeaRestTransport {
                 }
                 StatementState::Pending | StatementState::Running => {
                     if start.elapsed() > self.config.poll_timeout {
-                        return Err(Error::io().message("Statement execution timed out"));
+                        return Err(Error::timeout().message("Statement execution timed out"));
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
@@ -284,19 +285,20 @@ impl SeaRestTransport {
             .header("Content-Type", "application/json")
             .json(&request_body)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         let response = self.http_client.execute(request, request_type).await?;
         let body = response
             .text()
             .await
-            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let sea_response: StatementExecutionResponse =
             serde_json::from_str(&body).map_err(|e| {
-                Error::io().message(format!(
-                    "Failed to parse execute response: {} - body: {}",
-                    e, body
+                Error::data_loss().message(format!(
+                    "Failed to parse execute response: {e} - body: {body}"
                 ))
             })?;
 
@@ -376,7 +378,9 @@ impl Transport for SeaRestTransport {
             .header("Content-Type", "application/json")
             .json(&request_body)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         let response = self
             .http_client
@@ -385,12 +389,11 @@ impl Transport for SeaRestTransport {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let session_response: CreateSessionResponse = serde_json::from_str(&body).map_err(|e| {
-            Error::io().message(format!(
-                "Failed to parse session response: {} - body: {}",
-                e, body
+            Error::data_loss().message(format!(
+                "Failed to parse session response: {e} - body: {body}"
             ))
         })?;
 
@@ -411,15 +414,30 @@ impl Transport for SeaRestTransport {
             .inner()
             .request(Method::DELETE, &url)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
-        // Ignore errors on session deletion (best effort cleanup)
-        let _ = self
+        // Best-effort cleanup. The HTTP client already retries the
+        // global Sea-category ceiling (900s / 5 attempts) before
+        // surfacing a final error here; once we're past that, the
+        // session was probably already torn down by an idle timeout
+        // or the network is hard down. Log so failures aren't
+        // invisible, but don't propagate — the caller has no
+        // useful recovery path.
+        if let Err(e) = self
             .http_client
             .execute(request, RequestType::CloseSession)
-            .await;
-
-        debug!("Deleted session: {}", session_id);
+            .await
+        {
+            tracing::warn!(
+                session_id = %session_id,
+                error = %e,
+                "delete_session failed after HTTP retries; server-side session will be reclaimed by idle timeout"
+            );
+        } else {
+            debug!("Deleted session: {}", session_id);
+        }
 
         Ok(())
     }
@@ -456,7 +474,9 @@ impl Transport for SeaRestTransport {
             .inner()
             .request(Method::GET, &url)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         let response = self
             .http_client
@@ -465,12 +485,11 @@ impl Transport for SeaRestTransport {
         let body = response
             .text()
             .await
-            .map_err(|e| Error::io().message(format!("Failed to read response: {}", e)))?;
+            .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let chunks_response: GetChunksResponse = serde_json::from_str(&body).map_err(|e| {
-            Error::io().message(format!(
-                "Failed to parse chunks response: {} - body: {}",
-                e, body
+            Error::data_loss().message(format!(
+                "Failed to parse chunks response: {e} - body: {body}"
             ))
         })?;
 
@@ -523,7 +542,9 @@ impl Transport for SeaRestTransport {
             .inner()
             .request(Method::POST, &url)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         self.http_client
             .execute(request, RequestType::CancelStatement)
@@ -544,7 +565,9 @@ impl Transport for SeaRestTransport {
             .inner()
             .request(Method::DELETE, &url)
             .build()
-            .map_err(|e| Error::io().message(format!("Failed to build request: {}", e)))?;
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
 
         // Ignore errors on statement close (best effort cleanup)
         let _ = self
