@@ -318,15 +318,21 @@ exercises `Session` end-to-end without needing PR 4 to land first.
   corresponding `Transport::list_*` (existing) or a new
   `Transport::list_primary_keys` / `list_foreign_keys` /
   `list_functions` / `list_type_info` / `list_table_types` method.
-- The four metadata calls `client/sea.rs` doesn't have today
-  (`primary_keys`, `foreign_keys`, `functions`, `type_info`) are
-  added as new SQL builders in `metadata/sql.rs` against
-  `information_schema.*` and wired through `Transport`.
-- The result schema for each method matches the ODBC contract
-  (`SQLPrimaryKeys`, `SQLForeignKeys`, …). The schema-fixing logic
-  that `src/adbc/metadata_builder.rs` does today moves into
-  `metadata/parse.rs` so it's reused from both the legacy ADBC
-  layer and the new `Metadata` API.
+- The three metadata calls `client/sea.rs` doesn't have today
+  (`primary_keys`, `foreign_keys`, `functions`) are added as new
+  builders in `metadata/sql.rs` (`SHOW KEYS`, `SHOW FOREIGN KEYS`,
+  `information_schema.routines`) and wired through `Transport`.
+- **The kernel does not reshape the result.** `Metadata::list_*`
+  passes the server-shaped Arrow batch (`catalog`, `databaseName`,
+  `catalogName`, `namespace`, `tableName`, `col_name`, `keySeq`,
+  `constraintName`, …) through to `ResultStream` verbatim. Driver
+  wrappers (PySQL, Node) consume the server columns directly today;
+  JDBC and ODBC drivers already maintain a rename layer
+  (`MetadataResultConstants` / `metadata_transformer.cpp`) and
+  continue to use it. Two static methods (`type_info` /
+  `table_types`) have no server-native shape and are synthesised
+  in-memory using the JDBC `getTypeInfo` / `getTableTypes` schemas;
+  see `src/metadata/schemas.rs`.
 - A thin `ResultStream::from_reader(Box<dyn ResultReader>)` adapter
   lands here — metadata results today fit in one batch from inline
   Arrow, so this is the smallest `ResultStream` body that works.
@@ -665,8 +671,14 @@ mechanism:
 - After PR 2, `src/adbc/database.rs` *can* reuse
   `ConnectionConfig::from_http_path` for its own option-parsing —
   optional but reduces duplication.
-- After PR 3, `src/adbc/connection.rs::get_objects` delegates to
-  `Metadata::list_*` and reshapes the result.
+- After PR 3, `src/adbc/connection.rs::get_objects` keeps using its
+  existing pipeline (calls `Transport::list_*` directly and reshapes
+  into the ADBC nested `get_objects` table) — `Metadata::list_*`
+  doesn't reshape, so delegating through it would just throw away
+  work the legacy path then has to redo. Both pipelines share the
+  same `Transport` / `metadata::sql` plumbing; the legacy
+  `parse_*`/`metadata_builder` family goes away in PR 7 alongside
+  the rest of `src/adbc/`.
 - After PR 4, `src/adbc/statement.rs::execute` delegates to
   `Statement::execute()` via a thin shim. The legacy `bind` /
   `bind_stream` / `prepare` surface lowers to `TypedValue`s.

@@ -15,10 +15,36 @@
 //! `Metadata` — flat per-method catalog metadata API.
 //!
 //! Per `docs/spec-v0.md` "Metadata", the kernel exposes one method per
-//! ODBC metadata call. Each returns a `ResultStream` whose schema
-//! matches the corresponding ODBC SQLProcedures / SQLTables / SQLColumns
-//! / etc. contract. Drivers stop reimplementing the SHOW-CATALOGS /
-//! SHOW-TABLES plumbing — the kernel owns it.
+//! ODBC metadata call. The kernel **does not reshape** the returned
+//! columns — it issues the appropriate `SHOW` / `information_schema`
+//! query and exposes the server-shaped Arrow batch verbatim through
+//! a `ResultStream`. PySQL and Node consume those batches directly;
+//! JDBC and ODBC drivers translate to their respective spec column
+//! names (a rename layer they already maintain).
+//!
+//! The kernel owns the **wire plumbing**: SQL building, retry,
+//! cancellation, paging, schema discovery, error mapping. It does
+//! **not** own the JDBC/ODBC column-name contract.
+//!
+//! Server-shape examples (subject to change with DBR; see
+//! `docs/migration-plan.md`):
+//!
+//! - `list_catalogs` → `catalog: Utf8`
+//! - `list_schemas` → `databaseName: Utf8` (+ `catalog: Utf8` when
+//!   `SHOW SCHEMAS IN ALL CATALOGS`)
+//! - `list_tables` → `catalogName, namespace, tableName, tableType,
+//!   isTemporary, information?, remarks?`
+//! - `list_columns` → `col_name, catalogName?, namespace, tableName,
+//!   columnType, columnSize?, …`
+//! - `primary_keys` / `foreign_keys` → `catalogName, namespace,
+//!   tableName, col_name, keySeq, constraintName, constraintType,
+//!   parentCatalogName, parentNamespace, parentTableName,
+//!   parentColName, updateRule, deleteRule, deferrability`
+//! - `procedures` / `functions` → `routine_catalog, routine_schema,
+//!   routine_name, comment, specific_name`
+//! - `type_info` / `table_types` → no server-native shape; the
+//!   kernel synthesises results using the JDBC `getTypeInfo` /
+//!   `getTableTypes` schemas (see [`crate::metadata::schemas`]).
 //!
 //! ## Identifier vs LIKE pattern
 //!
@@ -45,9 +71,7 @@
 //! addendum A2 for the rationale.
 
 use crate::kernel_error::{Error, Result};
-use crate::metadata::shape;
 use crate::metadata::static_data;
-use crate::reader::ReshapingReader;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use std::sync::Arc;
@@ -183,6 +207,8 @@ impl Metadata {
     }
 
     /// All catalogs visible to the session.
+    ///
+    /// Server shape: `catalog: Utf8`.
     pub async fn list_catalogs(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         let raw = self
@@ -190,40 +216,45 @@ impl Metadata {
             .transport()
             .list_catalogs(self.session.session_id())
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_catalogs)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
+    ///
+    /// Server shape: `databaseName: Utf8`. When `catalog` is `None`
+    /// (`SHOW SCHEMAS IN ALL CATALOGS`), an additional `catalog:
+    /// Utf8` column is present. Wrappers that need a uniform shape
+    /// should add the catalog column themselves from the requested
+    /// `catalog` argument when omitted.
     pub async fn list_schemas(
         &self,
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
-        let catalog_str = catalog.as_ref().map(|i| i.as_str());
         let raw = self
             .session
             .transport()
             .list_schemas(
                 self.session.session_id(),
-                catalog_str,
+                catalog.as_ref().map(|i| i.as_str()),
                 schema_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        // SHOW SCHEMAS IN `catalog` returns rows without the catalog
-        // column; supply the queried catalog as the fallback so the
-        // JDBC TABLE_CATALOG column is populated correctly.
-        let fallback = catalog_str.map(|s| s.to_string());
-        let reader = ReshapingReader::new(raw.reader, move |raw| {
-            shape::reshape_schemas(raw, fallback.as_deref())
-        })?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
-    /// (pattern), and an optional list of table types (e.g.
-    /// `["TABLE", "VIEW"]`).
+    /// (pattern).
+    ///
+    /// Server shape: `catalogName, namespace, tableName, tableType,
+    /// isTemporary, information?, remarks?`.
+    ///
+    /// `table_types` is an **advisory** filter — Databricks `SHOW
+    /// TABLES` does not honour it server-side, so the kernel passes
+    /// it through unchanged. Wrappers that need to narrow by
+    /// `tableType` apply the filter on the returned `tableType`
+    /// column.
     pub async fn list_tables(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -243,17 +274,15 @@ impl Metadata {
                 table_types,
             )
             .await?;
-        // Capture an owned filter for the post-fetch table_types narrowing.
-        let filter: Option<Vec<String>> =
-            table_types.map(|t| t.iter().map(|s| s.to_string()).collect());
-        let reader = ReshapingReader::new(raw.reader, move |raw| {
-            shape::reshape_tables(raw, filter.as_deref())
-        })?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Columns of tables matching the filter. Catalog is exact;
     /// schema / table / column are patterns.
+    ///
+    /// Server shape: `col_name, catalogName?, namespace, tableName,
+    /// columnType, columnSize?, decimalDigits?, radix?, isNullable?,
+    /// remarks?, ordinalPosition?, isAutoIncrement?, isGenerated?`.
     ///
     /// Catalog is **required**: Databricks `SHOW COLUMNS` does not
     /// support an "all catalogs" form. `None` returns
@@ -282,17 +311,24 @@ impl Metadata {
                 column_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_columns)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Primary keys for the given table. All three identifiers are
     /// exact names — ODBC SQLPrimaryKeys does not support patterns.
     ///
-    /// Catalog and schema are required at the kernel layer: Databricks
-    /// `SHOW KEYS` needs `IN CATALOG / IN SCHEMA / IN TABLE` qualified
-    /// fully. Wrappers that want to fall back to a session default
-    /// should resolve it before calling.
+    /// Server shape (Databricks `SHOW KEYS`): `catalogName,
+    /// namespace, tableName, col_name, keySeq, constraintName,
+    /// constraintType, parentCatalogName, parentNamespace,
+    /// parentTableName, parentColName, updateRule, deleteRule,
+    /// deferrability`. Wrappers filter `constraintType =
+    /// 'PRIMARY KEY'` to isolate the PK rows from the FK rows the
+    /// server returns alongside.
+    ///
+    /// Catalog and schema are required at the kernel layer:
+    /// Databricks `SHOW KEYS` needs `IN CATALOG / IN SCHEMA / IN
+    /// TABLE` fully qualified. Wrappers that want to fall back to a
+    /// session default should resolve it before calling.
     pub async fn primary_keys(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -316,8 +352,7 @@ impl Metadata {
                 table.as_str(),
             )
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_primary_keys)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
@@ -328,6 +363,9 @@ impl Metadata {
     /// `SHOW FOREIGN KEYS IN TABLE` semantics. Wrappers that want to
     /// query by parent only should resolve to a foreign-side filter
     /// before calling.
+    ///
+    /// Server shape: same as [`primary_keys`](Self::primary_keys) —
+    /// `SHOW FOREIGN KEYS` shares its result schema with `SHOW KEYS`.
     pub async fn foreign_keys(
         &self,
         parent_catalog: Option<Identifier<'_>>,
@@ -360,12 +398,15 @@ impl Metadata {
                 foreign_table.as_str(),
             )
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_foreign_keys)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
     /// name are patterns.
+    ///
+    /// Server shape (`SELECT ... FROM information_schema.routines`):
+    /// `routine_catalog, routine_schema, routine_name, comment,
+    /// specific_name`.
     pub async fn functions(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -383,12 +424,14 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_functions)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
     /// name are patterns.
+    ///
+    /// Server shape: same columns as
+    /// [`functions`](Self::functions).
     pub async fn procedures(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -406,8 +449,7 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        let reader = ReshapingReader::new(raw.reader, shape::reshape_procedures)?;
-        ResultStream::from_reader(Box::new(reader))
+        ResultStream::from_reader(raw.reader)
     }
 
     /// SQL data types supported by the workspace. No filters. No wire

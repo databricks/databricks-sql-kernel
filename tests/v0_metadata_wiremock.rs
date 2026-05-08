@@ -14,20 +14,22 @@
 
 //! Wiremock end-to-end tests for the v0 `Metadata::*` surface.
 //!
-//! For each `Metadata::*` RPC, we stub the SEA `POST /sessions` and
-//! `POST /statements` endpoints, encoding a synthesised raw
-//! Databricks Arrow batch as inline base64. We then drive the call
-//! through `Session::open` + `Metadata::*` and assert that:
-//!
-//! 1. The returned `ResultStream`'s schema matches the JDBC contract
-//!    (column names + types from `metadata::schemas::*`).
-//! 2. The reshape layer produced the expected row content.
+//! For each wire-driven `Metadata::*` RPC, we stub the SEA
+//! `POST /sessions` and `POST /statements` endpoints, encoding a
+//! synthesised Databricks Arrow batch as inline base64. We then drive
+//! the call through `Session::open` + `Metadata::*` and assert that
+//! the returned `ResultStream` exposes the **server-shaped** columns
+//! verbatim — the kernel does not rename or filter.
 //!
 //! Static methods (`type_info`, `table_types`) skip the wire entirely
-//! and just verify the in-memory reader path.
+//! and verify the synthesised JDBC-shape result the kernel
+//! constructs locally.
+//!
+//! Validation errors (empty identifier, `None` catalog on
+//! `list_columns`, etc.) are also covered here.
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -55,7 +57,6 @@ async fn open_session(server: &MockServer) -> Session {
         .expect("Session::open should succeed")
 }
 
-/// Stub the create-session endpoint so `Session::open` succeeds.
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
@@ -67,8 +68,6 @@ async fn mount_create_session(server: &MockServer) {
         .await;
 }
 
-/// Stub the delete-session endpoint so the Drop fire-and-forget
-/// path doesn't generate noisy 404s.
 async fn mount_delete_session(server: &MockServer) {
     Mock::given(method("DELETE"))
         .and(path("/api/2.0/sql/sessions/sess-test"))
@@ -77,7 +76,6 @@ async fn mount_delete_session(server: &MockServer) {
         .await;
 }
 
-/// Encode a single `RecordBatch` as Arrow IPC stream bytes.
 fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     let mut buf = Vec::new();
     {
@@ -88,8 +86,6 @@ fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
     buf
 }
 
-/// Build a synthesised SUCCEEDED response body with inline Arrow
-/// data (matching what `SeaRestTransport::execute_and_read` consumes).
 fn succeeded_inline_response_body(batch: &RecordBatch) -> String {
     let ipc = arrow_ipc_bytes(batch);
     let attachment = STANDARD.encode(&ipc);
@@ -133,7 +129,6 @@ fn succeeded_inline_response_body(batch: &RecordBatch) -> String {
     .to_string()
 }
 
-/// Stub `POST /statements` to return `body` for any execute call.
 async fn mount_execute(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
@@ -142,8 +137,6 @@ async fn mount_execute(server: &MockServer, body: String) {
         .await;
 }
 
-/// Build a `RecordBatch` from a list of `(name, values)` pairs where
-/// values is a `Vec<Option<&str>>`.
 fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     let fields: Vec<Field> = cols
         .iter()
@@ -156,8 +149,6 @@ fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
-/// Pull all batches into a single `Vec<RecordBatch>` (one for the
-/// metadata path).
 async fn drain_stream(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("next_batch") {
@@ -169,10 +160,14 @@ async fn drain_stream(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<R
     out
 }
 
-// ─── Tests ──────────────────────────────────────────────────────────
+fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
+    schema.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+// ─── Pass-through tests ─────────────────────────────────────────────
 
 #[tokio::test]
-async fn list_catalogs_returns_jdbc_table_cat_column() {
+async fn list_catalogs_passes_server_columns_through() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -190,19 +185,17 @@ async fn list_catalogs_returns_jdbc_table_cat_column() {
         .await
         .expect("list_catalogs");
 
-    let schema = stream.schema();
-    assert_eq!(schema.fields().len(), 1);
-    assert_eq!(schema.field(0).name(), "TABLE_CAT");
+    // Server shape: single `catalog` column.
+    assert_eq!(col_names(&stream.schema()), vec!["catalog"]);
 
     let batches = drain_stream(&mut stream).await;
-    assert_eq!(batches.len(), 1);
     let names = batches[0].column(0).as_string::<i32>();
     assert_eq!(names.value(0), "main");
     assert_eq!(names.value(1), "hive_metastore");
 }
 
 #[tokio::test]
-async fn list_schemas_uses_fallback_catalog_when_column_absent() {
+async fn list_schemas_passes_server_columns_through() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -221,17 +214,18 @@ async fn list_schemas_uses_fallback_catalog_when_column_absent() {
         .await
         .expect("list_schemas");
 
-    assert_eq!(stream.schema().field(0).name(), "TABLE_SCHEM");
-    assert_eq!(stream.schema().field(1).name(), "TABLE_CATALOG");
+    // Server shape: just `databaseName` (no synthesised catalog
+    // column — the kernel passes through what the server returned).
+    assert_eq!(col_names(&stream.schema()), vec!["databaseName"]);
 
     let batches = drain_stream(&mut stream).await;
-    let cat = batches[0].column(1).as_string::<i32>();
-    assert_eq!(cat.value(0), "main");
-    assert_eq!(cat.value(1), "main");
+    let arr = batches[0].column(0).as_string::<i32>();
+    assert_eq!(arr.value(0), "default");
+    assert_eq!(arr.value(1), "information_schema");
 }
 
 #[tokio::test]
-async fn list_tables_returns_jdbc_columns_with_nulls_for_unknown() {
+async fn list_tables_passes_server_columns_through() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -251,38 +245,31 @@ async fn list_tables_returns_jdbc_columns_with_nulls_for_unknown() {
         .await
         .expect("list_tables");
 
-    let schema = stream.schema();
-    let names: Vec<&str> = schema.fields().iter().map(|f| f.name().as_str()).collect();
     assert_eq!(
-        names,
-        vec![
-            "TABLE_CAT",
-            "TABLE_SCHEM",
-            "TABLE_NAME",
-            "TABLE_TYPE",
-            "REMARKS",
-            "TYPE_CAT",
-            "TYPE_SCHEM",
-            "TYPE_NAME",
-            "SELF_REFERENCING_COL_NAME",
-            "REF_GENERATION",
-        ]
+        col_names(&stream.schema()),
+        vec!["catalogName", "namespace", "tableName", "tableType"]
     );
 
     let batches = drain_stream(&mut stream).await;
     assert_eq!(batches[0].num_rows(), 1);
-    // TYPE_CAT … REF_GENERATION (positions 5-9) all NULL.
-    for i in 5..10 {
-        assert!(batches[0].column(i).is_null(0));
-    }
+    assert_eq!(
+        batches[0]
+            .column_by_name("tableType")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "TABLE"
+    );
 }
 
 #[tokio::test]
-async fn list_tables_filters_by_table_types() {
+async fn list_tables_table_types_arg_is_advisory_no_op() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
+    // Both rows are returned even though the caller asked for only
+    // VIEW: the kernel does not filter post-fetch.
     let raw = string_batch(vec![
         ("catalogName", vec![Some("main"), Some("main")]),
         ("namespace", vec![Some("d"), Some("d")]),
@@ -299,16 +286,11 @@ async fn list_tables_filters_by_table_types() {
         .expect("list_tables");
 
     let batches = drain_stream(&mut stream).await;
-    assert_eq!(batches[0].num_rows(), 1);
-    assert_eq!(
-        batches[0].column(2).as_string::<i32>().value(0),
-        "v1",
-        "filter must keep only VIEW rows"
-    );
+    assert_eq!(batches[0].num_rows(), 2, "kernel passes both rows through");
 }
 
 #[tokio::test]
-async fn list_columns_translates_data_type_and_nullable() {
+async fn list_columns_passes_server_columns_through() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -330,22 +312,27 @@ async fn list_columns_translates_data_type_and_nullable() {
         .await
         .expect("list_columns");
 
-    assert_eq!(stream.schema().fields().len(), 24);
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "catalogName",
+            "namespace",
+            "tableName",
+            "col_name",
+            "columnType",
+            "isNullable",
+        ]
+    );
 
     let batches = drain_stream(&mut stream).await;
-    let rb = &batches[0];
-    let data_type = rb
-        .column_by_name("DATA_TYPE")
-        .unwrap()
-        .as_primitive::<arrow_array::types::Int32Type>();
-    assert_eq!(data_type.value(0), 4); // JDBC INTEGER
-    let nullable = rb
-        .column_by_name("NULLABLE")
-        .unwrap()
-        .as_primitive::<arrow_array::types::Int32Type>();
-    assert_eq!(nullable.value(0), 0); // columnNoNulls
-    let is_nullable = rb.column_by_name("IS_NULLABLE").unwrap().as_string::<i32>();
-    assert_eq!(is_nullable.value(0), "NO");
+    assert_eq!(
+        batches[0]
+            .column_by_name("columnType")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "INT"
+    );
 }
 
 #[tokio::test]
@@ -367,29 +354,21 @@ async fn list_columns_without_catalog_errors() {
 }
 
 #[tokio::test]
-async fn primary_keys_zero_rows_succeeds() {
+async fn primary_keys_passes_server_columns_through() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
-    // Empty result — Databricks returns the schema even with 0 rows.
-    // Use the live `SHOW KEYS` shape (camelCase) so the reshape
-    // layer's tolerance is exercised end-to-end.
-    let fields = vec![
-        Field::new("catalogName", DataType::Utf8, true),
-        Field::new("namespace", DataType::Utf8, true),
-        Field::new("tableName", DataType::Utf8, true),
-        Field::new("col_name", DataType::Utf8, true),
-        Field::new("keySeq", DataType::Int32, true),
-    ];
-    let arrays: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(Vec::<&str>::new())),
-        Arc::new(StringArray::from(Vec::<&str>::new())),
-        Arc::new(StringArray::from(Vec::<&str>::new())),
-        Arc::new(StringArray::from(Vec::<&str>::new())),
-        Arc::new(Int32Array::from(Vec::<i32>::new())),
-    ];
-    let raw = RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap();
+    // Live `SHOW KEYS` shape — full 14-column row including the
+    // parent linkage columns and constraintType.
+    let raw = string_batch(vec![
+        ("catalogName", vec![Some("main")]),
+        ("namespace", vec![Some("d")]),
+        ("tableName", vec![Some("t")]),
+        ("col_name", vec![Some("id")]),
+        ("constraintName", vec![Some("pk_t")]),
+        ("constraintType", vec![Some("PRIMARY KEY")]),
+    ]);
     mount_execute(&server, succeeded_inline_response_body(&raw)).await;
 
     let session = open_session(&server).await;
@@ -403,9 +382,28 @@ async fn primary_keys_zero_rows_succeeds() {
         .await
         .expect("primary_keys");
 
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "catalogName",
+            "namespace",
+            "tableName",
+            "col_name",
+            "constraintName",
+            "constraintType",
+        ]
+    );
+
     let batches = drain_stream(&mut stream).await;
-    assert_eq!(batches[0].num_rows(), 0);
-    assert_eq!(batches[0].schema().fields().len(), 6);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0]
+            .column_by_name("constraintType")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "PRIMARY KEY"
+    );
 }
 
 #[tokio::test]
@@ -430,9 +428,10 @@ async fn primary_keys_without_schema_errors() {
     }
 }
 
+// ─── Static-method tests (JDBC-shape, synthesised) ──────────────────
+
 #[tokio::test]
 async fn type_info_returns_static_jdbc_rows_without_wire_call() {
-    // Note: no execute mock — we never hit the wire.
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -441,9 +440,9 @@ async fn type_info_returns_static_jdbc_rows_without_wire_call() {
     let mut stream = session.metadata().type_info().await.expect("type_info");
 
     let schema = stream.schema();
+    assert_eq!(schema.fields().len(), 19);
     assert_eq!(schema.field(0).name(), "TYPE_NAME");
     assert_eq!(schema.field(1).name(), "DATA_TYPE");
-    assert_eq!(schema.fields().len(), 19);
 
     let batches = drain_stream(&mut stream).await;
     assert!(batches[0].num_rows() >= 19);
@@ -459,8 +458,7 @@ async fn table_types_returns_static_set() {
     let mut stream = session.metadata().table_types().await.expect("table_types");
 
     let schema = stream.schema();
-    assert_eq!(schema.fields().len(), 1);
-    assert_eq!(schema.field(0).name(), "TABLE_TYPE");
+    assert_eq!(col_names(&schema), vec!["TABLE_TYPE"]);
 
     let batches = drain_stream(&mut stream).await;
     let arr = batches[0].column(0).as_string::<i32>();

@@ -23,12 +23,16 @@
 //! cargo test --test v0_metadata_e2e -- --ignored
 //! ```
 //!
-//! Each test asserts:
+//! Each wire-driven test asserts:
 //! 1. The call succeeds against the live warehouse.
-//! 2. The returned `ResultStream` schema matches the JDBC contract
-//!    (column names from `metadata::schemas::*`).
+//! 2. The returned `ResultStream` exposes the **server-shaped**
+//!    columns (the kernel does not rename).
 //! 3. Where applicable, the result has at least one row.
+//!
+//! Static methods (`type_info`, `table_types`) assert the JDBC-shape
+//! the kernel synthesises locally.
 
+use arrow_array::cast::AsArray;
 use arrow_array::Array;
 use databricks_sql_kernel::{AuthConfig, Identifier, ResultBatch, ResultStream, Session};
 use std::env;
@@ -50,8 +54,6 @@ async fn live_session() -> Session {
         .expect("Session::open against live workspace")
 }
 
-/// Drain a stream's batches and return total row count + fully
-/// materialised batches.
 async fn collect(mut stream: ResultStream) -> (Vec<arrow_array::RecordBatch>, usize) {
     let mut batches = Vec::new();
     let mut rows = 0;
@@ -65,27 +67,27 @@ async fn collect(mut stream: ResultStream) -> (Vec<arrow_array::RecordBatch>, us
     (batches, rows)
 }
 
-fn jdbc_field_names(schema: &arrow_schema::Schema) -> Vec<String> {
+fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
     schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
 #[tokio::test]
 #[ignore]
-async fn list_catalogs_returns_table_cat_with_main() {
+async fn list_catalogs_returns_server_catalog_column() {
     let session = live_session().await;
     let stream = session
         .metadata()
         .list_catalogs()
         .await
         .expect("list_catalogs");
-    assert_eq!(jdbc_field_names(&stream.schema()), vec!["TABLE_CAT"]);
+    assert_eq!(col_names(&stream.schema()), vec!["catalog"]);
 
     let (batches, rows) = collect(stream).await;
     assert!(rows > 0, "live workspace should have at least one catalog");
     let names: Vec<String> = batches
         .iter()
         .flat_map(|rb| {
-            let arr = arrow_array::cast::AsArray::as_string::<i32>(rb.column(0));
+            let arr = rb.column(0).as_string::<i32>();
             (0..arr.len())
                 .map(|i| arr.value(i).to_string())
                 .collect::<Vec<_>>()
@@ -101,22 +103,20 @@ async fn list_catalogs_returns_table_cat_with_main() {
 
 #[tokio::test]
 #[ignore]
-async fn list_schemas_in_main_returns_default_and_information_schema() {
+async fn list_schemas_returns_server_database_name_column() {
     let session = live_session().await;
     let stream = session
         .metadata()
         .list_schemas(Some(Identifier::new("main").unwrap()), None)
         .await
         .expect("list_schemas");
-    assert_eq!(
-        jdbc_field_names(&stream.schema()),
-        vec!["TABLE_SCHEM", "TABLE_CATALOG"]
-    );
+    // SHOW SCHEMAS IN <catalog> returns just databaseName.
+    assert_eq!(col_names(&stream.schema()), vec!["databaseName"]);
 
     let (batches, _) = collect(stream).await;
     let mut schema_names: Vec<String> = Vec::new();
     for rb in batches {
-        let arr = arrow_array::cast::AsArray::as_string::<i32>(rb.column(0));
+        let arr = rb.column(0).as_string::<i32>();
         for i in 0..arr.len() {
             schema_names.push(arr.value(i).to_string());
         }
@@ -135,7 +135,7 @@ async fn list_schemas_in_main_returns_default_and_information_schema() {
 
 #[tokio::test]
 #[ignore]
-async fn list_tables_in_information_schema_returns_views() {
+async fn list_tables_returns_server_columns() {
     let session = live_session().await;
     let stream = session
         .metadata()
@@ -148,7 +148,17 @@ async fn list_tables_in_information_schema_returns_views() {
         .await
         .expect("list_tables");
 
-    assert_eq!(stream.schema().fields().len(), 10);
+    // Server returns at minimum: catalogName, namespace, tableName,
+    // tableType. Other columns (isTemporary / information / remarks)
+    // may or may not be present depending on DBR version — assert
+    // the required ones are there.
+    let names = col_names(&stream.schema());
+    for required in ["catalogName", "namespace", "tableName", "tableType"] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "expected '{required}' in {names:?}"
+        );
+    }
 
     let (_, rows) = collect(stream).await;
     assert!(
@@ -161,7 +171,7 @@ async fn list_tables_in_information_schema_returns_views() {
 
 #[tokio::test]
 #[ignore]
-async fn list_columns_for_information_schema_tables_view() {
+async fn list_columns_returns_server_columns() {
     let session = live_session().await;
     let stream = session
         .metadata()
@@ -174,7 +184,14 @@ async fn list_columns_for_information_schema_tables_view() {
         .await
         .expect("list_columns");
 
-    assert_eq!(stream.schema().fields().len(), 24);
+    let names = col_names(&stream.schema());
+    for required in ["col_name", "namespace", "tableName", "columnType"] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "expected '{required}' in {names:?}"
+        );
+    }
+
     let (_, rows) = collect(stream).await;
     assert!(rows > 0, "tables view should have columns");
 
@@ -182,11 +199,7 @@ async fn list_columns_for_information_schema_tables_view() {
 }
 
 /// Resolve a real (non-view) table to drive PK/FK SHOW commands
-/// against. Falls back through a handful of well-known sample tables;
-/// returns `None` if none of them are reachable on the workspace, in
-/// which case the calling test logs and returns early.
-///
-/// Databricks `SHOW (PRIMARY|FOREIGN) KEYS` rejects views with
+/// against. `SHOW (PRIMARY|FOREIGN) KEYS` rejects views with
 /// `EXPECT_TABLE_NOT_VIEW`, so we cannot use `information_schema.*`
 /// for these tests.
 async fn find_known_table(session: &Session) -> Option<(String, String, String)> {
@@ -196,7 +209,6 @@ async fn find_known_table(session: &Session) -> Option<(String, String, String)>
         ("samples", "tpch", "orders"),
     ];
     for (cat, schema, table) in candidates {
-        // Probe via list_columns — succeeds iff the table is visible.
         let res = session
             .metadata()
             .list_columns(
@@ -207,7 +219,6 @@ async fn find_known_table(session: &Session) -> Option<(String, String, String)>
             )
             .await;
         if let Ok(s) = res {
-            // Only count it as found if at least one row exists.
             let (_, rows) = collect(s).await;
             if rows > 0 {
                 return Some((cat.to_string(), schema.to_string(), table.to_string()));
@@ -219,7 +230,7 @@ async fn find_known_table(session: &Session) -> Option<(String, String, String)>
 
 #[tokio::test]
 #[ignore]
-async fn primary_keys_runs_cleanly_against_real_table() {
+async fn primary_keys_returns_server_show_keys_columns() {
     let session = live_session().await;
     let Some((cat, schema, table)) = find_known_table(&session).await else {
         eprintln!("skipping primary_keys E2E — no known sample table reachable");
@@ -236,8 +247,24 @@ async fn primary_keys_runs_cleanly_against_real_table() {
         .await
         .expect("primary_keys");
 
-    assert_eq!(stream.schema().fields().len(), 6);
-    // Row count may be 0 (sample tables typically don't have PKs).
+    // Live SHOW KEYS shape on Dogfood: 14 columns including
+    // catalogName / namespace / tableName / col_name / keySeq /
+    // constraintName / constraintType / parent* / updateRule /
+    // deleteRule / deferrability. Required minimum:
+    let names = col_names(&stream.schema());
+    for required in [
+        "catalogName",
+        "namespace",
+        "tableName",
+        "col_name",
+        "keySeq",
+        "constraintName",
+    ] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "expected '{required}' in {names:?}"
+        );
+    }
     let _ = collect(stream).await;
 
     session.close().await.expect("close");
@@ -245,7 +272,7 @@ async fn primary_keys_runs_cleanly_against_real_table() {
 
 #[tokio::test]
 #[ignore]
-async fn foreign_keys_runs_cleanly_against_real_table() {
+async fn foreign_keys_returns_server_show_foreign_keys_columns() {
     let session = live_session().await;
     let Some((cat, schema, table)) = find_known_table(&session).await else {
         eprintln!("skipping foreign_keys E2E — no known sample table reachable");
@@ -265,7 +292,22 @@ async fn foreign_keys_runs_cleanly_against_real_table() {
         .await
         .expect("foreign_keys");
 
-    assert_eq!(stream.schema().fields().len(), 14);
+    let names = col_names(&stream.schema());
+    for required in [
+        "catalogName",
+        "namespace",
+        "tableName",
+        "col_name",
+        "parentCatalogName",
+        "parentNamespace",
+        "parentTableName",
+        "parentColName",
+    ] {
+        assert!(
+            names.iter().any(|n| n == required),
+            "expected '{required}' in {names:?}"
+        );
+    }
     let _ = collect(stream).await;
 
     session.close().await.expect("close");
@@ -273,17 +315,18 @@ async fn foreign_keys_runs_cleanly_against_real_table() {
 
 #[tokio::test]
 #[ignore]
-async fn functions_returns_jdbc_columns() {
-    // Cross-catalog query (system.information_schema) requires
-    // privileges some workspaces don't grant; if the call returns
-    // SqlError(INSUFFICIENT_PERMISSIONS) we accept that as valid —
-    // the wire path worked, just the workspace doesn't grant
-    // information_schema reads to our test user.
+async fn functions_returns_information_schema_routine_columns() {
     let session = live_session().await;
     let res = session.metadata().functions(None, None, None).await;
     match res {
         Ok(stream) => {
-            assert_eq!(stream.schema().fields().len(), 6);
+            let names = col_names(&stream.schema());
+            for required in ["routine_catalog", "routine_schema", "routine_name"] {
+                assert!(
+                    names.iter().any(|n| n == required),
+                    "expected '{required}' in {names:?}"
+                );
+            }
             let _ = collect(stream).await;
         }
         Err(e) => {
@@ -296,27 +339,30 @@ async fn functions_returns_jdbc_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn type_info_returns_static_set_without_warehouse_busy() {
+async fn type_info_returns_static_jdbc_shape() {
     let session = live_session().await;
     let stream = session.metadata().type_info().await.expect("type_info");
 
+    // type_info is synthesised — kernel returns the JDBC shape since
+    // there's no server-native shape to mirror.
+    let names = col_names(&stream.schema());
+    assert_eq!(names[0], "TYPE_NAME");
+    assert_eq!(names[1], "DATA_TYPE");
     assert_eq!(stream.schema().fields().len(), 19);
+
     let (_, rows) = collect(stream).await;
-    assert!(
-        rows >= 19,
-        "type_info should have at least 19 rows, got {rows}"
-    );
+    assert!(rows >= 19, "type_info should have ≥19 rows, got {rows}");
 
     session.close().await.expect("close");
 }
 
 #[tokio::test]
 #[ignore]
-async fn table_types_returns_supported_set() {
+async fn table_types_returns_static_jdbc_shape() {
     let session = live_session().await;
     let stream = session.metadata().table_types().await.expect("table_types");
 
-    assert_eq!(stream.schema().fields().len(), 1);
+    assert_eq!(col_names(&stream.schema()), vec!["TABLE_TYPE"]);
     let (_, rows) = collect(stream).await;
     assert!(rows >= 3, "table_types should have at least 3 rows");
 
