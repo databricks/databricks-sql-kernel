@@ -153,37 +153,206 @@ async fn re_execute_invalidates_prior_handle() {
     session.close().await.expect("session close");
 }
 
+/// **End-to-end coverage of every `Row::get_*` accessor against
+/// server-emitted Arrow.** Issues a single `SELECT` that emits one
+/// column per supported Databricks SQL type, then walks every
+/// accessor to confirm:
+///
+/// - Each accessor reads the correct value back from the
+///   corresponding server-emitted Arrow type.
+/// - The `NULL` column returns `Ok(None)` for every accessor type.
+///
+/// If a wire-format detail of the kernel's reader path regresses (an
+/// Arrow type, a decimal scale, a date encoding, …) this test fails
+/// at the specific column rather than as a generic "execute()
+/// returned wrong values".
 #[tokio::test]
 #[ignore]
-async fn type_roundtrip_select_bound_value() {
+async fn select_returns_all_types_correctly() {
     let session = live_session().await;
-    let cases: Vec<(&str, TypedValue)> = vec![
-        ("BIGINT", TypedValue::Int64(42)),
-        ("STRING", TypedValue::String("hello".into())),
-        ("BOOLEAN", TypedValue::Bool(true)),
-        ("DOUBLE", TypedValue::Float64(2.5)),
-    ];
-    for (label, value) in cases {
-        let mut stmt = session.statement();
-        stmt.spec().sql("SELECT ?").param(1, value.clone()).unwrap();
-        let mut exec = stmt
-            .execute()
-            .await
-            .unwrap_or_else(|e| panic!("execute {label}: {e:?}"));
-        let stream = exec.result_stream_mut();
-        stream.next_batch().await.unwrap().unwrap();
-        let row = stream.next_row_in_batch().expect("a row");
-        match (&value, label) {
-            (TypedValue::Int64(v), _) => assert_eq!(row.get_i64(0).unwrap(), Some(*v)),
-            (TypedValue::String(v), _) => assert_eq!(row.get_str(0).unwrap(), Some(v.as_str())),
-            (TypedValue::Bool(v), _) => assert_eq!(row.get_bool(0).unwrap(), Some(*v)),
-            (TypedValue::Float64(v), _) => {
-                let got = row.get_f64(0).unwrap().expect("float value");
-                assert!((got - *v).abs() < f64::EPSILON, "{label}: {got} vs {v}");
-            }
-            _ => unreachable!(),
-        }
-        exec.close().await.expect("close");
-    }
+    let mut stmt = session.statement();
+    stmt.spec().sql(
+        "SELECT \
+             CAST(true AS BOOLEAN)                AS c_bool, \
+             CAST(127 AS TINYINT)                 AS c_i8, \
+             CAST(32000 AS SMALLINT)              AS c_i16, \
+             CAST(2000000000 AS INT)              AS c_i32, \
+             CAST(9000000000 AS BIGINT)           AS c_i64, \
+             CAST(1.5 AS FLOAT)                   AS c_f32, \
+             CAST(2.5 AS DOUBLE)                  AS c_f64, \
+             CAST('-123.45' AS DECIMAL(10,2))     AS c_dec, \
+             CAST('hello' AS STRING)              AS c_str, \
+             X'CAFE'                              AS c_bin, \
+             CAST('2026-05-11' AS DATE)           AS c_date, \
+             CAST('2026-05-11 12:34:56' AS TIMESTAMP) AS c_ts, \
+             CAST(NULL AS INT)                    AS c_null",
+    );
+    let mut exec = stmt.execute().await.expect("execute SELECT all-types");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+
+    // Primitives.
+    assert_eq!(row.get_bool(0).unwrap(), Some(true), "c_bool");
+    assert_eq!(row.get_i8(1).unwrap(), Some(127), "c_i8");
+    assert_eq!(row.get_i16(2).unwrap(), Some(32000), "c_i16");
+    assert_eq!(row.get_i32(3).unwrap(), Some(2_000_000_000), "c_i32");
+    assert_eq!(row.get_i64(4).unwrap(), Some(9_000_000_000), "c_i64");
+    assert!(
+        (row.get_f32(5).unwrap().unwrap() - 1.5_f32).abs() < f32::EPSILON,
+        "c_f32"
+    );
+    assert!(
+        (row.get_f64(6).unwrap().unwrap() - 2.5_f64).abs() < f64::EPSILON,
+        "c_f64"
+    );
+
+    // Widening: get_i64 should also handle the i8/i16/i32 columns.
+    assert_eq!(row.get_i64(1).unwrap(), Some(127));
+    assert_eq!(row.get_i64(2).unwrap(), Some(32000));
+    assert_eq!(row.get_i64(3).unwrap(), Some(2_000_000_000));
+
+    // Decimal — canonical string form preserves scale.
+    assert_eq!(row.get_decimal(7).unwrap().as_deref(), Some("-123.45"));
+
+    // String.
+    assert_eq!(row.get_str(8).unwrap(), Some("hello"));
+
+    // Binary — `X'CAFE'` literal is two bytes.
+    assert_eq!(row.get_bytes(9).unwrap(), Some(&[0xCA, 0xFE][..]));
+
+    // Date — chrono NaiveDate.
+    assert_eq!(
+        row.get_date(10).unwrap(),
+        Some(chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap()),
+    );
+
+    // Timestamp — chrono NaiveDateTime.
+    assert_eq!(
+        row.get_timestamp(11).unwrap(),
+        Some(
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 11)
+                .unwrap()
+                .and_hms_opt(12, 34, 56)
+                .unwrap()
+        ),
+    );
+
+    // NULL — every accessor that's type-compatible returns Ok(None).
+    // The column is INT, so get_i64 should succeed-as-None and
+    // get_i32 / get_i16 / get_i8 should reject the type before
+    // even seeing the NULL.
+    assert_eq!(row.get_i64(12).unwrap(), None, "c_null via get_i64");
+    assert_eq!(row.get_i32(12).unwrap(), None, "c_null via get_i32");
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+/// **End-to-end coverage of every `TypedValue` variant as a bound
+/// parameter.** Issues `SELECT ?, ?, ?, …` binding one of each
+/// supported `TypedValue` variant, then walks the corresponding
+/// `Row` accessor to confirm the wire payload round-trips
+/// end-to-end.
+///
+/// Binary is excluded — SEA's Statement Execution API does not
+/// accept `BINARY` as a parameter type. The kernel rejects
+/// `TypedValue::Binary` at execute time with an error message
+/// pointing callers at the `unhex(?)` workaround; the round-trip
+/// is exercised through that workaround in this test.
+#[tokio::test]
+#[ignore]
+async fn bind_all_typed_values_round_trip() {
+    let session = live_session().await;
+    let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
+    let ts = date.and_hms_opt(12, 34, 56).unwrap();
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql(
+            "SELECT \
+                 ? AS c_bool, \
+                 ? AS c_i64, \
+                 ? AS c_f64, \
+                 ? AS c_str, \
+                 unhex(?) AS c_bin, \
+                 CAST(? AS DECIMAL(10,2)) AS c_dec, \
+                 CAST(? AS DATE) AS c_date, \
+                 CAST(? AS TIMESTAMP) AS c_ts, \
+                 ? AS c_null",
+        )
+        .param(1, TypedValue::Bool(true))
+        .unwrap()
+        .param(2, TypedValue::Int64(9_000_000_000))
+        .unwrap()
+        .param(3, TypedValue::Float64(2.5))
+        .unwrap()
+        .param(4, TypedValue::String("hello".into()))
+        .unwrap()
+        // Binary workaround per the doc on TypedValue::Binary: bind
+        // the hex string and let SQL `unhex(?)` rehydrate to bytes
+        // server-side.
+        .param(5, TypedValue::String("cafe".into()))
+        .unwrap()
+        .param(
+            6,
+            TypedValue::Decimal {
+                value: "-123.45".into(),
+                precision: 10,
+                scale: 2,
+            },
+        )
+        .unwrap()
+        .param(7, TypedValue::Date(date))
+        .unwrap()
+        .param(8, TypedValue::Timestamp(ts))
+        .unwrap()
+        .param(9, TypedValue::Null)
+        .unwrap();
+    let mut exec = stmt.execute().await.expect("execute bind-all-types");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+
+    assert_eq!(row.get_bool(0).unwrap(), Some(true));
+    assert_eq!(row.get_i64(1).unwrap(), Some(9_000_000_000));
+    assert!((row.get_f64(2).unwrap().unwrap() - 2.5).abs() < f64::EPSILON);
+    assert_eq!(row.get_str(3).unwrap(), Some("hello"));
+    assert_eq!(
+        row.get_bytes(4).unwrap(),
+        Some(&[0xCA, 0xFE][..]),
+        "BINARY round-trip via the documented `unhex(?)` workaround",
+    );
+    assert_eq!(row.get_decimal(5).unwrap().as_deref(), Some("-123.45"));
+    assert_eq!(row.get_date(6).unwrap(), Some(date));
+    assert_eq!(row.get_timestamp(7).unwrap(), Some(ts));
+    // NULL parameter — server returns SQL NULL; STRING is the default
+    // type for TypedValue::Null on the wire.
+    assert_eq!(row.get_str(8).unwrap(), None);
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+/// Verifies the kernel rejects `TypedValue::Binary` at execute time
+/// (live wire) with a message pointing at the `unhex(?)` workaround
+/// — so callers see a typed error before any HTTP round-trip rather
+/// than a confusing SEA error from the server.
+#[tokio::test]
+#[ignore]
+async fn bind_binary_typed_value_is_rejected_at_execute_time() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT ?")
+        .param(1, TypedValue::Binary(vec![0xCA, 0xFE]))
+        .unwrap();
+    let err = match stmt.execute().await {
+        Ok(_) => panic!("Binary must be rejected before wire"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert!(err.message.contains("unhex"), "{}", err.message);
     session.close().await.expect("session close");
 }

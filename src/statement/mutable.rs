@@ -152,7 +152,7 @@ impl Statement {
         for (i, value) in self.spec.positional_params.iter().enumerate() {
             exec_params
                 .parameters
-                .push(typed_value_to_sea_parameter((i + 1) as i32, value));
+                .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
         }
 
         // 4. Install a Drop guard so a future cancelled after we

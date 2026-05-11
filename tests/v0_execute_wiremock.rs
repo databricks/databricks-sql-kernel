@@ -322,6 +322,29 @@ async fn execute_rejects_named_params_in_v0() {
 }
 
 #[tokio::test]
+async fn execute_rejects_binary_typed_value_before_wire() {
+    // No execute mock — Binary must be rejected client-side before
+    // any HTTP request, with a message pointing at the `unhex(?)`
+    // workaround.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT ?")
+        .param(1, TypedValue::Binary(vec![0xCA, 0xFE]))
+        .unwrap();
+    let err = match stmt.execute().await {
+        Ok(_) => panic!("Binary must be rejected before any wire call"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    assert!(err.message.contains("unhex"), "{}", err.message);
+}
+
+#[tokio::test]
 async fn execute_sends_positional_params_in_wire_form() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

@@ -49,8 +49,8 @@ use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
-    Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type,
-    Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+    Date32Type, Date64Type, Decimal128Type, Decimal256Type, DecimalType, Float32Type, Float64Type,
+    Int16Type, Int32Type, Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
     TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
 };
 use arrow_array::{Array, RecordBatch};
@@ -328,20 +328,28 @@ impl<'a> Row<'a> {
         }
     }
 
-    /// `Decimal128` column rendered in canonical decimal string form
-    /// (e.g. `"-123.456"`). String avoids pulling `rust_decimal`
-    /// into the public surface.
+    /// Decimal column rendered in canonical decimal string form
+    /// (e.g. `"-123.456"`). Accepts both `Decimal128` and `Decimal256`
+    /// — Databricks decimals are capped at precision 38 today (fits
+    /// `Decimal128`), but the kernel handles `Decimal256` too so
+    /// future precision bumps don't surface as `InvalidArgument`.
+    /// Returning a `String` keeps `rust_decimal` out of the public
+    /// surface.
     pub fn get_decimal(&self, col: usize) -> Result<Option<String>> {
         let arr = self.column(col)?;
         if arr.is_null(self.row_idx) {
             return Ok(None);
         }
         match arr.data_type() {
-            DataType::Decimal128(_p, s) => {
+            DataType::Decimal128(p, s) => {
                 let raw = arr.as_primitive::<Decimal128Type>().value(self.row_idx);
-                Ok(Some(format_decimal128(raw, *s)))
+                Ok(Some(Decimal128Type::format_decimal(raw, *p, *s)))
             }
-            other => Err(type_mismatch(col, "Decimal128", other)),
+            DataType::Decimal256(p, s) => {
+                let raw = arr.as_primitive::<Decimal256Type>().value(self.row_idx);
+                Ok(Some(Decimal256Type::format_decimal(raw, *p, *s)))
+            }
+            other => Err(type_mismatch(col, "Decimal128/Decimal256", other)),
         }
     }
 
@@ -415,21 +423,6 @@ fn type_mismatch(col: usize, expected: &str, actual: &DataType) -> Error {
     Error::invalid_argument().message(format!(
         "column {col} type mismatch: expected {expected}, got {actual:?}"
     ))
-}
-
-/// Format a `Decimal128` raw value with the given scale into the
-/// canonical decimal string form (`-123.456`, `42`, …).
-fn format_decimal128(raw: i128, scale: i8) -> String {
-    if scale <= 0 {
-        return raw.to_string();
-    }
-    let scale = scale as u32;
-    let divisor = 10_i128.pow(scale);
-    let sign = if raw < 0 { "-" } else { "" };
-    let abs_raw = raw.unsigned_abs();
-    let whole = abs_raw / divisor as u128;
-    let frac = abs_raw % divisor as u128;
-    format!("{sign}{whole}.{frac:0>width$}", width = scale as usize)
 }
 
 /// Paginated result stream.
@@ -585,8 +578,8 @@ mod tests {
     use crate::kernel_error::ErrorCode;
     use crate::reader::InMemoryReader;
     use arrow_array::{
-        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
-        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Decimal256Array,
+        Float32Array, Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
         TimestampMicrosecondArray, UInt32Array, UInt64Array, UInt8Array,
     };
     use arrow_schema::{Field, Schema as ArrowSchema};
@@ -754,6 +747,27 @@ mod tests {
         assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("-123.45"));
         let r = first_row(&mut stream);
         assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("1.00"));
+    }
+
+    #[tokio::test]
+    async fn get_decimal_handles_decimal256() {
+        // Databricks doesn't emit Decimal256 today, but the kernel
+        // formats it just as well as Decimal128 — so future precision
+        // bumps don't regress as InvalidArgument.
+        use arrow_buffer::i256;
+        let schema = schema_for(vec![Field::new("d", DataType::Decimal256(50, 3), false)]);
+        let arr: ArrayRef = Arc::new(
+            Decimal256Array::from(vec![i256::from_i128(-123_456_i128), i256::from_i128(1000)])
+                .with_precision_and_scale(50, 3)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("-123.456"));
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("1.000"));
     }
 
     #[tokio::test]

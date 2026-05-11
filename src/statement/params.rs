@@ -288,40 +288,78 @@ fn format_decimal128(raw: i128, scale: i8) -> String {
 // TypedValue → SEA parameter
 // ---------------------------------------------------------------------------
 
-/// Convert a [`TypedValue`] to its (type-name, optional-string-value)
-/// SEA wire form. Single source of truth used by both the positional
-/// and named [`StatementParameter`] builders below.
-fn typed_value_to_sea_payload(value: &TypedValue) -> (&'static str, Option<String>) {
+/// SEA wire payload for a single bound parameter: the
+/// Databricks-side type name (which the server interprets to coerce
+/// the value), and the canonical string form of the value (`None`
+/// for SQL NULL).
+struct SeaPayload {
+    type_name: String,
+    value: Option<String>,
+}
+
+/// Convert a [`TypedValue`] to its SEA wire form. Returns
+/// `Err(InvalidArgument)` for variants the SEA wire protocol does
+/// not accept as a bound parameter type (today: `Binary` — see the
+/// variant arm for the workaround).
+fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
+    fn ok(type_name: impl Into<String>, value: Option<String>) -> Result<SeaPayload> {
+        Ok(SeaPayload {
+            type_name: type_name.into(),
+            value,
+        })
+    }
     match value {
-        TypedValue::Null => ("STRING", None),
-        TypedValue::Bool(b) => ("BOOLEAN", Some(b.to_string())),
-        TypedValue::Int8(v) => ("TINYINT", Some(v.to_string())),
-        TypedValue::Int16(v) => ("SMALLINT", Some(v.to_string())),
-        TypedValue::Int32(v) => ("INT", Some(v.to_string())),
-        TypedValue::Int64(v) => ("BIGINT", Some(v.to_string())),
+        TypedValue::Null => ok("STRING", None),
+        TypedValue::Bool(b) => ok("BOOLEAN", Some(b.to_string())),
+        TypedValue::Int8(v) => ok("TINYINT", Some(v.to_string())),
+        TypedValue::Int16(v) => ok("SMALLINT", Some(v.to_string())),
+        TypedValue::Int32(v) => ok("INT", Some(v.to_string())),
+        TypedValue::Int64(v) => ok("BIGINT", Some(v.to_string())),
         // Unsigned types are promoted to the next wider signed type
         // — Databricks SQL has no unsigned numerics. Matches the
         // policy in `arrow_type_to_databricks`.
-        TypedValue::UInt8(v) => ("SMALLINT", Some(v.to_string())),
-        TypedValue::UInt16(v) => ("INT", Some(v.to_string())),
-        TypedValue::UInt32(v) => ("BIGINT", Some(v.to_string())),
-        TypedValue::UInt64(v) => ("BIGINT", Some(v.to_string())),
-        TypedValue::Float32(v) => ("FLOAT", Some(v.to_string())),
-        TypedValue::Float64(v) => ("DOUBLE", Some(v.to_string())),
-        TypedValue::String(s) => ("STRING", Some(s.clone())),
-        TypedValue::Binary(b) => ("BINARY", Some(hex::encode(b))),
-        TypedValue::Decimal { value, .. } => {
-            // SEA expects the canonical decimal string in `value`;
-            // precision/scale are reflected in the type name when
-            // the caller cares, but DECIMAL alone is accepted server-side.
-            ("DECIMAL", Some(value.clone()))
+        TypedValue::UInt8(v) => ok("SMALLINT", Some(v.to_string())),
+        TypedValue::UInt16(v) => ok("INT", Some(v.to_string())),
+        TypedValue::UInt32(v) => ok("BIGINT", Some(v.to_string())),
+        TypedValue::UInt64(v) => ok("BIGINT", Some(v.to_string())),
+        TypedValue::Float32(v) => ok("FLOAT", Some(v.to_string())),
+        TypedValue::Float64(v) => ok("DOUBLE", Some(v.to_string())),
+        TypedValue::String(s) => ok("STRING", Some(s.clone())),
+        // SEA's Statement Execution API does not accept BINARY as a
+        // parameter type — the server rejects every value with
+        // `INVALID_PARAMETER_MARKER_VALUE.INVALID_DATA_TYPE`. The
+        // JDBC driver works around this by interpolating bytes into
+        // the SQL text as `X'hex'` literals, gated on a separate
+        // `supportManyParameters` connection flag; the kernel
+        // doesn't do SQL rewriting. Callers that need to bind raw
+        // bytes should hex-encode them, pass as `TypedValue::String`,
+        // and wrap the marker with `unhex(?)` in their SQL (e.g.
+        // `INSERT INTO t VALUES (unhex(?))`). Tracked as a v0.1
+        // follow-up: native binary binding once SEA grows wire
+        // support.
+        TypedValue::Binary(_) => Err(Error::invalid_argument().message(
+            "TypedValue::Binary is not accepted by the SEA wire protocol as a parameter type. \
+             Hex-encode the bytes, bind them as TypedValue::String, and wrap the marker with \
+             unhex(?) in your SQL (e.g. `INSERT INTO t VALUES (unhex(?))`).",
+        )),
+        TypedValue::Decimal {
+            value,
+            precision,
+            scale,
+        } => {
+            // The parameter type name must carry (precision, scale)
+            // so the server doesn't default to `DECIMAL(10, 0)` and
+            // round the fractional digits away — observed against
+            // Dogfood with `value="-123.45"` defaulting to
+            // `"-123.00"`. JDBC sends the same form.
+            ok(format!("DECIMAL({precision},{scale})"), Some(value.clone()))
         }
-        TypedValue::Date(d) => ("DATE", Some(d.format("%Y-%m-%d").to_string())),
-        TypedValue::Timestamp(ts) => (
+        TypedValue::Date(d) => ok("DATE", Some(d.format("%Y-%m-%d").to_string())),
+        TypedValue::Timestamp(ts) => ok(
             "TIMESTAMP",
             Some(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
         ),
-        TypedValue::Interval(s) => ("INTERVAL", Some(s.clone())),
+        TypedValue::Interval(s) => ok("INTERVAL", Some(s.clone())),
     }
 }
 
@@ -329,19 +367,18 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> (&'static str, Option<Strin
 /// [`StatementParameter`].
 ///
 /// `ordinal` is 1-based on the wire. Direct conversion — no
-/// Arrow round-trip.
-pub(crate) fn typed_value_to_sea_parameter(ordinal: i32, value: &TypedValue) -> StatementParameter {
-    let (type_name, value) = typed_value_to_sea_payload(value);
-    StatementParameter {
+/// Arrow round-trip. Returns `Err(InvalidArgument)` for variants
+/// the SEA wire protocol does not accept (today: `Binary`).
+pub(crate) fn typed_value_to_sea_parameter(
+    ordinal: i32,
+    value: &TypedValue,
+) -> Result<StatementParameter> {
+    let payload = typed_value_to_sea_payload(value)?;
+    Ok(StatementParameter {
         ordinal,
-        // `StatementParameter.ordinal` is non-optional on the wire,
-        // but `name` (when populated by `typed_value_to_named_sea_parameter`)
-        // is what flags a binding as named. We carry the ordinal here
-        // because SEA tolerates it; servers ignore the field for
-        // named bindings.
-        param_type: type_name.to_string(),
-        value,
-    }
+        param_type: payload.type_name,
+        value: payload.value,
+    })
 }
 
 // Note: SEA's `StatementParameter` is positional-only today
@@ -735,7 +772,7 @@ mod tests {
 
     #[test]
     fn typed_value_null_emits_string_type_with_no_value() {
-        let p = typed_value_to_sea_parameter(1, &TypedValue::Null);
+        let p = typed_value_to_sea_parameter(1, &TypedValue::Null).unwrap();
         assert_eq!(p.ordinal, 1);
         assert_eq!(p.param_type, "STRING");
         assert_eq!(p.value, None);
@@ -759,7 +796,7 @@ mod tests {
             ),
         ];
         for (v, expect_type, expect_value) in cases {
-            let p = typed_value_to_sea_parameter(7, &v);
+            let p = typed_value_to_sea_parameter(7, &v).unwrap();
             assert_eq!(p.ordinal, 7);
             assert_eq!(p.param_type, expect_type, "type for {v:?}");
             assert_eq!(p.value.as_deref(), Some(expect_value), "value for {v:?}");
@@ -775,21 +812,28 @@ mod tests {
             (TypedValue::UInt64(42), "BIGINT", "42"),
         ];
         for (v, expect_type, expect_value) in cases {
-            let p = typed_value_to_sea_parameter(1, &v);
+            let p = typed_value_to_sea_parameter(1, &v).unwrap();
             assert_eq!(p.param_type, expect_type, "type for {v:?}");
             assert_eq!(p.value.as_deref(), Some(expect_value), "value for {v:?}");
         }
     }
 
     #[test]
-    fn typed_value_binary_is_hex_encoded() {
-        let p = typed_value_to_sea_parameter(1, &TypedValue::Binary(vec![0xCA, 0xFE]));
-        assert_eq!(p.param_type, "BINARY");
-        assert_eq!(p.value.as_deref(), Some("cafe"));
+    fn typed_value_binary_is_rejected_with_workaround_message() {
+        use crate::kernel_error::ErrorCode;
+        let err =
+            typed_value_to_sea_parameter(1, &TypedValue::Binary(vec![0xCA, 0xFE])).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        // The error message must mention the workaround (hex+unhex)
+        // so callers can fix their query without reading source.
+        assert!(err.message.contains("unhex"), "{}", err.message);
     }
 
     #[test]
-    fn typed_value_decimal_emits_value_string() {
+    fn typed_value_decimal_emits_value_string_with_precision_scale() {
+        // Precision and scale must be in the type name; otherwise
+        // SEA defaults to DECIMAL(10,0) and rounds fractional
+        // digits away.
         let p = typed_value_to_sea_parameter(
             1,
             &TypedValue::Decimal {
@@ -797,15 +841,16 @@ mod tests {
                 precision: 10,
                 scale: 2,
             },
-        );
-        assert_eq!(p.param_type, "DECIMAL");
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "DECIMAL(10,2)");
         assert_eq!(p.value.as_deref(), Some("-123.45"));
     }
 
     #[test]
     fn typed_value_date_emits_yyyy_mm_dd() {
         let d = chrono::NaiveDate::from_ymd_opt(2026, 5, 7).unwrap();
-        let p = typed_value_to_sea_parameter(1, &TypedValue::Date(d));
+        let p = typed_value_to_sea_parameter(1, &TypedValue::Date(d)).unwrap();
         assert_eq!(p.param_type, "DATE");
         assert_eq!(p.value.as_deref(), Some("2026-05-07"));
     }
@@ -816,7 +861,7 @@ mod tests {
             .unwrap()
             .and_hms_opt(12, 0, 0)
             .unwrap();
-        let p = typed_value_to_sea_parameter(1, &TypedValue::Timestamp(ts));
+        let p = typed_value_to_sea_parameter(1, &TypedValue::Timestamp(ts)).unwrap();
         assert_eq!(p.param_type, "TIMESTAMP");
         assert_eq!(p.value.as_deref(), Some("2026-05-07 12:00:00"));
     }
