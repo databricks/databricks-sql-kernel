@@ -45,9 +45,8 @@
 //! `next_batch()` resets the row cursor to the start of the new
 //! batch.
 
-#![allow(dead_code, unused_variables)]
-
 use crate::kernel_error::Result;
+use crate::reader::ResultReader;
 use arrow_array::RecordBatch;
 use arrow_schema::Schema;
 use std::sync::Arc;
@@ -101,6 +100,10 @@ pub struct Row<'a> {
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
+#[allow(
+    dead_code,
+    reason = "row accessors land in PR 5; PR 3 only ships the batch-level API for Metadata"
+)]
 impl<'a> Row<'a> {
     /// Number of columns in the row.
     pub fn num_columns(&self) -> usize {
@@ -116,28 +119,28 @@ impl<'a> Row<'a> {
 
     /// UTF-8 string column. Returns `None` for SQL NULL; borrows from
     /// the underlying batch.
-    pub fn get_str(&self, col: usize) -> Result<Option<&'a str>> {
+    pub fn get_str(&self, _col: usize) -> Result<Option<&'a str>> {
         unimplemented!("PR 5")
     }
 
     /// 64-bit signed integer column.
-    pub fn get_i64(&self, col: usize) -> Result<Option<i64>> {
+    pub fn get_i64(&self, _col: usize) -> Result<Option<i64>> {
         unimplemented!("PR 5")
     }
 
     /// 64-bit float column.
-    pub fn get_f64(&self, col: usize) -> Result<Option<f64>> {
+    pub fn get_f64(&self, _col: usize) -> Result<Option<f64>> {
         unimplemented!("PR 5")
     }
 
     /// Boolean column.
-    pub fn get_bool(&self, col: usize) -> Result<Option<bool>> {
+    pub fn get_bool(&self, _col: usize) -> Result<Option<bool>> {
         unimplemented!("PR 5")
     }
 
     /// Binary column. Returns `None` for SQL NULL; borrows from the
     /// underlying batch.
-    pub fn get_bytes(&self, col: usize) -> Result<Option<&'a [u8]>> {
+    pub fn get_bytes(&self, _col: usize) -> Result<Option<&'a [u8]>> {
         unimplemented!("PR 5")
     }
 
@@ -154,21 +157,61 @@ impl<'a> Row<'a> {
 /// Paginated result stream.
 ///
 /// Internally wraps a `Box<dyn ResultReader>` (kernel-internal trait
-/// — see `src/reader/mod.rs:291` on `main`). Wrappers see one
-/// concrete public type; the polymorphism is hidden.
+/// — see `src/reader/mod.rs`). Wrappers see one concrete public type;
+/// the polymorphism is hidden.
 #[non_exhaustive]
 pub struct ResultStream {
-    // PR 5: reader: Box<dyn ResultReader>, schema: SchemaRef,
-    // current batch + row cursor for next_row_in_batch().
+    /// Wrapped synchronous reader. The reader's `next_batch` is
+    /// already sync and does no I/O for in-memory readers; for
+    /// CloudFetch / inline readers it `block_on`s the runtime
+    /// internally. PR 5 generalises this to drive truly-async
+    /// fetches without `block_on`.
+    reader: Box<dyn ResultReader>,
+
+    /// Cached schema. Filled in eagerly by [`ResultStream::from_reader`]
+    /// so [`ResultStream::schema`] is non-fallible.
+    schema: SchemaRef,
+
+    /// The most recent batch returned by [`ResultStream::next_batch`].
+    /// Owned by the stream so the borrowed `&ResultBatch` stays valid
+    /// until the next call to `next_batch` replaces it.
+    current: Option<ResultBatch>,
+
+    /// Flips to `true` once the wrapped reader returns its first
+    /// `None`. Subsequent `next_batch` calls short-circuit to
+    /// `Ok(None)` without re-entering the reader — saves a wasted
+    /// call on readers whose `next_batch` is non-trivial (CloudFetch
+    /// in particular checks state and may take a runtime tick).
+    exhausted: bool,
 }
 
 impl ResultStream {
+    /// Build a `ResultStream` over a kernel-internal `ResultReader`.
+    ///
+    /// `pub(crate)` — wrappers never call this directly. They go
+    /// through `Metadata::*` (PR 3) or `ExecutedStatement::result_stream`
+    /// (PR 4).
+    ///
+    /// Pulls the reader's schema eagerly so `ResultStream::schema`
+    /// is non-fallible and available before any batches are
+    /// requested. v0 only ever wraps Arrow-producing readers, so
+    /// every batch is wrapped in [`ResultBatch::Arrow`].
+    pub(crate) fn from_reader(reader: Box<dyn ResultReader>) -> Result<Self> {
+        let schema = reader.schema()?;
+        Ok(Self {
+            reader,
+            schema,
+            current: None,
+            exhausted: false,
+        })
+    }
+
     /// Result schema. Available before any batches have been pulled.
     /// Returns a cheap-clone `Arc<Schema>` so callers can hold the
     /// schema independently of the stream (the FFI layer needs this
     /// to keep the schema alive across an `extern "C"` boundary).
     pub fn schema(&self) -> SchemaRef {
-        unimplemented!("PR 5: clone the SchemaRef from the wrapped reader")
+        self.schema.clone()
     }
 
     /// Pull the next batch into the kernel's buffer and return a
@@ -184,8 +227,27 @@ impl ResultStream {
     /// property and keeps the `#[non_exhaustive] enum ResultBatch`
     /// envelope as the v1 escape hatch (additional variants in v1+
     /// are non-breaking).
+    ///
+    /// **v0 implementation note.** The wrapped `ResultReader` is
+    /// synchronous (it `block_on`s internally for the
+    /// network-driving variants). The `async fn` signature is the
+    /// **forward-compatible** API the spec mandates; PR 5 swaps the
+    /// body for a real async path without breaking callers.
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
-        unimplemented!("PR 5: implement next_batch()")
+        if self.exhausted {
+            return Ok(None);
+        }
+        match self.reader.next_batch()? {
+            Some(rb) => {
+                self.current = Some(ResultBatch::Arrow(rb));
+                Ok(self.current.as_ref())
+            }
+            None => {
+                self.current = None;
+                self.exhausted = true;
+                Ok(None)
+            }
+        }
     }
 
     /// Pull the next row from the currently-buffered batch.
@@ -217,6 +279,7 @@ impl ResultStream {
     /// `Drop` performs the same cleanup if `close` was never called
     /// explicitly.
     pub fn close(self) {
-        unimplemented!("PR 5: drop buffered batches, stop the link prefetcher")
+        // Drops `self` (and the wrapped reader / current batch).
+        // Background tasks owned by the reader stop on `Drop`.
     }
 }

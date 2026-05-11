@@ -15,10 +15,36 @@
 //! `Metadata` — flat per-method catalog metadata API.
 //!
 //! Per `docs/spec-v0.md` "Metadata", the kernel exposes one method per
-//! ODBC metadata call. Each returns a `ResultStream` whose schema
-//! matches the corresponding ODBC SQLProcedures / SQLTables / SQLColumns
-//! / etc. contract. Drivers stop reimplementing the SHOW-CATALOGS /
-//! SHOW-TABLES plumbing — the kernel owns it.
+//! ODBC metadata call. The kernel **does not reshape** the returned
+//! columns — it issues the appropriate `SHOW` / `information_schema`
+//! query and exposes the server-shaped Arrow batch verbatim through
+//! a `ResultStream`. PySQL and Node consume those batches directly;
+//! JDBC and ODBC drivers translate to their respective spec column
+//! names (a rename layer they already maintain).
+//!
+//! The kernel owns the **wire plumbing**: SQL building, retry,
+//! cancellation, paging, schema discovery, error mapping. It does
+//! **not** own the JDBC/ODBC column-name contract.
+//!
+//! Server-shape examples (subject to change with DBR; see
+//! `docs/migration-plan.md`):
+//!
+//! - `list_catalogs` → `catalog: Utf8`
+//! - `list_schemas` → `databaseName: Utf8` (+ `catalog: Utf8` when
+//!   `SHOW SCHEMAS IN ALL CATALOGS`)
+//! - `list_tables` → `catalogName, namespace, tableName, tableType,
+//!   isTemporary, information?, remarks?`
+//! - `list_columns` → `col_name, catalogName?, namespace, tableName,
+//!   columnType, columnSize?, …`
+//! - `primary_keys` / `foreign_keys` → `catalogName, namespace,
+//!   tableName, col_name, keySeq, constraintName, constraintType,
+//!   parentCatalogName, parentNamespace, parentTableName,
+//!   parentColName, updateRule, deleteRule, deferrability`
+//! - `procedures` / `functions` → `routine_catalog, routine_schema,
+//!   routine_name, comment, specific_name`
+//! - `type_info` / `table_types` → no server-native shape; the
+//!   kernel synthesises results using the JDBC `getTypeInfo` /
+//!   `getTableTypes` schemas (see [`crate::metadata::schemas`]).
 //!
 //! ## Identifier vs LIKE pattern
 //!
@@ -44,12 +70,17 @@
 //! the `await`); the lifetime never leaks into a stored type. See
 //! addendum A2 for the rationale.
 
-#![allow(dead_code, unused_variables)]
-
-use crate::kernel_error::Result;
+use crate::kernel_error::{Error, Result};
+use crate::metadata::static_data;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use std::sync::Arc;
+
+/// Databricks identifier-length cap. Matches the server-side limit;
+/// reject longer strings client-side so we fail fast with a clear
+/// error rather than as a cryptic SEA error.
+const MAX_IDENTIFIER_BYTES: usize = 255;
+const MAX_LIKE_PATTERN_BYTES: usize = 255;
 
 // ─── Identifier vs LikePattern newtypes ─────────────────────────────────────
 
@@ -64,17 +95,38 @@ use std::sync::Arc;
 pub struct Identifier<'a>(&'a str);
 
 impl<'a> Identifier<'a> {
-    /// Construct from a borrowed string. Validation lands in PR 6.
+    /// Construct from a borrowed string.
     ///
-    /// PR 6 will reject:
-    /// - Empty string
-    /// - Embedded NUL bytes (`\0`) — would terminate the SQL string
-    ///   early once cast to a C string in some FFI paths
-    /// - Backtick characters (`` ` ``) — would break the kernel's
-    ///   backtick-escaping at the SQL boundary
-    /// - Strings exceeding 255 bytes (Databricks identifier-length cap)
+    /// Rejects:
+    /// - Empty string — meaningless as an identifier; almost always a
+    ///   bug at the wrapper layer.
+    /// - Embedded NUL bytes (`\0`) — would terminate the string at the
+    ///   first FFI / C ABI boundary and silently truncate the
+    ///   identifier in transit.
+    /// - Backtick characters (`` ` ``) — the kernel backtick-escapes
+    ///   identifiers at the SQL boundary, so a literal backtick would
+    ///   break out of the escaping. Databricks itself rejects
+    ///   identifiers containing backticks.
+    /// - Strings exceeding 255 bytes (Databricks identifier-length
+    ///   cap) — fail fast client-side rather than surfacing a
+    ///   server-side error.
     pub fn new(s: &'a str) -> Result<Self> {
-        // PR 6: implement the validation above.
+        if s.is_empty() {
+            return Err(Error::invalid_argument().message("identifier must not be empty"));
+        }
+        if s.len() > MAX_IDENTIFIER_BYTES {
+            return Err(Error::invalid_argument().message(format!(
+                "identifier exceeds {MAX_IDENTIFIER_BYTES}-byte limit ({} bytes)",
+                s.len()
+            )));
+        }
+        if s.contains('\0') {
+            return Err(Error::invalid_argument().message("identifier must not contain a NUL byte"));
+        }
+        if s.contains('`') {
+            return Err(Error::invalid_argument()
+                .message("identifier must not contain a backtick character"));
+        }
         Ok(Self(s))
     }
 
@@ -104,14 +156,33 @@ impl<'a> Identifier<'a> {
 pub struct LikePattern<'a>(&'a str);
 
 impl<'a> LikePattern<'a> {
-    /// Construct from a borrowed pattern. Validation lands in PR 6.
+    /// Construct from a borrowed pattern.
     ///
-    /// PR 6 will reject:
-    /// - Empty string
-    /// - Embedded NUL bytes
-    /// - Strings exceeding 255 bytes
+    /// Rejects:
+    /// - Empty string — callers should pass `None` for "match all".
+    /// - Embedded NUL bytes — same FFI-truncation hazard as
+    ///   [`Identifier::new`].
+    /// - Strings exceeding 255 bytes.
+    ///
+    /// Backslash-escaping of literal `%` / `_` is the **caller's**
+    /// responsibility per ODBC convention; the kernel does not
+    /// interpret the pattern beyond passing it to the SQL builder.
     pub fn new(s: &'a str) -> Result<Self> {
-        // PR 6: implement the validation above.
+        if s.is_empty() {
+            return Err(Error::invalid_argument()
+                .message("LIKE pattern must not be empty (pass None for \"match all\")"));
+        }
+        if s.len() > MAX_LIKE_PATTERN_BYTES {
+            return Err(Error::invalid_argument().message(format!(
+                "LIKE pattern exceeds {MAX_LIKE_PATTERN_BYTES}-byte limit ({} bytes)",
+                s.len()
+            )));
+        }
+        if s.contains('\0') {
+            return Err(
+                Error::invalid_argument().message("LIKE pattern must not contain a NUL byte")
+            );
+        }
         Ok(Self(s))
     }
 
@@ -136,22 +207,54 @@ impl Metadata {
     }
 
     /// All catalogs visible to the session.
+    ///
+    /// Server shape: `catalog: Utf8`.
     pub async fn list_catalogs(&self) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement list_catalogs()")
+        let _g = self.session.log_span().clone().entered();
+        let raw = self
+            .session
+            .transport()
+            .list_catalogs(self.session.session_id())
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
+    ///
+    /// Server shape: `databaseName: Utf8`. When `catalog` is `None`
+    /// (`SHOW SCHEMAS IN ALL CATALOGS`), an additional `catalog:
+    /// Utf8` column is present. Wrappers that need a uniform shape
+    /// should add the catalog column themselves from the requested
+    /// `catalog` argument when omitted.
     pub async fn list_schemas(
         &self,
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement list_schemas()")
+        let _g = self.session.log_span().clone().entered();
+        let raw = self
+            .session
+            .transport()
+            .list_schemas(
+                self.session.session_id(),
+                catalog.as_ref().map(|i| i.as_str()),
+                schema_pattern.as_ref().map(|p| p.as_str()),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
-    /// (pattern), and a comma-of `&str` table types (e.g. `["TABLE",
-    /// "VIEW"]`).
+    /// (pattern).
+    ///
+    /// Server shape: `catalogName, namespace, tableName, tableType,
+    /// isTemporary, information?, remarks?`.
+    ///
+    /// `table_types` is an **advisory** filter — Databricks `SHOW
+    /// TABLES` does not honour it server-side, so the kernel passes
+    /// it through unchanged. Wrappers that need to narrow by
+    /// `tableType` apply the filter on the returned `tableType`
+    /// column.
     pub async fn list_tables(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -159,11 +262,31 @@ impl Metadata {
         table_pattern: Option<LikePattern<'_>>,
         table_types: Option<&[&str]>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement list_tables()")
+        let _g = self.session.log_span().clone().entered();
+        let raw = self
+            .session
+            .transport()
+            .list_tables(
+                self.session.session_id(),
+                catalog.as_ref().map(|i| i.as_str()),
+                schema_pattern.as_ref().map(|p| p.as_str()),
+                table_pattern.as_ref().map(|p| p.as_str()),
+                table_types,
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Columns of tables matching the filter. Catalog is exact;
     /// schema / table / column are patterns.
+    ///
+    /// Server shape: `col_name, catalogName?, namespace, tableName,
+    /// columnType, columnSize?, decimalDigits?, radix?, isNullable?,
+    /// remarks?, ordinalPosition?, isAutoIncrement?, isGenerated?`.
+    ///
+    /// Catalog is **required**: Databricks `SHOW COLUMNS` does not
+    /// support an "all catalogs" form. `None` returns
+    /// `InvalidArgument`.
     pub async fn list_columns(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -171,23 +294,78 @@ impl Metadata {
         table_pattern: Option<LikePattern<'_>>,
         column_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement list_columns()")
+        let _g = self.session.log_span().clone().entered();
+        let catalog = catalog.ok_or_else(|| {
+            Error::invalid_argument().message(
+                "list_columns requires a catalog (SHOW COLUMNS IN ALL CATALOGS is unsupported)",
+            )
+        })?;
+        let raw = self
+            .session
+            .transport()
+            .list_columns(
+                self.session.session_id(),
+                catalog.as_str(),
+                schema_pattern.as_ref().map(|p| p.as_str()),
+                table_pattern.as_ref().map(|p| p.as_str()),
+                column_pattern.as_ref().map(|p| p.as_str()),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Primary keys for the given table. All three identifiers are
     /// exact names — ODBC SQLPrimaryKeys does not support patterns.
+    ///
+    /// Server shape (Databricks `SHOW KEYS`): `catalogName,
+    /// namespace, tableName, col_name, keySeq, constraintName,
+    /// constraintType, parentCatalogName, parentNamespace,
+    /// parentTableName, parentColName, updateRule, deleteRule,
+    /// deferrability`. Wrappers filter `constraintType =
+    /// 'PRIMARY KEY'` to isolate the PK rows from the FK rows the
+    /// server returns alongside.
+    ///
+    /// Catalog and schema are required at the kernel layer:
+    /// Databricks `SHOW KEYS` needs `IN CATALOG / IN SCHEMA / IN
+    /// TABLE` fully qualified. Wrappers that want to fall back to a
+    /// session default should resolve it before calling.
     pub async fn primary_keys(
         &self,
         catalog: Option<Identifier<'_>>,
         schema: Option<Identifier<'_>>,
         table: Identifier<'_>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement primary_keys()")
+        let _g = self.session.log_span().clone().entered();
+        let catalog = catalog.ok_or_else(|| {
+            Error::invalid_argument().message("primary_keys requires a catalog identifier")
+        })?;
+        let schema = schema.ok_or_else(|| {
+            Error::invalid_argument().message("primary_keys requires a schema identifier")
+        })?;
+        let raw = self
+            .session
+            .transport()
+            .list_primary_keys(
+                self.session.session_id(),
+                catalog.as_str(),
+                schema.as_str(),
+                table.as_str(),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
     /// exact identifiers — ODBC SQLForeignKeys does not support
-    /// patterns. Either side may be omitted for "any".
+    /// patterns. The **foreign side** must be fully specified
+    /// (catalog + schema + table); the parent side is optional and
+    /// matches "any parent" when omitted, matching the underlying
+    /// `SHOW FOREIGN KEYS IN TABLE` semantics. Wrappers that want to
+    /// query by parent only should resolve to a foreign-side filter
+    /// before calling.
+    ///
+    /// Server shape: same as [`primary_keys`](Self::primary_keys) —
+    /// `SHOW FOREIGN KEYS` shares its result schema with `SHOW KEYS`.
     pub async fn foreign_keys(
         &self,
         parent_catalog: Option<Identifier<'_>>,
@@ -197,38 +375,171 @@ impl Metadata {
         foreign_schema: Option<Identifier<'_>>,
         foreign_table: Option<Identifier<'_>>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement foreign_keys()")
+        let _g = self.session.log_span().clone().entered();
+        let foreign_catalog = foreign_catalog.ok_or_else(|| {
+            Error::invalid_argument().message("foreign_keys requires foreign_catalog")
+        })?;
+        let foreign_schema = foreign_schema.ok_or_else(|| {
+            Error::invalid_argument().message("foreign_keys requires foreign_schema")
+        })?;
+        let foreign_table = foreign_table.ok_or_else(|| {
+            Error::invalid_argument().message("foreign_keys requires foreign_table")
+        })?;
+        let raw = self
+            .session
+            .transport()
+            .list_foreign_keys(
+                self.session.session_id(),
+                parent_catalog.as_ref().map(|i| i.as_str()),
+                parent_schema.as_ref().map(|i| i.as_str()),
+                parent_table.as_ref().map(|i| i.as_str()),
+                foreign_catalog.as_str(),
+                foreign_schema.as_str(),
+                foreign_table.as_str(),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
     /// name are patterns.
+    ///
+    /// Server shape (`SELECT ... FROM information_schema.routines`):
+    /// `routine_catalog, routine_schema, routine_name, comment,
+    /// specific_name`.
     pub async fn functions(
         &self,
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement functions()")
+        let _g = self.session.log_span().clone().entered();
+        let raw = self
+            .session
+            .transport()
+            .list_functions(
+                self.session.session_id(),
+                catalog.as_ref().map(|i| i.as_str()),
+                schema_pattern.as_ref().map(|p| p.as_str()),
+                name_pattern.as_ref().map(|p| p.as_str()),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
     /// name are patterns.
+    ///
+    /// Server shape: same columns as
+    /// [`functions`](Self::functions).
     pub async fn procedures(
         &self,
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement procedures()")
+        let _g = self.session.log_span().clone().entered();
+        let raw = self
+            .session
+            .transport()
+            .list_procedures(
+                self.session.session_id(),
+                catalog.as_ref().map(|i| i.as_str()),
+                schema_pattern.as_ref().map(|p| p.as_str()),
+                name_pattern.as_ref().map(|p| p.as_str()),
+            )
+            .await?;
+        ResultStream::from_reader(raw.reader)
     }
 
-    /// SQL data types supported by the workspace. No filters.
+    /// SQL data types supported by the workspace. No filters. No wire
+    /// call — returns a static in-memory result.
     pub async fn type_info(&self) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement type_info()")
+        let _g = self.session.log_span().clone().entered();
+        let reader = static_data::type_info_reader();
+        ResultStream::from_reader(reader)
     }
 
-    /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No filters.
+    /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No
+    /// filters. No wire call — returns a static in-memory result
+    /// driven by the session's transport list (see
+    /// [`Transport::list_table_types`](crate::client::Transport::list_table_types)).
     pub async fn table_types(&self) -> Result<ResultStream> {
-        unimplemented!("PR 6: implement table_types()")
+        let _g = self.session.log_span().clone().entered();
+        let types = self.session.transport().list_table_types();
+        let reader = static_data::table_types_reader(&types);
+        ResultStream::from_reader(reader)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel_error::ErrorCode;
+
+    #[test]
+    fn identifier_accepts_normal_name() {
+        let id = Identifier::new("main").expect("normal name accepted");
+        assert_eq!(id.as_str(), "main");
+    }
+
+    #[test]
+    fn identifier_rejects_empty() {
+        let err = Identifier::new("").expect_err("empty identifier rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn identifier_rejects_nul_byte() {
+        let err = Identifier::new("foo\0bar").expect_err("NUL byte rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("NUL"));
+    }
+
+    #[test]
+    fn identifier_rejects_backtick() {
+        let err = Identifier::new("foo`bar").expect_err("backtick rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("backtick"));
+    }
+
+    #[test]
+    fn identifier_rejects_too_long() {
+        let s = "a".repeat(MAX_IDENTIFIER_BYTES + 1);
+        let err = Identifier::new(&s).expect_err("oversize identifier rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("255"));
+    }
+
+    #[test]
+    fn identifier_accepts_max_length() {
+        let s = "a".repeat(MAX_IDENTIFIER_BYTES);
+        Identifier::new(&s).expect("exactly 255 bytes is accepted");
+    }
+
+    #[test]
+    fn like_pattern_accepts_wildcard_pattern() {
+        let pat = LikePattern::new("info%").expect("normal pattern accepted");
+        assert_eq!(pat.as_str(), "info%");
+    }
+
+    #[test]
+    fn like_pattern_rejects_empty() {
+        let err = LikePattern::new("").expect_err("empty pattern rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("None"), "{}", err.message);
+    }
+
+    #[test]
+    fn like_pattern_rejects_nul_byte() {
+        let err = LikePattern::new("foo\0bar").expect_err("NUL byte rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn like_pattern_rejects_too_long() {
+        let s = "a".repeat(MAX_LIKE_PATTERN_BYTES + 1);
+        let err = LikePattern::new(&s).expect_err("oversize pattern rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 }

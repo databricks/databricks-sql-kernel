@@ -189,10 +189,6 @@ impl SqlCommandBuilder {
     ///
     /// Order matters: backslashes must be escaped first, then quotes.
     /// Reversing the order would double-escape `\'` → `\''` → `\\''`.
-    #[allow(
-        dead_code,
-        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
-    )]
     fn escape_sql_string(value: &str) -> String {
         value.replace('\\', "\\\\").replace('\'', "''")
     }
@@ -204,10 +200,6 @@ impl SqlCommandBuilder {
     ///
     /// Empty string catalog must be handled by the caller before reaching
     /// the SQL builder (return an empty result at the FFI/client layer).
-    #[allow(
-        dead_code,
-        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
-    )]
     fn resolve_catalog_prefix(catalog: Option<&str>) -> String {
         match catalog {
             None => "system".to_string(),
@@ -225,10 +217,6 @@ impl SqlCommandBuilder {
     /// at the FFI/client layer) before calling this method.
     ///
     /// Schema and procedure patterns use SQL LIKE syntax directly (no Hive conversion).
-    #[allow(
-        dead_code,
-        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
-    )]
     pub fn build_get_procedures(
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
@@ -266,7 +254,7 @@ impl SqlCommandBuilder {
     /// Same catalog resolution as `build_get_procedures`.
     #[allow(
         dead_code,
-        reason = "called only under feature `metadata-ffi`; PR 3 wires it into the v0 Metadata path"
+        reason = "still called only under feature `metadata-ffi`; v0 Metadata does not expose procedure columns"
     )]
     pub fn build_get_procedure_columns(
         catalog: Option<&str>,
@@ -318,7 +306,45 @@ impl SqlCommandBuilder {
         sql
     }
 
-    #[allow(dead_code)] // Used by ffi/metadata.rs when metadata-ffi feature is enabled
+    /// Build a SELECT query against `information_schema.routines` for
+    /// `getFunctions`.
+    ///
+    /// Mirrors [`SqlCommandBuilder::build_get_procedures`] but filters
+    /// `routine_type = 'FUNCTION'`. Catalog resolution and pattern
+    /// escaping match the procedures builder, so `escape_sql_string`
+    /// and `resolve_catalog_prefix` are the single source of truth
+    /// for both.
+    pub fn build_get_functions(
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        function_pattern: Option<&str>,
+    ) -> String {
+        let prefix = Self::resolve_catalog_prefix(catalog);
+        let mut sql = format!(
+            "SELECT routine_catalog, routine_schema, routine_name, comment, specific_name \
+             FROM {}.information_schema.routines \
+             WHERE routine_type = 'FUNCTION'",
+            prefix
+        );
+
+        if let Some(pattern) = schema_pattern {
+            sql.push_str(&format!(
+                " AND routine_schema LIKE '{}'",
+                Self::escape_sql_string(pattern)
+            ));
+        }
+
+        if let Some(pattern) = function_pattern {
+            sql.push_str(&format!(
+                " AND routine_name LIKE '{}'",
+                Self::escape_sql_string(pattern)
+            ));
+        }
+
+        sql.push_str(" ORDER BY routine_catalog, routine_schema, routine_name");
+        sql
+    }
+
     pub fn build_show_primary_keys(catalog: &str, schema: &str, table: &str) -> String {
         format!(
             "SHOW KEYS IN CATALOG {} IN SCHEMA {} IN TABLE {}",
@@ -328,7 +354,6 @@ impl SqlCommandBuilder {
         )
     }
 
-    #[allow(dead_code)] // Used by ffi/metadata.rs when metadata-ffi feature is enabled
     pub fn build_show_foreign_keys(catalog: &str, schema: &str, table: &str) -> String {
         format!(
             "SHOW FOREIGN KEYS IN CATALOG {} IN SCHEMA {} IN TABLE {}",
@@ -691,6 +716,52 @@ mod tests {
             "Backslash in column_pattern should be escaped: {}",
             sql
         );
+    }
+
+    // --- foreign keys with special characters ---
+
+    // --- getFunctions SQL builder tests ---
+
+    #[test]
+    fn test_get_functions_null_catalog() {
+        let sql = SqlCommandBuilder::build_get_functions(None, None, None);
+        assert!(sql.starts_with("SELECT routine_catalog"));
+        assert!(sql.contains("FROM system.information_schema.routines"));
+        assert!(sql.contains("WHERE routine_type = 'FUNCTION'"));
+        assert!(sql.ends_with("ORDER BY routine_catalog, routine_schema, routine_name"));
+    }
+
+    #[test]
+    fn test_get_functions_specific_catalog() {
+        let sql = SqlCommandBuilder::build_get_functions(Some("main"), None, None);
+        assert!(sql.contains("FROM `main`.information_schema.routines"));
+    }
+
+    #[test]
+    fn test_get_functions_with_schema_pattern() {
+        let sql = SqlCommandBuilder::build_get_functions(None, Some("default%"), None);
+        assert!(sql.contains("AND routine_schema LIKE 'default%'"));
+    }
+
+    #[test]
+    fn test_get_functions_with_function_pattern() {
+        let sql = SqlCommandBuilder::build_get_functions(None, None, Some("avg%"));
+        assert!(sql.contains("AND routine_name LIKE 'avg%'"));
+    }
+
+    #[test]
+    fn test_get_functions_with_all_filters() {
+        let sql =
+            SqlCommandBuilder::build_get_functions(Some("prod"), Some("public"), Some("fn_%"));
+        assert!(sql.contains("FROM `prod`.information_schema.routines"));
+        assert!(sql.contains("AND routine_schema LIKE 'public'"));
+        assert!(sql.contains("AND routine_name LIKE 'fn_%'"));
+    }
+
+    #[test]
+    fn test_get_functions_sql_injection_escaped() {
+        let sql = SqlCommandBuilder::build_get_functions(None, Some("it's"), None);
+        assert!(sql.contains("AND routine_schema LIKE 'it''s'"));
     }
 
     // --- foreign keys with special characters ---

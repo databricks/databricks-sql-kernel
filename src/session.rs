@@ -74,7 +74,7 @@ use tracing::{debug, info_span, Span};
 /// wrappers.
 #[allow(
     dead_code,
-    reason = "fields are read by Statement / Metadata / ResultStream wiring in PRs 3-5"
+    reason = "config / runtime_handle are read by Statement wiring in PR 4"
 )]
 pub(crate) struct SessionInner {
     /// Wire-protocol abstraction. v0 holds a `SeaRestTransport`
@@ -108,6 +108,27 @@ pub(crate) struct SessionInner {
     /// transient `delete_session` failures don't leak the server-
     /// side session.
     closed: std::sync::atomic::AtomicBool,
+}
+
+impl SessionInner {
+    /// Crate-internal accessor for the session's transport. Used by
+    /// `Metadata` (and PR 4's `Statement`) to drive RPCs without
+    /// reaching into private fields.
+    pub(crate) fn transport(&self) -> &Arc<dyn Transport> {
+        &self.transport
+    }
+
+    /// Crate-internal accessor for the server-issued session ID.
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Crate-internal accessor for the per-session tracing span.
+    /// Callers clone the span and `.entered()` it at the top of each
+    /// public method body.
+    pub(crate) fn log_span(&self) -> &Span {
+        &self.log_span
+    }
 }
 
 impl Drop for SessionInner {

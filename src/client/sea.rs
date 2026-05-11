@@ -704,6 +704,78 @@ impl Transport for SeaRestTransport {
         .await
     }
 
+    async fn list_functions(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        function_pattern: Option<&str>,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_get_functions(catalog, schema_pattern, function_pattern);
+        debug!("list_functions: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
+    async fn list_primary_keys(
+        &self,
+        session_id: &str,
+        catalog: &str,
+        schema: &str,
+        table: &str,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_show_primary_keys(catalog, schema, table);
+        debug!("list_primary_keys: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
+    async fn list_foreign_keys(
+        &self,
+        session_id: &str,
+        _parent_catalog: Option<&str>,
+        _parent_schema: Option<&str>,
+        _parent_table: Option<&str>,
+        foreign_catalog: &str,
+        foreign_schema: &str,
+        foreign_table: &str,
+    ) -> Result<ExecuteResult> {
+        // ODBC `SQLForeignKeys` and JDBC `getImportedKeys` /
+        // `getCrossReference` collapse into one Transport call here:
+        // the foreign side identifies the table, the parent side (if
+        // provided) is a post-fetch filter on the result's `parent*`
+        // columns. Databricks `SHOW FOREIGN KEYS IN ...` is
+        // server-side single-sided — it queries by the foreign
+        // (FK-bearing) table only and returns the parent linkage as
+        // result columns. The kernel passes those columns through
+        // unchanged; wrappers narrow on `parentCatalogName` /
+        // `parentNamespace` / `parentTableName` if the caller
+        // provided a parent-side filter.
+        let sql = SqlCommandBuilder::build_show_foreign_keys(
+            foreign_catalog,
+            foreign_schema,
+            foreign_table,
+        );
+        debug!("list_foreign_keys: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
     fn list_table_types(&self) -> Vec<String> {
         vec![
             "SYSTEM TABLE".to_string(),

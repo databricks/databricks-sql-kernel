@@ -283,7 +283,14 @@ impl ResultReaderFactory {
 }
 
 /// Trait for result readers.
-pub trait ResultReader: Send {
+///
+/// Readers are `Send + Sync` so a `Box<dyn ResultReader>` can live
+/// inside a `Send + !Sync` public handle (`ResultStream` /
+/// `ExecutedStatement`) and still satisfy the `&self`-future-is-Send
+/// expectation of `async_trait` methods on the surrounding
+/// `ExecutedStatementHandle`. Practically every existing impl is
+/// already Sync (their state is `Arc`s or owned `Vec`s).
+pub trait ResultReader: Send + Sync {
     /// Get the schema of the result.
     fn schema(&self) -> Result<SchemaRef>;
 
@@ -344,6 +351,40 @@ impl ResultReader for InlineArrowReader {
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
+    }
+}
+
+/// In-memory result reader.
+///
+/// Yields a fixed `Vec<RecordBatch>` from memory, one batch per call
+/// to [`InMemoryReader::next_batch`]. Backs the static
+/// `Metadata::type_info` and `Metadata::table_types` streams — both
+/// return data without ever touching the wire.
+pub struct InMemoryReader {
+    schema: SchemaRef,
+    batches: std::vec::IntoIter<RecordBatch>,
+}
+
+impl InMemoryReader {
+    /// Build a reader over the given batches. The schema is taken
+    /// from the caller (rather than inferred from the first batch)
+    /// so an empty `batches` slice still produces a typed empty
+    /// stream.
+    pub fn new(schema: SchemaRef, batches: Vec<RecordBatch>) -> Self {
+        Self {
+            schema,
+            batches: batches.into_iter(),
+        }
+    }
+}
+
+impl ResultReader for InMemoryReader {
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        Ok(self.batches.next())
     }
 }
 
