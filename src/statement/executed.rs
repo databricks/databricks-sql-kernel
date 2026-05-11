@@ -28,15 +28,15 @@
 //! caller finishes iterating rows and then closes the statement
 //! separately.
 
-#![allow(dead_code, unused_variables)]
-
 use crate::kernel_error::Result;
 use crate::result_stream::{ResultStream, SchemaRef};
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::validity::ValidityFlag;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tracing::warn;
 
 /// Sync-consumption executed handle.
 pub struct ExecutedStatement {
@@ -47,13 +47,40 @@ pub struct ExecutedStatement {
     /// stale calls locally with no network round-trip.
     valid: ValidityFlag,
     result_stream: ResultStream,
+    /// Flips to `true` after the first successful (or the first
+    /// duplicate-call short-circuited) `close()`. Tells `Drop` to
+    /// skip its fire-and-forget cleanup so an explicit close
+    /// doesn't trigger a redundant background spawn.
+    closed: Arc<AtomicBool>,
 }
 
 impl ExecutedStatement {
+    /// Crate-internal constructor. Built by [`Statement::execute`].
+    pub(crate) fn new(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+        result_stream: ResultStream,
+    ) -> Self {
+        Self {
+            session,
+            statement_id,
+            valid,
+            result_stream,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Result schema. Available without iterating any batches; mirrors
     /// the underlying `ResultStream::schema()`.
     pub fn schema(&self) -> SchemaRef {
         self.result_stream.schema()
+    }
+
+    /// Borrow the result stream immutably. JDBC/ODBC parity — the
+    /// caller separates "done iterating" from "done with statement".
+    pub fn result_stream(&self) -> &ResultStream {
+        &self.result_stream
     }
 
     /// Mutable borrow of the result stream for batch / row consumption.
@@ -75,16 +102,53 @@ impl ExecutedStatementHandle for ExecutedStatement {
     }
 
     async fn cancel(&self) -> Result<()> {
-        unimplemented!("PR 5: validity check, then Transport::cancel_statement")
+        // Local validity short-circuits a wire call against an
+        // already-closed/superseded handle.
+        self.valid.check()?;
+        self.session
+            .transport()
+            .cancel_statement(&self.statement_id)
+            .await
     }
 
     async fn close(&self) -> Result<()> {
-        unimplemented!("PR 5: implement close() — idempotent")
+        // Idempotent: the first call flips the flag; subsequent
+        // calls return Ok(()) without hitting the wire. The
+        // server-side close is idempotent too, but skipping the
+        // round-trip is cheaper and avoids ambiguous "double-close"
+        // log noise.
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        self.session
+            .transport()
+            .close_statement(&self.statement_id)
+            .await
     }
 }
 
 impl Drop for ExecutedStatement {
     fn drop(&mut self) {
-        // PR 5: fire-and-forget CloseStatement if close() wasn't called.
+        // If close() already ran, nothing to do.
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        // Fire-and-forget CloseStatement. Drop must not panic and
+        // we can't surface a failure here; the runtime keeps the
+        // background task alive until completion. Swallows errors
+        // by design.
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = transport.close_statement(&stmt_id).await {
+                warn!(
+                    statement_id = %stmt_id,
+                    error = %e,
+                    "fire-and-forget close_statement on Drop failed; \
+                     server-side resource reclaimed when the session closes"
+                );
+            }
+        });
     }
 }

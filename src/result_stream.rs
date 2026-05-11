@@ -45,10 +45,17 @@
 //! `next_batch()` resets the row cursor to the start of the new
 //! batch.
 
-use crate::kernel_error::Result;
+use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
-use arrow_array::RecordBatch;
-use arrow_schema::Schema;
+use arrow_array::cast::AsArray;
+use arrow_array::types::{
+    Date32Type, Date64Type, Decimal128Type, Float32Type, Float64Type, Int16Type, Int32Type,
+    Int64Type, Int8Type, TimestampMicrosecondType, TimestampMillisecondType,
+    TimestampNanosecondType, TimestampSecondType, UInt16Type, UInt32Type, UInt64Type, UInt8Type,
+};
+use arrow_array::{Array, RecordBatch};
+use arrow_schema::{DataType, Schema, TimeUnit};
+use chrono::{NaiveDate, NaiveDateTime};
 use std::sync::Arc;
 
 /// Cheap-clone reference to a result schema. The kernel hands one
@@ -94,20 +101,14 @@ pub enum ResultBatch {
 /// (e.g. UTF-8 columns return `&'a str`, byte columns return
 /// `&'a [u8]`). PR 5 fleshes out the full per-Arrow-type set.
 pub struct Row<'a> {
-    // PR 5: batch reference + row index.
-    //   batch: &'a RecordBatch,
-    //   row_idx: usize,
-    _phantom: std::marker::PhantomData<&'a ()>,
+    batch: &'a RecordBatch,
+    row_idx: usize,
 }
 
-#[allow(
-    dead_code,
-    reason = "row accessors land in PR 5; PR 3 only ships the batch-level API for Metadata"
-)]
 impl<'a> Row<'a> {
     /// Number of columns in the row.
     pub fn num_columns(&self) -> usize {
-        unimplemented!("PR 5")
+        self.batch.num_columns()
     }
 
     // No `Row::schema()` accessor: the schema lives on the parent
@@ -117,41 +118,318 @@ impl<'a> Row<'a> {
     // in a way that adds bookkeeping cost without saving the caller a
     // meaningful step.
 
+    fn column(&self, col: usize) -> Result<&'a dyn Array> {
+        if col >= self.batch.num_columns() {
+            return Err(Error::invalid_argument().message(format!(
+                "column index {col} out of range (batch has {} columns)",
+                self.batch.num_columns()
+            )));
+        }
+        Ok(self.batch.column(col).as_ref())
+    }
+
     /// UTF-8 string column. Returns `None` for SQL NULL; borrows from
     /// the underlying batch.
-    pub fn get_str(&self, _col: usize) -> Result<Option<&'a str>> {
-        unimplemented!("PR 5")
+    pub fn get_str(&self, col: usize) -> Result<Option<&'a str>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Utf8 => Ok(Some(arr.as_string::<i32>().value(self.row_idx))),
+            DataType::LargeUtf8 => Ok(Some(arr.as_string::<i64>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Utf8/LargeUtf8", other)),
+        }
     }
 
-    /// 64-bit signed integer column.
-    pub fn get_i64(&self, _col: usize) -> Result<Option<i64>> {
-        unimplemented!("PR 5")
+    /// 64-bit signed integer column. Widens `Int8`/`Int16`/`Int32`.
+    pub fn get_i64(&self, col: usize) -> Result<Option<i64>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Int8 => Ok(Some(
+                arr.as_primitive::<Int8Type>().value(self.row_idx) as i64
+            )),
+            DataType::Int16 => Ok(Some(
+                arr.as_primitive::<Int16Type>().value(self.row_idx) as i64
+            )),
+            DataType::Int32 => Ok(Some(
+                arr.as_primitive::<Int32Type>().value(self.row_idx) as i64
+            )),
+            DataType::Int64 => Ok(Some(arr.as_primitive::<Int64Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Int{8,16,32,64}", other)),
+        }
     }
 
-    /// 64-bit float column.
-    pub fn get_f64(&self, _col: usize) -> Result<Option<f64>> {
-        unimplemented!("PR 5")
+    /// 32-bit signed integer column. Widens `Int8`/`Int16`. Fails
+    /// with `InvalidArgument` for `Int64` to avoid silent truncation.
+    pub fn get_i32(&self, col: usize) -> Result<Option<i32>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Int8 => Ok(Some(
+                arr.as_primitive::<Int8Type>().value(self.row_idx) as i32
+            )),
+            DataType::Int16 => Ok(Some(
+                arr.as_primitive::<Int16Type>().value(self.row_idx) as i32
+            )),
+            DataType::Int32 => Ok(Some(arr.as_primitive::<Int32Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Int{8,16,32}", other)),
+        }
+    }
+
+    /// 16-bit signed integer column. Widens `Int8`.
+    pub fn get_i16(&self, col: usize) -> Result<Option<i16>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Int8 => Ok(Some(
+                arr.as_primitive::<Int8Type>().value(self.row_idx) as i16
+            )),
+            DataType::Int16 => Ok(Some(arr.as_primitive::<Int16Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Int{8,16}", other)),
+        }
+    }
+
+    /// 8-bit signed integer column.
+    pub fn get_i8(&self, col: usize) -> Result<Option<i8>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Int8 => Ok(Some(arr.as_primitive::<Int8Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Int8", other)),
+        }
+    }
+
+    /// 64-bit unsigned integer column. Widens `UInt8`/`UInt16`/`UInt32`.
+    pub fn get_u64(&self, col: usize) -> Result<Option<u64>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::UInt8 => Ok(Some(
+                arr.as_primitive::<UInt8Type>().value(self.row_idx) as u64
+            )),
+            DataType::UInt16 => Ok(Some(
+                arr.as_primitive::<UInt16Type>().value(self.row_idx) as u64
+            )),
+            DataType::UInt32 => Ok(Some(
+                arr.as_primitive::<UInt32Type>().value(self.row_idx) as u64
+            )),
+            DataType::UInt64 => Ok(Some(arr.as_primitive::<UInt64Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "UInt{8,16,32,64}", other)),
+        }
+    }
+
+    /// 32-bit unsigned integer column. Widens `UInt8`/`UInt16`.
+    pub fn get_u32(&self, col: usize) -> Result<Option<u32>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::UInt8 => Ok(Some(
+                arr.as_primitive::<UInt8Type>().value(self.row_idx) as u32
+            )),
+            DataType::UInt16 => Ok(Some(
+                arr.as_primitive::<UInt16Type>().value(self.row_idx) as u32
+            )),
+            DataType::UInt32 => Ok(Some(arr.as_primitive::<UInt32Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "UInt{8,16,32}", other)),
+        }
+    }
+
+    /// 16-bit unsigned integer column. Widens `UInt8`.
+    pub fn get_u16(&self, col: usize) -> Result<Option<u16>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::UInt8 => Ok(Some(
+                arr.as_primitive::<UInt8Type>().value(self.row_idx) as u16
+            )),
+            DataType::UInt16 => Ok(Some(arr.as_primitive::<UInt16Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "UInt{8,16}", other)),
+        }
+    }
+
+    /// 8-bit unsigned integer column.
+    pub fn get_u8(&self, col: usize) -> Result<Option<u8>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::UInt8 => Ok(Some(arr.as_primitive::<UInt8Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "UInt8", other)),
+        }
+    }
+
+    /// 64-bit float column. Widens `Float32`.
+    pub fn get_f64(&self, col: usize) -> Result<Option<f64>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Float32 => Ok(Some(
+                arr.as_primitive::<Float32Type>().value(self.row_idx) as f64
+            )),
+            DataType::Float64 => Ok(Some(arr.as_primitive::<Float64Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Float{32,64}", other)),
+        }
+    }
+
+    /// 32-bit float column.
+    pub fn get_f32(&self, col: usize) -> Result<Option<f32>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Float32 => Ok(Some(arr.as_primitive::<Float32Type>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Float32", other)),
+        }
     }
 
     /// Boolean column.
-    pub fn get_bool(&self, _col: usize) -> Result<Option<bool>> {
-        unimplemented!("PR 5")
+    pub fn get_bool(&self, col: usize) -> Result<Option<bool>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Boolean => Ok(Some(arr.as_boolean().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Boolean", other)),
+        }
     }
 
     /// Binary column. Returns `None` for SQL NULL; borrows from the
     /// underlying batch.
-    pub fn get_bytes(&self, _col: usize) -> Result<Option<&'a [u8]>> {
-        unimplemented!("PR 5")
+    pub fn get_bytes(&self, col: usize) -> Result<Option<&'a [u8]>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Binary => Ok(Some(arr.as_binary::<i32>().value(self.row_idx))),
+            DataType::LargeBinary => Ok(Some(arr.as_binary::<i64>().value(self.row_idx))),
+            other => Err(type_mismatch(col, "Binary/LargeBinary", other)),
+        }
     }
 
-    // PR 5: get_decimal, get_date, get_timestamp, get_interval, …
-    //
-    // Implementation note for PR 5: hand-rolling 14+ accessors invites
-    // inconsistency in NULL handling, type-mismatch error policy, and
-    // lifetime threading. Land these as a macro-derived set keyed on
-    // Arrow primitive types — single source of truth for the
-    // `Result<Option<T>>` shape and a single place to thread the `'a`
-    // lifetime against the underlying `RecordBatch`.
+    /// `Decimal128` column rendered in canonical decimal string form
+    /// (e.g. `"-123.456"`). String avoids pulling `rust_decimal`
+    /// into the public surface.
+    pub fn get_decimal(&self, col: usize) -> Result<Option<String>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Decimal128(_p, s) => {
+                let raw = arr.as_primitive::<Decimal128Type>().value(self.row_idx);
+                Ok(Some(format_decimal128(raw, *s)))
+            }
+            other => Err(type_mismatch(col, "Decimal128", other)),
+        }
+    }
+
+    /// Date column as `chrono::NaiveDate`.
+    pub fn get_date(&self, col: usize) -> Result<Option<NaiveDate>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Date32 => Ok(arr.as_primitive::<Date32Type>().value_as_date(self.row_idx)),
+            DataType::Date64 => Ok(arr.as_primitive::<Date64Type>().value_as_date(self.row_idx)),
+            other => Err(type_mismatch(col, "Date32/Date64", other)),
+        }
+    }
+
+    /// Timestamp column as `chrono::NaiveDateTime`. Drops any
+    /// timezone — the caller must layer a TZ on top if they need
+    /// one.
+    pub fn get_timestamp(&self, col: usize) -> Result<Option<NaiveDateTime>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Timestamp(unit, _tz) => Ok(match unit {
+                TimeUnit::Second => arr
+                    .as_primitive::<TimestampSecondType>()
+                    .value_as_datetime(self.row_idx),
+                TimeUnit::Millisecond => arr
+                    .as_primitive::<TimestampMillisecondType>()
+                    .value_as_datetime(self.row_idx),
+                TimeUnit::Microsecond => arr
+                    .as_primitive::<TimestampMicrosecondType>()
+                    .value_as_datetime(self.row_idx),
+                TimeUnit::Nanosecond => arr
+                    .as_primitive::<TimestampNanosecondType>()
+                    .value_as_datetime(self.row_idx),
+            }),
+            other => Err(type_mismatch(col, "Timestamp", other)),
+        }
+    }
+
+    /// Interval column in canonical SQL string form. Databricks
+    /// emits intervals as UTF-8 in v0, so this is a thin wrapper
+    /// around [`get_str`](Self::get_str) that also accepts Arrow's
+    /// native `Interval` types (returned as a `Debug`-formatted
+    /// string for now).
+    pub fn get_interval(&self, col: usize) -> Result<Option<String>> {
+        let arr = self.column(col)?;
+        if arr.is_null(self.row_idx) {
+            return Ok(None);
+        }
+        match arr.data_type() {
+            DataType::Utf8 => Ok(Some(arr.as_string::<i32>().value(self.row_idx).to_owned())),
+            DataType::LargeUtf8 => Ok(Some(arr.as_string::<i64>().value(self.row_idx).to_owned())),
+            DataType::Interval(_) => {
+                // Arrow's native Interval types are rarely used by
+                // Databricks results — fall back to a Debug-formatted
+                // representation so callers see *something*. Tracked
+                // as a §7 follow-up to render properly.
+                Ok(Some(format!("{:?}", arr.slice(self.row_idx, 1))))
+            }
+            other => Err(type_mismatch(col, "Utf8/Interval", other)),
+        }
+    }
+}
+
+/// Build a typed-error for `Row` accessor type mismatches.
+fn type_mismatch(col: usize, expected: &str, actual: &DataType) -> Error {
+    Error::invalid_argument().message(format!(
+        "column {col} type mismatch: expected {expected}, got {actual:?}"
+    ))
+}
+
+/// Format a `Decimal128` raw value with the given scale into the
+/// canonical decimal string form (`-123.456`, `42`, …).
+fn format_decimal128(raw: i128, scale: i8) -> String {
+    if scale <= 0 {
+        return raw.to_string();
+    }
+    let scale = scale as u32;
+    let divisor = 10_i128.pow(scale);
+    let sign = if raw < 0 { "-" } else { "" };
+    let abs_raw = raw.unsigned_abs();
+    let whole = abs_raw / divisor as u128;
+    let frac = abs_raw % divisor as u128;
+    format!("{sign}{whole}.{frac:0>width$}", width = scale as usize)
 }
 
 /// Paginated result stream.
@@ -176,6 +454,11 @@ pub struct ResultStream {
     /// Owned by the stream so the borrowed `&ResultBatch` stays valid
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
+
+    /// Row cursor inside [`current`](Self::current). Reset to `0`
+    /// every time `next_batch` populates a fresh batch.
+    /// `next_row_in_batch` reads and increments.
+    current_row_idx: usize,
 
     /// Flips to `true` once the wrapped reader returns its first
     /// `None`. Subsequent `next_batch` calls short-circuit to
@@ -202,6 +485,7 @@ impl ResultStream {
             reader,
             schema,
             current: None,
+            current_row_idx: 0,
             exhausted: false,
         })
     }
@@ -240,10 +524,12 @@ impl ResultStream {
         match self.reader.next_batch()? {
             Some(rb) => {
                 self.current = Some(ResultBatch::Arrow(rb));
+                self.current_row_idx = 0;
                 Ok(self.current.as_ref())
             }
             None => {
                 self.current = None;
+                self.current_row_idx = 0;
                 self.exhausted = true;
                 Ok(None)
             }
@@ -257,7 +543,16 @@ impl ResultStream {
     /// Returns `None` when the current batch is exhausted — call
     /// `next_batch().await` to load the next batch and resume.
     pub fn next_row_in_batch(&mut self) -> Option<Row<'_>> {
-        unimplemented!("PR 5: implement next_row_in_batch()")
+        let ResultBatch::Arrow(batch) = self.current.as_ref()?;
+        if self.current_row_idx >= batch.num_rows() {
+            return None;
+        }
+        let row = Row {
+            batch,
+            row_idx: self.current_row_idx,
+        };
+        self.current_row_idx += 1;
+        Some(row)
     }
 
     // A row-stream adapter (`into_rows`, `into_stream`, etc.) is
@@ -281,5 +576,306 @@ impl ResultStream {
     pub fn close(self) {
         // Drops `self` (and the wrapped reader / current batch).
         // Background tasks owned by the reader stop on `Drop`.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel_error::ErrorCode;
+    use crate::reader::InMemoryReader;
+    use arrow_array::{
+        ArrayRef, BinaryArray, BooleanArray, Date32Array, Decimal128Array, Float32Array,
+        Float64Array, Int16Array, Int32Array, Int64Array, Int8Array, StringArray,
+        TimestampMicrosecondArray, UInt32Array, UInt64Array, UInt8Array,
+    };
+    use arrow_schema::{Field, Schema as ArrowSchema};
+    use std::sync::Arc;
+
+    fn schema_for(fields: Vec<Field>) -> Arc<ArrowSchema> {
+        Arc::new(ArrowSchema::new(fields))
+    }
+
+    fn stream_with(batch: RecordBatch) -> ResultStream {
+        let schema = batch.schema();
+        let reader = InMemoryReader::new(schema, vec![batch]);
+        ResultStream::from_reader(Box::new(reader)).expect("from_reader")
+    }
+
+    async fn advance_to_first_row(stream: &mut ResultStream) {
+        let _ = stream
+            .next_batch()
+            .await
+            .expect("next_batch")
+            .expect("at least one batch");
+    }
+
+    fn first_row(stream: &mut ResultStream) -> Row<'_> {
+        stream.next_row_in_batch().expect("a row")
+    }
+
+    #[tokio::test]
+    async fn get_str_returns_value_and_none_for_null() {
+        let schema = schema_for(vec![Field::new("s", DataType::Utf8, true)]);
+        let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("hi"), None]));
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_str(0).unwrap(), Some("hi"));
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_str(0).unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn get_i64_widens_smaller_ints() {
+        let schema = schema_for(vec![
+            Field::new("a", DataType::Int8, false),
+            Field::new("b", DataType::Int16, false),
+            Field::new("c", DataType::Int32, false),
+            Field::new("d", DataType::Int64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Int8Array::from(vec![1])),
+                Arc::new(Int16Array::from(vec![2])),
+                Arc::new(Int32Array::from(vec![3])),
+                Arc::new(Int64Array::from(vec![4])),
+            ],
+        )
+        .unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_i64(0).unwrap(), Some(1));
+        assert_eq!(r.get_i64(1).unwrap(), Some(2));
+        assert_eq!(r.get_i64(2).unwrap(), Some(3));
+        assert_eq!(r.get_i64(3).unwrap(), Some(4));
+    }
+
+    #[tokio::test]
+    async fn get_i32_rejects_int64_to_avoid_truncation() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int64, false)]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        let err = r.get_i32(0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn get_u_unsigned_accessors() {
+        let schema = schema_for(vec![
+            Field::new("a", DataType::UInt8, false),
+            Field::new("b", DataType::UInt32, false),
+            Field::new("c", DataType::UInt64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(UInt8Array::from(vec![7])),
+                Arc::new(UInt32Array::from(vec![1_000_000])),
+                Arc::new(UInt64Array::from(vec![u64::MAX])),
+            ],
+        )
+        .unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_u8(0).unwrap(), Some(7));
+        assert_eq!(r.get_u32(1).unwrap(), Some(1_000_000));
+        assert_eq!(r.get_u64(2).unwrap(), Some(u64::MAX));
+    }
+
+    #[tokio::test]
+    async fn get_f64_widens_f32() {
+        let schema = schema_for(vec![
+            Field::new("a", DataType::Float32, false),
+            Field::new("b", DataType::Float64, false),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Float32Array::from(vec![1.5_f32])),
+                Arc::new(Float64Array::from(vec![2.5_f64])),
+            ],
+        )
+        .unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert!((r.get_f64(0).unwrap().unwrap() - 1.5).abs() < f64::EPSILON);
+        assert!((r.get_f64(1).unwrap().unwrap() - 2.5).abs() < f64::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn get_bool_and_bytes() {
+        let schema = schema_for(vec![
+            Field::new("flag", DataType::Boolean, true),
+            Field::new("blob", DataType::Binary, true),
+        ]);
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(BooleanArray::from(vec![Some(true), Some(false)])),
+                Arc::new(BinaryArray::from_opt_vec(vec![
+                    Some(b"hello"),
+                    Some(b"world"),
+                ])),
+            ],
+        )
+        .unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_bool(0).unwrap(), Some(true));
+        assert_eq!(r.get_bytes(1).unwrap(), Some(&b"hello"[..]));
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_bool(0).unwrap(), Some(false));
+        assert_eq!(r.get_bytes(1).unwrap(), Some(&b"world"[..]));
+    }
+
+    #[tokio::test]
+    async fn get_decimal_renders_canonical_string() {
+        let schema = schema_for(vec![Field::new("d", DataType::Decimal128(10, 2), false)]);
+        let arr: ArrayRef = Arc::new(
+            Decimal128Array::from(vec![-12345_i128, 100_i128])
+                .with_precision_and_scale(10, 2)
+                .unwrap(),
+        );
+        let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("-123.45"));
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("1.00"));
+    }
+
+    #[tokio::test]
+    async fn get_date_and_timestamp() {
+        let schema = schema_for(vec![
+            Field::new("d", DataType::Date32, true),
+            Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
+        ]);
+        // 2026-01-01 ↔ days since UNIX epoch (1970-01-01) = 20454.
+        let date = chrono::NaiveDate::from_ymd_opt(2026, 1, 1).unwrap();
+        let days = (date - chrono::NaiveDate::from_ymd_opt(1970, 1, 1).unwrap()).num_days() as i32;
+        let dt = chrono::NaiveDate::from_ymd_opt(2026, 1, 1)
+            .unwrap()
+            .and_hms_opt(12, 0, 0)
+            .unwrap();
+        let micros = dt.and_utc().timestamp_micros();
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(Date32Array::from(vec![Some(days)])),
+                Arc::new(TimestampMicrosecondArray::from(vec![Some(micros)])),
+            ],
+        )
+        .unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        assert_eq!(r.get_date(0).unwrap(), Some(date));
+        assert_eq!(r.get_timestamp(1).unwrap(), Some(dt));
+    }
+
+    #[tokio::test]
+    async fn type_mismatch_returns_invalid_argument() {
+        let schema = schema_for(vec![Field::new("s", DataType::Utf8, false)]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        let r = first_row(&mut stream);
+        let err = r.get_i64(0).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(err.message.contains("type mismatch"), "{}", err.message);
+    }
+
+    #[tokio::test]
+    async fn next_row_in_batch_walks_all_rows_then_none() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
+        let mut stream = stream_with(batch);
+        advance_to_first_row(&mut stream).await;
+        assert_eq!(
+            stream
+                .next_row_in_batch()
+                .unwrap()
+                .get_i32(0)
+                .unwrap()
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            stream
+                .next_row_in_batch()
+                .unwrap()
+                .get_i32(0)
+                .unwrap()
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            stream
+                .next_row_in_batch()
+                .unwrap()
+                .get_i32(0)
+                .unwrap()
+                .unwrap(),
+            3
+        );
+        assert!(stream.next_row_in_batch().is_none());
+    }
+
+    #[tokio::test]
+    async fn next_batch_resets_row_cursor() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let b1 = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![10, 20]))],
+        )
+        .unwrap();
+        let b2 = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![30]))]).unwrap();
+        let reader = InMemoryReader::new(b1.schema(), vec![b1, b2]);
+        let mut stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+
+        stream.next_batch().await.unwrap().unwrap();
+        assert!(stream.next_row_in_batch().is_some());
+        assert!(stream.next_row_in_batch().is_some());
+        assert!(stream.next_row_in_batch().is_none());
+
+        stream.next_batch().await.unwrap().unwrap();
+        // Cursor reset — first row of the new batch is available.
+        assert_eq!(
+            stream
+                .next_row_in_batch()
+                .unwrap()
+                .get_i32(0)
+                .unwrap()
+                .unwrap(),
+            30
+        );
+        assert!(stream.next_row_in_batch().is_none());
+    }
+
+    #[tokio::test]
+    async fn exhausted_stream_short_circuits() {
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
+        let mut stream = stream_with(batch);
+        // Pull and exhaust.
+        stream.next_batch().await.unwrap();
+        assert!(stream.next_batch().await.unwrap().is_none());
+        // Subsequent calls keep returning None without crashing.
+        assert!(stream.next_batch().await.unwrap().is_none());
     }
 }

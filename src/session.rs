@@ -129,6 +129,13 @@ impl SessionInner {
     pub(crate) fn log_span(&self) -> &Span {
         &self.log_span
     }
+
+    /// Crate-internal accessor for the session's tokio runtime
+    /// handle. Used by `ExecutedStatement::Drop` to spawn the
+    /// fire-and-forget `close_statement` clean-up.
+    pub(crate) fn runtime_handle(&self) -> &tokio::runtime::Handle {
+        &self.runtime_handle
+    }
 }
 
 impl Drop for SessionInner {
