@@ -335,10 +335,56 @@ async fn bind_all_typed_values_round_trip() {
     session.close().await.expect("session close");
 }
 
+/// Verifies the kernel handles every SQL-text use of BINARY
+/// documented at
+/// https://docs.databricks.com/aws/en/sql/language-manual/data-types/binary-type
+/// — `X'...'` literals (odd and even length, empty), and
+/// `CAST(string AS BINARY)`. These all flow through the normal
+/// execute path; only the SEA parameter-array bind layer rejects
+/// BINARY (covered by the next test).
+#[tokio::test]
+#[ignore]
+async fn binary_sql_literals_and_casts_work() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql(
+        "SELECT \
+             X'1ABF'                       AS even_hex, \
+             X'1'                          AS odd_hex_pads_leading_zero, \
+             X''                           AS empty_binary, \
+             CAST('Spark' AS BINARY)       AS cast_string",
+    );
+    let mut exec = stmt.execute().await.expect("execute binary SQL literals");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+
+    assert_eq!(row.get_bytes(0).unwrap(), Some(&[0x1A, 0xBF][..]));
+    assert_eq!(
+        row.get_bytes(1).unwrap(),
+        Some(&[0x01][..]),
+        "X'1' should pad to a leading zero per the BINARY type docs",
+    );
+    assert_eq!(row.get_bytes(2).unwrap(), Some(&[][..]));
+    assert_eq!(
+        row.get_bytes(3).unwrap(),
+        Some(&[0x53, 0x70, 0x61, 0x72, 0x6B][..]),
+        "CAST('Spark' AS BINARY) → UTF-8 bytes of 'Spark'",
+    );
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
 /// Verifies the kernel rejects `TypedValue::Binary` at execute time
 /// (live wire) with a message pointing at the `unhex(?)` workaround
 /// — so callers see a typed error before any HTTP round-trip rather
-/// than a confusing SEA error from the server.
+/// than a confusing SEA error from the server. This is the **only**
+/// BINARY-related case the kernel doesn't support today: the SEA
+/// parameters-array bind layer. SQL-text uses of BINARY (literals,
+/// casts, result columns) work fine — see
+/// `binary_sql_literals_and_casts_work` above.
 #[tokio::test]
 #[ignore]
 async fn bind_binary_typed_value_is_rejected_at_execute_time() {

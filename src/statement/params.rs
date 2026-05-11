@@ -326,30 +326,36 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
         TypedValue::Float64(v) => ok("DOUBLE", Some(v.to_string())),
         TypedValue::String(s) => ok("STRING", Some(s.clone())),
         // BINARY is a real Databricks SQL type
-        // (https://docs.databricks.com/aws/en/sql/language-manual/data-types/binary-type)
-        // and the kernel reads BINARY *result* columns natively via
-        // `Row::get_bytes`. The gap is at the parameter-binding
-        // layer of the SEA wire protocol: the server rejects every
-        // value with `INVALID_PARAMETER_MARKER_VALUE.INVALID_DATA_TYPE`
-        // when `param_type="BINARY"`, regardless of value encoding.
-        // PySQL independently confirms this — its
-        // `DatabricksSupportedType` enum lists `BINARY` but ships no
-        // `BinaryParameter` class.
+        // (https://docs.databricks.com/aws/en/sql/language-manual/data-types/binary-type).
+        // Everywhere BINARY appears in SQL text — `X'cafe'`
+        // literals, `CAST(... AS BINARY)`, BINARY result columns —
+        // works through the kernel today (the
+        // `select_returns_all_types_correctly` E2E test proves it).
+        //
+        // The narrow gap is **the SEA parameter-array bind layer**:
+        // when the kernel sends `{"type": "BINARY", "value": ...}`
+        // in the SEA `parameters` field, the server rejects with
+        // `INVALID_PARAMETER_MARKER_VALUE.INVALID_DATA_TYPE`
+        // regardless of value encoding (verified empirically;
+        // PySQL independently confirms by listing `BINARY` in its
+        // `DatabricksSupportedType` enum but shipping no
+        // `BinaryParameter` class).
         //
         // JDBC works around this by SQL-text interpolation
         // (`X'hex'` literal, gated on a `supportManyParameters`
-        // connection flag); the kernel doesn't do SQL rewriting.
-        // Callers that need to bind raw bytes should hex-encode
-        // them, pass as `TypedValue::String`, and wrap the marker
-        // with `unhex(?)` in their SQL (e.g.
+        // connection flag); the kernel doesn't do SQL rewriting in
+        // v0. Callers needing to bind raw bytes hex-encode them,
+        // pass as `TypedValue::String`, and wrap the marker with
+        // `unhex(?)` in their SQL (e.g.
         // `INSERT INTO t VALUES (unhex(?))`). Tracked as a v0.1
         // follow-up: native binary param binding once SEA grows
-        // wire support.
+        // wire support (or auto-rewrite to `unhex(?)`).
         TypedValue::Binary(_) => Err(Error::invalid_argument().message(
-            "TypedValue::Binary is not currently accepted as a SEA parameter type \
-             (the BINARY data type itself works fine for result columns and SQL casts). \
-             Workaround: hex-encode the bytes, bind them as TypedValue::String, and wrap \
-             the marker with unhex(?) in your SQL (e.g. `INSERT INTO t VALUES (unhex(?))`).",
+            "TypedValue::Binary cannot currently be bound through SEA's parameters array \
+             (server-side limitation; the BINARY type itself works everywhere else — `X'cafe'` \
+             literals, CAST(... AS BINARY), BINARY result columns). Workaround: hex-encode the \
+             bytes, bind them as TypedValue::String, and wrap the marker with unhex(?) in your \
+             SQL (e.g. `INSERT INTO t VALUES (unhex(?))`).",
         )),
         TypedValue::Decimal {
             value,
