@@ -594,6 +594,29 @@ mod tests {
             })
         }
 
+        async fn submit_statement(
+            &self,
+            _session_id: &str,
+            _sql: &str,
+            _params: &ExecuteParams,
+        ) -> Result<crate::client::ExecuteResponse> {
+            unimplemented!("submit_statement not used by the link-fetcher mock")
+        }
+
+        async fn fetch_completed_result(
+            &self,
+            _statement_id: &str,
+        ) -> Result<Option<ExecuteResult>> {
+            unimplemented!("fetch_completed_result not used by the link-fetcher mock")
+        }
+
+        async fn statement_status(
+            &self,
+            _statement_id: &str,
+        ) -> Result<crate::client::ExecuteResponse> {
+            unimplemented!("statement_status not used by the link-fetcher mock")
+        }
+
         async fn get_result_chunks(
             &self,
             _statement_id: &str,

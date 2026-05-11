@@ -173,6 +173,50 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         params: &ExecuteParams,
     ) -> Result<ExecuteResult>;
 
+    /// Submit a SQL statement without polling for completion.
+    ///
+    /// Returns whatever the server replied with on the initial
+    /// `POST /statements` — `PENDING`, `RUNNING`, or terminal — so
+    /// the caller (`Statement::submit`) can hand back an
+    /// `ExecutedAsyncStatement` immediately. Unlike
+    /// [`Transport::execute_statement`], this never polls and never
+    /// constructs a reader; callers fetch results later via
+    /// [`Transport::fetch_completed_result`].
+    ///
+    /// Callers are expected to set `params.wait_timeout = Some("0s")`
+    /// so the server returns immediately rather than blocking for up
+    /// to 10s; this method does not enforce that itself because the
+    /// param plumbing predates the async path.
+    async fn submit_statement(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+    ) -> Result<ExecuteResponse>;
+
+    /// Refresh status for an already-submitted statement and, if
+    /// terminal-and-succeeded, materialise the reader.
+    ///
+    /// Returns:
+    /// - `Ok(Some(ExecuteResult))` when the server reports
+    ///   `Succeeded` (or `Closed` with inline data, which the SEA
+    ///   server emits for one-batch results).
+    /// - `Ok(None)` when the server reports `Pending` / `Running` —
+    ///   the caller should `status()` again later.
+    /// - `Err(...)` on `Failed` / `Cancelled` / true `Closed`-without-data
+    ///   with the same structured error
+    ///   `Transport::execute_statement`'s polling path produces.
+    ///
+    /// Used by `ExecutedAsyncStatement::fetch_result` and inside the
+    /// `await_result` poll loop.
+    async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>>;
+
+    /// One-shot status check for an in-flight statement. Returns the
+    /// full `ExecuteResponse` (status + manifest + initial result, if
+    /// any). Used by `ExecutedAsyncStatement::status` and the
+    /// `await_result` poll loop.
+    async fn statement_status(&self, statement_id: &str) -> Result<ExecuteResponse>;
+
     // --- Result Fetching (CloudFetch) ---
 
     /// Fetch chunk links for CloudFetch.

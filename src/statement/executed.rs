@@ -36,7 +36,7 @@ use crate::statement::validity::ValidityFlag;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{warn, Instrument};
 
 /// Sync-consumption executed handle.
 pub struct ExecutedStatement {
@@ -103,12 +103,18 @@ impl ExecutedStatementHandle for ExecutedStatement {
 
     async fn cancel(&self) -> Result<()> {
         // Local validity short-circuits a wire call against an
-        // already-closed/superseded handle.
-        self.valid.check()?;
-        self.session
-            .transport()
-            .cancel_statement(&self.statement_id)
-            .await
+        // already-closed/superseded handle. `instrument` (rather
+        // than `.entered()`) so the future stays `Send` per the
+        // `ExecutedStatementHandle` trait bound.
+        async {
+            self.valid.check()?;
+            self.session
+                .transport()
+                .cancel_statement(&self.statement_id)
+                .await
+        }
+        .instrument(self.session.log_span().clone())
+        .await
     }
 
     async fn close(&self) -> Result<()> {
@@ -117,13 +123,17 @@ impl ExecutedStatementHandle for ExecutedStatement {
         // server-side close is idempotent too, but skipping the
         // round-trip is cheaper and avoids ambiguous "double-close"
         // log noise.
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        async {
+            if self.closed.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.session
+                .transport()
+                .close_statement(&self.statement_id)
+                .await
         }
-        self.session
-            .transport()
-            .close_statement(&self.statement_id)
-            .await
+        .instrument(self.session.log_span().clone())
+        .await
     }
 }
 

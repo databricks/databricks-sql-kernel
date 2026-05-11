@@ -121,10 +121,80 @@ impl Statement {
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
         let _g = self.session.log_span().clone().entered();
 
-        // 1. Auto-cancel + close any prior handle from this Statement.
         self.invalidate_prior().await;
+        let (sql, exec_params) = self.prepare_for_dispatch("10s")?;
 
-        // 2. Validate the spec.
+        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+        let guard = cancel_state.guard();
+
+        // SeaRestTransport::execute_statement polls to completion
+        // (10s server-side wait_timeout, then GetStatementStatus
+        // loop until terminal).
+        let result = self
+            .session
+            .transport()
+            .execute_statement(self.session.session_id(), &sql, &exec_params)
+            .await?;
+
+        cancel_state.observe(&result.statement_id);
+        guard.defuse();
+
+        let valid = ValidityFlag::new();
+        self.last_statement_id = Some(result.statement_id.clone());
+        self.last_valid = Some(valid.clone());
+
+        let result_stream = ResultStream::from_reader(result.reader)?;
+        Ok(ExecutedStatement::new(
+            Arc::clone(&self.session),
+            result.statement_id,
+            valid,
+            result_stream,
+        ))
+    }
+
+    /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
+    /// auto-cancel-and-close semantics as `execute()`.
+    ///
+    /// Returns immediately once the server hands back a
+    /// `statement_id` — the caller drives polling via
+    /// [`ExecutedAsyncStatement::status`] / `await_result` /
+    /// `fetch_result`. Long-running queries that would blow past
+    /// `execute()`'s sync polling budget belong on this path.
+    pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
+        let _g = self.session.log_span().clone().entered();
+
+        self.invalidate_prior().await;
+        let (sql, exec_params) = self.prepare_for_dispatch("0s")?;
+
+        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+        let guard = cancel_state.guard();
+
+        let response = self
+            .session
+            .transport()
+            .submit_statement(self.session.session_id(), &sql, &exec_params)
+            .await?;
+
+        cancel_state.observe(&response.statement_id);
+        guard.defuse();
+
+        let valid = ValidityFlag::new();
+        self.last_statement_id = Some(response.statement_id.clone());
+        self.last_valid = Some(valid.clone());
+
+        Ok(ExecutedAsyncStatement::new(
+            Arc::clone(&self.session),
+            response.statement_id,
+            valid,
+        ))
+    }
+
+    /// Shared spec-validation + `ExecuteParams` builder used by both
+    /// [`execute`](Self::execute) and [`submit`](Self::submit).
+    ///
+    /// `wait_timeout_secs` is the textual SEA wait-timeout
+    /// (`"10s"` for sync, `"0s"` for async submit).
+    fn prepare_for_dispatch(&self, wait_timeout_secs: &str) -> Result<(String, ExecuteParams)> {
         let sql = self
             .spec
             .sql
@@ -143,9 +213,8 @@ impl Statement {
             ));
         }
 
-        // 3. Build ExecuteParams from spec.
         let mut exec_params = ExecuteParams {
-            wait_timeout: Some("10s".to_string()),
+            wait_timeout: Some(wait_timeout_secs.to_string()),
             on_wait_timeout: Some("CONTINUE".to_string()),
             ..ExecuteParams::default()
         };
@@ -154,50 +223,7 @@ impl Statement {
                 .parameters
                 .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
         }
-
-        // 4. Install a Drop guard so a future cancelled after we
-        //    learn the statement_id fires a fire-and-forget
-        //    `cancel_statement` against the server. v0 caveat: the
-        //    transport doesn't expose the assigned statement_id
-        //    until execute_statement() returns, so the guard only
-        //    covers the post-success / pre-defuse window. Tracked
-        //    in pr-4-plan §7.
-        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
-        let guard = cancel_state.guard();
-
-        // 5. Drive the wire call. SeaRestTransport::execute_statement
-        //    already polls to completion (wait_timeout 10s, then
-        //    GetStatementStatus loop until terminal).
-        let result = self
-            .session
-            .transport()
-            .execute_statement(self.session.session_id(), &sql, &exec_params)
-            .await?;
-
-        // 6. Record the assigned statement_id for the drop guard,
-        //    then defuse — the success path owns cleanup via
-        //    ExecutedStatement::Drop.
-        cancel_state.observe(&result.statement_id);
-        guard.defuse();
-
-        // 7. Wrap the reader in a ResultStream and build the handle.
-        let valid = ValidityFlag::new();
-        self.last_statement_id = Some(result.statement_id.clone());
-        self.last_valid = Some(valid.clone());
-
-        let result_stream = ResultStream::from_reader(result.reader)?;
-        Ok(ExecutedStatement::new(
-            Arc::clone(&self.session),
-            result.statement_id,
-            valid,
-            result_stream,
-        ))
-    }
-
-    /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
-    /// auto-cancel-and-close semantics as `execute()`.
-    pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
-        unimplemented!("PR 5: implement submit()")
+        Ok((sql, exec_params))
     }
 
     /// Auto-cancel + close any prior executed handle this `Statement`
