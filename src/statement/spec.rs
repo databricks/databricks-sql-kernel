@@ -30,14 +30,44 @@ use std::collections::HashMap;
 
 /// A typed value bound as a SQL parameter.
 ///
-/// **TODO:** populate variants. The full set lands alongside the parameter
-/// conversion glue in PR 5; v0 covers the SEA-supported types.
+/// `#[non_exhaustive]` so v1+ variants stay non-breaking. The current
+/// set mirrors what Databricks SEA accepts. `UInt*` variants are
+/// accepted at the public API but promoted to the next wider signed
+/// type at the wire boundary, matching `arrow_type_to_databricks`.
+///
+/// `Decimal::value` is a string in canonical decimal form
+/// (e.g. `"-123.456"`) so the variant doesn't pull `rust_decimal`
+/// into the public surface and wrappers can pass arbitrarily-precise
+/// values without an intermediate type.
+///
+/// `Interval` is also a string in canonical SQL form
+/// (e.g. `"INTERVAL '1' DAY"`) — that's the form SEA expects on the
+/// wire.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TypedValue {
     Null,
-    // Bool(bool), Int(i64), Float(f64), String(String), Decimal(...),
-    // Date(...), Timestamp(...), Binary(Vec<u8>), …
+    Bool(bool),
+    Int8(i8),
+    Int16(i16),
+    Int32(i32),
+    Int64(i64),
+    UInt8(u8),
+    UInt16(u16),
+    UInt32(u32),
+    UInt64(u64),
+    Float32(f32),
+    Float64(f64),
+    String(String),
+    Binary(Vec<u8>),
+    Decimal {
+        value: String,
+        precision: u8,
+        scale: i8,
+    },
+    Date(chrono::NaiveDate),
+    Timestamp(chrono::NaiveDateTime),
+    Interval(String),
 }
 
 /// Wire-format requested for the result.

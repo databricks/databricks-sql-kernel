@@ -53,15 +53,17 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
-#![allow(dead_code, unused_variables)]
-
-use crate::kernel_error::Result;
+use crate::kernel_error::{Error, Result};
+use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::executed_async::ExecutedAsyncStatement;
-use crate::statement::spec::StatementSpec;
+use crate::statement::params::typed_value_to_sea_parameter;
+use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
+use crate::types::sea::ExecuteParams;
 use std::sync::Arc;
+use tracing::warn;
 
 /// Lifecycle owner for a single statement spec.
 ///
@@ -112,9 +114,84 @@ impl Statement {
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// it is auto-cancelled and closed before issuing the new
-    /// ExecuteStatement.
+    /// ExecuteStatement, and the prior handle's
+    /// [`ValidityFlag`] is flipped so subsequent calls on it
+    /// short-circuit to `InvalidStatementHandle` without hitting the
+    /// wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        unimplemented!("PR 5: implement execute()")
+        let _g = self.session.log_span().clone().entered();
+
+        // 1. Auto-cancel + close any prior handle from this Statement.
+        self.invalidate_prior().await;
+
+        // 2. Validate the spec.
+        let sql = self
+            .spec
+            .sql
+            .as_deref()
+            .ok_or_else(|| {
+                Error::invalid_argument().message("StatementSpec.sql must be set before execute()")
+            })?
+            .to_owned();
+        if self.spec.result_format != ResultFormat::Arrow {
+            return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
+        }
+        if !self.spec.named_params.is_empty() {
+            return Err(Error::invalid_argument().message(
+                "named parameter bindings are not supported in v0 — SEA wire format \
+                 carries positional bindings only",
+            ));
+        }
+
+        // 3. Build ExecuteParams from spec.
+        let mut exec_params = ExecuteParams {
+            wait_timeout: Some("10s".to_string()),
+            on_wait_timeout: Some("CONTINUE".to_string()),
+            ..ExecuteParams::default()
+        };
+        for (i, value) in self.spec.positional_params.iter().enumerate() {
+            exec_params
+                .parameters
+                .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
+        }
+
+        // 4. Install a Drop guard so a future cancelled after we
+        //    learn the statement_id fires a fire-and-forget
+        //    `cancel_statement` against the server. v0 caveat: the
+        //    transport doesn't expose the assigned statement_id
+        //    until execute_statement() returns, so the guard only
+        //    covers the post-success / pre-defuse window. Tracked
+        //    in pr-4-plan §7.
+        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+        let guard = cancel_state.guard();
+
+        // 5. Drive the wire call. SeaRestTransport::execute_statement
+        //    already polls to completion (wait_timeout 10s, then
+        //    GetStatementStatus loop until terminal).
+        let result = self
+            .session
+            .transport()
+            .execute_statement(self.session.session_id(), &sql, &exec_params)
+            .await?;
+
+        // 6. Record the assigned statement_id for the drop guard,
+        //    then defuse — the success path owns cleanup via
+        //    ExecutedStatement::Drop.
+        cancel_state.observe(&result.statement_id);
+        guard.defuse();
+
+        // 7. Wrap the reader in a ResultStream and build the handle.
+        let valid = ValidityFlag::new();
+        self.last_statement_id = Some(result.statement_id.clone());
+        self.last_valid = Some(valid.clone());
+
+        let result_stream = ResultStream::from_reader(result.reader)?;
+        Ok(ExecutedStatement::new(
+            Arc::clone(&self.session),
+            result.statement_id,
+            valid,
+            result_stream,
+        ))
     }
 
     /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
@@ -122,11 +199,110 @@ impl Statement {
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
         unimplemented!("PR 5: implement submit()")
     }
+
+    /// Auto-cancel + close any prior executed handle this `Statement`
+    /// produced. Errors are swallowed because re-execute should never
+    /// fail because the *prior* server-side resource refused to clean
+    /// up.
+    async fn invalidate_prior(&mut self) {
+        if let Some(valid) = self.last_valid.take() {
+            valid.invalidate();
+        }
+        if let Some(prior_id) = self.last_statement_id.take() {
+            // Best-effort cancel + close. We don't await the cancel
+            // separately — close is idempotent and the server
+            // releases resources on close regardless of cancel
+            // status.
+            if let Err(e) = self.session.transport().cancel_statement(&prior_id).await {
+                warn!(
+                    statement_id = %prior_id,
+                    error = %e,
+                    "auto-cancel of prior statement failed; closing anyway"
+                );
+            }
+            if let Err(e) = self.session.transport().close_statement(&prior_id).await {
+                warn!(
+                    statement_id = %prior_id,
+                    error = %e,
+                    "auto-close of prior statement failed; will be reclaimed by session close"
+                );
+            }
+        }
+    }
+}
+
+/// Shared state between `Statement::execute` and its `Drop` guard.
+///
+/// The guard reads `observed_id` on drop. If `defuse` was called
+/// before the drop, the guard is a no-op; otherwise the guard
+/// spawns a fire-and-forget `cancel_statement` against the observed
+/// statement_id (if any).
+struct MidExecuteCancelState {
+    session: Arc<SessionInner>,
+    observed_id: std::sync::Mutex<Option<String>>,
+    defused: std::sync::atomic::AtomicBool,
+}
+
+impl MidExecuteCancelState {
+    fn new(session: Arc<SessionInner>) -> Arc<Self> {
+        Arc::new(Self {
+            session,
+            observed_id: std::sync::Mutex::new(None),
+            defused: std::sync::atomic::AtomicBool::new(false),
+        })
+    }
+
+    fn observe(&self, id: &str) {
+        if let Ok(mut slot) = self.observed_id.lock() {
+            *slot = Some(id.to_owned());
+        }
+    }
+
+    fn guard(self: &Arc<Self>) -> MidExecuteCancelGuard {
+        MidExecuteCancelGuard {
+            state: Arc::clone(self),
+        }
+    }
+}
+
+/// RAII guard that fires a fire-and-forget `cancel_statement` on
+/// drop unless [`defuse`](MidExecuteCancelGuard::defuse) was called.
+struct MidExecuteCancelGuard {
+    state: Arc<MidExecuteCancelState>,
+}
+
+impl MidExecuteCancelGuard {
+    fn defuse(self) {
+        self.state
+            .defused
+            .store(true, std::sync::atomic::Ordering::Release);
+        // Drop runs, sees defused=true, and skips.
+    }
+}
+
+impl Drop for MidExecuteCancelGuard {
+    fn drop(&mut self) {
+        if self
+            .state
+            .defused
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return;
+        }
+        let id = self.state.observed_id.lock().ok().and_then(|g| g.clone());
+        let Some(id) = id else {
+            return;
+        };
+        let transport = Arc::clone(self.state.session.transport());
+        self.state.session.runtime_handle().spawn(async move {
+            let _ = transport.cancel_statement(&id).await;
+        });
+    }
 }
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        // (1) Flip the validity flag so any executed handle the caller
+        // Flip the validity flag so any executed handle the caller
         // still holds short-circuits to InvalidStatementHandle on its
         // next call without a network round-trip. Server-side cleanup
         // for handles that *are* still live is the executed handle's
@@ -136,23 +312,12 @@ impl Drop for Statement {
         if let Some(valid) = self.last_valid.take() {
             valid.invalidate();
         }
-        // (2) Orphan-id safety net: if a `last_statement_id` was
-        // recorded but no executed handle is tracking it (the
-        // in-flight `execute()` future was dropped after the server
-        // assigned an id but before the handle was constructed and
-        // returned), fire-and-forget Cancel+Close so the server
-        // doesn't keep charging DBUs. Idempotent CloseStatement makes
-        // double-close from another path safe.
-        //
-        // PR 5 implementation note: distinguishing "handle returned
-        // and still live" from "handle never returned" needs a flag
-        // beyond what's in this struct today (the in-flight `execute`
-        // body sets `last_statement_id` on the manifest before
-        // wrapping into the handle). Track a `handle_returned: bool`
-        // on `Statement`, set it when execute/submit returns the
-        // handle, and check `last_statement_id.is_some() &&
-        // !handle_returned` here. PR 5 plumbs the transport through
-        // and adds the field; the orphan-cleanup body lives here.
-        let _orphan_id = self.last_statement_id.take();
+        // `last_statement_id` is left as-is. By construction it is
+        // only set immediately before `ExecutedStatement::new`
+        // wraps it; if the caller still holds an `ExecutedStatement`,
+        // that handle owns the close-on-drop responsibility. If the
+        // caller dropped the handle before this `Statement`, the
+        // handle's own `Drop` already spawned the close. There is no
+        // remaining cleanup obligation here.
     }
 }
