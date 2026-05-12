@@ -153,15 +153,39 @@ impl ExecutedAsyncStatement {
     /// Block until the server reaches a terminal state, then return
     /// the result stream. Internally polls with backoff using the
     /// session's [`crate::client::TransportConfig`] cadence (the
-    /// same `poll_interval` the sync `execute()` path uses).
+    /// same `poll_interval` / `poll_timeout` the sync `execute()`
+    /// path uses).
+    ///
+    /// **Drop-cancellation.** Dropping the returned future before
+    /// it resolves to a terminal state (e.g. a winning branch in
+    /// `tokio::select!`, a timeout wrapper firing) spawns a
+    /// fire-and-forget `cancel_statement` against the server so a
+    /// long-running query doesn't keep charging DBUs after the
+    /// caller has given up. The cancel is best-effort; success is
+    /// not awaited.
+    ///
+    /// **Polling timeout.** When the transport's
+    /// `TransportConfig.poll_timeout` elapses without reaching a
+    /// terminal state, returns `Error::timeout()` (same shape the
+    /// sync polling path produces). The caller may issue a fresh
+    /// `status()` or `await_result()` to resume.
     pub async fn await_result(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         self.valid.check()?;
 
-        // Poll cadence comes from the session's defaults; the kernel
-        // doesn't expose it as a per-handle knob today (callers who
-        // need tighter control roll their own status() loop).
-        let poll_interval = std::time::Duration::from_millis(500);
+        // Poll cadence + ceiling come from the transport's config —
+        // same source the sync `wait_for_completion` path uses, so
+        // a caller's `SessionBuilder` tuning applies to both modes.
+        let cfg = self.session.transport().poll_config();
+        let start = std::time::Instant::now();
+
+        // RAII guard: if the future is dropped mid-poll (timeout,
+        // tokio::select! loser, task cancellation), spawn a
+        // best-effort `cancel_statement` so the server stops
+        // charging DBUs on a now-orphaned query. Defused once we
+        // reach a terminal state on the success or error path.
+        let cancel_guard =
+            AwaitResultCancelGuard::new(Arc::clone(&self.session), self.statement_id.clone());
 
         loop {
             self.valid.check()?;
@@ -172,15 +196,33 @@ impl ExecutedAsyncStatement {
                 .await?;
             match StatementStatus::from_sea_response(&response) {
                 StatementStatus::Succeeded | StatementStatus::Closed => {
+                    cancel_guard.defuse();
                     return self.materialise_result().await;
                 }
-                StatementStatus::Failed(e) => return Err(e),
+                StatementStatus::Failed(e) => {
+                    // Server already decided this is terminal — no
+                    // need to fire a redundant cancel.
+                    cancel_guard.defuse();
+                    return Err(e);
+                }
                 StatementStatus::Cancelled => {
+                    cancel_guard.defuse();
                     return Err(Error::invalid_state()
                         .message(format!("Statement {} was cancelled", self.statement_id)));
                 }
                 StatementStatus::Pending | StatementStatus::Running => {
-                    tokio::time::sleep(poll_interval).await;
+                    if start.elapsed() > cfg.poll_timeout {
+                        // Internal poll-timeout: we asked to wait,
+                        // we gave up. Leave the cancel guard armed
+                        // so the server stops charging DBUs on the
+                        // now-orphaned query when we return — same
+                        // policy as a caller-initiated future drop.
+                        return Err(Error::timeout().message(format!(
+                            "Statement {} did not reach a terminal state within {:?}",
+                            self.statement_id, cfg.poll_timeout
+                        )));
+                    }
+                    tokio::time::sleep(cfg.poll_interval).await;
                 }
             }
         }
@@ -200,7 +242,9 @@ impl ExecutedAsyncStatement {
 
     /// Internal: resolve the reader for an (expected to be) terminal
     /// statement. Returns `InvalidState` if the server reports the
-    /// statement is still running.
+    /// statement is still running. The error includes the observed
+    /// status so callers don't have to re-query, and points at the
+    /// actionable follow-up.
     async fn materialise_result(&self) -> Result<ResultStream> {
         match self
             .session
@@ -209,11 +253,85 @@ impl ExecutedAsyncStatement {
             .await?
         {
             Some(result) => ResultStream::from_reader(result.reader),
-            None => Err(Error::invalid_state().message(format!(
-                "Statement {} is not terminal yet; call status() and try again",
-                self.statement_id
-            ))),
+            None => {
+                // Re-read the status so the error message names the
+                // observed state (Pending vs Running). Best-effort —
+                // if the status call itself fails, fall back to the
+                // generic non-terminal message.
+                let observed = match self
+                    .session
+                    .transport()
+                    .statement_status(&self.statement_id)
+                    .await
+                {
+                    Ok(r) => match r.status.state {
+                        crate::types::sea::StatementState::Pending => "Pending",
+                        crate::types::sea::StatementState::Running => "Running",
+                        _ => "non-terminal",
+                    },
+                    Err(_) => "non-terminal",
+                };
+                Err(Error::invalid_state().message(format!(
+                    "Statement {} is not terminal yet (status: {}); call await_result() to \
+                     block until done, or poll status() and re-call fetch_result() once it \
+                     reports Succeeded / Closed",
+                    self.statement_id, observed
+                )))
+            }
         }
+    }
+}
+
+/// RAII guard that fires a fire-and-forget `cancel_statement` on
+/// drop unless [`defuse`](AwaitResultCancelGuard::defuse) was called.
+///
+/// Installed at the top of `await_result` so that a future dropped
+/// mid-poll (the canonical `tokio::select!` / `tokio::time::timeout`
+/// pattern) doesn't leave a long-running query charging DBUs.
+/// Defuses on every terminal status branch in the poll loop —
+/// success, failure, server-reported cancel — so the cancel only
+/// fires on caller-initiated drops.
+struct AwaitResultCancelGuard {
+    session: Arc<SessionInner>,
+    statement_id: String,
+    defused: bool,
+}
+
+impl AwaitResultCancelGuard {
+    fn new(session: Arc<SessionInner>, statement_id: String) -> Self {
+        Self {
+            session,
+            statement_id,
+            defused: false,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.defused = true;
+        // `Drop` will see `defused = true` and skip.
+    }
+}
+
+impl Drop for AwaitResultCancelGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        // Spawn fire-and-forget. Drop must not panic and we can't
+        // surface a failure here. The runtime keeps the background
+        // task alive until the cancel completes.
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = transport.cancel_statement(&stmt_id).await {
+                warn!(
+                    statement_id = %stmt_id,
+                    error = %e,
+                    "fire-and-forget cancel_statement on await_result drop failed",
+                );
+            }
+        });
     }
 }
 

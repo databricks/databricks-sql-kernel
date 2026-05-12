@@ -183,10 +183,11 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// constructs a reader; callers fetch results later via
     /// [`Transport::fetch_completed_result`].
     ///
-    /// Callers are expected to set `params.wait_timeout = Some("0s")`
-    /// so the server returns immediately rather than blocking for up
-    /// to 10s; this method does not enforce that itself because the
-    /// param plumbing predates the async path.
+    /// **The implementation forces `params.wait_timeout = "0s"`**
+    /// regardless of what the caller supplied — submit's contract
+    /// is "no wait", and honouring a non-zero caller value would
+    /// defeat the point (the server would block up to 50s and we
+    /// would just be slower about returning a `PENDING` handle).
     async fn submit_statement(
         &self,
         session_id: &str,
@@ -232,6 +233,12 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         chunk_index: i64,
         row_offset: i64,
     ) -> Result<ChunkLinkFetchResult>;
+
+    /// Polling cadence + ceiling the kernel should use when driving
+    /// `await_result` / `wait_for_completion`. v0 returns the
+    /// transport's `TransportConfig` directly; future transports
+    /// (gRPC, Thrift) can override.
+    fn poll_config(&self) -> TransportConfig;
 
     // --- Statement Lifecycle ---
 

@@ -499,3 +499,67 @@ async fn submit_rejects_binary_param_with_unhex_workaround_message() {
     assert_eq!(err.code, ErrorCode::InvalidArgument);
     assert!(err.message.contains("unhex"), "{}", err.message);
 }
+
+#[tokio::test]
+async fn await_result_drop_fires_cancel_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // The server keeps reporting RUNNING — `await_result` will loop
+    // forever, so the test drops the future via tokio::time::timeout
+    // and asserts that the drop fires `POST /statements/{id}/cancel`.
+    mount_submit(&server, pending_body("stmt-cancel-on-drop")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-cancel-on-drop"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(running_body("stmt-cancel-on-drop")),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-cancel-on-drop/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    // Drop the await_result future via timeout. We expect timeout
+    // to win — the server stays in RUNNING forever per the mock.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(200),
+        async_exec.await_result(),
+    )
+    .await;
+    assert!(outcome.is_err(), "timeout should fire");
+
+    // Give the spawned fire-and-forget cancel a moment to land.
+    // 200ms is generous; the cancel task is a single POST on a
+    // local mock.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+    // Query wiremock for the recorded requests on the cancel
+    // endpoint.
+    let cancel_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|req| {
+            req.method == "POST"
+                && req
+                    .url
+                    .path()
+                    .ends_with("/statements/stmt-cancel-on-drop/cancel")
+        })
+        .count();
+    assert!(
+        cancel_calls >= 1,
+        "await_result drop should fire at least one cancel_statement; got {cancel_calls}"
+    );
+}

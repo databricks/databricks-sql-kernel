@@ -983,4 +983,34 @@ mod tests {
         assert!(iter.next().is_none());
         assert!(iter.next().is_none());
     }
+
+    #[test]
+    fn into_owned_batches_yields_batch_then_error_then_none() {
+        // BatchThenErrorReader: one Ok(Some(batch)), then Err.
+        // Iterator must yield the batch, surface the error, then
+        // fuse to None forever.
+        use crate::reader::test_utils::BatchThenErrorReader;
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let reader = BatchThenErrorReader {
+            schema: batch.schema(),
+            batch: Some(batch),
+        };
+        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+
+        let mut iter = stream.into_owned_batches();
+        let first = iter.next().expect("first yields a batch");
+        let first = first.expect("first is Ok(batch)");
+        assert_eq!(first.num_rows(), 2);
+
+        let second = iter.next().expect("second yields an error");
+        assert!(second.is_err(), "second is Err");
+
+        assert!(iter.next().is_none(), "iterator fuses to None after Err");
+        assert!(iter.next().is_none(), "remains None on subsequent calls");
+    }
 }

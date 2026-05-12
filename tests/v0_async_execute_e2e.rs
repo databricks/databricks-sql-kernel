@@ -141,8 +141,16 @@ async fn status_reports_progress_for_range() {
     );
     assert!(ok, "unexpected initial status: {s:?}");
 
-    // Drain to completion via await_result.
-    let mut stream = async_exec.await_result().await.expect("await_result");
+    // Drain to completion via await_result. Wrap in a 60s outer
+    // timeout — Dogfood is generally fast, but a slow workspace
+    // shouldn't be able to hang CI when this test runs.
+    let mut stream = tokio::time::timeout(
+        std::time::Duration::from_secs(60),
+        async_exec.await_result(),
+    )
+    .await
+    .expect("await_result must finish within 60s")
+    .expect("await_result must succeed");
     let rows = drain_rows(&mut stream).await;
     assert!(rows > 0, "count(*) returns at least one row");
 

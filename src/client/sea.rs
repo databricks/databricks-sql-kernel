@@ -484,12 +484,18 @@ impl Transport for SeaRestTransport {
         params: &ExecuteParams,
     ) -> Result<ExecuteResponse> {
         // Single POST /statements; no polling, no reader creation.
-        // The caller is responsible for setting `params.wait_timeout = "0s"`
-        // so the server returns immediately. `RequestType::ExecuteStatement`
+        // Force `wait_timeout = "0s"` regardless of what the caller
+        // passed — submit's contract is "no wait", and silently
+        // honouring a non-zero caller value would defeat the point
+        // (the server would block up to 50s and we'd just be slower
+        // about handing back a PENDING handle). `RequestType::ExecuteStatement`
         // matches the retry policy of the sync path — submit is also
         // non-idempotent in the worst case (e.g. an INSERT submitted
         // twice).
-        self.call_execute_api(session_id, sql, params, RequestType::ExecuteStatement)
+        let mut params = params.clone();
+        params.wait_timeout = Some("0s".to_string());
+        params.on_wait_timeout = Some("CONTINUE".to_string());
+        self.call_execute_api(session_id, sql, &params, RequestType::ExecuteStatement)
             .await
     }
 
@@ -592,6 +598,10 @@ impl Transport for SeaRestTransport {
             next_chunk_index,
             next_row_offset: None, // SEA doesn't use row offset
         })
+    }
+
+    fn poll_config(&self) -> TransportConfig {
+        self.config.clone()
     }
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {

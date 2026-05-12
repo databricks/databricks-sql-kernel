@@ -644,6 +644,10 @@ mod tests {
             })
         }
 
+        fn poll_config(&self) -> crate::client::TransportConfig {
+            crate::client::TransportConfig::default()
+        }
+
         async fn cancel_statement(&self, _statement_id: &str) -> Result<()> {
             Ok(())
         }
