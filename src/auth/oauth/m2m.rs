@@ -61,7 +61,7 @@ use std::sync::Arc;
 /// use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
 /// use std::sync::Arc;
 ///
-/// # async fn example() -> databricks_sql_kernel::error::Result<()> {
+/// # async fn example() -> databricks_sql_kernel::Result<()> {
 /// let http_client = Arc::new(DatabricksHttpClient::with_default_retry(HttpClientConfig::default())?);
 /// let provider = ClientCredentialsProvider::new(
 ///     "https://my-workspace.cloud.databricks.com",
@@ -118,7 +118,7 @@ impl ClientCredentialsProvider {
     /// # use databricks_sql_kernel::auth::oauth::m2m::ClientCredentialsProvider;
     /// # use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
     /// # use std::sync::Arc;
-    /// # async fn example() -> databricks_sql_kernel::error::Result<()> {
+    /// # async fn example() -> databricks_sql_kernel::Result<()> {
     /// let http_client = Arc::new(DatabricksHttpClient::with_default_retry(HttpClientConfig::default())?);
     /// let provider = ClientCredentialsProvider::new(
     ///     "https://my-workspace.cloud.databricks.com",

@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Shared metadata utilities used by all kernel surfaces.
+//! Shared metadata utilities used by the v0 `Metadata` surface.
 //!
-//! This module provides protocol-neutral building blocks:
-//! - `SqlCommandBuilder`: Builds SHOW SQL commands for metadata queries
-//! - Result parsing: Parses `ExecuteResult` readers into intermediate structs
-//! - Type mapping: Maps Databricks types to Arrow/XDBC types
-//!
-//! The ADBC-specific Arrow builder for `get_objects` lives at
-//! `crate::adbc::metadata_builder` and is gated on the `legacy-adbc` feature.
+//! Protocol-neutral building blocks:
+//! - `SqlCommandBuilder`: Builds SHOW SQL commands for metadata queries.
+//! - `schemas`, `static_data`: kernel-synthesised result schemas for
+//!   `type_info` / `table_types`.
+//! - `type_mapping`: Maps Databricks types to Arrow/XDBC types.
 
-pub mod parse;
 pub(crate) mod schemas;
 pub mod sql;
 pub(crate) mod static_data;

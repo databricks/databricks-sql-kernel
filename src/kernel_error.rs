@@ -31,8 +31,8 @@
 //! Error::invalid_argument().message("bad host URL")
 //! ```
 //!
-//! The short form mirrors the driverbase `ErrorHelper` API the legacy
-//! ADBC layer uses, which keeps the swap mechanical and readable.
+//! The short form is ergonomically modelled on a categorised-constructor
+//! + chainable builder pattern, so error sites stay terse and readable.
 //!
 //! ## What's `#[non_exhaustive]` and what isn't
 //!
@@ -218,11 +218,11 @@ impl Error {
         Self::new(code, "")
     }
 
-    // ─── Categorised constructors (driverbase parity) ───────────────
+    // ─── Categorised constructors ───────────────────────────────────
     //
-    // These mirror `driverbase::error::ErrorHelper::*` so the swap
-    // from `DatabricksErrorHelper::xxx()` to `Error::xxx()` is a
-    // mechanical text replacement at every call site.
+    // One constructor per `ErrorCode` variant. Each returns an empty
+    // message — call sites chain [`Error::message`] /
+    // [`Error::with_source`] / [`Error::sqlstate`] to fill in detail.
 
     /// `ErrorCode::InvalidArgument`. Caller passed a malformed
     /// argument.
@@ -288,7 +288,7 @@ impl Error {
     }
 
     /// `ErrorCode::Internal` with a source-code `location` already
-    /// attached. Mirror of `driverbase`'s `internal(location)`.
+    /// attached.
     pub fn internal_at(location: impl AsRef<str>) -> Self {
         Self::internal().location(location)
     }
@@ -326,10 +326,9 @@ impl Error {
         Self::empty(ErrorCode::InvalidArgument)
     }
 
-    // ─── Builder API (driverbase parity) ────────────────────────────
+    // ─── Builder API ────────────────────────────────────────────────
 
-    /// Append to the error message. Driverbase joins clauses with
-    /// `; `; we do the same.
+    /// Append to the error message; clauses are joined with `; `.
     pub fn message(mut self, msg: impl AsRef<str>) -> Self {
         if !self.message.is_empty() {
             self.message.push_str("; ");
@@ -338,10 +337,9 @@ impl Error {
         self
     }
 
-    /// Wrap the error with a context phrase. Driverbase formats
-    /// these as `could not <CONTEXT>: <ERROR>` at display time; we
-    /// inline that into the message at call time so the typed
-    /// `Error` doesn't need a separate field.
+    /// Wrap the error with a context phrase, formatted at call time
+    /// as `could not <CONTEXT>: <ERROR>` so the typed `Error` doesn't
+    /// need a separate field.
     pub fn context(mut self, ctx: impl AsRef<str>) -> Self {
         let ctx = ctx.as_ref();
         if self.message.is_empty() {
@@ -352,9 +350,7 @@ impl Error {
         self
     }
 
-    /// Append a `format_args!` clause to the message. Mirrors
-    /// driverbase's `format(...)` so call sites that use the macro
-    /// form swap one-for-one.
+    /// Append a `format_args!` clause to the message (`; `-joined).
     pub fn format(mut self, args: std::fmt::Arguments) -> Self {
         if !self.message.is_empty() {
             self.message.push_str("; ");
@@ -426,39 +422,6 @@ impl Error {
         Self::invalid_argument().format(format_args!("unknown option {key:?}"))
     }
 
-    /// Error for when a user sets an option to an invalid value.
-    pub fn set_invalid_option<K: std::fmt::Debug>(
-        key: &K,
-        value: &adbc_core::options::OptionValue,
-    ) -> Self {
-        Self::invalid_argument().context(format!("invalid option {key:?}={value:?}"))
-    }
-
-    /// Unwrap an option value as an integer.
-    pub fn option_as_int<K: std::fmt::Debug>(
-        key: &K,
-        value: &adbc_core::options::OptionValue,
-    ) -> Result<i64> {
-        match value {
-            adbc_core::options::OptionValue::String(s) => s
-                .parse::<i64>()
-                .map_err(|_| Self::set_invalid_option(key, value).message("must be an integer")),
-            adbc_core::options::OptionValue::Int(v) => Ok(*v),
-            v => Err(Self::set_invalid_option(key, v).message("must be an integer")),
-        }
-    }
-
-    /// Unwrap an option value as a string.
-    pub fn option_as_string<'v, K: std::fmt::Debug>(
-        key: &K,
-        value: &'v adbc_core::options::OptionValue,
-    ) -> Result<&'v str> {
-        match value {
-            adbc_core::options::OptionValue::String(s) => Ok(s.as_ref()),
-            v => Err(Self::set_invalid_option(key, v).message("must be a string")),
-        }
-    }
-
     // ─── HTTP / wire mapping ────────────────────────────────────────
 
     /// Map an HTTP status code to the categorised constructor per
@@ -481,26 +444,6 @@ impl Error {
             _ => Self::internal(),
         };
         err.with_http_status(status)
-    }
-
-    // ─── ADBC interop (legacy shim) ─────────────────────────────────
-
-    /// Convert this typed kernel error into the ADBC trait surface's
-    /// `adbc_core::error::Error`. Used by `src/adbc/*` to feed the
-    /// ADBC `Result<T>` back to consumers.
-    ///
-    /// Removed in PR 7 alongside `src/adbc/`.
-    pub fn to_adbc(self) -> adbc_core::error::Error {
-        let status = error_code_to_adbc_status(self.code);
-        let message = format_message_for_adbc(&self);
-        let sqlstate = sqlstate_str_to_array(self.sql_state.as_deref()).unwrap_or([0; 5]);
-        adbc_core::error::Error {
-            message,
-            status,
-            vendor_code: self.vendor_code.unwrap_or(0),
-            sqlstate,
-            details: None,
-        }
     }
 }
 
@@ -538,17 +481,11 @@ impl std::error::Error for Error {
     }
 }
 
-impl From<Error> for adbc_core::error::Error {
-    fn from(value: Error) -> Self {
-        value.to_adbc()
-    }
-}
-
 impl From<arrow_schema::ArrowError> for Error {
     fn from(err: arrow_schema::ArrowError) -> Self {
-        // Mirrors driverbase's `from_arrow` mapping. Arrow errors are
-        // mostly internal (parse / cast / IPC), with a few that map
-        // to data-quality (`DataLoss`) or invalid-argument categories.
+        // Arrow errors are mostly internal (parse / cast / IPC), with
+        // a few that map to data-quality (`DataLoss`) or
+        // invalid-argument categories.
         match err {
             arrow_schema::ArrowError::NotYetImplemented(msg) => {
                 Self::not_implemented().format(format_args!("{msg}"))
@@ -615,61 +552,6 @@ impl From<arrow_schema::ArrowError> for Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
-// ─── ADBC interop helpers ───────────────────────────────────────────
-
-fn error_code_to_adbc_status(code: ErrorCode) -> adbc_core::error::Status {
-    use adbc_core::error::Status;
-    match code {
-        ErrorCode::InvalidArgument => Status::InvalidArguments,
-        ErrorCode::Unauthenticated => Status::Unauthenticated,
-        ErrorCode::PermissionDenied => Status::Unauthorized,
-        ErrorCode::NotFound => Status::NotFound,
-        ErrorCode::ResourceExhausted => Status::IO,
-        ErrorCode::Unavailable => Status::IO,
-        ErrorCode::Timeout => Status::Timeout,
-        ErrorCode::Cancelled => Status::Cancelled,
-        ErrorCode::DataLoss => Status::InvalidData,
-        ErrorCode::Internal => Status::Internal,
-        ErrorCode::InvalidStatementHandle => Status::InvalidState,
-        ErrorCode::NetworkError => Status::IO,
-        ErrorCode::SqlError => Status::Internal,
-    }
-}
-
-fn format_message_for_adbc(err: &Error) -> String {
-    let mut out = format!(
-        "[Databricks] {}",
-        if err.message.is_empty() {
-            "(no message)"
-        } else {
-            err.message.as_str()
-        }
-    );
-    // adbc_core::error::Error has no string-shaped slot for the
-    // Databricks error_code slug, so we surface it in the message
-    // string instead. Lossy bridge — wrappers reading the typed
-    // kernel_error::Error directly get the structured field.
-    if let Some(ec) = &err.error_code {
-        write!(&mut out, " [error_code {ec}]").ok();
-    }
-    if let Some(loc) = &err.location {
-        write!(&mut out, " (at {loc})").ok();
-    }
-    if let Some(cause) = &err.cause {
-        write!(
-            &mut out,
-            ". While handling error: {}",
-            if cause.message.is_empty() {
-                "(no message)"
-            } else {
-                cause.message.as_str()
-            }
-        )
-        .ok();
-    }
-    out
-}
-
 // ─── SQLSTATE extraction helpers ────────────────────────────────────
 
 /// Extract a SQLSTATE from a free-form error message.
@@ -690,23 +572,6 @@ pub fn extract_sqlstate_from_message(message: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Convert a 5-character SQLSTATE string into the `[c_char; 5]`
-/// representation `adbc_core::error::Error::sqlstate` expects.
-fn sqlstate_str_to_array(sqlstate: Option<&str>) -> Option<[std::os::raw::c_char; 5]> {
-    let s = sqlstate?;
-    let bytes = s.as_bytes();
-    if bytes.len() != 5 {
-        return None;
-    }
-    Some([
-        bytes[0] as std::os::raw::c_char,
-        bytes[1] as std::os::raw::c_char,
-        bytes[2] as std::os::raw::c_char,
-        bytes[3] as std::os::raw::c_char,
-        bytes[4] as std::os::raw::c_char,
-    ])
 }
 
 #[cfg(test)]
@@ -851,33 +716,6 @@ mod tests {
     }
 
     #[test]
-    fn to_adbc_maps_status_correctly() {
-        use adbc_core::error::Status;
-        let e = Error::invalid_argument().message("bad option");
-        let adbc = e.to_adbc();
-        assert_eq!(adbc.status, Status::InvalidArguments);
-        assert!(adbc.message.contains("Databricks"));
-        assert!(adbc.message.contains("bad option"));
-    }
-
-    #[test]
-    fn to_adbc_carries_sqlstate_and_vendor_code() {
-        let e = Error::sql_error()
-            .message("syntax")
-            .with_sql_state("42601")
-            .with_vendor_code(7);
-        let adbc = e.to_adbc();
-        assert_eq!(adbc.vendor_code, 7);
-        assert_eq!(
-            std::str::from_utf8(unsafe {
-                std::slice::from_raw_parts(adbc.sqlstate.as_ptr() as *const u8, 5)
-            })
-            .unwrap(),
-            "42601"
-        );
-    }
-
-    #[test]
     fn arrow_error_conversion_categorises() {
         let e: Error = arrow_schema::ArrowError::SchemaError("missing".into()).into();
         assert_eq!(e.code, ErrorCode::Internal);
@@ -906,21 +744,5 @@ mod tests {
         let s = format!("{e}");
         assert!(s.contains("[error_code STATEMENT_NOT_FOUND]"));
         assert!(s.contains("[SQLSTATE 42P01]"));
-    }
-
-    #[test]
-    fn to_adbc_surfaces_error_code_in_message() {
-        // ADBC has no string-shaped vendor slot; the slug lives in the
-        // formatted message. Wrappers that need typed access read the
-        // kernel_error::Error directly.
-        let e = Error::sql_error()
-            .message("warehouse stopped")
-            .with_error_code("WAREHOUSE_STOPPED");
-        let adbc = e.to_adbc();
-        assert!(
-            adbc.message.contains("[error_code WAREHOUSE_STOPPED]"),
-            "ADBC message lost error_code slug: {}",
-            adbc.message
-        );
     }
 }

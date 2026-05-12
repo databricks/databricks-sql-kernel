@@ -42,9 +42,7 @@ pub use retry::{
     build_retry_configs, RequestCategory, RequestType, RetryConfig, RetryConfigOverrides,
 };
 
-// Crate-internal surface — `Transport` trait + its value types. The
-// `legacy-adbc` layer reaches in here while it still exists; PR 7
-// drops these once the legacy layer is removed.
+// Crate-internal surface — `Transport` trait + its value types.
 pub(crate) use sea::SeaRestTransport;
 pub(crate) use transport::{
     ChunkLinkFetchResult, ExecuteResponse, ExecuteResult, ExecuteResultData, SessionInfo,

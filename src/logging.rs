@@ -12,13 +12,13 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Logging configuration for the Databricks ADBC driver.
+//! Logging configuration for the Databricks SQL Kernel.
 //!
 //! Initializes a `tracing-subscriber` with file or stderr output.
 //!
 //! ## Configuration priority
 //!
-//! 1. `databricks.log_level` / `databricks.log_file` ADBC options (highest)
+//! 1. Kernel `LoggingConfig` (highest, when wired through `Session`)
 //! 2. `RUST_LOG` environment variable
 //! 3. Default: `warn`
 //!
@@ -26,16 +26,10 @@
 //!
 //! ```bash
 //! # Via environment variable
-//! RUST_LOG=databricks_sql_kernel=debug ./my_adbc_app
-//! ```
-//!
-//! Or programmatically via ADBC options:
-//! ```ignore
-//! database.set_option("databricks.log_level", "debug")?;
-//! database.set_option("databricks.log_file", "/tmp/adbc.log")?;
+//! RUST_LOG=databricks_sql_kernel=debug ./my_app
 //! ```
 
-#![cfg_attr(not(feature = "legacy-adbc"), allow(dead_code))]
+#![allow(dead_code)]
 
 use std::sync::OnceLock;
 use tracing_subscriber::{

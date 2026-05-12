@@ -248,64 +248,6 @@ impl SqlCommandBuilder {
         sql
     }
 
-    /// Build a SELECT query against `information_schema.parameters` joined with
-    /// `information_schema.routines` for getProcedureColumns.
-    ///
-    /// Same catalog resolution as `build_get_procedures`.
-    #[allow(
-        dead_code,
-        reason = "still called only under feature `metadata-ffi`; v0 Metadata does not expose procedure columns"
-    )]
-    pub fn build_get_procedure_columns(
-        catalog: Option<&str>,
-        schema_pattern: Option<&str>,
-        procedure_pattern: Option<&str>,
-        column_pattern: Option<&str>,
-    ) -> String {
-        let prefix = Self::resolve_catalog_prefix(catalog);
-        let mut sql = format!(
-            "SELECT \
-             p.specific_catalog, p.specific_schema, p.specific_name, \
-             p.parameter_name, p.parameter_mode, p.is_result, \
-             p.data_type, p.full_data_type, \
-             p.numeric_precision, p.numeric_precision_radix, p.numeric_scale, \
-             p.character_maximum_length, p.character_octet_length, \
-             p.ordinal_position, p.parameter_default, p.comment \
-             FROM {prefix}.information_schema.parameters p \
-             JOIN {prefix}.information_schema.routines r \
-             ON p.specific_catalog = r.specific_catalog \
-             AND p.specific_schema = r.specific_schema \
-             AND p.specific_name = r.specific_name \
-             WHERE r.routine_type = 'PROCEDURE'"
-        );
-
-        if let Some(pattern) = schema_pattern {
-            sql.push_str(&format!(
-                " AND p.specific_schema LIKE '{}'",
-                Self::escape_sql_string(pattern)
-            ));
-        }
-
-        if let Some(pattern) = procedure_pattern {
-            sql.push_str(&format!(
-                " AND p.specific_name LIKE '{}'",
-                Self::escape_sql_string(pattern)
-            ));
-        }
-
-        if let Some(pattern) = column_pattern {
-            sql.push_str(&format!(
-                " AND p.parameter_name LIKE '{}'",
-                Self::escape_sql_string(pattern)
-            ));
-        }
-
-        sql.push_str(
-            " ORDER BY p.specific_catalog, p.specific_schema, p.specific_name, p.ordinal_position",
-        );
-        sql
-    }
-
     /// Build a SELECT query against `information_schema.routines` for
     /// `getFunctions`.
     ///
@@ -570,57 +512,6 @@ mod tests {
         assert!(sql.contains("FROM `my``catalog`.information_schema.routines"));
     }
 
-    #[test]
-    fn test_get_procedure_columns_null_catalog() {
-        let sql = SqlCommandBuilder::build_get_procedure_columns(None, None, None, None);
-        assert!(sql.contains("FROM system.information_schema.parameters p"));
-        assert!(sql.contains("JOIN system.information_schema.routines r"));
-        assert!(sql.contains("WHERE r.routine_type = 'PROCEDURE'"));
-        assert!(sql.ends_with(
-            "ORDER BY p.specific_catalog, p.specific_schema, p.specific_name, p.ordinal_position"
-        ));
-    }
-
-    #[test]
-    fn test_get_procedure_columns_specific_catalog() {
-        let sql = SqlCommandBuilder::build_get_procedure_columns(Some("main"), None, None, None);
-        assert!(sql.contains("FROM `main`.information_schema.parameters p"));
-        assert!(sql.contains("JOIN `main`.information_schema.routines r"));
-    }
-
-    #[test]
-    fn test_get_procedure_columns_with_all_filters() {
-        let sql = SqlCommandBuilder::build_get_procedure_columns(
-            Some("prod"),
-            Some("public"),
-            Some("my_proc"),
-            Some("param%"),
-        );
-        assert!(sql.contains("FROM `prod`.information_schema.parameters p"));
-        assert!(sql.contains("AND p.specific_schema LIKE 'public'"));
-        assert!(sql.contains("AND p.specific_name LIKE 'my_proc'"));
-        assert!(sql.contains("AND p.parameter_name LIKE 'param%'"));
-    }
-
-    #[test]
-    fn test_get_procedure_columns_selects_all_needed_columns() {
-        let sql = SqlCommandBuilder::build_get_procedure_columns(None, None, None, None);
-        // Verify key columns are selected
-        assert!(sql.contains("p.specific_catalog"));
-        assert!(sql.contains("p.parameter_name"));
-        assert!(sql.contains("p.parameter_mode"));
-        assert!(sql.contains("p.is_result"));
-        assert!(sql.contains("p.data_type"));
-        assert!(sql.contains("p.full_data_type"));
-        assert!(sql.contains("p.numeric_precision"));
-        assert!(sql.contains("p.numeric_scale"));
-        assert!(sql.contains("p.character_maximum_length"));
-        assert!(sql.contains("p.character_octet_length"));
-        assert!(sql.contains("p.ordinal_position"));
-        assert!(sql.contains("p.parameter_default"));
-        assert!(sql.contains("p.comment"));
-    }
-
     // --- resolve_catalog_prefix edge cases ---
 
     #[test]
@@ -686,39 +577,6 @@ mod tests {
     fn test_escape_sql_string_empty() {
         assert_eq!(SqlCommandBuilder::escape_sql_string(""), "");
     }
-
-    // --- procedure_columns SQL injection in column_pattern ---
-
-    #[test]
-    fn test_get_procedure_columns_column_pattern_injection() {
-        let sql = SqlCommandBuilder::build_get_procedure_columns(
-            None,
-            None,
-            None,
-            Some("'; DROP TABLE --"),
-        );
-        // Input: '; DROP TABLE --
-        // After escaping: ''; DROP TABLE --
-        // Embedded in LIKE '...': LIKE '''; DROP TABLE --'
-        assert!(
-            sql.contains("AND p.parameter_name LIKE '''; DROP TABLE --'"),
-            "Single quotes in column_pattern should be escaped: {}",
-            sql
-        );
-    }
-
-    #[test]
-    fn test_get_procedure_columns_column_pattern_backslash() {
-        let sql =
-            SqlCommandBuilder::build_get_procedure_columns(None, None, None, Some(r"param\name"));
-        assert!(
-            sql.contains(r"AND p.parameter_name LIKE 'param\\name'"),
-            "Backslash in column_pattern should be escaped: {}",
-            sql
-        );
-    }
-
-    // --- foreign keys with special characters ---
 
     // --- getFunctions SQL builder tests ---
 
