@@ -37,6 +37,22 @@ use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 use tracing::debug;
 
+/// Internal terminal-outcome for a single SEA statement response.
+///
+/// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
+/// so the sync polling loop and the async one-shot
+/// [`Transport::fetch_completed_result`] path produce identical
+/// outcomes (and identical errors) for `FAILED` / `CANCELLED` /
+/// `CLOSED-no-data` responses.
+enum StatementOutcome {
+    /// `Succeeded` (or `Closed` with inline data).
+    Done(ExecuteResponse),
+    /// `Pending` / `Running` — caller polls again.
+    NotReady(ExecuteResponse),
+    /// Terminal error.
+    Err(Error),
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -171,79 +187,88 @@ impl SeaRestTransport {
         Self::convert_response(sea_response)
     }
 
+    /// Decode a single SEA `ExecuteResponse` into a terminal outcome.
+    ///
+    /// Shared by `wait_for_completion` (sync poll loop) and
+    /// [`Transport::fetch_completed_result`] (async one-shot fetch)
+    /// so both paths produce identical errors for `FAILED` /
+    /// `CANCELLED` / `CLOSED-no-data`.
+    fn terminal_outcome(response: ExecuteResponse) -> StatementOutcome {
+        match response.status.state {
+            StatementState::Succeeded => StatementOutcome::Done(response),
+            StatementState::Failed => {
+                let service_error = response.status.error.as_ref();
+                let error_msg = service_error
+                    .and_then(|e| e.message.clone())
+                    .unwrap_or_else(|| "Unknown error".to_string());
+
+                // Server-reported execution error → SqlError with the
+                // structured fields populated from the envelope.
+                let mut error = Error::sql_error()
+                    .message(&error_msg)
+                    .with_query_id(&response.statement_id);
+
+                if let Some(err) = service_error {
+                    // SQLSTATE: prefer the structured field; fall back
+                    // to parsing the message ("SQLSTATE: XXXXX" pattern).
+                    let sqlstate = err
+                        .sql_state
+                        .as_ref()
+                        .filter(|s| s.len() == 5)
+                        .cloned()
+                        .or_else(|| crate::kernel_error::extract_sqlstate_from_message(&error_msg));
+                    if let Some(s) = sqlstate {
+                        error = error.with_sql_state(s);
+                    }
+
+                    // Databricks-specific error code slug
+                    // (`STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`, …).
+                    // Wrappers branch on this to map host-language
+                    // exception taxonomies.
+                    if let Some(ec) = err.error_code.as_deref().filter(|s| !s.is_empty()) {
+                        error = error.with_error_code(ec);
+                    }
+                }
+
+                StatementOutcome::Err(error)
+            }
+            StatementState::Canceled => {
+                StatementOutcome::Err(Error::invalid_state().message("Statement was canceled"))
+            }
+            StatementState::Closed => {
+                // Closed with result data is valid for inline results
+                // — the server delivers the data and immediately
+                // closes the statement since no further fetching is
+                // needed.
+                if response.result.is_some() {
+                    StatementOutcome::Done(response)
+                } else {
+                    StatementOutcome::Err(Error::invalid_state().message("Statement was closed"))
+                }
+            }
+            StatementState::Pending | StatementState::Running => {
+                StatementOutcome::NotReady(response)
+            }
+        }
+    }
+
     /// Wait for statement to complete, polling status.
     async fn wait_for_completion(&self, response: ExecuteResponse) -> Result<ExecuteResponse> {
         let start = std::time::Instant::now();
         let mut current_response = response;
 
         loop {
-            match current_response.status.state {
-                StatementState::Succeeded => return Ok(current_response),
-                StatementState::Failed => {
-                    let service_error = current_response.status.error.as_ref();
-                    let error_msg = service_error
-                        .and_then(|e| e.message.clone())
-                        .unwrap_or_else(|| "Unknown error".to_string());
-
-                    // Server-reported execution error → SqlError with the
-                    // structured fields populated from the envelope.
-                    let mut error = Error::sql_error()
-                        .message(&error_msg)
-                        .with_query_id(&current_response.statement_id);
-
-                    if let Some(err) = service_error {
-                        // SQLSTATE: prefer the structured field; fall back
-                        // to parsing the message ("SQLSTATE: XXXXX" pattern).
-                        let sqlstate = err
-                            .sql_state
-                            .as_ref()
-                            .filter(|s| s.len() == 5)
-                            .cloned()
-                            .or_else(|| {
-                                crate::kernel_error::extract_sqlstate_from_message(&error_msg)
-                            });
-                        if let Some(s) = sqlstate {
-                            error = error.with_sql_state(s);
-                        }
-
-                        // Databricks-specific error code slug
-                        // (`STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`, …).
-                        // Wrappers branch on this to map host-language
-                        // exception taxonomies.
-                        if let Some(ec) = err.error_code.as_deref().filter(|s| !s.is_empty()) {
-                            error = error.with_error_code(ec);
-                        }
-                    }
-
-                    return Err(error);
-                }
-                StatementState::Canceled => {
-                    return Err(Error::invalid_state().message("Statement was canceled"));
-                }
-                StatementState::Closed => {
-                    // Closed with result data is valid for inline results — the server
-                    // delivers the data and immediately closes the statement since no
-                    // further fetching is needed.
-                    if current_response.result.is_some() {
-                        debug!("Statement closed with inline result data - treating as success");
-                        return Ok(current_response);
-                    }
-                    return Err(Error::invalid_state().message("Statement was closed"));
-                }
-                StatementState::Pending | StatementState::Running => {
+            match Self::terminal_outcome(current_response) {
+                StatementOutcome::Done(r) => return Ok(r),
+                StatementOutcome::Err(e) => return Err(e),
+                StatementOutcome::NotReady(r) => {
                     if start.elapsed() > self.config.poll_timeout {
                         return Err(Error::timeout().message("Statement execution timed out"));
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
-
-                    debug!(
-                        "Polling statement status: {}",
-                        current_response.statement_id
-                    );
-                    current_response = self
-                        .get_statement_status(&current_response.statement_id)
-                        .await?;
+                    debug!("Polling statement status: {}", r.statement_id);
+                    current_response = self.get_statement_status(&r.statement_id).await?;
                 }
             }
         }
@@ -452,6 +477,49 @@ impl Transport for SeaRestTransport {
             .await
     }
 
+    async fn submit_statement(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+    ) -> Result<ExecuteResponse> {
+        // Single POST /statements; no polling, no reader creation.
+        // Force `wait_timeout = "0s"` regardless of what the caller
+        // passed — submit's contract is "no wait", and silently
+        // honouring a non-zero caller value would defeat the point
+        // (the server would block up to 50s and we'd just be slower
+        // about handing back a PENDING handle). `RequestType::ExecuteStatement`
+        // matches the retry policy of the sync path — submit is also
+        // non-idempotent in the worst case (e.g. an INSERT submitted
+        // twice).
+        let mut params = params.clone();
+        params.wait_timeout = Some("0s".to_string());
+        params.on_wait_timeout = Some("CONTINUE".to_string());
+        self.call_execute_api(session_id, sql, &params, RequestType::ExecuteStatement)
+            .await
+    }
+
+    async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>> {
+        let response = self.get_statement_status(statement_id).await?;
+        match Self::terminal_outcome(response) {
+            StatementOutcome::Done(r) => {
+                let reader_factory = self.reader_factory()?;
+                let reader = reader_factory.create_reader(&r.statement_id, &r)?;
+                Ok(Some(ExecuteResult {
+                    statement_id: r.statement_id,
+                    reader,
+                    manifest: r.manifest,
+                }))
+            }
+            StatementOutcome::NotReady(_) => Ok(None),
+            StatementOutcome::Err(e) => Err(e),
+        }
+    }
+
+    async fn statement_status(&self, statement_id: &str) -> Result<ExecuteResponse> {
+        self.get_statement_status(statement_id).await
+    }
+
     async fn get_result_chunks(
         &self,
         statement_id: &str,
@@ -530,6 +598,10 @@ impl Transport for SeaRestTransport {
             next_chunk_index,
             next_row_offset: None, // SEA doesn't use row offset
         })
+    }
+
+    fn poll_config(&self) -> TransportConfig {
+        self.config.clone()
     }
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {

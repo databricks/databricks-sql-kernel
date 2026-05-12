@@ -26,16 +26,18 @@
 //! the parent `Statement` is re-executed, avoiding wasted network
 //! round-trips on zombie handles.
 
-#![allow(dead_code, unused_variables)]
-
+use crate::client::ExecuteResponse;
 use crate::kernel_error::Error;
 use crate::kernel_error::Result;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::validity::ValidityFlag;
+use crate::types::sea::StatementState;
 use async_trait::async_trait;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use tracing::{warn, Instrument};
 
 /// Server-side execution status.
 ///
@@ -44,12 +46,64 @@ use std::sync::Arc;
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum StatementStatus {
+    /// Server has not yet started the statement.
     Pending,
+    /// Server is actively executing.
     Running,
+    /// Terminal — results are ready.
     Succeeded,
+    /// Terminal — server reported a failure. Carries the structured
+    /// `Error` with `sql_state` / `error_code` / `query_id`
+    /// populated when the wire envelope provided them.
     Failed(Error),
+    /// Terminal — statement was cancelled.
     Cancelled,
+    /// Terminal — statement was closed. The server emits this when
+    /// it has delivered inline results and immediately released
+    /// resources (no further fetching is needed). The kernel
+    /// treats `Closed` as a terminal "result-ready" state.
     Closed,
+}
+
+impl StatementStatus {
+    /// Map a SEA `ExecuteResponse` to its public kernel status. The
+    /// `Failed` arm preserves the same structured error
+    /// `Transport::execute_statement`'s sync polling produces, so
+    /// callers get identical `sql_state` / `error_code` /
+    /// `query_id` regardless of which path surfaced the failure.
+    pub(crate) fn from_sea_response(response: &ExecuteResponse) -> Self {
+        match response.status.state {
+            StatementState::Pending => StatementStatus::Pending,
+            StatementState::Running => StatementStatus::Running,
+            StatementState::Succeeded => StatementStatus::Succeeded,
+            StatementState::Canceled => StatementStatus::Cancelled,
+            StatementState::Closed => StatementStatus::Closed,
+            StatementState::Failed => {
+                let service_error = response.status.error.as_ref();
+                let error_msg = service_error
+                    .and_then(|e| e.message.clone())
+                    .unwrap_or_else(|| "Unknown error".to_string());
+                let mut error = Error::sql_error()
+                    .message(&error_msg)
+                    .with_query_id(&response.statement_id);
+                if let Some(err) = service_error {
+                    let sqlstate = err
+                        .sql_state
+                        .as_ref()
+                        .filter(|s| s.len() == 5)
+                        .cloned()
+                        .or_else(|| crate::kernel_error::extract_sqlstate_from_message(&error_msg));
+                    if let Some(s) = sqlstate {
+                        error = error.with_sql_state(s);
+                    }
+                    if let Some(ec) = err.error_code.as_deref().filter(|s| !s.is_empty()) {
+                        error = error.with_error_code(ec);
+                    }
+                }
+                StatementStatus::Failed(error)
+            }
+        }
+    }
 }
 
 /// Async-consumption executed handle.
@@ -60,32 +114,224 @@ pub struct ExecutedAsyncStatement {
     /// when the parent `Statement` is dropped. Reads short-circuit
     /// stale calls locally with no network round-trip.
     valid: ValidityFlag,
+    /// Flips to `true` after the first successful (or
+    /// short-circuited) `close()`. Tells `Drop` to skip its
+    /// fire-and-forget cleanup.
+    closed: Arc<AtomicBool>,
 }
 
 impl ExecutedAsyncStatement {
+    /// Crate-internal constructor. Built by [`Statement::submit`].
+    pub(crate) fn new(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+    ) -> Self {
+        Self {
+            session,
+            statement_id,
+            valid,
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// One-shot status check. Non-blocking. Issues a single
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`
     /// has already invalidated this handle.
     pub async fn status(&self) -> Result<StatementStatus> {
-        unimplemented!("PR 5: validity check, then Transport::get_statement_status")
+        let _g = self.session.log_span().clone().entered();
+        self.valid.check()?;
+        let response = self
+            .session
+            .transport()
+            .statement_status(&self.statement_id)
+            .await?;
+        Ok(StatementStatus::from_sea_response(&response))
     }
 
     /// Block until the server reaches a terminal state, then return
-    /// the result stream. Internally polls with backoff.
+    /// the result stream. Internally polls with backoff using the
+    /// session's [`crate::client::TransportConfig`] cadence (the
+    /// same `poll_interval` / `poll_timeout` the sync `execute()`
+    /// path uses).
+    ///
+    /// **Drop-cancellation.** Dropping the returned future before
+    /// it resolves to a terminal state (e.g. a winning branch in
+    /// `tokio::select!`, a timeout wrapper firing) spawns a
+    /// fire-and-forget `cancel_statement` against the server so a
+    /// long-running query doesn't keep charging DBUs after the
+    /// caller has given up. The cancel is best-effort; success is
+    /// not awaited.
+    ///
+    /// **Polling timeout.** When the transport's
+    /// `TransportConfig.poll_timeout` elapses without reaching a
+    /// terminal state, returns `Error::timeout()` (same shape the
+    /// sync polling path produces). The caller may issue a fresh
+    /// `status()` or `await_result()` to resume.
     pub async fn await_result(&self) -> Result<ResultStream> {
-        unimplemented!("PR 5: implement await_result()")
+        let _g = self.session.log_span().clone().entered();
+        self.valid.check()?;
+
+        // Poll cadence + ceiling come from the transport's config —
+        // same source the sync `wait_for_completion` path uses, so
+        // a caller's `SessionBuilder` tuning applies to both modes.
+        let cfg = self.session.transport().poll_config();
+        let start = std::time::Instant::now();
+
+        // RAII guard: if the future is dropped mid-poll (timeout,
+        // tokio::select! loser, task cancellation), spawn a
+        // best-effort `cancel_statement` so the server stops
+        // charging DBUs on a now-orphaned query. Defused once we
+        // reach a terminal state on the success or error path.
+        let cancel_guard =
+            AwaitResultCancelGuard::new(Arc::clone(&self.session), self.statement_id.clone());
+
+        loop {
+            self.valid.check()?;
+            let response = self
+                .session
+                .transport()
+                .statement_status(&self.statement_id)
+                .await?;
+            match StatementStatus::from_sea_response(&response) {
+                StatementStatus::Succeeded | StatementStatus::Closed => {
+                    cancel_guard.defuse();
+                    return self.materialise_result().await;
+                }
+                StatementStatus::Failed(e) => {
+                    // Server already decided this is terminal — no
+                    // need to fire a redundant cancel.
+                    cancel_guard.defuse();
+                    return Err(e);
+                }
+                StatementStatus::Cancelled => {
+                    cancel_guard.defuse();
+                    return Err(Error::invalid_state()
+                        .message(format!("Statement {} was cancelled", self.statement_id)));
+                }
+                StatementStatus::Pending | StatementStatus::Running => {
+                    if start.elapsed() > cfg.poll_timeout {
+                        // Internal poll-timeout: we asked to wait,
+                        // we gave up. Leave the cancel guard armed
+                        // so the server stops charging DBUs on the
+                        // now-orphaned query when we return — same
+                        // policy as a caller-initiated future drop.
+                        return Err(Error::timeout().message(format!(
+                            "Statement {} did not reach a terminal state within {:?}",
+                            self.statement_id, cfg.poll_timeout
+                        )));
+                    }
+                    tokio::time::sleep(cfg.poll_interval).await;
+                }
+            }
+        }
     }
 
     /// Fetch the result without polling. Errors if the statement has
     /// not finished — the precise error code is tracked under the
-    /// pending `ErrorCode` taxonomy expansion (see addendum A8). Until
-    /// then PR 5 returns `ErrorCode::InvalidArgument` with a clear
-    /// message; v0.1 will tighten this once `FailedPrecondition` /
-    /// `InvalidState` lands. Useful when the caller has already
-    /// confirmed completion via `status()`.
+    /// pending `ErrorCode` taxonomy expansion (see spec addendum A8).
+    /// Until then, returns `ErrorCode::InvalidState` with a clear
+    /// message pointing callers at [`status`](Self::status). Useful
+    /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
-        unimplemented!("PR 5: implement fetch_result()")
+        let _g = self.session.log_span().clone().entered();
+        self.valid.check()?;
+        self.materialise_result().await
+    }
+
+    /// Internal: resolve the reader for an (expected to be) terminal
+    /// statement. Returns `InvalidState` if the server reports the
+    /// statement is still running. The error includes the observed
+    /// status so callers don't have to re-query, and points at the
+    /// actionable follow-up.
+    async fn materialise_result(&self) -> Result<ResultStream> {
+        match self
+            .session
+            .transport()
+            .fetch_completed_result(&self.statement_id)
+            .await?
+        {
+            Some(result) => ResultStream::from_reader(result.reader),
+            None => {
+                // Re-read the status so the error message names the
+                // observed state (Pending vs Running). Best-effort —
+                // if the status call itself fails, fall back to the
+                // generic non-terminal message.
+                let observed = match self
+                    .session
+                    .transport()
+                    .statement_status(&self.statement_id)
+                    .await
+                {
+                    Ok(r) => match r.status.state {
+                        crate::types::sea::StatementState::Pending => "Pending",
+                        crate::types::sea::StatementState::Running => "Running",
+                        _ => "non-terminal",
+                    },
+                    Err(_) => "non-terminal",
+                };
+                Err(Error::invalid_state().message(format!(
+                    "Statement {} is not terminal yet (status: {}); call await_result() to \
+                     block until done, or poll status() and re-call fetch_result() once it \
+                     reports Succeeded / Closed",
+                    self.statement_id, observed
+                )))
+            }
+        }
+    }
+}
+
+/// RAII guard that fires a fire-and-forget `cancel_statement` on
+/// drop unless [`defuse`](AwaitResultCancelGuard::defuse) was called.
+///
+/// Installed at the top of `await_result` so that a future dropped
+/// mid-poll (the canonical `tokio::select!` / `tokio::time::timeout`
+/// pattern) doesn't leave a long-running query charging DBUs.
+/// Defuses on every terminal status branch in the poll loop —
+/// success, failure, server-reported cancel — so the cancel only
+/// fires on caller-initiated drops.
+struct AwaitResultCancelGuard {
+    session: Arc<SessionInner>,
+    statement_id: String,
+    defused: bool,
+}
+
+impl AwaitResultCancelGuard {
+    fn new(session: Arc<SessionInner>, statement_id: String) -> Self {
+        Self {
+            session,
+            statement_id,
+            defused: false,
+        }
+    }
+
+    fn defuse(mut self) {
+        self.defused = true;
+        // `Drop` will see `defused = true` and skip.
+    }
+}
+
+impl Drop for AwaitResultCancelGuard {
+    fn drop(&mut self) {
+        if self.defused {
+            return;
+        }
+        // Spawn fire-and-forget. Drop must not panic and we can't
+        // surface a failure here. The runtime keeps the background
+        // task alive until the cancel completes.
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = transport.cancel_statement(&stmt_id).await {
+                warn!(
+                    statement_id = %stmt_id,
+                    error = %e,
+                    "fire-and-forget cancel_statement on await_result drop failed",
+                );
+            }
+        });
     }
 }
 
@@ -96,16 +342,56 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
     }
 
     async fn cancel(&self) -> Result<()> {
-        unimplemented!("PR 5: validity check, then Transport::cancel_statement")
+        async {
+            self.valid.check()?;
+            self.session
+                .transport()
+                .cancel_statement(&self.statement_id)
+                .await
+        }
+        .instrument(self.session.log_span().clone())
+        .await
     }
 
     async fn close(&self) -> Result<()> {
-        unimplemented!("PR 5: implement close() — idempotent")
+        // Idempotent — the first call flips the flag; subsequent
+        // calls return Ok(()) without hitting the wire. Matches
+        // ExecutedStatement::close's contract.
+        async {
+            if self.closed.swap(true, Ordering::AcqRel) {
+                return Ok(());
+            }
+            self.session
+                .transport()
+                .close_statement(&self.statement_id)
+                .await
+        }
+        .instrument(self.session.log_span().clone())
+        .await
     }
 }
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
-        // PR 5: fire-and-forget CloseStatement if close() wasn't called.
+        if self.closed.load(Ordering::Acquire) {
+            return;
+        }
+        // Fire-and-forget close on the session's runtime — mirrors
+        // ExecutedStatement::Drop. Errors are swallowed by design;
+        // Drop must not panic and the server reclaims the statement
+        // when the session closes anyway.
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = transport.close_statement(&stmt_id).await {
+                warn!(
+                    statement_id = %stmt_id,
+                    error = %e,
+                    "fire-and-forget close_statement on ExecutedAsyncStatement::Drop failed; \
+                     server-side resource reclaimed when the session closes"
+                );
+            }
+        });
     }
 }

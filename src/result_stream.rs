@@ -570,6 +570,62 @@ impl ResultStream {
         // Drops `self` (and the wrapped reader / current batch).
         // Background tasks owned by the reader stop on `Drop`.
     }
+
+    /// Consume the stream and yield **owned** `RecordBatch`es as a
+    /// sync iterator.
+    ///
+    /// The native async batch/row API is the recommended path for
+    /// Rust callers — borrowing per-batch avoids the heap
+    /// allocation per row that owned streaming would force. This
+    /// adapter exists for FFI / non-async consumers (PR 6's C ABI,
+    /// PyO3 `pyclass` wrappers, napi-rs resource wrappers, anyone
+    /// who'd otherwise drop down to `arrow::RecordBatchReader`)
+    /// where carrying a borrow across a host-language boundary
+    /// isn't expressible.
+    ///
+    /// The wrapped reader is synchronous (it `block_on`s the
+    /// runtime internally for CloudFetch), so this iterator does
+    /// not need a separate tokio handle — `next()` is a plain
+    /// blocking call. Errors are surfaced once; subsequent calls
+    /// after an `Err` keep returning `None`.
+    pub fn into_owned_batches(self) -> OwnedBatchIter {
+        OwnedBatchIter {
+            reader: self.reader,
+            done: false,
+        }
+    }
+}
+
+/// Iterator over owned `RecordBatch`es produced by
+/// [`ResultStream::into_owned_batches`].
+///
+/// `Iterator::Item` is `Result<RecordBatch>`. The first error stops
+/// iteration; subsequent `next()` calls return `None`. Stops at the
+/// reader's natural end-of-stream the same way.
+pub struct OwnedBatchIter {
+    reader: Box<dyn ResultReader>,
+    done: bool,
+}
+
+impl Iterator for OwnedBatchIter {
+    type Item = Result<RecordBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.done {
+            return None;
+        }
+        match self.reader.next_batch() {
+            Ok(Some(batch)) => Some(Ok(batch)),
+            Ok(None) => {
+                self.done = true;
+                None
+            }
+            Err(e) => {
+                self.done = true;
+                Some(Err(e))
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -891,5 +947,70 @@ mod tests {
         assert!(stream.next_batch().await.unwrap().is_none());
         // Subsequent calls keep returning None without crashing.
         assert!(stream.next_batch().await.unwrap().is_none());
+    }
+
+    #[test]
+    fn into_owned_batches_yields_then_terminates() {
+        // Pure-sync iterator path — no tokio needed.
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
+            .unwrap();
+        let b2 = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3]))]).unwrap();
+        let reader = InMemoryReader::new(b1.schema(), vec![b1.clone(), b2.clone()]);
+        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+
+        let mut iter = stream.into_owned_batches();
+        let first = iter.next().unwrap().unwrap();
+        assert_eq!(first.num_rows(), 2);
+        let second = iter.next().unwrap().unwrap();
+        assert_eq!(second.num_rows(), 1);
+        assert!(iter.next().is_none(), "exhausted iterator returns None");
+        assert!(iter.next().is_none(), "still None on subsequent calls");
+    }
+
+    #[test]
+    fn into_owned_batches_stops_after_error() {
+        // ErrorReader yields one Err then would yield None; iterator
+        // surfaces the error once and terminates.
+        use crate::reader::test_utils::ErrorReader;
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let reader = ErrorReader { schema };
+        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+
+        let mut iter = stream.into_owned_batches();
+        let first = iter.next().unwrap();
+        assert!(first.is_err());
+        assert!(iter.next().is_none());
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn into_owned_batches_yields_batch_then_error_then_none() {
+        // BatchThenErrorReader: one Ok(Some(batch)), then Err.
+        // Iterator must yield the batch, surface the error, then
+        // fuse to None forever.
+        use crate::reader::test_utils::BatchThenErrorReader;
+        let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![100, 200]))],
+        )
+        .unwrap();
+        let reader = BatchThenErrorReader {
+            schema: batch.schema(),
+            batch: Some(batch),
+        };
+        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+
+        let mut iter = stream.into_owned_batches();
+        let first = iter.next().expect("first yields a batch");
+        let first = first.expect("first is Ok(batch)");
+        assert_eq!(first.num_rows(), 2);
+
+        let second = iter.next().expect("second yields an error");
+        assert!(second.is_err(), "second is Err");
+
+        assert!(iter.next().is_none(), "iterator fuses to None after Err");
+        assert!(iter.next().is_none(), "remains None on subsequent calls");
     }
 }

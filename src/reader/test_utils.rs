@@ -73,6 +73,29 @@ impl ResultReader for ErrorReader {
     }
 }
 
+/// A reader that yields one successful batch, then errors on the
+/// next `next_batch()` call. Used to exercise iterator
+/// implementations' error-after-data path (i.e. that `Some(Err(...))`
+/// is surfaced after a successful batch and no further items
+/// follow).
+pub struct BatchThenErrorReader {
+    pub schema: SchemaRef,
+    pub batch: Option<RecordBatch>,
+}
+
+impl ResultReader for BatchThenErrorReader {
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.batch.take() {
+            Some(b) => Ok(Some(b)),
+            None => Err(Error::io().message("simulated read error after first batch")),
+        }
+    }
+}
+
 /// A reader that returns an error on `schema()`.
 pub struct SchemaErrorReader;
 
