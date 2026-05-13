@@ -1,0 +1,16 @@
+[build-system]
+requires = ["maturin>=1.5,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "databricks-sql-kernel"
+version = "0.1.0"
+description = "Python bindings for the Databricks SQL Kernel (PyO3)"
+requires-python = ">=3.9"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Databricks" }]
+dependencies = ["pyarrow>=14"]
+
+[tool.maturin]
+module-name = "databricks_sql_kernel"
+features = ["pyo3/extension-module"]
