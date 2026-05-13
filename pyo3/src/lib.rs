@@ -15,14 +15,16 @@
 //! Python bindings for the Databricks SQL Kernel.
 //!
 //! Phase 1 surface today: `Session`, `Statement`, `ExecutedStatement`,
-//! `Metadata`, `ResultStream`. PAT auth only; synchronous `execute()`
-//! path. Built as the `databricks_sql_kernel` extension module via
-//! `maturin develop` / `maturin build`.
+//! `ExecutedAsyncStatement`, `Metadata`, `ResultStream`. PAT auth
+//! only. Both synchronous `execute()` and async `submit()` paths
+//! supported. Built as the `databricks_sql_kernel` extension module
+//! via `maturin develop` / `maturin build`.
 //!
 //! The kernel's API is async — every method call from Python detaches
 //! the GIL and `block_on`s on the session-owned tokio runtime.
 
 mod errors;
+mod executed_async;
 mod fetch;
 mod metadata;
 mod result_stream;
@@ -38,6 +40,7 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<session::Session>()?;
     m.add_class::<statement::Statement>()?;
     m.add_class::<statement::ExecutedStatement>()?;
+    m.add_class::<executed_async::ExecutedAsyncStatement>()?;
     m.add_class::<metadata::Metadata>()?;
     m.add_class::<result_stream::ResultStream>()?;
     Ok(())

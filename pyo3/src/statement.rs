@@ -20,6 +20,7 @@
 //! batch-by-batch as pyarrow `RecordBatch`es.
 
 use crate::errors::to_py_err;
+use crate::executed_async::ExecutedAsyncStatement;
 use crate::fetch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
@@ -77,6 +78,22 @@ impl Statement {
         let exec_result = py.detach(|| runtime.block_on(inner.stmt.execute()));
         let exec = exec_result.map_err(|e| to_py_err(py, e))?;
         Ok(ExecutedStatement::new(exec, runtime))
+    }
+
+    /// Submit-and-return. Sends `ExecuteStatement` with
+    /// `wait_timeout=0s` so the server returns immediately with a
+    /// `statement_id`; the kernel does not poll. Returns an
+    /// `ExecutedAsyncStatement` the caller drives via `status()` /
+    /// `await_result()` / `fetch_result()`.
+    ///
+    /// Long-running queries that would blow past `execute()`'s sync
+    /// polling budget belong on this path.
+    fn submit(&mut self, py: Python<'_>) -> PyResult<ExecutedAsyncStatement> {
+        let inner = self.alive_mut()?;
+        let runtime = inner.runtime.clone();
+        let submit_result = py.detach(|| runtime.block_on(inner.stmt.submit()));
+        let exec = submit_result.map_err(|e| to_py_err(py, e))?;
+        Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
     /// Drop the statement. Any prior `ExecutedStatement` keeps

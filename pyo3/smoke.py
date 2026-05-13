@@ -172,6 +172,77 @@ def main() -> None:
     except k.KernelError as e:
         check("closed" in str(e), f"KernelError mentions closed: {e}")
 
+    # --- async statement surface ---
+    banner("async submit + await_result")
+    stmt = session.statement()
+    stmt.set_sql("SELECT 7 AS n")
+    async_exec = stmt.submit()
+    check(bool(async_exec.statement_id), f"async statement_id: {async_exec.statement_id!r}")
+    state, failure = async_exec.status()
+    check(state in ("Pending", "Running", "Succeeded", "Closed"), f"status state={state!r}")
+    check(failure is None, f"non-failed status has failure=None: {failure!r}")
+    rs = async_exec.await_result()
+    table = rs.fetch_all_arrow()
+    check(table.num_rows == 1, f"1 row, got {table.num_rows}")
+    check(table.column(0).to_pylist() == [7], f"value is 7: {table.column(0).to_pylist()}")
+    # After await_result, status should be terminal.
+    state, _ = async_exec.status()
+    check(state in ("Succeeded", "Closed"), f"terminal status after await_result: {state!r}")
+    rs.close()
+    async_exec.close()
+    stmt.close()
+
+    banner("async submit + fetch_result (after explicit wait via status loop)")
+    stmt = session.statement()
+    stmt.set_sql("SELECT 99 AS n")
+    async_exec = stmt.submit()
+    # Poll a few times until terminal — should reach Succeeded almost immediately for SELECT 99.
+    import time
+
+    for _ in range(20):
+        state, _ = async_exec.status()
+        if state in ("Succeeded", "Closed", "Failed", "Cancelled"):
+            break
+        time.sleep(0.1)
+    check(state in ("Succeeded", "Closed"), f"reached terminal state: {state!r}")
+    rs = async_exec.fetch_result()
+    table = rs.fetch_all_arrow()
+    check(table.num_rows == 1 and table.column(0).to_pylist() == [99], f"value is 99")
+    rs.close()
+    async_exec.close()
+    stmt.close()
+
+    banner("async submit + Failed status surfaces structured error")
+    stmt = session.statement()
+    stmt.set_sql("SELECT * FROM definitely_not_a_table_xyz_async")
+    async_exec = stmt.submit()
+    # Poll until terminal.
+    for _ in range(20):
+        state, failure = async_exec.status()
+        if state in ("Succeeded", "Closed", "Failed", "Cancelled"):
+            break
+        time.sleep(0.1)
+    check(state == "Failed", f"expected Failed, got: {state!r}")
+    check(isinstance(failure, dict), f"failure is dict: {failure!r}")
+    check(failure.get("code") == "SqlError", f"failure.code=SqlError, got: {failure.get('code')}")
+    check("sql_state" in failure, "failure has sql_state")
+    check("query_id" in failure, "failure has query_id")
+    async_exec.close()
+    stmt.close()
+
+    banner("operations on closed ExecutedAsyncStatement raise KernelError")
+    stmt = session.statement()
+    stmt.set_sql("SELECT 1")
+    async_exec = stmt.submit()
+    async_exec.close()
+    async_exec.close()  # idempotent
+    try:
+        async_exec.status()
+        check(False, "should have raised")
+    except k.KernelError as e:
+        check("closed" in str(e), f"KernelError mentions closed: {e}")
+    stmt.close()
+
     banner("close session")
     session.close()
     session.close()  # idempotent
