@@ -16,12 +16,13 @@
 
 # Kernel-v0 Migration Plan
 
-> **Scope.** This document describes how we migrate the existing Rust ADBC
-> driver (now living under `src/adbc/` with feature `legacy-adbc`) into the
-> v0 Kernel surface defined in `docs/spec-v0.md`.
+> **Scope.** This document describes how we migrated the existing Rust
+> ADBC driver into the v0 Kernel surface defined in `docs/spec-v0.md`.
 >
-> **Status.** Plan only — no code changes. Each PR section below is the
-> contract for a future PR; nothing here is implemented yet.
+> **Status.** PRs 1–4 merged, PR 5 (Async Statement) open, PR 7 (ADBC
+> cutover) in progress. PR 6 (C ABI) deferred until an ODBC / Go
+> consumer needs it. Each PR section below is the contract for that
+> PR.
 
 ## 1. Background
 
@@ -105,22 +106,27 @@ re-derive the order from three constraints:
    unit test against the new surface, or a passing E2E test against a
    live warehouse. Skeleton-only PRs (no behaviour) don't count.
 
-This gives **7 PRs** end-to-end:
+This gives **6 PRs** end-to-end (the originally-planned C ABI PR is
+deferred until an external consumer needs it — PyO3 / napi-rs link the
+Rust crate directly, so v0 has no consumer that requires the C ABI
+today):
 
-| PR  | Theme                                      | What lands                                                                                                                              |
-|----:|--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
-| 1   | Foundations                                | `kernel_error::Error` end-to-end across all internals; `DatabricksClient` trait → `pub(crate) Transport`; `SeaClient` → `SeaRestTransport`. No public-API changes. |
-| 2   | Session                                    | `Session::open`, `SessionBuilder`, fully-typed `SessionConfig` groups (`ConnectionConfig`, `AuthConfig`, `HttpConfig`, `ResultConfig`, `LoggingConfig`, `TlsConfig`, `ProxyConfig`, `TelemetryConfig`). PAT + OAuth M2M / U2M wired. First E2E test. |
-| 3   | Metadata                                   | All ten `Metadata::*` methods (`list_catalogs` / `_schemas` / `_tables` / `_columns` / `primary_keys` / `foreign_keys` / `functions` / `procedures` / `type_info` / `table_types`); `Identifier` / `LikePattern` validation; new `information_schema` SQL builders for the calls SEA doesn't have today. |
-| 4   | Statement + Results (core)                 | `StatementSpec`, `Statement::execute`, `ExecutedStatement`, `ResultStream::next_batch` (borrowed) + `next_row_in_batch` + `Row<'a>` accessors + `into_rows` + `into_owned_batches`, `TypedValue` + parameter binding, cancellation (`Statement::cancel` concurrent with `execute()`), drop-in-flight `CancelStatement`. |
-| 5   | Async Statement                            | `Statement::submit`, `ExecutedAsyncStatement::status / await_result / fetch_result / cancel / close`; mirrors PR 4 but with caller-driven polling. |
-| 6   | C ABI                                      | `include/databricks_kernel.h`; `kernel_error_*`, `kernel_session_*`, `kernel_statement_*`, `kernel_executed_*`, `kernel_result_*` (Arrow C Data Interface for batches), `kernel_metadata_*`. Process-wide tokio runtime. C smoke tests in `tests/c/`. |
-| 7   | Cutover                                    | Delete `src/adbc/`, `legacy-adbc` / `ffi` / `metadata-ffi` features, `adbc_core` / `adbc_ffi` / `driverbase` deps, `manifest.toml`, `include/legacy/`. Rename `kernel_error.rs` → `error.rs`, `result_stream.rs` → `result.rs`, `metadata_v0.rs` → `metadata.rs`. Migrate examples + integration tests. Bump to `0.2.0`. |
+| PR  | Status   | Theme                                      | What lands                                                                                                                              |
+|----:|----------|--------------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------|
+| 1   | merged   | Foundations                                | `kernel_error::Error` end-to-end across all internals; `DatabricksClient` trait → `pub(crate) Transport`; `SeaClient` → `SeaRestTransport`. No public-API changes. |
+| 2   | merged   | Session                                    | `Session::open`, `SessionBuilder`, fully-typed `SessionConfig` groups (`ConnectionConfig`, `AuthConfig`, `HttpConfig`, `ResultConfig`, `LoggingConfig`, `TlsConfig`, `ProxyConfig`, `TelemetryConfig`). PAT + OAuth M2M / U2M wired. First E2E test. |
+| 3   | merged   | Metadata                                   | All ten `Metadata::*` methods (`list_catalogs` / `_schemas` / `_tables` / `_columns` / `primary_keys` / `foreign_keys` / `functions` / `procedures` / `type_info` / `table_types`); `Identifier` / `LikePattern` validation; new `information_schema` SQL builders for the calls SEA doesn't have today. Server-shape pass-through (no JDBC-style reshape). |
+| 4   | merged   | Statement + Results (core)                 | `StatementSpec`, `Statement::execute`, `ExecutedStatement`, `ResultStream::next_batch` (borrowed) + `next_row_in_batch` + `Row<'a>` accessors + `into_rows` + `into_owned_batches`, `TypedValue` + parameter binding, cancellation (`Statement::cancel` concurrent with `execute()`), drop-in-flight `CancelStatement`. |
+| 5   | open     | Async Statement                            | `Statement::submit`, `ExecutedAsyncStatement::status / await_result / fetch_result / cancel / close`; mirrors PR 4 but with caller-driven polling. |
+| 6   | deferred | C ABI                                      | Skeleton ships at `src/ffi/`; bodies deferred until an ODBC / Go consumer needs them. PyO3 / napi-rs link the Rust crate directly. |
+| 7   | in progress | ADBC cutover                            | Delete `src/adbc/`, `legacy-adbc` / `ffi` / `metadata-ffi` features, `adbc_core` / `adbc_ffi` / `driverbase` deps, ADBC-only examples, ADBC-only integration tests. Trim `kernel_error` of ADBC-boundary helpers (`to_adbc`, `From<Error> for adbc_core::error::Error`, OptionValue parsing helpers). No renames yet — `kernel_error.rs` / `result_stream.rs` / `metadata_v0.rs` keep their names. |
 
-Independent track:
+Independent tracks:
 
 | PR  | Theme                | Why                                                          |
 |----:|----------------------|--------------------------------------------------------------|
+| —   | C ABI                 | Deferred; will land when an ODBC / Go consumer needs it.    |
+| —   | File renames + 0.2.0  | `kernel_error.rs` → `error.rs`, `result_stream.rs` → `result.rs`, `metadata_v0.rs` → `metadata.rs`. Cosmetic; separate PR. |
 | 8+  | Wrapper repo cutovers | Separate repos, separate cadences. See §6.                  |
 
 ### Why these bundles
@@ -148,14 +154,15 @@ Independent track:
   `StatementStatus` enum semantics, and `await_result` /
   `fetch_result` distinction. Worth its own review pass; carving it
   out also keeps PR 4 from creeping further.
-- **PR 6 (C ABI).** One cohesive interface, one header, one set of
-  reviewers (likely the ODBC team). Splitting "session-and-error"
-  vs "everything else" forces them to review the runtime-management
-  story without context for what runs on top of it.
-- **PR 7 (Cutover).** Pure deletion + rename. Reviewing this with
-  any new behaviour mixed in is exactly the situation we want to
-  avoid — it's the one PR where a reviewer *should* be skimming for
-  "did anything other than removal sneak in?".
+- **PR 6 (C ABI). Deferred.** Originally next after PR 5, but v0's
+  only declared consumers (PyO3 / napi-rs) link the Rust crate
+  directly. Postponed until an ODBC / Go consumer makes the C ABI
+  load-bearing; the skeleton at `src/ffi/` reserves the names.
+- **PR 7 (ADBC cutover).** Brought forward ahead of PR 6 once we
+  confirmed `legacy-adbc` had no remaining consumers. Pure deletion.
+  Reviewing this with any new behaviour mixed in is exactly the
+  situation we want to avoid — it's the one PR where a reviewer
+  *should* be skimming for "did anything other than removal sneak in?".
 
 The rest of this section gives the contract for each PR.
 
@@ -576,49 +583,80 @@ review.
 
 ---
 
-### PR 7 — Cutover: delete `legacy-adbc`
+### PR 7 — ADBC cutover
 
-**Goal.** One concern: removal. No new behaviour.
+**Goal.** One concern: removal. No new behaviour. Brought forward
+ahead of the C ABI work (PR 6) because the v0 surface (PRs 1–5) is
+already the production path — `legacy-adbc` has no remaining
+consumers, and keeping it green was costing review surface area on
+every later PR.
 
 **What changes.**
 
-- `src/adbc/` deleted.
-- `src/error.rs` deleted; `src/kernel_error.rs` renamed to
-  `src/error.rs`. The crate-root re-export already points here, so
-  no consumer change.
-- `src/result_stream.rs` renamed to `src/result.rs` (the legacy
-  `src/result/mod.rs` is part of the deletion).
-- `src/metadata_v0.rs` renamed to `src/metadata.rs` after the
-  legacy `src/metadata/` mod absorbs its parsers and SQL builders
-  into a `metadata::sql` / `metadata::parse` submodule layout. The
-  v0 `Metadata` struct lives at `metadata::Metadata`.
+- `src/adbc/` deleted (`connection.rs`, `database.rs`, `driver.rs`,
+  `statement.rs`, `metadata_builder.rs`, `mod.rs`, plus `ffi/error.rs`
+  and `ffi/metadata.rs`).
+- `src/error.rs` deleted (legacy `DatabricksErrorHelper`; its only
+  callers lived in `src/adbc/`). `src/kernel_error.rs` keeps its
+  name — the rename to `src/error.rs` is deferred to avoid mixing
+  removal with renames in this PR.
+- `src/result_stream.rs` and `src/metadata_v0.rs` keep their names
+  for the same reason. Renames land in a later cleanup PR.
+- `src/metadata/parse.rs` deleted (only `metadata_builder` consumed
+  it).
+- `kernel_error.rs` trimmed of ADBC-boundary helpers: `to_adbc()`,
+  `From<Error> for adbc_core::error::Error`,
+  `error_code_to_adbc_status`, `format_message_for_adbc`,
+  `sqlstate_str_to_array`, and the `set_invalid_option` /
+  `option_as_int` / `option_as_string` helpers that took
+  `adbc_core::options::OptionValue`. `extract_sqlstate_from_message`
+  stays — used by v0 sync + async polling.
+- `SqlCommandBuilder::build_get_procedure_columns` and
+  `Transport::list_procedure_columns` deleted — only the legacy
+  metadata-FFI builder reached them; v0 `Metadata` does not expose
+  procedure columns.
 - `Cargo.toml`:
-  - `legacy-adbc`, `ffi`, `metadata-ffi` features removed.
-  - `adbc_core`, `adbc_ffi`, `driverbase` deps removed.
-  - `arrow` (with `ffi` feature) becomes unconditional — the new
-    C ABI uses Arrow C Data Interface.
-- `manifest.toml` (ADBC driver-manager descriptor) deleted.
-- `include/legacy/databricks_metadata_ffi.h` deleted.
-- `lib.rs` cleanup: drop the `#[cfg(feature = "legacy-adbc")]`
-  block and the `adbc_ffi::export_driver!` macro call.
-- `examples/*.rs` (8 files) migrated to the v0 surface. The
-  `[[example]]` blocks lose `required-features = ["legacy-adbc"]`.
-- `tests/*.rs` (8 files) migrated. Most have a v0 counterpart from
-  PRs 2–5; this PR deletes the legacy version.
-- README updated to remove "currently exposed via the ADBC trait
-  surface" language.
-- `Cargo.toml`: `0.1.0` → `0.2.0`.
+  - `legacy-adbc`, `ffi`, `metadata-ffi` features removed (entire
+    `[features]` section).
+  - `adbc_core`, `adbc_ffi`, `driverbase`, `adbc_driver_manager`
+    deps removed.
+  - Optional `arrow = { ..., features = ["ffi"] }` dep removed —
+    only the `metadata-ffi` feature used it.
+  - `arrow-array` / `arrow-buffer` / `arrow-schema` / `arrow-select`
+    / `arrow-ipc` (v57) kept; the v0 surface uses these directly.
+  - `[[example]]` blocks removed (all 8 example targets deleted).
+  - `keywords` drops `"adbc"`.
+  - Version stays `0.1.0` (bump deferred to the rename cleanup PR).
+- `lib.rs`: `#[cfg(feature = "legacy-adbc")] pub mod adbc;` and the
+  `adbc_ffi::export_driver!` macro call removed. Module-level doc
+  comment updated for the v0 surface.
+- `examples/` deleted entirely (all 8 files were ADBC-dependent).
+- ADBC-only `tests/*.rs` deleted: `ffi_round_trip.rs`,
+  `integration.rs`, `metadata_e2e.rs`, `oauth_e2e.rs`,
+  `prepared_statement_e2e.rs`, `proxy_e2e.rs`, `tls_e2e.rs`. The v0
+  wiremock + E2E tests (`v0_session_*`, `v0_metadata_*`,
+  `v0_sync_execute_*`, `v0_async_execute_*`, `oauth_u2m_integration`)
+  cover the corresponding behaviour.
+- Doc-comment cleanup across `src/ffi/mod.rs`, `src/statement/mod.rs`,
+  `src/client/mod.rs`, `src/logging.rs` to drop references to the
+  legacy ADBC surface / `legacy-adbc` feature / `metadata-ffi`
+  feature.
 
 **What does NOT change.**
 
-- Nothing additive. Pure removal + rename.
+- No behavioural changes on the v0 surface.
+- File renames (`kernel_error.rs` → `error.rs`,
+  `result_stream.rs` → `result.rs`, `metadata_v0.rs` →
+  `metadata.rs`) deferred — separate PR.
+- Version bump to `0.2.0` deferred — separate PR.
 
 **Tests.**
 
 - `cargo test` (no features) passes.
-- `cargo test --no-default-features` passes (no features should be
-  needed at all post-cutover).
-- `make check` (fmt + clippy + tests + C tests from PR 6) green.
+- `cargo build` is warning-free.
+- The v0 wiremock + E2E tests carried over from PRs 2–5 cover the
+  intended behaviour (Session, Metadata, sync Statement, async
+  Statement, OAuth U2M).
 
 ---
 
@@ -658,31 +696,12 @@ repo / release cadence.
 
 ## 5. Cross-cutting concerns
 
-### 5.1 Maintaining the legacy ADBC surface
+### 5.1 Maintaining the legacy ADBC surface (historical)
 
-PRs 1–6 must keep `cargo test --features legacy-adbc` green. The
-mechanism:
-
-- `src/adbc/` keeps owning its own `Database`/`Connection`/
-  `Statement`. After PR 1 it imports `kernel_error::Error` and
-  converts at the ADBC trait boundary (one helper per file); also
-  picks up the `Transport` rename trivially since the type was
-  always `pub(crate)` in spirit.
-- After PR 2, `src/adbc/database.rs` *can* reuse
-  `ConnectionConfig::from_http_path` for its own option-parsing —
-  optional but reduces duplication.
-- After PR 3, `src/adbc/connection.rs::get_objects` keeps using its
-  existing pipeline (calls `Transport::list_*` directly and reshapes
-  into the ADBC nested `get_objects` table) — `Metadata::list_*`
-  doesn't reshape, so delegating through it would just throw away
-  work the legacy path then has to redo. Both pipelines share the
-  same `Transport` / `metadata::sql` plumbing; the legacy
-  `parse_*`/`metadata_builder` family goes away in PR 7 alongside
-  the rest of `src/adbc/`.
-- After PR 4, `src/adbc/statement.rs::execute` delegates to
-  `Statement::execute()` via a thin shim. The legacy `bind` /
-  `bind_stream` / `prepare` surface lowers to `TypedValue`s.
-- PR 7 is the deletion.
+PRs 1–5 kept `cargo test --features legacy-adbc` green through the
+v0 build-out. PR 7 deleted `src/adbc/` and the `legacy-adbc` /
+`ffi` / `metadata-ffi` features entirely. The v0 surface is now the
+only surface.
 
 ### 5.2 Async runtime
 
@@ -922,9 +941,8 @@ clear it.
 | 3  | ~700    | Medium  | New `information_schema` SQL builders + reshape.                       |
 | 4  | ~2300   | High    | Core query path: Statement, ResultStream, Row, TypedValue, cancel.     |
 | 5  | ~400    | Medium  | Mirrors PR 4 with caller-driven polling.                               |
-| 6  | ~2200   | High    | C ABI: header, opaque handles, runtime mgmt, full surface.             |
-| 7  | -2500   | Low     | Pure deletion + rename. Net negative LoC.                              |
+| 6  | —       | —       | Deferred until an ODBC / Go consumer needs it; not currently scoped.   |
+| 7  | -8000   | Low     | Pure deletion. ADBC surface + ADBC tests + ADBC examples gone.         |
 
-Total new code: ~7,200 LoC; deletions in PR 7 bring the net to
-~4,700. Roughly six weeks at one PR per ~5 days; PR 4 and PR 6
-are the long poles and likely justify two-week reviews each.
+PR 6's C ABI work is deferred; renames + `0.2.0` bump live in a
+separate cosmetic PR.

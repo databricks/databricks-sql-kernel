@@ -21,11 +21,8 @@
 //! - [`executed_async::ExecutedAsyncStatement`] — async-consumption executed handle.
 //! - [`handle::ExecutedStatementHandle`] — shared trait across both executed types.
 //!
-//! `params` holds the protocol-neutral parameter conversion helpers shared
-//! by the new `Statement` and the legacy ADBC `Statement`.
-//!
-//! The legacy ADBC `Statement` (gated on `legacy-adbc`) lives at
-//! `crate::adbc::statement`.
+//! `params` holds the protocol-neutral parameter conversion helpers used
+//! by `Statement` to encode `TypedValue` bindings for SEA.
 
 pub mod executed;
 pub mod executed_async;

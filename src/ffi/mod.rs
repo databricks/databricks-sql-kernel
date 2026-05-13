@@ -20,9 +20,6 @@
 //! C strings / structs into `SessionConfig`, and exposes opaque handles
 //! for `Session`, `Statement`, `ExecutedStatement`,
 //! `ExecutedAsyncStatement`, and `ResultStream`.
-//!
-//! Distinct from the legacy `crate::adbc::ffi` module (ADBC-shaped
-//! metadata-FFI, gated on `legacy-adbc`).
 
 #![allow(dead_code, unused_variables)]
 // Skeleton: each function will get its `# Safety` doc when its body

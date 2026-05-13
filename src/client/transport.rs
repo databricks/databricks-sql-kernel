@@ -297,25 +297,6 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         procedure_pattern: Option<&str>,
     ) -> Result<ExecuteResult>;
 
-    /// List procedure columns (parameters), optionally filtered.
-    ///
-    /// Uses `information_schema.parameters` joined with `information_schema.routines`
-    /// filtered by `routine_type = 'PROCEDURE'`.
-    /// When catalog is None, queries `system.information_schema` (cross-catalog).
-    /// When catalog is empty string, returns empty result.
-    #[allow(
-        dead_code,
-        reason = "kept for legacy ADBC FFI compatibility; v0 Metadata does not expose procedure columns"
-    )]
-    async fn list_procedure_columns(
-        &self,
-        session_id: &str,
-        catalog: Option<&str>,
-        schema_pattern: Option<&str>,
-        procedure_pattern: Option<&str>,
-        column_pattern: Option<&str>,
-    ) -> Result<ExecuteResult>;
-
     /// List functions, optionally filtered by catalog, schema pattern, and function name pattern.
     ///
     /// Uses `information_schema.routines` filtered by `routine_type = 'FUNCTION'`.

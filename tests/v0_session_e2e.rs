@@ -20,7 +20,7 @@
 //!
 //! ```sh
 //! set -a && source ~/.databricks/pecotesting-creds && set +a
-//! cargo test --features legacy-adbc --test v0_session_e2e -- --ignored
+//! cargo test --test v0_session_e2e -- --ignored
 //! ```
 //!
 //! Three smoke tests cover the auth modes the plan calls for: PAT

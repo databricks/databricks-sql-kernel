@@ -16,12 +16,15 @@
 
 # CLAUDE.md — Databricks SQL Kernel
 
-Rust client core for Databricks SQL. Currently exposed via the ADBC trait
-surface from `adbc_core`; a native Rust API and a stable C ABI for ODBC/Go
-consumers are planned.
+Rust client core for Databricks SQL. Exposes a Databricks-native v0
+async API (`Session` → `Statement` → `ExecutedStatement` /
+`ExecutedAsyncStatement` → `ResultStream`, plus a flat `Metadata`
+surface) intended for direct Rust use, PyO3 / napi-rs wrappers, and a
+custom C ABI (skeleton today) for ODBC / Go consumers.
 
-The repo was seeded from `adbc-drivers/databricks` (Rust subtree) and is
-being evolved into the kernel.
+The repo was seeded from `adbc-drivers/databricks` (Rust subtree); the
+v0 surface lives at the crate root and the legacy ADBC layer has been
+removed.
 
 ## Build & Test
 
@@ -50,24 +53,36 @@ cargo test
 
 ## Architecture
 
+v0 surface (see `docs/spec-v0.md`):
+
 ```
-Driver -> Database -> Connection -> Statement -> ResultSet
+Session -> Statement -> ExecutedStatement       -> ResultStream
+                     -> ExecutedAsyncStatement  -> ResultStream
+Session -> Metadata (flat per-method catalog API)
 ```
 
 | Module | Purpose |
 |--------|---------|
+| `session/` | `Session` + `SessionBuilder` (stateful authenticated handle) |
+| `statement/` | `Statement` (mutable), `ExecutedStatement`, `ExecutedAsyncStatement`, `StatementSpec`, `TypedValue` |
+| `result_stream/` | `ResultStream` + borrowed `Row<'a>` cursor over Arrow batches |
+| `metadata_v0/` | Flat per-method `Metadata` surface (`catalogs`, `schemas`, `tables`, …) |
+| `config/` | Typed `SessionConfig` / `AuthConfig` / `ConnectionConfig` / etc. |
+| `kernel_error/` | `Error` + `ErrorCode` (kernel-native error type) |
 | `auth/` | Authentication (PAT, OAuth M2M, OAuth U2M) |
-| `client/` | HTTP communication with Databricks (SEA, retry) |
+| `client/` | HTTP transport to Databricks (SEA, retry, transport trait) |
 | `reader/` | Result fetching (CloudFetch, inline Arrow) |
 | `result/` | Result set abstraction over Arrow RecordBatches |
-| `metadata/` | Catalog/schema/table metadata |
-| `ffi/` | C ABI for metadata propagation |
+| `metadata/` | Shared SQL builders + schemas for `Metadata` |
+| `ffi/` | Custom C ABI for ODBC / Go (skeleton) |
 | `telemetry/` | Metrics collection |
 
 ## Error handling
 
-- Internal code returns `crate::Result<T>`, built via `DatabricksErrorHelper` (`invalid_argument()`, `io()`, `not_implemented()`, `invalid_state()`, …).
-- ADBC trait implementations (in `connection.rs`, `database.rs`, `statement/`) return `adbc_core::error::Result`. Convert with `.to_adbc()`.
+Internal code returns `crate::Result<T>`, built via the categorised
+constructors on `Error` (`Error::invalid_argument()`, `Error::io()`,
+`Error::not_implemented()`, `Error::invalid_state()`, …) chained with
+`.message(...)` / `.with_source(...)` / `.sqlstate(...)`.
 
 ## License headers
 
@@ -97,8 +112,8 @@ CI runs `cargo-about` and fails on unapproved licenses. New permissive licenses 
 
 ## Local development environment
 
-Connection variables for examples and E2E tests can be set via
-`.cargo/config.toml` (gitignored — do **not** commit) under `[env]`:
+Connection variables for E2E tests can be set via `.cargo/config.toml`
+(gitignored — do **not** commit) under `[env]`:
 
 ```toml
 [env]
@@ -112,6 +127,7 @@ E2E tests requiring a live Databricks connection are marked `#[ignore]` and run 
 
 ## References
 
-- [ADBC specification](https://arrow.apache.org/adbc/)
 - [Databricks SQL Statement Execution API](https://docs.databricks.com/api/workspace/statementexecution)
 - [Apache Arrow Rust](https://docs.rs/arrow/latest/arrow/)
+- `docs/spec-v0.md` — v0 Kernel API spec
+- `docs/migration-plan.md` — staged migration plan from ADBC to v0

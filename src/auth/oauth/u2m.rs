@@ -78,7 +78,7 @@ const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 /// use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
 /// use std::sync::Arc;
 ///
-/// # async fn example() -> databricks_sql_kernel::error::Result<()> {
+/// # async fn example() -> databricks_sql_kernel::Result<()> {
 /// let http_client = Arc::new(DatabricksHttpClient::with_default_retry(HttpClientConfig::default())?);
 /// let provider = AuthorizationCodeProvider::new(
 ///     "https://my-workspace.cloud.databricks.com",
@@ -142,7 +142,7 @@ impl AuthorizationCodeProvider {
     /// # use databricks_sql_kernel::auth::oauth::u2m::AuthorizationCodeProvider;
     /// # use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
     /// # use std::sync::Arc;
-    /// # async fn example() -> databricks_sql_kernel::error::Result<()> {
+    /// # async fn example() -> databricks_sql_kernel::Result<()> {
     /// let http_client = Arc::new(DatabricksHttpClient::with_default_retry(HttpClientConfig::default())?);
     /// let provider = AuthorizationCodeProvider::new(
     ///     "https://my-workspace.cloud.databricks.com",

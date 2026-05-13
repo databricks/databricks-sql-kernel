@@ -73,7 +73,7 @@ enum CallbackResult {
 /// use databricks_sql_kernel::auth::oauth::callback::CallbackServer;
 /// use std::time::Duration;
 ///
-/// # async fn example() -> databricks_sql_kernel::error::Result<()> {
+/// # async fn example() -> databricks_sql_kernel::Result<()> {
 /// // Start callback server on port 8020
 /// let server = CallbackServer::new(8020).await?;
 /// let redirect_uri = server.redirect_uri();

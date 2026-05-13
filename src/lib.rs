@@ -37,17 +37,12 @@
 //!
 //! - **Direct Rust crate** for PyO3 / napi-rs wrappers (Python and
 //!   Node.js).
-//! - **Custom C ABI** under `crate::ffi` for ODBC / Go consumers
-//!   that cannot link the Rust crate directly.
+//! - **Custom C ABI** under `crate::ffi` (skeleton today; bodies land
+//!   when an ODBC / Go consumer needs them).
 //!
-//! The legacy ADBC trait surface lives at `crate::adbc::*` (gated on
-//! the `legacy-adbc` feature) and is scheduled for removal in an
-//! upcoming PR.
-//!
-//! ## Example (v0 spec — bodies land in PRs 4–7)
+//! ## Example
 //!
 //! ```ignore
-//! // PR 4a: switch from `ignore` to `no_run` once Session::open lands.
 //! use databricks_sql_kernel::{
 //!     AuthConfig, ConnectionConfig, Session, TypedValue,
 //! };
@@ -64,7 +59,7 @@
 //! let mut stmt = session.statement();
 //! stmt.spec()
 //!     .sql("SELECT * FROM my_table WHERE id = ?")
-//!     .param(1, TypedValue::Null)?;
+//!     .param(1, TypedValue::Int64(42))?;
 //!
 //! let mut exec = stmt.execute().await?;
 //! while let Some(_batch) = exec.result_stream_mut().next_batch().await? {
@@ -77,7 +72,6 @@
 
 pub mod auth;
 pub mod client;
-pub mod error;
 pub(crate) mod logging;
 pub mod metadata;
 pub mod reader;
@@ -86,25 +80,16 @@ pub mod statement;
 pub mod telemetry;
 pub mod types;
 
-// === v0 Kernel spec surface (skeleton — populated in subsequent PRs) ===
 pub mod config;
 pub mod kernel_error;
 pub mod metadata_v0;
 pub mod result_stream;
 pub mod session;
 
-// New custom C ABI for ODBC/Go consumers (replaces ADBC FFI).
+// Custom C ABI for ODBC / Go consumers (skeleton).
 pub mod ffi;
 
-// === v0 Kernel public re-exports ===
-//
-// New code targets these crate-root paths. The driverbase-backed
-// `crate::error::*` and `crate::client::*` re-exports are intentionally
-// **not** here: when `kernel_error.rs` is renamed to `error.rs` in the
-// removal PR, a crate-root `Result` would silently swap types, which
-// could change wrapper behaviour without a compile error. Wrappers use
-// the explicit `crate::kernel_error::Result` (later just
-// `crate::error::Result`) during the migration.
+// === Public re-exports ===
 pub use config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
     ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
@@ -152,17 +137,3 @@ const _: fn() = || {
     assert_send_sync::<Identifier<'static>>();
     assert_send_sync::<LikePattern<'static>>();
 };
-
-// === Legacy ADBC surface (gated, scheduled for removal) ===
-//
-// Callers explicitly use `crate::adbc::*`; no convenience re-exports at
-// the crate root. The crate-root paths now belong to the v0 surface
-// (above). Gated on `legacy-adbc`; scheduled for deletion in the
-// upcoming ADBC-cleanup PR.
-#[cfg(feature = "legacy-adbc")]
-pub mod adbc;
-
-// FFI export — produces AdbcDatabricksInit and AdbcDriverInit symbols
-// when built with `cargo build --features ffi`
-#[cfg(all(feature = "ffi", feature = "legacy-adbc"))]
-adbc_ffi::export_driver!(AdbcDatabricksInit, crate::adbc::driver::Driver);
