@@ -14,33 +14,39 @@
   limitations under the License.
 -->
 
-# PySQL × Kernel: SEA-mode integration via PyO3
+# PySQL × Kernel integration via PyO3
 
 > Status: draft. Owner: @vikrant-puppala. Last updated: 2026-05-13.
 
 ## Summary
 
-Replace the Python connector's native (pure-Python) SEA backend with a
-PyO3 binding over the v0 Rust kernel
-(`databricks-sql-kernel`). When `use_sea=True` is passed to
-`databricks.sql.connect(...)`, the connector routes session, statement,
-result, and metadata operations through the kernel instead of speaking
-SEA in Python.
+Route the Python connector's `use_sea=True` code path through a PyO3
+binding over the v0 Rust kernel (`databricks-sql-kernel`). When
+`use_sea=True` is passed to `databricks.sql.connect(...)`, the
+connector hands session, statement, result, and metadata operations to
+the kernel instead of speaking SEA in Python.
+
+The connector keeps treating this as a single user-facing flag
+(`use_sea`). The wire protocol the kernel picks underneath is a
+kernel-internal concern (v0 uses SEA REST; future versions may use
+SEA-gRPC or other transports). The flag name is retained for
+backward compatibility, not as a protocol contract.
 
 Behavioral parity target is the existing **Thrift** code path in the
-Python connector — not the native SEA backend. The native SEA backend
-is short-lived: once the kernel path reaches Thrift parity it is
-deleted.
+Python connector. The new backend has to match Thrift's observable
+behavior — same auth flows, same parameter semantics, same async
+execution shape, same metadata results — before it's considered
+production-ready.
 
 Strategy reference: [Heilmeier — Rust Kernel Strategy for OSS SQL
 Drivers](https://docs.google.com/document/d/1ZcsH0RP1fnmXEw3SeOi9e8Yi2PtOhYaBLr4jwwswifY/edit?tab=t.0#heading=h.mnkp0kk05pi0).
 
 ## Why
 
-1. **One implementation of SEA across drivers.** The kernel is already
-   the source of truth for SEA, CloudFetch, auth, retries, and result
-   handling. Re-implementing SEA in Python (and again in Go, Node.js,
-   ODBC) is the duplication the kernel exists to remove.
+1. **One implementation across drivers.** The kernel is already the
+   source of truth for SEA, CloudFetch, auth, retries, and result
+   handling. Re-implementing the same logic in Python (and again in
+   Go, Node.js, ODBC) is the duplication the kernel exists to remove.
 2. **Decoupling from ADBC.** Prior POCs
    ([adbc-drivers/databricks#423](https://github.com/adbc-drivers/databricks/pull/423),
    [databricks/databricks-sql-python#782](https://github.com/databricks/databricks-sql-python/pull/782))
@@ -50,21 +56,23 @@ Drivers](https://docs.google.com/document/d/1ZcsH0RP1fnmXEw3SeOi9e8Yi2PtOhYaBLr4
    driver-manager binary protocol. The v0 kernel exposes a
    Databricks-native API directly intended for PyO3/napi-rs/C-ABI
    consumers; we use that instead.
-3. **Thrift parity as a precondition.** SEA is becoming the default for
-   Databricks SQL going forward, but only after the kernel can serve
-   every Thrift code path the connector ships today. This doc tracks
-   that parity work.
+3. **Thrift parity as a precondition.** Before the connector flips any
+   default behavior, the kernel-backed path has to match every Thrift
+   code path the connector ships today. This doc tracks that parity
+   work.
 
 ## Non-goals
 
 - Replacing the Thrift backend. `use_sea=False` continues to route to
   `ThriftDatabricksClient` unchanged.
+- Deleting or restructuring the existing native SEA backend
+  (`src/databricks/sql/backend/sea/`). It stays in the repo. This
+  work only changes what `use_sea=True` is wired to.
+- Exposing the kernel's transport choice (SEA REST today, possibly
+  SEA-gRPC tomorrow) to the connector or to end users. The kernel
+  owns that knob internally; the connector backend never names it.
 - Volume / staging operations (`PUT`/`GET`). The kernel does not ship
-  a Volume API yet; this work is tracked separately and does not gate
-  the cutover.
-- Reusing the legacy native SEA backend as a runtime fallback. We do
-  not ship a `_use_native_sea=True` escape hatch. The native SEA
-  backend is deleted as a single step once parity lands.
+  a Volume API yet; this work is tracked separately.
 - `napi-rs` Node.js bindings or the kernel's own C-ABI. Both are
   out-of-scope here and live behind their own design docs.
 
@@ -110,8 +118,9 @@ to be a **direct Rust crate dependency**, not a ctypes-over-C consumer.
   Both are PAT-only, sync-only, no metadata, with synthetic
   session/statement IDs. They are the structural template for the new
   backend but are **discarded** — neither is on the migration path.
-- Native SEA backend (`backend/sea/`) exists and works but is **not**
-  the parity target.
+- Native SEA backend (`backend/sea/`) exists today. This work does
+  not modify or remove it; whether and when it gets cleaned up is
+  out of scope for this doc.
 
 ### Prior PyO3 work (`~/databricks-adbc/rust-pyo3`)
 
@@ -128,15 +137,15 @@ it wraps ADBC's `Optionable` layer, not the kernel's v0 API.
    use_sea=False  ──┐           ▼           ┌── use_sea=True
                     │   _create_backend()   │
                     ▼                       ▼
-         ThriftDatabricksClient    SeaKernelDatabricksClient
+         ThriftDatabricksClient      KernelDatabricksClient
                                             │
                               databricks_sql_kernel  (PyO3 ext module)
                                             │
                           databricks-sql-kernel  (Rust crate, v0 API)
                                             │
-                                   reqwest / tokio
+                                  (kernel-internal transport)
                                             │
-                                  Databricks SEA endpoint
+                                    Databricks endpoint
 ```
 
 Two repos, two artifacts:
@@ -144,8 +153,11 @@ Two repos, two artifacts:
 - **`databricks-sql-kernel`** ships the Rust crate **and** a PyO3
   sub-crate (`pyo3/`) that builds a wheel named
   `databricks-sql-kernel` (importable as `databricks_sql_kernel`).
-- **`databricks-sql-python`** gains a `backend/sea_kernel/` module that
+- **`databricks-sql-python`** gains a `backend/kernel/` module that
   imports `databricks_sql_kernel` and implements `DatabricksClient`.
+  The module is named after the **kernel** (the dependency it wraps),
+  not the wire protocol the kernel happens to use today — that
+  protocol may change without any change to this module's name.
 
 ## Decisions
 
@@ -154,11 +166,12 @@ Two repos, two artifacts:
 | D1 | PyO3 crate lives **inside the kernel repo** as `pyo3/` | Single repo keeps the Rust API and its Python binding in lockstep; the kernel's CLAUDE.md already names PyO3 / napi-rs as kernel consumers. |
 | D2 | Python module name: `databricks_sql_kernel` | Drops the `_adbc_` infix; reflects the decoupling from ADBC. |
 | D3 | Fresh Python-connector branch off `master`, not a continuation of `adbc-rust-backend-via-dm` | The old branch is structurally useful but semantically wrong (ADBC names, no metadata, synthetic IDs). Easier to copy patterns than rebase. |
-| D4 | New connector module is `backend/sea_kernel/` | Mirrors `backend/sea/` naming; reads naturally next to `backend/thrift_backend.py`. |
+| D4 | New connector module is `backend/kernel/` (not `backend/sea_kernel/`) | The module's identity is "the backend that delegates to the kernel," not the wire protocol. The kernel may switch its default transport (SEA REST → SEA gRPC → …) without renaming this module. |
 | D5 | One `tokio::runtime::Runtime` per `Session`, owned on the Rust side | Spec says wrappers own the runtime. Per-session keeps lifetime simple and isolates failure to the session it belongs to. |
-| D6 | `databricks-sql-kernel` is an **optional extra** of the connector | `pip install 'databricks-sql-connector[sea]'`. Without it, `use_sea=True` raises `ImportError`. Mirrors how `[pyarrow]` is handled today. |
-| D7 | No legacy fallback flag | The native SEA backend is deleted in the cutover commit, not gated behind a runtime switch. |
-| D8 | OAuth delegates to the connector's auth provider via `AuthConfig::External` | Avoids running two OAuth implementations in parallel. Connector keeps owning credential caches and refresh; kernel just asks for a bearer when it needs one. |
+| D6 | `databricks-sql-kernel` is an **optional extra** of the connector | `pip install 'databricks-sql-connector[kernel]'`. Without it, `use_sea=True` raises `ImportError`. Mirrors how `[pyarrow]` is handled today. |
+| D7 | `use_sea` keeps its name in the connector's public API | The flag's name is a backward-compat constraint; changing it would break every user already passing `use_sea=True`. The flag's *meaning* shifts from "talk SEA in Python" to "delegate to the kernel," but the surface stays put. |
+| D8 | The connector backend never names the kernel's transport | No `transport=`/`use_grpc=`/etc. knob exposed to users or carried in the backend's API. If the kernel grows transport variants later, they're picked kernel-side based on kernel config. |
+| D9 | OAuth delegates to the connector's auth provider via `AuthConfig::External` | Avoids running two OAuth implementations in parallel. Connector keeps owning credential caches and refresh; kernel just asks for a bearer when it needs one. |
 
 ## Rollout plan
 
@@ -258,20 +271,20 @@ auth state; the kernel calls back whenever it needs a fresh bearer.
   closes everything cleanly. Live-creds tests gated on env vars (same
   pattern the kernel uses for its `#[ignore]` E2E tests).
 
-### Phase 2 — `sea_kernel` backend (connector repo)
+### Phase 2 — `kernel` backend (connector repo)
 
-New directory `src/databricks/sql/backend/sea_kernel/`.
+New directory `src/databricks/sql/backend/kernel/`.
 
 ```
-sea_kernel/
+kernel/
   __init__.py
-  client.py          # SeaKernelDatabricksClient(DatabricksClient)
-  result_set.py      # SeaKernelResultSet(ResultSet)
+  client.py          # KernelDatabricksClient(DatabricksClient)
+  result_set.py      # KernelResultSet(ResultSet)
   auth_bridge.py     # auth_provider -> databricks_sql_kernel auth kwargs
   type_mapping.py    # TSparkParameter <-> kernel TypedValue + Arrow type -> dbapi str
 ```
 
-**`SeaKernelDatabricksClient` shape:**
+**`KernelDatabricksClient` shape:**
 
 - Construction takes the connector's already-built `auth_provider`
   (not a raw `access_token`), `server_hostname`, `http_path`,
@@ -283,7 +296,7 @@ sea_kernel/
 - `execute_command(...)` creates a fresh kernel `Statement`, binds
   params via `type_mapping.tspark_to_typed_value`, picks
   `execute()` (sync) or `submit()` (`async_op=True`), wraps the
-  returned handle in a `SeaKernelResultSet`. `CommandId` comes from
+  returned handle in a `KernelResultSet`. `CommandId` comes from
   the kernel handle's `statement_id`.
 - `cancel_command` / `close_command` call the kernel handle's
   `cancel()` / `close()` (real ops, no longer no-ops).
@@ -299,7 +312,7 @@ sea_kernel/
 - `max_download_threads` returns the connector's configured value;
   CloudFetch tuning happens kernel-side via `CloudFetchConfig`.
 
-**`SeaKernelResultSet` shape:**
+**`KernelResultSet` shape:**
 
 - Drop-in port of `backend/adbc/result_set.py` — same FIFO batch
   buffer, same `fetchone / fetchmany / fetchall`, same
@@ -329,9 +342,9 @@ Edit `src/databricks/sql/session.py::_create_backend`:
 
 ```python
 if self.use_sea:
-    from databricks.sql.backend.sea_kernel.client import SeaKernelDatabricksClient
-    logger.debug("Creating SEA backend client (Rust kernel via PyO3)")
-    return SeaKernelDatabricksClient(
+    from databricks.sql.backend.kernel.client import KernelDatabricksClient
+    logger.debug("Creating kernel-backed client for use_sea=True")
+    return KernelDatabricksClient(
         server_hostname=server_hostname,
         http_path=http_path,
         auth_provider=auth_provider,
@@ -349,6 +362,8 @@ if self.use_sea:
 - Delete `backend/adbc/`, `backend/adbc_dm/`, and the related
   imports/branches in `session.py`. Those POC backends were the
   staging ground for this work; they have no users.
+- `backend/sea/` is **not** touched. It's no longer reachable via
+  `use_sea=True` but stays in the codebase as-is.
 
 ### Phase 4 — Packaging and build
 
@@ -359,7 +374,7 @@ if self.use_sea:
 
   ```toml
   [tool.poetry.extras]
-  sea = ["databricks-sql-kernel"]
+  kernel = ["databricks-sql-kernel"]
   ```
 
   and a corresponding optional dependency declaration. `use_sea=True`
@@ -367,36 +382,36 @@ if self.use_sea:
 
   ```
   ImportError: use_sea=True requires the databricks-sql-kernel package.
-  Install it with: pip install 'databricks-sql-connector[sea]'
+  Install it with: pip install 'databricks-sql-connector[kernel]'
   ```
 
 - Local dev: `maturin develop --release` from `kernel/pyo3/` into the
   connector's venv. Documented in
   `databricks-sql-python/CONTRIBUTING.md` under a new "Working on the
-  SEA kernel path" section.
+  kernel backend" section.
 
-### Phase 5 — Cutover (single commit)
+### Phase 5 — Parity sign-off
 
 When the parity matrix below is green:
 
-1. In the connector, flip `use_sea=True` to be the documented
-   recommendation. `use_sea=False` (Thrift) remains supported but is
-   no longer the default the docs steer users toward.
-2. Delete `src/databricks/sql/backend/sea/` (the native SEA backend)
-   and its tests. Remove the `from ...backend.sea...` imports that
-   only existed to support it.
-3. Update `CHANGELOG.md`.
+1. `use_sea=True` is documented as a supported, production-ready path
+   alongside `use_sea=False` (Thrift). No flag flip; no behavior
+   change for users already on Thrift.
+2. Update `CHANGELOG.md` to note that `use_sea=True` is now backed by
+   the Rust kernel via PyO3.
 
-The Thrift backend is **not** touched. It stays as the
-`use_sea=False` path; a separate effort decides when (and whether)
-Thrift gets routed through the kernel.
+This work does **not** touch the existing `backend/sea/` native SEA
+backend or the Thrift backend. `use_sea=True` becomes a stable
+public route to the kernel; everything else stays put. Any later
+cleanup of `backend/sea/` is a separate decision and a separate doc.
 
 ## Parity matrix (Thrift is the target)
 
-The gating signal for Phase 5 is "every Thrift integration test
-passes against `use_sea=True`." This list is the explicit checklist.
+The gating signal for Phase 5 sign-off is "every Thrift integration
+test passes against `use_sea=True`." This list is the explicit
+checklist.
 
-| Capability | Thrift status | Kernel status (today) | sea_kernel work |
+| Capability | Thrift status | Kernel status (today) | `backend/kernel/` work |
 |---|---|---|---|
 | PAT auth | ✓ | ✓ | Wire through `auth_bridge` |
 | OAuth M2M | ✓ | ✓ | Wire through `auth_bridge` |
@@ -429,15 +444,15 @@ passes against `use_sea=True`." This list is the explicit checklist.
 | Volume `PUT` / `GET` | ✓ (Thrift) | ✗ | **Out of scope.** `use_sea=True` raises `NotImplementedError` for staging ops until kernel ships the surface. Documented limitation. |
 
 Anything in this table that is missing on the kernel side blocks
-Phase 5. Each missing item gets a tracked issue against the kernel
-repo before cutover.
+Phase 5 sign-off. Each missing item gets a tracked issue against the
+kernel repo before sign-off.
 
 ## Test plan
 
 1. **Unit (PyO3 crate):** Rust-side tests stay minimal (compile,
    error mapping). Heavy testing is Python-side.
 2. **Unit (connector backend):** new tests under
-   `tests/unit/test_sea_kernel_*` for the auth bridge, the type
+   `tests/unit/test_kernel_backend_*` for the auth bridge, the type
    mapper, and the result-set buffer logic. Mock the kernel module
    via the same pattern the connector uses for `thrift` mocks.
 3. **Integration (live):** the existing
@@ -449,9 +464,11 @@ repo before cutover.
    `use_sea=True` legs are skipped if `databricks-sql-kernel` is not
    installed.
 4. **Performance baseline:** a small benchmark (TPC-H-like wide
-   scan, 10M rows, mix of types) recorded for Thrift, native SEA,
-   and kernel-SEA before Phase 5. Cutover requires kernel-SEA ≥
-   native-SEA on throughput and ≤ Thrift on memory.
+   scan, 10M rows, mix of types) recorded for Thrift and for
+   `use_sea=True` (kernel-backed) before Phase 5 sign-off. The
+   kernel-backed path should be within striking distance of Thrift
+   on throughput and not regress memory by more than a small
+   constant factor.
 
 ## Risks
 
@@ -467,9 +484,9 @@ repo before cutover.
   refresh-token semantics), users hit subtle bugs. Mitigated by
   decision D8 — the kernel delegates back to the connector for
   OAuth, not the other way around.
-- **Volume operations gap.** Documented limitation at cutover. Users
-  who rely on `PUT`/`GET` stay on `use_sea=False`. Surfaces as a
-  clear `NotImplementedError`, not a hang.
+- **Volume operations gap.** Documented limitation at Phase 5
+  sign-off. Users who rely on `PUT`/`GET` stay on `use_sea=False`.
+  Surfaces as a clear `NotImplementedError`, not a hang.
 - **Single-runtime-per-session cost.** A tokio runtime is ~1 MB of
   stacks per session. For high session counts we may want a shared
   runtime. Defer until measured.
@@ -480,7 +497,7 @@ repo before cutover.
    `_http_proxy`, `http_headers`, custom user-agent — connector
    passes them as `kwargs` today. The auth_bridge takes them; how do
    they reach `SessionBuilder.http / .proxy / .tls`? Likely a small
-   `connection_options.py` in `sea_kernel/`.
+   `connection_options.py` in `backend/kernel/`.
 2. **Do we expose `Statement.submit()` to async-cursor users today?**
    Connector's `async_op=True` path runs through `execute_async() →
    get_query_state → get_execution_result`. Kernel's
@@ -508,15 +525,15 @@ The PR order, smallest first:
    await_result` on PyO3.
 5. **(kernel)** `External` token provider trampoline (enables OAuth
    delegation).
-6. **(connector)** `backend/sea_kernel/` skeleton with `client.py`
+6. **(connector)** `backend/kernel/` skeleton with `client.py`
    and `result_set.py` (sync path, PAT). Wire `_create_backend` for
    `use_sea=True`. Delete `backend/adbc/` and `backend/adbc_dm/` in
-   the same PR.
+   the same PR. `backend/sea/` is not touched.
 7. **(connector)** OAuth bridge through auth_bridge.py.
 8. **(connector)** Async execution path + metadata.
 9. **(connector)** Parametric e2e parity suite + benchmarks.
-10. **(connector)** Phase 5 cutover: delete `backend/sea/`,
-    documentation flips.
+10. **(connector)** Phase 5 sign-off: docs flip `use_sea=True` to
+    "supported, kernel-backed"; CHANGELOG entry.
 
 Each step in steps 2–4 is independently shippable: the wheel exists
 and works for its slice, even if the connector hasn't caught up.
