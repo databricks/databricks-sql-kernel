@@ -20,12 +20,11 @@
 //! batch-by-batch as pyarrow `RecordBatch`es.
 
 use crate::errors::to_py_err;
-use arrow_array::RecordBatch;
+use crate::fetch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
-    ExecutedStatement as KExecutedStatement, ExecutedStatementHandle, ResultBatch,
-    Statement as KStatement,
+    ExecutedStatement as KExecutedStatement, ExecutedStatementHandle, Statement as KStatement,
 };
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -149,25 +148,12 @@ impl ExecutedStatement {
         if inner.exhausted {
             return Ok(None);
         }
-        // Drive next_batch() on the session runtime with the GIL
-        // released for the whole I/O. The returned reference borrows
-        // from the stream; clone the RecordBatch (Arc-backed columns
-        // — cheap) out into an owned value so the borrow ends before
-        // we touch pyarrow.
         let runtime = inner.runtime.clone();
-        let batch_result: databricks_sql_kernel::Result<Option<RecordBatch>> = py.detach(|| {
-            runtime.block_on(async {
-                let stream = inner.exec.result_stream_mut();
-                match stream.next_batch().await? {
-                    Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
-                    Some(_) => Err(databricks_sql_kernel::Error::invalid_argument()
-                        .message("kernel returned a non-Arrow ResultBatch variant")),
-                    None => Ok(None),
-                }
-            })
-        });
-        match batch_result.map_err(|e| to_py_err(py, e))? {
-            Some(batch) => Ok(Some(batch.to_pyarrow(py)?)),
+        let batch = py
+            .detach(|| fetch::next_batch(&runtime, inner.exec.result_stream_mut()))
+            .map_err(|e| to_py_err(py, e))?;
+        match batch {
+            Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
                 inner.exhausted = true;
                 Ok(None)
@@ -179,34 +165,11 @@ impl ExecutedStatement {
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = self.alive_mut()?;
         let runtime = inner.runtime.clone();
-        let drain_result: databricks_sql_kernel::Result<Vec<RecordBatch>> = py.detach(|| {
-            runtime.block_on(async {
-                let mut out = Vec::new();
-                let stream = inner.exec.result_stream_mut();
-                loop {
-                    match stream.next_batch().await? {
-                        Some(ResultBatch::Arrow(rb)) => out.push(rb.clone()),
-                        Some(_) => {
-                            return Err(databricks_sql_kernel::Error::invalid_argument()
-                                .message("kernel returned a non-Arrow ResultBatch variant"));
-                        }
-                        None => break,
-                    }
-                }
-                Ok(out)
-            })
-        });
-        let batches = drain_result.map_err(|e| to_py_err(py, e))?;
+        let batches = py
+            .detach(|| fetch::drain(&runtime, inner.exec.result_stream_mut()))
+            .map_err(|e| to_py_err(py, e))?;
         inner.exhausted = true;
-
-        let py_batches: Vec<Bound<'py, PyAny>> = batches
-            .into_iter()
-            .map(|b| b.to_pyarrow(py))
-            .collect::<PyResult<_>>()?;
-        let py_schema = self.schema.as_ref().to_pyarrow(py)?;
-        let pa = py.import("pyarrow")?;
-        pa.getattr("Table")?
-            .call_method1("from_batches", (py_batches, py_schema))
+        fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
 
     /// Cancel the in-flight statement on the server. Local validity

@@ -21,6 +21,7 @@
 //! pyclass alive longer than the user keeps a reference.
 
 use crate::errors::to_py_err;
+use crate::metadata::Metadata;
 use crate::statement::Statement;
 use databricks_sql_kernel::{AuthConfig, Session as KSession};
 use pyo3::prelude::*;
@@ -123,6 +124,15 @@ impl Session {
         let inner = self.alive()?;
         let kstmt = inner.session.statement();
         Ok(Statement::new(kstmt, inner.runtime.clone()))
+    }
+
+    /// Metadata operations bound to this session (flat per-method,
+    /// ODBC-shaped). Returns a fresh `Metadata` handle on every call;
+    /// the handle is cheap to construct and throw away.
+    fn metadata(&self) -> PyResult<Metadata> {
+        let inner = self.alive()?;
+        let kmeta = inner.session.metadata();
+        Ok(Metadata::new(kmeta, inner.runtime.clone()))
     }
 
     /// Explicitly close the session. Idempotent. Subsequent calls on
