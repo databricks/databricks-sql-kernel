@@ -20,10 +20,11 @@
 //! they `block_on` the same pool without keeping the `Session`
 //! pyclass alive longer than the user keeps a reference.
 
+use crate::auth::build_auth_config;
 use crate::errors::to_py_err;
 use crate::metadata::Metadata;
 use crate::statement::Statement;
-use databricks_sql_kernel::{AuthConfig, Session as KSession};
+use databricks_sql_kernel::Session as KSession;
 use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
@@ -50,24 +51,52 @@ pub(crate) struct SessionInner {
 impl Session {
     /// Open a new session against the given workspace.
     ///
-    /// PAT auth only in this phase. `host` may be bare
-    /// (`my-workspace.databricks.com`) or fully-qualified
-    /// (`https://...`). `http_path` is the SQL endpoint path.
+    /// `host` may be bare (`my-workspace.databricks.com`) or
+    /// fully-qualified (`https://...`). `http_path` is the SQL
+    /// endpoint path.
+    ///
+    /// Auth selection:
+    ///
+    /// - `auth_type="pat"` (default when `access_token` is provided):
+    ///   `access_token` carries the bearer token. Kernel uses it
+    ///   verbatim for every request.
+    /// - `auth_type="external"`: `token_callback` is a no-arg
+    ///   Python callable that returns a fresh bearer token. The
+    ///   kernel invokes it once per HTTP request needing auth;
+    ///   the callable owns its own caching / refresh. Use this to
+    ///   delegate OAuth / MSAL / federation to the connector's
+    ///   existing auth provider.
+    ///
+    /// Omitting `auth_type` is equivalent to `"pat"` for backward
+    /// compatibility with Phase-1 callers that only had PAT.
     #[new]
-    #[pyo3(signature = (host, http_path, *, access_token, catalog=None, schema=None))]
+    #[pyo3(signature = (host, http_path, *, auth_type=None, access_token=None, token_callback=None, catalog=None, schema=None))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
         host: String,
         http_path: String,
-        access_token: String,
+        auth_type: Option<String>,
+        access_token: Option<String>,
+        token_callback: Option<Py<PyAny>>,
         catalog: Option<String>,
         schema: Option<String>,
     ) -> PyResult<Self> {
-        if access_token.is_empty() {
-            return Err(pyo3::exceptions::PyValueError::new_err(
-                "access_token must not be empty",
-            ));
-        }
+        // Resolve auth_type: default to "pat" only when the caller
+        // also passed access_token. This keeps existing PAT callers
+        // working without changes while still rejecting ambiguous
+        // calls like `Session(host, http_path)` with no auth.
+        let resolved_auth_type = match auth_type.as_deref() {
+            Some(t) => t.to_owned(),
+            None if access_token.is_some() => "pat".to_owned(),
+            None => {
+                return Err(pyo3::exceptions::PyValueError::new_err(
+                    "Session requires auth: pass auth_type='pat' with access_token, \
+                     or auth_type='external' with token_callback",
+                ));
+            }
+        };
+        let auth_config = build_auth_config(&resolved_auth_type, access_token, token_callback)?;
 
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker
@@ -90,12 +119,9 @@ impl Session {
         let rt = runtime.clone();
         let open_result = py.detach(|| {
             rt.block_on(async {
-                let mut builder =
-                    KSession::builder()
-                        .http_path(host, http_path)
-                        .auth(AuthConfig::Pat {
-                            token: access_token,
-                        });
+                let mut builder = KSession::builder()
+                    .http_path(host, http_path)
+                    .auth(auth_config);
                 if catalog.is_some() || schema.is_some() {
                     let mut defaults = databricks_sql_kernel::DefaultOpts::default();
                     defaults.catalog = catalog;

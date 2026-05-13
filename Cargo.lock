@@ -385,6 +385,7 @@ dependencies = [
  "arrow-array",
  "arrow-pyarrow",
  "arrow-schema",
+ "async-trait",
  "databricks-sql-kernel",
  "pyo3",
  "tokio",

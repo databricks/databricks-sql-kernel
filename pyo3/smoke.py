@@ -270,6 +270,76 @@ def main() -> None:
         check("message" in attrs, "attrs has 'message'")
     s2.close()
 
+    # --- External auth (Python-callable token provider) ---
+    #
+    # NOTE: the kernel today rejects `AuthConfig::External` at
+    # `build_auth_provider` ("reserved; v0 wires PAT + OAuthM2M +
+    # OAuthU2M only"). Until a follow-up kernel PR wires it into
+    # the HTTP client's `AuthProvider` adapter, opening a live
+    # session with `auth_type='external'` surfaces that kernel
+    # error. The smoke test verifies:
+    #
+    # 1. The wrapper accepts and validates the new kwargs.
+    # 2. Bad kwargs surface as `ValueError` at construction time
+    #    (before the kernel ever sees them).
+    # 3. Calling `Session(auth_type='external', ...)` surfaces the
+    #    kernel's "reserved" error verbatim — proving the path
+    #    reaches the kernel and the trampoline is wired correctly.
+    #
+    # The trampoline itself (Python callback → Rust → kernel
+    # `TokenProvider`) is covered by Rust unit tests in
+    # `pyo3/src/auth.rs` so we know the GIL handoff works.
+
+    banner("input validation — missing auth")
+    try:
+        k.Session(host=HOST, http_path=HTTP_PATH)
+        check(False, "no auth should have raised ValueError")
+    except ValueError as e:
+        check(True, f"ValueError as expected: {e}")
+
+    banner("input validation — auth_type='external' without callback")
+    try:
+        k.Session(host=HOST, http_path=HTTP_PATH, auth_type="external")
+        check(False, "should have raised")
+    except ValueError as e:
+        check("token_callback" in str(e), f"ValueError mentions token_callback: {e}")
+
+    banner("input validation — non-callable callback")
+    try:
+        k.Session(
+            host=HOST,
+            http_path=HTTP_PATH,
+            auth_type="external",
+            token_callback="not-callable",
+        )
+        check(False, "should have raised")
+    except ValueError as e:
+        check("callable" in str(e), f"ValueError mentions callable: {e}")
+
+    banner("auth_type='external' surfaces the kernel's 'reserved' error today")
+
+    def ok_callback():
+        return TOKEN
+
+    try:
+        k.Session(
+            host=HOST,
+            http_path=HTTP_PATH,
+            auth_type="external",
+            token_callback=ok_callback,
+        )
+        check(False, "should have raised until kernel wires AuthConfig::External")
+    except k.KernelError as e:
+        attrs = e.args[1]
+        check(
+            attrs.get("code") == "InvalidArgument",
+            f"code=InvalidArgument, got: {attrs.get('code')}",
+        )
+        check(
+            "External" in attrs.get("message", ""),
+            f"message names External: {attrs.get('message')}",
+        )
+
     print("\nAll smoke checks passed.")
 
 
