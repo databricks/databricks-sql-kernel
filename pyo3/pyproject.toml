@@ -13,4 +13,4 @@ dependencies = ["pyarrow>=14"]
 
 [tool.maturin]
 module-name = "databricks_sql_kernel"
-features = ["extension-module"]
+

@@ -15,12 +15,13 @@
 //! Python bindings for the Databricks SQL Kernel.
 //!
 //! Phase 1 surface today: `Session`, `Statement`, `ExecutedStatement`,
-//! `ExecutedAsyncStatement`, `Metadata`, `ResultStream`. Auth: PAT
-//! plus `External` (Python-callable token provider — used by the
-//! connector to delegate OAuth back to its own auth provider).
-//! Both synchronous `execute()` and async `submit()` paths
-//! supported. Built as the `databricks_sql_kernel` extension module
-//! via `maturin develop` / `maturin build`.
+//! `ExecutedAsyncStatement`, `Metadata`, `ResultStream`. Auth is
+//! PAT-only — OAuth and other auth types are reserved in the kernel
+//! surface but not yet wired here, pending a decision on whether
+//! PySQL owns OAuth or the kernel does (see Phase 2 design notes).
+//! Both synchronous `execute()` and async `submit()` paths supported.
+//! Built as the `databricks_sql_kernel` extension module via
+//! `maturin develop` / `maturin build`.
 //!
 //! The kernel's API is async — every method call from Python detaches
 //! the GIL and `block_on`s on the session-owned tokio runtime.

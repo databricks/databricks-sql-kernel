@@ -55,24 +55,11 @@ impl Session {
     /// fully-qualified (`https://...`). `http_path` is the SQL
     /// endpoint path.
     ///
-    /// Auth selection:
-    ///
-    /// - `auth_type="pat"` (default when `access_token` is provided):
-    ///   `access_token` carries the bearer token. Kernel uses it
-    ///   verbatim for every request.
-    /// - `auth_type="external"`: `token_callback` is a no-arg
-    ///   Python callable that returns a fresh bearer token. The
-    ///   kernel invokes it **once per HTTP request that needs
-    ///   authentication**, so the callable MUST be cheap (in-process
-    ///   cache lookup is the right pattern; a network round-trip
-    ///   inside the callback will multiply request latency
-    ///   noticeably under load). The callable owns its own caching
-    ///   and refresh — the kernel does not cache the returned
-    ///   token across calls. Use this to delegate OAuth / MSAL /
-    ///   federation to the connector's existing auth provider.
-    ///
-    /// Omitting `auth_type` is equivalent to `"pat"` for backward
-    /// compatibility with Phase-1 callers that only had PAT.
+    /// Auth: PAT only in this phase. Pass `access_token=<dapi...>`
+    /// (or the explicit form `auth_type='pat', access_token=...`).
+    /// OAuth and other auth types are reserved and will be wired
+    /// in once the credential-ownership question (kernel-owned vs
+    /// connector-owned OAuth) is settled.
     ///
     /// `session_conf` is the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
@@ -87,7 +74,6 @@ impl Session {
         *,
         auth_type=None,
         access_token=None,
-        token_callback=None,
         catalog=None,
         schema=None,
         session_conf=None,
@@ -99,7 +85,6 @@ impl Session {
         http_path: String,
         auth_type: Option<String>,
         access_token: Option<String>,
-        token_callback: Option<Py<PyAny>>,
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
@@ -113,12 +98,12 @@ impl Session {
             None if access_token.is_some() => "pat".to_owned(),
             None => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Session requires auth: pass auth_type='pat' with access_token, \
-                     or auth_type='external' with token_callback",
+                    "Session requires auth: pass access_token (PAT) — \
+                     other auth types are not yet supported by this binding",
                 ));
             }
         };
-        let auth_config = build_auth_config(&resolved_auth_type, access_token, token_callback)?;
+        let auth_config = build_auth_config(&resolved_auth_type, access_token)?;
 
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker

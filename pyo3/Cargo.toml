@@ -36,13 +36,7 @@ crate-type = ["cdylib"]
 databricks-sql-kernel = { path = ".." }
 
 # pyo3 — abi3-py39 lets one wheel cover Python 3.9+.
-#
-# `extension-module` is gated behind a Cargo feature so that
-# `cargo test -p databricks-sql-kernel-pyo3` can build a normal
-# binary that links against libpython (needed to run unit tests
-# that call `Python::attach`). Maturin enables the feature via
-# pyproject.toml when building the wheel.
-pyo3 = { version = "0.26", features = ["abi3-py39"] }
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
 
 # Multi-thread runtime — one per Session, owned on the Rust side.
 tokio = { version = "1", features = ["rt-multi-thread"] }
@@ -52,10 +46,3 @@ tokio = { version = "1", features = ["rt-multi-thread"] }
 arrow-array = "57"
 arrow-schema = "57"
 arrow-pyarrow = "57"
-
-# Required to implement the kernel's #[async_trait] TokenProvider on
-# the Python-callable trampoline used by AuthConfig::External.
-async-trait = "0.1"
-
-[features]
-extension-module = ["pyo3/extension-module"]
