@@ -27,9 +27,14 @@
 
 # Code coverage profiles and other test artifacts
 *.out
-coverage.*
+coverage.json
+coverage.lcov
+coverage.txt
+coverage.html
+coverage.info
 *.coverprofile
 profile.cov
+lcov.info
 
 # Dependency directories (remove the comment below to include it)
 # vendor/

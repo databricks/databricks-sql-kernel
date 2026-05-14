@@ -49,7 +49,7 @@ cargo test
 ## PR conventions
 
 - Title follows [conventional commits](https://www.conventionalcommits.org/en/v1.0.0/): `type(scope): description`. No JIRA prefixes — CI rejects them.
-- Commits must be DCO-signed (`git commit -s`).
+- Commits must be DCO-signed (`git commit -s`). Enforced by `.github/workflows/dco-check.yml`.
 
 ## Architecture
 
@@ -84,31 +84,14 @@ constructors on `Error` (`Error::invalid_argument()`, `Error::io()`,
 `Error::not_implemented()`, `Error::invalid_state()`, …) chained with
 `.message(...)` / `.with_source(...)` / `.sqlstate(...)`.
 
-## License headers
-
-Apache 2.0 headers are required on all source files; CI runs Apache RAT.
-
-Rust:
-```rust
-// Copyright (c) 2026 Databricks, Inc.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// ...
-```
-
-Markdown (HTML comment):
-```html
-<!--
-  Copyright (c) 2026 Databricks, Inc.
-
-  Licensed under the Apache License, Version 2.0 (the "License");
-  ...
--->
-```
-
 ## Adding Cargo dependencies
 
-CI runs `cargo-about` and fails on unapproved licenses. New permissive licenses must be added to the `accepted` list in `about.toml`.
+CI runs `cargo-deny check` (`.github/workflows/license-check.yml`)
+and fails on unapproved licenses or RustSec advisories. New
+permissive licenses must be added to `[licenses].allow` in
+`deny.toml` with PR-description justification. `about.toml` is
+preserved separately for generating attribution pages on demand;
+the CI gate lives on `deny.toml`.
 
 ## Local development environment
 
