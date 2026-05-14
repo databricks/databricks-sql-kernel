@@ -66,12 +66,6 @@ impl ExecutedAsyncStatement {
             inner: Some(ExecutedAsyncInner { exec, runtime }),
         }
     }
-
-    fn alive(&self) -> PyResult<&ExecutedAsyncInner> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| crate::errors::KernelError::new_err("ExecutedAsyncStatement is closed"))
-    }
 }
 
 #[pymethods]
@@ -82,48 +76,38 @@ impl ExecutedAsyncStatement {
     }
 
     /// Single-shot status check. Returns a tuple
-    /// `(state: str, failure: Optional[dict])` where:
+    /// `(state: str, failure: Optional[KernelError])` where:
     ///
     /// - `state` is one of `Pending / Running / Succeeded / Failed /
     ///   Cancelled / Closed`.
     /// - `failure` is `None` unless `state == "Failed"`, in which
-    ///   case it carries the same structured-attrs dict that
-    ///   `KernelError` exposes (`code`, `message`, `sql_state`,
+    ///   case it carries a `KernelError` instance exposing the
+    ///   structured fields (`code`, `message`, `sql_state`,
     ///   `error_code`, `vendor_code`, `http_status`, `retryable`,
-    ///   `query_id`).
+    ///   `query_id`) as plain attributes.
     ///
-    /// Surfacing failure as a dict rather than raising lets polling
+    /// Surfacing failure as a value rather than raising lets polling
     /// callers branch on terminal vs non-terminal states without a
-    /// try/except boundary. The connector backend re-raises as
-    /// the appropriate PEP 249 exception when it actually needs to.
+    /// try/except boundary. The connector backend re-raises the
+    /// failure as the appropriate PEP 249 exception when it actually
+    /// needs to.
     fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.alive()?;
-        let status = py
-            .detach(|| inner.runtime.block_on(inner.exec.status()))
-            .map_err(|e| to_py_err(py, e))?;
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        let runtime = inner.runtime.clone();
+        let status = run_kernel!(py, runtime, inner.exec.status())?;
         let state = status_str(&status);
-        let failure: Option<Bound<'py, PyAny>> = match &status {
+        let failure: Bound<'py, PyAny> = match &status {
             StatementStatus::Failed(err) => {
-                // Re-use the same dict-shape `to_py_err` produces so
-                // wrappers consume one format end-to-end. The
-                // exception carries the dict as its second `arg`.
+                // Build the KernelError instance the same way every
+                // other failure path does, then hand it to Python as
+                // a plain value (not raised). Callers read .code /
+                // .sql_state / .query_id directly.
                 let py_err = to_py_err(py, err.clone());
-                let args = py_err.value(py).getattr("args")?;
-                let tuple: Vec<Bound<'py, PyAny>> = args.extract()?;
-                tuple.into_iter().nth(1)
+                py_err.value(py).clone().into_any()
             }
-            _ => None,
+            _ => py.None().into_bound(py),
         };
-        let tuple = pyo3::types::PyTuple::new(
-            py,
-            [
-                state.into_pyobject(py)?.into_any(),
-                match failure {
-                    Some(f) => f,
-                    None => py.None().into_bound(py),
-                },
-            ],
-        )?;
+        let tuple = pyo3::types::PyTuple::new(py, [state.into_pyobject(py)?.into_any(), failure])?;
         Ok(tuple.into_any())
     }
 
@@ -134,29 +118,28 @@ impl ExecutedAsyncStatement {
     /// session-configured `poll_interval` / `poll_timeout` cadence.
     /// `Failed` / `Cancelled` raise `KernelError`.
     fn await_result(&self, py: Python<'_>) -> PyResult<ResultStream> {
-        let inner = self.alive()?;
-        let stream = py
-            .detach(|| inner.runtime.block_on(inner.exec.await_result()))
-            .map_err(|e| to_py_err(py, e))?;
-        Ok(ResultStream::new(stream, inner.runtime.clone()))
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        let runtime = inner.runtime.clone();
+        let stream = run_kernel!(py, runtime, inner.exec.await_result())?;
+        Ok(ResultStream::new(stream, runtime))
     }
 
     /// Fetch the result without polling. Raises `KernelError(code=
     /// 'InvalidState')` if the statement has not reached a terminal
     /// state — call after `status()` reports `Succeeded`/`Closed`.
     fn fetch_result(&self, py: Python<'_>) -> PyResult<ResultStream> {
-        let inner = self.alive()?;
-        let stream = py
-            .detach(|| inner.runtime.block_on(inner.exec.fetch_result()))
-            .map_err(|e| to_py_err(py, e))?;
-        Ok(ResultStream::new(stream, inner.runtime.clone()))
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        let runtime = inner.runtime.clone();
+        let stream = run_kernel!(py, runtime, inner.exec.fetch_result())?;
+        Ok(ResultStream::new(stream, runtime))
     }
 
     /// Cancel the in-flight statement on the server.
     fn cancel(&self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.alive()?;
-        py.detach(|| inner.runtime.block_on(inner.exec.cancel()))
-            .map_err(|e| to_py_err(py, e))
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        let runtime = inner.runtime.clone();
+        run_kernel!(py, runtime, inner.exec.cancel())?;
+        Ok(())
     }
 
     /// Close the statement (server-side `CloseStatement`). Idempotent.
@@ -165,9 +148,9 @@ impl ExecutedAsyncStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = py.detach(|| runtime.block_on(inner.exec.close()));
+        let res = run_kernel!(py, runtime, inner.exec.close());
         self.inner = None;
-        res.map_err(|e| to_py_err(py, e))
+        res.map(|_| ())
     }
 
     fn __repr__(&self) -> String {

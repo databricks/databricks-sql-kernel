@@ -25,6 +25,12 @@
 //! The kernel's API is async — every method call from Python detaches
 //! the GIL and `block_on`s on the session-owned tokio runtime.
 
+// `macros` is `#[macro_use]` so the `run_kernel!` / `alive!` /
+// `alive_mut!` macros are visible across the rest of the crate
+// without per-file imports.
+#[macro_use]
+mod macros;
+
 mod auth;
 mod errors;
 mod executed_async;

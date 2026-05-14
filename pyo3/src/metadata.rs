@@ -25,8 +25,22 @@
 //! a call site. The kernel's runtime checks (empty, NUL, backticks
 //! for identifiers; length caps for both) still apply; bad input
 //! surfaces as `KernelError(code='InvalidArgument', ...)`.
+//!
+//! ## Why the methods aren't fully macro-ised
+//!
+//! The 10 metadata methods share an outer shape (release GIL, run
+//! future on session runtime, wrap result in `ResultStream`), which
+//! `run_kernel_block!` collapses. They differ in:
+//!
+//! - which positional args are required vs optional,
+//! - which args are exact identifiers vs LIKE patterns,
+//! - the `list_tables` extra `table_types: Option<Vec<String>>`.
+//!
+//! A declarative macro that covered all the variations would need
+//! its own DSL and would be harder to read than the explicit forms.
+//! The outer-scaffolding macro is where the win lives; the inner
+//! conversions stay explicit and grep-able.
 
-use crate::errors::to_py_err;
 use crate::result_stream::ResultStream;
 use databricks_sql_kernel::{Identifier, LikePattern, Metadata as KMetadata, Result as KResult};
 use pyo3::prelude::*;
@@ -65,9 +79,7 @@ fn opt_pattern(s: &Option<String>) -> KResult<Option<LikePattern<'_>>> {
 impl Metadata {
     /// All catalogs visible to the session.
     fn list_catalogs(&self, py: Python<'_>) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| self.runtime.block_on(self.inner.list_catalogs()))
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, { self.inner.list_catalogs().await })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -79,13 +91,11 @@ impl Metadata {
         catalog: Option<String>,
         schema_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = opt_identifier(&catalog)?;
-                let pat = opt_pattern(&schema_pattern)?;
-                self.runtime.block_on(self.inner.list_schemas(cat, pat))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = opt_identifier(&catalog)?;
+            let pat = opt_pattern(&schema_pattern)?;
+            self.inner.list_schemas(cat, pat).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -102,19 +112,16 @@ impl Metadata {
         table_pattern: Option<String>,
         table_types: Option<Vec<String>>,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let tbl = opt_pattern(&table_pattern)?;
-                let types_owned: Option<Vec<&str>> = table_types
-                    .as_ref()
-                    .map(|v| v.iter().map(String::as_str).collect());
-                let types_slice: Option<&[&str]> = types_owned.as_deref();
-                self.runtime
-                    .block_on(self.inner.list_tables(cat, sch, tbl, types_slice))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = opt_identifier(&catalog)?;
+            let sch = opt_pattern(&schema_pattern)?;
+            let tbl = opt_pattern(&table_pattern)?;
+            let types_owned: Option<Vec<&str>> = table_types
+                .as_ref()
+                .map(|v| v.iter().map(String::as_str).collect());
+            let types_slice: Option<&[&str]> = types_owned.as_deref();
+            self.inner.list_tables(cat, sch, tbl, types_slice).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -129,16 +136,13 @@ impl Metadata {
         table_pattern: Option<String>,
         column_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = Some(Identifier::new(&catalog)?);
-                let sch = opt_pattern(&schema_pattern)?;
-                let tbl = opt_pattern(&table_pattern)?;
-                let col = opt_pattern(&column_pattern)?;
-                self.runtime
-                    .block_on(self.inner.list_columns(cat, sch, tbl, col))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = Some(Identifier::new(&catalog)?);
+            let sch = opt_pattern(&schema_pattern)?;
+            let tbl = opt_pattern(&table_pattern)?;
+            let col = opt_pattern(&column_pattern)?;
+            self.inner.list_columns(cat, sch, tbl, col).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -151,15 +155,12 @@ impl Metadata {
         schema: String,
         table: String,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = Some(Identifier::new(&catalog)?);
-                let sch = Some(Identifier::new(&schema)?);
-                let tbl = Identifier::new(&table)?;
-                self.runtime
-                    .block_on(self.inner.primary_keys(cat, sch, tbl))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = Some(Identifier::new(&catalog)?);
+            let sch = Some(Identifier::new(&schema)?);
+            let tbl = Identifier::new(&table)?;
+            self.inner.primary_keys(cat, sch, tbl).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -180,18 +181,15 @@ impl Metadata {
         foreign_schema: String,
         foreign_table: String,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let pc = opt_identifier(&parent_catalog)?;
-                let ps = opt_identifier(&parent_schema)?;
-                let pt = opt_identifier(&parent_table)?;
-                let fc = Some(Identifier::new(&foreign_catalog)?);
-                let fs = Some(Identifier::new(&foreign_schema)?);
-                let ft = Some(Identifier::new(&foreign_table)?);
-                self.runtime
-                    .block_on(self.inner.foreign_keys(pc, ps, pt, fc, fs, ft))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let pc = opt_identifier(&parent_catalog)?;
+            let ps = opt_identifier(&parent_schema)?;
+            let pt = opt_identifier(&parent_table)?;
+            let fc = Some(Identifier::new(&foreign_catalog)?);
+            let fs = Some(Identifier::new(&foreign_schema)?);
+            let ft = Some(Identifier::new(&foreign_table)?);
+            self.inner.foreign_keys(pc, ps, pt, fc, fs, ft).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -204,14 +202,12 @@ impl Metadata {
         schema_pattern: Option<String>,
         name_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let nam = opt_pattern(&name_pattern)?;
-                self.runtime.block_on(self.inner.functions(cat, sch, nam))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = opt_identifier(&catalog)?;
+            let sch = opt_pattern(&schema_pattern)?;
+            let nam = opt_pattern(&name_pattern)?;
+            self.inner.functions(cat, sch, nam).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
@@ -224,31 +220,25 @@ impl Metadata {
         schema_pattern: Option<String>,
         name_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| -> KResult<_> {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let nam = opt_pattern(&name_pattern)?;
-                self.runtime.block_on(self.inner.procedures(cat, sch, nam))
-            })
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, {
+            let cat = opt_identifier(&catalog)?;
+            let sch = opt_pattern(&schema_pattern)?;
+            let nam = opt_pattern(&name_pattern)?;
+            self.inner.procedures(cat, sch, nam).await
+        })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
     /// SQL data types supported by the workspace. No filters; no
     /// wire call (static in-memory result).
     fn type_info(&self, py: Python<'_>) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| self.runtime.block_on(self.inner.type_info()))
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, { self.inner.type_info().await })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
     /// All table types. No wire call.
     fn table_types(&self, py: Python<'_>) -> PyResult<ResultStream> {
-        let stream = py
-            .detach(|| self.runtime.block_on(self.inner.table_types()))
-            .map_err(|e| to_py_err(py, e))?;
+        let stream = run_kernel_block!(py, self.runtime, { self.inner.table_types().await })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 }

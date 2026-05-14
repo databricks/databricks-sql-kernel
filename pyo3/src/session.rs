@@ -21,7 +21,6 @@
 //! pyclass alive longer than the user keeps a reference.
 
 use crate::auth::build_auth_config;
-use crate::errors::to_py_err;
 use crate::metadata::Metadata;
 use crate::statement::Statement;
 use databricks_sql_kernel::Session as KSession;
@@ -62,10 +61,14 @@ impl Session {
     ///   verbatim for every request.
     /// - `auth_type="external"`: `token_callback` is a no-arg
     ///   Python callable that returns a fresh bearer token. The
-    ///   kernel invokes it once per HTTP request needing auth;
-    ///   the callable owns its own caching / refresh. Use this to
-    ///   delegate OAuth / MSAL / federation to the connector's
-    ///   existing auth provider.
+    ///   kernel invokes it **once per HTTP request that needs
+    ///   authentication**, so the callable MUST be cheap (in-process
+    ///   cache lookup is the right pattern; a network round-trip
+    ///   inside the callback will multiply request latency
+    ///   noticeably under load). The callable owns its own caching
+    ///   and refresh — the kernel does not cache the returned
+    ///   token across calls. Use this to delegate OAuth / MSAL /
+    ///   federation to the connector's existing auth provider.
     ///
     /// Omitting `auth_type` is equivalent to `"pat"` for backward
     /// compatibility with Phase-1 callers that only had PAT.
@@ -114,25 +117,22 @@ impl Session {
         );
 
         // `Session::open` is async and grabs the current tokio handle.
-        // Drive it on our runtime; detach the GIL while we wait so
-        // other Python threads can run.
+        // Drive it on the runtime; the macro detaches the GIL for the
+        // I/O and maps kernel errors into `KernelError`.
         let rt = runtime.clone();
-        let open_result = py.detach(|| {
-            rt.block_on(async {
-                let mut builder = KSession::builder()
-                    .http_path(host, http_path)
-                    .auth(auth_config);
-                if catalog.is_some() || schema.is_some() {
-                    let mut defaults = databricks_sql_kernel::DefaultOpts::default();
-                    defaults.catalog = catalog;
-                    defaults.schema = schema;
-                    builder = builder.defaults(defaults);
-                }
-                builder.open().await
-            })
-        });
+        let session = run_kernel!(py, rt, async {
+            let mut builder = KSession::builder()
+                .http_path(host, http_path)
+                .auth(auth_config);
+            if catalog.is_some() || schema.is_some() {
+                let mut defaults = databricks_sql_kernel::DefaultOpts::default();
+                defaults.catalog = catalog;
+                defaults.schema = schema;
+                builder = builder.defaults(defaults);
+            }
+            builder.open().await
+        })?;
 
-        let session = open_result.map_err(|e| to_py_err(py, e))?;
         Ok(Self {
             inner: Some(SessionInner { session, runtime }),
         })
@@ -141,13 +141,13 @@ impl Session {
     /// Server-issued session id.
     #[getter]
     fn session_id(&self) -> PyResult<String> {
-        let inner = self.alive()?;
+        let inner = alive!(self, "Session");
         Ok(inner.session.session_id().to_owned())
     }
 
     /// Build a new `Statement` bound to this session.
     fn statement(&self) -> PyResult<Statement> {
-        let inner = self.alive()?;
+        let inner = alive!(self, "Session");
         let kstmt = inner.session.statement();
         Ok(Statement::new(kstmt, inner.runtime.clone()))
     }
@@ -156,7 +156,7 @@ impl Session {
     /// ODBC-shaped). Returns a fresh `Metadata` handle on every call;
     /// the handle is cheap to construct and throw away.
     fn metadata(&self) -> PyResult<Metadata> {
-        let inner = self.alive()?;
+        let inner = alive!(self, "Session");
         let kmeta = inner.session.metadata();
         Ok(Metadata::new(kmeta, inner.runtime.clone()))
     }
@@ -168,8 +168,9 @@ impl Session {
             return Ok(());
         };
         let SessionInner { session, runtime } = inner;
-        let close_result = py.detach(|| runtime.block_on(session.close()));
-        close_result.map_err(|e| to_py_err(py, e))
+        let rt = runtime;
+        run_kernel!(py, rt, session.close())?;
+        Ok(())
     }
 
     fn __repr__(&self) -> String {
@@ -180,13 +181,5 @@ impl Session {
             ),
             None => "Session(closed=True)".to_owned(),
         }
-    }
-}
-
-impl Session {
-    fn alive(&self) -> PyResult<&SessionInner> {
-        self.inner
-            .as_ref()
-            .ok_or_else(|| crate::errors::KernelError::new_err("Session is closed"))
     }
 }

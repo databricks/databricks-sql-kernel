@@ -25,7 +25,6 @@
 //! `ExecutedStatement::fetch_next_batch` / `fetch_all_arrow` can call
 //! the same code path through its `result_stream_mut()` borrow.
 
-use crate::errors::to_py_err;
 use crate::fetch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
@@ -64,12 +63,6 @@ impl ResultStream {
             }),
         }
     }
-
-    fn alive_mut(&mut self) -> PyResult<&mut ResultStreamInner> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| crate::errors::KernelError::new_err("ResultStream is closed"))
-    }
 }
 
 #[pymethods]
@@ -82,14 +75,12 @@ impl ResultStream {
     /// Pull the next batch as a `pyarrow.RecordBatch`, or `None` when
     /// exhausted.
     fn fetch_next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "ResultStream");
         if inner.exhausted {
             return Ok(None);
         }
         let runtime = inner.runtime.clone();
-        let batch = py
-            .detach(|| fetch::next_batch(&runtime, &mut inner.stream))
-            .map_err(|e| to_py_err(py, e))?;
+        let batch = run_sync_kernel!(py, fetch::next_batch(&runtime, &mut inner.stream))?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
@@ -101,11 +92,9 @@ impl ResultStream {
 
     /// Drain the full result and return a single `pyarrow.Table`.
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "ResultStream");
         let runtime = inner.runtime.clone();
-        let batches = py
-            .detach(|| fetch::drain(&runtime, &mut inner.stream))
-            .map_err(|e| to_py_err(py, e))?;
+        let batches = run_sync_kernel!(py, fetch::drain(&runtime, &mut inner.stream))?;
         inner.exhausted = true;
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }

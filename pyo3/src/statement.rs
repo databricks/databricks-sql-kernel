@@ -14,12 +14,11 @@
 
 //! `Statement` + `ExecutedStatement` Python classes.
 //!
-//! Sync-execute path only in this phase. Mirrors the kernel's
-//! `Statement::execute() -> ExecutedStatement` flow: build a spec
-//! (sql + params), call `execute()`, then drain the result stream
-//! batch-by-batch as pyarrow `RecordBatch`es.
+//! Mirrors the kernel's `Statement::execute() -> ExecutedStatement`
+//! flow (sync) and `Statement::submit() -> ExecutedAsyncStatement`
+//! (async-consumption). The fetch surface on `ExecutedStatement`
+//! returns Arrow record batches as pyarrow values.
 
-use crate::errors::to_py_err;
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::fetch;
 use arrow_pyarrow::ToPyArrow;
@@ -52,19 +51,13 @@ impl Statement {
             inner: Some(StatementInner { stmt, runtime }),
         }
     }
-
-    fn alive_mut(&mut self) -> PyResult<&mut StatementInner> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| crate::errors::KernelError::new_err("Statement is closed"))
-    }
 }
 
 #[pymethods]
 impl Statement {
     /// Set the SQL text to execute. Replaces any previously-set SQL.
     fn set_sql(&mut self, sql: String) -> PyResult<()> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "Statement");
         inner.stmt.spec().sql(sql);
         Ok(())
     }
@@ -73,10 +66,9 @@ impl Statement {
     /// polling and returns an `ExecutedStatement` with the result
     /// stream ready to drain.
     fn execute(&mut self, py: Python<'_>) -> PyResult<ExecutedStatement> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();
-        let exec_result = py.detach(|| runtime.block_on(inner.stmt.execute()));
-        let exec = exec_result.map_err(|e| to_py_err(py, e))?;
+        let exec = run_kernel!(py, runtime, inner.stmt.execute())?;
         Ok(ExecutedStatement::new(exec, runtime))
     }
 
@@ -89,10 +81,9 @@ impl Statement {
     /// Long-running queries that would blow past `execute()`'s sync
     /// polling budget belong on this path.
     fn submit(&mut self, py: Python<'_>) -> PyResult<ExecutedAsyncStatement> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();
-        let submit_result = py.detach(|| runtime.block_on(inner.stmt.submit()));
-        let exec = submit_result.map_err(|e| to_py_err(py, e))?;
+        let exec = run_kernel!(py, runtime, inner.stmt.submit())?;
         Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
@@ -137,12 +128,6 @@ impl ExecutedStatement {
             }),
         }
     }
-
-    fn alive_mut(&mut self) -> PyResult<&mut ExecutedInner> {
-        self.inner
-            .as_mut()
-            .ok_or_else(|| crate::errors::KernelError::new_err("ExecutedStatement is closed"))
-    }
 }
 
 #[pymethods]
@@ -161,14 +146,15 @@ impl ExecutedStatement {
     /// Pull the next batch as a `pyarrow.RecordBatch`, or `None` if
     /// the stream is exhausted.
     fn fetch_next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "ExecutedStatement");
         if inner.exhausted {
             return Ok(None);
         }
         let runtime = inner.runtime.clone();
-        let batch = py
-            .detach(|| fetch::next_batch(&runtime, inner.exec.result_stream_mut()))
-            .map_err(|e| to_py_err(py, e))?;
+        let batch = run_sync_kernel!(
+            py,
+            fetch::next_batch(&runtime, inner.exec.result_stream_mut())
+        )?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
@@ -180,11 +166,9 @@ impl ExecutedStatement {
 
     /// Drain the full result and return a single `pyarrow.Table`.
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "ExecutedStatement");
         let runtime = inner.runtime.clone();
-        let batches = py
-            .detach(|| fetch::drain(&runtime, inner.exec.result_stream_mut()))
-            .map_err(|e| to_py_err(py, e))?;
+        let batches = run_sync_kernel!(py, fetch::drain(&runtime, inner.exec.result_stream_mut()))?;
         inner.exhausted = true;
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
@@ -193,10 +177,10 @@ impl ExecutedStatement {
     /// flag short-circuits if the parent `Statement` was re-executed
     /// or dropped.
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
-        let inner = self.alive_mut()?;
+        let inner = alive_mut!(self, "ExecutedStatement");
         let runtime = inner.runtime.clone();
-        let res = py.detach(|| runtime.block_on(inner.exec.cancel()));
-        res.map_err(|e| to_py_err(py, e))
+        run_kernel!(py, runtime, inner.exec.cancel())?;
+        Ok(())
     }
 
     /// Close the statement (server-side `CloseStatement`). Idempotent.
@@ -206,12 +190,12 @@ impl ExecutedStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = py.detach(|| runtime.block_on(inner.exec.close()));
+        let res = run_kernel!(py, runtime, inner.exec.close());
         // Drop the kernel handle regardless of close() outcome — the
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.
         self.inner = None;
-        res.map_err(|e| to_py_err(py, e))
+        res.map(|_| ())
     }
 
     fn __repr__(&self) -> String {
