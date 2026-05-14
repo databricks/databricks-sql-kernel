@@ -52,3 +52,38 @@ def test_use_after_close_raises_kernel_error(fresh_session):
         assert e.code == "InvalidStatementHandle", e.code
     else:
         raise AssertionError("expected KernelError on use-after-close")
+
+
+@live
+def test_session_conf_round_trips():
+    """`session_conf` is passed through to SEA `session_configuration`
+    verbatim. Setting `ANSI_MODE=false` proves the map reached the
+    server and was honoured — `SET ANSI_MODE` reflects it back.
+    `ANSI_MODE` was chosen because it's on the allow-list this
+    warehouse accepts and round-trips cleanly (`TIMEZONE` is
+    rejected with "Unsupported configuration" on dogfood;
+    `USE_CACHED_RESULT` / `STATEMENT_TIMEOUT` are
+    workspace-policy-clamped)."""
+    import os
+    s = k.Session(
+        host=os.environ["DATABRICKS_HOST"],
+        http_path=os.environ["DATABRICKS_HTTP_PATH"],
+        access_token=os.environ["DATABRICKS_TOKEN"],
+        session_conf={"ANSI_MODE": "false"},
+    )
+    try:
+        stmt = s.statement()
+        stmt.set_sql("SET ANSI_MODE")
+        exec_ = stmt.execute()
+        try:
+            table = exec_.fetch_all_arrow()
+            # Server returns rows like (key='ANSI_MODE', value='false').
+            row = {f.name: table.column(i).to_pylist()[0] for i, f in enumerate(table.schema)}
+            assert row.get("value") == "false", (
+                f"server did not honour ANSI_MODE=false; got row {row!r}"
+            )
+        finally:
+            exec_.close()
+            stmt.close()
+    finally:
+        s.close()

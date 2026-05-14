@@ -25,6 +25,7 @@ use crate::metadata::Metadata;
 use crate::statement::Statement;
 use databricks_sql_kernel::Session as KSession;
 use pyo3::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::{Builder, Runtime};
 
@@ -72,8 +73,25 @@ impl Session {
     ///
     /// Omitting `auth_type` is equivalent to `"pat"` for backward
     /// compatibility with Phase-1 callers that only had PAT.
+    ///
+    /// `session_conf` is the server-bound session configuration map
+    /// — passed through to SEA `session_confs` verbatim. Use for
+    /// `ANSI_MODE`, `TIMEZONE`, `STATEMENT_TIMEOUT`, query-tag
+    /// presets, etc. The kernel does not validate keys; the server
+    /// rejects unknown ones with a `KernelError(code='SqlError')`
+    /// when it picks them up.
     #[new]
-    #[pyo3(signature = (host, http_path, *, auth_type=None, access_token=None, token_callback=None, catalog=None, schema=None))]
+    #[pyo3(signature = (
+        host,
+        http_path,
+        *,
+        auth_type=None,
+        access_token=None,
+        token_callback=None,
+        catalog=None,
+        schema=None,
+        session_conf=None,
+    ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
         py: Python<'_>,
@@ -84,6 +102,7 @@ impl Session {
         token_callback: Option<Py<PyAny>>,
         catalog: Option<String>,
         schema: Option<String>,
+        session_conf: Option<HashMap<String, String>>,
     ) -> PyResult<Self> {
         // Resolve auth_type: default to "pat" only when the caller
         // also passed access_token. This keeps existing PAT callers
@@ -129,6 +148,9 @@ impl Session {
                 defaults.catalog = catalog;
                 defaults.schema = schema;
                 builder = builder.defaults(defaults);
+            }
+            if let Some(conf) = session_conf {
+                builder = builder.session_conf(conf);
             }
             builder.open().await
         })?;
