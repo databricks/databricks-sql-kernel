@@ -28,9 +28,14 @@ repository = "https://github.com/databricks/databricks-sql-kernel"
 # symbol from the `#[pymodule]` function name (not this `[lib].name`).
 # Picking a distinct name avoids colliding with the kernel root crate's
 # own cdylib output.
+#
+# `rlib` is included so `cargo test -p databricks-sql-kernel-pyo3`
+# can pick up future `#[cfg(test)]` modules in `src/**`. With only
+# `cdylib`, cargo silently reports "running 0 tests / ok" even if a
+# `#[test]` exists — a real footgun for any later Rust-side test.
 [lib]
 name = "databricks_sql_kernel_pyo3"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 databricks-sql-kernel = { path = ".." }

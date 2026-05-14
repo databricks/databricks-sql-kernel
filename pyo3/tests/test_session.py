@@ -63,12 +63,17 @@ def test_session_conf_round_trips():
     warehouse accepts and round-trips cleanly (`TIMEZONE` is
     rejected with "Unsupported configuration" on dogfood;
     `USE_CACHED_RESULT` / `STATEMENT_TIMEOUT` are
-    workspace-policy-clamped)."""
-    import os
+    workspace-policy-clamped).
+    """
+    # Pull from the same module-level constants conftest defines so
+    # offline pytest runs short-circuit via @live before this body
+    # ever evaluates — no `os.environ[...]` KeyError hazard.
+    from conftest import HOST, HTTP_PATH, TOKEN
+
     s = k.Session(
-        host=os.environ["DATABRICKS_HOST"],
-        http_path=os.environ["DATABRICKS_HTTP_PATH"],
-        access_token=os.environ["DATABRICKS_TOKEN"],
+        host=HOST,
+        http_path=HTTP_PATH,
+        access_token=TOKEN,
         session_conf={"ANSI_MODE": "false"},
     )
     try:

@@ -87,9 +87,23 @@ impl Statement {
         Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
-    /// Drop the statement. Any prior `ExecutedStatement` keeps
-    /// working — kernel-side it has its own validity flag and
-    /// statement_id and is independent of the `Statement` lifecycle.
+    /// Drop the statement lifecycle owner.
+    ///
+    /// **Server-side cleanup is owned by `ExecutedStatement` /
+    /// `ExecutedAsyncStatement`, not by `Statement`.** Each of
+    /// those handles fires a fire-and-forget `CloseStatement` from
+    /// its own `Drop` impl, and they hold their own
+    /// `Arc<SessionInner>` so they outlive the parent `Statement`
+    /// cleanly. Calling `Statement.close()` here therefore does
+    /// **not** send any RPC — it only drops the local lifecycle
+    /// owner, which flips the validity flag on any executed handle
+    /// the caller has already abandoned so its eventual `Drop`
+    /// short-circuits cleanly.
+    ///
+    /// If the caller is still using an `ExecutedStatement` produced
+    /// by this `Statement`, that handle continues to work
+    /// unaffected. To release the server-side statement, call
+    /// `.close()` on the `ExecutedStatement` (or just let it Drop).
     fn close(&mut self) {
         self.inner = None;
     }
