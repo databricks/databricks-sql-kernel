@@ -430,7 +430,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                         .request_async(http_client.inner())
                         .await
                         .map_err(|e| {
-                            Error::io()
+                            Error::unauthenticated()
                                 .message(format!("U2M authorization code exchange failed: {}", e))
                                 .context("authorization code grant")
                         })?;

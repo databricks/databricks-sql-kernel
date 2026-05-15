@@ -267,7 +267,7 @@ impl AuthProvider for ClientCredentialsProvider {
                         .request_async(http_client.inner())
                         .await
                         .map_err(|e| {
-                            Error::io()
+                            Error::unauthenticated()
                                 .message(format!("M2M token exchange failed: {}", e))
                                 .context("client credentials grant")
                         })?;
