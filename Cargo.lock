@@ -385,6 +385,7 @@ dependencies = [
  "arrow-array",
  "arrow-pyarrow",
  "arrow-schema",
+ "chrono",
  "databricks-sql-kernel",
  "pyo3",
  "tokio",

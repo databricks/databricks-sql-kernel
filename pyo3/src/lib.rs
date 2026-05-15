@@ -37,6 +37,7 @@ mod errors;
 mod executed_async;
 mod fetch;
 mod metadata;
+mod params;
 mod result_stream;
 mod session;
 mod statement;

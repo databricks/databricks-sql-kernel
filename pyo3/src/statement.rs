@@ -19,12 +19,15 @@
 //! (async-consumption). The fetch surface on `ExecutedStatement`
 //! returns Arrow record batches as pyarrow values.
 
+use crate::errors::to_py_err;
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::fetch;
+use crate::params::parse_typed_value;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
-    ExecutedStatement as KExecutedStatement, ExecutedStatementHandle, Statement as KStatement,
+    Error as KError, ExecutedStatement as KExecutedStatement, ExecutedStatementHandle,
+    Statement as KStatement,
 };
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -59,6 +62,67 @@ impl Statement {
     fn set_sql(&mut self, sql: String) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
         inner.stmt.spec().sql(sql);
+        Ok(())
+    }
+
+    /// Bind a positional parameter.
+    ///
+    /// ``ordinal`` is 1-based on the SEA wire. ``value_str`` is the
+    /// connector's string-serialised form (or ``None`` for SQL
+    /// NULL); ``sql_type`` is the Databricks SQL type name.
+    ///
+    /// Accepted ``sql_type`` values (case-insensitive):
+    /// ``"VOID"``, ``"BOOLEAN"`` / ``"BOOL"``, ``"TINYINT"``,
+    /// ``"SMALLINT"``, ``"INT"`` / ``"INTEGER"``, ``"BIGINT"`` /
+    /// ``"LONG"``, ``"FLOAT"``, ``"DOUBLE"``, ``"STRING"`` /
+    /// ``"VARCHAR"`` / ``"CHAR"``, ``"DATE"``, ``"TIMESTAMP"`` /
+    /// ``"TIMESTAMP_NTZ"``, ``"INTERVAL"``, ``"DECIMAL(p,s)"`` and
+    /// ``"DECIMAL(p)"`` (scale defaults to 0). See
+    /// ``pyo3/src/params.rs`` for the authoritative mapping.
+    ///
+    /// This shape — string value + type name — exists because the
+    /// connector's ``TSparkParameter`` already string-serialises
+    /// every value (the Thrift wire format uses
+    /// ``stringValue``). Re-parsing into a native Python type just
+    /// to re-encode to a kernel ``TypedValue`` would be a lossy
+    /// round-trip; the kernel takes the string directly.
+    ///
+    /// Named bindings, compound types (ARRAY/MAP/STRUCT), and
+    /// BINARY are not yet supported and raise
+    /// ``KernelError(code='InvalidArgument', ...)``. Bad value
+    /// literals (e.g. ``bind_param(1, "abc", "INT")``) also raise
+    /// at bind time, before ``execute()``.
+    #[pyo3(signature = (ordinal, value_str, sql_type))]
+    fn bind_param(
+        &mut self,
+        py: Python<'_>,
+        ordinal: i64,
+        value_str: Option<String>,
+        sql_type: String,
+    ) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        // Reject ordinal < 1 here rather than via PyO3's `usize`
+        // extraction. A `usize` parameter would surface a negative
+        // ordinal as Python `OverflowError` before the function body
+        // ran, breaking the documented `KernelError(InvalidArgument)`
+        // contract that wrappers catch on. The kernel itself also
+        // rejects 0 (see `StatementSpec::param`), but we surface that
+        // here for the same reason — one error code, one type, for
+        // every invalid ordinal.
+        if ordinal < 1 {
+            return Err(to_py_err(
+                py,
+                KError::invalid_argument()
+                    .message("positional parameter ordinal must be >= 1 (1-based)"),
+            ));
+        }
+        let typed =
+            parse_typed_value(&sql_type, value_str.as_deref()).map_err(|e| to_py_err(py, e))?;
+        inner
+            .stmt
+            .spec()
+            .param(ordinal as usize, typed)
+            .map_err(|e| to_py_err(py, e))?;
         Ok(())
     }
 
