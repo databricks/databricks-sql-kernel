@@ -376,7 +376,9 @@ impl SeaRestTransport {
         // attributes to recover the precise type for columns whose
         // Arrow shape collapses (VARIANT → Utf8, intervals → Interval,
         // GEOMETRY/GEOGRAPHY → Utf8).
-        let reader = reader_factory.create_reader(&response.statement_id, &response)?;
+        let reader = reader_factory
+            .create_reader(&response.statement_id, &response)
+            .await?;
 
         // `server_state` carries the terminal state forward so the
         // executed handle can skip a redundant CloseStatement when
@@ -518,7 +520,7 @@ impl Transport for SeaRestTransport {
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
-                let reader = reader_factory.create_reader(&r.statement_id, &r)?;
+                let reader = reader_factory.create_reader(&r.statement_id, &r).await?;
                 let server_state = r.status.state;
                 Ok(Some(ExecuteResult {
                     statement_id: r.statement_id,

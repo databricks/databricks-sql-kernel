@@ -692,20 +692,20 @@ mod tests {
     use super::*;
     use arrow_array::Array;
 
-    #[test]
-    fn type_info_reader_yields_expected_shape() {
+    #[tokio::test]
+    async fn type_info_reader_yields_expected_shape() {
         let mut r = type_info_reader();
-        let rb = r.next_batch().unwrap().expect("one batch");
+        let rb = r.next_batch().await.unwrap().expect("one batch");
         assert_eq!(rb.schema(), *TYPE_INFO_SCHEMA);
         assert!(rb.num_rows() >= 19, "{} rows", rb.num_rows());
         // Stream is exhausted after the first batch.
-        assert!(r.next_batch().unwrap().is_none());
+        assert!(r.next_batch().await.unwrap().is_none());
     }
 
-    #[test]
-    fn type_info_includes_required_databricks_types() {
+    #[tokio::test]
+    async fn type_info_includes_required_databricks_types() {
         let mut r = type_info_reader();
-        let rb = r.next_batch().unwrap().unwrap();
+        let rb = r.next_batch().await.unwrap().unwrap();
         let names = rb
             .column_by_name("TYPE_NAME")
             .unwrap()
@@ -734,15 +734,15 @@ mod tests {
         }
     }
 
-    #[test]
-    fn table_types_reader_yields_provided_types() {
+    #[tokio::test]
+    async fn table_types_reader_yields_provided_types() {
         let types = vec!["TABLE".to_string(), "VIEW".to_string()];
         let mut r = table_types_reader(&types);
-        let rb = r.next_batch().unwrap().expect("one batch");
+        let rb = r.next_batch().await.unwrap().expect("one batch");
         assert_eq!(rb.num_rows(), 2);
         let arr = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         assert_eq!(arr.value(0), "TABLE");
         assert_eq!(arr.value(1), "VIEW");
-        assert!(r.next_batch().unwrap().is_none());
+        assert!(r.next_batch().await.unwrap().is_none());
     }
 }

@@ -98,12 +98,12 @@ use std::sync::Arc;
 /// an empty stream typed to the operation's JDBC schema; pass other
 /// errors through. Matches the JDBC driver's
 /// `isObjectNotFoundException → empty getXResult` pattern.
-fn not_found_or<F>(err: Error, schema: SchemaRef, otherwise: F) -> Result<ResultStream>
+async fn not_found_or<F>(err: Error, schema: SchemaRef, otherwise: F) -> Result<ResultStream>
 where
     F: FnOnce(Error) -> Result<ResultStream>,
 {
     if is_object_not_found(&err) {
-        ResultStream::from_reader(Box::new(EmptyReader::new(schema)))
+        ResultStream::from_reader(Box::new(EmptyReader::new(schema))).await
     } else {
         otherwise(err)
     }
@@ -254,7 +254,7 @@ impl Metadata {
             GET_CATALOGS_SCHEMA.clone(),
             Box::new(thrift_shape::reshape_catalogs),
         );
-        ResultStream::from_reader(Box::new(reshaped))
+        ResultStream::from_reader(Box::new(reshaped)).await
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
@@ -281,14 +281,14 @@ impl Metadata {
             .await
         {
             Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err),
+            Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
         };
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_SCHEMAS_SCHEMA.clone(),
             Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
         );
-        ResultStream::from_reader(Box::new(reshaped))
+        ResultStream::from_reader(Box::new(reshaped)).await
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
@@ -329,7 +329,7 @@ impl Metadata {
             .await
         {
             Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err),
+            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
         };
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
@@ -341,7 +341,7 @@ impl Metadata {
                 thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
             }),
         );
-        ResultStream::from_reader(Box::new(reshaped))
+        ResultStream::from_reader(Box::new(reshaped)).await
     }
 
     /// Columns of tables matching the filter. Catalog is optional and
@@ -390,14 +390,14 @@ impl Metadata {
             .await
         {
             Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err),
+            Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
         };
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_COLUMNS_SCHEMA.clone(),
             Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
         );
-        ResultStream::from_reader(Box::new(reshaped))
+        ResultStream::from_reader(Box::new(reshaped)).await
     }
 
     /// Primary keys for the given table. All three identifiers are
@@ -438,7 +438,7 @@ impl Metadata {
                 table.as_str(),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
@@ -484,7 +484,7 @@ impl Metadata {
                 foreign_table.as_str(),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
@@ -510,7 +510,7 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
@@ -535,7 +535,7 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// SQL data types supported by the workspace. No filters. No wire
@@ -543,7 +543,7 @@ impl Metadata {
     pub async fn type_info(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         let reader = static_data::type_info_reader();
-        ResultStream::from_reader(reader)
+        ResultStream::from_reader(reader).await
     }
 
     /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No
@@ -554,7 +554,7 @@ impl Metadata {
         let _g = self.session.log_span().clone().entered();
         let types = self.session.transport().list_table_types();
         let reader = static_data::table_types_reader(&types);
-        ResultStream::from_reader(reader)
+        ResultStream::from_reader(reader).await
     }
 }
 

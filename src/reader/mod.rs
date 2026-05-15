@@ -32,9 +32,9 @@ use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
 use crate::reader::inline::InlineArrowProvider;
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
-use crate::util::runtime::block_on_in_runtime;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use std::sync::Arc;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
@@ -85,16 +85,15 @@ impl ResultReaderFactory {
     /// to the wrapped reader's schema. Both sites share the same helper,
     /// so the metadata-attachment behaviour is consistent across the
     /// two surfaces.
-    pub(crate) fn create_reader(
+    pub(crate) async fn create_reader(
         &self,
         statement_id: &str,
         response: &ExecuteResponse,
     ) -> Result<Box<dyn ResultReader + Send>> {
         let inner = self.create_inner_reader(statement_id, response)?;
-        Ok(Box::new(ManifestAugmentingReader::new(
-            inner,
-            response.manifest.as_ref(),
-        )?))
+        Ok(Box::new(
+            ManifestAugmentingReader::new(inner, response.manifest.as_ref()).await?,
+        ))
     }
 
     /// Pick the right concrete reader for `response`: CloudFetch,
@@ -290,10 +289,7 @@ impl ResultReaderFactory {
             self.runtime_handle.clone(),
         );
 
-        Ok(Box::new(CloudFetchResultReader::new(
-            provider,
-            self.runtime_handle.clone(),
-        )))
+        Ok(Box::new(CloudFetchResultReader::new(provider)))
     }
 
     fn create_inline_reader(
@@ -321,39 +317,39 @@ impl ResultReaderFactory {
 /// expectation of `async_trait` methods on the surrounding
 /// `ExecutedStatementHandle`. Practically every existing impl is
 /// already Sync (their state is `Arc`s or owned `Vec`s).
+///
+/// Both methods are `async` so the CloudFetch implementation can
+/// `.await` its underlying async provider directly — no internal
+/// `block_on`. This is what makes the public `ResultStream::next_batch`
+/// truly async and safe to call from a tokio runtime (e.g. napi-rs).
+#[async_trait]
 pub trait ResultReader: Send + Sync {
     /// Get the schema of the result.
-    fn schema(&self) -> Result<SchemaRef>;
+    async fn schema(&self) -> Result<SchemaRef>;
 
     /// Get the next record batch, or None if end of results.
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
 }
 
 /// Wrapper for StreamingCloudFetchProvider that implements ResultReader.
 struct CloudFetchResultReader {
     provider: Arc<StreamingCloudFetchProvider>,
-    runtime_handle: tokio::runtime::Handle,
 }
 
 impl CloudFetchResultReader {
-    fn new(
-        provider: Arc<StreamingCloudFetchProvider>,
-        runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self {
-            provider,
-            runtime_handle,
-        }
+    fn new(provider: Arc<StreamingCloudFetchProvider>) -> Self {
+        Self { provider }
     }
 }
 
+#[async_trait]
 impl ResultReader for CloudFetchResultReader {
-    fn schema(&self) -> Result<SchemaRef> {
-        block_on_in_runtime(&self.runtime_handle, self.provider.get_schema())
+    async fn schema(&self) -> Result<SchemaRef> {
+        self.provider.get_schema().await
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        block_on_in_runtime(&self.runtime_handle, self.provider.next_batch())
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.provider.next_batch().await
     }
 }
 
@@ -373,14 +369,15 @@ impl InlineArrowReader {
     }
 }
 
+#[async_trait]
 impl ResultReader for InlineArrowReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         self.schema
             .clone()
             .ok_or_else(|| Error::invalid_state().message("Schema not available for inline result"))
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
     }
 }
@@ -409,12 +406,13 @@ impl InMemoryReader {
     }
 }
 
+#[async_trait]
 impl ResultReader for InMemoryReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(self.batches.next())
     }
 }
@@ -434,12 +432,13 @@ impl EmptyReader {
     }
 }
 
+#[async_trait]
 impl ResultReader for EmptyReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(None)
     }
 }
@@ -483,11 +482,11 @@ impl ManifestAugmentingReader {
     /// `databricks.*` keys. When it's `None`, the wrapper is a
     /// pass-through (so callers don't need to special-case the
     /// metadata-less path).
-    pub(crate) fn new(
+    pub(crate) async fn new(
         inner: Box<dyn ResultReader + Send>,
         manifest: Option<&ResultManifest>,
     ) -> Result<Self> {
-        let schema = inner.schema()?;
+        let schema = inner.schema().await?;
         let schema = match manifest {
             Some(m) => ResultReaderAdapter::augment_schema_with_manifest(&schema, m),
             None => schema,
@@ -496,13 +495,14 @@ impl ManifestAugmentingReader {
     }
 }
 
+#[async_trait]
 impl ResultReader for ManifestAugmentingReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        match self.inner.next_batch()? {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.inner.next_batch().await? {
             None => Ok(None),
             Some(batch) => {
                 // Re-project the batch's columns onto our augmented
@@ -539,11 +539,15 @@ pub struct ResultReaderAdapter {
 impl ResultReaderAdapter {
     /// Create a new adapter wrapping a ResultReader, optionally augmenting the
     /// schema with Databricks column metadata from the SEA manifest.
-    pub fn new(
+    ///
+    /// `async` because [`ResultReader::schema`] is async (the CloudFetch
+    /// reader forces the first chunk to download to extract the schema).
+    /// In-memory readers resolve their schema synchronously.
+    pub async fn new(
         inner: Box<dyn ResultReader + Send>,
         manifest: Option<&ResultManifest>,
     ) -> Result<Self> {
-        let schema = inner.schema()?;
+        let schema = inner.schema().await?;
         let schema = match manifest {
             Some(m) => Self::augment_schema_with_manifest(&schema, m),
             None => schema,
@@ -624,7 +628,14 @@ impl Iterator for ResultReaderAdapter {
     type Item = std::result::Result<RecordBatch, ArrowError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        match self.inner.next_batch() {
+        // Sync `Iterator` adapter for arrow's `RecordBatchReader`.
+        // Uses the executor-agnostic `futures::executor::block_on` so
+        // this works in non-tokio contexts (e.g. unit tests) for
+        // in-memory readers whose futures are immediately ready. For
+        // CloudFetch readers (which use tokio primitives internally),
+        // callers must drive iteration from inside a tokio runtime
+        // context — use the async `ResultStream::next_batch` instead.
+        match futures::executor::block_on(self.inner.next_batch()) {
             Ok(Some(batch)) => Some(Ok(batch)),
             Ok(None) => None,
             Err(e) => Some(Err(ArrowError::ExternalError(Box::new(
@@ -648,22 +659,22 @@ mod tests {
 
     // --- ResultReaderAdapter tests ---
 
-    #[test]
-    fn test_adapter_schema() {
+    #[tokio::test]
+    async fn test_adapter_schema() {
         let batch = make_test_batch(vec!["a"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
-        let adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, None).await.unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         assert_eq!(schema.fields().len(), 1);
         assert_eq!(schema.field(0).name(), "name");
     }
 
-    #[test]
-    fn test_adapter_iterates_batches() {
+    #[tokio::test]
+    async fn test_adapter_iterates_batches() {
         let batch1 = make_test_batch(vec!["a", "b"]);
         let batch2 = make_test_batch(vec!["c"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch1, batch2]));
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None).await.unwrap();
 
         let first = adapter.next().unwrap().unwrap();
         assert_eq!(first.num_rows(), 2);
@@ -674,34 +685,34 @@ mod tests {
         assert!(adapter.next().is_none());
     }
 
-    #[test]
-    fn test_adapter_empty_reader() {
+    #[tokio::test]
+    async fn test_adapter_empty_reader() {
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![]));
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None).await.unwrap();
         assert!(adapter.next().is_none());
     }
 
-    #[test]
-    fn test_adapter_propagates_error() {
+    #[tokio::test]
+    async fn test_adapter_propagates_error() {
         let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Utf8, false)]));
         let reader: Box<dyn ResultReader + Send> = Box::new(ErrorReader { schema });
-        let mut adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let mut adapter = ResultReaderAdapter::new(reader, None).await.unwrap();
 
         let result = adapter.next().unwrap();
         assert!(result.is_err());
     }
 
-    #[test]
-    fn test_adapter_schema_error() {
+    #[tokio::test]
+    async fn test_adapter_schema_error() {
         let reader: Box<dyn ResultReader + Send> = Box::new(SchemaErrorReader);
-        let result = ResultReaderAdapter::new(reader, None);
+        let result = ResultReaderAdapter::new(reader, None).await;
         assert!(result.is_err());
     }
 
     // --- EmptyReader tests ---
 
-    #[test]
-    fn test_empty_reader_with_schema() {
+    #[tokio::test]
+    async fn test_empty_reader_with_schema() {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
             Field::new("name", DataType::Utf8, true),
@@ -709,22 +720,22 @@ mod tests {
         let mut reader = EmptyReader::new(schema.clone());
 
         // Schema should be preserved
-        let result_schema = reader.schema().unwrap();
+        let result_schema = reader.schema().await.unwrap();
         assert_eq!(result_schema.fields().len(), 2);
         assert_eq!(result_schema.field(0).name(), "id");
         assert_eq!(result_schema.field(1).name(), "name");
 
         // Should return no batches
-        assert!(reader.next_batch().unwrap().is_none());
+        assert!(reader.next_batch().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_empty_reader_with_empty_schema() {
+    #[tokio::test]
+    async fn test_empty_reader_with_empty_schema() {
         let schema = Arc::new(Schema::empty());
         let mut reader = EmptyReader::new(schema);
 
-        assert_eq!(reader.schema().unwrap().fields().len(), 0);
-        assert!(reader.next_batch().unwrap().is_none());
+        assert_eq!(reader.schema().await.unwrap().fields().len(), 0);
+        assert!(reader.next_batch().await.unwrap().is_none());
     }
 
     #[test]
@@ -946,15 +957,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_adapter_with_manifest() {
+    #[tokio::test]
+    async fn test_adapter_with_manifest() {
         let batch = make_test_batch(vec!["hello"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
         let manifest = make_manifest(vec![make_column_info(
             "name", "STRING", "STRING", 0, None, None, None,
         )]);
 
-        let adapter = ResultReaderAdapter::new(reader, Some(&manifest)).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, Some(&manifest))
+            .await
+            .unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         assert_eq!(
             schema.field(0).metadata().get(metadata_keys::TYPE_NAME),
@@ -962,12 +975,12 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_adapter_without_manifest() {
+    #[tokio::test]
+    async fn test_adapter_without_manifest() {
         let batch = make_test_batch(vec!["hello"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
 
-        let adapter = ResultReaderAdapter::new(reader, None).unwrap();
+        let adapter = ResultReaderAdapter::new(reader, None).await.unwrap();
         let schema = arrow_array::RecordBatchReader::schema(&adapter);
         // No databricks metadata when manifest is None
         assert!(!schema
@@ -978,8 +991,8 @@ mod tests {
 
     // --- ManifestAugmentingReader tests ---
 
-    #[test]
-    fn test_manifest_augmenting_reader_attaches_metadata_to_schema_and_batches() {
+    #[tokio::test]
+    async fn test_manifest_augmenting_reader_attaches_metadata_to_schema_and_batches() {
         // Server-shape: Utf8 column the kernel doesn't otherwise know
         // is a VARIANT. The manifest carries the precise type.
         let batch = make_test_batch(vec!["{\"a\":1}"]);
@@ -988,10 +1001,12 @@ mod tests {
             "name", "VARIANT", "VARIANT", 0, None, None, None,
         )]);
 
-        let mut wrapper = ManifestAugmentingReader::new(reader, Some(&manifest)).unwrap();
+        let mut wrapper = ManifestAugmentingReader::new(reader, Some(&manifest))
+            .await
+            .unwrap();
 
         // Stream-level schema carries the metadata.
-        let schema = wrapper.schema().unwrap();
+        let schema = wrapper.schema().await.unwrap();
         assert_eq!(
             schema.field(0).metadata().get(metadata_keys::TYPE_NAME),
             Some(&"VARIANT".to_string())
@@ -1000,7 +1015,7 @@ mod tests {
         // Batches emitted by `next_batch` are re-projected onto the
         // augmented schema, so consumers reading `batch.schema()`
         // also see the metadata.
-        let batch = wrapper.next_batch().unwrap().expect("one batch");
+        let batch = wrapper.next_batch().await.unwrap().expect("one batch");
         assert_eq!(
             batch
                 .schema()
@@ -1009,16 +1024,16 @@ mod tests {
                 .get(metadata_keys::TYPE_NAME),
             Some(&"VARIANT".to_string())
         );
-        assert!(wrapper.next_batch().unwrap().is_none());
+        assert!(wrapper.next_batch().await.unwrap().is_none());
     }
 
-    #[test]
-    fn test_manifest_augmenting_reader_passes_through_when_manifest_absent() {
+    #[tokio::test]
+    async fn test_manifest_augmenting_reader_passes_through_when_manifest_absent() {
         let batch = make_test_batch(vec!["plain"]);
         let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
 
-        let mut wrapper = ManifestAugmentingReader::new(reader, None).unwrap();
-        let schema = wrapper.schema().unwrap();
+        let mut wrapper = ManifestAugmentingReader::new(reader, None).await.unwrap();
+        let schema = wrapper.schema().await.unwrap();
         assert!(
             !schema
                 .field(0)
@@ -1027,7 +1042,7 @@ mod tests {
             "no manifest → no databricks.* metadata"
         );
 
-        let batch = wrapper.next_batch().unwrap().expect("one batch");
+        let batch = wrapper.next_batch().await.unwrap().expect("one batch");
         assert!(
             !batch
                 .schema()
