@@ -189,6 +189,38 @@ impl Statement {
         ))
     }
 
+    /// Explicit close. Cancels and closes any executed handle this
+    /// `Statement` is still tracking, then drops the lifecycle
+    /// owner. Mirrors what users of JDBC `Statement.close()` /
+    /// ODBC `SQLFreeStmt(SQL_CLOSE)` / PySQL `cursor.close()`
+    /// already expect: closing the lifecycle owner releases the
+    /// associated server-side resources too.
+    ///
+    /// Implementation: just re-uses [`invalidate_prior`] which is
+    /// already what `execute()` / `submit()` call before re-use,
+    /// so the wire shape (CancelStatement + CloseStatement against
+    /// the tracked `last_statement_id`, validity flag flipped) is
+    /// identical to the auto-cancel-on-reuse path. Errors are
+    /// swallowed as `warn!` for the same reason as that path —
+    /// transient failures on a now-orphaned statement should not
+    /// surface as user-visible errors; the server reclaims on
+    /// session close anyway.
+    ///
+    /// After `close()`, any `ExecutedStatement` /
+    /// `ExecutedAsyncStatement` the caller still holds
+    /// short-circuits to `InvalidStatementHandle` locally on its
+    /// next call — no wire round-trip.
+    ///
+    /// Symmetric with [`Session::close`]: consumes `self` so a
+    /// double-close is a compile error. `Drop` runs as a fallback
+    /// for callers that forget to call `close()` explicitly, but
+    /// the explicit path is the supported one.
+    pub async fn close(mut self) -> Result<()> {
+        let _g = self.session.log_span().clone().entered();
+        self.invalidate_prior().await;
+        Ok(())
+    }
+
     /// Shared spec-validation + `ExecuteParams` builder used by both
     /// [`execute`](Self::execute) and [`submit`](Self::submit).
     ///

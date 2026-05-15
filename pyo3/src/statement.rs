@@ -87,25 +87,30 @@ impl Statement {
         Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
-    /// Drop the statement lifecycle owner.
+    /// Explicit close — cancels and closes any executed handle this
+    /// `Statement` is still tracking, then drops the lifecycle
+    /// owner.
     ///
-    /// **Server-side cleanup is owned by `ExecutedStatement` /
-    /// `ExecutedAsyncStatement`, not by `Statement`.** Each of
-    /// those handles fires a fire-and-forget `CloseStatement` from
-    /// its own `Drop` impl, and they hold their own
-    /// `Arc<SessionInner>` so they outlive the parent `Statement`
-    /// cleanly. Calling `Statement.close()` here therefore does
-    /// **not** send any RPC — it only drops the local lifecycle
-    /// owner, which flips the validity flag on any executed handle
-    /// the caller has already abandoned so its eventual `Drop`
-    /// short-circuits cleanly.
+    /// Matches the surface JDBC / ODBC / PySQL users expect:
+    /// closing the lifecycle owner releases the associated
+    /// server-side statement too. Any `ExecutedStatement` /
+    /// `ExecutedAsyncStatement` the caller still holds becomes
+    /// invalid; its next call short-circuits locally to
+    /// `KernelError(code='InvalidStatementHandle')` without a
+    /// network round-trip.
     ///
-    /// If the caller is still using an `ExecutedStatement` produced
-    /// by this `Statement`, that handle continues to work
-    /// unaffected. To release the server-side statement, call
-    /// `.close()` on the `ExecutedStatement` (or just let it Drop).
-    fn close(&mut self) {
-        self.inner = None;
+    /// Idempotent — a second `close()` call is a no-op.
+    fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        let Some(inner) = self.inner.take() else {
+            return Ok(());
+        };
+        let StatementInner { stmt, runtime } = inner;
+        // Kernel `Statement::close` is async (it awaits
+        // CancelStatement + CloseStatement against the tracked
+        // executed handle), so we route it through the standard
+        // py.detach + block_on path.
+        run_kernel!(py, runtime, stmt.close())?;
+        Ok(())
     }
 }
 

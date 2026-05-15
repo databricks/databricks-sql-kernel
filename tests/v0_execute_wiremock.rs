@@ -444,6 +444,44 @@ async fn executed_close_is_idempotent() {
 }
 
 #[tokio::test]
+async fn statement_close_cancels_and_closes_outstanding_executed_handle() {
+    // `Statement::close()` must cancel + close any executed handle
+    // the Statement is still tracking, so a JDBC / ODBC / PySQL-
+    // style "I'm done with this whole thing" call actually
+    // releases the server-side statement. Same wire shape as the
+    // auto-invalidate-on-reuse path that `execute()` / `submit()`
+    // run before re-issuing.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-Z/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-Z", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let exec = stmt.execute().await.expect("execute");
+    assert_eq!(exec.statement_id(), "stmt-Z");
+
+    // Close the parent Statement (not the executed handle). The
+    // executed handle the caller still holds becomes invalid; its
+    // next call short-circuits locally via the validity flag.
+    stmt.close().await.expect("Statement::close");
+
+    let err = exec
+        .cancel()
+        .await
+        .expect_err("stale handle cancel after Statement::close must fail");
+    assert_eq!(err.code, ErrorCode::InvalidStatementHandle);
+}
+
+#[tokio::test]
 async fn row_accessors_walk_succeeded_result() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

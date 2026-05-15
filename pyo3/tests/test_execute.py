@@ -84,6 +84,46 @@ def test_use_after_close_raises_kernel_error(session):
 
 
 @live
+def test_statement_close_invalidates_held_executed_statement(session):
+    """`Statement.close()` is the user-facing "release everything"
+    operation. After calling it, the kernel sends `CloseStatement`
+    against the held executed handle and flips its local validity
+    flag; subsequent **wire-touching** calls on the handle (cancel)
+    short-circuit to `KernelError(code='InvalidStatementHandle')`.
+
+    Note: already-buffered Arrow batches still drain locally —
+    `fetch_next_batch` doesn't go through the validity flag because
+    it operates on in-memory data the kernel already pulled. That
+    matches JDBC semantics: rows already in the client buffer
+    aren't unfetched by `close()`. The server-side state is what
+    actually gets released."""
+    stmt = session.statement()
+    stmt.set_sql("SELECT 1 AS n")
+    exec_ = stmt.execute()
+    # Close the parent Statement while the user still holds exec_.
+    stmt.close()
+    # Cancel/close routes through `valid.check()` and now errors.
+    try:
+        exec_.cancel()
+    except k.KernelError as e:
+        assert e.code == "InvalidStatementHandle", e.code
+    else:
+        raise AssertionError(
+            "expected KernelError(InvalidStatementHandle) on cancel after Statement.close"
+        )
+
+
+@live
+def test_statement_close_is_idempotent(session):
+    """A second `Statement.close()` is a no-op (does not error)."""
+    stmt = session.statement()
+    stmt.set_sql("SELECT 1")
+    stmt.execute().close()  # close the executed handle ourselves
+    stmt.close()
+    stmt.close()  # idempotent
+
+
+@live
 def test_bad_sql_surfaces_structured_kernel_error(session):
     stmt = session.statement()
     stmt.set_sql("SELECT * FROM definitely_not_a_table_xyz_kernel_test")
