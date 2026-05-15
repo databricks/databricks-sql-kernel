@@ -56,18 +56,26 @@ pub struct ExecutedStatement {
 
 impl ExecutedStatement {
     /// Crate-internal constructor. Built by [`Statement::execute`].
+    ///
+    /// `closed` is a shared flag — the parent [`Statement`] owns the
+    /// same `Arc` so that flipping `closed` here also short-circuits
+    /// the lifecycle-owner's `invalidate_prior` cleanup path. The
+    /// parent pre-sets the flag to `true` when the server returned
+    /// `state=CLOSED` in its execute response, so neither side fires
+    /// the redundant `CloseStatement` round-trip.
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
         valid: ValidityFlag,
         result_stream: ResultStream,
+        closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             session,
             statement_id,
             valid,
             result_stream,
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
         }
     }
 

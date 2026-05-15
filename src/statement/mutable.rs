@@ -62,6 +62,7 @@ use crate::statement::params::typed_value_to_sea_parameter;
 use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
 use crate::types::sea::ExecuteParams;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::warn;
 
@@ -83,6 +84,13 @@ pub struct Statement {
     /// after `Drop`. See `validity::ValidityFlag` for the
     /// Acquire/Release contract.
     last_valid: Option<ValidityFlag>,
+    /// `closed` flag shared with the most recent `ExecutedStatement`.
+    /// Pre-set to `true` when the server returned `state=CLOSED` in its
+    /// execute response (the inline-result fast path), and flipped to
+    /// `true` by `ExecutedStatement::close`. Lets `invalidate_prior`
+    /// skip the CancelStatement + CloseStatement round-trips when the
+    /// server side is already gone.
+    last_closed: Option<Arc<AtomicBool>>,
 }
 
 impl Statement {
@@ -94,6 +102,7 @@ impl Statement {
             spec: StatementSpec::new(),
             last_statement_id: None,
             last_valid: None,
+            last_closed: None,
         }
     }
 
@@ -108,9 +117,17 @@ impl Statement {
         &self.spec
     }
 
-    /// Wait-for-result execution. Sends ExecuteStatement with
-    /// `wait_timeout=10s`; the kernel polls internally if the server
-    /// does not finish in 10s. Returns when results are ready.
+    /// Wait-for-result execution. The kernel sends ExecuteStatement
+    /// **without** a `wait_timeout` field — the SEA server's
+    /// default behaviour is to hold the connection for up to 10s,
+    /// same wait as `wait_timeout=10s`, but it auto-closes the
+    /// statement on success and returns `state=CLOSED`. Setting
+    /// `wait_timeout=10s` explicitly returns `state=SUCCEEDED`
+    /// (statement still alive server-side, requires a separate
+    /// `CloseStatement`) and adds ~150–260ms to the response —
+    /// observed against Dogfood; see PR description for the bench
+    /// numbers. The kernel polls internally if the query needs
+    /// longer than 10s.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// it is auto-cancelled and closed before issuing the new
@@ -122,14 +139,14 @@ impl Statement {
         let _g = self.session.log_span().clone().entered();
 
         self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch("10s")?;
+        let (sql, exec_params) = self.prepare_for_dispatch(None)?;
 
         let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
         let guard = cancel_state.guard();
 
         // SeaRestTransport::execute_statement polls to completion
-        // (10s server-side wait_timeout, then GetStatementStatus
-        // loop until terminal).
+        // (server's default ~10s wait, then GetStatementStatus loop
+        // until terminal).
         let result = self
             .session
             .transport()
@@ -140,8 +157,14 @@ impl Statement {
         guard.defuse();
 
         let valid = ValidityFlag::new();
+        let already_closed = matches!(
+            result.server_state,
+            crate::types::sea::StatementState::Closed
+        );
+        let closed = Arc::new(AtomicBool::new(already_closed));
         self.last_statement_id = Some(result.statement_id.clone());
         self.last_valid = Some(valid.clone());
+        self.last_closed = Some(Arc::clone(&closed));
 
         let result_stream = ResultStream::from_reader(result.reader)?;
         Ok(ExecutedStatement::new(
@@ -149,6 +172,7 @@ impl Statement {
             result.statement_id,
             valid,
             result_stream,
+            closed,
         ))
     }
 
@@ -164,7 +188,7 @@ impl Statement {
         let _g = self.session.log_span().clone().entered();
 
         self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch("0s")?;
+        let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
         let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
         let guard = cancel_state.guard();
@@ -179,13 +203,19 @@ impl Statement {
         guard.defuse();
 
         let valid = ValidityFlag::new();
+        // submit path always uses wait_timeout=0s, so the server can't
+        // return CLOSED yet; start the flag false and let later close()
+        // calls flip it.
+        let closed = Arc::new(AtomicBool::new(false));
         self.last_statement_id = Some(response.statement_id.clone());
         self.last_valid = Some(valid.clone());
+        self.last_closed = Some(Arc::clone(&closed));
 
         Ok(ExecutedAsyncStatement::new(
             Arc::clone(&self.session),
             response.statement_id,
             valid,
+            closed,
         ))
     }
 
@@ -224,9 +254,21 @@ impl Statement {
     /// Shared spec-validation + `ExecuteParams` builder used by both
     /// [`execute`](Self::execute) and [`submit`](Self::submit).
     ///
-    /// `wait_timeout_secs` is the textual SEA wait-timeout
-    /// (`"10s"` for sync, `"0s"` for async submit).
-    fn prepare_for_dispatch(&self, wait_timeout_secs: &str) -> Result<(String, ExecuteParams)> {
+    /// `wait_timeout_secs`:
+    /// - `Some("0s")` — async submit; server returns immediately.
+    /// - `None` — sync execute; omit the field so the server uses
+    ///   its default wait (up to ~10s, auto-closes on success and
+    ///   returns `state=CLOSED`). Setting `Some("10s")` explicitly
+    ///   produces equivalent wait behaviour but the server then
+    ///   returns `state=SUCCEEDED` (statement still alive) and is
+    ///   ~150–260ms slower per request on Dogfood — verified by
+    ///   probe.
+    /// - Other concrete values (e.g. `Some("5s")`) are valid for
+    ///   callers that want explicit control.
+    fn prepare_for_dispatch(
+        &self,
+        wait_timeout_secs: Option<&str>,
+    ) -> Result<(String, ExecuteParams)> {
         let sql = self
             .spec
             .sql
@@ -245,9 +287,13 @@ impl Statement {
             ));
         }
 
+        // `wait_timeout = None` means "omit the field"; the server
+        // applies its default (~10s wait + auto-close on success).
+        // `on_wait_timeout` only matters when wait_timeout is set,
+        // so mirror the presence.
         let mut exec_params = ExecuteParams {
-            wait_timeout: Some(wait_timeout_secs.to_string()),
-            on_wait_timeout: Some("CONTINUE".to_string()),
+            wait_timeout: wait_timeout_secs.map(|s| s.to_string()),
+            on_wait_timeout: wait_timeout_secs.map(|_| "CONTINUE".to_string()),
             ..ExecuteParams::default()
         };
         for (i, value) in self.spec.positional_params.iter().enumerate() {
@@ -266,7 +312,20 @@ impl Statement {
         if let Some(valid) = self.last_valid.take() {
             valid.invalidate();
         }
+        // If the shared `closed` flag is already set, the server side
+        // is gone (either the server auto-closed on the inline-result
+        // fast path, or the caller already closed the executed
+        // handle). Flip it to claim the cleanup duty in case it
+        // wasn't set yet, and skip the round-trips.
+        let already_closed = self
+            .last_closed
+            .take()
+            .map(|f| f.swap(true, Ordering::AcqRel))
+            .unwrap_or(false);
         if let Some(prior_id) = self.last_statement_id.take() {
+            if already_closed {
+                return;
+            }
             // Best-effort cancel + close. We don't await the cancel
             // separately — close is idempotent and the server
             // releases resources on close regardless of cancel
