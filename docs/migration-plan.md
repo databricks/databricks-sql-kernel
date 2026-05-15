@@ -932,6 +932,38 @@ clear it.
   session are visibly grouped (matches the legacy ADBC layer's
   `_log_span` pattern).
 
+### Proxy + TLS E2E coverage (v0.1)
+
+The legacy ADBC layer carried live-network proxy and TLS E2E tests
+(`tests/proxy_e2e.rs`, `tests/tls_e2e.rs`); both were deleted in
+PR #11 alongside the ADBC code. The v0 ports of those files were
+briefly staged behind a `proxy_tls_e2e` cargo feature in an earlier
+revision of PR #17 but were removed: the kernel-side `ProxyConfig`
+/ `TlsConfig` fields they referenced don't exist yet (both structs
+are `#[non_exhaustive]` placeholders in `src/config.rs`), so the
+test files didn't compile and the gating churn was strictly
+clutter.
+
+`ci/proxy/{squid-auth.conf,htpasswd}` is preserved on the branch
+for reuse when the v0.1 work lands.
+
+v0.1 work is a single PR off `main`:
+
+1. **Flesh `ProxyConfig`** in `src/config.rs` with fields
+   `url: String`, `username: Option<String>`,
+   `password: Option<String>`, `bypass_hosts: Vec<String>`.
+2. **Flesh `TlsConfig`** with `trusted_certificate_path: Option<PathBuf>`,
+   `allow_self_signed: bool`, `allow_hostname_mismatch: bool`.
+3. **Plumb both through** `src/client/http.rs` so the HTTP client
+   actually honours them (the legacy `crate::client::http::{ProxyConfig,
+   TlsConfig}` already had working production-shaped impls in the
+   ADBC layer — this is a lift, not a re-invent).
+4. **Port `tests/proxy_e2e.rs` + `tests/tls_e2e.rs`** fresh against
+   the new struct shape (the ADBC-era versions in git history are
+   the reference) and add `proxy` + `tls` jobs to
+   `.github/workflows/rust-e2e.yml` with the inline `docker run`
+   pattern the `e2e` job already uses.
+
 ## 8. Estimated scope
 
 | PR | LoC est | Risk    | Notes                                                                  |
