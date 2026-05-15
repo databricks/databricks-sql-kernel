@@ -63,7 +63,7 @@ use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
 use crate::types::sea::ExecuteParams;
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{warn, Instrument};
 
 /// Lifecycle owner for a single statement spec.
 ///
@@ -119,37 +119,46 @@ impl Statement {
     /// short-circuit to `InvalidStatementHandle` without hitting the
     /// wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        let _g = self.session.log_span().clone().entered();
+        // `instrument` (rather than `.entered()`) so the resulting
+        // future stays `Send` — napi-rs's `execute_tokio_future` and
+        // `tokio::spawn` both require `Send`, and `EnteredSpan` is
+        // `!Send`. Clone the span up-front to avoid double-borrowing
+        // `self.session` (once in the async body, once on the
+        // `.instrument()` argument).
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            let (sql, exec_params) = self.prepare_for_dispatch("10s")?;
 
-        self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch("10s")?;
+            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let guard = cancel_state.guard();
 
-        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
-        let guard = cancel_state.guard();
+            // SeaRestTransport::execute_statement polls to completion
+            // (10s server-side wait_timeout, then GetStatementStatus
+            // loop until terminal).
+            let result = self
+                .session
+                .transport()
+                .execute_statement(self.session.session_id(), &sql, &exec_params)
+                .await?;
 
-        // SeaRestTransport::execute_statement polls to completion
-        // (10s server-side wait_timeout, then GetStatementStatus
-        // loop until terminal).
-        let result = self
-            .session
-            .transport()
-            .execute_statement(self.session.session_id(), &sql, &exec_params)
-            .await?;
+            cancel_state.observe(&result.statement_id);
+            guard.defuse();
 
-        cancel_state.observe(&result.statement_id);
-        guard.defuse();
+            let valid = ValidityFlag::new();
+            self.last_statement_id = Some(result.statement_id.clone());
+            self.last_valid = Some(valid.clone());
 
-        let valid = ValidityFlag::new();
-        self.last_statement_id = Some(result.statement_id.clone());
-        self.last_valid = Some(valid.clone());
-
-        let result_stream = ResultStream::from_reader(result.reader).await?;
-        Ok(ExecutedStatement::new(
-            Arc::clone(&self.session),
-            result.statement_id,
-            valid,
-            result_stream,
-        ))
+            let result_stream = ResultStream::from_reader(result.reader).await?;
+            Ok(ExecutedStatement::new(
+                Arc::clone(&self.session),
+                result.statement_id,
+                valid,
+                result_stream,
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
@@ -161,32 +170,35 @@ impl Statement {
     /// `fetch_result`. Long-running queries that would blow past
     /// `execute()`'s sync polling budget belong on this path.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
-        let _g = self.session.log_span().clone().entered();
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            let (sql, exec_params) = self.prepare_for_dispatch("0s")?;
 
-        self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch("0s")?;
+            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let guard = cancel_state.guard();
 
-        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
-        let guard = cancel_state.guard();
+            let response = self
+                .session
+                .transport()
+                .submit_statement(self.session.session_id(), &sql, &exec_params)
+                .await?;
 
-        let response = self
-            .session
-            .transport()
-            .submit_statement(self.session.session_id(), &sql, &exec_params)
-            .await?;
+            cancel_state.observe(&response.statement_id);
+            guard.defuse();
 
-        cancel_state.observe(&response.statement_id);
-        guard.defuse();
+            let valid = ValidityFlag::new();
+            self.last_statement_id = Some(response.statement_id.clone());
+            self.last_valid = Some(valid.clone());
 
-        let valid = ValidityFlag::new();
-        self.last_statement_id = Some(response.statement_id.clone());
-        self.last_valid = Some(valid.clone());
-
-        Ok(ExecutedAsyncStatement::new(
-            Arc::clone(&self.session),
-            response.statement_id,
-            valid,
-        ))
+            Ok(ExecutedAsyncStatement::new(
+                Arc::clone(&self.session),
+                response.statement_id,
+                valid,
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Explicit close. Cancels and closes any executed handle this
