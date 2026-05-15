@@ -36,7 +36,14 @@ arrow-select = "57"
 arrow-ipc = "57"
 
 # HTTP client and async runtime
-reqwest = { version = "0.12", features = ["json", "gzip", "stream", "native-tls"] }
+#
+# `rustls-tls` (not `native-tls`) because the napi-rs binding is loaded
+# into Node.js processes that statically link OpenSSL 3.x. Dynamically
+# linking against the system's OpenSSL 1.1 (which is what `native-tls`
+# pulls in on Linux today) collides with Node's symbols at module load
+# time and segfaults the process before any Rust code runs. `rustls` is
+# pure Rust + ring and avoids the conflict entirely.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream", "rustls-tls"] }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
