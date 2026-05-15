@@ -318,11 +318,56 @@ impl CloudFetchResultReader {
 
 impl ResultReader for CloudFetchResultReader {
     fn schema(&self) -> Result<SchemaRef> {
-        self.runtime_handle.block_on(self.provider.get_schema())
+        block_on_in_runtime(&self.runtime_handle, self.provider.get_schema())
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.runtime_handle.block_on(self.provider.next_batch())
+        block_on_in_runtime(&self.runtime_handle, self.provider.next_batch())
+    }
+}
+
+/// Bridge a sync trait method to an async kernel operation,
+/// safely whether or not we're already inside a tokio runtime.
+///
+/// `runtime_handle.block_on(fut)` works when called from outside
+/// any tokio runtime, but panics ("Cannot start a runtime from
+/// within a runtime") when the kernel is being driven by a wrapper
+/// that already owns a `block_on` higher up the stack — exactly
+/// what the PyO3 binding does for every kernel call (see issue
+/// #19).
+///
+/// `tokio::task::block_in_place` tells the runtime "I'm about to
+/// do something blocking; move other tasks to a different worker
+/// thread." After that, `Handle::current().block_on(fut)` is safe
+/// because the runtime considers this thread off-budget. Same
+/// pattern the kernel already uses for OAuth in
+/// `auth/oauth/m2m.rs`.
+///
+/// **Requires a multi-threaded runtime when called from inside a
+/// runtime context.** `block_in_place` panics on current-thread
+/// runtimes. The kernel's session runtime is multi-thread (see
+/// `Builder::new_multi_thread` in the PyO3 wrapper and the
+/// `flavor = "multi_thread"` annotation on the regression test
+/// for issue #19), and any caller driving the kernel from a
+/// runtime context should also be on multi-thread for the same
+/// concurrent-IO reasons.
+fn block_on_in_runtime<F>(runtime_handle: &tokio::runtime::Handle, fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        // Inside a runtime: escape via block_in_place + the
+        // current handle. The captured `runtime_handle` and the
+        // current one are the same in practice (the kernel
+        // captures it at Session::open time).
+        tokio::task::block_in_place(|| tokio::runtime::Handle::current().block_on(fut))
+    } else {
+        // Outside any runtime (direct Rust-crate use, e.g. the
+        // ODBC C ABI shim's sync entry points): block_on the
+        // captured handle directly. `block_in_place` would panic
+        // on a current-thread runtime, so we keep the old path
+        // for callers that aren't already in a runtime.
+        runtime_handle.block_on(fut)
     }
 }
 
