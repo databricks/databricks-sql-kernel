@@ -18,6 +18,7 @@ use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
 use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
+use async_trait::async_trait;
 use std::sync::Arc;
 
 /// A simple mock reader that returns predefined batches.
@@ -42,12 +43,13 @@ impl MockReader {
     }
 }
 
+#[async_trait]
 impl ResultReader for MockReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         if self.index >= self.batches.len() {
             Ok(None)
         } else {
@@ -63,12 +65,13 @@ pub struct ErrorReader {
     pub schema: SchemaRef,
 }
 
+#[async_trait]
 impl ResultReader for ErrorReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Err(Error::io().message("simulated read error"))
     }
 }
@@ -83,12 +86,13 @@ pub struct BatchThenErrorReader {
     pub batch: Option<RecordBatch>,
 }
 
+#[async_trait]
 impl ResultReader for BatchThenErrorReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.batch.take() {
             Some(b) => Ok(Some(b)),
             None => Err(Error::io().message("simulated read error after first batch")),
@@ -99,12 +103,13 @@ impl ResultReader for BatchThenErrorReader {
 /// A reader that returns an error on `schema()`.
 pub struct SchemaErrorReader;
 
+#[async_trait]
 impl ResultReader for SchemaErrorReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Err(Error::io().message("schema unavailable"))
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(None)
     }
 }

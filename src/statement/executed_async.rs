@@ -252,7 +252,7 @@ impl ExecutedAsyncStatement {
             .fetch_completed_result(&self.statement_id)
             .await?
         {
-            Some(result) => ResultStream::from_reader(result.reader),
+            Some(result) => ResultStream::from_reader(result.reader).await,
             None => {
                 // Re-read the status so the error message names the
                 // observed state (Pending vs Running). Best-effort —

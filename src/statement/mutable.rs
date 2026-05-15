@@ -143,7 +143,7 @@ impl Statement {
         self.last_statement_id = Some(result.statement_id.clone());
         self.last_valid = Some(valid.clone());
 
-        let result_stream = ResultStream::from_reader(result.reader)?;
+        let result_stream = ResultStream::from_reader(result.reader).await?;
         Ok(ExecutedStatement::new(
             Arc::clone(&self.session),
             result.statement_id,

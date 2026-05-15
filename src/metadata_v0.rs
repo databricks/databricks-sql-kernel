@@ -216,7 +216,7 @@ impl Metadata {
             .transport()
             .list_catalogs(self.session.session_id())
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
@@ -241,7 +241,7 @@ impl Metadata {
                 schema_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
@@ -274,7 +274,7 @@ impl Metadata {
                 table_types,
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Columns of tables matching the filter. Catalog is exact;
@@ -311,7 +311,7 @@ impl Metadata {
                 column_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Primary keys for the given table. All three identifiers are
@@ -352,7 +352,7 @@ impl Metadata {
                 table.as_str(),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
@@ -398,7 +398,7 @@ impl Metadata {
                 foreign_table.as_str(),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
@@ -424,7 +424,7 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
@@ -449,7 +449,7 @@ impl Metadata {
                 name_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        ResultStream::from_reader(raw.reader).await
     }
 
     /// SQL data types supported by the workspace. No filters. No wire
@@ -457,7 +457,7 @@ impl Metadata {
     pub async fn type_info(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         let reader = static_data::type_info_reader();
-        ResultStream::from_reader(reader)
+        ResultStream::from_reader(reader).await
     }
 
     /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No
@@ -468,7 +468,7 @@ impl Metadata {
         let _g = self.session.log_span().clone().entered();
         let types = self.session.transport().list_table_types();
         let reader = static_data::table_types_reader(&types);
-        ResultStream::from_reader(reader)
+        ResultStream::from_reader(reader).await
     }
 }
 
