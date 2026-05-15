@@ -87,4 +87,4 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # Workspace — the kernel is the root crate; language bindings live as
 # sibling members. PyO3 first; napi-rs / etc. slot in here later.
 [workspace]
-members = [".", "pyo3"]
+members = [".", "pyo3", "napi"]
