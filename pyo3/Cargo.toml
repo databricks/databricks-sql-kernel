@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+[package]
+name = "databricks-sql-kernel-pyo3"
+version = "0.1.0"
+edition = "2021"
+authors = ["Databricks"]
+license = "Apache-2.0"
+description = "PyO3 Python bindings for the Databricks SQL Kernel"
+repository = "https://github.com/databricks/databricks-sql-kernel"
+
+# Built as a Python extension module by maturin. The lib basename here
+# only affects the intermediate `.so` cargo produces; maturin renames
+# the wheel artifact to `databricks_sql_kernel.<abi>.so` per
+# `module-name` in pyproject.toml, and pyo3 derives the `PyInit_*`
+# symbol from the `#[pymodule]` function name (not this `[lib].name`).
+# Picking a distinct name avoids colliding with the kernel root crate's
+# own cdylib output.
+#
+# `rlib` is included so `cargo test -p databricks-sql-kernel-pyo3`
+# can pick up future `#[cfg(test)]` modules in `src/**`. With only
+# `cdylib`, cargo silently reports "running 0 tests / ok" even if a
+# `#[test]` exists — a real footgun for any later Rust-side test.
+[lib]
+name = "databricks_sql_kernel_pyo3"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+databricks-sql-kernel = { path = ".." }
+
+# pyo3 — abi3-py39 lets one wheel cover Python 3.9+.
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
+
+# Multi-thread runtime — one per Session, owned on the Rust side.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+# Arrow handoff. Pinned to 57 to match the kernel's arrow-* deps so we
+# share the same RecordBatch / Schema types and never have to convert.
+arrow-array = "57"
+arrow-schema = "57"
+arrow-pyarrow = "57"

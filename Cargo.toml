@@ -76,3 +76,8 @@ tempfile = "3"
 [lib]
 name = "databricks_sql_kernel"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+# Workspace — the kernel is the root crate; language bindings live as
+# sibling members. PyO3 first; napi-rs / etc. slot in here later.
+[workspace]
+members = [".", "pyo3"]
