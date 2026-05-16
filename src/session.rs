@@ -518,11 +518,11 @@ impl SessionBuilder {
 /// Translate the public [`HttpConfig`] (+ proxy / TLS / org_id) into
 /// the internal [`HttpClientConfig`] the HTTP client expects.
 ///
-/// v0's [`ProxyConfig`] and [`TlsConfig`] are empty `#[non_exhaustive]`
-/// reservation structs — they don't carry fields yet. We pass through
-/// the internal [`HttpProxyConfig::default`] / [`HttpTlsConfig::default`]
-/// for now; PR follow-ups will wire the real fields when the v0
-/// proxy/TLS shape lands.
+/// The public [`ProxyConfig`] is still a reserved `#[non_exhaustive]`
+/// struct (no fields wired yet); the public [`TlsConfig`] now carries
+/// `custom_ca_cert` / `accept_self_signed` /
+/// `skip_hostname_verification` and is projected onto the internal
+/// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
     let mut hcc = HttpClientConfig {
         connect_timeout: Duration::from_secs(30),
@@ -531,15 +531,14 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
         read_timeout: config.http.request_timeout,
         max_connections_per_host: config.http.pool_max_idle_per_host,
         proxy: HttpProxyConfig::default(),
-        tls: HttpTlsConfig::default(),
+        tls: HttpTlsConfig::from_public(&config.tls),
         org_id,
         ..HttpClientConfig::default()
     };
-    // Touch the v0 reserved configs so a future field addition
+    // Touch the still-reserved proxy config so a future field addition
     // (without setting it through here) shows up as a compile error
     // rather than a silently-dropped option.
     let ProxyConfig { .. } = config.proxy.clone().unwrap_or_default();
-    let TlsConfig { .. } = config.tls.clone();
     let _ = &mut hcc;
     hcc
 }

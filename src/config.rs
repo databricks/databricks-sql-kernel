@@ -343,13 +343,64 @@ impl Default for HttpConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfig {}
 
-// ─── TLS (reserved) ─────────────────────────────────────────────────────────
+// ─── TLS ────────────────────────────────────────────────────────────────────
 
-/// Reserved for v0.1. Fields land once the TLS story (custom CA bundles,
-/// cert pinning, FIPS mode) is settled.
+/// TLS settings for the HTTP client.
+///
+/// All defaults match the most secure stance: validate the system trust
+/// store, require a valid certificate chain, and verify hostnames. Any
+/// non-default field is a *relaxation* — flip these for dev / on-prem
+/// boxes with self-signed certs, never against production.
+///
+/// The kernel exposes only fields that the internal rustls plumbing
+/// already supports — cert pinning and FIPS mode are *not* in scope.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub struct TlsConfig {}
+#[derive(Clone, Default)]
+pub struct TlsConfig {
+    /// PEM-encoded CA certificate bytes to add to the trust store on
+    /// top of the system roots. Use this when connecting through a
+    /// corporate proxy that re-signs TLS or to an on-prem Databricks
+    /// deployment using an internal CA.
+    ///
+    /// Carrying bytes (rather than a path) keeps the surface friendly
+    /// for foreign-language wrappers — napi-rs / pyo3 callers pass a
+    /// `Buffer` / `bytes` directly without needing to materialise a
+    /// tempfile.
+    pub custom_ca_cert: Option<Vec<u8>>,
+
+    /// Accept self-signed server certificates.
+    ///
+    /// Note: the underlying reqwest backend does not distinguish
+    /// "self-signed only" from "fully unvalidated" — setting this to
+    /// `true` disables ALL chain validation (CA trust, expiration,
+    /// etc.) via `danger_accept_invalid_certs(true)`. Use only in
+    /// development.
+    pub accept_self_signed: bool,
+
+    /// Skip the certificate-hostname-vs-SNI match check. Use only
+    /// when connecting via an IP literal or a hostname the cert
+    /// wasn't issued for in a development / lab environment.
+    pub skip_hostname_verification: bool,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field(
+                "custom_ca_cert",
+                &self
+                    .custom_ca_cert
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            .field("accept_self_signed", &self.accept_self_signed)
+            .field(
+                "skip_hostname_verification",
+                &self.skip_hostname_verification,
+            )
+            .finish()
+    }
+}
 
 // ─── Result management (CloudFetch + future result knobs) ───────────────────
 
@@ -639,5 +690,33 @@ mod tests {
         assert!(!s.contains("supersecret"), "subject_token leaked: {s}");
         assert!(s.contains("<redacted>"));
         assert!(s.contains("databricks"));
+    }
+
+    // ─── TlsConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn tls_config_default_is_strict() {
+        let tls = TlsConfig::default();
+        assert!(tls.custom_ca_cert.is_none());
+        assert!(!tls.accept_self_signed);
+        assert!(!tls.skip_hostname_verification);
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_ca_cert_bytes() {
+        // The PEM bytes themselves aren't secret, but a multi-kB blob
+        // in every log line is unhelpful — Debug should summarise.
+        let tls = TlsConfig {
+            custom_ca_cert: Some(b"-----BEGIN CERTIFICATE-----...".to_vec()),
+            accept_self_signed: false,
+            skip_hostname_verification: false,
+        };
+        let s = format!("{tls:?}");
+        assert!(s.contains("<"), "expected byte-count summary, got: {s}");
+        assert!(
+            s.contains("bytes>"),
+            "expected byte-count summary, got: {s}"
+        );
+        assert!(!s.contains("BEGIN CERTIFICATE"), "raw bytes leaked: {s}");
     }
 }

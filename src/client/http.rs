@@ -93,6 +93,42 @@ pub struct TlsConfig {
     pub allow_hostname_mismatch: Option<bool>,
     /// Path to a PEM-encoded CA certificate file to add to the trust store.
     pub trusted_certificate_path: Option<String>,
+    /// PEM-encoded CA certificate bytes to add to the trust store.
+    /// Alternative to `trusted_certificate_path` for callers that
+    /// have the cert in-memory (e.g. foreign-language wrappers
+    /// passing `Buffer` / `bytes` without a tempfile shim). When
+    /// both are set, the path is read first, then the in-memory PEM
+    /// is added as an additional root.
+    pub trusted_certificate_pem: Option<Vec<u8>>,
+}
+
+impl TlsConfig {
+    /// Project the public [`crate::config::TlsConfig`] onto the internal
+    /// HTTP-client TLS struct. Public fields land on their internal
+    /// counterparts; internal-only fields (`enabled`,
+    /// `trusted_certificate_path`) stay at their defaults.
+    ///
+    /// `accept_self_signed` / `skip_hostname_verification` are booleans
+    /// on the public surface (default: stricter); the internal layer
+    /// uses `Option<bool>` so the existing `None == default` semantics
+    /// are preserved. We map a `false` to `None` rather than
+    /// `Some(false)` to keep `Debug` output / RUST_LOG noise free of
+    /// no-op overrides.
+    pub fn from_public(cfg: &crate::config::TlsConfig) -> Self {
+        Self {
+            enabled: None,
+            allow_self_signed: cfg.accept_self_signed.then_some(true),
+            allow_hostname_mismatch: cfg.skip_hostname_verification.then_some(true),
+            trusted_certificate_path: None,
+            trusted_certificate_pem: cfg.custom_ca_cert.clone(),
+        }
+    }
+}
+
+impl From<&crate::config::TlsConfig> for TlsConfig {
+    fn from(cfg: &crate::config::TlsConfig) -> Self {
+        Self::from_public(cfg)
+    }
 }
 
 /// Configuration for the HTTP client.
@@ -211,6 +247,18 @@ impl DatabricksHttpClient {
             })?;
             builder = builder.add_root_certificate(cert);
             debug!("Added custom CA certificate from: {}", cert_path);
+        }
+
+        if let Some(ref pem) = config.tls.trusted_certificate_pem {
+            let cert = reqwest::Certificate::from_pem(pem).map_err(|e| {
+                Error::invalid_argument()
+                    .message(format!("Invalid in-memory PEM certificate: {}", e))
+            })?;
+            builder = builder.add_root_certificate(cert);
+            debug!(
+                "Added custom CA certificate from in-memory bytes ({} bytes)",
+                pem.len()
+            );
         }
 
         // Apply proxy configuration
@@ -809,6 +857,91 @@ lGrv15pBcePj
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("Invalid PEM certificate"));
+    }
+
+    #[test]
+    fn test_http_client_with_in_memory_pem_bytes() {
+        // Public-API path: PEM bytes pass through the internal
+        // `trusted_certificate_pem` field directly (no tempfile shim
+        // required by foreign-language wrappers).
+        let mut config = HttpClientConfig::default();
+        config.tls.trusted_certificate_pem = Some(TEST_CA_CERT_PEM.as_bytes().to_vec());
+        let client = DatabricksHttpClient::new(config, default_retry_configs());
+        assert!(client.is_ok());
+    }
+
+    #[test]
+    fn test_tls_config_from_public_maps_all_fields() {
+        // accept_self_signed=true maps to Some(true);
+        // skip_hostname_verification=true maps to Some(true);
+        // custom_ca_cert maps to trusted_certificate_pem.
+        let public = crate::config::TlsConfig {
+            custom_ca_cert: Some(b"pem-bytes".to_vec()),
+            accept_self_signed: true,
+            skip_hostname_verification: true,
+        };
+        let internal = TlsConfig::from_public(&public);
+        assert_eq!(internal.allow_self_signed, Some(true));
+        assert_eq!(internal.allow_hostname_mismatch, Some(true));
+        assert_eq!(
+            internal.trusted_certificate_pem,
+            Some(b"pem-bytes".to_vec())
+        );
+        // `enabled` and `trusted_certificate_path` stay at internal
+        // defaults — the public surface doesn't expose them.
+        assert!(internal.enabled.is_none());
+        assert!(internal.trusted_certificate_path.is_none());
+    }
+
+    #[test]
+    fn test_tls_config_from_public_default_is_strict() {
+        // A default public TlsConfig produces an internal config that
+        // does NOT relax any default — `None` everywhere on the
+        // permissive switches so log output stays clean.
+        let internal = TlsConfig::from_public(&crate::config::TlsConfig::default());
+        assert!(internal.allow_self_signed.is_none());
+        assert!(internal.allow_hostname_mismatch.is_none());
+        assert!(internal.trusted_certificate_pem.is_none());
+        assert!(internal.trusted_certificate_path.is_none());
+    }
+
+    #[test]
+    fn test_http_client_via_public_tls_config_with_self_signed_accepts_build() {
+        // End-to-end builder check: a Session-style construction
+        // (public TlsConfig -> from_public -> HttpClientConfig ->
+        // reqwest builder) succeeds when accept_self_signed is set.
+        let public = crate::config::TlsConfig {
+            custom_ca_cert: None,
+            accept_self_signed: true,
+            skip_hostname_verification: false,
+        };
+        let config = HttpClientConfig {
+            tls: TlsConfig::from_public(&public),
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs());
+        assert!(
+            client.is_ok(),
+            "reqwest client construction should succeed when accept_self_signed=true is set"
+        );
+    }
+
+    #[test]
+    fn test_http_client_via_public_tls_config_with_custom_ca_accepts_build() {
+        let public = crate::config::TlsConfig {
+            custom_ca_cert: Some(TEST_CA_CERT_PEM.as_bytes().to_vec()),
+            accept_self_signed: false,
+            skip_hostname_verification: false,
+        };
+        let config = HttpClientConfig {
+            tls: TlsConfig::from_public(&public),
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs());
+        assert!(
+            client.is_ok(),
+            "reqwest client construction should succeed when custom_ca_cert is set with a valid PEM"
+        );
     }
 
     #[test]
