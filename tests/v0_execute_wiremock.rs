@@ -593,3 +593,148 @@ async fn kernel_invariant_parent_drop_invalidates_executed_cancel() {
         .expect_err("cancel after parent Statement drop must short-circuit");
     assert_eq!(err.code, ErrorCode::InvalidStatementHandle);
 }
+
+// ─── ExecutedStatement extended status accessors (PR #23) ─────────
+
+/// Build a SEA `SUCCEEDED` body with the 5 extended status fields
+/// populated. Mirrors `succeeded_inline_body` but injects status
+/// fields the kernel surfaces via `ExecutedStatement::*` getters.
+#[allow(clippy::too_many_arguments)]
+fn succeeded_inline_body_with_status(
+    statement_id: &str,
+    batch: &RecordBatch,
+    num_modified_rows: Option<i64>,
+    progress: Option<f64>,
+    display_message: Option<&str>,
+    diagnostic_info: Option<&str>,
+    error_details_json: Option<&str>,
+) -> String {
+    let ipc = arrow_ipc_bytes(batch);
+    let attachment = STANDARD.encode(&ipc);
+    let columns: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            json!({
+                "name": f.name(),
+                "type_name": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    DataType::Utf8 => "STRING",
+                    _ => "STRING",
+                },
+                "type_text": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    DataType::Utf8 => "STRING",
+                    _ => "STRING",
+                },
+                "position": i as i32,
+            })
+        })
+        .collect();
+
+    let mut status = json!({ "state": "SUCCEEDED" });
+    let status_obj = status.as_object_mut().unwrap();
+    if let Some(n) = num_modified_rows {
+        status_obj.insert("num_modified_rows".to_string(), json!(n));
+    }
+    if let Some(p) = progress {
+        status_obj.insert("progress".to_string(), json!(p));
+    }
+    if let Some(m) = display_message {
+        status_obj.insert("display_message".to_string(), json!(m));
+    }
+    if let Some(d) = diagnostic_info {
+        status_obj.insert("diagnostic_info".to_string(), json!(d));
+    }
+    if let Some(e) = error_details_json {
+        status_obj.insert("error_details_json".to_string(), json!(e));
+    }
+
+    json!({
+        "statement_id": statement_id,
+        "status": status,
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": batch.num_columns() as i32,
+                "columns": columns,
+            },
+            "total_chunk_count": 1,
+            "total_row_count": batch.num_rows() as i64,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": batch.num_rows() as i64,
+            "byte_count": ipc.len() as i64,
+            "attachment": attachment,
+        },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn executed_statement_surfaces_extended_status_fields() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(
+        &server,
+        succeeded_inline_body_with_status(
+            "stmt-status",
+            &batch,
+            Some(7),
+            Some(1.0),
+            Some("All good"),
+            Some("operator=Scan"),
+            Some(r#"{"k":"v"}"#),
+        ),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let exec = stmt.execute().await.expect("execute");
+
+    assert_eq!(exec.num_modified_rows(), Some(7));
+    assert_eq!(exec.progress(), Some(1.0));
+    assert_eq!(exec.display_message(), Some("All good"));
+    assert_eq!(exec.diagnostic_info(), Some("operator=Scan"));
+    assert_eq!(exec.error_details_json(), Some(r#"{"k":"v"}"#));
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn executed_statement_status_fields_default_to_none() {
+    // When the server omits the extended fields (the common case for
+    // SELECT on classic warehouses), all five accessors return None.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-empty-status", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let exec = stmt.execute().await.expect("execute");
+
+    assert_eq!(exec.num_modified_rows(), None);
+    assert_eq!(exec.progress(), None);
+    assert_eq!(exec.display_message(), None);
+    assert_eq!(exec.diagnostic_info(), None);
+    assert_eq!(exec.error_details_json(), None);
+
+    exec.close().await.expect("close");
+}

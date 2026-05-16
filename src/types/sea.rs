@@ -38,6 +38,30 @@ pub struct StatementStatus {
     pub state: StatementState,
     #[serde(default)]
     pub error: Option<ServiceError>,
+    /// Number of rows modified by the statement (UPDATE / INSERT /
+    /// DELETE / MERGE). Absent on SELECT and on warehouses that don't
+    /// surface the counter.
+    #[serde(default)]
+    pub num_modified_rows: Option<i64>,
+    /// Fractional completion in `[0.0, 1.0]`. Populated on analytics
+    /// warehouses; absent (or always 1.0 on terminal) elsewhere.
+    #[serde(default)]
+    pub progress: Option<f64>,
+    /// Server-supplied user-facing message (e.g. "Statement was
+    /// canceled by the user" or progress hints). Distinct from
+    /// `error.message`; populated on non-error states too.
+    #[serde(default)]
+    pub display_message: Option<String>,
+    /// Server-supplied diagnostic detail — multi-line text with
+    /// stack frames or operator context. Intended for log / support
+    /// surfaces, not user-facing strings.
+    #[serde(default)]
+    pub diagnostic_info: Option<String>,
+    /// Server-supplied JSON blob with extended error details.
+    /// Pass-through string — wrappers parse if they need structured
+    /// access.
+    #[serde(default)]
+    pub error_details_json: Option<String>,
 }
 
 /// Possible states of a statement during execution.
@@ -501,6 +525,56 @@ mod tests {
         assert_eq!(manifest.schema.column_count, 0);
         assert!(manifest.schema.columns.is_empty());
         assert_eq!(manifest.total_row_count, Some(0));
+    }
+
+    #[test]
+    fn test_statement_status_with_extended_fields() {
+        // SEA response with all five extended status fields populated.
+        let json = r#"{
+            "statement_id": "stmt-extended",
+            "status": {
+                "state": "SUCCEEDED",
+                "num_modified_rows": 42,
+                "progress": 0.875,
+                "display_message": "Statement completed",
+                "diagnostic_info": "operator=Scan; rows=42",
+                "error_details_json": "{\"trace\":\"...\"}"
+            }
+        }"#;
+
+        let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status.state, StatementState::Succeeded);
+        assert_eq!(response.status.num_modified_rows, Some(42));
+        assert_eq!(response.status.progress, Some(0.875));
+        assert_eq!(
+            response.status.display_message,
+            Some("Statement completed".to_string())
+        );
+        assert_eq!(
+            response.status.diagnostic_info,
+            Some("operator=Scan; rows=42".to_string())
+        );
+        assert_eq!(
+            response.status.error_details_json,
+            Some(r#"{"trace":"..."}"#.to_string())
+        );
+    }
+
+    #[test]
+    fn test_statement_status_extended_fields_absent() {
+        // Minimal SEA response — extended fields are optional and
+        // default to None when the server omits them.
+        let json = r#"{
+            "statement_id": "stmt-min",
+            "status": { "state": "SUCCEEDED" }
+        }"#;
+
+        let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status.num_modified_rows, None);
+        assert_eq!(response.status.progress, None);
+        assert_eq!(response.status.display_message, None);
+        assert_eq!(response.status.diagnostic_info, None);
+        assert_eq!(response.status.error_details_json, None);
     }
 
     #[test]

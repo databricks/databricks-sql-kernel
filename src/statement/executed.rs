@@ -33,6 +33,7 @@ use crate::result_stream::{ResultStream, SchemaRef};
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::validity::ValidityFlag;
+use crate::types::sea::StatementStatus as SeaStatementStatus;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -47,6 +48,11 @@ pub struct ExecutedStatement {
     /// stale calls locally with no network round-trip.
     valid: ValidityFlag,
     result_stream: ResultStream,
+    /// Terminal SEA `StatementStatus` captured at construction.
+    /// Kept as the wire-shape struct so the accessor methods can
+    /// hand back individual fields without re-querying the server.
+    /// Mutated only at construction; no interior mutability.
+    status: SeaStatementStatus,
     /// Flips to `true` after the first successful (or the first
     /// duplicate-call short-circuited) `close()`. Tells `Drop` to
     /// skip its fire-and-forget cleanup so an explicit close
@@ -69,6 +75,7 @@ impl ExecutedStatement {
         valid: ValidityFlag,
         result_stream: ResultStream,
         closed: Arc<AtomicBool>,
+        status: SeaStatementStatus,
     ) -> Self {
         Self {
             session,
@@ -76,6 +83,7 @@ impl ExecutedStatement {
             valid,
             result_stream,
             closed,
+            status,
         }
     }
 
@@ -100,6 +108,42 @@ impl ExecutedStatement {
     /// otherwise the borrow checker rejects the call.
     pub fn result_stream_mut(&mut self) -> &mut ResultStream {
         &mut self.result_stream
+    }
+
+    /// Rows modified by the statement (UPDATE / INSERT / DELETE /
+    /// MERGE). Absent for SELECT and on warehouses that don't surface
+    /// the counter.
+    pub fn num_modified_rows(&self) -> Option<i64> {
+        self.status.num_modified_rows
+    }
+
+    /// Fractional completion in `[0.0, 1.0]`. Populated on analytics
+    /// warehouses; absent elsewhere. On a terminal `ExecutedStatement`
+    /// this is typically `Some(1.0)` when populated at all.
+    pub fn progress(&self) -> Option<f64> {
+        self.status.progress
+    }
+
+    /// Server-supplied user-facing message. Distinct from the
+    /// `error.message` carried inside `Failed` — populated on
+    /// non-error states too (e.g. cancellation reasons, progress
+    /// hints).
+    pub fn display_message(&self) -> Option<&str> {
+        self.status.display_message.as_deref()
+    }
+
+    /// Server-supplied diagnostic detail — multi-line text with
+    /// stack frames or operator context. Intended for log / support
+    /// surfaces; not user-facing.
+    pub fn diagnostic_info(&self) -> Option<&str> {
+        self.status.diagnostic_info.as_deref()
+    }
+
+    /// Server-supplied JSON blob with extended error details.
+    /// Pass-through string — wrappers parse if they need structured
+    /// access.
+    pub fn error_details_json(&self) -> Option<&str> {
+        self.status.error_details_json.as_deref()
     }
 }
 
