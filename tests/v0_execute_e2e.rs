@@ -403,33 +403,41 @@ async fn bind_binary_typed_value_is_rejected_at_execute_time() {
     session.close().await.expect("session close");
 }
 
-/// Repro for issue #19: `CloudFetchResultReader::next_batch` calls
-/// `runtime_handle.block_on` from a sync trait method. When the
-/// kernel is driven from inside an enclosing tokio runtime (e.g.
-/// the PyO3 wrapper's `runtime.block_on`, or a `#[tokio::test]`
-/// here), the inner `block_on` is nested under the same runtime
-/// and tokio panics with "Cannot start a runtime from within a
+/// Regression guard for issue #19 (kernel `block_on` removal).
+///
+/// History: the original `CloudFetchResultReader::next_batch` was a
+/// sync trait method that called `runtime_handle.block_on(...)` on
+/// an inner async future. When the kernel ran under an enclosing
+/// tokio runtime (e.g. the PyO3 wrapper's `runtime.block_on`, the
+/// napi-rs `execute_tokio_future`, or a `#[tokio::test]` like this
+/// one), the inner `block_on` would nest under the same runtime and
+/// tokio would panic with "Cannot start a runtime from within a
 /// runtime."
 ///
-/// `range(100000)` is too small to flip the server to CloudFetch
-/// disposition (it inlines the Arrow stream), so the existing
-/// `multi_batch_range_succeeds` test never reaches the
-/// `block_on` path. `range(1000000)` reliably triggers external
-/// links on Dogfood.
+/// This commit fixed it by making the `ResultReader` trait itself
+/// `async` (Option 1 in issue #19), so `next_batch().await` is now
+/// genuinely async end-to-end — no inner `block_on`, no nested-
+/// runtime hazard, and no caller-side multi-thread-runtime
+/// requirement. This test exists to keep that property pinned: if
+/// a future refactor reintroduces a sync→async bridge inside a
+/// reader, draining 1M rows from inside a tokio test will repro
+/// the original panic.
 ///
-/// Gated to `flavor = "multi_thread"` because the eventual fix
-/// uses `tokio::task::block_in_place`, which is a no-op on
-/// current-thread runtimes. The PyO3 wrapper is multi-thread, so
-/// matching that here is the realistic shape.
+/// `range(100_000)` is too small to flip the server to CloudFetch
+/// disposition (inline Arrow), so we use `range(1_000_000)` to
+/// reliably hit external-link results on pecotesting.
+///
+/// Adapted from PR #20's regression test (author: @vikrantpuppala)
+/// — see the kernel-async-public-api PR description for the
+/// Option 1 vs Option 2 framing.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn cloudfetch_drain_does_not_nest_block_on() {
     let session = live_session().await;
     let mut stmt = session.statement();
-    // Large enough to force external-links disposition (the
-    // CloudFetchResultReader path) on Dogfood. If a future
-    // server-side change moves the inline/external threshold,
-    // bump this.
+    // Large enough to force external-links (CloudFetch) disposition
+    // on the test warehouse. If a future server-side change moves
+    // the inline/external threshold, bump this.
     stmt.spec().sql("SELECT * FROM range(1000000)");
     let mut exec = stmt.execute().await.expect("execute range(1000000)");
 
@@ -437,7 +445,8 @@ async fn cloudfetch_drain_does_not_nest_block_on() {
     assert_eq!(
         rows, 1_000_000,
         "expected 1M rows; if this drain panicked with \
-         'Cannot start a runtime from within a runtime' the fix has regressed"
+         'Cannot start a runtime from within a runtime' the Option-1 \
+         async-trait fix has regressed"
     );
     exec.close().await.expect("close");
     session.close().await.expect("session close");
