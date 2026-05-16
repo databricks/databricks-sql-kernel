@@ -170,7 +170,7 @@ impl Statement {
             // path. See `prepare_for_dispatch` for why omitting
             // `wait_timeout` typically yields `Closed` on the inline-result
             // fast path.
-            let already_closed = result.server_state == StatementState::Closed;
+            let already_closed = result.status.state == StatementState::Closed;
             let closed = Arc::new(AtomicBool::new(already_closed));
             self.last_statement_id = Some(result.statement_id.clone());
             self.last_valid = Some(valid.clone());
@@ -183,6 +183,7 @@ impl Statement {
                 valid,
                 result_stream,
                 closed,
+                result.status,
             ))
         }
         .instrument(span)
