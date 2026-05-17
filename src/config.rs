@@ -321,7 +321,13 @@ pub struct HttpConfig {
     /// Maximum total time across retries for a single logical RPC.
     pub overall_timeout: Duration,
 
-    /// Connection pool size.
+    /// Connection pool size (max idle warm sockets per remote host).
+    ///
+    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
+    /// default. Raise this for workloads that burst many concurrent
+    /// `executeStatement` calls or CloudFetch chunk downloads against a
+    /// single host; too low a value forces fresh TLS handshakes when the
+    /// pool fills.
     pub pool_max_idle_per_host: usize,
 }
 
@@ -330,7 +336,7 @@ impl Default for HttpConfig {
         Self {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
-            pool_max_idle_per_host: 10,
+            pool_max_idle_per_host: 100,
         }
     }
 }
@@ -639,5 +645,16 @@ mod tests {
         assert!(!s.contains("supersecret"), "subject_token leaked: {s}");
         assert!(s.contains("<redacted>"));
         assert!(s.contains("databricks"));
+    }
+
+    // ─── HttpConfig defaults ───────────────────────────────────────
+
+    #[test]
+    fn http_config_default_pool_max_idle_per_host_is_100() {
+        // Matches the JDBC driver's `HttpConnectionPoolSize` default and
+        // narrows the throughput gap with thrift's `maxSockets: Infinity`
+        // for high-concurrency workloads. See
+        // `sea-workflow/specs/07-errors-retries/connection-pool-default-mismatch.md`.
+        assert_eq!(HttpConfig::default().pool_max_idle_per_host, 100);
     }
 }
