@@ -34,10 +34,7 @@ use std::sync::Arc;
 use tokio::runtime::Runtime;
 
 /// Python-facing borrowed result stream.
-///
-/// `unsendable` — like the rest of the surface, holding a tokio
-/// `Runtime` makes the pyclass `!Send`.
-#[pyclass(name = "ResultStream", unsendable)]
+#[pyclass(name = "ResultStream")]
 pub(crate) struct ResultStream {
     inner: Option<ResultStreamInner>,
     /// Cached schema — survives `close()` so callers can still read
