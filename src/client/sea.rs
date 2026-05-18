@@ -720,7 +720,7 @@ impl Transport for SeaRestTransport {
     async fn list_columns(
         &self,
         session_id: &str,
-        catalog: &str,
+        catalog: Option<&str>,
         schema_pattern: Option<&str>,
         table_pattern: Option<&str>,
         column_pattern: Option<&str>,
