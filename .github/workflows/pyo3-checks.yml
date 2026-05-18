@@ -115,27 +115,24 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
 
       # uv is the Python package manager the kernel pyo3 sub-crate
-      # uses for env management. `uv.lock` carries SHA256 hashes
-      # for every artifact (direct + transitive); `uv sync --frozen`
-      # installs exactly what's in the lock with no resolver step.
-      # Per go/pinning-python-deps, this is the recommended pinning
-      # strategy for Databricks Python projects. uv itself is
-      # installed via astral-sh/setup-uv (SHA-pinned) rather than
-      # via `pip install uv` so the bootstrap is also hash-locked.
+      # uses for env management. uv itself is installed via
+      # astral-sh/setup-uv (SHA-pinned) rather than via
+      # `pip install uv` so the bootstrap is also hash-locked.
       - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
         with:
-          # Pin uv to a known good version; bump deliberately so the
-          # lockfile-resolver behaviour is stable across CI runs.
+          # Pin uv to a known good version; bump deliberately.
           version: "0.11.14"
 
       - name: Install dev dependencies (uv sync)
-        # `--frozen` refuses to update the lockfile — if `uv.lock` is
-        # missing or out-of-date with `pyproject.toml`, this step
-        # fails loudly rather than silently re-resolving. The lock
-        # is committed and includes the `dev` dependency group
-        # (maturin, pytest) plus the runtime `pyarrow`.
+        # No `--frozen` and no committed lockfile: per go/pinning-
+        # python-deps the externally-published-library rule says
+        # *not* to pin transitive deps (it impedes downstream
+        # `pip install`). The `[project].dependencies` major-version
+        # bounds in `pyproject.toml` plus the JFrog proxy's 7-day
+        # age filter on `db-pypi` are the baseline protection. uv
+        # re-resolves each run within those bounds.
         working-directory: pyo3
-        run: uv sync --frozen --group dev
+        run: uv sync --group dev
 
       - name: Cargo unit tests (pyo3 crate)
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff

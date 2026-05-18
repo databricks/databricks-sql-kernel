@@ -114,49 +114,21 @@ How this shows up in the repo:
   workflow runs the same composite with `uv: "true"` (exports
   `UV_INDEX_URL` + `PIP_INDEX_URL` for fallback compatibility).
   The pyo3 sub-crate uses [uv](https://docs.astral.sh/uv/) for
-  Python env management per
-  [go/pinning-python-deps](https://docs.google.com/document/d/1thJsoOBW3NzvRV6pWpujcD8mn4KOXgAW8t10iw6Z6LA/edit).
-  `pyo3/uv.lock` carries SHA256 hashes for every artifact
-  (direct + transitive). `uv sync --frozen --group dev` installs
-  exactly what's in the lock; no resolver step in CI.
-- **Two-layer Python pinning** (per the published-library vs
-  applications/services split in the guidance doc):
-  - **`pyo3/pyproject.toml` `[project].dependencies`** is the
-    **public contract** for downstream `pip install
-    databricks-sql-kernel` users. Loose major-version-bounded
-    pins (`pyarrow>=14,<19`) — exact pins make the wheel hard
-    for end-users to install alongside their own pyarrow
-    consumers.
-  - **`pyo3/uv.lock`** is the **CI/dev** environment, fully
-    hash-locked for reproducibility. Generated from
-    `pyproject.toml` + the `[dependency-groups].dev` table.
+  Python env management.
+- **Python dep pinning follows the externally-published-library
+  rule from [go/pinning-python-deps](https://docs.google.com/document/d/1thJsoOBW3NzvRV6pWpujcD8mn4KOXgAW8t10iw6Z6LA/edit)**:
+  major-version upper bounds in `pyo3/pyproject.toml`
+  (`pyarrow>=14,<19`), no exact pins, no transitive constraints,
+  no committed lockfile. Exact pins would impede downstream
+  `pip install databricks-sql-kernel` for end-users with their
+  own pyarrow consumers. The `db-pypi` proxy's 7-day age filter
+  is the baseline supply-chain protection; `uv sync` re-resolves
+  each CI run within the major-version bounds.
 - **Composite action**: `.github/actions/setup-jfrog/action.yml`
   encapsulates the OIDC token exchange (`id-token: write`
   permission required) plus the cargo / uv config writes.
   Workflows that need registry access reference it with
   `uses: ./.github/actions/setup-jfrog`.
-
-Regenerating `pyo3/uv.lock`:
-
-```bash
-cd pyo3
-uv lock                 # or `uv lock --upgrade-package <pkg>` for a targeted bump
-```
-
-Run from a host with JFrog access (`UV_INDEX_URL` set to the
-db-pypi proxy, or `--index-url` flag). uv records hashes for
-every artifact. Commit the regenerated lockfile in the same PR
-that bumps a version in `pyproject.toml`.
-
-**Open-source caveat.** `uv.lock` records the index URL the
-resolver hit. To avoid leaking the internal proxy URL when this
-repo eventually open-sources, locally regenerate against the
-public PyPI URL by setting `UV_INDEX_URL=https://pypi.org/simple/`
-in your shell (or pass `--index-url`) before running `uv lock`.
-The CI workflow then sets `UV_INDEX_URL` to the JFrog proxy via
-the composite action's env-var injection (which does NOT modify
-the lockfile — uv only writes the index URL during `uv lock`,
-not during `uv sync`).
 
 ## Local development environment
 
