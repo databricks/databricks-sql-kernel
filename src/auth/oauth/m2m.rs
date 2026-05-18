@@ -33,9 +33,11 @@ use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
 use crate::kernel_error::{Error, Result};
+use crate::util::runtime::block_on_in_runtime;
 use oauth2::basic::BasicClient;
 use oauth2::{AuthUrl, ClientId, ClientSecret, Scope, TokenResponse, TokenUrl};
 use std::sync::Arc;
+use tokio::runtime::Handle as RuntimeHandle;
 
 /// OAuth provider for M2M (Machine-to-Machine) authentication.
 ///
@@ -90,6 +92,12 @@ pub struct ClientCredentialsProvider {
     http_client: Arc<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis")
     scopes: Vec<String>,
+    /// Tokio runtime handle captured from the constructing context;
+    /// used to drive the async token exchange from the sync
+    /// `get_auth_header` trait method safely whether or not the
+    /// caller is already inside a runtime (see
+    /// `crate::util::runtime::block_on_in_runtime`).
+    runtime_handle: RuntimeHandle,
 }
 
 impl ClientCredentialsProvider {
@@ -207,6 +215,14 @@ impl ClientCredentialsProvider {
             token_store: TokenStore::new(),
             http_client,
             scopes,
+            // `new_with_full_config` is `async`, so we're guaranteed
+            // to be inside a tokio runtime here. Capture that handle
+            // so `get_auth_header` can dispatch correctly later via
+            // `block_on_in_runtime`, even when the caller has
+            // wrapped the kernel in its own outer `block_on` (e.g.
+            // the PyO3 binding) or eventually drives auth from a
+            // non-tokio thread (e.g. the C ABI shim).
+            runtime_handle: RuntimeHandle::current(),
         })
     }
 }
@@ -238,61 +254,64 @@ impl AuthProvider for ClientCredentialsProvider {
         let scopes = self.scopes.clone();
 
         // Get or refresh token via TokenStore
+        let runtime_handle = self.runtime_handle.clone();
         let token = self.token_store.get_or_refresh(move || {
-            // Execute async token fetch within the runtime
-            // Use block_in_place to avoid blocking the runtime if we're in one,
-            // and get the handle to block_on the async operation
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
-                    // Build the OAuth client
-                    let oauth_client = BasicClient::new(ClientId::new(client_id))
-                        .set_client_secret(ClientSecret::new(client_secret))
-                        .set_auth_uri(AuthUrl::new(auth_endpoint).map_err(|e| {
-                            Error::invalid_argument()
-                                .message(format!("Invalid authorization endpoint URL: {}", e))
-                        })?)
-                        .set_token_uri(TokenUrl::new(token_endpoint).map_err(|e| {
-                            Error::invalid_argument()
-                                .message(format!("Invalid token endpoint URL: {}", e))
-                        })?);
+            // Execute the async token fetch via the kernel's
+            // captured runtime handle. `block_on_in_runtime`
+            // dispatches on `Handle::try_current()`: it uses
+            // `block_in_place` when called from inside a runtime
+            // (e.g. driven by the PyO3 wrapper), and falls back to
+            // a direct `block_on` when called from a plain thread
+            // (e.g. the future C ABI shim). See `crate::util::runtime`.
+            block_on_in_runtime(&runtime_handle, async {
+                // Build the OAuth client
+                let oauth_client = BasicClient::new(ClientId::new(client_id))
+                    .set_client_secret(ClientSecret::new(client_secret))
+                    .set_auth_uri(AuthUrl::new(auth_endpoint).map_err(|e| {
+                        Error::invalid_argument()
+                            .message(format!("Invalid authorization endpoint URL: {}", e))
+                    })?)
+                    .set_token_uri(TokenUrl::new(token_endpoint).map_err(|e| {
+                        Error::invalid_argument()
+                            .message(format!("Invalid token endpoint URL: {}", e))
+                    })?);
 
-                    // Build the token request
-                    let mut token_request = oauth_client.exchange_client_credentials();
-                    for scope in &scopes {
-                        token_request = token_request.add_scope(Scope::new(scope.clone()));
-                    }
+                // Build the token request
+                let mut token_request = oauth_client.exchange_client_credentials();
+                for scope in &scopes {
+                    token_request = token_request.add_scope(Scope::new(scope.clone()));
+                }
 
-                    // Execute the token exchange using inner reqwest client
-                    let token_response = token_request
-                        .request_async(http_client.inner())
-                        .await
-                        .map_err(|e| {
-                            Error::io()
-                                .message(format!("M2M token exchange failed: {}", e))
-                                .context("client credentials grant")
-                        })?;
+                // Execute the token exchange using inner reqwest client
+                let token_response = token_request
+                    .request_async(http_client.inner())
+                    .await
+                    .map_err(|e| {
+                        Error::io()
+                            .message(format!("M2M token exchange failed: {}", e))
+                            .context("client credentials grant")
+                    })?;
 
-                    // Convert to OAuthToken
-                    let access_token = token_response.access_token().secret().to_string();
-                    let token_type = token_response.token_type().as_ref().to_string();
-                    let expires_in = token_response
-                        .expires_in()
-                        .map(|d| d.as_secs() as i64)
-                        .unwrap_or(3600);
+                // Convert to OAuthToken
+                let access_token = token_response.access_token().secret().to_string();
+                let token_type = token_response.token_type().as_ref().to_string();
+                let expires_in = token_response
+                    .expires_in()
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(3600);
 
-                    let scopes_result = token_response
-                        .scopes()
-                        .map(|s| s.iter().map(|scope| scope.to_string()).collect())
-                        .unwrap_or_else(|| scopes.clone());
+                let scopes_result = token_response
+                    .scopes()
+                    .map(|s| s.iter().map(|scope| scope.to_string()).collect())
+                    .unwrap_or_else(|| scopes.clone());
 
-                    Ok(OAuthToken::new(
-                        access_token,
-                        token_type,
-                        expires_in,
-                        None, // No refresh token for M2M
-                        scopes_result,
-                    ))
-                })
+                Ok(OAuthToken::new(
+                    access_token,
+                    token_type,
+                    expires_in,
+                    None, // No refresh token for M2M
+                    scopes_result,
+                ))
             })
         })?;
 

@@ -32,6 +32,7 @@ use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
 use crate::reader::inline::InlineArrowProvider;
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
+use crate::util::runtime::block_on_in_runtime;
 use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
 use std::sync::Arc;
@@ -318,11 +319,11 @@ impl CloudFetchResultReader {
 
 impl ResultReader for CloudFetchResultReader {
     fn schema(&self) -> Result<SchemaRef> {
-        self.runtime_handle.block_on(self.provider.get_schema())
+        block_on_in_runtime(&self.runtime_handle, self.provider.get_schema())
     }
 
     fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        self.runtime_handle.block_on(self.provider.next_batch())
+        block_on_in_runtime(&self.runtime_handle, self.provider.next_batch())
     }
 }
 

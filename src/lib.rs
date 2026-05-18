@@ -85,6 +85,7 @@ pub mod kernel_error;
 pub mod metadata_v0;
 pub mod result_stream;
 pub mod session;
+pub(crate) mod util;
 
 // Custom C ABI for ODBC / Go consumers (skeleton).
 pub mod ffi;

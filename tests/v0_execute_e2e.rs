@@ -402,3 +402,43 @@ async fn bind_binary_typed_value_is_rejected_at_execute_time() {
     assert!(err.message.contains("unhex"), "{}", err.message);
     session.close().await.expect("session close");
 }
+
+/// Repro for issue #19: `CloudFetchResultReader::next_batch` calls
+/// `runtime_handle.block_on` from a sync trait method. When the
+/// kernel is driven from inside an enclosing tokio runtime (e.g.
+/// the PyO3 wrapper's `runtime.block_on`, or a `#[tokio::test]`
+/// here), the inner `block_on` is nested under the same runtime
+/// and tokio panics with "Cannot start a runtime from within a
+/// runtime."
+///
+/// `range(100000)` is too small to flip the server to CloudFetch
+/// disposition (it inlines the Arrow stream), so the existing
+/// `multi_batch_range_succeeds` test never reaches the
+/// `block_on` path. `range(1000000)` reliably triggers external
+/// links on Dogfood.
+///
+/// Gated to `flavor = "multi_thread"` because the eventual fix
+/// uses `tokio::task::block_in_place`, which is a no-op on
+/// current-thread runtimes. The PyO3 wrapper is multi-thread, so
+/// matching that here is the realistic shape.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn cloudfetch_drain_does_not_nest_block_on() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    // Large enough to force external-links disposition (the
+    // CloudFetchResultReader path) on Dogfood. If a future
+    // server-side change moves the inline/external threshold,
+    // bump this.
+    stmt.spec().sql("SELECT * FROM range(1000000)");
+    let mut exec = stmt.execute().await.expect("execute range(1000000)");
+
+    let rows = drain_rows(exec.result_stream_mut()).await;
+    assert_eq!(
+        rows, 1_000_000,
+        "expected 1M rows; if this drain panicked with \
+         'Cannot start a runtime from within a runtime' the fix has regressed"
+    );
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
