@@ -93,6 +93,71 @@ permissive licenses must be added to `[licenses].allow` in
 preserved separately for generating attribution pages on demand;
 the CI gate lives on `deny.toml`.
 
+## Supply-chain hardening
+
+Per [go/hardened-gha](https://docs.google.com/document/d/1zoHgolfZO_IUBIU3w40NmYsoZ9eTRdAmjlfwYOxkj70/edit),
+the protected runners block direct access to public package
+registries (crates.io, PyPI, npm, etc.). All third-party
+dependency fetches route through Databricks' JFrog Artifactory
+proxy at `databricks.jfrog.io`.
+
+How this shows up in the repo:
+
+- **GitHub Actions steps** are SHA-pinned, with the version tag in
+  a trailing comment (e.g. `uses: actions/checkout@34e1148... # v4`).
+- **Cargo** access goes through `db-cargo-remote`. Workflows that
+  hit cargo run `./.github/actions/setup-jfrog` with `cargo: "true"`
+  before `setup-rust-toolchain`. `Cargo.lock` carries per-crate
+  SHA256 checksums (`source = "registry+..."` + `checksum = "..."`),
+  which is Cargo's native pinning mechanism.
+- **PyPI** access goes through `db-pypi`. The `pyo3-checks.yml`
+  workflow runs the same composite with `uv: "true"` (exports
+  `UV_INDEX_URL` + `PIP_INDEX_URL` for fallback compatibility).
+  The pyo3 sub-crate uses [uv](https://docs.astral.sh/uv/) for
+  Python env management per
+  [go/pinning-python-deps](https://docs.google.com/document/d/1thJsoOBW3NzvRV6pWpujcD8mn4KOXgAW8t10iw6Z6LA/edit).
+  `pyo3/uv.lock` carries SHA256 hashes for every artifact
+  (direct + transitive). `uv sync --frozen --group dev` installs
+  exactly what's in the lock; no resolver step in CI.
+- **Two-layer Python pinning** (per the published-library vs
+  applications/services split in the guidance doc):
+  - **`pyo3/pyproject.toml` `[project].dependencies`** is the
+    **public contract** for downstream `pip install
+    databricks-sql-kernel` users. Loose major-version-bounded
+    pins (`pyarrow>=14,<19`) — exact pins make the wheel hard
+    for end-users to install alongside their own pyarrow
+    consumers.
+  - **`pyo3/uv.lock`** is the **CI/dev** environment, fully
+    hash-locked for reproducibility. Generated from
+    `pyproject.toml` + the `[dependency-groups].dev` table.
+- **Composite action**: `.github/actions/setup-jfrog/action.yml`
+  encapsulates the OIDC token exchange (`id-token: write`
+  permission required) plus the cargo / uv config writes.
+  Workflows that need registry access reference it with
+  `uses: ./.github/actions/setup-jfrog`.
+
+Regenerating `pyo3/uv.lock`:
+
+```bash
+cd pyo3
+uv lock                 # or `uv lock --upgrade-package <pkg>` for a targeted bump
+```
+
+Run from a host with JFrog access (`UV_INDEX_URL` set to the
+db-pypi proxy, or `--index-url` flag). uv records hashes for
+every artifact. Commit the regenerated lockfile in the same PR
+that bumps a version in `pyproject.toml`.
+
+**Open-source caveat.** `uv.lock` records the index URL the
+resolver hit. To avoid leaking the internal proxy URL when this
+repo eventually open-sources, locally regenerate against the
+public PyPI URL by setting `UV_INDEX_URL=https://pypi.org/simple/`
+in your shell (or pass `--index-url`) before running `uv lock`.
+The CI workflow then sets `UV_INDEX_URL` to the JFrog proxy via
+the composite action's env-var injection (which does NOT modify
+the lockfile — uv only writes the index URL during `uv lock`,
+not during `uv sync`).
+
 ## Local development environment
 
 Connection variables for E2E tests can be set via `.cargo/config.toml`

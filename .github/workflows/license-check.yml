@@ -42,6 +42,9 @@ on:
 
 permissions:
   contents: read
+  # Required for the OIDC token exchange that the
+  # `.github/actions/setup-jfrog` composite uses. See go/hardened-gha.
+  id-token: write
 
 defaults:
   run:
@@ -55,6 +58,10 @@ jobs:
       labels: linux-ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
 
