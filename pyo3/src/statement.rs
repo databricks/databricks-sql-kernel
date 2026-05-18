@@ -38,7 +38,7 @@ use tokio::runtime::Runtime;
 /// Spec mutation is collapsed into simple `set_*` / `bind_*` methods
 /// for now. The full `Statement::spec()` API surface lands in later
 /// phases (named params, statement_conf, result_format).
-#[pyclass(name = "Statement", unsendable)]
+#[pyclass(name = "Statement")]
 pub(crate) struct Statement {
     inner: Option<StatementInner>,
 }
@@ -180,7 +180,7 @@ impl Statement {
 
 /// Python-facing executed statement handle. Owns the kernel
 /// `ExecutedStatement` and serves the result stream lazily.
-#[pyclass(name = "ExecutedStatement", unsendable)]
+#[pyclass(name = "ExecutedStatement")]
 pub(crate) struct ExecutedStatement {
     inner: Option<ExecutedInner>,
     /// Cached statement id so callers can read it after `close()`

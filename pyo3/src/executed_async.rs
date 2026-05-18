@@ -46,7 +46,7 @@ fn status_str(status: &StatementStatus) -> &'static str {
     }
 }
 
-#[pyclass(name = "ExecutedAsyncStatement", unsendable)]
+#[pyclass(name = "ExecutedAsyncStatement")]
 pub(crate) struct ExecutedAsyncStatement {
     inner: Option<ExecutedAsyncInner>,
     /// Cached statement id so callers can read it after `close()`.

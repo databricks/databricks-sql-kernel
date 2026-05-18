@@ -52,7 +52,7 @@ use tokio::runtime::Runtime;
 /// Constructed via `Session.metadata()`. Cheap to construct and
 /// throw away — the underlying kernel `Metadata` is a thin wrapper
 /// around the shared session state.
-#[pyclass(name = "Metadata", unsendable)]
+#[pyclass(name = "Metadata")]
 pub(crate) struct Metadata {
     inner: KMetadata,
     runtime: Arc<Runtime>,

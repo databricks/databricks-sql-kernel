@@ -31,11 +31,14 @@ use tokio::runtime::{Builder, Runtime};
 
 /// Python-facing session handle.
 ///
-/// `unsendable` — the kernel `Session` is `Send + Sync` (asserted in
-/// the kernel's `lib.rs`), but the tokio `Runtime` is `!Send` once it
-/// has been driven. Marking the pyclass unsendable keeps Python from
-/// trying to migrate it across threads.
-#[pyclass(name = "Session", unsendable)]
+/// Both fields of `SessionInner` are `Send + Sync` (the kernel
+/// `Session` asserts it in `lib.rs`; `tokio::runtime::Runtime` is
+/// documented `Send + Sync`), so the pyclass is **not** `unsendable`.
+/// This lets Python use the same `Session` from multiple threads —
+/// the legitimate pattern for `databricks-sql-python` connections
+/// shared across a worker pool. The `Send + Sync` invariant is
+/// regression-asserted in the test module at the bottom of this file.
+#[pyclass(name = "Session")]
 pub(crate) struct Session {
     /// `None` after `close()`. Methods return a clean Python error
     /// rather than panicking on a closed session.
@@ -188,5 +191,16 @@ impl Session {
             ),
             None => "Session(closed=True)".to_owned(),
         }
+    }
+}
+
+#[cfg(test)]
+mod send_sync_tests {
+    use super::*;
+    fn assert_send_sync<T: Send + Sync>() {}
+    #[test]
+    fn runtime_arc_is_send_sync() {
+        assert_send_sync::<Arc<Runtime>>();
+        assert_send_sync::<SessionInner>();
     }
 }
