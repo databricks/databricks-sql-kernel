@@ -38,6 +38,7 @@ use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
 use crate::kernel_error::{Error, Result};
+use crate::util::runtime::block_on_in_runtime;
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, CsrfToken, PkceCodeChallenge, RedirectUrl, RefreshToken,
@@ -45,6 +46,7 @@ use oauth2::{
 };
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::runtime::Handle as RuntimeHandle;
 
 /// Default callback server port for OAuth redirects.
 const DEFAULT_CALLBACK_PORT: u16 = 8020;
@@ -112,6 +114,12 @@ pub struct AuthorizationCodeProvider {
     callback_timeout: Duration,
     /// Whether to open browser automatically (set to false in tests)
     open_browser: bool,
+    /// Tokio runtime handle captured from the constructing context;
+    /// used to drive the async token exchange from the sync
+    /// `get_auth_header` trait method safely whether or not the
+    /// caller is already inside a runtime (see
+    /// `crate::util::runtime::block_on_in_runtime`).
+    runtime_handle: RuntimeHandle,
 }
 
 impl AuthorizationCodeProvider {
@@ -243,6 +251,11 @@ impl AuthorizationCodeProvider {
             callback_port,
             callback_timeout,
             open_browser: true,
+            // `new_with_full_config` is `async`, so we're guaranteed
+            // to be inside a tokio runtime here. Capture that handle
+            // so `get_auth_header` can dispatch correctly later via
+            // `block_on_in_runtime`.
+            runtime_handle: RuntimeHandle::current(),
         })
     }
 }
@@ -291,10 +304,14 @@ impl AuthProvider for AuthorizationCodeProvider {
         let http_client = self.http_client.clone();
 
         // Get or refresh token via TokenStore
+        let runtime_handle = self.runtime_handle.clone();
         let token = self.token_store.get_or_refresh(move || {
-            // Execute async token fetch/refresh within the runtime
-            tokio::task::block_in_place(|| {
-                tokio::runtime::Handle::current().block_on(async {
+            // Execute async token fetch/refresh via the kernel's
+            // captured runtime handle. `block_on_in_runtime`
+            // dispatches on `Handle::try_current()`: `block_in_place`
+            // inside a runtime, direct `block_on` otherwise. See
+            // `crate::util::runtime`.
+            block_on_in_runtime(&runtime_handle, async {
                     // Try loading from cache first
                     if let Some(cached_token) = TokenCache::load(&host, &client_id, &scopes) {
                         if let Some(ref refresh_token_str) = cached_token.refresh_token {
@@ -464,7 +481,6 @@ impl AuthProvider for AuthorizationCodeProvider {
                     TokenCache::save(&host, &client_id, &scopes, &token);
 
                     Ok(token)
-                })
             })
         })?;
 
