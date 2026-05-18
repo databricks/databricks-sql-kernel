@@ -56,18 +56,26 @@ pub struct ExecutedStatement {
 
 impl ExecutedStatement {
     /// Crate-internal constructor. Built by [`Statement::execute`].
+    ///
+    /// `closed` is a shared flag — the parent [`Statement`] owns the
+    /// same `Arc` so that flipping `closed` here also short-circuits
+    /// the lifecycle-owner's `invalidate_prior` cleanup path. The
+    /// parent pre-sets the flag to `true` when the server returned
+    /// `state=CLOSED` in its execute response, so neither side fires
+    /// the redundant `CloseStatement` round-trip.
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
         valid: ValidityFlag,
         result_stream: ResultStream,
+        closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             session,
             statement_id,
             valid,
             result_stream,
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
         }
     }
 
@@ -139,8 +147,13 @@ impl ExecutedStatementHandle for ExecutedStatement {
 
 impl Drop for ExecutedStatement {
     fn drop(&mut self) {
-        // If close() already ran, nothing to do.
-        if self.closed.load(Ordering::Acquire) {
+        // `swap` (not `load`) so the shared `closed` flag — held by the
+        // parent `Statement::last_closed` — reflects that Drop is now
+        // handling cleanup. Without this, a `drop(executed) → execute()
+        // again` sequence would have `invalidate_prior` fire a redundant
+        // `CloseStatement` racing the one we're about to spawn. The
+        // server is idempotent so it's harmless, but a wasted RPC.
+        if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Fire-and-forget CloseStatement. Drop must not panic and

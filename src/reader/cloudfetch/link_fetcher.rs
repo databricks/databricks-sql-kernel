@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use crate::client::{ExecuteResult, SessionInfo};
     use crate::reader::EmptyReader;
-    use crate::types::sea::ExecuteParams;
+    use crate::types::sea::{ExecuteParams, StatementState};
     use arrow_schema::Schema;
     use std::collections::HashMap;
     use std::sync::Arc as StdArc;
@@ -591,6 +591,7 @@ mod tests {
                 statement_id: "mock-statement".to_string(),
                 reader: Box::new(EmptyReader::new(StdArc::new(Schema::empty()))),
                 manifest: None,
+                server_state: StatementState::Succeeded,
             })
         }
 

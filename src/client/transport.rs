@@ -27,7 +27,7 @@
 use crate::kernel_error::Result;
 use crate::reader::ResultReader;
 use crate::types::cloudfetch::CloudFetchLink;
-use crate::types::sea::{ExecuteParams, ResultManifest, StatementStatus};
+use crate::types::sea::{ExecuteParams, ResultManifest, StatementState, StatementStatus};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::time::Duration;
@@ -72,6 +72,17 @@ pub(crate) struct ExecuteResult {
     pub statement_id: String,
     pub reader: Box<dyn ResultReader + Send>,
     pub manifest: Option<ResultManifest>,
+    /// Terminal state the server reported in its final response.
+    /// `Closed` means the server has already cleaned up the
+    /// statement on its end — the kernel must NOT issue a
+    /// separate `CloseStatement` for it (the server returns 404
+    /// `STATEMENT_NOT_FOUND` on such redundant closes). This is
+    /// the common case when the kernel omits `wait_timeout` from
+    /// the execute request: the server holds the connection for
+    /// its default wait, returns inline data with `state=CLOSED`,
+    /// and is done. Setting a concrete `wait_timeout` yields
+    /// `Succeeded` instead and requires an explicit close.
+    pub server_state: StatementState,
 }
 
 impl std::fmt::Debug for ExecuteResult {
@@ -80,6 +91,7 @@ impl std::fmt::Debug for ExecuteResult {
             .field("statement_id", &self.statement_id)
             .field("reader", &"<dyn ResultReader>")
             .field("manifest", &self.manifest)
+            .field("server_state", &self.server_state)
             .finish()
     }
 }

@@ -369,10 +369,15 @@ impl SeaRestTransport {
         let response = self.wait_for_completion(response).await?;
         let reader_factory = self.reader_factory()?;
         let reader = reader_factory.create_reader(&response.statement_id, &response)?;
+        // `server_state` carries the terminal state forward so the
+        // executed handle can skip a redundant CloseStatement when
+        // the server already cleaned up (state=Closed).
+        let server_state = response.status.state;
         Ok(ExecuteResult {
             statement_id: response.statement_id,
             reader,
             manifest: response.manifest,
+            server_state,
         })
     }
 }
@@ -505,10 +510,12 @@ impl Transport for SeaRestTransport {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
                 let reader = reader_factory.create_reader(&r.statement_id, &r)?;
+                let server_state = r.status.state;
                 Ok(Some(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
+                    server_state,
                 }))
             }
             StatementOutcome::NotReady(_) => Ok(None),

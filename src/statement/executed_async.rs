@@ -122,16 +122,24 @@ pub struct ExecutedAsyncStatement {
 
 impl ExecutedAsyncStatement {
     /// Crate-internal constructor. Built by [`Statement::submit`].
+    ///
+    /// `closed` is shared with the parent [`Statement`] so flipping it
+    /// here also short-circuits the lifecycle-owner's
+    /// `invalidate_prior` cleanup path. The submit path always sends
+    /// `wait_timeout=0s`, so the server returns `Pending`/`Running` and
+    /// the flag starts `false`; the share-and-flip pattern still
+    /// applies once the caller (or `Drop`) closes either handle.
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
         valid: ValidityFlag,
+        closed: Arc<AtomicBool>,
     ) -> Self {
         Self {
             session,
             statement_id,
             valid,
-            closed: Arc::new(AtomicBool::new(false)),
+            closed,
         }
     }
 
@@ -373,7 +381,11 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
-        if self.closed.load(Ordering::Acquire) {
+        // `swap` (not `load`) so the shared `closed` flag — held by the
+        // parent `Statement::last_closed` — reflects that Drop is now
+        // handling cleanup, preventing a duplicate `CloseStatement`
+        // from `invalidate_prior` on the next `execute()` / `submit()`.
+        if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Fire-and-forget close on the session's runtime — mirrors
