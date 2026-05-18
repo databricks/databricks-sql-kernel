@@ -56,6 +56,30 @@ use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::{Arc, LazyLock};
 
+/// Detect "object not found" server errors that JDBC's `DatabaseMetaData`
+/// contract translates into an empty result rather than a thrown
+/// exception. Mirrors the JDBC driver's
+/// `MetadataResultConstants.isObjectNotFoundException` (catalog,
+/// schema, or table not found).
+///
+/// We match on:
+/// - SQL state `42704` — the SQL standard "undefined object" state
+///   the Databricks server emits for missing catalog / schema / table.
+/// - Error-message substrings for older server builds that don't
+///   populate `sqlstate` reliably (`NO_SUCH_CATALOG_EXCEPTION`,
+///   `TABLE_OR_VIEW_NOT_FOUND`, `SCHEMA_NOT_FOUND`,
+///   `INVALID_PARAMETER_VALUE`).
+pub(crate) fn is_object_not_found(err: &Error) -> bool {
+    if err.sql_state.as_deref() == Some("42704") {
+        return true;
+    }
+    let msg = &err.message;
+    msg.contains("NO_SUCH_CATALOG_EXCEPTION")
+        || msg.contains("TABLE_OR_VIEW_NOT_FOUND")
+        || msg.contains("SCHEMA_NOT_FOUND")
+        || msg.contains("INVALID_PARAMETER_VALUE")
+}
+
 // ─── JDBC schemas ──────────────────────────────────────────────────
 
 /// JDBC `getCatalogs` — single column.
@@ -116,7 +140,13 @@ pub(crate) static GET_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("SCOPE_SCHEMA", DataType::Utf8, true),
         Field::new("SCOPE_TABLE", DataType::Utf8, true),
         Field::new("SOURCE_DATA_TYPE", DataType::Int32, true),
-        Field::new("IS_AUTOINCREMENT", DataType::Utf8, false),
+        // JDBC `DatabaseMetaData.getColumns` Javadoc names this
+        // `IS_AUTOINCREMENT` (one word). Thrift's wire response uses
+        // `IS_AUTO_INCREMENT` (with the underscore), and that's what
+        // existing PySQL/JDBC users on Databricks see today. Match
+        // Thrift's spelling so the kernel backend is a drop-in
+        // replacement; the column meaning is identical.
+        Field::new("IS_AUTO_INCREMENT", DataType::Utf8, false),
     ]))
 });
 
@@ -275,12 +305,57 @@ pub(crate) fn reshape_tables(
     // Apply table_types filter, if requested. JDBC's contract:
     // null/empty = no filter; otherwise keep only rows whose
     // TABLE_TYPE is in the list.
-    if let Some(types) = table_types {
-        if !types.is_empty() {
-            return filter_tables_by_type(&reshaped, types);
-        }
+    let filtered = match table_types {
+        Some(types) if !types.is_empty() => filter_tables_by_type(&reshaped, types)?,
+        _ => reshaped,
+    };
+    // Sort to match the JDBC driver's `getTables` row order
+    // (`TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME`). JDBC's
+    // `MetadataResultSetBuilder.getTablesResult` does the same sort
+    // with a comment marking it as the Thrift-mode order, so
+    // consumers that compare kernel output against the existing
+    // Thrift backend see matching row sequence.
+    sort_tables(&filtered)
+}
+
+/// Lex-sort a JDBC-shape getTables batch by `TABLE_TYPE, TABLE_CAT,
+/// TABLE_SCHEM, TABLE_NAME` to match JDBC / Thrift row ordering.
+fn sort_tables(batch: &RecordBatch) -> Result<RecordBatch> {
+    if batch.num_rows() <= 1 {
+        return Ok(batch.clone());
     }
-    Ok(reshaped)
+    // Schema positions: 0=TABLE_CAT, 1=TABLE_SCHEM, 2=TABLE_NAME,
+    // 3=TABLE_TYPE. Sort key order is TABLE_TYPE first.
+    let sort_columns = [
+        arrow_ord::sort::SortColumn {
+            values: Arc::clone(batch.column(3)),
+            options: None,
+        },
+        arrow_ord::sort::SortColumn {
+            values: Arc::clone(batch.column(0)),
+            options: None,
+        },
+        arrow_ord::sort::SortColumn {
+            values: Arc::clone(batch.column(1)),
+            options: None,
+        },
+        arrow_ord::sort::SortColumn {
+            values: Arc::clone(batch.column(2)),
+            options: None,
+        },
+    ];
+    let indices = arrow_ord::sort::lexsort_to_indices(&sort_columns, None)
+        .map_err(|e| Error::data_loss().message(format!("sort_tables lexsort: {e}")))?;
+    let cols: Result<Vec<ArrayRef>> = batch
+        .columns()
+        .iter()
+        .map(|c| {
+            arrow_select::take::take(c.as_ref(), &indices, None)
+                .map_err(|e| Error::data_loss().message(format!("sort_tables take: {e}")))
+        })
+        .collect();
+    RecordBatch::try_new(batch.schema(), cols?)
+        .map_err(|e| Error::data_loss().message(format!("sort_tables build: {e}")))
 }
 
 /// Reshape `SHOW COLUMNS IN CATALOG` output.

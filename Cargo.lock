@@ -397,6 +397,7 @@ dependencies = [
  "arrow-buffer",
  "arrow-cast",
  "arrow-ipc",
+ "arrow-ord",
  "arrow-schema",
  "arrow-select",
  "async-trait",

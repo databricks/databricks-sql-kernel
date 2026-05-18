@@ -82,13 +82,32 @@
 
 use crate::kernel_error::{Error, Result};
 use crate::metadata::jdbc_shape::{
-    self, JdbcReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA, GET_SCHEMAS_SCHEMA,
-    GET_TABLES_SCHEMA,
+    self, is_object_not_found, JdbcReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
+    GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
 };
 use crate::metadata::static_data;
+use crate::reader::EmptyReader;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
+use arrow_schema::SchemaRef;
 use std::sync::Arc;
+
+/// JDBC's `DatabaseMetaData` contract: metadata methods return an
+/// empty result set for non-existent catalogs / schemas / tables
+/// rather than raising. Translate `is_object_not_found` errors into
+/// an empty stream typed to the operation's JDBC schema; pass other
+/// errors through. Matches the JDBC driver's
+/// `isObjectNotFoundException → empty getXResult` pattern.
+fn not_found_or<F>(err: Error, schema: SchemaRef, otherwise: F) -> Result<ResultStream>
+where
+    F: FnOnce(Error) -> Result<ResultStream>,
+{
+    if is_object_not_found(&err) {
+        ResultStream::from_reader(Box::new(EmptyReader::new(schema)))
+    } else {
+        otherwise(err)
+    }
+}
 
 /// Databricks identifier-length cap. Matches the server-side limit;
 /// reject longer strings client-side so we fail fast with a clear
@@ -251,7 +270,7 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
-        let raw = self
+        let raw = match self
             .session
             .transport()
             .list_schemas(
@@ -259,7 +278,11 @@ impl Metadata {
                 catalog.as_ref().map(|i| i.as_str()),
                 schema_pattern.as_ref().map(|p| p.as_str()),
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err),
+        };
         let reshaped = JdbcReshapingReader::new(
             raw.reader,
             GET_SCHEMAS_SCHEMA.clone(),
@@ -293,7 +316,7 @@ impl Metadata {
         let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
         let types_owned: Option<Vec<String>> =
             table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
-        let raw = self
+        let raw = match self
             .session
             .transport()
             .list_tables(
@@ -303,7 +326,11 @@ impl Metadata {
                 table_pattern.as_ref().map(|p| p.as_str()),
                 table_types,
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err),
+        };
         let reshaped = JdbcReshapingReader::new(
             raw.reader,
             GET_TABLES_SCHEMA.clone(),
@@ -317,8 +344,16 @@ impl Metadata {
         ResultStream::from_reader(Box::new(reshaped))
     }
 
-    /// Columns of tables matching the filter. Catalog is exact;
-    /// schema / table / column are patterns.
+    /// Columns of tables matching the filter. Catalog is optional and
+    /// exact; schema / table / column are patterns.
+    ///
+    /// `catalog = None` emits `SHOW COLUMNS IN ALL CATALOGS` and
+    /// returns rows from every catalog visible to the session. The
+    /// server response carries a `catalogName` column so each row's
+    /// `TABLE_CAT` is filled correctly without client-side
+    /// enumeration. (JDBC's `getColumns(null, …)` historically
+    /// enumerates catalogs and unions the results; the kernel does
+    /// it in a single round trip.)
     ///
     /// JDBC `getColumns` shape: 23 columns — `TABLE_CAT, TABLE_SCHEM,
     /// TABLE_NAME, COLUMN_NAME, DATA_TYPE, TYPE_NAME, COLUMN_SIZE,
@@ -326,17 +361,13 @@ impl Metadata {
     /// REMARKS, COLUMN_DEF, SQL_DATA_TYPE, SQL_DATETIME_SUB,
     /// CHAR_OCTET_LENGTH, ORDINAL_POSITION, IS_NULLABLE,
     /// SCOPE_CATALOG, SCOPE_SCHEMA, SCOPE_TABLE, SOURCE_DATA_TYPE,
-    /// IS_AUTOINCREMENT`. `DATA_TYPE` is derived per-row from the
+    /// IS_AUTO_INCREMENT`. `DATA_TYPE` is derived per-row from the
     /// server's `columnType` string via the JDBC type-code table;
     /// `TYPE_NAME` preserves the server's precise type string.
     /// Columns without a server-side source (`BUFFER_LENGTH`,
     /// `SQL_DATA_TYPE`, `SQL_DATETIME_SUB`, `CHAR_OCTET_LENGTH`,
     /// `COLUMN_DEF`, `SCOPE_*`, `SOURCE_DATA_TYPE`) are emitted as
     /// null per JDBC spec.
-    ///
-    /// Catalog is **required**: Databricks `SHOW COLUMNS` does not
-    /// support an "all catalogs" form. `None` returns
-    /// `InvalidArgument`.
     pub async fn list_columns(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -345,27 +376,26 @@ impl Metadata {
         column_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
-        let catalog = catalog.ok_or_else(|| {
-            Error::invalid_argument().message(
-                "list_columns requires a catalog (SHOW COLUMNS IN ALL CATALOGS is unsupported)",
-            )
-        })?;
-        let catalog_str = catalog.as_str().to_owned();
-        let raw = self
+        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
+        let raw = match self
             .session
             .transport()
             .list_columns(
                 self.session.session_id(),
-                catalog.as_str(),
+                catalog.as_ref().map(|i| i.as_str()),
                 schema_pattern.as_ref().map(|p| p.as_str()),
                 table_pattern.as_ref().map(|p| p.as_str()),
                 column_pattern.as_ref().map(|p| p.as_str()),
             )
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err),
+        };
         let reshaped = JdbcReshapingReader::new(
             raw.reader,
             GET_COLUMNS_SCHEMA.clone(),
-            Box::new(move |b| jdbc_shape::reshape_columns(b, Some(catalog_str.as_str()))),
+            Box::new(move |b| jdbc_shape::reshape_columns(b, catalog_str.as_deref())),
         );
         ResultStream::from_reader(Box::new(reshaped))
     }
