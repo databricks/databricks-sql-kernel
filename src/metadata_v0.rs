@@ -15,36 +15,46 @@
 //! `Metadata` — flat per-method catalog metadata API.
 //!
 //! Per `docs/spec-v0.md` "Metadata", the kernel exposes one method per
-//! ODBC metadata call. The kernel **does not reshape** the returned
-//! columns — it issues the appropriate `SHOW` / `information_schema`
-//! query and exposes the server-shaped Arrow batch verbatim through
-//! a `ResultStream`. PySQL and Node consume those batches directly;
-//! JDBC and ODBC drivers translate to their respective spec column
-//! names (a rename layer they already maintain).
+//! ODBC metadata call. The kernel returns **JDBC-shape**
+//! [`java.sql.DatabaseMetaData`](https://docs.oracle.com/javase/8/docs/api/java/sql/DatabaseMetaData.html)
+//! result schemas for the four core methods (`list_catalogs`,
+//! `list_schemas`, `list_tables`, `list_columns`): the kernel
+//! issues the appropriate `SHOW` / `information_schema` query,
+//! reshapes the server response (rename columns, synthesize
+//! JDBC-only columns as nulls, derive `DATA_TYPE` integer codes),
+//! and exposes the JDBC-shape Arrow batch through a `ResultStream`.
+//! See [`crate::metadata::jdbc_shape`] for the schemas and reshape
+//! logic.
 //!
-//! The kernel owns the **wire plumbing**: SQL building, retry,
-//! cancellation, paging, schema discovery, error mapping. It does
-//! **not** own the JDBC/ODBC column-name contract.
+//! Rationale: JDBC, ODBC, and the existing PySQL / Node drivers all
+//! surface the JDBC `DatabaseMetaData` column-name contract to their
+//! users. Pushing the reshape into the kernel keeps every binding
+//! free of duplicated rename + synthesis code. ADBC `GetObjects` is
+//! the one outlier (deeply nested Arrow struct); the ADBC binding
+//! restructures from the JDBC-shape rows.
 //!
-//! Server-shape examples (subject to change with DBR; see
-//! `docs/migration-plan.md`):
+//! JDBC-shape contracts for the four core methods:
 //!
-//! - `list_catalogs` → `catalog: Utf8`
-//! - `list_schemas` → `databaseName: Utf8` (+ `catalog: Utf8` when
-//!   `SHOW SCHEMAS IN ALL CATALOGS`)
-//! - `list_tables` → `catalogName, namespace, tableName, tableType,
-//!   isTemporary, information?, remarks?`
-//! - `list_columns` → `col_name, catalogName?, namespace, tableName,
-//!   columnType, columnSize?, …`
-//! - `primary_keys` / `foreign_keys` → `catalogName, namespace,
-//!   tableName, col_name, keySeq, constraintName, constraintType,
-//!   parentCatalogName, parentNamespace, parentTableName,
-//!   parentColName, updateRule, deleteRule, deferrability`
-//! - `procedures` / `functions` → `routine_catalog, routine_schema,
-//!   routine_name, comment, specific_name`
-//! - `type_info` / `table_types` → no server-native shape; the
-//!   kernel synthesises results using the JDBC `getTypeInfo` /
-//!   `getTableTypes` schemas (see [`crate::metadata::schemas`]).
+//! - `list_catalogs` → `TABLE_CAT: Utf8`
+//! - `list_schemas` → `TABLE_SCHEM, TABLE_CATALOG`
+//! - `list_tables` → `TABLE_CAT, TABLE_SCHEM, TABLE_NAME, TABLE_TYPE,
+//!   REMARKS, TYPE_CAT, TYPE_SCHEM, TYPE_NAME,
+//!   SELF_REFERENCING_COL_NAME, REF_GENERATION` (last 5 always null
+//!   per JDBC spec). `table_types`, when provided, filters rows on
+//!   `TABLE_TYPE` kernel-side (Databricks `SHOW TABLES` doesn't
+//!   honour the filter server-side).
+//! - `list_columns` → 23 columns mirroring JDBC `getColumns`.
+//!   `DATA_TYPE` is derived from the server's `columnType` string
+//!   via the canonical JDBC type-code table; `TYPE_NAME` preserves
+//!   the precise server type so wrappers retain access to it.
+//!
+//! `primary_keys`, `foreign_keys`, `procedures`, `functions` still
+//! pass server shape through unchanged — those reshapes are not yet
+//! implemented and remain a wrapper responsibility.
+//!
+//! `type_info` / `table_types` have no server-native shape; the
+//! kernel synthesises results using the JDBC `getTypeInfo` /
+//! `getTableTypes` schemas (see [`crate::metadata::schemas`]).
 //!
 //! ## Identifier vs LIKE pattern
 //!
@@ -71,6 +81,10 @@
 //! addendum A2 for the rationale.
 
 use crate::kernel_error::{Error, Result};
+use crate::metadata::jdbc_shape::{
+    self, JdbcReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA, GET_SCHEMAS_SCHEMA,
+    GET_TABLES_SCHEMA,
+};
 use crate::metadata::static_data;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
@@ -208,7 +222,7 @@ impl Metadata {
 
     /// All catalogs visible to the session.
     ///
-    /// Server shape: `catalog: Utf8`.
+    /// JDBC `getCatalogs` shape: `TABLE_CAT: Utf8`.
     pub async fn list_catalogs(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         let raw = self
@@ -216,22 +230,27 @@ impl Metadata {
             .transport()
             .list_catalogs(self.session.session_id())
             .await?;
-        ResultStream::from_reader(raw.reader)
+        let reshaped = JdbcReshapingReader::new(
+            raw.reader,
+            GET_CATALOGS_SCHEMA.clone(),
+            Box::new(jdbc_shape::reshape_catalogs),
+        );
+        ResultStream::from_reader(Box::new(reshaped))
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
     ///
-    /// Server shape: `databaseName: Utf8`. When `catalog` is `None`
-    /// (`SHOW SCHEMAS IN ALL CATALOGS`), an additional `catalog:
-    /// Utf8` column is present. Wrappers that need a uniform shape
-    /// should add the catalog column themselves from the requested
-    /// `catalog` argument when omitted.
+    /// JDBC `getSchemas` shape: `TABLE_SCHEM: Utf8 (not null),
+    /// TABLE_CATALOG: Utf8`. When the underlying server response omits
+    /// the catalog column (single-catalog `SHOW SCHEMAS IN <catalog>`
+    /// form), `TABLE_CATALOG` is filled from the `catalog` argument.
     pub async fn list_schemas(
         &self,
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
+        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
         let raw = self
             .session
             .transport()
@@ -241,20 +260,28 @@ impl Metadata {
                 schema_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        let reshaped = JdbcReshapingReader::new(
+            raw.reader,
+            GET_SCHEMAS_SCHEMA.clone(),
+            Box::new(move |b| jdbc_shape::reshape_schemas(b, catalog_str.as_deref())),
+        );
+        ResultStream::from_reader(Box::new(reshaped))
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
     /// (pattern).
     ///
-    /// Server shape: `catalogName, namespace, tableName, tableType,
-    /// isTemporary, information?, remarks?`.
+    /// JDBC `getTables` shape: 10 columns — `TABLE_CAT, TABLE_SCHEM,
+    /// TABLE_NAME, TABLE_TYPE, REMARKS, TYPE_CAT, TYPE_SCHEM,
+    /// TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION`. The
+    /// last five have no server-side source and are emitted as nulls
+    /// per JDBC spec.
     ///
-    /// `table_types` is an **advisory** filter — Databricks `SHOW
-    /// TABLES` does not honour it server-side, so the kernel passes
-    /// it through unchanged. Wrappers that need to narrow by
-    /// `tableType` apply the filter on the returned `tableType`
-    /// column.
+    /// `table_types`, when `Some(non-empty)`, filters the result to
+    /// rows whose `TABLE_TYPE` matches one of the listed strings —
+    /// matches `java.sql.DatabaseMetaData.getTables` behaviour.
+    /// Databricks `SHOW TABLES` itself does not accept a type filter,
+    /// so the filter is applied kernel-side after reshape.
     pub async fn list_tables(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -263,6 +290,9 @@ impl Metadata {
         table_types: Option<&[&str]>,
     ) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
+        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
+        let types_owned: Option<Vec<String>> =
+            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
         let raw = self
             .session
             .transport()
@@ -274,15 +304,35 @@ impl Metadata {
                 table_types,
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        let reshaped = JdbcReshapingReader::new(
+            raw.reader,
+            GET_TABLES_SCHEMA.clone(),
+            Box::new(move |b| {
+                let types_ref: Option<Vec<&str>> = types_owned
+                    .as_ref()
+                    .map(|v| v.iter().map(|s| s.as_str()).collect());
+                jdbc_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
+            }),
+        );
+        ResultStream::from_reader(Box::new(reshaped))
     }
 
     /// Columns of tables matching the filter. Catalog is exact;
     /// schema / table / column are patterns.
     ///
-    /// Server shape: `col_name, catalogName?, namespace, tableName,
-    /// columnType, columnSize?, decimalDigits?, radix?, isNullable?,
-    /// remarks?, ordinalPosition?, isAutoIncrement?, isGenerated?`.
+    /// JDBC `getColumns` shape: 23 columns — `TABLE_CAT, TABLE_SCHEM,
+    /// TABLE_NAME, COLUMN_NAME, DATA_TYPE, TYPE_NAME, COLUMN_SIZE,
+    /// BUFFER_LENGTH, DECIMAL_DIGITS, NUM_PREC_RADIX, NULLABLE,
+    /// REMARKS, COLUMN_DEF, SQL_DATA_TYPE, SQL_DATETIME_SUB,
+    /// CHAR_OCTET_LENGTH, ORDINAL_POSITION, IS_NULLABLE,
+    /// SCOPE_CATALOG, SCOPE_SCHEMA, SCOPE_TABLE, SOURCE_DATA_TYPE,
+    /// IS_AUTOINCREMENT`. `DATA_TYPE` is derived per-row from the
+    /// server's `columnType` string via the JDBC type-code table;
+    /// `TYPE_NAME` preserves the server's precise type string.
+    /// Columns without a server-side source (`BUFFER_LENGTH`,
+    /// `SQL_DATA_TYPE`, `SQL_DATETIME_SUB`, `CHAR_OCTET_LENGTH`,
+    /// `COLUMN_DEF`, `SCOPE_*`, `SOURCE_DATA_TYPE`) are emitted as
+    /// null per JDBC spec.
     ///
     /// Catalog is **required**: Databricks `SHOW COLUMNS` does not
     /// support an "all catalogs" form. `None` returns
@@ -300,6 +350,7 @@ impl Metadata {
                 "list_columns requires a catalog (SHOW COLUMNS IN ALL CATALOGS is unsupported)",
             )
         })?;
+        let catalog_str = catalog.as_str().to_owned();
         let raw = self
             .session
             .transport()
@@ -311,7 +362,12 @@ impl Metadata {
                 column_pattern.as_ref().map(|p| p.as_str()),
             )
             .await?;
-        ResultStream::from_reader(raw.reader)
+        let reshaped = JdbcReshapingReader::new(
+            raw.reader,
+            GET_COLUMNS_SCHEMA.clone(),
+            Box::new(move |b| jdbc_shape::reshape_columns(b, Some(catalog_str.as_str()))),
+        );
+        ResultStream::from_reader(Box::new(reshaped))
     }
 
     /// Primary keys for the given table. All three identifiers are
