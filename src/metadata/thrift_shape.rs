@@ -139,7 +139,11 @@ pub(crate) static GET_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("SQL_DATA_TYPE", DataType::Int32, true),
         Field::new("SQL_DATETIME_SUB", DataType::Int32, true),
         Field::new("CHAR_OCTET_LENGTH", DataType::Int32, true),
-        Field::new("ORDINAL_POSITION", DataType::Int32, false),
+        // JDBC spec says non-null, but older DBR builds may omit
+        // `ordinalPosition` from the `SHOW COLUMNS` response. Declare
+        // nullable so the reshape doesn't fail on those rows; modern
+        // DBR populates it and the value flows through.
+        Field::new("ORDINAL_POSITION", DataType::Int32, true),
         Field::new("IS_NULLABLE", DataType::Utf8, false),
         Field::new("SCOPE_CATALOG", DataType::Utf8, true),
         Field::new("SCOPE_SCHEMA", DataType::Utf8, true),
@@ -165,23 +169,37 @@ fn column_index(schema: &Schema, name: &str) -> Option<usize> {
     schema.fields().iter().position(|f| f.name() == name)
 }
 
-/// Return the named source column cast to `Utf8`. Returns a fresh all-null
-/// array when the column is missing or the cast fails (extreme edge case).
-fn utf8_column(batch: &RecordBatch, name: &str) -> ArrayRef {
+/// Return the named source column as a `Utf8` array, casting from a
+/// related string type (`LargeUtf8`, dictionary-encoded Utf8, …) if
+/// necessary. Returns a fresh all-null array when the column is
+/// absent from the source schema — older DBR builds omit columns
+/// modern DBR includes, and the synthesised null lets the reshape
+/// proceed.
+///
+/// A cast failure is surfaced as `Error::data_loss` rather than
+/// silently producing nulls. Identifier columns in `SHOW *` responses
+/// have always been `Utf8`; if a future DBR returns a genuinely
+/// incompatible type, the kernel should fail loudly rather than emit
+/// rows the JDBC schema then rejects at `RecordBatch::try_new` with a
+/// confusing nullability-violation error.
+fn utf8_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     match column_index(batch.schema_ref(), name) {
         Some(idx) => {
             let col = batch.column(idx);
             if col.data_type() == &DataType::Utf8 {
-                Arc::clone(col)
+                Ok(Arc::clone(col))
             } else {
-                // Should not happen in practice: SHOW commands always
-                // return identifiers as Utf8. Cast as a safety net.
-                arrow_cast::cast(col.as_ref(), &DataType::Utf8).unwrap_or_else(|_| {
-                    Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()]))
+                arrow_cast::cast(col.as_ref(), &DataType::Utf8).map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "unexpected non-Utf8 type for SHOW response column {name:?}: {e}"
+                    ))
                 })
             }
         }
-        None => Arc::new(StringArray::from(vec![None::<&str>; batch.num_rows()])),
+        None => Ok(Arc::new(StringArray::from(vec![
+            None::<&str>;
+            batch.num_rows()
+        ]))),
     }
 }
 
@@ -200,20 +218,29 @@ fn constant_utf8(len: usize, value: Option<&str>) -> ArrayRef {
     Arc::new(StringArray::from(vec![v; len]))
 }
 
-/// Cast a source column to `Int32`, replacing failures with all-null.
-fn int32_column(batch: &RecordBatch, name: &str) -> ArrayRef {
+/// Return the named source column as an `Int32` array, casting from a
+/// related integer type if necessary. Returns an all-null `Int32`
+/// array when the column is absent — symmetric with [`utf8_column`].
+/// A cast failure is surfaced as `Error::data_loss` rather than
+/// silently producing nulls.
+fn int32_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     match column_index(batch.schema_ref(), name) {
         Some(idx) => {
             let col = batch.column(idx);
             if col.data_type() == &DataType::Int32 {
-                Arc::clone(col)
+                Ok(Arc::clone(col))
             } else {
-                arrow_cast::cast(col.as_ref(), &DataType::Int32).unwrap_or_else(|_| {
-                    Arc::new(Int32Array::from(vec![None::<i32>; batch.num_rows()]))
+                arrow_cast::cast(col.as_ref(), &DataType::Int32).map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "unexpected non-Int32 type for SHOW response column {name:?}: {e}"
+                    ))
                 })
             }
         }
-        None => Arc::new(Int32Array::from(vec![None::<i32>; batch.num_rows()])),
+        None => Ok(Arc::new(Int32Array::from(vec![
+            None::<i32>;
+            batch.num_rows()
+        ]))),
     }
 }
 
@@ -221,11 +248,47 @@ fn null_int32(len: usize) -> ArrayRef {
     Arc::new(Int32Array::from(vec![None::<i32>; len]))
 }
 
+/// Map a server-side `"true"` / `"false"` string column to JDBC's
+/// `"YES"` / `"NO"` / `""` convention. Used for `IS_NULLABLE` and
+/// `IS_AUTO_INCREMENT` in `reshape_columns`; both follow the same
+/// rule (JDBC defines an empty string when the value is "unknown",
+/// which we use for null / unrecognised inputs). Missing source
+/// column → all-empty string array.
+fn bool_string_to_yn(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    let n = batch.num_rows();
+    let Some(idx) = column_index(batch.schema_ref(), name) else {
+        return Ok(Arc::new(StringArray::from(vec![Some(""); n])));
+    };
+    let arr = batch.column(idx);
+    let strs = arrow_cast::cast(arr.as_ref(), &DataType::Utf8).map_err(|e| {
+        Error::data_loss().message(format!(
+            "unexpected non-Utf8 type for SHOW response column {name:?}: {e}"
+        ))
+    })?;
+    let strs = strs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+        Error::data_loss().message(format!("{name} cast did not yield StringArray"))
+    })?;
+    let labels: Vec<&str> = (0..n)
+        .map(|i| {
+            if strs.is_null(i) {
+                ""
+            } else {
+                match strs.value(i) {
+                    "true" => "YES",
+                    "false" => "NO",
+                    _ => "",
+                }
+            }
+        })
+        .collect();
+    Ok(Arc::new(StringArray::from(labels)))
+}
+
 // ─── Per-operation reshape ─────────────────────────────────────────
 
 /// Reshape `SHOW CATALOGS` output. Server returns `catalog: Utf8`.
 pub(crate) fn reshape_catalogs(batch: &RecordBatch) -> Result<RecordBatch> {
-    let table_cat = utf8_column(batch, "catalog");
+    let table_cat = utf8_column(batch, "catalog")?;
     RecordBatch::try_new(GET_CATALOGS_SCHEMA.clone(), vec![table_cat])
         .map_err(|e| Error::data_loss().message(format!("reshape catalogs: {e}")))
 }
@@ -244,9 +307,9 @@ pub(crate) fn reshape_schemas(
     batch: &RecordBatch,
     requested_catalog: Option<&str>,
 ) -> Result<RecordBatch> {
-    let table_schem = utf8_column(batch, "databaseName");
+    let table_schem = utf8_column(batch, "databaseName")?;
     let table_catalog = if column_index(batch.schema_ref(), "catalog").is_some() {
-        utf8_column(batch, "catalog")
+        utf8_column(batch, "catalog")?
     } else {
         constant_utf8(batch.num_rows(), requested_catalog)
     };
@@ -272,21 +335,21 @@ pub(crate) fn reshape_tables(
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
     let table_cat = if column_index(batch.schema_ref(), "catalogName").is_some() {
-        utf8_column(batch, "catalogName")
+        utf8_column(batch, "catalogName")?
     } else {
         constant_utf8(n, requested_catalog)
     };
-    let table_schem = utf8_column(batch, "namespace");
-    let table_name = utf8_column(batch, "tableName");
+    let table_schem = utf8_column(batch, "namespace")?;
+    let table_name = utf8_column(batch, "tableName")?;
     let table_type = if column_index(batch.schema_ref(), "tableType").is_some() {
-        utf8_column(batch, "tableType")
+        utf8_column(batch, "tableType")?
     } else {
         // Old DBR fallback: best-effort default. Matches the JDBC
         // driver's behaviour when SHOW TABLES doesn't expose tableType.
         Arc::new(StringArray::from(vec![Some("TABLE"); n]))
     };
     let remarks = if column_index(batch.schema_ref(), "remarks").is_some() {
-        utf8_column(batch, "remarks")
+        utf8_column(batch, "remarks")?
     } else {
         Arc::new(StringArray::from(vec![Some(""); n]))
     };
@@ -383,14 +446,14 @@ pub(crate) fn reshape_columns(
 ) -> Result<RecordBatch> {
     let n = batch.num_rows();
     let table_cat = if column_index(batch.schema_ref(), "catalogName").is_some() {
-        utf8_column(batch, "catalogName")
+        utf8_column(batch, "catalogName")?
     } else {
         constant_utf8(n, requested_catalog)
     };
-    let table_schem = utf8_column(batch, "namespace");
-    let table_name = utf8_column(batch, "tableName");
-    let column_name = utf8_column(batch, "col_name");
-    let column_type_arr = utf8_column(batch, "columnType");
+    let table_schem = utf8_column(batch, "namespace")?;
+    let table_name = utf8_column(batch, "tableName")?;
+    let column_name = utf8_column(batch, "col_name")?;
+    let column_type_arr = utf8_column(batch, "columnType")?;
 
     // DATA_TYPE: JDBC integer type code derived per row from columnType.
     let column_type_strs = column_type_arr.as_any().downcast_ref::<StringArray>();
@@ -416,9 +479,9 @@ pub(crate) fn reshape_columns(
     // TYPE_NAME: the precise server-reported type string, preserved.
     let type_name = column_type_arr;
 
-    let column_size = int32_column(batch, "columnSize");
-    let decimal_digits = int32_column(batch, "decimalDigits");
-    let num_prec_radix = int32_column(batch, "radix");
+    let column_size = int32_column(batch, "columnSize")?;
+    let decimal_digits = int32_column(batch, "decimalDigits")?;
+    let num_prec_radix = int32_column(batch, "radix")?;
     // NULLABLE: JDBC integer code. SHOW COLUMNS returns "true"/"false"
     // as a string. Map: true → 1 (nullable), false → 0 (no nulls),
     // missing → 2 (unknown).
@@ -447,59 +510,12 @@ pub(crate) fn reshape_columns(
         }
         None => Arc::new(Int32Array::from(vec![2_i32; n])),
     };
-    let remarks = utf8_column(batch, "remarks");
-    let ordinal_position = int32_column(batch, "ordinalPosition");
-    // IS_NULLABLE: JDBC's "YES" / "NO" / "" string mirror of NULLABLE.
-    let is_nullable_str: ArrayRef = match column_index(batch.schema_ref(), "isNullable") {
-        Some(idx) => {
-            let arr = batch.column(idx);
-            let strs = arrow_cast::cast(arr.as_ref(), &DataType::Utf8)
-                .map_err(|e| Error::data_loss().message(format!("cast isNullable: {e}")))?;
-            let strs = strs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                Error::data_loss().message("isNullable cast did not yield StringArray")
-            })?;
-            let labels: Vec<&str> = (0..n)
-                .map(|i| {
-                    if strs.is_null(i) {
-                        ""
-                    } else {
-                        match strs.value(i) {
-                            "true" => "YES",
-                            "false" => "NO",
-                            _ => "",
-                        }
-                    }
-                })
-                .collect();
-            Arc::new(StringArray::from(labels))
-        }
-        None => Arc::new(StringArray::from(vec![Some(""); n])),
-    };
-    let is_autoincrement: ArrayRef = match column_index(batch.schema_ref(), "isAutoIncrement") {
-        Some(idx) => {
-            let arr = batch.column(idx);
-            let strs = arrow_cast::cast(arr.as_ref(), &DataType::Utf8)
-                .map_err(|e| Error::data_loss().message(format!("cast isAutoIncrement: {e}")))?;
-            let strs = strs.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
-                Error::data_loss().message("isAutoIncrement cast did not yield StringArray")
-            })?;
-            let labels: Vec<&str> = (0..n)
-                .map(|i| {
-                    if strs.is_null(i) {
-                        ""
-                    } else {
-                        match strs.value(i) {
-                            "true" => "YES",
-                            "false" => "NO",
-                            _ => "",
-                        }
-                    }
-                })
-                .collect();
-            Arc::new(StringArray::from(labels))
-        }
-        None => Arc::new(StringArray::from(vec![Some(""); n])),
-    };
+    let remarks = utf8_column(batch, "remarks")?;
+    let ordinal_position = int32_column(batch, "ordinalPosition")?;
+    // IS_NULLABLE / IS_AUTO_INCREMENT: server emits "true"/"false";
+    // JDBC contract is "YES"/"NO"/"" (empty for unknown).
+    let is_nullable_str = bool_string_to_yn(batch, "isNullable")?;
+    let is_autoincrement = bool_string_to_yn(batch, "isAutoIncrement")?;
 
     RecordBatch::try_new(
         GET_COLUMNS_SCHEMA.clone(),
@@ -615,6 +631,49 @@ impl ResultReader for ThriftReshapingReader {
 mod tests {
     use super::*;
     use arrow_array::{BooleanArray, RecordBatch};
+
+    // ─── is_object_not_found tests ─────────────────────────────────
+
+    fn err(state: Option<&str>, message: &str) -> Error {
+        let mut e = Error::sql_error().message(message);
+        if let Some(s) = state {
+            e = e.with_sql_state(s);
+        }
+        e
+    }
+
+    #[test]
+    fn is_object_not_found_matches_sqlstate_42704() {
+        assert!(is_object_not_found(&err(Some("42704"), "anything goes")));
+    }
+
+    #[test]
+    fn is_object_not_found_matches_known_message_substrings() {
+        for substring in [
+            "NO_SUCH_CATALOG_EXCEPTION",
+            "TABLE_OR_VIEW_NOT_FOUND",
+            "SCHEMA_NOT_FOUND",
+            "INVALID_PARAMETER_VALUE",
+        ] {
+            let msg = format!("[{substring}] details follow");
+            assert!(
+                is_object_not_found(&err(None, &msg)),
+                "expected {substring} to be detected"
+            );
+        }
+    }
+
+    #[test]
+    fn is_object_not_found_rejects_unrelated_errors() {
+        // Authn error — different SQL state, different message.
+        let auth_err = err(Some("28000"), "Invalid credentials");
+        assert!(!is_object_not_found(&auth_err));
+        // Runtime error with no SQL state and a non-matching message.
+        let runtime_err = err(None, "Server-internal failure");
+        assert!(!is_object_not_found(&runtime_err));
+    }
+
+    // ─── reshape tests ─────────────────────────────────────────────
 
     fn server_catalogs(rows: &[&str]) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new(

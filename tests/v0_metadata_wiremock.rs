@@ -18,15 +18,19 @@
 //! `POST /sessions` and `POST /statements` endpoints, encoding a
 //! synthesised Databricks Arrow batch as inline base64. We then drive
 //! the call through `Session::open` + `Metadata::*` and assert that
-//! the returned `ResultStream` exposes the **server-shaped** columns
-//! verbatim — the kernel does not rename or filter.
+//! the returned `ResultStream` exposes the **Thrift-compatible**
+//! column shape — the kernel renames server columns
+//! (`catalog → TABLE_CAT`, `databaseName → TABLE_SCHEM`, …),
+//! synthesises JDBC-only columns where the server omits them, and
+//! sorts where the JDBC contract requires. See
+//! `src/metadata/thrift_shape.rs`.
 //!
 //! Static methods (`type_info`, `table_types`) skip the wire entirely
 //! and verify the synthesised JDBC-shape result the kernel
 //! constructs locally.
 //!
 //! Validation errors (empty identifier, `None` catalog on
-//! `list_columns`, etc.) are also covered here.
+//! `primary_keys`, etc.) are also covered here.
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
@@ -149,6 +153,28 @@ fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
+/// Mixed-type RecordBatch builder for `list_columns` fixtures, which
+/// need `ordinalPosition: Int32` alongside the string columns.
+fn columns_batch(
+    str_cols: Vec<(&str, Vec<Option<&str>>)>,
+    ordinal_positions: Vec<Option<i32>>,
+) -> RecordBatch {
+    use arrow_array::Int32Array;
+    let n = str_cols[0].1.len();
+    assert_eq!(ordinal_positions.len(), n);
+    let mut fields: Vec<Field> = str_cols
+        .iter()
+        .map(|(n, _)| Field::new(*n, DataType::Utf8, true))
+        .collect();
+    fields.push(Field::new("ordinalPosition", DataType::Int32, true));
+    let mut arrays: Vec<ArrayRef> = str_cols
+        .iter()
+        .map(|(_, v)| Arc::new(StringArray::from(v.clone())) as ArrayRef)
+        .collect();
+    arrays.push(Arc::new(Int32Array::from(ordinal_positions)));
+    RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+}
+
 async fn drain_stream(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("next_batch") {
@@ -164,10 +190,10 @@ fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
     schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
-// ─── Pass-through tests ─────────────────────────────────────────────
+// ─── Thrift-shape reshape tests ─────────────────────────────────────
 
 #[tokio::test]
-async fn list_catalogs_passes_server_columns_through() {
+async fn list_catalogs_returns_table_cat_column() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -185,8 +211,8 @@ async fn list_catalogs_passes_server_columns_through() {
         .await
         .expect("list_catalogs");
 
-    // Server shape: single `catalog` column.
-    assert_eq!(col_names(&stream.schema()), vec!["catalog"]);
+    // Kernel renames the server's `catalog` column to `TABLE_CAT`.
+    assert_eq!(col_names(&stream.schema()), vec!["TABLE_CAT"]);
 
     let batches = drain_stream(&mut stream).await;
     let names = batches[0].column(0).as_string::<i32>();
@@ -195,12 +221,13 @@ async fn list_catalogs_passes_server_columns_through() {
 }
 
 #[tokio::test]
-async fn list_schemas_passes_server_columns_through() {
+async fn list_schemas_returns_jdbc_columns_with_synthesised_catalog() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
-    // SHOW SCHEMAS IN `main` returns only databaseName.
+    // `SHOW SCHEMAS IN <catalog>` returns only `databaseName`. The
+    // kernel synthesises `TABLE_CATALOG` from the request argument.
     let raw = string_batch(vec![(
         "databaseName",
         vec![Some("default"), Some("information_schema")],
@@ -214,26 +241,31 @@ async fn list_schemas_passes_server_columns_through() {
         .await
         .expect("list_schemas");
 
-    // Server shape: just `databaseName` (no synthesised catalog
-    // column — the kernel passes through what the server returned).
-    assert_eq!(col_names(&stream.schema()), vec!["databaseName"]);
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec!["TABLE_SCHEM", "TABLE_CATALOG"]
+    );
 
     let batches = drain_stream(&mut stream).await;
-    let arr = batches[0].column(0).as_string::<i32>();
-    assert_eq!(arr.value(0), "default");
-    assert_eq!(arr.value(1), "information_schema");
+    let schem = batches[0].column(0).as_string::<i32>();
+    let cat = batches[0].column(1).as_string::<i32>();
+    assert_eq!(schem.value(0), "default");
+    assert_eq!(schem.value(1), "information_schema");
+    // Catalog argument echoed into TABLE_CATALOG for every row.
+    assert_eq!(cat.value(0), "main");
+    assert_eq!(cat.value(1), "main");
 }
 
 #[tokio::test]
-async fn list_tables_passes_server_columns_through() {
+async fn list_tables_returns_jdbc_columns_with_synthesised_nulls() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
     let raw = string_batch(vec![
-        ("catalogName", vec![Some("main")]),
         ("namespace", vec![Some("default")]),
         ("tableName", vec![Some("t1")]),
+        ("catalogName", vec![Some("main")]),
         ("tableType", vec![Some("TABLE")]),
     ]);
     mount_execute(&server, succeeded_inline_response_body(&raw)).await;
@@ -245,35 +277,60 @@ async fn list_tables_passes_server_columns_through() {
         .await
         .expect("list_tables");
 
+    // JDBC `getTables` 10-column shape.
     assert_eq!(
         col_names(&stream.schema()),
-        vec!["catalogName", "namespace", "tableName", "tableType"]
+        vec![
+            "TABLE_CAT",
+            "TABLE_SCHEM",
+            "TABLE_NAME",
+            "TABLE_TYPE",
+            "REMARKS",
+            "TYPE_CAT",
+            "TYPE_SCHEM",
+            "TYPE_NAME",
+            "SELF_REFERENCING_COL_NAME",
+            "REF_GENERATION",
+        ]
     );
 
     let batches = drain_stream(&mut stream).await;
     assert_eq!(batches[0].num_rows(), 1);
     assert_eq!(
         batches[0]
-            .column_by_name("tableType")
+            .column_by_name("TABLE_TYPE")
             .unwrap()
             .as_string::<i32>()
             .value(0),
         "TABLE"
     );
+    // Synthesised JDBC-only columns are all null.
+    for col in [
+        "TYPE_CAT",
+        "TYPE_SCHEM",
+        "TYPE_NAME",
+        "SELF_REFERENCING_COL_NAME",
+        "REF_GENERATION",
+    ] {
+        assert!(
+            batches[0].column_by_name(col).unwrap().is_null(0),
+            "{col} should be null"
+        );
+    }
 }
 
 #[tokio::test]
-async fn list_tables_table_types_arg_is_advisory_no_op() {
+async fn list_tables_table_types_filters_kernel_side() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
-    // Both rows are returned even though the caller asked for only
-    // VIEW: the kernel does not filter post-fetch.
+    // The Databricks server doesn't honour `table_types` on
+    // `SHOW TABLES`; the kernel filters on `TABLE_TYPE` after reshape.
     let raw = string_batch(vec![
-        ("catalogName", vec![Some("main"), Some("main")]),
         ("namespace", vec![Some("d"), Some("d")]),
         ("tableName", vec![Some("t1"), Some("v1")]),
+        ("catalogName", vec![Some("main"), Some("main")]),
         ("tableType", vec![Some("TABLE"), Some("VIEW")]),
     ]);
     mount_execute(&server, succeeded_inline_response_body(&raw)).await;
@@ -286,23 +343,83 @@ async fn list_tables_table_types_arg_is_advisory_no_op() {
         .expect("list_tables");
 
     let batches = drain_stream(&mut stream).await;
-    assert_eq!(batches[0].num_rows(), 2, "kernel passes both rows through");
+    assert_eq!(batches[0].num_rows(), 1, "kernel filters to VIEW only");
+    assert_eq!(
+        batches[0]
+            .column_by_name("TABLE_NAME")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "v1"
+    );
 }
 
 #[tokio::test]
-async fn list_columns_passes_server_columns_through() {
+async fn list_tables_sorted_by_jdbc_key() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
+    // Rows arrive in deliberately scrambled order — the kernel must
+    // sort by (TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME) to
+    // match JDBC's `getTables` row order ("matching Thrift mode" per
+    // JDBC's `MetadataResultSetBuilder`).
     let raw = string_batch(vec![
-        ("catalogName", vec![Some("main")]),
-        ("namespace", vec![Some("default")]),
-        ("tableName", vec![Some("t")]),
-        ("col_name", vec![Some("id")]),
-        ("columnType", vec![Some("INT")]),
-        ("isNullable", vec![Some("false")]),
+        ("namespace", vec![Some("s2"), Some("s1"), Some("s1")]),
+        ("tableName", vec![Some("z"), Some("a"), Some("b")]),
+        (
+            "catalogName",
+            vec![Some("main"), Some("main"), Some("main")],
+        ),
+        (
+            "tableType",
+            vec![Some("VIEW"), Some("TABLE"), Some("TABLE")],
+        ),
     ]);
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(None, None, None, None)
+        .await
+        .expect("list_tables");
+
+    let batches = drain_stream(&mut stream).await;
+    let types = batches[0]
+        .column_by_name("TABLE_TYPE")
+        .unwrap()
+        .as_string::<i32>();
+    let names = batches[0]
+        .column_by_name("TABLE_NAME")
+        .unwrap()
+        .as_string::<i32>();
+    // TABLE rows come before VIEW; within TABLE, sorted by name.
+    assert_eq!(types.value(0), "TABLE");
+    assert_eq!(names.value(0), "a");
+    assert_eq!(types.value(1), "TABLE");
+    assert_eq!(names.value(1), "b");
+    assert_eq!(types.value(2), "VIEW");
+    assert_eq!(names.value(2), "z");
+}
+
+#[tokio::test]
+async fn list_columns_returns_jdbc_columns_with_data_type_derived() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = columns_batch(
+        vec![
+            ("col_name", vec![Some("id")]),
+            ("catalogName", vec![Some("main")]),
+            ("namespace", vec![Some("default")]),
+            ("tableName", vec![Some("t")]),
+            ("columnType", vec![Some("INT")]),
+            ("isNullable", vec![Some("false")]),
+        ],
+        vec![Some(1)],
+    );
     mount_execute(&server, succeeded_inline_response_body(&raw)).await;
 
     let session = open_session(&server).await;
@@ -312,45 +429,87 @@ async fn list_columns_passes_server_columns_through() {
         .await
         .expect("list_columns");
 
-    assert_eq!(
-        col_names(&stream.schema()),
-        vec![
-            "catalogName",
-            "namespace",
-            "tableName",
-            "col_name",
-            "columnType",
-            "isNullable",
-        ]
-    );
+    // 23-column JDBC `getColumns` shape.
+    assert_eq!(stream.schema().fields().len(), 23);
+    let names = col_names(&stream.schema());
+    assert_eq!(names[0], "TABLE_CAT");
+    assert_eq!(names[3], "COLUMN_NAME");
+    assert_eq!(names[4], "DATA_TYPE");
+    assert_eq!(names[5], "TYPE_NAME");
 
     let batches = drain_stream(&mut stream).await;
+    // TYPE_NAME preserves the server's precise string.
     assert_eq!(
         batches[0]
-            .column_by_name("columnType")
+            .column_by_name("TYPE_NAME")
             .unwrap()
             .as_string::<i32>()
             .value(0),
         "INT"
     );
+    // DATA_TYPE is the JDBC integer code: INT → 4.
+    let data_type = batches[0]
+        .column_by_name("DATA_TYPE")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Int32Type>();
+    assert_eq!(data_type.value(0), 4);
+    // NULLABLE derived from isNullable=false → 0 (columnNoNulls).
+    let nullable = batches[0]
+        .column_by_name("NULLABLE")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Int32Type>();
+    assert_eq!(nullable.value(0), 0);
+    // IS_NULLABLE string mirror.
+    assert_eq!(
+        batches[0]
+            .column_by_name("IS_NULLABLE")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "NO"
+    );
 }
 
 #[tokio::test]
-async fn list_columns_without_catalog_errors() {
+async fn list_columns_without_catalog_emits_all_catalogs_query() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
+    // The kernel maps `catalog=None` to
+    // `SHOW COLUMNS IN ALL CATALOGS`; the server response carries
+    // `catalogName` so each row's TABLE_CAT is filled from the wire
+    // (not synthesised from the request).
+    let raw = columns_batch(
+        vec![
+            ("col_name", vec![Some("id")]),
+            ("catalogName", vec![Some("hive_metastore")]),
+            ("namespace", vec![Some("d")]),
+            ("tableName", vec![Some("t")]),
+            ("columnType", vec![Some("BIGINT")]),
+            ("isNullable", vec![Some("true")]),
+        ],
+        vec![Some(1)],
+    );
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+
     let session = open_session(&server).await;
-    let res = session
+    let mut stream = session
         .metadata()
         .list_columns(None, None, None, None)
-        .await;
-    use databricks_sql_kernel::ErrorCode;
-    match res {
-        Ok(_) => panic!("None catalog must error"),
-        Err(err) => assert_eq!(err.code, ErrorCode::InvalidArgument),
-    }
+        .await
+        .expect("list_columns with catalog=None should succeed");
+
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(
+        batches[0]
+            .column_by_name("TABLE_CAT")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "hive_metastore",
+        "TABLE_CAT is populated from the server's catalogName column"
+    );
 }
 
 #[tokio::test]
