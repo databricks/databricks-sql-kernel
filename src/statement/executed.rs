@@ -147,8 +147,13 @@ impl ExecutedStatementHandle for ExecutedStatement {
 
 impl Drop for ExecutedStatement {
     fn drop(&mut self) {
-        // If close() already ran, nothing to do.
-        if self.closed.load(Ordering::Acquire) {
+        // `swap` (not `load`) so the shared `closed` flag — held by the
+        // parent `Statement::last_closed` — reflects that Drop is now
+        // handling cleanup. Without this, a `drop(executed) → execute()
+        // again` sequence would have `invalidate_prior` fire a redundant
+        // `CloseStatement` racing the one we're about to spawn. The
+        // server is idempotent so it's harmless, but a wasted RPC.
+        if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Fire-and-forget CloseStatement. Drop must not panic and

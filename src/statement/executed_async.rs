@@ -381,7 +381,11 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
-        if self.closed.load(Ordering::Acquire) {
+        // `swap` (not `load`) so the shared `closed` flag — held by the
+        // parent `Statement::last_closed` — reflects that Drop is now
+        // handling cleanup, preventing a duplicate `CloseStatement`
+        // from `invalidate_prior` on the next `execute()` / `submit()`.
+        if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
         // Fire-and-forget close on the session's runtime — mirrors

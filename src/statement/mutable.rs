@@ -61,7 +61,7 @@ use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::params::typed_value_to_sea_parameter;
 use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
-use crate::types::sea::ExecuteParams;
+use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::warn;
@@ -157,10 +157,14 @@ impl Statement {
         guard.defuse();
 
         let valid = ValidityFlag::new();
-        let already_closed = matches!(
-            result.server_state,
-            crate::types::sea::StatementState::Closed
-        );
+        // Only `Closed` triggers the short-circuit. `Succeeded` means
+        // the server still owns the statement and we must issue
+        // CloseStatement. `Failed` / `Canceled` are terminal but still
+        // server-side-tracked — also fall through to the standard close
+        // path. See `prepare_for_dispatch` for why omitting
+        // `wait_timeout` typically yields `Closed` on the inline-result
+        // fast path.
+        let already_closed = result.server_state == StatementState::Closed;
         let closed = Arc::new(AtomicBool::new(already_closed));
         self.last_statement_id = Some(result.statement_id.clone());
         self.last_valid = Some(valid.clone());
