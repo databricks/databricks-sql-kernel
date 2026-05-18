@@ -17,7 +17,7 @@
 //!
 //! Schemas for the four wire-driven core methods (`list_catalogs`,
 //! `list_schemas`, `list_tables`, `list_columns`) live in
-//! [`crate::metadata::jdbc_shape`] alongside the reshape logic —
+//! [`crate::metadata::thrift_shape`] alongside the reshape logic —
 //! they form a single JDBC-shape contract that's the kernel's
 //! responsibility. `primary_keys` / `foreign_keys` / `procedures` /
 //! `functions` still pass server shape through; reshape for those is

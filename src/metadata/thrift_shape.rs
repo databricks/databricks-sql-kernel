@@ -12,30 +12,35 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! JDBC-shape reshape for wire-driven metadata RPCs.
+//! Thrift-compatible reshape for wire-driven metadata RPCs.
 //!
 //! The server's `SHOW CATALOGS / SHOW SCHEMAS / SHOW TABLES / SHOW COLUMNS`
 //! commands return columns named in the Databricks dialect (`catalog`,
-//! `namespace`, `tableName`, `columnType`, …). Every existing
-//! Databricks driver consumer — JDBC, ODBC, the Python connector, the
-//! Node driver — surfaces the JDBC `DatabaseMetaData` column-name
-//! contract (`TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `DATA_TYPE`,
-//! …) to its users. Pushing the rename + synthesis into the kernel
-//! keeps every binding free of duplicated reshape logic.
+//! `namespace`, `tableName`, `columnType`, …). The existing Thrift
+//! backend in the Python connector — and equivalently JDBC, ODBC, and
+//! the Node driver — surface a different, stable column-name contract
+//! (`TABLE_CAT`, `TABLE_SCHEM`, `TABLE_NAME`, `DATA_TYPE`, …) to their
+//! users. Those names originate in the JDBC `DatabaseMetaData` spec;
+//! Thrift inherited them via HiveServer2, and every Databricks driver
+//! since has matched. Pushing the rename + synthesis into the kernel
+//! keeps every binding free of duplicated reshape logic and gives the
+//! kernel backend a drop-in shape match with Thrift.
 //!
 //! ADBC `GetObjects` is the one outlier — it returns a deeply nested
 //! Arrow struct rather than a flat result set. The ADBC binding
-//! restructures from the JDBC-shape rows anyway; "raw" vs "JDBC" as
-//! input is roughly equal effort, so we standardise on JDBC.
+//! restructures from these rows; "raw" vs "Thrift-compatible" as
+//! input is roughly equal effort, so we standardise on the latter.
 //!
 //! ## What this module owns
 //!
-//! - The canonical JDBC column list per operation (single source of
-//!   truth; kept aligned with `java.sql.DatabaseMetaData`).
+//! - The canonical column list per operation (single source of truth;
+//!   kept aligned with what the Thrift backend returns, which in turn
+//!   tracks `java.sql.DatabaseMetaData`).
 //! - Functions to reshape a server-shaped Arrow `RecordBatch` into
-//!   the JDBC-shape `RecordBatch`: rename source columns, synthesize
-//!   missing ones (mostly nullable `Utf8`), filter when ODBC requires
-//!   it (`table_types`), and sort rows per the JDBC ordering.
+//!   the Thrift-compatible `RecordBatch`: rename source columns,
+//!   synthesize missing ones (mostly nullable `Utf8`), filter when
+//!   ODBC requires it (`table_types`), and sort rows per the JDBC
+//!   ordering Thrift inherited.
 //!
 //! ## What this module deliberately does NOT do
 //!
@@ -559,7 +564,7 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
 
 // ─── Streaming reshape reader ──────────────────────────────────────
 
-/// Per-batch reshape closure used by [`JdbcReshapingReader`]. Held
+/// Per-batch reshape closure used by [`ThriftReshapingReader`]. Held
 /// as a boxed `Fn` so each `list_*` method can capture its own
 /// arguments (requested catalog, table-type filter, …) into the
 /// closure without leaking them into the reader's type.
@@ -573,13 +578,13 @@ pub(crate) type ReshapeFn = dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send +
 /// returning. Schema is fixed at construction (the JDBC-shape schema
 /// for the operation) so callers see consistent column descriptors
 /// even across an empty stream.
-pub(crate) struct JdbcReshapingReader {
+pub(crate) struct ThriftReshapingReader {
     upstream: Box<dyn ResultReader + Send>,
     schema: SchemaRef,
     reshape: Box<ReshapeFn>,
 }
 
-impl JdbcReshapingReader {
+impl ThriftReshapingReader {
     pub(crate) fn new(
         upstream: Box<dyn ResultReader + Send>,
         schema: SchemaRef,
@@ -593,7 +598,7 @@ impl JdbcReshapingReader {
     }
 }
 
-impl ResultReader for JdbcReshapingReader {
+impl ResultReader for ThriftReshapingReader {
     fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }

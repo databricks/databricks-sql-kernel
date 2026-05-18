@@ -23,7 +23,7 @@
 //! reshapes the server response (rename columns, synthesize
 //! JDBC-only columns as nulls, derive `DATA_TYPE` integer codes),
 //! and exposes the JDBC-shape Arrow batch through a `ResultStream`.
-//! See [`crate::metadata::jdbc_shape`] for the schemas and reshape
+//! See [`crate::metadata::thrift_shape`] for the schemas and reshape
 //! logic.
 //!
 //! Rationale: JDBC, ODBC, and the existing PySQL / Node drivers all
@@ -81,11 +81,11 @@
 //! addendum A2 for the rationale.
 
 use crate::kernel_error::{Error, Result};
-use crate::metadata::jdbc_shape::{
-    self, is_object_not_found, JdbcReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
+use crate::metadata::static_data;
+use crate::metadata::thrift_shape::{
+    self, is_object_not_found, ThriftReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
     GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
 };
-use crate::metadata::static_data;
 use crate::reader::EmptyReader;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
@@ -249,10 +249,10 @@ impl Metadata {
             .transport()
             .list_catalogs(self.session.session_id())
             .await?;
-        let reshaped = JdbcReshapingReader::new(
+        let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_CATALOGS_SCHEMA.clone(),
-            Box::new(jdbc_shape::reshape_catalogs),
+            Box::new(thrift_shape::reshape_catalogs),
         );
         ResultStream::from_reader(Box::new(reshaped))
     }
@@ -283,10 +283,10 @@ impl Metadata {
             Ok(r) => r,
             Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err),
         };
-        let reshaped = JdbcReshapingReader::new(
+        let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_SCHEMAS_SCHEMA.clone(),
-            Box::new(move |b| jdbc_shape::reshape_schemas(b, catalog_str.as_deref())),
+            Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
         );
         ResultStream::from_reader(Box::new(reshaped))
     }
@@ -331,14 +331,14 @@ impl Metadata {
             Ok(r) => r,
             Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err),
         };
-        let reshaped = JdbcReshapingReader::new(
+        let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_TABLES_SCHEMA.clone(),
             Box::new(move |b| {
                 let types_ref: Option<Vec<&str>> = types_owned
                     .as_ref()
                     .map(|v| v.iter().map(|s| s.as_str()).collect());
-                jdbc_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
+                thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
             }),
         );
         ResultStream::from_reader(Box::new(reshaped))
@@ -392,10 +392,10 @@ impl Metadata {
             Ok(r) => r,
             Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err),
         };
-        let reshaped = JdbcReshapingReader::new(
+        let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_COLUMNS_SCHEMA.clone(),
-            Box::new(move |b| jdbc_shape::reshape_columns(b, catalog_str.as_deref())),
+            Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
         );
         ResultStream::from_reader(Box::new(reshaped))
     }

@@ -20,8 +20,8 @@
 //!   `type_info` / `table_types`.
 //! - `type_mapping`: Maps Databricks types to Arrow/XDBC types.
 
-pub(crate) mod jdbc_shape;
 pub(crate) mod schemas;
 pub mod sql;
 pub(crate) mod static_data;
+pub(crate) mod thrift_shape;
 pub mod type_mapping;
