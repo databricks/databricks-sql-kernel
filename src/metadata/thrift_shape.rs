@@ -130,7 +130,13 @@ pub(crate) static GET_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("DATA_TYPE", DataType::Int32, false),
         Field::new("TYPE_NAME", DataType::Utf8, false),
         Field::new("COLUMN_SIZE", DataType::Int32, true),
-        Field::new("BUFFER_LENGTH", DataType::Int32, true),
+        // JDBC spec says `Types.INTEGER` (Int32) for BUFFER_LENGTH,
+        // but Thrift's `GetColumns` RPC ships it as TINYINT — that's
+        // what existing PySQL/JDBC users see today. Match Thrift's
+        // wire type so the kernel backend is a drop-in replacement.
+        // The value is always null (no server-side source), so the
+        // narrower range has no practical effect.
+        Field::new("BUFFER_LENGTH", DataType::Int8, true),
         Field::new("DECIMAL_DIGITS", DataType::Int32, true),
         Field::new("NUM_PREC_RADIX", DataType::Int32, true),
         Field::new("NULLABLE", DataType::Int32, false),
@@ -148,7 +154,12 @@ pub(crate) static GET_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("SCOPE_CATALOG", DataType::Utf8, true),
         Field::new("SCOPE_SCHEMA", DataType::Utf8, true),
         Field::new("SCOPE_TABLE", DataType::Utf8, true),
-        Field::new("SOURCE_DATA_TYPE", DataType::Int32, true),
+        // JDBC spec says `Types.SMALLINT` (Int16) for SOURCE_DATA_TYPE.
+        // Thrift's `GetColumns` ships it as SMALLINT and that's what
+        // PySQL/JDBC users see today; we previously emitted Int32 to
+        // align with Int32 elsewhere in the schema, but Thrift's
+        // narrower type is the user-facing contract.
+        Field::new("SOURCE_DATA_TYPE", DataType::Int16, true),
         // JDBC `DatabaseMetaData.getColumns` Javadoc names this
         // `IS_AUTOINCREMENT` (one word). Thrift's wire response uses
         // `IS_AUTO_INCREMENT` (with the underscore), and that's what
@@ -246,6 +257,14 @@ fn int32_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
 
 fn null_int32(len: usize) -> ArrayRef {
     Arc::new(Int32Array::from(vec![None::<i32>; len]))
+}
+
+fn null_int16(len: usize) -> ArrayRef {
+    Arc::new(arrow_array::Int16Array::from(vec![None::<i16>; len]))
+}
+
+fn null_int8(len: usize) -> ArrayRef {
+    Arc::new(arrow_array::Int8Array::from(vec![None::<i8>; len]))
 }
 
 /// Map a server-side `"true"` / `"false"` string column to JDBC's
@@ -527,7 +546,7 @@ pub(crate) fn reshape_columns(
             data_type_arr,
             type_name,
             column_size,
-            null_int32(n), // BUFFER_LENGTH
+            null_int8(n), // BUFFER_LENGTH (Thrift wire type: TINYINT)
             decimal_digits,
             num_prec_radix,
             nullable,
@@ -541,7 +560,7 @@ pub(crate) fn reshape_columns(
             null_utf8(n),  // SCOPE_CATALOG
             null_utf8(n),  // SCOPE_SCHEMA
             null_utf8(n),  // SCOPE_TABLE
-            null_int32(n), // SOURCE_DATA_TYPE
+            null_int16(n), // SOURCE_DATA_TYPE (Thrift wire type: SMALLINT)
             is_autoincrement,
         ],
     )
