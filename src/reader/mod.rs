@@ -430,6 +430,68 @@ pub mod metadata_keys {
     pub const TYPE_INTERVAL_TYPE: &str = "databricks.type_interval_type";
 }
 
+/// Wrapper that augments an upstream `ResultReader`'s schema with
+/// Databricks per-column metadata from the SEA `ResultManifest`
+/// (server-reported `type_name`, `type_text`, precision, scale,
+/// interval kind), and re-projects each emitted `RecordBatch` onto
+/// that augmented schema so downstream consumers see the metadata
+/// both on `ResultStream::schema()` and on `batch.schema()`.
+///
+/// Active in the live `execute_and_read` path; transparent when
+/// the manifest is absent (e.g. queries without column info). See
+/// also [`ResultReaderAdapter`] for the Arrow-FFI-shaped wrapper.
+pub(crate) struct ManifestAugmentingReader {
+    inner: Box<dyn ResultReader + Send>,
+    schema: SchemaRef,
+}
+
+impl ManifestAugmentingReader {
+    /// Build an augmenting wrapper around `inner`.
+    ///
+    /// When `manifest` is `Some`, the upstream schema is rewritten
+    /// to attach Databricks column metadata under the
+    /// `databricks.*` keys. When it's `None`, the wrapper is a
+    /// pass-through (so callers don't need to special-case the
+    /// metadata-less path).
+    pub(crate) fn new(
+        inner: Box<dyn ResultReader + Send>,
+        manifest: Option<&ResultManifest>,
+    ) -> Result<Self> {
+        let schema = inner.schema()?;
+        let schema = match manifest {
+            Some(m) => ResultReaderAdapter::augment_schema_with_manifest(&schema, m),
+            None => schema,
+        };
+        Ok(Self { inner, schema })
+    }
+}
+
+impl ResultReader for ManifestAugmentingReader {
+    fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.inner.next_batch()? {
+            None => Ok(None),
+            Some(batch) => {
+                // Re-project the batch's columns onto our augmented
+                // schema. Column count, types, and order are
+                // unchanged — only `Field::metadata()` differs — so
+                // this is a cheap rebuild that reuses the same
+                // `ArrayRef`s under the hood.
+                let columns: Vec<arrow_array::ArrayRef> = batch.columns().to_vec();
+                RecordBatch::try_new(self.schema.clone(), columns)
+                    .map(Some)
+                    .map_err(|e| {
+                        crate::kernel_error::Error::data_loss()
+                            .message(format!("manifest reproject: {e}"))
+                    })
+            }
+        }
+    }
+}
+
 /// Adapter to make ResultReader work as arrow's RecordBatchReader.
 pub struct ResultReaderAdapter {
     inner: Box<dyn ResultReader + Send>,
@@ -457,7 +519,10 @@ impl ResultReaderAdapter {
     /// attach `databricks.*` key-value metadata to the field. This preserves
     /// server-provided type_name, type_text, precision, scale, etc. through the
     /// Arrow C Data Interface FFI boundary.
-    fn augment_schema_with_manifest(schema: &SchemaRef, manifest: &ResultManifest) -> SchemaRef {
+    pub(crate) fn augment_schema_with_manifest(
+        schema: &SchemaRef,
+        manifest: &ResultManifest,
+    ) -> SchemaRef {
         use std::collections::HashMap;
 
         let col_by_pos: HashMap<usize, &crate::types::sea::ColumnInfo> = manifest
@@ -871,5 +936,67 @@ mod tests {
             .field(0)
             .metadata()
             .contains_key(metadata_keys::TYPE_NAME));
+    }
+
+    // --- ManifestAugmentingReader tests ---
+
+    #[test]
+    fn test_manifest_augmenting_reader_attaches_metadata_to_schema_and_batches() {
+        // Server-shape: Utf8 column the kernel doesn't otherwise know
+        // is a VARIANT. The manifest carries the precise type.
+        let batch = make_test_batch(vec!["{\"a\":1}"]);
+        let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![make_column_info(
+            "name", "VARIANT", "VARIANT", 0, None, None, None,
+        )]);
+
+        let mut wrapper = ManifestAugmentingReader::new(reader, Some(&manifest)).unwrap();
+
+        // Stream-level schema carries the metadata.
+        let schema = wrapper.schema().unwrap();
+        assert_eq!(
+            schema.field(0).metadata().get(metadata_keys::TYPE_NAME),
+            Some(&"VARIANT".to_string())
+        );
+
+        // Batches emitted by `next_batch` are re-projected onto the
+        // augmented schema, so consumers reading `batch.schema()`
+        // also see the metadata.
+        let batch = wrapper.next_batch().unwrap().expect("one batch");
+        assert_eq!(
+            batch
+                .schema()
+                .field(0)
+                .metadata()
+                .get(metadata_keys::TYPE_NAME),
+            Some(&"VARIANT".to_string())
+        );
+        assert!(wrapper.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_manifest_augmenting_reader_passes_through_when_manifest_absent() {
+        let batch = make_test_batch(vec!["plain"]);
+        let reader: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+
+        let mut wrapper = ManifestAugmentingReader::new(reader, None).unwrap();
+        let schema = wrapper.schema().unwrap();
+        assert!(
+            !schema
+                .field(0)
+                .metadata()
+                .contains_key(metadata_keys::TYPE_NAME),
+            "no manifest → no databricks.* metadata"
+        );
+
+        let batch = wrapper.next_batch().unwrap().expect("one batch");
+        assert!(
+            !batch
+                .schema()
+                .field(0)
+                .metadata()
+                .contains_key(metadata_keys::TYPE_NAME),
+            "no manifest → batch schema also clean"
+        );
     }
 }

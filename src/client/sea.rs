@@ -368,7 +368,20 @@ impl SeaRestTransport {
             .await?;
         let response = self.wait_for_completion(response).await?;
         let reader_factory = self.reader_factory()?;
-        let reader = reader_factory.create_reader(&response.statement_id, &response)?;
+        let raw_reader = reader_factory.create_reader(&response.statement_id, &response)?;
+
+        // Wrap the reader so each emitted batch — and the stream's
+        // own `schema()` — carries the server-reported column
+        // metadata (`databricks.type_name` etc.) from the SEA
+        // manifest. Without this, the augmenter would never fire
+        // and downstream consumers (PySQL, future ADBC) would lose
+        // access to the precise type for VARIANT / INTERVAL /
+        // GEOMETRY / GEOGRAPHY columns that otherwise collapse to
+        // their Arrow shape (Utf8 / Interval / Utf8 / Utf8).
+        let reader: Box<dyn crate::reader::ResultReader + Send> = Box::new(
+            crate::reader::ManifestAugmentingReader::new(raw_reader, response.manifest.as_ref())?,
+        );
+
         // `server_state` carries the terminal state forward so the
         // executed handle can skip a redundant CloseStatement when
         // the server already cleaned up (state=Closed).
