@@ -148,6 +148,11 @@ impl Connection {
     ///
     /// JDBC `getTables` shape: 10 columns. `tableTypes`, when provided,
     /// filters rows by `TABLE_TYPE` kernel-side.
+    ///
+    /// `tableTypes` is an advisory filter. Databricks `SHOW TABLES` does
+    /// NOT honour the table-type filter server-side; the kernel applies
+    /// it client-side after the result returns. Callers expecting
+    /// server-side rejection of off-type tables should not rely on this.
     #[napi]
     pub async fn list_tables(
         &self,
