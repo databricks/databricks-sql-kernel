@@ -134,22 +134,144 @@ No wire change. The flag is purely client-side post-processing.
 
 ### Result-stream integration
 
-A new `JsonStringifyingReader` wrapper, applied in
-`ResultReaderFactory::create_reader` *after* the existing
-`ManifestAugmentingReader` wrap (so it sees fields with
-`databricks.type_name` metadata, which it needs to identify
-VARIANT / GEOMETRY / GEOGRAPHY columns that share Arrow's `Utf8`
-with regular strings):
+The existing `ManifestAugmentingReader` is renamed and generalised
+into a single `ResultPostProcessor` that owns *all* per-batch
+post-processing the kernel does today (and adds tomorrow). It runs
+exactly **one** `next_batch` indirection regardless of how many
+transforms are enabled, and **zero** per-row work for transforms
+that are inactive.
 
-```
-        raw_reader
-            └─ ManifestAugmentingReader  (existing)
-                  └─ JsonStringifyingReader  (new, when flag is set)
+```rust
+pub(crate) struct ResultPostProcessor {
+    inner: Box<dyn ResultReader + Send>,
+    schema: SchemaRef,
+    /// `None` when no per-batch reshape is needed (no `databricks.*`
+    /// metadata to copy through *and* JSON stringification disabled).
+    /// `Some` when at least one transform applies; the closure walks
+    /// the batch once, runs every active transform inline, returns a
+    /// fresh `RecordBatch`.
+    transform: Option<BatchTransform>,
+}
+
+type BatchTransform =
+    Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>;
 ```
 
-The wrapper is pass-through when the flag is off. When on, each
-`next_batch` walks the schema once (cached on construction),
-identifies complex columns, and re-projects.
+`ResultPostProcessor::new` runs once at construction time and
+decides what to do:
+
+1. Take the inner schema; apply the manifest-augmentation rewrite
+   to produce the output schema (no-op when manifest is `None`).
+2. Inspect the *augmented* schema: are any columns complex
+   (`List` / `Map` / `Struct` / `Utf8`-with-VARIANT-metadata /
+   ...)?
+3. **Decide the transform shape once**, based on what's active:
+   - **No manifest, no JSON**: `transform = None`, batches passed
+     through untouched.
+   - **Manifest only**: the closure just re-projects each batch's
+     columns onto the augmented schema (single `RecordBatch::try_new`).
+   - **JSON only** (shouldn't happen — manifest is always present
+     in execute responses — but kept consistent): walk only the
+     complex columns.
+   - **Both**: a single fused walk that re-projects *and*
+     stringifies complex columns in the same pass, producing
+     exactly one new `RecordBatch` per upstream batch.
+
+The hot path on `next_batch` is then unconditional:
+
+```rust
+fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    let Some(batch) = self.inner.next_batch()? else {
+        return Ok(None);
+    };
+    match &self.transform {
+        Some(transform) => Ok(Some(transform(&batch)?)),
+        None => Ok(Some(batch)),
+    }
+}
+```
+
+Single struct, single hot-path branch (matched once per batch, not
+per row), and the "pass-through" case really is pass-through (no
+`Vec<ArrayRef>` allocation, no `try_new`, no schema rebuild).
+
+### Why one struct instead of separate `ManifestAugmentingReader`
+### and `JsonStringifyingReader`
+
+The natural object-oriented factoring is one wrapper per
+transform. We deliberately don't do that for three reasons:
+
+1. **Per-batch overhead matters.** Result batches arrive
+   thousands at a time for CloudFetch streams; every extra
+   `Box<dyn ResultReader>` indirection is a virtual call per batch.
+   Today's two transforms could grow (interval stringification,
+   future others). Each is microseconds, but they compound and
+   would force a measurement-driven cleanup later.
+2. **Pass-through paths should actually be free.** With per-
+   transform wrappers, the "no-op" path (no manifest, no JSON)
+   still costs one `RecordBatch::try_new` per batch to re-project
+   onto an identical schema. With one consolidated processor that
+   decides `transform = None` at construction, the upstream batch
+   flows through without any rebuild.
+3. **The transforms are unidirectional and tightly coupled.**
+   JSON stringification needs to read field metadata that the
+   manifest augmenter writes. Layering them per the natural
+   factoring still requires the JSON layer to look up the
+   augmenter's output, so the coupling is real either way. A
+   fused walk is no harder to reason about than two sequential
+   walks that already have to agree on field-metadata semantics.
+
+If the kernel later accumulates a transform that genuinely
+benefits from being separately addressable (e.g. an Arrow-FFI
+adapter that wants only some of the transforms), we revisit then.
+Today, all transforms apply to all `ResultReader` consumers, so
+the consolidated shape is correct.
+
+### Migration of the existing `ManifestAugmentingReader`
+
+`ManifestAugmentingReader` (introduced in PR #35) is renamed to
+`ResultPostProcessor`. The existing constructor signature changes
+from
+
+```rust
+ManifestAugmentingReader::new(inner, manifest: Option<&ResultManifest>)
+```
+
+to
+
+```rust
+ResultPostProcessor::new(
+    inner,
+    manifest: Option<&ResultManifest>,
+    options: PostProcessOptions,
+)
+```
+
+where `PostProcessOptions` is a small struct holding the JSON flag
+(and any future transform flags). The two existing tests
+(`test_manifest_augmenting_reader_*`) are updated to construct the
+new struct with `options::default()` (JSON off) and assert the
+same behaviour they do today.
+
+The wrap site in `ResultReaderFactory::create_reader` becomes:
+
+```rust
+pub(crate) fn create_reader(
+    &self,
+    statement_id: &str,
+    response: &ExecuteResponse,
+) -> Result<Box<dyn ResultReader + Send>> {
+    let inner = self.create_inner_reader(statement_id, response)?;
+    Ok(Box::new(ResultPostProcessor::new(
+        inner,
+        response.manifest.as_ref(),
+        self.post_process_options(),
+    )?))
+}
+```
+
+`post_process_options()` reads the session config (`complex_types_as_json`)
+and builds the `PostProcessOptions` for this reader.
 
 ## JSON format
 
@@ -206,53 +328,104 @@ Edge cases worth calling out, with the rule we pick:
 
 ## Implementation sketch
 
-### New module: `src/result/json_stringify.rs`
+### Files touched
 
-Exports `JsonStringifyingReader` and a `json_stringify_batch`
-helper. Internally uses `serde_json` for the JSON emission (already
-in our dep set via `reqwest`) so we don't hand-roll escaping rules.
+- **`src/reader/post_processor.rs`** (new) — `ResultPostProcessor`
+  struct + `PostProcessOptions`. Rename target for the existing
+  `ManifestAugmentingReader` (which is folded into this).
+- **`src/reader/post_processor/json.rs`** (new) — pure functions
+  for the per-type JSON serialization. No `ResultReader` impl;
+  just `to_json_string(value: &dyn Array, row: usize, field: &Field) -> String`-shape
+  helpers. Lets us unit-test the formatter without spinning up a
+  reader.
+- **`src/reader/mod.rs`** — drop `ManifestAugmentingReader`,
+  rewire `ResultReaderFactory::create_reader` to call
+  `ResultPostProcessor::new` instead. `augment_schema_with_manifest`
+  helper moves to `post_processor.rs`.
+- **`src/client/sea.rs`** — no change; the factory already runs
+  here.
+- **`src/session/builder.rs`** + **`src/session.rs`** — surface
+  `complex_types_as_json` on `SessionBuilder`. `ResultReaderFactory`
+  reads it via `self.config` (already plumbed for the wire-path
+  config knobs).
 
-### `ResultReaderFactory::create_reader` change
+The JSON serialization itself uses `serde_json` for primitive value
+emission (already pulled in transitively via `reqwest`) so we don't
+hand-roll escaping rules.
+
+### `ResultPostProcessor::new` decision logic
+
+Run once at construction. Cheap — proportional to column count, not
+row count:
+
+1. Compute the output schema:
+   - If `manifest = Some`, apply `augment_schema_with_manifest`.
+   - Else, use the inner schema as-is.
+2. Decide whether the batch transform is needed:
+   - Inspect the augmented schema. Are there any complex columns
+     (`List` / `LargeList` / `FixedSizeList` / `Map` / `Struct`,
+     or `Utf8`+VARIANT/GEOMETRY/GEOGRAPHY metadata)?
+   - If `options.complex_types_as_json` is `true` *and* the schema
+     has complex columns, **JSON path** is active.
+   - If the output schema differs structurally from the inner
+     schema (i.e. we wrote field metadata, so `Field` objects
+     differ), **re-projection path** is active.
+   - Else, neither is needed.
+3. Build a single `BatchTransform` closure capturing only the
+   work that's actually active:
+   - Neither active → `transform = None`. Hot path is pass-through.
+   - Re-projection only → closure does one `RecordBatch::try_new`
+     onto the augmented schema, reusing the source `ArrayRef`s.
+   - JSON only (shouldn't happen, but for completeness) → closure
+     walks complex columns, leaves primitives untouched.
+   - Both → closure does a single fused walk: for each column
+     index, either reproject the source `ArrayRef` (primitive) or
+     emit a fresh `Utf8` array of JSON strings (complex). Builds
+     the final `RecordBatch` from the resulting columns.
+
+### Per-batch hot path
 
 ```rust
-pub(crate) fn create_reader(
-    &self,
-    statement_id: &str,
-    response: &ExecuteResponse,
-) -> Result<Box<dyn ResultReader + Send>> {
-    let inner = self.create_inner_reader(statement_id, response)?;
-    let augmented = Box::new(ManifestAugmentingReader::new(
-        inner,
-        response.manifest.as_ref(),
-    )?);
-    if self.config.complex_types_as_json {
-        Ok(Box::new(JsonStringifyingReader::new(augmented)?))
-    } else {
-        Ok(augmented)
+fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+    let Some(batch) = self.inner.next_batch()? else {
+        return Ok(None);
+    };
+    match &self.transform {
+        Some(t) => Ok(Some(t(&batch)?)),
+        None => Ok(Some(batch)),
     }
 }
 ```
 
-### Per-batch reshape
+One branch per batch, picked once at construction. The
+pass-through case is genuinely free — no allocation, no rebuild,
+the upstream `RecordBatch` flows through.
 
-For each column whose schema (after `ManifestAugmentingReader`)
-indicates a complex type (Arrow native: `List`, `LargeList`,
-`FixedSizeList`, `Map`, `Struct`; or `Utf8` with metadata
-`databricks.type_name in {VARIANT, GEOMETRY, GEOGRAPHY}`):
+### JSON serialization details
 
-1. Walk the column row-by-row.
-2. For each value, recurse using the Arrow column's child schema
-   and the per-type formatting rules above.
-3. Emit a fresh `Utf8` array with one JSON string per row, `None`
-   for SQL NULL.
+For each complex column, the closure produced at construction
+knows:
 
-Cache the per-column "is this complex?" decision and the per-row
-formatter once at batch construction so the hot path is just
-"format value to JSON".
+- The column index in the source batch.
+- A row-formatter function specialised to that column's schema
+  (closed over the Arrow `DataType` and any per-field
+  `databricks.type_name` metadata).
 
-VARIANT / GEOMETRY / GEOGRAPHY are passed through verbatim — the
-server already emits them as JSON / WKT text inside `Utf8`, so the
-column is already in the correct shape.
+Per-row, the formatter recurses through the type:
+
+- Primitives: `serde_json::Value::to_string()` on the canonical
+  Rust value (matching the per-type formatting table above).
+- `List` / `Map` / `Struct`: walk children, recurse.
+- `Utf8` with VARIANT/GEOMETRY/GEOGRAPHY metadata: pass through
+  the source value as-is (the server has already emitted it as
+  JSON / WKT text).
+
+The output array is built incrementally via `StringBuilder` for
+each complex column.
+
+VARIANT / GEOMETRY / GEOGRAPHY columns can be handled by a fast
+path that just copies the source `ArrayRef` (no re-emit needed),
+since the data is already correct.
 
 ### Schema rewriting
 
