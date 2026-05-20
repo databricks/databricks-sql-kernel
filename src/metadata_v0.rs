@@ -148,6 +148,9 @@ impl<'a> Identifier<'a> {
         if s.is_empty() {
             return Err(Error::invalid_argument().message("identifier must not be empty"));
         }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument().message("identifier must not be all whitespace"));
+        }
         if s.len() > MAX_IDENTIFIER_BYTES {
             return Err(Error::invalid_argument().message(format!(
                 "identifier exceeds {MAX_IDENTIFIER_BYTES}-byte limit ({} bytes)",
@@ -205,6 +208,10 @@ impl<'a> LikePattern<'a> {
         if s.is_empty() {
             return Err(Error::invalid_argument()
                 .message("LIKE pattern must not be empty (pass None for \"match all\")"));
+        }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument()
+                .message("LIKE pattern must not be all whitespace (pass None for \"match all\")"));
         }
         if s.len() > MAX_LIKE_PATTERN_BYTES {
             return Err(Error::invalid_argument().message(format!(
@@ -668,5 +675,31 @@ mod tests {
         let s = "a".repeat(MAX_LIKE_PATTERN_BYTES + 1);
         let err = LikePattern::new(&s).expect_err("oversize pattern rejected");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn identifier_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = Identifier::new(s).expect_err("whitespace-only identifier rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn like_pattern_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = LikePattern::new(s).expect_err("whitespace-only pattern rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
     }
 }

@@ -79,14 +79,14 @@ fn opt_pattern(s: &Option<String>) -> KResult<Option<LikePattern<'_>>> {
 /// infect the enclosing napi async fn.
 async fn run_on_blocking<F, Fut>(f: F) -> napi::Result<ResultStream>
 where
-    F: FnOnce(Handle) -> Fut + Send + 'static,
+    F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = KResult<ResultStream>>,
 {
     // Capture the handle before entering spawn_blocking; get_handle()
     // must be called from inside an async context (it snapshots
     // Handle::current() on first call).
     let handle = get_handle().clone();
-    let stream = tokio::task::spawn_blocking(move || handle.block_on(f(handle.clone())))
+    let stream = tokio::task::spawn_blocking(move || handle.block_on(f()))
         .await
         .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
         .map_err(napi_err_from_kernel)?;
@@ -116,7 +116,7 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream =
-                run_on_blocking(move |_h| async move { meta.list_catalogs().await }).await?;
+                run_on_blocking(move || async move { meta.list_catalogs().await }).await?;
             Ok(Statement::from_result_stream(stream))
         })
         .await
@@ -133,7 +133,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = opt_identifier(&catalog)?;
                 let pat = opt_pattern(&schema_pattern)?;
                 meta.list_schemas(cat, pat).await
@@ -158,7 +158,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = opt_identifier(&catalog)?;
                 let sch = opt_pattern(&schema_pattern)?;
                 let tbl = opt_pattern(&table_pattern)?;
@@ -187,7 +187,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = opt_identifier(&catalog)?;
                 let sch = opt_pattern(&schema_pattern)?;
                 let tbl = opt_pattern(&table_pattern)?;
@@ -211,7 +211,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = opt_identifier(&catalog)?;
                 let sch = opt_pattern(&schema_pattern)?;
                 let nam = opt_pattern(&function_pattern)?;
@@ -234,7 +234,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = opt_identifier(&catalog)?;
                 let sch = opt_pattern(&schema_pattern)?;
                 let nam = opt_pattern(&procedure_pattern)?;
@@ -252,7 +252,7 @@ impl Connection {
     pub async fn list_table_types(&self) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move { meta.table_types().await }).await?;
+            let stream = run_on_blocking(move || async move { meta.table_types().await }).await?;
             Ok(Statement::from_result_stream(stream))
         })
         .await
@@ -264,7 +264,7 @@ impl Connection {
     pub async fn list_type_info(&self) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move { meta.type_info().await }).await?;
+            let stream = run_on_blocking(move || async move { meta.type_info().await }).await?;
             Ok(Statement::from_result_stream(stream))
         })
         .await
@@ -281,7 +281,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let cat = Some(Identifier::new(&catalog)?);
                 let sch = Some(Identifier::new(&schema)?);
                 let tbl = Identifier::new(&table)?;
@@ -309,7 +309,7 @@ impl Connection {
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream = run_on_blocking(move |_h| async move {
+            let stream = run_on_blocking(move || async move {
                 let pc = opt_identifier(&parent_catalog)?;
                 let ps = opt_identifier(&parent_schema)?;
                 let pt = opt_identifier(&parent_table)?;
