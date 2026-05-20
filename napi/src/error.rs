@@ -37,6 +37,7 @@
 
 use databricks_sql_kernel::{Error as KernelError, ErrorCode};
 use napi::{Error as NapiError, Status};
+use serde_json::{json, Map, Value};
 
 /// Sentinel that tells the TS adapter the `reason` string is a JSON
 /// envelope rather than a plain message. Has to be ASCII-only so it
@@ -50,41 +51,39 @@ pub(crate) const ERROR_SENTINEL: &str = "__databricks_error__:";
 pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
     let status = status_from_kernel_code(e.code);
 
-    // Build a minimal JSON envelope. We hand-build it (no serde_json
-    // dep) — the field set is small and fixed, and avoiding serde
-    // keeps the crate dep graph trim.
-    let mut envelope = String::with_capacity(e.message.len() + 128);
-    envelope.push_str(ERROR_SENTINEL);
-    envelope.push('{');
-    push_json_str_field(&mut envelope, "code", error_code_str(e.code));
-    envelope.push(',');
-    push_json_str_field(&mut envelope, "message", &e.message);
-    if let Some(s) = &e.sql_state {
-        envelope.push(',');
-        push_json_str_field(&mut envelope, "sqlState", s);
+    // Build the envelope as a `serde_json::Map` so the TS contract is
+    // single-sourced in one place (the key set below) and the value
+    // escaping is delegated to serde_json. Optional fields are only
+    // inserted when present so the wire shape stays compact and the
+    // TS-side `reviver` doesn't have to special-case nulls.
+    let mut obj = Map::new();
+    obj.insert("code".to_owned(), Value::from(error_code_str(e.code)));
+    obj.insert("message".to_owned(), Value::from(e.message));
+    if let Some(s) = e.sql_state {
+        obj.insert("sqlState".to_owned(), Value::from(s));
     }
-    if let Some(ec) = &e.error_code {
-        envelope.push(',');
-        push_json_str_field(&mut envelope, "errorCode", ec);
+    if let Some(ec) = e.error_code {
+        obj.insert("errorCode".to_owned(), Value::from(ec));
     }
     if let Some(vc) = e.vendor_code {
-        envelope.push(',');
-        envelope.push_str("\"vendorCode\":");
-        envelope.push_str(&vc.to_string());
+        obj.insert("vendorCode".to_owned(), Value::from(vc));
     }
     if let Some(hs) = e.http_status {
-        envelope.push(',');
-        envelope.push_str("\"httpStatus\":");
-        envelope.push_str(&hs.to_string());
+        obj.insert("httpStatus".to_owned(), Value::from(hs));
     }
     if e.retryable {
-        envelope.push_str(",\"retryable\":true");
+        obj.insert("retryable".to_owned(), Value::from(true));
     }
-    if let Some(qid) = &e.query_id {
-        envelope.push(',');
-        push_json_str_field(&mut envelope, "queryId", qid);
+    if let Some(qid) = e.query_id {
+        obj.insert("queryId".to_owned(), Value::from(qid));
     }
-    envelope.push('}');
+
+    // `to_string` on a JSON object is infallible: every field above is
+    // a `String` / `i64` / `u16` / `bool` whose serialization can't fail.
+    let payload = json!(obj).to_string();
+    let mut envelope = String::with_capacity(ERROR_SENTINEL.len() + payload.len());
+    envelope.push_str(ERROR_SENTINEL);
+    envelope.push_str(&payload);
 
     NapiError::new(status, envelope)
 }
@@ -127,27 +126,30 @@ fn error_code_str(code: ErrorCode) -> &'static str {
     }
 }
 
-/// Append `"key":"value"` to the JSON buffer, escaping the value's
-/// `"` and `\` characters and control chars to keep the envelope
-/// JSON-parseable. The narrow set of escapes is sufficient for the
-/// human-readable error messages the kernel produces (no embedded
-/// binary blobs, no Unicode surrogate pairs).
-fn push_json_str_field(out: &mut String, key: &str, value: &str) {
-    out.push('"');
-    out.push_str(key);
-    out.push_str("\":\"");
-    for ch in value.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => {
-                out.push_str(&format!("\\u{:04x}", c as u32));
-            }
-            c => out.push(c),
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn envelope_carries_sentinel_and_code() {
+        let e = KernelError::invalid_argument().message("hi");
+        let napi_err = napi_err_from_kernel(e);
+        let reason = napi_err.reason.to_string();
+        assert!(reason.starts_with(ERROR_SENTINEL));
+        let payload = &reason[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["code"], "InvalidArgument");
+        assert_eq!(v["message"], "hi");
     }
-    out.push('"');
+
+    #[test]
+    fn message_escaping_round_trips() {
+        let nasty = "quote\"backslash\\newline\nctrl\u{1}end";
+        let e = KernelError::internal().message(nasty);
+        let napi_err = napi_err_from_kernel(e);
+        let reason = napi_err.reason.to_string();
+        let payload = &reason[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["message"], nasty);
+    }
 }

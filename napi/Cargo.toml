@@ -12,6 +12,27 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Standalone workspace.
+#
+# This crate is intentionally NOT a member of the kernel workspace at
+# `../Cargo.toml`. The reason is Cargo feature unification: pyo3 (a
+# kernel-workspace member) builds the kernel with the default
+# `tls-native` feature; this crate builds it with `tls-rustls`. If both
+# lived in the same workspace, `cargo build --workspace` would unify
+# the kernel's feature set to `tls-native ∪ tls-rustls`, link both TLS
+# stacks into the resulting napi cdylib, and reintroduce the OpenSSL ↔
+# Node symbol clash the rustls switch was meant to avoid.
+#
+# Building this crate is therefore done from `napi/` (not from the
+# kernel root with `--workspace`). The kernel is reached via `path =
+# ".."` — the same source tree, just a different workspace view.
+#
+# Side benefit: `[profile.release]` below is now honored. Profile
+# sections in non-root workspace members are silently ignored by Cargo;
+# making this crate its own workspace root activates them.
+[workspace]
+members = ["."]
+
 [package]
 name = "databricks-sea-native"
 version = "0.1.0"
@@ -22,7 +43,12 @@ description = "Databricks SQL Node.js SEA native binding (napi-rs)"
 publish = false
 
 [lib]
-crate-type = ["cdylib"]
+# `rlib` alongside `cdylib` so `cargo test -p databricks-sea-native`
+# can pick up `#[cfg(test)]` modules in src/**. With only `cdylib`,
+# cargo silently reports "running 0 tests / ok" even when `#[test]`
+# functions exist — a real footgun for any later Rust-side test.
+# Mirrors the equivalent decision in `pyo3/Cargo.toml`.
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 # napi-rs v2 line; `napi6` enables N-API 6 surface, `async` enables the
@@ -65,6 +91,11 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 arrow-array = "57"
 arrow-schema = "57"
 arrow-ipc = "57"
+
+# Error envelope serialization. Already a kernel transitive dep; the
+# direct declaration is so we can use `serde_json::json!` in
+# `src/error.rs` without bouncing through a hand-rolled escaper.
+serde_json = "1"
 
 [build-dependencies]
 napi-build = "2"
