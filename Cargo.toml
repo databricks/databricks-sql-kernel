@@ -95,9 +95,20 @@ tempfile = "3"
 # disables defaults) to avoid the OpenSSL-symbol clash with the host
 # Node.js process at module load time.
 #
-# Exactly one TLS feature MUST be enabled. Don't enable both — Cargo
-# feature unification would activate both reqwest backends, which is a
-# build error.
+# These features are MUTUALLY EXCLUSIVE in intent (not in compile): a
+# binary that ends up with both `reqwest/native-tls` AND
+# `reqwest/rustls-tls` active will link both TLS stacks. That is not a
+# compile error — reqwest 0.12 accepts both features simultaneously and
+# silently picks one at runtime — but in a napi cdylib it defeats the
+# whole reason for the rustls switch: system OpenSSL gets linked in
+# anyway, and on process load that clashes with Node.js's statically
+# linked OpenSSL.
+#
+# The napi crate enforces the intent structurally by being its own
+# workspace (not a member of this kernel workspace), so
+# `cargo build --workspace` here only sees `tls-native` via pyo3 and
+# never unifies the two. Don't add napi to `[workspace] members` —
+# build it from `napi/` instead. See `napi/Cargo.toml`.
 [features]
 default = ["tls-native"]
 tls-native = ["reqwest/native-tls"]
