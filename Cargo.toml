@@ -37,13 +37,18 @@ arrow-ipc = "57"
 
 # HTTP client and async runtime
 #
-# `rustls-tls` (not `native-tls`) because the napi-rs binding is loaded
-# into Node.js processes that statically link OpenSSL 3.x. Dynamically
-# linking against the system's OpenSSL 1.1 (which is what `native-tls`
-# pulls in on Linux today) collides with Node's symbols at module load
-# time and segfaults the process before any Rust code runs. `rustls` is
-# pure Rust + ring and avoids the conflict entirely.
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream", "rustls-tls"] }
+# TLS backend is selected by Cargo features (see `[features]` below).
+# Default = `tls-native` to preserve compatibility for direct-Rust and
+# C-ABI consumers (e.g. future ODBC), which historically use the system
+# OpenSSL via `native-tls`.
+#
+# The napi-rs binding crate (`napi/`) opts INTO `tls-rustls` instead:
+# napi modules are loaded into Node.js processes that statically link
+# OpenSSL 3.x, and dynamically linking against the system's OpenSSL 1.1
+# (which `native-tls` pulls in on Linux) collides with Node's symbols at
+# module load time and segfaults the process before any Rust code runs.
+# `rustls` is pure Rust + ring and avoids the conflict entirely.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -81,6 +86,22 @@ dirs = "5"           # Cross-platform config directory (~/.config/)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 tempfile = "3"
+
+# TLS backend selection.
+#
+# Default is `tls-native` (reqwest's `native-tls` backend) to preserve
+# compatibility for direct-Rust use and the C-ABI / ODBC path. The napi
+# binding crate (`napi/`) explicitly enables `tls-rustls` instead (and
+# disables defaults) to avoid the OpenSSL-symbol clash with the host
+# Node.js process at module load time.
+#
+# Exactly one TLS feature MUST be enabled. Don't enable both — Cargo
+# feature unification would activate both reqwest backends, which is a
+# build error.
+[features]
+default = ["tls-native"]
+tls-native = ["reqwest/native-tls"]
+tls-rustls = ["reqwest/rustls-tls"]
 
 [lib]
 name = "databricks_sql_kernel"
