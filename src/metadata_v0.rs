@@ -134,6 +134,8 @@ impl<'a> Identifier<'a> {
     /// Rejects:
     /// - Empty string — meaningless as an identifier; almost always a
     ///   bug at the wrapper layer.
+    /// - Strings consisting only of whitespace — would backtick-escape
+    ///   to a blank token and produce a server-side parse error.
     /// - Embedded NUL bytes (`\0`) — would terminate the string at the
     ///   first FFI / C ABI boundary and silently truncate the
     ///   identifier in transit.
@@ -197,6 +199,8 @@ impl<'a> LikePattern<'a> {
     ///
     /// Rejects:
     /// - Empty string — callers should pass `None` for "match all".
+    /// - Strings consisting only of whitespace — callers should pass
+    ///   `None` for "match all".
     /// - Embedded NUL bytes — same FFI-truncation hazard as
     ///   [`Identifier::new`].
     /// - Strings exceeding 255 bytes.
