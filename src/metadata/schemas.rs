@@ -12,24 +12,24 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Output schemas for `Metadata::*` static methods.
+//! Output schemas for the static `Metadata::type_info` and
+//! `Metadata::table_types` methods.
 //!
-//! The kernel passes server-shaped batches through unchanged for
-//! every wire-driven metadata RPC (catalogs / schemas / tables /
-//! columns / primary_keys / foreign_keys / procedures / functions),
-//! so there are no kernel-defined schemas for those — the columns
-//! are whatever Databricks' `SHOW` / `information_schema` query
-//! returns. Wrappers (PySQL, Node, JDBC, ODBC) reshape if their
-//! public surface requires it.
+//! Schemas for the four wire-driven core methods (`list_catalogs`,
+//! `list_schemas`, `list_tables`, `list_columns`) live in
+//! [`crate::metadata::thrift_shape`] alongside the reshape logic —
+//! they form a single JDBC-shape contract that's the kernel's
+//! responsibility. `primary_keys` / `foreign_keys` / `procedures` /
+//! `functions` still pass server shape through; reshape for those is
+//! deferred.
 //!
 //! Static methods (`type_info`, `table_types`) have no server-native
 //! shape to mirror — there's no `SHOW TYPE_INFO` command — so the
 //! kernel synthesises a result. The schemas live here so the
-//! synthesiser and any downstream wrapper sees one source of truth.
-//! We use the **JDBC `getTypeInfo` / `getTableTypes`** column
-//! contract because it's the most established standard for these
-//! two static answers; wrappers that want a different shape (e.g.
-//! ODBC `SQLGetTypeInfo` columns) translate locally.
+//! synthesiser sees one source of truth. We use the **JDBC
+//! `getTypeInfo` / `getTableTypes`** column contract for the same
+//! reason as the four core methods: it's the contract JDBC, ODBC,
+//! and PySQL all agree on. ADBC restructures from this shape.
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::{Arc, LazyLock};

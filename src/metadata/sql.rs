@@ -155,13 +155,17 @@ impl SqlCommandBuilder {
 
     /// Build SHOW COLUMNS command.
     ///
-    /// Catalog is a required parameter (not taken from builder state) because
-    /// `SHOW COLUMNS IN ALL CATALOGS` is not supported by Databricks.
-    pub fn build_show_columns(&self, catalog: &str) -> String {
-        let mut sql = format!(
-            "SHOW COLUMNS IN CATALOG {}",
-            Self::escape_identifier(catalog)
-        );
+    /// `catalog = None` emits `SHOW COLUMNS IN ALL CATALOGS …`, which
+    /// the Databricks server supports (the response includes
+    /// `catalogName` so callers can still attribute each row to its
+    /// catalog). JDBC's `getColumns(null, …)` enumerates catalogs
+    /// client-side rather than using this form; the kernel uses it
+    /// directly for a single round trip.
+    pub fn build_show_columns(&self, catalog: Option<&str>) -> String {
+        let mut sql = match catalog {
+            Some(c) => format!("SHOW COLUMNS IN CATALOG {}", Self::escape_identifier(c)),
+            None => "SHOW COLUMNS IN ALL CATALOGS".to_string(),
+        };
 
         if let Some(ref pattern) = self.schema_pattern {
             sql.push_str(&format!(" SCHEMA LIKE '{}'", pattern));
@@ -391,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_show_columns_with_catalog() {
-        let sql = SqlCommandBuilder::new().build_show_columns("main");
+        let sql = SqlCommandBuilder::new().build_show_columns(Some("main"));
         assert_eq!(sql, "SHOW COLUMNS IN CATALOG `main`");
     }
 
@@ -401,10 +405,29 @@ mod tests {
             .with_schema_pattern(Some("default"))
             .with_table_pattern(Some("my_table"))
             .with_column_pattern(Some("id%"))
-            .build_show_columns("main");
+            .build_show_columns(Some("main"));
         assert_eq!(
             sql,
             "SHOW COLUMNS IN CATALOG `main` SCHEMA LIKE 'default' TABLE LIKE 'my.table' LIKE 'id*'"
+        );
+    }
+
+    #[test]
+    fn test_show_columns_all_catalogs() {
+        let sql = SqlCommandBuilder::new().build_show_columns(None);
+        assert_eq!(sql, "SHOW COLUMNS IN ALL CATALOGS");
+    }
+
+    #[test]
+    fn test_show_columns_all_catalogs_with_patterns() {
+        let sql = SqlCommandBuilder::new()
+            .with_schema_pattern(Some("default"))
+            .with_table_pattern(Some("my_table"))
+            .with_column_pattern(Some("id%"))
+            .build_show_columns(None);
+        assert_eq!(
+            sql,
+            "SHOW COLUMNS IN ALL CATALOGS SCHEMA LIKE 'default' TABLE LIKE 'my.table' LIKE 'id*'"
         );
     }
 

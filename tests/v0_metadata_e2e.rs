@@ -73,14 +73,15 @@ fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
 
 #[tokio::test]
 #[ignore]
-async fn list_catalogs_returns_server_catalog_column() {
+async fn list_catalogs_returns_table_cat_column() {
     let session = live_session().await;
     let stream = session
         .metadata()
         .list_catalogs()
         .await
         .expect("list_catalogs");
-    assert_eq!(col_names(&stream.schema()), vec!["catalog"]);
+    // Thrift-compatible JDBC shape: single `TABLE_CAT` column.
+    assert_eq!(col_names(&stream.schema()), vec!["TABLE_CAT"]);
 
     let (batches, rows) = collect(stream).await;
     assert!(rows > 0, "live workspace should have at least one catalog");
@@ -103,15 +104,20 @@ async fn list_catalogs_returns_server_catalog_column() {
 
 #[tokio::test]
 #[ignore]
-async fn list_schemas_returns_server_database_name_column() {
+async fn list_schemas_returns_jdbc_columns() {
     let session = live_session().await;
     let stream = session
         .metadata()
         .list_schemas(Some(Identifier::new("main").unwrap()), None)
         .await
         .expect("list_schemas");
-    // SHOW SCHEMAS IN <catalog> returns just databaseName.
-    assert_eq!(col_names(&stream.schema()), vec!["databaseName"]);
+    // JDBC `getSchemas` shape: TABLE_SCHEM, TABLE_CATALOG. The kernel
+    // synthesises TABLE_CATALOG from the catalog arg when the server's
+    // single-catalog `SHOW SCHEMAS` response omits it.
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec!["TABLE_SCHEM", "TABLE_CATALOG"]
+    );
 
     let (batches, _) = collect(stream).await;
     let mut schema_names: Vec<String> = Vec::new();
@@ -135,7 +141,7 @@ async fn list_schemas_returns_server_database_name_column() {
 
 #[tokio::test]
 #[ignore]
-async fn list_tables_returns_server_columns() {
+async fn list_tables_returns_jdbc_columns() {
     let session = live_session().await;
     let stream = session
         .metadata()
@@ -148,17 +154,22 @@ async fn list_tables_returns_server_columns() {
         .await
         .expect("list_tables");
 
-    // Server returns at minimum: catalogName, namespace, tableName,
-    // tableType. Other columns (isTemporary / information / remarks)
-    // may or may not be present depending on DBR version — assert
-    // the required ones are there.
-    let names = col_names(&stream.schema());
-    for required in ["catalogName", "namespace", "tableName", "tableType"] {
-        assert!(
-            names.iter().any(|n| n == required),
-            "expected '{required}' in {names:?}"
-        );
-    }
+    // JDBC `getTables` 10-column shape.
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "TABLE_CAT",
+            "TABLE_SCHEM",
+            "TABLE_NAME",
+            "TABLE_TYPE",
+            "REMARKS",
+            "TYPE_CAT",
+            "TYPE_SCHEM",
+            "TYPE_NAME",
+            "SELF_REFERENCING_COL_NAME",
+            "REF_GENERATION",
+        ]
+    );
 
     let (_, rows) = collect(stream).await;
     assert!(
@@ -171,7 +182,7 @@ async fn list_tables_returns_server_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn list_columns_returns_server_columns() {
+async fn list_columns_returns_jdbc_columns() {
     let session = live_session().await;
     let stream = session
         .metadata()
@@ -184,8 +195,21 @@ async fn list_columns_returns_server_columns() {
         .await
         .expect("list_columns");
 
+    // JDBC `getColumns` 23-column shape. Check the load-bearing
+    // columns; the rest are JDBC-mandated nulls / synthesised.
     let names = col_names(&stream.schema());
-    for required in ["col_name", "namespace", "tableName", "columnType"] {
+    assert_eq!(names.len(), 23);
+    for required in [
+        "TABLE_CAT",
+        "TABLE_SCHEM",
+        "TABLE_NAME",
+        "COLUMN_NAME",
+        "DATA_TYPE",
+        "TYPE_NAME",
+        "NULLABLE",
+        "IS_NULLABLE",
+        "IS_AUTO_INCREMENT",
+    ] {
         assert!(
             names.iter().any(|n| n == required),
             "expected '{required}' in {names:?}"

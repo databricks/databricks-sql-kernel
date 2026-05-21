@@ -368,11 +368,25 @@ impl SeaRestTransport {
             .await?;
         let response = self.wait_for_completion(response).await?;
         let reader_factory = self.reader_factory()?;
+        // `create_reader` wraps in a `ManifestAugmentingReader`
+        // internally, so the reader returned here already carries
+        // the server-reported per-column metadata
+        // (`databricks.type_name` etc.) on its schema and on every
+        // emitted batch. Bindings (PySQL, future ADBC) read those
+        // attributes to recover the precise type for columns whose
+        // Arrow shape collapses (VARIANT → Utf8, intervals → Interval,
+        // GEOMETRY/GEOGRAPHY → Utf8).
         let reader = reader_factory.create_reader(&response.statement_id, &response)?;
+
+        // `server_state` carries the terminal state forward so the
+        // executed handle can skip a redundant CloseStatement when
+        // the server already cleaned up (state=Closed).
+        let server_state = response.status.state;
         Ok(ExecuteResult {
             statement_id: response.statement_id,
             reader,
             manifest: response.manifest,
+            server_state,
         })
     }
 }
@@ -505,10 +519,12 @@ impl Transport for SeaRestTransport {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
                 let reader = reader_factory.create_reader(&r.statement_id, &r)?;
+                let server_state = r.status.state;
                 Ok(Some(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
+                    server_state,
                 }))
             }
             StatementOutcome::NotReady(_) => Ok(None),
@@ -713,7 +729,7 @@ impl Transport for SeaRestTransport {
     async fn list_columns(
         &self,
         session_id: &str,
-        catalog: &str,
+        catalog: Option<&str>,
         schema_pattern: Option<&str>,
         table_pattern: Option<&str>,
         column_pattern: Option<&str>,

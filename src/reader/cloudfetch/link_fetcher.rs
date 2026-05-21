@@ -547,7 +547,7 @@ mod tests {
     use super::*;
     use crate::client::{ExecuteResult, SessionInfo};
     use crate::reader::EmptyReader;
-    use crate::types::sea::ExecuteParams;
+    use crate::types::sea::{ExecuteParams, StatementState};
     use arrow_schema::Schema;
     use std::collections::HashMap;
     use std::sync::Arc as StdArc;
@@ -591,6 +591,7 @@ mod tests {
                 statement_id: "mock-statement".to_string(),
                 reader: Box::new(EmptyReader::new(StdArc::new(Schema::empty()))),
                 manifest: None,
+                server_state: StatementState::Succeeded,
             })
         }
 
@@ -686,7 +687,7 @@ mod tests {
         async fn list_columns(
             &self,
             _session_id: &str,
-            _catalog: &str,
+            _catalog: Option<&str>,
             _schema_pattern: Option<&str>,
             _table_pattern: Option<&str>,
             _column_pattern: Option<&str>,

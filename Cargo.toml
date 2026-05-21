@@ -29,6 +29,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 arrow-array = "57"
 arrow-buffer = "57"
+arrow-cast = "57"
+arrow-ord = "57"
 arrow-schema = "57"
 arrow-select = "57"
 arrow-ipc = "57"

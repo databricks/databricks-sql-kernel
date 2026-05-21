@@ -52,7 +52,7 @@ use tokio::runtime::Runtime;
 /// Constructed via `Session.metadata()`. Cheap to construct and
 /// throw away — the underlying kernel `Metadata` is a thin wrapper
 /// around the shared session state.
-#[pyclass(name = "Metadata", unsendable)]
+#[pyclass(name = "Metadata")]
 pub(crate) struct Metadata {
     inner: KMetadata,
     runtime: Arc<Runtime>,
@@ -125,19 +125,23 @@ impl Metadata {
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
-    /// Columns of tables matching the filter. `catalog` is required
-    /// (Databricks `SHOW COLUMNS` cannot span catalogs).
-    #[pyo3(signature = (*, catalog, schema_pattern=None, table_pattern=None, column_pattern=None))]
+    /// Columns of tables matching the filter. `catalog = None` emits
+    /// `SHOW COLUMNS IN ALL CATALOGS`; otherwise scoped to the named
+    /// catalog. Schema / table / column patterns are SQL LIKE.
+    #[pyo3(signature = (*, catalog=None, schema_pattern=None, table_pattern=None, column_pattern=None))]
     fn list_columns(
         &self,
         py: Python<'_>,
-        catalog: String,
+        catalog: Option<String>,
         schema_pattern: Option<String>,
         table_pattern: Option<String>,
         column_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = Some(Identifier::new(&catalog)?);
+            let cat = match catalog.as_deref() {
+                Some(s) => Some(Identifier::new(s)?),
+                None => None,
+            };
             let sch = opt_pattern(&schema_pattern)?;
             let tbl = opt_pattern(&table_pattern)?;
             let col = opt_pattern(&column_pattern)?;
