@@ -9,8 +9,21 @@ description = "Python bindings for the Databricks SQL Kernel (PyO3)"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Databricks" }]
-dependencies = ["pyarrow>=14"]
+# Runtime dependency for downstream consumers. Loose major-version
+# bound per the published-library guidance — exact pins make this
+# wheel harder for end-users to install alongside their own pyarrow
+# consumers. The CI environment is fully hash-locked via `uv.lock`
+# (see below), separately from this contract.
+dependencies = ["pyarrow>=14,<19"]
+
+# Dev / CI dependencies. PEP 735 standard; uv reads this directly.
+# `uv sync --frozen` installs from `uv.lock`, which carries SHA256
+# hashes for every artifact + transitive dep.
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2.0",
+    "pytest>=8.3,<9.0",
+]
 
 [tool.maturin]
 module-name = "databricks_sql_kernel"
-

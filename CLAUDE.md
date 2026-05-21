@@ -93,6 +93,43 @@ permissive licenses must be added to `[licenses].allow` in
 preserved separately for generating attribution pages on demand;
 the CI gate lives on `deny.toml`.
 
+## Supply-chain hardening
+
+Per [go/hardened-gha](https://docs.google.com/document/d/1zoHgolfZO_IUBIU3w40NmYsoZ9eTRdAmjlfwYOxkj70/edit),
+the protected runners block direct access to public package
+registries (crates.io, PyPI, npm, etc.). All third-party
+dependency fetches route through Databricks' JFrog Artifactory
+proxy at `databricks.jfrog.io`.
+
+How this shows up in the repo:
+
+- **GitHub Actions steps** are SHA-pinned, with the version tag in
+  a trailing comment (e.g. `uses: actions/checkout@34e1148... # v4`).
+- **Cargo** access goes through `db-cargo-remote`. Workflows that
+  hit cargo run `./.github/actions/setup-jfrog` with `cargo: "true"`
+  before `setup-rust-toolchain`. `Cargo.lock` carries per-crate
+  SHA256 checksums (`source = "registry+..."` + `checksum = "..."`),
+  which is Cargo's native pinning mechanism.
+- **PyPI** access goes through `db-pypi`. The `pyo3-checks.yml`
+  workflow runs the same composite with `uv: "true"` (exports
+  `UV_INDEX_URL` + `PIP_INDEX_URL` for fallback compatibility).
+  The pyo3 sub-crate uses [uv](https://docs.astral.sh/uv/) for
+  Python env management.
+- **Python dep pinning follows the externally-published-library
+  rule from [go/pinning-python-deps](https://docs.google.com/document/d/1thJsoOBW3NzvRV6pWpujcD8mn4KOXgAW8t10iw6Z6LA/edit)**:
+  major-version upper bounds in `pyo3/pyproject.toml`
+  (`pyarrow>=14,<19`), no exact pins, no transitive constraints,
+  no committed lockfile. Exact pins would impede downstream
+  `pip install databricks-sql-kernel` for end-users with their
+  own pyarrow consumers. The `db-pypi` proxy's 7-day age filter
+  is the baseline supply-chain protection; `uv sync` re-resolves
+  each CI run within the major-version bounds.
+- **Composite action**: `.github/actions/setup-jfrog/action.yml`
+  encapsulates the OIDC token exchange (`id-token: write`
+  permission required) plus the cargo / uv config writes.
+  Workflows that need registry access reference it with
+  `uses: ./.github/actions/setup-jfrog`.
+
 ## Local development environment
 
 Connection variables for E2E tests can be set via `.cargo/config.toml`

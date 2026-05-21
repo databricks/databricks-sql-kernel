@@ -41,6 +41,10 @@ concurrency:
 
 permissions:
   contents: read
+  # Required for the OIDC token exchange that the
+  # `.github/actions/setup-jfrog` composite uses to authenticate
+  # against the JFrog cargo + pip proxies. See go/hardened-gha.
+  id-token: write
 
 defaults:
   run:
@@ -99,14 +103,36 @@ jobs:
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
 
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+          uv: "true"
+
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065  # v5.6.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
 
-      - name: Install maturin + pytest
-        run: pip install 'maturin>=1.5,<2.0' pytest
+      # uv is the Python package manager the kernel pyo3 sub-crate
+      # uses for env management. uv itself is installed via
+      # astral-sh/setup-uv (SHA-pinned) rather than via
+      # `pip install uv` so the bootstrap is also hash-locked.
+      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+        with:
+          # Pin uv to a known good version; bump deliberately.
+          version: "0.11.14"
+
+      - name: Install dev dependencies (uv sync)
+        # No `--frozen` and no committed lockfile: per go/pinning-
+        # python-deps the externally-published-library rule says
+        # *not* to pin transitive deps (it impedes downstream
+        # `pip install`). The `[project].dependencies` major-version
+        # bounds in `pyproject.toml` plus the JFrog proxy's 7-day
+        # age filter on `db-pypi` are the baseline protection. uv
+        # re-resolves each run within those bounds.
+        working-directory: pyo3
+        run: uv sync --group dev
 
       - name: Cargo unit tests (pyo3 crate)
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff
@@ -117,9 +143,9 @@ jobs:
       - name: "Build + install pyo3 wheel (maturin develop)"
         working-directory: pyo3
         # `develop` builds the extension and installs it into the
-        # runner's active Python in one step — what `pytest` needs.
-        # Debug build is fine for tests and ~2x faster than --release.
-        run: maturin develop --interpreter python${{ matrix.python-version }}
+        # uv-managed venv from the previous step. Debug build is
+        # fine for tests and ~2x faster than --release.
+        run: uv run maturin develop --interpreter python${{ matrix.python-version }}
 
       - name: pytest (no-network + live tiers)
         working-directory: pyo3
@@ -130,4 +156,4 @@ jobs:
         # repo; on fork PRs without approval, the no-network tier
         # (test_module.py + test_auth.py) runs and the live tier
         # skips cleanly.
-        run: pytest -v
+        run: uv run pytest -v
