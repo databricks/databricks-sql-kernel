@@ -102,4 +102,11 @@ napi-build = "2"
 
 [profile.release]
 lto = true
-strip = "symbols"
+# `strip = "debuginfo"` (not `"symbols"`) — keeps function-name symbols
+# so production stack traces from `panic_payload_msg` (and any future
+# native crash dump) are readable. Stripping `debuginfo` only drops the
+# DWARF/PDB debug sections, which costs ~no binary size on cdylibs but
+# preserves the symbol table that's needed to make a numeric backtrace
+# useful in incident triage. If you need a smaller artifact, strip
+# `"symbols"` in CI and archive an unstripped `.node` for symbolication.
+strip = "debuginfo"
