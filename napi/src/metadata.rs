@@ -51,7 +51,6 @@
 use std::sync::Arc;
 
 use databricks_sql_kernel::{Identifier, LikePattern, Metadata, Result as KResult, ResultStream};
-use tokio::runtime::Handle;
 
 use crate::connection::Connection;
 use crate::error::napi_err_from_kernel;
