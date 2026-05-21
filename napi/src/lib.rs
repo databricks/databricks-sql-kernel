@@ -22,6 +22,18 @@
 //! `ResultStream`) are added in the follow-up commit.
 
 #![deny(unsafe_op_in_unsafe_fn)]
+// Skeleton-PR state: every `pub(crate)` item in this crate (error
+// envelope helpers, tokio Handle accessor, panic-guarded wrapper) is
+// authored against the contract used by the follow-up napi-classes PR
+// (#25). Until that PR lands, the lib-only build has zero production
+// callers and every helper looks dead. Tests in `#[cfg(test)] mod
+// tests` exercise them, which is why `cargo test` is green even
+// while `cargo clippy --lib -- -D warnings` would otherwise reject
+// the build.
+//
+// We narrow the suppression to non-test builds so the lint still
+// fires on genuinely-unused test code.
+#![cfg_attr(not(test), allow(dead_code))]
 
 #[macro_use]
 extern crate napi_derive;
@@ -38,4 +50,17 @@ pub(crate) mod util;
 #[napi]
 pub fn version() -> String {
     env!("CARGO_PKG_VERSION").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn version_matches_cargo_pkg_version() {
+        // Doubles as the "binding loaded" smoke contract — keep this
+        // even when the function is otherwise inert.
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
+        assert!(!version().is_empty());
+    }
 }

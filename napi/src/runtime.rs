@@ -42,6 +42,10 @@ static RUNTIME_HANDLE: OnceCell<Handle> = OnceCell::new();
 ///
 /// Round 1b has no async entry points that exercise this yet; Round 2
 /// will call it from `Database::open()` and other `#[napi] async fn`s.
+/// `try_get_handle` has a test in this crate so it's reachable from
+/// the test build; `get_handle()` itself cannot be tested without a
+/// real tokio runtime context and is intentionally dead until Round 2,
+/// so it keeps its own `allow(dead_code)`.
 #[allow(dead_code)]
 pub(crate) fn get_handle() -> &'static Handle {
     RUNTIME_HANDLE.get_or_init(Handle::current)
@@ -53,4 +57,26 @@ pub(crate) fn get_handle() -> &'static Handle {
 /// (i.e. there is no kernel state that needs closing either).
 pub(crate) fn try_get_handle() -> Option<&'static Handle> {
     RUNTIME_HANDLE.get()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Note: we cannot exercise `get_handle()` from the unit-test binary
+    // because that would require running inside a tokio runtime context
+    // AND would race with `try_get_handle_returns_none_before_init`
+    // (the OnceCell is process-static). Round 2's `Database::open()`
+    // integration tests will exercise the populated path end-to-end.
+    //
+    // What we CAN test in isolation: the cold-cache accessor returns
+    // `None` when nothing has populated the OnceCell yet. This is the
+    // case Drop impls rely on (GC-thread cleanup with no live async
+    // entry points) and is the regression-risk path.
+    #[test]
+    fn try_get_handle_returns_none_before_init() {
+        // `cargo test --lib` runs each test in its own process by
+        // default, so we can assume the OnceCell is empty here.
+        assert!(try_get_handle().is_none());
+    }
 }

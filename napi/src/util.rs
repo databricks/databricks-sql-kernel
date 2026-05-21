@@ -60,3 +60,76 @@ fn panic_payload_msg(p: Box<dyn Any + Send>) -> String {
     }
     "non-string panic payload".to_string()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn guarded_returns_inner_ok() {
+        let result: NapiResult<i32> = guarded(async { Ok(42) }).await;
+        assert_eq!(result.unwrap(), 42);
+    }
+
+    #[tokio::test]
+    async fn guarded_passes_through_inner_err() {
+        // An `Err` returned by the future flows out unchanged — only
+        // panics get rewrapped. Status::Cancelled distinguishes from
+        // the panic path's Status::GenericFailure.
+        let result: NapiResult<()> =
+            guarded(async { Err(NapiError::new(Status::Cancelled, "inner")) }).await;
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::Cancelled);
+        assert_eq!(err.reason, "inner");
+    }
+
+    #[tokio::test]
+    async fn guarded_recovers_static_str_panic() {
+        let result: NapiResult<()> = guarded(async {
+            panic!("static str panic");
+        })
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::GenericFailure);
+        assert!(
+            err.reason.contains("static str panic"),
+            "expected panic message in reason, got: {}",
+            err.reason
+        );
+        assert!(err.reason.starts_with("panic in native binding: "));
+    }
+
+    #[tokio::test]
+    async fn guarded_recovers_owned_string_panic() {
+        let result: NapiResult<()> = guarded(async {
+            let msg = format!("owned String panic at {}", 42);
+            panic!("{}", msg);
+        })
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::GenericFailure);
+        assert!(
+            err.reason.contains("owned String panic at 42"),
+            "expected formatted panic in reason, got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn guarded_recovers_non_string_panic() {
+        // panic_any with a non-(str|String) payload — these fall
+        // through to the "non-string panic payload" branch. Important
+        // because third-party crates sometimes panic with custom types.
+        let result: NapiResult<()> = guarded(async {
+            std::panic::panic_any(42i32);
+        })
+        .await;
+        let err = result.unwrap_err();
+        assert_eq!(err.status, Status::GenericFailure);
+        assert!(
+            err.reason.contains("non-string panic payload"),
+            "expected non-string marker in reason, got: {}",
+            err.reason
+        );
+    }
+}
