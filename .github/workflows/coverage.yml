@@ -14,7 +14,14 @@
 
 # Code coverage report. Runs `cargo llvm-cov` against the unit /
 # integration test suite (E2E tests stay #[ignore]'d) and uploads
-# the lcov result to Codecov via OIDC.
+# the lcov result as a workflow artifact for local inspection.
+#
+# The previous draft uploaded to Codecov via `use_oidc: true`, but
+# that requires the repo to be enrolled in Codecov's GitHub App
+# with OIDC enabled — not yet verified. Pairing unverified
+# enrollment with `fail_ci_if_error: false` silently masks dropped
+# uploads, so the Codecov step is removed until enrollment is
+# confirmed and we can opt back in with `fail_ci_if_error: true`.
 
 name: Coverage
 
@@ -31,8 +38,6 @@ concurrency:
 
 permissions:
   contents: read
-  id-token: write
-  pull-requests: write
 
 defaults:
   run:
@@ -68,20 +73,10 @@ jobs:
         # as `pr-checks.yml`'s `test` job.
         run: cargo llvm-cov --workspace --lcov --output-path lcov.info
 
-      # Codecov upload.
-      #
-      # `use_oidc: true` is tokenless, but it requires the repo to be
-      # enrolled in Codecov's GitHub App with OIDC enabled in the
-      # Codecov dashboard. Until that is set up, the action falls
-      # back to anonymous upload which Codecov silently rate-limits
-      # and may drop. `fail_ci_if_error: false` keeps the job green
-      # in that case (we don't want a one-off Codecov outage to red-
-      # light unrelated PRs) — but it does mean coverage data may not
-      # actually land. Watch for the Codecov check on the first few
-      # PRs to confirm uploads are flowing.
-      - name: Upload to Codecov
-        uses: codecov/codecov-action@e79a6962e0d4c0c17b229090214935d2e33f8354  # v6.0.1
+      - name: Upload lcov artifact
+        uses: actions/upload-artifact@65c4c4a1ddee5b72f698fdd19549f0f0fb45cf08  # v4.6.0
         with:
-          files: lcov.info
-          fail_ci_if_error: false
-          use_oidc: true
+          name: lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 14
