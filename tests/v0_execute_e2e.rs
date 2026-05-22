@@ -321,8 +321,11 @@ async fn bind_all_typed_values_round_trip() {
         // reads it back as `NaiveDateTime`.
         .param(9, TypedValue::TimestampNtz(ts))
         .unwrap()
-        // TIMESTAMP_LTZ — tz-aware. Verified at value level via
-        // `get_timestamp_ltz` (added alongside the variant).
+        // TIMESTAMP_LTZ — tz-aware. Verified by comparing the
+        // underlying `naive_utc()` wall-clock via `get_timestamp`
+        // (the row API doesn't distinguish LTZ from TIMESTAMP at
+        // value level — the type-name distinction lives in column
+        // metadata, not in the accessor).
         .param(10, TypedValue::TimestampLtz(ts_ltz))
         .unwrap()
         .param(11, TypedValue::Null)

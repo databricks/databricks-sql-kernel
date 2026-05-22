@@ -75,10 +75,10 @@ impl Statement {
     /// ``"VOID"``, ``"BOOLEAN"`` / ``"BOOL"``, ``"TINYINT"``,
     /// ``"SMALLINT"``, ``"INT"`` / ``"INTEGER"``, ``"BIGINT"`` /
     /// ``"LONG"``, ``"FLOAT"``, ``"DOUBLE"``, ``"STRING"`` /
-    /// ``"VARCHAR"`` / ``"CHAR"``, ``"DATE"``, ``"TIMESTAMP"`` /
-    /// ``"TIMESTAMP_NTZ"``, ``"INTERVAL"``, ``"DECIMAL(p,s)"`` and
-    /// ``"DECIMAL(p)"`` (scale defaults to 0). See
-    /// ``pyo3/src/params.rs`` for the authoritative mapping.
+    /// ``"VARCHAR"`` / ``"CHAR"``, ``"DATE"``, ``"TIMESTAMP"``,
+    /// ``"TIMESTAMP_NTZ"``, ``"TIMESTAMP_LTZ"``, ``"INTERVAL"``,
+    /// ``"DECIMAL(p,s)"`` and ``"DECIMAL(p)"`` (scale defaults to
+    /// 0). See ``pyo3/src/params.rs`` for the authoritative mapping.
     ///
     /// This shape — string value + type name — exists because the
     /// connector's ``TSparkParameter`` already string-serialises
