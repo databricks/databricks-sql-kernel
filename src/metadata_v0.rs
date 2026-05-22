@@ -91,6 +91,7 @@ use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
+use tracing::Instrument;
 
 /// JDBC's `DatabaseMetaData` contract: metadata methods return an
 /// empty result set for non-existent catalogs / schemas / tables
@@ -243,18 +244,22 @@ impl Metadata {
     ///
     /// JDBC `getCatalogs` shape: `TABLE_CAT: Utf8`.
     pub async fn list_catalogs(&self) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let raw = self
-            .session
-            .transport()
-            .list_catalogs(self.session.session_id())
-            .await?;
-        let reshaped = ThriftReshapingReader::new(
-            raw.reader,
-            GET_CATALOGS_SCHEMA.clone(),
-            Box::new(thrift_shape::reshape_catalogs),
-        );
-        ResultStream::from_reader(Box::new(reshaped)).await
+        let span = self.session.log_span().clone();
+        async {
+            let raw = self
+                .session
+                .transport()
+                .list_catalogs(self.session.session_id())
+                .await?;
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_CATALOGS_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_catalogs),
+            );
+            ResultStream::from_reader(Box::new(reshaped)).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
@@ -268,27 +273,31 @@ impl Metadata {
         catalog: Option<Identifier<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
-        let raw = match self
-            .session
-            .transport()
-            .list_schemas(
-                self.session.session_id(),
-                catalog.as_ref().map(|i| i.as_str()),
-                schema_pattern.as_ref().map(|p| p.as_str()),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
-        };
-        let reshaped = ThriftReshapingReader::new(
-            raw.reader,
-            GET_SCHEMAS_SCHEMA.clone(),
-            Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
-        );
-        ResultStream::from_reader(Box::new(reshaped)).await
+        let span = self.session.log_span().clone();
+        async {
+            let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
+            let raw = match self
+                .session
+                .transport()
+                .list_schemas(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
+            };
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_SCHEMAS_SCHEMA.clone(),
+                Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
+            );
+            ResultStream::from_reader(Box::new(reshaped)).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Tables filtered by catalog (exact), schema (pattern), table
@@ -312,36 +321,40 @@ impl Metadata {
         table_pattern: Option<LikePattern<'_>>,
         table_types: Option<&[&str]>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
-        let types_owned: Option<Vec<String>> =
-            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
-        let raw = match self
-            .session
-            .transport()
-            .list_tables(
-                self.session.session_id(),
-                catalog.as_ref().map(|i| i.as_str()),
-                schema_pattern.as_ref().map(|p| p.as_str()),
-                table_pattern.as_ref().map(|p| p.as_str()),
-                table_types,
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
-        };
-        let reshaped = ThriftReshapingReader::new(
-            raw.reader,
-            GET_TABLES_SCHEMA.clone(),
-            Box::new(move |b| {
-                let types_ref: Option<Vec<&str>> = types_owned
-                    .as_ref()
-                    .map(|v| v.iter().map(|s| s.as_str()).collect());
-                thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
-            }),
-        );
-        ResultStream::from_reader(Box::new(reshaped)).await
+        let span = self.session.log_span().clone();
+        async {
+            let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
+            let types_owned: Option<Vec<String>> =
+                table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
+            let raw = match self
+                .session
+                .transport()
+                .list_tables(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                    table_pattern.as_ref().map(|p| p.as_str()),
+                    table_types,
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
+            };
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_TABLES_SCHEMA.clone(),
+                Box::new(move |b| {
+                    let types_ref: Option<Vec<&str>> = types_owned
+                        .as_ref()
+                        .map(|v| v.iter().map(|s| s.as_str()).collect());
+                    thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
+                }),
+            );
+            ResultStream::from_reader(Box::new(reshaped)).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Columns of tables matching the filter. Catalog is optional and
@@ -375,29 +388,33 @@ impl Metadata {
         table_pattern: Option<LikePattern<'_>>,
         column_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
-        let raw = match self
-            .session
-            .transport()
-            .list_columns(
-                self.session.session_id(),
-                catalog.as_ref().map(|i| i.as_str()),
-                schema_pattern.as_ref().map(|p| p.as_str()),
-                table_pattern.as_ref().map(|p| p.as_str()),
-                column_pattern.as_ref().map(|p| p.as_str()),
-            )
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
-        };
-        let reshaped = ThriftReshapingReader::new(
-            raw.reader,
-            GET_COLUMNS_SCHEMA.clone(),
-            Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
-        );
-        ResultStream::from_reader(Box::new(reshaped)).await
+        let span = self.session.log_span().clone();
+        async {
+            let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
+            let raw = match self
+                .session
+                .transport()
+                .list_columns(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                    table_pattern.as_ref().map(|p| p.as_str()),
+                    column_pattern.as_ref().map(|p| p.as_str()),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
+            };
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_COLUMNS_SCHEMA.clone(),
+                Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
+            );
+            ResultStream::from_reader(Box::new(reshaped)).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Primary keys for the given table. All three identifiers are
@@ -421,24 +438,28 @@ impl Metadata {
         schema: Option<Identifier<'_>>,
         table: Identifier<'_>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let catalog = catalog.ok_or_else(|| {
-            Error::invalid_argument().message("primary_keys requires a catalog identifier")
-        })?;
-        let schema = schema.ok_or_else(|| {
-            Error::invalid_argument().message("primary_keys requires a schema identifier")
-        })?;
-        let raw = self
-            .session
-            .transport()
-            .list_primary_keys(
-                self.session.session_id(),
-                catalog.as_str(),
-                schema.as_str(),
-                table.as_str(),
-            )
-            .await?;
-        ResultStream::from_reader(raw.reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let catalog = catalog.ok_or_else(|| {
+                Error::invalid_argument().message("primary_keys requires a catalog identifier")
+            })?;
+            let schema = schema.ok_or_else(|| {
+                Error::invalid_argument().message("primary_keys requires a schema identifier")
+            })?;
+            let raw = self
+                .session
+                .transport()
+                .list_primary_keys(
+                    self.session.session_id(),
+                    catalog.as_str(),
+                    schema.as_str(),
+                    table.as_str(),
+                )
+                .await?;
+            ResultStream::from_reader(raw.reader).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
@@ -461,30 +482,34 @@ impl Metadata {
         foreign_schema: Option<Identifier<'_>>,
         foreign_table: Option<Identifier<'_>>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let foreign_catalog = foreign_catalog.ok_or_else(|| {
-            Error::invalid_argument().message("foreign_keys requires foreign_catalog")
-        })?;
-        let foreign_schema = foreign_schema.ok_or_else(|| {
-            Error::invalid_argument().message("foreign_keys requires foreign_schema")
-        })?;
-        let foreign_table = foreign_table.ok_or_else(|| {
-            Error::invalid_argument().message("foreign_keys requires foreign_table")
-        })?;
-        let raw = self
-            .session
-            .transport()
-            .list_foreign_keys(
-                self.session.session_id(),
-                parent_catalog.as_ref().map(|i| i.as_str()),
-                parent_schema.as_ref().map(|i| i.as_str()),
-                parent_table.as_ref().map(|i| i.as_str()),
-                foreign_catalog.as_str(),
-                foreign_schema.as_str(),
-                foreign_table.as_str(),
-            )
-            .await?;
-        ResultStream::from_reader(raw.reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let foreign_catalog = foreign_catalog.ok_or_else(|| {
+                Error::invalid_argument().message("foreign_keys requires foreign_catalog")
+            })?;
+            let foreign_schema = foreign_schema.ok_or_else(|| {
+                Error::invalid_argument().message("foreign_keys requires foreign_schema")
+            })?;
+            let foreign_table = foreign_table.ok_or_else(|| {
+                Error::invalid_argument().message("foreign_keys requires foreign_table")
+            })?;
+            let raw = self
+                .session
+                .transport()
+                .list_foreign_keys(
+                    self.session.session_id(),
+                    parent_catalog.as_ref().map(|i| i.as_str()),
+                    parent_schema.as_ref().map(|i| i.as_str()),
+                    parent_table.as_ref().map(|i| i.as_str()),
+                    foreign_catalog.as_str(),
+                    foreign_schema.as_str(),
+                    foreign_table.as_str(),
+                )
+                .await?;
+            ResultStream::from_reader(raw.reader).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
@@ -499,18 +524,22 @@ impl Metadata {
         schema_pattern: Option<LikePattern<'_>>,
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let raw = self
-            .session
-            .transport()
-            .list_functions(
-                self.session.session_id(),
-                catalog.as_ref().map(|i| i.as_str()),
-                schema_pattern.as_ref().map(|p| p.as_str()),
-                name_pattern.as_ref().map(|p| p.as_str()),
-            )
-            .await?;
-        ResultStream::from_reader(raw.reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let raw = self
+                .session
+                .transport()
+                .list_functions(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                    name_pattern.as_ref().map(|p| p.as_str()),
+                )
+                .await?;
+            ResultStream::from_reader(raw.reader).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
@@ -524,26 +553,34 @@ impl Metadata {
         schema_pattern: Option<LikePattern<'_>>,
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let raw = self
-            .session
-            .transport()
-            .list_procedures(
-                self.session.session_id(),
-                catalog.as_ref().map(|i| i.as_str()),
-                schema_pattern.as_ref().map(|p| p.as_str()),
-                name_pattern.as_ref().map(|p| p.as_str()),
-            )
-            .await?;
-        ResultStream::from_reader(raw.reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let raw = self
+                .session
+                .transport()
+                .list_procedures(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                    name_pattern.as_ref().map(|p| p.as_str()),
+                )
+                .await?;
+            ResultStream::from_reader(raw.reader).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// SQL data types supported by the workspace. No filters. No wire
     /// call — returns a static in-memory result.
     pub async fn type_info(&self) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let reader = static_data::type_info_reader();
-        ResultStream::from_reader(reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let reader = static_data::type_info_reader();
+            ResultStream::from_reader(reader).await
+        }
+        .instrument(span)
+        .await
     }
 
     /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No
@@ -551,10 +588,14 @@ impl Metadata {
     /// driven by the session's transport list (see
     /// [`Transport::list_table_types`](crate::client::Transport::list_table_types)).
     pub async fn table_types(&self) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        let types = self.session.transport().list_table_types();
-        let reader = static_data::table_types_reader(&types);
-        ResultStream::from_reader(reader).await
+        let span = self.session.log_span().clone();
+        async {
+            let types = self.session.transport().list_table_types();
+            let reader = static_data::table_types_reader(&types);
+            ResultStream::from_reader(reader).await
+        }
+        .instrument(span)
+        .await
     }
 }
 

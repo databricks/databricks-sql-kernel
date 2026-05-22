@@ -57,3 +57,58 @@ where
         runtime_handle.block_on(fut)
     }
 }
+
+/// Bridge from a sync iterator to an async kernel future when no
+/// runtime handle has been threaded through.
+///
+/// Three cases:
+///
+/// - **No tokio runtime on this thread** (plain Rust use, the C ABI
+///   shim's sync entry points): falls back to
+///   `futures::executor::block_on`. Sufficient for readers whose
+///   futures are immediately ready (in-memory data); the only safe
+///   option when nobody set up a reactor.
+///
+/// - **Multi-thread tokio runtime**: escapes via `block_in_place` +
+///   the discovered handle (same shape as
+///   [`block_on_in_runtime`]). Tells the runtime "I'm about to do
+///   something blocking" so other tasks can migrate to a different
+///   worker, then drives the future to completion. This is the
+///   primary CloudFetch path under napi-rs.
+///
+/// - **Current-thread tokio runtime**: `block_in_place` panics here
+///   ("can call blocking only when running on the multi-threaded
+///   runtime"). For in-memory readers (immediately-ready futures)
+///   `futures::executor::block_on` still works because the future
+///   never yields, so we fall back to it. For futures that genuinely
+///   await tokio primitives (CloudFetch / timer / Notify), this path
+///   cannot bridge safely — sync iteration over CloudFetch from a
+///   current-thread runtime is a logically impossible request. The
+///   fallback at least doesn't crash unit tests that iterate
+///   in-memory mock readers from inside `#[tokio::test]`.
+///
+/// Used by [`crate::result_stream::OwnedBatchIter`] and
+/// [`crate::reader::ResultReaderAdapter`] — sync iterator adapters
+/// over `Box<dyn ResultReader>` where the caller couldn't thread a
+/// handle through at construction time (e.g. arrow's
+/// `RecordBatchReader` impl). Async-aware kernel callers should
+/// drive the reader via `next_batch().await` instead.
+pub(crate) fn block_on_current_runtime<F>(fut: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => match handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {
+                tokio::task::block_in_place(|| handle.block_on(fut))
+            }
+            // CurrentThread (or any future single-worker flavor):
+            // block_in_place panics. Fall back to executor::block_on
+            // — works for immediately-ready futures (in-memory
+            // readers), and there's no safe option for futures that
+            // need this runtime's reactor anyway.
+            _ => futures::executor::block_on(fut),
+        },
+        Err(_) => futures::executor::block_on(fut),
+    }
+}

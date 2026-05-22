@@ -591,12 +591,15 @@ impl ResultStream {
     /// isn't expressible.
     ///
     /// The wrapped reader is async; `next()` drives it via
-    /// `futures::executor::block_on`, which is executor-agnostic and
-    /// works in non-tokio contexts for in-memory readers. For
-    /// CloudFetch readers (which use tokio primitives internally),
-    /// `next()` must be called from inside a tokio runtime context
-    /// — see the `tokio::task::block_in_place` pattern in
-    /// `docs/spec-v0.md`. Errors are surfaced once; subsequent calls
+    /// [`crate::util::runtime::block_on_current_runtime`], which uses
+    /// `tokio::task::block_in_place` + the current runtime handle when
+    /// called from inside a multi-thread tokio runtime, and falls back
+    /// to `futures::executor::block_on` when no runtime is on the
+    /// thread (e.g. plain Rust callers, the C ABI shim). This keeps
+    /// CloudFetch readers (which await tokio primitives internally)
+    /// safe from the nested-`block_on` panic that motivated issue #19,
+    /// while still letting in-memory readers iterate without a tokio
+    /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
     pub fn into_owned_batches(self) -> OwnedBatchIter {
         OwnedBatchIter {
@@ -624,11 +627,14 @@ impl Iterator for OwnedBatchIter {
         if self.done {
             return None;
         }
-        // Executor-agnostic blocking poll. Safe for in-memory readers
-        // (immediately-ready futures). CloudFetch readers must be
-        // driven from inside a tokio runtime context — the underlying
-        // provider uses tokio primitives.
-        match futures::executor::block_on(self.reader.next_batch()) {
+        // Runtime-aware blocking poll: uses block_in_place + the
+        // current Handle when there's a tokio runtime on this thread
+        // (the case for CloudFetch readers, which await tokio
+        // primitives); falls back to futures::executor::block_on for
+        // plain-thread callers driving in-memory readers. Prevents
+        // the nested-block_on panic from issue #19 on the sync
+        // iterator path.
+        match crate::util::runtime::block_on_current_runtime(self.reader.next_batch()) {
             Ok(Some(batch)) => Some(Ok(batch)),
             Ok(None) => {
                 self.done = true;

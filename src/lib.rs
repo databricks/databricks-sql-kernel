@@ -70,6 +70,26 @@
 //! exec.close().await?;
 //! ```
 
+// === TLS feature wiring guard ===
+//
+// Exactly one of `tls-native` / `tls-rustls` must be active. Zero
+// would compile but every HTTPS call would fail at runtime (reqwest
+// can't pick a backend); both would link two TLS stacks into the
+// binary and defeat the napi crate's reason for choosing rustls.
+// Catch both cases at the build that introduces them.
+#[cfg(not(any(feature = "tls-native", feature = "tls-rustls")))]
+compile_error!(
+    "databricks-sql-kernel requires one of `tls-native` (default) or `tls-rustls`. \
+     If you set `default-features = false`, opt back into one explicitly."
+);
+
+#[cfg(all(feature = "tls-native", feature = "tls-rustls"))]
+compile_error!(
+    "`tls-native` and `tls-rustls` are mutually exclusive — enabling both links two \
+     TLS stacks and defeats the napi crate's rustls switch. The napi binding must \
+     disable defaults (`default-features = false`) before enabling `tls-rustls`."
+);
+
 pub mod auth;
 pub mod client;
 pub(crate) mod logging;
@@ -137,4 +157,43 @@ const _: fn() = || {
     // (the borrow lifetime is not what determines auto-trait status).
     assert_send_sync::<Identifier<'static>>();
     assert_send_sync::<LikePattern<'static>>();
+};
+
+// Futures returned by the async public surface MUST stay `Send` so
+// napi-rs's `execute_tokio_future` and `tokio::spawn` accept them.
+// `tracing::span::EnteredSpan` is `!Send` (it carries a
+// `PhantomData<*mut ()>`), so any maintainer reverting an
+// `async {}.instrument(span)` pattern back to a `let _g = span.entered();`
+// guard inside an async fn would silently regress this invariant —
+// all in-tree tests would still pass. These per-method asserts catch
+// it at the build that introduces it.
+const _: fn() = || {
+    fn assert_send<T: Send>(_: &T) {}
+    // The bindings on these are only used for type-checking; the
+    // closure is never invoked at runtime.
+    let _: fn(&mut Statement) = |stmt| {
+        assert_send(&stmt.execute());
+        assert_send(&stmt.submit());
+    };
+    let _: fn(Statement) = |stmt| {
+        assert_send(&stmt.close());
+    };
+    let _: fn(&ExecutedAsyncStatement) = |exec| {
+        assert_send(&exec.status());
+        assert_send(&exec.await_result());
+        assert_send(&exec.fetch_result());
+    };
+    let _: fn(Session) = |session| {
+        assert_send(&session.close());
+    };
+    let _: fn(&Metadata) = |md| {
+        assert_send(&md.list_catalogs());
+        assert_send(&md.list_schemas(None, None));
+        assert_send(&md.list_tables(None, None, None, None));
+        assert_send(&md.list_columns(None, None, None, None));
+        assert_send(&md.functions(None, None, None));
+        assert_send(&md.procedures(None, None, None));
+        assert_send(&md.type_info());
+        assert_send(&md.table_types());
+    };
 };

@@ -85,7 +85,10 @@ pub struct TlsConfig {
     /// Default: false.
     pub allow_self_signed: Option<bool>,
     /// Don't verify that the certificate hostname matches the server.
-    /// Requires the `native-tls` backend.
+    /// Works under both the `tls-native` (delegates to native-tls's
+    /// `danger_accept_invalid_hostnames`) and `tls-rustls` (installs
+    /// reqwest's `IgnoreHostname` verifier) backends. **Insecure** —
+    /// for dev/test only.
     /// Default: false.
     pub allow_hostname_mismatch: Option<bool>,
     /// Path to a PEM-encoded CA certificate file to add to the trust store.
@@ -269,6 +272,20 @@ impl DatabricksHttpClient {
         let client = builder.build().map_err(|e| {
             Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
         })?;
+
+        // Surface which TLS backend was compiled in so oncall debugging
+        // a handshake / unknown-CA report can tell at a glance whether
+        // this binary is on native-tls (system CA store) or rustls
+        // (Mozilla webpki-roots). The two stacks differ on cert
+        // validation behavior, OCSP, and TLS 1.3 quirks.
+        debug!(
+            tls_backend = if cfg!(feature = "tls-rustls") {
+                "rustls"
+            } else {
+                "native-tls"
+            },
+            "DatabricksHttpClient initialised"
+        );
 
         Ok(Self {
             client,

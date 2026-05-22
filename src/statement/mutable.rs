@@ -163,10 +163,6 @@ impl Statement {
             guard.defuse();
 
             let valid = ValidityFlag::new();
-            self.last_statement_id = Some(result.statement_id.clone());
-            self.last_valid = Some(valid.clone());
-
-            let valid = ValidityFlag::new();
             // Only `Closed` triggers the short-circuit. `Succeeded` means
             // the server still owns the statement and we must issue
             // CloseStatement. `Failed` / `Canceled` are terminal but still
@@ -220,9 +216,6 @@ impl Statement {
             guard.defuse();
 
             let valid = ValidityFlag::new();
-            self.last_statement_id = Some(response.statement_id.clone());
-            self.last_valid = Some(valid.clone());
-
             // submit path always uses wait_timeout=0s, so the server can't
             // return CLOSED yet; start the flag false and let later close()
             // calls flip it.
@@ -269,9 +262,13 @@ impl Statement {
     /// for callers that forget to call `close()` explicitly, but
     /// the explicit path is the supported one.
     pub async fn close(mut self) -> Result<()> {
-        let _g = self.session.log_span().clone().entered();
-        self.invalidate_prior().await;
-        Ok(())
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Shared spec-validation + `ExecuteParams` builder used by both

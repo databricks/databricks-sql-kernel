@@ -322,6 +322,15 @@ impl ResultReaderFactory {
 /// `.await` its underlying async provider directly — no internal
 /// `block_on`. This is what makes the public `ResultStream::next_batch`
 /// truly async and safe to call from a tokio runtime (e.g. napi-rs).
+///
+/// **External implementors**: this trait is rewritten by `async_trait`
+/// into a `Pin<Box<dyn Future + Send>>` return shape. Any external
+/// `impl ResultReader for MyType { async fn schema(&self) -> ... }`
+/// must be annotated with `#[async_trait::async_trait]`, otherwise the
+/// compiler will emit an opaque type-mismatch error. The same goes for
+/// the bound on `Box<dyn ResultReader + Send>` containers — readers
+/// constructed outside the kernel need to thread `async_trait` through
+/// their definitions.
 #[async_trait]
 pub trait ResultReader: Send + Sync {
     /// Get the schema of the result.
@@ -629,13 +638,14 @@ impl Iterator for ResultReaderAdapter {
 
     fn next(&mut self) -> Option<Self::Item> {
         // Sync `Iterator` adapter for arrow's `RecordBatchReader`.
-        // Uses the executor-agnostic `futures::executor::block_on` so
-        // this works in non-tokio contexts (e.g. unit tests) for
-        // in-memory readers whose futures are immediately ready. For
-        // CloudFetch readers (which use tokio primitives internally),
-        // callers must drive iteration from inside a tokio runtime
-        // context — use the async `ResultStream::next_batch` instead.
-        match futures::executor::block_on(self.inner.next_batch()) {
+        // `block_on_current_runtime` uses block_in_place + the
+        // current runtime Handle when one exists (the case for
+        // CloudFetch readers), and falls back to
+        // `futures::executor::block_on` when there is no runtime
+        // (in-memory readers in plain-thread tests / non-tokio
+        // callers). Prevents the issue-#19 nested-block_on panic
+        // on this sync iterator path.
+        match crate::util::runtime::block_on_current_runtime(self.inner.next_batch()) {
             Ok(Some(batch)) => Some(Ok(batch)),
             Ok(None) => None,
             Err(e) => Some(Err(ArrowError::ExternalError(Box::new(
