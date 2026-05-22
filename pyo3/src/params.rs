@@ -71,7 +71,19 @@ pub(crate) fn parse_typed_value(sql_type: &str, value_str: Option<&str>) -> Resu
             "BINARY parameters are not supported by the SEA wire today",
         )),
         "DATE" => parse_date(s),
-        "TIMESTAMP" | "TIMESTAMP_NTZ" => parse_timestamp(s),
+        // The three timestamp variants map to three distinct TypedValue
+        // arms so the SEA wire payload carries the exact type-name
+        // string the server expects. `TIMESTAMP` and `TIMESTAMP_NTZ`
+        // share `parse_timestamp` for the naive-datetime parsing; the
+        // NTZ arm re-wraps as `TimestampNtz` so the SEA payload mapper
+        // emits the explicit type-name. `TIMESTAMP_LTZ` has its own
+        // parser since it carries a timezone offset.
+        "TIMESTAMP" => parse_timestamp(s),
+        "TIMESTAMP_NTZ" => parse_timestamp(s).map(|v| match v {
+            TypedValue::Timestamp(ts) => TypedValue::TimestampNtz(ts),
+            other => other,
+        }),
+        "TIMESTAMP_LTZ" => parse_timestamp_ltz(s),
         "INTERVAL" => Ok(TypedValue::Interval(s.to_owned())),
         _ if upper.starts_with("DECIMAL(") => parse_decimal(sql_type, s),
         _ if is_compound_type_name(&upper) => Err(invalid(
@@ -194,6 +206,54 @@ fn parse_timestamp(s: &str) -> Result<TypedValue> {
         }
     }
     Err(invalid_msg(format!("invalid TIMESTAMP literal {s:?}")))
+}
+
+/// Parse a `TIMESTAMP_LTZ` literal into a tz-aware `DateTime<Utc>`.
+///
+/// Accepts three input shapes, all interpreted as UTC on the wire:
+///
+/// 1. Naive form (`"2026-05-15 12:30:45[.f]"` or T-separator) — the
+///    value is taken as UTC. This matches what Python's
+///    `datetime.utcnow().isoformat()` produces.
+/// 2. Trailing `Z` (`"2026-05-15T12:30:45Z"`) — explicit UTC marker;
+///    same semantics as #1 after stripping `Z`.
+/// 3. Explicit offset (`"2026-05-15T12:30:45+05:30"`) — parsed and
+///    converted to UTC, preserving the wall-clock-to-instant
+///    relationship.
+///
+/// The naive form is what most connector code emits today; the
+/// offset form covers callers using Python `datetime.astimezone(tz).isoformat()`.
+fn parse_timestamp_ltz(s: &str) -> Result<TypedValue> {
+    use chrono::{DateTime, FixedOffset, Utc};
+
+    // Try explicit-offset (RFC 3339) form first — covers `+HH:MM` and
+    // `Z` suffix in one call.
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
+        return Ok(TypedValue::TimestampLtz(dt.with_timezone(&Utc)));
+    }
+    // Also try the space-separated equivalent (`%Y-%m-%d %H:%M:%S%.f%:z`)
+    // which Python's `datetime.astimezone().isoformat(sep=' ')`
+    // happens to emit.
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z") {
+        return Ok(TypedValue::TimestampLtz(dt.with_timezone(&Utc)));
+    }
+    // Fall back to the naive forms `parse_timestamp` accepts, treating
+    // them as UTC. Strip trailing `Z` first.
+    let body = s.strip_suffix('Z').unwrap_or(s);
+    let formats = [
+        "%Y-%m-%d %H:%M:%S%.f",
+        "%Y-%m-%d %H:%M:%S",
+        "%Y-%m-%dT%H:%M:%S%.f",
+        "%Y-%m-%dT%H:%M:%S",
+    ];
+    for fmt in formats {
+        if let Ok(naive) = NaiveDateTime::parse_from_str(body, fmt) {
+            return Ok(TypedValue::TimestampLtz(
+                DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc),
+            ));
+        }
+    }
+    Err(invalid_msg(format!("invalid TIMESTAMP_LTZ literal {s:?}")))
 }
 
 fn parse_decimal(sql_type: &str, value: &str) -> Result<TypedValue> {
@@ -437,6 +497,47 @@ mod tests {
         // ISO-8601 T-separator variant (some Python datetime formatters use it).
         let c = parse_typed_value("TIMESTAMP", Some("2026-05-15T12:30:45")).unwrap();
         assert!(matches!(c, TypedValue::Timestamp(_)));
+    }
+
+    #[test]
+    fn timestamp_ntz_maps_to_distinct_variant() {
+        // Same literal as TIMESTAMP, but the type-name distinguishes:
+        // TIMESTAMP_NTZ → TypedValue::TimestampNtz, not Timestamp.
+        let v = parse_typed_value("TIMESTAMP_NTZ", Some("2026-05-15 12:30:45")).unwrap();
+        assert!(matches!(v, TypedValue::TimestampNtz(_)));
+        let v = parse_typed_value("TIMESTAMP_NTZ", Some("2026-05-15T12:30:45.123Z")).unwrap();
+        assert!(matches!(v, TypedValue::TimestampNtz(_)));
+    }
+
+    #[test]
+    fn timestamp_ltz_parses_naive_offset_and_z_forms() {
+        // Naive form — interpreted as UTC.
+        let v = parse_typed_value("TIMESTAMP_LTZ", Some("2026-05-15 12:30:45")).unwrap();
+        let TypedValue::TimestampLtz(dt) = v else {
+            panic!("expected TimestampLtz");
+        };
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%SZ").to_string(),
+            "2026-05-15T12:30:45Z"
+        );
+
+        // Trailing-Z form — equivalent UTC.
+        let v = parse_typed_value("TIMESTAMP_LTZ", Some("2026-05-15T12:30:45Z")).unwrap();
+        assert!(matches!(v, TypedValue::TimestampLtz(_)));
+
+        // Explicit positive offset — wall-clock 18:00 in +05:30 →
+        // 12:30 UTC. Confirms tz conversion (not just stripping).
+        let v = parse_typed_value("TIMESTAMP_LTZ", Some("2026-05-15T18:00:00+05:30")).unwrap();
+        let TypedValue::TimestampLtz(dt) = v else {
+            panic!("expected TimestampLtz");
+        };
+        assert_eq!(dt.format("%H:%M").to_string(), "12:30");
+    }
+
+    #[test]
+    fn timestamp_ltz_rejects_invalid_literal() {
+        let e = parse_typed_value("TIMESTAMP_LTZ", Some("not-a-timestamp")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
     }
 
     #[test]

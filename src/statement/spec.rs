@@ -43,6 +43,24 @@ use std::collections::HashMap;
 /// `Interval` is also a string in canonical SQL form
 /// (e.g. `"INTERVAL '1' DAY"`) — that's the form SEA expects on the
 /// wire.
+///
+/// **Timestamp variants.** Databricks SQL has three distinct
+/// timestamp types and the kernel preserves the distinction:
+///
+/// - [`TypedValue::Timestamp`] — the historical `TIMESTAMP` type.
+///   Wire form is naive (no timezone). Semantics historically vary
+///   per session and DBR version; in practice modern sessions treat
+///   it as equivalent to `TIMESTAMP_NTZ`. Kept for backwards
+///   compatibility with existing wrappers; prefer
+///   [`TypedValue::TimestampNtz`] for new code that wants explicit
+///   "no-timezone" guarantees.
+/// - [`TypedValue::TimestampNtz`] — `TIMESTAMP_NTZ`. Explicitly
+///   "no timezone": the server stores the value as-is and does not
+///   apply session-timezone interpretation on read.
+/// - [`TypedValue::TimestampLtz`] — `TIMESTAMP_LTZ`. "Local time
+///   zone": the value is anchored to UTC on the wire; the server
+///   may apply session-timezone interpretation in some display
+///   contexts. Represented as a tz-aware `chrono::DateTime<Utc>`.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TypedValue {
@@ -66,7 +84,13 @@ pub enum TypedValue {
         scale: i8,
     },
     Date(chrono::NaiveDate),
+    /// `TIMESTAMP` — see enum-level docs for the relationship to the
+    /// NTZ / LTZ variants.
     Timestamp(chrono::NaiveDateTime),
+    /// `TIMESTAMP_NTZ` — explicit no-timezone timestamp.
+    TimestampNtz(chrono::NaiveDateTime),
+    /// `TIMESTAMP_LTZ` — timezone-aware; always UTC on the wire.
+    TimestampLtz(chrono::DateTime<chrono::Utc>),
     Interval(String),
 }
 
