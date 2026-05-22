@@ -85,6 +85,13 @@ pub(crate) fn parse_typed_value(sql_type: &str, value_str: Option<&str>) -> Resu
         }),
         "TIMESTAMP_LTZ" => parse_timestamp_ltz(s),
         "INTERVAL" => Ok(TypedValue::Interval(s.to_owned())),
+        // VARIANT — pass the JSON text through verbatim. We don't
+        // validate parseability: the connector is expected to have
+        // produced valid JSON (Python's `json.dumps`, JS's
+        // `JSON.stringify`, etc.), and on a malformed payload the
+        // server returns a typed error which the kernel surfaces
+        // back to the caller.
+        "VARIANT" => Ok(TypedValue::Variant(s.to_owned())),
         _ if upper.starts_with("DECIMAL(") => parse_decimal(sql_type, s),
         _ if is_compound_type_name(&upper) => Err(invalid(
             "compound parameter types (ARRAY/MAP/STRUCT) are not yet supported",
@@ -538,6 +545,35 @@ mod tests {
     fn timestamp_ltz_rejects_invalid_literal() {
         let e = parse_typed_value("TIMESTAMP_LTZ", Some("not-a-timestamp")).unwrap_err();
         assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn variant_passes_json_text_through() {
+        // Object form — verbatim through to TypedValue::Variant.
+        let json = r#"{"k":1,"nested":{"a":[true,null]}}"#;
+        let v = parse_typed_value("VARIANT", Some(json)).unwrap();
+        match v {
+            TypedValue::Variant(s) => assert_eq!(s, json),
+            other => panic!("expected Variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn variant_accepts_scalar_json_values() {
+        // VARIANT permits any JSON value, not just objects / arrays.
+        for raw in [r#""hello""#, "42", "true", "null", "[1,2,3]"] {
+            let v = parse_typed_value("VARIANT", Some(raw)).unwrap();
+            assert!(matches!(v, TypedValue::Variant(_)), "case {raw}");
+        }
+    }
+
+    #[test]
+    fn variant_does_not_validate_json() {
+        // The kernel doesn't parse VARIANT — malformed JSON is the
+        // server's job to reject. Confirms we don't accidentally
+        // pre-validate at the kernel boundary.
+        let v = parse_typed_value("VARIANT", Some("not even close to json")).unwrap();
+        assert!(matches!(v, TypedValue::Variant(_)));
     }
 
     #[test]
