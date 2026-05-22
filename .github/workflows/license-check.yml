@@ -63,10 +63,10 @@ jobs:
         with:
           cargo: "true"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@a416ddeedbd372e614cc1386e8b642692f66865e  # v2.57.1
+        uses: taiki-e/install-action@e0eafa9a0d485c37f97c0f7beb930a58a2facbac  # v2.79.4
         with:
           tool: cargo-deny
 
