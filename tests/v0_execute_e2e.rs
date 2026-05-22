@@ -367,12 +367,21 @@ async fn bind_all_typed_values_round_trip() {
     // existing timestamp accessor. The wall-clock equals what we
     // bound (i.e. no silent tz drift).
     assert_eq!(row.get_timestamp(9).unwrap(), Some(ts_ltz.naive_utc()));
-    // VARIANT readback: server returns the JSON canonical form
-    // (key order preserved from input, whitespace stripped). Our
-    // input has no whitespace, so the canonical form equals the
-    // input. `get_str` reads the Utf8 Arrow column; the type
-    // distinction is in the column metadata.
-    assert_eq!(row.get_str(10).unwrap(), Some(variant_json));
+    // VARIANT readback: server returns canonical JSON. We compare
+    // structurally (parse both sides to serde_json::Value, then
+    // equality) rather than by byte-equality, because VARIANT's
+    // binary representation doesn't textually guarantee key order
+    // — a future canonicaliser change could flake byte-equality
+    // assertions without actually breaking the round-trip.
+    let variant_back = row
+        .get_str(10)
+        .unwrap()
+        .expect("VARIANT column should not be NULL");
+    let expected: serde_json::Value =
+        serde_json::from_str(variant_json).expect("test input must parse");
+    let actual: serde_json::Value =
+        serde_json::from_str(variant_back).expect("server VARIANT readback must parse");
+    assert_eq!(actual, expected, "VARIANT structural mismatch");
     // NULL parameter — server returns SQL NULL; STRING is the default
     // type for TypedValue::Null on the wire.
     assert_eq!(row.get_str(11).unwrap(), None);

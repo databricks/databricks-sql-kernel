@@ -91,6 +91,18 @@ pub(crate) fn parse_typed_value(sql_type: &str, value_str: Option<&str>) -> Resu
         // `JSON.stringify`, etc.), and on a malformed payload the
         // server returns a typed error which the kernel surfaces
         // back to the caller.
+        //
+        // Note on the JSON-null vs SQL-NULL asymmetry: a caller
+        // binding a JSON `null` value sends `value_str=Some("null")`
+        // and lands here as `TypedValue::Variant("null")` — a VARIANT
+        // column containing the JSON-null value. The SQL-NULL path is
+        // distinct: `value_str=None` short-circuits at the top of
+        // this function to `TypedValue::Null` regardless of
+        // `sql_type`. Both are correct and intentionally different.
+        // Don't "fix" this by collapsing `Variant("null")` into
+        // `TypedValue::Null` — JSON-null is a meaningful VARIANT
+        // payload that the server stores and reads back as a JSON
+        // `null` literal, not as SQL NULL.
         "VARIANT" => Ok(TypedValue::Variant(s.to_owned())),
         _ if upper.starts_with("DECIMAL(") => parse_decimal(sql_type, s),
         _ if is_compound_type_name(&upper) => Err(invalid(
@@ -561,6 +573,11 @@ mod tests {
     #[test]
     fn variant_accepts_scalar_json_values() {
         // VARIANT permits any JSON value, not just objects / arrays.
+        // Note: `"null"` here is a JSON-null literal inside the VARIANT
+        // (i.e. `TypedValue::Variant("null".into())`), NOT SQL NULL.
+        // SQL NULL is reached via `value_str=None`, which short-
+        // circuits to `TypedValue::Null` before this match arm. See
+        // the comment on the `"VARIANT"` arm in `parse_typed_value`.
         for raw in [r#""hello""#, "42", "true", "null", "[1,2,3]"] {
             let v = parse_typed_value("VARIANT", Some(raw)).unwrap();
             assert!(matches!(v, TypedValue::Variant(_)), "case {raw}");
