@@ -456,6 +456,91 @@ async fn bind_all_typed_values_round_trip() {
     session.close().await.expect("session close");
 }
 
+/// **GEOGRAPHY + GEOMETRY round-trip.** Separate from the
+/// bind-all-types test because Databricks geospatial types require
+/// DBR ≥ 16.x; older warehouses will fail the SELECT. Both bindings
+/// use EWKT-with-SRID form on the way in; readback uses `ST_AsText`
+/// (server strips the SRID prefix and returns bare WKT — the SRID
+/// lives in column metadata, not the textual value).
+#[tokio::test]
+#[ignore]
+async fn bind_geography_and_geometry_round_trip() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql(
+            "SELECT \
+                 ST_AsText(ST_GeogFromText(?))  AS c_geog_wkt, \
+                 ST_SRID(ST_GeogFromText(?))    AS c_geog_srid, \
+                 ST_AsText(ST_GeomFromText(?))  AS c_geom_wkt, \
+                 ST_SRID(ST_GeomFromText(?))    AS c_geom_srid",
+        )
+        // Same EWKT body passed twice (once for the WKT readback,
+        // once for the SRID readback). The two server-side parses
+        // produce identical geos.
+        .param(
+            1,
+            TypedValue::Geography {
+                wkt: "POINT(-122.4194 37.7749)".into(),
+                srid: Some(4326),
+                wkb: None,
+            },
+        )
+        .unwrap()
+        .param(
+            2,
+            TypedValue::Geography {
+                wkt: "POINT(-122.4194 37.7749)".into(),
+                srid: Some(4326),
+                wkb: None,
+            },
+        )
+        .unwrap()
+        .param(
+            3,
+            TypedValue::Geometry {
+                wkt: "LINESTRING(0 0,1 1,2 2)".into(),
+                srid: Some(0),
+                wkb: None,
+            },
+        )
+        .unwrap()
+        .param(
+            4,
+            TypedValue::Geometry {
+                wkt: "LINESTRING(0 0,1 1,2 2)".into(),
+                srid: Some(0),
+                wkb: None,
+            },
+        )
+        .unwrap();
+    let mut exec = stmt.execute().await.expect("execute geo bind");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+
+    // Geography column: bare WKT body comes back, SRID in a
+    // separate column via ST_SRID.
+    assert_eq!(
+        row.get_str(0).unwrap(),
+        Some("POINT(-122.4194 37.7749)"),
+        "Geography WKT round-trip",
+    );
+    assert_eq!(row.get_i32(1).unwrap(), Some(4326), "Geography SRID");
+
+    // Geometry column: same shape.
+    assert_eq!(
+        row.get_str(2).unwrap(),
+        Some("LINESTRING(0 0, 1 1, 2 2)"),
+        "Geometry WKT round-trip (note: server reformats with spaces after commas)",
+    );
+    assert_eq!(row.get_i32(3).unwrap(), Some(0), "Geometry SRID");
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
 /// Verifies the kernel handles every SQL-text use of BINARY
 /// documented at
 /// https://docs.databricks.com/aws/en/sql/language-manual/data-types/binary-type
