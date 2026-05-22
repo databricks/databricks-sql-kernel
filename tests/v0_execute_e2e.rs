@@ -451,3 +451,35 @@ async fn cloudfetch_drain_does_not_nest_block_on() {
     exec.close().await.expect("close");
     session.close().await.expect("session close");
 }
+
+/// Current-thread sibling of `cloudfetch_drain_does_not_nest_block_on`.
+///
+/// Under Option-1 (this PR's async trait), the fix is supposed to be
+/// runtime-flavor-independent. The `multi_thread` test above could
+/// still pass even if a future refactor reintroduced a sync→async
+/// `block_on` bridge protected by `tokio::task::block_in_place` (the
+/// Option-2 stopgap PR #20 used). `current_thread` is the worst case:
+/// `block_in_place` panics on a current-thread runtime, so a nested
+/// `block_on` here would surface immediately. This is the
+/// discriminating regression guard.
+#[tokio::test(flavor = "current_thread")]
+#[ignore]
+async fn cloudfetch_drain_works_on_current_thread_runtime() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT * FROM range(1000000)");
+    let mut exec = stmt
+        .execute()
+        .await
+        .expect("execute range(1000000) on current_thread runtime");
+
+    let rows = drain_rows(exec.result_stream_mut()).await;
+    assert_eq!(
+        rows, 1_000_000,
+        "expected 1M rows on current_thread runtime; if this drain \
+         panicked or block_in_place was reintroduced, the Option-1 \
+         async-trait fix has regressed"
+    );
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
