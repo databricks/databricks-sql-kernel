@@ -46,6 +46,41 @@ static RUNTIME_HANDLE: OnceCell<Handle> = OnceCell::new();
 /// the test build; `get_handle()` itself cannot be tested without a
 /// real tokio runtime context and is intentionally dead until Round 2,
 /// so it keeps its own `allow(dead_code)`.
+///
+/// # PERF NOTE — pool sizing & sharing
+///
+/// The handle returned here is napi-rs's *process-global*
+/// `tokio::runtime::Runtime` (created via
+/// `tokio::runtime::Runtime::new()` in
+/// `napi-2.16.17/src/tokio_runtime.rs:11`). Default worker-thread count
+/// is `num_cpus`. **The host's `num_cpus` is the raw CPU count, not the
+/// cgroup CPU quota** — containers / serverless functions with a CPU
+/// limit (k8s `resources.limits.cpu`, Lambda 0.5-vCPU plans) still get
+/// a pool sized for the underlying host, which over-provisions threads
+/// and inflates context-switch overhead.
+///
+/// Override knobs (must be in effect *before* napi-rs initializes its
+/// runtime, i.e. before the first `#[napi] async fn` runs):
+/// - `TOKIO_WORKER_THREADS` env var, read by `tokio::runtime::Runtime::new()`.
+///   Set this in the JS-side launcher / Docker `ENV` / k8s pod spec.
+/// - `napi::create_custom_tokio_runtime(rt)` from a
+///   `#[napi::module_init]` block — fully programmatic, but only the
+///   binding crate can call it.
+///
+/// Note: this is NOT `NAPI_RS_WORKER_THREADS`; that name does not exist
+/// in napi-rs 2.x. Caveat for anyone copying patterns from older
+/// napi-rs docs.
+///
+/// # Pool-sharing divergence from pyo3
+///
+/// pyo3 builds a tokio runtime per `Session`. This binding shares
+/// **one** global pool across every `Connection` / `Statement` /
+/// `ResultStream`. CloudFetch (`src/reader/cloudfetch/`) spawns N+5
+/// concurrent tasks per active statement via the captured handle — at
+/// scale (many parallel statements) the shared pool contention is the
+/// dominant runtime overhead, whereas pyo3's per-session isolation
+/// avoids cross-statement interference. PR #25's sizing benchmarks
+/// must account for this when comparing napi vs pyo3 absolute numbers.
 #[allow(dead_code)]
 pub(crate) fn get_handle() -> &'static Handle {
     RUNTIME_HANDLE.get_or_init(Handle::current)
