@@ -115,6 +115,27 @@ mod tests {
         );
     }
 
+    /// Compile-time guard: `panic = "abort"` MUST NOT be active for
+    /// any profile this crate builds under. `catch_unwind` (which
+    /// `guarded` depends on) becomes a process-aborting no-op under
+    /// `panic = "abort"`, turning a recoverable per-statement panic
+    /// into a fleet-wide Node-process exit.
+    ///
+    /// `compile_error!` inside a `#[cfg(panic = "abort")]` block fails
+    /// the build with a clear message rather than letting tests pass
+    /// against a binary that would crash production. The
+    /// `#[allow(unexpected_cfgs)]` is so the `cfg(panic = ...)` check
+    /// itself is recognised by rustc's lint as a known cfg key.
+    #[allow(unexpected_cfgs)]
+    const _: () = {
+        #[cfg(panic = "abort")]
+        compile_error!(
+            "panic = \"abort\" disables catch_unwind, breaking util::guarded \
+             and turning recoverable per-statement panics into Node-process \
+             aborts. See [profile.release] comment in napi/Cargo.toml."
+        );
+    };
+
     #[tokio::test]
     async fn guarded_recovers_non_string_panic() {
         // panic_any with a non-(str|String) payload — these fall

@@ -102,6 +102,18 @@ napi-build = "2"
 
 [profile.release]
 lto = true
+# Single codegen unit for the cdylib: ~30-60s slower build for
+# meaningfully smaller binary + better cross-crate inlining. Mirrors
+# the standard napi-rs release-profile recipe.
+codegen-units = 1
+# `panic = "abort"` MUST NOT be added here. The crate relies on
+# `util::guarded`'s `catch_unwind` to convert futures-panics into
+# `napi::Error` rejected promises (pattern #8 in the napi-rs patterns
+# doc). With `panic = "abort"`, `catch_unwind` becomes a no-op and the
+# Node process exits instead — turning a recoverable per-statement
+# panic into a fleet-wide outage. The 5 `util::guarded_recovers_*`
+# tests cover this contract; if any future optimisation flips this
+# flag the test binary itself will abort under panic before reporting.
 # `strip = "debuginfo"` (not `"symbols"`) — keeps function-name symbols
 # so production stack traces from `panic_payload_msg` (and any future
 # native crash dump) are readable. Stripping `debuginfo` only drops the
