@@ -75,14 +75,6 @@ use serde_json::{json, Map, Value};
 /// with the sentinel (an unlikely but possible source of confusion).
 pub(crate) const ERROR_SENTINEL: &str = "__databricks_error__:";
 
-/// Marker prepended to a kernel `Error.message` that would otherwise
-/// collide with [`ERROR_SENTINEL`] when nested inside the envelope.
-/// Mirrors the convention used in other defensive-escape sites in the
-/// driver. Visible to JS consumers as a prefix on the recovered
-/// `message` field — they see e.g. `"[escaped] __databricks_error__:..."`
-/// rather than a corrupted envelope.
-pub(crate) const ESCAPED_PREFIX: &str = "[escaped] ";
-
 /// Map a kernel [`Error`] into a `napi::Error`. Preserves the kernel
 /// `ErrorCode` (mapped to the closest napi `Status`), and stuffs eight
 /// of the ten structured kernel-`Error` fields (`code`, `message`,
@@ -91,28 +83,32 @@ pub(crate) const ESCAPED_PREFIX: &str = "[escaped] ";
 /// reconstruct the typed error class. `location` and `cause` are
 /// intentionally omitted from the v1 envelope — see the module-level
 /// doc for rationale.
-pub(crate) fn napi_err_from_kernel(mut e: KernelError) -> NapiError {
+///
+/// The whole JSON-envelope-on-`reason` scheme is interim. The follow-up
+/// PR that lands the first `#[napi]` entry points (PR #25) is expected
+/// to replace it with typed errors via `Env::create_error` +
+/// `set_named_property` (mirroring pyo3's `setattr` approach in
+/// `pyo3/src/errors.rs`). The sentinel + envelope vanish once that
+/// lands. See `sea-workflow/jira-candidates/2026-05-23-napi-typed-error-refactor.md`
+/// for the deferred-spec write-up.
+pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
     let status = status_from_kernel_code(e.code);
 
-    // Sentinel-collision defense: a kernel `Error.message` that itself
-    // starts with `ERROR_SENTINEL` would land verbatim inside the JSON
-    // envelope's `"message"` field — harmless to serde_json (the inner
-    // string is properly JSON-escaped), but a stop-at-first-newline /
-    // naive substring TS parser could mis-locate the envelope boundary.
-    // The `debug_assert!` traps the case during dev so a future
-    // kernel-side change cannot silently start emitting such messages
-    // unnoticed; the unconditional escape below ensures `--release`
-    // builds (where `debug_assert!` is compiled out) still see a
-    // canonical, non-doubly-prefixed envelope. Real-world likelihood is
-    // near zero, but the defense is cheap (one `starts_with` per error;
-    // errors are never on a hot path) and survives release stripping.
+    // Sentinel-collision defense (dev-time only): a kernel `Error.message`
+    // that itself starts with `ERROR_SENTINEL` would land verbatim inside
+    // the JSON envelope's `"message"` field. serde_json escapes it
+    // correctly so a JSON-parsing TS reviver still recovers the right
+    // payload; the practical hazard is a naive `indexOf(SENTINEL)`-based
+    // reviver mis-locating the boundary. Today the kernel never emits
+    // such a message; this `debug_assert!` catches any future kernel-side
+    // change that would start to. We deliberately do NOT add a
+    // release-build runtime escape — the right fix is to delete the
+    // envelope scheme entirely (see typed-error refactor deferred-spec)
+    // rather than harden the workaround.
     debug_assert!(
         !e.message.starts_with(ERROR_SENTINEL),
         "kernel Error.message must not start with ERROR_SENTINEL (would corrupt the wire envelope)"
     );
-    if e.message.starts_with(ERROR_SENTINEL) {
-        e.message = format!("{ESCAPED_PREFIX}{}", e.message);
-    }
 
     // Build the envelope as a `serde_json::Map` so the TS contract is
     // single-sourced in one place (the key set below) and the value
@@ -257,100 +253,41 @@ mod tests {
         }
     }
 
-    /// Sentinel-collision regression guard. `debug_assert!` is the
-    /// dev-time trap; the unconditional escape branch is the
-    /// release-build guarantee. This test enforces both edges:
+    /// Dev-time invariant: a kernel `Error.message` that starts with
+    /// `ERROR_SENTINEL` is treated as a policy violation and fires the
+    /// `debug_assert!` in `napi_err_from_kernel`. The kernel never emits
+    /// such a message today; this test catches any future kernel-side
+    /// change that would start to. `cargo test` runs under the debug
+    /// profile, so the assertion is active; we use `catch_unwind` to
+    /// observe the panic without aborting the test process.
     ///
-    /// 1. In debug / `cargo test` builds the `debug_assert!` panics
-    ///    so the kernel author sees the policy violation immediately.
-    /// 2. With panics caught, the resulting envelope decodes to a
-    ///    single well-formed JSON object whose `message` field is the
-    ///    escaped original (not the raw sentinel-prefixed string) —
-    ///    i.e. no doubly-prefixed wire payload that would confuse a
-    ///    naive TS reviver.
-    ///
-    /// Reviewer-verified against the comment at PR #27 / error.rs:99
-    /// asserting that `debug_assert!` alone is insufficient because it
-    /// vanishes under `--release` (where the binding ships).
+    /// This is **dev-time only on purpose**. Release builds compile
+    /// `debug_assert!` out, so a sentinel-prefixed kernel message would
+    /// be embedded inside the JSON envelope's `"message"` field
+    /// verbatim — well-formed JSON (serde_json escapes it correctly),
+    /// safe for a JSON-parsing TS reviver. The only consumers that
+    /// would mis-parse are naive `indexOf(SENTINEL)`-style revivers,
+    /// which we explicitly don't support. The deeper fix is to delete
+    /// the envelope scheme entirely in favour of typed errors via
+    /// `Env::create_error` + `set_named_property`. See
+    /// `sea-workflow/jira-candidates/2026-05-23-napi-typed-error-refactor.md`.
     #[test]
-    fn sentinel_collision_defense_survives_release_strip() {
+    fn sentinel_prefix_triggers_debug_assert() {
         use std::panic;
 
-        let nasty = format!("{ERROR_SENTINEL}injected\":\"value");
-        let nasty_for_closure = nasty.clone();
-
-        // Edge 1: the debug-time trap fires. Use catch_unwind because
-        // `debug_assert!` is active under `cargo test`'s debug profile;
-        // we want the test to *prove* the assert is wired, not skip past
-        // it.
+        let nasty = format!("{ERROR_SENTINEL}injected");
         let prev_hook = panic::take_hook();
         panic::set_hook(Box::new(|_| {}));
         let asserted = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let e = KernelError::internal().message(&nasty_for_closure);
-            // Discard the result; we only want to know whether the
-            // function panicked. In `--release` (no debug_assert) this
-            // would succeed and return a NapiError instead.
+            let e = KernelError::internal().message(&nasty);
             let _ = napi_err_from_kernel(e);
         }));
         panic::set_hook(prev_hook);
         assert!(
             asserted.is_err(),
             "debug_assert! should fire in debug builds when kernel \
-             message starts with ERROR_SENTINEL — got Ok back, defense \
-             is missing the dev-time trap"
-        );
-
-        // Edge 2: the runtime escape branch produces a non-corrupt
-        // envelope even when `debug_assert!` is compiled out. Simulate
-        // that path by exercising the escape branch directly: we feed
-        // the function a *pre-escaped* message (mirroring what the
-        // release-build branch would do) and verify the wire shape.
-        // This is the strict release-build contract: exactly one
-        // ERROR_SENTINEL boundary, parseable as JSON, with the original
-        // sentinel-prefixed string visible inside the `message` field
-        // (prefixed with ESCAPED_PREFIX).
-        let pre_escaped = format!("{ESCAPED_PREFIX}{nasty}");
-        let e = KernelError::internal().message(&pre_escaped);
-        let napi_err = napi_err_from_kernel(e);
-        let reason = napi_err.reason.to_string();
-
-        // Exactly one ERROR_SENTINEL at position 0; the JSON payload
-        // that follows must start with `{` (the envelope object). A
-        // doubly-prefixed wire would look like
-        // `__databricks_error__:__databricks_error__:{...}` and the
-        // second byte after the first sentinel would be the second
-        // sentinel, not `{`. (The sentinel string may still legitimately
-        // appear *inside* the JSON as escaped data on the right-hand
-        // side of `"message":` — that's fine because the TS reviver is
-        // contracted to JSON-parse the entire substring after the
-        // structural boundary, not to scan for sentinels recursively.)
-        assert!(
-            reason.starts_with(ERROR_SENTINEL),
-            "envelope must start with sentinel, got: {reason}"
-        );
-        let after_first = &reason[ERROR_SENTINEL.len()..];
-        assert!(
-            after_first.starts_with('{'),
-            "byte after first ERROR_SENTINEL must be `{{` (JSON object); \
-             a doubly-prefixed envelope would have a second sentinel \
-             here instead. reason was: {reason}"
-        );
-
-        // The payload after the single boundary is a parseable JSON
-        // object — no premature termination, no string concatenation
-        // artefacts.
-        let payload = after_first;
-        let v: serde_json::Value =
-            serde_json::from_str(payload).expect("payload after ERROR_SENTINEL must be valid JSON");
-        let recovered_msg = v["message"]
-            .as_str()
-            .expect("envelope `message` must be a string");
-        // The escape prefix is visible to JS consumers so they can tell
-        // the message was sanitised (and that the inner sentinel is
-        // data, not a structural marker).
-        assert!(
-            recovered_msg.starts_with(ESCAPED_PREFIX),
-            "recovered message must carry ESCAPED_PREFIX, got: {recovered_msg}"
+             message starts with ERROR_SENTINEL — got Ok back, the \
+             dev-time trap is missing"
         );
     }
 
