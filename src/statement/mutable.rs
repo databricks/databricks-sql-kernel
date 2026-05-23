@@ -58,7 +58,7 @@ use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::executed_async::ExecutedAsyncStatement;
-use crate::statement::params::typed_value_to_sea_parameter;
+use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
 use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
 use crate::types::sea::{ExecuteParams, StatementState};
@@ -284,13 +284,6 @@ impl Statement {
         if self.spec.result_format != ResultFormat::Arrow {
             return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
         }
-        if !self.spec.named_params.is_empty() {
-            return Err(Error::invalid_argument().message(
-                "named parameter bindings are not supported in v0 — SEA wire format \
-                 carries positional bindings only",
-            ));
-        }
-
         // `wait_timeout = None` means "omit the field"; the server
         // applies its default (~10s wait + auto-close on success).
         // `on_wait_timeout` only matters when wait_timeout is set,
@@ -304,6 +297,11 @@ impl Statement {
             exec_params
                 .parameters
                 .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
+        }
+        for (name, value) in self.spec.named_params.iter() {
+            exec_params
+                .parameters
+                .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
         }
         Ok((sql, exec_params))
     }
