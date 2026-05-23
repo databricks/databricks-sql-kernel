@@ -354,6 +354,130 @@ mod tests {
         );
     }
 
+    /// Parity guard: the napi envelope must surface the same kernel
+    /// `Error` field set that pyo3's typed `KernelError` exposes via
+    /// `setattr`. The two bindings diverge on *wire mechanism* (typed
+    /// exception attrs vs JSON envelope) and on *naming convention*
+    /// (snake_case attrs in pyo3 vs camelCase JSON keys in napi) — but
+    /// the *field set* must stay aligned or downstream wrappers that
+    /// claim Python ↔ Node parity will silently drop information when
+    /// crossing the language boundary.
+    ///
+    /// pyo3 attaches via `attach_attrs(...)` in `pyo3/src/errors.rs:67`:
+    /// `code, message, sql_state, error_code, vendor_code, http_status,
+    /// retryable, query_id`. Both bindings intentionally omit `location`
+    /// (kernel-internal `file:line` for `Internal` errors) and `cause`
+    /// (recursive — needs an explicit schema decision). This test pins
+    /// the envelope to that 8-field contract.
+    ///
+    /// Reviewer-flagged at PR #27 / error.rs:76 — see comment text
+    /// `pyo3 attaches kernel error fields as Python attributes…`.
+    #[test]
+    fn envelope_field_set_matches_pyo3_setattr_contract() {
+        // Build a kernel error with every optional field populated so
+        // the conditional `if let Some(...)` branches in the encoder
+        // all fire and we exercise the full key set in one shot.
+        let mut e = KernelError::new(ErrorCode::NetworkError, "x");
+        e.sql_state = Some("08000".to_string());
+        e.error_code = Some("WAREHOUSE_STOPPED".to_string());
+        e.vendor_code = Some(1234);
+        e.http_status = Some(503);
+        e.retryable = true;
+        e.query_id = Some("01eedeadbeefdeadbeefdeadbeefdead".to_string());
+        // Set the *intentionally-omitted* fields too — the test should
+        // confirm they do NOT appear on the wire.
+        e.location = Some("kernel/src/foo.rs:42".to_string());
+        e.cause = Some(Box::new(KernelError::internal().message("inner")));
+
+        let napi_err = napi_err_from_kernel(e);
+        let reason = napi_err.reason.to_string();
+        let payload = &reason[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value =
+            serde_json::from_str(payload).expect("envelope payload must be valid JSON");
+        let obj = v
+            .as_object()
+            .expect("envelope payload must be a JSON object");
+
+        // Mirrors pyo3's `attach_attrs` field list, in pyo3's snake_case
+        // → napi's camelCase. Update both lists together when the
+        // contract changes.
+        let expected_keys: &[&str] = &[
+            "code",       // pyo3: "code"
+            "message",    // pyo3: "message"
+            "sqlState",   // pyo3: "sql_state"
+            "errorCode",  // pyo3: "error_code"
+            "vendorCode", // pyo3: "vendor_code"
+            "httpStatus", // pyo3: "http_status"
+            "retryable",  // pyo3: "retryable"
+            "queryId",    // pyo3: "query_id"
+        ];
+        for k in expected_keys {
+            assert!(
+                obj.contains_key(*k),
+                "envelope is missing the `{k}` key — pyo3 sets this via \
+                 setattr, napi binding must keep parity. payload: {payload}"
+            );
+        }
+
+        // Intentionally-omitted fields must NOT leak into the wire
+        // shape (the module doc and the kernel `Error` struct both
+        // identify `location` and `cause` as v1-omitted). If a future
+        // refactor accidentally includes them, this test breaks
+        // before the wire contract does.
+        for forbidden in &["location", "cause"] {
+            assert!(
+                !obj.contains_key(*forbidden),
+                "v1 envelope must NOT include `{forbidden}` — see the \
+                 module-level doc for the rationale. payload: {payload}"
+            );
+        }
+
+        // No surprise keys: the wire shape stays the documented set
+        // (exact-size check, not subset). A future field addition
+        // requires updating both pyo3's attach_attrs and this list.
+        assert_eq!(
+            obj.len(),
+            expected_keys.len(),
+            "envelope has unexpected extra keys vs the pyo3 parity set. \
+             expected: {expected_keys:?}, got: {:?}",
+            obj.keys().collect::<Vec<_>>()
+        );
+    }
+
+    /// Optional fields are omitted from the wire shape when `None` (no
+    /// `null` entries). This keeps the envelope compact AND means a TS
+    /// reviver doesn't need to special-case `null` separately from
+    /// "key missing", matching the pyo3 side where `setattr(..., None)`
+    /// still leaves an attribute set to Python `None` — but the
+    /// downstream client adapter inspects truthy-ness either way.
+    #[test]
+    fn envelope_omits_none_optional_fields() {
+        let e = KernelError::invalid_argument().message("hi");
+        let napi_err = napi_err_from_kernel(e);
+        let payload = &napi_err.reason.to_string()[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let obj = v.as_object().unwrap();
+        // Only the always-on fields appear: code + message.
+        // `retryable` defaults to `false` and is also omitted (the
+        // encoder branch only inserts it when `true`).
+        for absent in &[
+            "sqlState",
+            "errorCode",
+            "vendorCode",
+            "httpStatus",
+            "retryable",
+            "queryId",
+        ] {
+            assert!(
+                !obj.contains_key(*absent),
+                "key `{absent}` should be omitted when kernel field is \
+                 None/false, got: {payload}"
+            );
+        }
+        assert!(obj.contains_key("code"));
+        assert!(obj.contains_key("message"));
+    }
+
     #[test]
     fn status_from_kernel_code_maps_special_cases() {
         // Status mapping is mostly cosmetic but the 3 distinguished
