@@ -17,18 +17,27 @@
 //! - `Statement.fetchNextBatch() -> Option<ArrowBatch>` — drives
 //!   `ResultStream::next_batch().await`, serialises the borrowed
 //!   `RecordBatch` to Arrow IPC bytes, returns them to JS.
-//! - `Statement.schema() -> ArrowSchema` — returns the cached schema
-//!   from the kernel side, serialised as a schema-only IPC payload.
+//! - `Statement.schema() -> ArrowSchema` — returns the schema cached
+//!   at construction time, serialised as a schema-only IPC payload.
+//!   Available even after `close()` so JS callers can build error
+//!   reports against a disposed statement.
 //! - `Statement.cancel()` / `Statement.close()` — forwards to
 //!   `ExecutedStatement::cancel/close` via the
 //!   `ExecutedStatementHandle` trait. Drop fires-and-forgets close
 //!   if not already explicitly closed.
+//! - `Statement.statementId` — server-issued statement id, cached at
+//!   construction and exposed for log correlation against kernel /
+//!   server logs which key on the same id.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use arrow_ipc::writer::StreamWriter;
-use databricks_sql_kernel::{ExecutedStatement, ExecutedStatementHandle, ResultBatch};
+use arrow_schema::SchemaRef;
+use databricks_sql_kernel::{
+    Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch,
+};
 
 use crate::error::napi_err_from_kernel;
 use crate::result::{ArrowBatch, ArrowSchema};
@@ -37,58 +46,87 @@ use crate::util::guarded;
 
 /// Opaque executed-statement handle.
 ///
-/// `inner` is wrapped in `Arc<Mutex<Option<…>>>` so:
-/// - `fetch_next_batch` can `await` `ResultStream::next_batch` which
-///   requires `&mut ExecutedStatement` (via `result_stream_mut`),
-/// - `cancel` / `close` (which take `&self` on the kernel side via the
-///   `ExecutedStatementHandle` trait) can run concurrently with each
-///   other from a JS perspective without panicking,
-/// - `Drop` can hand the inner handle off to a tokio task without
-///   touching `&mut self` across an `await`.
+/// **Current concurrency shape** — every method takes `inner.lock()`
+/// and holds the guard across the kernel `.await`. tokio `Mutex` is
+/// FIFO, so cancel/close queue behind any in-flight `fetchNextBatch`
+/// until it returns naturally. This is a known limitation that exists
+/// because the napi shape has not yet been split into an
+/// `Arc<dyn ExecutedStatementHandle>` (for cancel/close, which the
+/// kernel exposes as `&self`-callable) plus a `Mutex<Option<…>>` only
+/// for the borrowed-mut fetch path. The lock-shape refactor needs a
+/// small kernel-side accessor and lands in a follow-up PR — see
+/// `sea-workflow/jira-candidates/2026-05-24-napi-cancel-during-fetch.md`.
+///
+/// `schema` and `statement_id` are cached at construction so they
+/// survive `close()` — JS callers building error reports against a
+/// disposed statement can still read them.
 #[napi]
 pub struct Statement {
     inner: Arc<Mutex<Option<ExecutedStatement>>>,
+    /// Schema captured at construction. Available even after `close()`.
+    schema: SchemaRef,
+    /// Server-issued id. Available even after `close()` for log
+    /// correlation.
+    statement_id: String,
+    /// Set to `true` when `fetchNextBatch` observes the natural end of
+    /// the stream (`None`). `cancel()` short-circuits to `Ok(())` when
+    /// this is set, matching the JDBC `Statement.cancel()` no-op-after-
+    /// completion contract — without it, a defensive cancel after the
+    /// stream is drained surfaces an opaque server-side error.
+    finished: Arc<AtomicBool>,
 }
 
 impl Statement {
     /// Crate-internal constructor — called from
     /// `Connection::execute_statement` once the kernel hands back the
-    /// `ExecutedStatement`.
+    /// `ExecutedStatement`. Caches `schema` and `statement_id` so
+    /// they're readable after `close()`.
     pub(crate) fn from_executed(executed: ExecutedStatement) -> Self {
+        let schema = executed.schema();
+        let statement_id = executed.statement_id().to_owned();
         Self {
             inner: Arc::new(Mutex::new(Some(executed))),
+            schema,
+            statement_id,
+            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 }
 
 #[napi]
 impl Statement {
-    /// Pull the next batch of results. Returns `None` when the stream
+    /// Server-issued statement id. Cached at construction; readable
+    /// even after `close()` so JS-side log lines can correlate against
+    /// kernel / server logs which key on the same id.
+    #[napi(getter)]
+    pub fn statement_id(&self) -> &str {
+        &self.statement_id
+    }
+
+    /// Pull the next batch of results. Returns `null` when the stream
     /// is exhausted. The returned `ArrowBatch.ipcBytes` is a complete
     /// Arrow IPC stream (schema header + 1 record-batch message)
     /// suitable for handing to `apache-arrow`'s `RecordBatchReader`.
     ///
-    /// On `Err`, the stream is left in an unspecified state — the
-    /// recommended recovery is to call `close()` and discard the
-    /// `Statement`. Subsequent `fetchNextBatch()` calls after an error
-    /// are not guaranteed to succeed or fail consistently.
+    /// On `Err`, the stream is in an unspecified state — call
+    /// `close()` and discard the `Statement`. Subsequent
+    /// `fetchNextBatch()` calls after an error are not guaranteed to
+    /// succeed or fail consistently.
     #[napi]
     pub async fn fetch_next_batch(&self) -> napi::Result<Option<ArrowBatch>> {
         let inner = Arc::clone(&self.inner);
+        let schema = self.schema.clone();
+        let finished = Arc::clone(&self.finished);
         guarded(async move {
             let mut guard = inner.lock().await;
-            let executed = guard.as_mut().ok_or_else(|| {
-                napi::Error::new(napi::Status::InvalidArg, "statement already closed")
-            })?;
+            let executed = guard.as_mut().ok_or_else(statement_closed_err)?;
 
             let stream = executed.result_stream_mut();
-            // Capture the schema before borrowing the next batch — we
-            // include the schema header in every IPC payload so the
-            // JS-side consumer can decode each batch independently
-            // without carrying state across calls.
-            let schema = stream.schema();
             let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
             let Some(batch) = maybe_batch else {
+                // End of stream — record so a defensive cancel after
+                // natural completion can short-circuit to Ok(()).
+                finished.store(true, Ordering::Release);
                 return Ok(None);
             };
             // `ResultBatch` is `#[non_exhaustive]`; v0 only ever
@@ -99,10 +137,14 @@ impl Statement {
             let record_batch = match batch {
                 ResultBatch::Arrow(rb) => rb,
                 _ => {
-                    return Err(napi::Error::new(
-                        napi::Status::GenericFailure,
-                        "non-Arrow ResultBatch variant — binding needs upgrade",
-                    ));
+                    return Err(napi_err_from_kernel(KernelError::internal().message(
+                        format!(
+                            "non-Arrow ResultBatch variant from kernel — \
+                         databricks-sea-native v{} cannot decode this batch \
+                         shape, upgrade the binding",
+                            env!("CARGO_PKG_VERSION"),
+                        ),
+                    )));
                 }
             };
             let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
@@ -115,46 +157,50 @@ impl Statement {
 
     /// Result schema as an Arrow IPC payload (schema header only, no
     /// record-batch message). Available before any batches have been
-    /// fetched.
+    /// fetched, and remains available after `close()` — the kernel
+    /// materialises the schema eagerly so JS callers can build error
+    /// reports against a disposed statement.
     #[napi]
     pub async fn schema(&self) -> napi::Result<ArrowSchema> {
-        let inner = Arc::clone(&self.inner);
-        guarded(async move {
-            let guard = inner.lock().await;
-            let executed = guard.as_ref().ok_or_else(|| {
-                napi::Error::new(napi::Status::InvalidArg, "statement already closed")
-            })?;
-            let schema = executed.schema();
-            let bytes = encode_ipc_stream(&schema, None)?;
-            Ok(ArrowSchema {
-                ipc_bytes: bytes.into(),
-            })
+        let bytes = encode_ipc_stream(&self.schema, None)?;
+        Ok(ArrowSchema {
+            ipc_bytes: bytes.into(),
         })
-        .await
     }
 
-    /// Server-side cancel. Hits the wire on every call — the kernel
-    /// does not short-circuit cancel against an already-finished or
-    /// already-closed statement, so a cancel that races with natural
-    /// completion can surface a server-side error indicating the
-    /// statement is no longer in a cancellable state. Callers that
-    /// fire cancel defensively after `fetchNextBatch` returned `None`
-    /// should treat that error as benign.
+    /// Server-side cancel.
+    ///
+    /// Short-circuits to `Ok(())` if `fetchNextBatch` has already
+    /// returned `null` (stream naturally exhausted) — matches the
+    /// JDBC `Statement.cancel()` no-op-after-completion contract, so
+    /// JS callers can fire cancel defensively without distinguishing
+    /// "real cancel" from "raced with natural completion."
+    ///
+    /// Returns `KernelError(InvalidStatementHandle)` if the statement
+    /// has been explicitly `close()`d.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
+        // Idempotent against natural completion.
+        if self.finished.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let guard = inner.lock().await;
-            let executed = guard.as_ref().ok_or_else(|| {
-                napi::Error::new(napi::Status::InvalidArg, "statement already closed")
-            })?;
+            let executed = guard.as_ref().ok_or_else(statement_closed_err)?;
             executed.cancel().await.map_err(napi_err_from_kernel)
         })
         .await
     }
 
-    /// Explicit close. Awaits the server-side close so the JS caller
-    /// can observe failures.
+    /// Explicit close. Awaits the server-side `CloseStatement` so the
+    /// JS caller can observe failures (auth revoked mid-session,
+    /// network error, server-side error). Idempotent — a second call
+    /// on an already-closed statement returns `Ok`.
+    ///
+    /// On `Err`, the kernel leaves its internal `closed` flag false
+    /// so `Drop`'s fire-and-forget cleanup retries; the caller still
+    /// sees the error and can surface it to logs / telemetry.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -176,14 +222,14 @@ impl Statement {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        // Invariant: `handle.spawn` only completes its body while the
-        // tokio runtime captured at first-call time is alive. If this
-        // `Drop` ever runs after napi-rs has torn down its runtime,
-        // the spawned task is cancelled before `take()` runs and the
-        // kernel handle leaks (no `close_statement` is issued). This
-        // is unreachable under napi-rs's current process-exit
-        // ordering; revisit (e.g. switch to a blocking close path) if
-        // that ordering ever changes.
+        // Best-effort cleanup: schedule a drop of the kernel handle on
+        // the captured tokio runtime. JS callers who need a
+        // guaranteed `close_statement` round-trip must call `close()`
+        // explicitly — `Drop` cannot `.await` and cannot surface
+        // failures, and the spawned task is subject to the runtime's
+        // lifetime. If process exit tears down the runtime before the
+        // task runs, the handle is dropped without a wire close; the
+        // server reclaims the statement when the session expires.
         let Some(handle) = runtime::try_get_handle() else {
             return;
         };
@@ -201,6 +247,20 @@ impl Drop for Statement {
             };
         });
     }
+}
+
+/// Closed-state error builder. Routes through the kernel error
+/// envelope so the TS-side reviver mints a typed
+/// `KernelError(code='InvalidStatementHandle')` rather than a raw
+/// `Status::InvalidArg` string the adapter can only match by
+/// substring. Single source of truth for all four call sites
+/// (fetch_next_batch / cancel and their Connection-side cousin) —
+/// keeps the wire-message shape stable for the TS reviver's contract
+/// test.
+fn statement_closed_err() -> napi::Error {
+    napi_err_from_kernel(
+        KernelError::invalid_statement_handle().message("statement already closed"),
+    )
 }
 
 /// Encode an Arrow schema (and optional one record batch) as an IPC
@@ -267,5 +327,108 @@ mod tests {
         assert_eq!(decoded.len(), 1, "exactly one batch decoded");
         assert_eq!(decoded[0].num_rows(), 3);
         assert_eq!(decoded[0].schema().fields(), schema.fields());
+    }
+
+    // ─── Closed-state behaviour ─────────────────────────────────────
+    //
+    // These tests pin the contract that the closed-state error
+    // shape is the kernel envelope (sentinel + `code` field), not a
+    // raw `Status::InvalidArg` string the TS reviver can only match
+    // by substring. We call the `statement_closed_err` helper
+    // directly rather than awaiting `#[napi]` methods: the napi-rs
+    // attribute macro injects code paths that link against the
+    // native napi runtime (`napi_get_reference_value` etc.) which
+    // aren't available in `cargo test`. Testing the helper is the
+    // load-bearing assertion — the methods all funnel through it.
+
+    fn assert_invalid_statement_handle_envelope(err: &napi::Error) {
+        let msg = err.reason.as_str();
+        assert!(
+            msg.starts_with(crate::error::ERROR_SENTINEL),
+            "expected envelope-sentinel-prefixed error, got: {msg}",
+        );
+        assert!(
+            msg.contains(r#""code":"InvalidStatementHandle""#),
+            "envelope payload missing InvalidStatementHandle code: {msg}",
+        );
+    }
+
+    #[test]
+    fn statement_closed_err_carries_invalid_statement_handle_envelope() {
+        // Single source of truth for all four call sites that surface
+        // closed-state errors. Pinning the wire shape here means a
+        // future maintainer who changes the error builder will break
+        // this test instead of silently breaking the TS adapter's
+        // reviver.
+        let err = statement_closed_err();
+        assert_invalid_statement_handle_envelope(&err);
+        // The human-readable message survives — TS-side error
+        // .stack frames stay informative.
+        assert!(
+            err.reason.contains("statement already closed"),
+            "closed-state error must carry the human message: {}",
+            err.reason,
+        );
+    }
+
+    #[test]
+    fn statement_closed_err_status_collapses_to_invalid_arg() {
+        // The napi `Status` field collapses to `InvalidArg` because
+        // it's an enum with no `InvalidStatementHandle` variant. The
+        // TS adapter discriminates on the envelope `code` field, not
+        // on this status. Pin it so a future kernel-side ErrorCode
+        // -> Status mapping change is loud.
+        let err = statement_closed_err();
+        assert_eq!(err.status, napi::Status::InvalidArg);
+    }
+
+    #[test]
+    fn statement_id_is_cached_and_survives_close() {
+        // `statement_id` is stored on the wrapper, not delegated to
+        // the kernel handle. Once cached, `close()` (which sets
+        // `inner = None`) cannot null it out.
+        let stmt = Statement {
+            inner: Arc::new(Mutex::new(None)), // "already closed"
+            schema: make_schema(),
+            statement_id: "stmt-survives-close".to_owned(),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        assert_eq!(stmt.statement_id(), "stmt-survives-close");
+    }
+
+    #[test]
+    fn schema_field_is_cached_arc() {
+        // Schema is held as a cheap Arc, not a fresh clone — so the
+        // getter is O(1) even on a closed statement. Verify by
+        // confirming Arc::strong_count rises when we clone.
+        let schema = make_schema();
+        let stmt = Statement {
+            inner: Arc::new(Mutex::new(None)),
+            schema: schema.clone(),
+            statement_id: "x".to_owned(),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        // Two refs alive: the local + the stmt field.
+        assert!(Arc::strong_count(&stmt.schema) >= 2);
+        drop(stmt);
+        // After dropping the stmt only the local remains.
+        assert_eq!(Arc::strong_count(&schema), 1);
+    }
+
+    #[test]
+    fn finished_flag_starts_false_and_can_be_toggled() {
+        // Pin the cancel-after-completion contract at field level:
+        // `cancel()` reads `finished` and short-circuits to Ok(())
+        // when set, matching the JDBC no-op-after-completion
+        // semantics. fetch_next_batch sets it when it returns None.
+        let stmt = Statement {
+            inner: Arc::new(Mutex::new(None)),
+            schema: make_schema(),
+            statement_id: "x".to_owned(),
+            finished: Arc::new(AtomicBool::new(false)),
+        };
+        assert!(!stmt.finished.load(Ordering::Acquire));
+        stmt.finished.store(true, Ordering::Release);
+        assert!(stmt.finished.load(Ordering::Acquire));
     }
 }

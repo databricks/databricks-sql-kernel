@@ -126,19 +126,30 @@ impl ExecutedStatementHandle for ExecutedStatement {
     }
 
     async fn close(&self) -> Result<()> {
-        // Idempotent: the first call flips the flag; subsequent
-        // calls return Ok(()) without hitting the wire. The
-        // server-side close is idempotent too, but skipping the
-        // round-trip is cheaper and avoids ambiguous "double-close"
-        // log noise.
+        // Idempotent on success: a prior successful close sets
+        // `closed=true` and subsequent calls short-circuit.
+        //
+        // On wire failure we deliberately keep `closed=false` so that
+        // `Drop`'s fire-and-forget retry path runs as a fallback —
+        // otherwise a transient close failure would silently leak the
+        // server-side statement until session expiry. Mirrors
+        // `Session::close`.
+        //
+        // The `&self` signature allows two callers to race and both
+        // hit the wire. The server-side close is idempotent (it
+        // returns the same Ok for duplicate close_statement calls),
+        // so the only cost of the race is one redundant RPC — far
+        // better than dropping the retry contract.
         async {
-            if self.closed.swap(true, Ordering::AcqRel) {
+            if self.closed.load(Ordering::Acquire) {
                 return Ok(());
             }
             self.session
                 .transport()
                 .close_statement(&self.statement_id)
-                .await
+                .await?;
+            self.closed.store(true, Ordering::Release);
+            Ok(())
         }
         .instrument(self.session.log_span().clone())
         .await

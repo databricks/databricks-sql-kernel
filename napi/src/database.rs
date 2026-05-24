@@ -19,14 +19,10 @@
 //! `Database` wrapper on top of this binding, so the napi surface itself
 //! stays flat: one free function, one opaque `Connection` class.
 //!
-//! Rationale for a free function over a static class method:
-//! - napi-rs v2's static-method codegen for async functions returning a
-//!   `#[napi]` struct is fragile — the runtime registration sometimes
-//!   omits the method from the class object. Free `#[napi]` functions
-//!   go through a different, more stable codegen path.
-//! - There is no kernel-side `Database` state to wrap; everything
-//!   meaningful lives on `Session`. A wrapper class with no fields adds
-//!   a JS object allocation per session for no benefit.
+//! A free function (not a static method on a wrapper class) because
+//! there is no kernel-side `Database` state to hold — everything
+//! meaningful lives on `Session`. A `Database` wrapper class with no
+//! fields would add a JS object allocation per session for no benefit.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -120,8 +116,10 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
             builder = builder.session_conf(conf);
         }
         let session = builder.open().await.map_err(napi_err_from_kernel)?;
+        let session_id = session.session_id().to_owned();
         Ok(Connection {
             inner: Arc::new(Mutex::new(Some(session))),
+            session_id,
         })
     })
     .await

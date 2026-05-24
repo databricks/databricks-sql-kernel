@@ -30,12 +30,22 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::Session;
+use databricks_sql_kernel::{Error as KernelError, Session};
 
 use crate::error::napi_err_from_kernel;
 use crate::runtime;
 use crate::statement::Statement;
 use crate::util::guarded;
+
+/// Closed-state error builder. Mirrors `statement::statement_closed_err`
+/// — route through the kernel envelope so the TS reviver mints a typed
+/// `KernelError(code='InvalidStatementHandle')`. Single source of truth
+/// for `executeStatement` on a closed Connection.
+fn connection_closed_err() -> napi::Error {
+    napi_err_from_kernel(
+        KernelError::invalid_statement_handle().message("connection already closed"),
+    )
+}
 
 /// Opaque connection handle wrapping a kernel `Session`.
 ///
@@ -43,16 +53,38 @@ use crate::util::guarded;
 /// - the Drop impl can clone the `Arc` and `.take()` the session on a
 ///   background tokio task without holding `&mut self` (which Drop is
 ///   forbidden from doing across an `await`),
-/// - `executeStatement` can share immutable access to the session via
-///   the `Arc<SessionInner>` clones the kernel makes internally
-///   (`Session::statement()` only needs `&self`).
+/// - `close()` can `.take()` the session to consume it for the kernel's
+///   move-by-value `Session::close(self)` signature.
+///
+/// **Current concurrency shape** — `executeStatement` holds
+/// `inner.lock()` across `stmt.execute().await`, so two concurrent
+/// `Promise.all([executeStatement(q1), executeStatement(q2)])` calls
+/// on the same Connection serialise even though the kernel transport
+/// supports concurrent statements per session, and `close()` blocks
+/// behind any in-flight execute. The kernel's `Session::statement()`
+/// is `&self`-callable, so the right shape is `Arc<Session>` with
+/// concurrent execute paths; that lands in the follow-up lock-shape
+/// refactor — see
+/// `sea-workflow/jira-candidates/2026-05-24-napi-cancel-during-fetch.md`.
 #[napi]
 pub struct Connection {
     pub(crate) inner: Arc<Mutex<Option<Session>>>,
+    /// Server-issued session id. Cached at construction; readable
+    /// even after `close()` so JS-side log lines can correlate
+    /// against kernel / server logs which key on the same id.
+    pub(crate) session_id: String,
 }
 
 #[napi]
 impl Connection {
+    /// Server-issued session id. Cached at construction; readable
+    /// even after `close()` so JS-side log lines can correlate
+    /// against kernel / server logs which key on the same id.
+    #[napi(getter)]
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
     /// Execute a SQL statement and return a Statement handle that
     /// streams batches via `fetchNextBatch()`.
     ///
@@ -63,9 +95,7 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let guard = inner.lock().await;
-            let session = guard.as_ref().ok_or_else(|| {
-                napi::Error::new(napi::Status::InvalidArg, "connection already closed")
-            })?;
+            let session = guard.as_ref().ok_or_else(connection_closed_err)?;
 
             let mut stmt = session.statement();
             stmt.spec().sql(sql);
@@ -103,19 +133,14 @@ impl Connection {
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        // Fire-and-forget close on the captured runtime. If `close()`
-        // was already called explicitly, `inner` holds `None` and the
-        // spawned task is a trivial no-op. `Drop` itself cannot
-        // `.await`, so callers who care about observing
-        // `DeleteSession` failures must call `close()` explicitly.
-        //
-        // Invariant: `handle.spawn` only completes its body while the
-        // tokio runtime captured at first-call time is alive. If this
-        // `Drop` ever runs after napi-rs has torn down its runtime,
-        // the spawned task is cancelled before `take()` runs and the
-        // kernel handle leaks (no `delete_session` is issued). This
-        // is unreachable under napi-rs's current process-exit
-        // ordering; revisit if that ordering ever changes.
+        // Best-effort cleanup: schedule a drop of the kernel handle on
+        // the captured tokio runtime. JS callers who need a
+        // guaranteed `DeleteSession` round-trip must call `close()`
+        // explicitly — `Drop` cannot `.await` and cannot surface
+        // failures, and the spawned task is subject to the runtime's
+        // lifetime. If process exit tears down the runtime before the
+        // task runs, the handle is dropped without a wire close; the
+        // server reclaims the session on its idle-timeout schedule.
         let Some(handle) = runtime::try_get_handle() else {
             // No async entry point ever ran — there's nothing to close.
             return;
@@ -131,5 +156,56 @@ impl Drop for Connection {
                 guard.take()
             };
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The closed-state error shape pins the TS adapter's reviver
+    // contract — a future maintainer who switches back to raw
+    // `napi::Error::new(Status::InvalidArg, "...")` will break this
+    // test instead of silently breaking the adapter.
+
+    fn assert_invalid_statement_handle_envelope(err: &napi::Error) {
+        let msg = err.reason.as_str();
+        assert!(
+            msg.starts_with(crate::error::ERROR_SENTINEL),
+            "expected envelope-sentinel-prefixed error, got: {msg}",
+        );
+        assert!(
+            msg.contains(r#""code":"InvalidStatementHandle""#),
+            "envelope payload missing InvalidStatementHandle code: {msg}",
+        );
+    }
+
+    #[test]
+    fn connection_closed_err_carries_invalid_statement_handle_envelope() {
+        let err = connection_closed_err();
+        assert_invalid_statement_handle_envelope(&err);
+        assert!(
+            err.reason.contains("connection already closed"),
+            "closed-state error must carry the human message: {}",
+            err.reason,
+        );
+    }
+
+    #[test]
+    fn connection_closed_err_status_collapses_to_invalid_arg() {
+        let err = connection_closed_err();
+        assert_eq!(err.status, napi::Status::InvalidArg);
+    }
+
+    #[test]
+    fn session_id_is_cached_and_survives_close() {
+        // The cached id is stored on the wrapper, not on the kernel
+        // Session — so even after close() takes the session out of
+        // `inner`, the getter still returns the original id.
+        let conn = Connection {
+            inner: Arc::new(Mutex::new(None)), // "already closed"
+            session_id: "session-survives-close".to_owned(),
+        };
+        assert_eq!(conn.session_id(), "session-survives-close");
     }
 }

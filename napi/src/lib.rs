@@ -15,10 +15,12 @@
 //! `databricks-sea-native` — napi-rs binding crate for the Databricks
 //! SQL Node.js driver's SEA (Statement Execution API) path.
 //!
-//! Round 2 surface: `Database.open` → `Connection.execute_statement`
-//! → `Statement.fetch_next_batch` / `schema` / `cancel` / `close`.
-//! Results cross the FFI as Arrow IPC bytes (see `result.rs`); the
-//! TS adapter decodes them via `apache-arrow`.
+//! Surface: `openSession()` (free function) → `Connection` (opaque
+//! class with `executeStatement` / `close` / `sessionId`) →
+//! `Statement` (opaque class with `fetchNextBatch` / `schema` /
+//! `cancel` / `close` / `statementId`). Results cross the FFI as
+//! Arrow IPC bytes (`ArrowBatch` / `ArrowSchema` POJOs in
+//! `result.rs`); the TS adapter decodes them via `apache-arrow`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // Skeleton-PR state: every `pub(crate)` item in this crate (error
