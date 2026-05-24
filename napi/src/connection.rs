@@ -79,33 +79,26 @@ impl Connection {
         .await
     }
 
-    /// Explicit close. Marks the connection wrapper as closed so
-    /// subsequent calls on this `Connection` return `InvalidArg`, then
-    /// schedules a fire-and-forget server-side close on the runtime.
+    /// Explicit close. Awaits the server-side `DeleteSession` so the
+    /// JS caller can observe failures (auth revoked mid-session,
+    /// warehouse stopped, network error). Idempotent — a second call
+    /// on an already-closed connection returns `Ok`.
     ///
-    /// **Why fire-and-forget and not `Session::close().await`:** the
-    /// kernel's `Session::close(self).await` body holds a
-    /// `tracing::EnteredSpan` (a `!Send` type) across an `.await`, so
-    /// the future is not `Send`. napi-rs's `execute_tokio_future` glue
-    /// rejects non-`Send` futures, and `Handle::spawn` does too. The
-    /// kernel's `SessionInner::Drop` already spawns the
-    /// `delete_session` RPC on the same runtime handle the napi
-    /// binding captured, so dropping the value is functionally
-    /// equivalent — the difference is that JS callers can't observe a
-    /// `delete_session` failure from `close()`. Tracked as a kernel-
-    /// side follow-up (clone the span rather than entering it) in
-    /// Round 3 findings.
+    /// On `Err`, the kernel leaves its internal `closed` flag false
+    /// so `Drop`'s fire-and-forget cleanup retries; the caller still
+    /// sees the error and can surface it to logs / telemetry.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
-            let _taken = {
+            let session = {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            // `_taken` drops here. Kernel's `SessionInner::Drop`
-            // spawns `delete_session` on its captured handle.
-            Ok(())
+            let Some(session) = session else {
+                return Ok(());
+            };
+            session.close().await.map_err(napi_err_from_kernel)
         })
         .await
     }
@@ -114,8 +107,10 @@ impl Connection {
 impl Drop for Connection {
     fn drop(&mut self) {
         // Fire-and-forget close on the captured runtime. If `close()`
-        // was already called, `inner` holds `None` and the spawned
-        // task is a trivial no-op.
+        // was already called explicitly, `inner` holds `None` and the
+        // spawned task is a trivial no-op. `Drop` itself cannot
+        // `.await`, so callers who care about observing
+        // `DeleteSession` failures must call `close()` explicitly.
         let Some(handle) = runtime::try_get_handle() else {
             // No async entry point ever ran — there's nothing to close.
             return;
@@ -123,17 +118,13 @@ impl Drop for Connection {
         let inner = Arc::clone(&self.inner);
         handle.spawn(async move {
             // Drop the session value on the runtime. The kernel's
-            // `SessionInner::Drop` already spawns a fire-and-forget
-            // `delete_session` against its own captured handle. We do
-            // NOT call `Session::close().await` here because that
-            // method holds a `tracing::EnteredSpan` (`!Send`) across
-            // its body, which would conflict with `Handle::spawn`'s
-            // `Send` bound on the future.
+            // `SessionInner::Drop` spawns a fire-and-forget
+            // `delete_session` against its own captured handle, so
+            // dropping inside a tokio context is sufficient cleanup.
             let _taken = {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            // `_taken` drops here; kernel's SessionInner::Drop fires.
         });
     }
 }
