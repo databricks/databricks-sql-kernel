@@ -137,14 +137,23 @@ impl Statement {
             let record_batch = match batch {
                 ResultBatch::Arrow(rb) => rb,
                 _ => {
-                    return Err(napi_err_from_kernel(KernelError::internal().message(
-                        format!(
+                    // `InvalidArgument`, not `Internal`: this isn't a
+                    // kernel bug (which would page oncall via the
+                    // Internal-category dashboards) — it's "binding
+                    // too old for the kernel it's linked against."
+                    // The kernel has rolled a new ResultBatch variant
+                    // that this binding's decode path doesn't know
+                    // how to handle, and the JS-side adapter should
+                    // surface this as a version-skew error to the
+                    // user. Matches the sibling-binding convention.
+                    return Err(napi_err_from_kernel(
+                        KernelError::invalid_argument().message(format!(
                             "non-Arrow ResultBatch variant from kernel — \
-                         databricks-sea-native v{} cannot decode this batch \
-                         shape, upgrade the binding",
+                             databricks-sea-native v{} cannot decode this batch \
+                             shape, upgrade the binding",
                             env!("CARGO_PKG_VERSION"),
-                        ),
-                    )));
+                        )),
+                    ));
                 }
             };
             let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
