@@ -14,7 +14,6 @@
 
 //! Opaque `Statement` wrapper around the kernel's `ExecutedStatement`.
 //!
-//! M0 surface (Round 2):
 //! - `Statement.fetchNextBatch() -> Option<ArrowBatch>` — drives
 //!   `ResultStream::next_batch().await`, serialises the borrowed
 //!   `RecordBatch` to Arrow IPC bytes, returns them to JS.
@@ -68,6 +67,11 @@ impl Statement {
     /// is exhausted. The returned `ArrowBatch.ipcBytes` is a complete
     /// Arrow IPC stream (schema header + 1 record-batch message)
     /// suitable for handing to `apache-arrow`'s `RecordBatchReader`.
+    ///
+    /// On `Err`, the stream is left in an unspecified state — the
+    /// recommended recovery is to call `close()` and discard the
+    /// `Statement`. Subsequent `fetchNextBatch()` calls after an error
+    /// are not guaranteed to succeed or fail consistently.
     #[napi]
     pub async fn fetch_next_batch(&self) -> napi::Result<Option<ArrowBatch>> {
         let inner = Arc::clone(&self.inner);
@@ -129,7 +133,13 @@ impl Statement {
         .await
     }
 
-    /// Server-side cancel. No-op if already finished.
+    /// Server-side cancel. Hits the wire on every call — the kernel
+    /// does not short-circuit cancel against an already-finished or
+    /// already-closed statement, so a cancel that races with natural
+    /// completion can surface a server-side error indicating the
+    /// statement is no longer in a cancellable state. Callers that
+    /// fire cancel defensively after `fetchNextBatch` returned `None`
+    /// should treat that error as benign.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -166,6 +176,14 @@ impl Statement {
 
 impl Drop for Statement {
     fn drop(&mut self) {
+        // Invariant: `handle.spawn` only completes its body while the
+        // tokio runtime captured at first-call time is alive. If this
+        // `Drop` ever runs after napi-rs has torn down its runtime,
+        // the spawned task is cancelled before `take()` runs and the
+        // kernel handle leaks (no `close_statement` is issued). This
+        // is unreachable under napi-rs's current process-exit
+        // ordering; revisit (e.g. switch to a blocking close path) if
+        // that ordering ever changes.
         let Some(handle) = runtime::try_get_handle() else {
             return;
         };
@@ -195,18 +213,59 @@ fn encode_ipc_stream(
     schema: &arrow_schema::SchemaRef,
     batch: Option<&arrow_array::RecordBatch>,
 ) -> napi::Result<Vec<u8>> {
+    fn arrow_err(e: impl std::fmt::Display) -> napi::Error {
+        napi::Error::new(napi::Status::GenericFailure, e.to_string())
+    }
     let mut buf: Vec<u8> = Vec::new();
     {
-        let mut writer = StreamWriter::try_new(&mut buf, schema)
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        let mut writer = StreamWriter::try_new(&mut buf, schema).map_err(arrow_err)?;
         if let Some(rb) = batch {
-            writer
-                .write(rb)
-                .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+            writer.write(rb).map_err(arrow_err)?;
         }
-        writer
-            .finish()
-            .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?;
+        writer.finish().map_err(arrow_err)?;
     }
     Ok(buf)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arrow_array::{Int32Array, RecordBatch};
+    use arrow_ipc::reader::StreamReader;
+    use arrow_schema::{DataType, Field, Schema};
+
+    fn make_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
+    }
+
+    #[test]
+    fn encode_ipc_stream_schema_only_yields_zero_batches() {
+        let schema = make_schema();
+        let bytes = encode_ipc_stream(&schema, None).expect("encode succeeds");
+        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
+        let decoded_schema = reader.schema();
+        let batches: Vec<_> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("decode succeeds");
+        assert_eq!(decoded_schema.fields(), schema.fields());
+        assert_eq!(batches.len(), 0, "schema-only payload yields 0 batches");
+    }
+
+    #[test]
+    fn encode_ipc_stream_schema_plus_batch_round_trips() {
+        let schema = make_schema();
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("batch builds");
+        let bytes = encode_ipc_stream(&schema, Some(&batch)).expect("encode succeeds");
+        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
+        let decoded: Vec<_> = reader
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .expect("decode succeeds");
+        assert_eq!(decoded.len(), 1, "exactly one batch decoded");
+        assert_eq!(decoded[0].num_rows(), 3);
+        assert_eq!(decoded[0].schema().fields(), schema.fields());
+    }
 }

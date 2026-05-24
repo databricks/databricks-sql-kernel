@@ -15,16 +15,14 @@
 //! Opaque `Connection` wrapper around the kernel's `Session`.
 //!
 //! The kernel collapses ADBC's `Database` + `Connection` into a single
-//! `Session`. We keep the wrapper name `Connection` on the JS side because
-//! that matches the existing Node driver's mental model.
+//! `Session`. We keep the wrapper name `Connection` on the JS side
+//! because that matches the existing Node driver's mental model.
 //!
-//! M0 surface (Round 2):
 //! - `Connection.executeStatement(sql)` — builds a kernel `Statement`,
-//!   sets the SQL, awaits `execute()`, wraps the result in a
+//!   sets the SQL, awaits `execute()`, and wraps the result in a
 //!   JS-visible `Statement` opaque handle. Catalog / schema /
-//!   sessionConf are session-level (`openSession` options), matching
-//!   pyo3 — the SEA wire protocol carries them on `CreateSession`,
-//!   not per-statement. Positional / named parameters land in M1.
+//!   sessionConf are session-level (`openSession` options) — the SEA
+//!   wire protocol carries them on `CreateSession`, not per-statement.
 //! - `Connection.close()` — explicit async close. Drop schedules a
 //!   fire-and-forget close on the captured runtime handle if explicit
 //!   close was never called.
@@ -59,8 +57,7 @@ impl Connection {
     /// streams batches via `fetchNextBatch()`.
     ///
     /// No per-statement options: catalog / schema / sessionConf are
-    /// session-level (`openSession`). Positional / named parameters
-    /// land in M1 via `Statement::spec().param(…)` on the kernel.
+    /// session-level (`openSession`).
     #[napi]
     pub async fn execute_statement(&self, sql: String) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
@@ -111,6 +108,14 @@ impl Drop for Connection {
         // spawned task is a trivial no-op. `Drop` itself cannot
         // `.await`, so callers who care about observing
         // `DeleteSession` failures must call `close()` explicitly.
+        //
+        // Invariant: `handle.spawn` only completes its body while the
+        // tokio runtime captured at first-call time is alive. If this
+        // `Drop` ever runs after napi-rs has torn down its runtime,
+        // the spawned task is cancelled before `take()` runs and the
+        // kernel handle leaks (no `delete_session` is issued). This
+        // is unreachable under napi-rs's current process-exit
+        // ordering; revisit if that ordering ever changes.
         let Some(handle) = runtime::try_get_handle() else {
             // No async entry point ever ran — there's nothing to close.
             return;

@@ -40,15 +40,13 @@ use crate::runtime;
 use crate::util::guarded;
 
 /// JS-visible options for opening a Databricks SQL session over PAT.
-///
-/// M0 supports PAT only — `token` is required. OAuth M2M / U2M variants
-/// land in M1 along with a discriminated-union shape on the JS side.
+/// `token` is required.
 ///
 /// Catalog / schema / sessionConf are applied once at session creation
 /// and remain in effect for every statement run on the resulting
 /// `Connection`. The SEA wire protocol carries them on
 /// `CreateSession`, not on `ExecuteStatement` — so there is no
-/// per-statement override path in either this binding or pyo3.
+/// per-statement override path on this binding.
 #[allow(
     dead_code,
     reason = "exported via napi macro codegen; not called from Rust"
@@ -106,11 +104,10 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
             .auth(AuthConfig::Pat {
                 token: options.token,
             });
-        // Mirror pyo3 (`pyo3/src/session.rs`): set `DefaultOpts` only
-        // if at least one of catalog / schema was provided, so callers
-        // who pass neither don't get a non-`None` `DefaultOpts` on the
-        // config (which would defeat any future kernel-side
-        // distinction between "no defaults" and "empty defaults").
+        // Only wire `DefaultOpts` when at least one of catalog / schema
+        // was provided; otherwise leave the config's `defaults` field
+        // `None` so the kernel can distinguish "no defaults" from
+        // "empty defaults" if that distinction ever becomes meaningful.
         // `DefaultOpts` is `#[non_exhaustive]` — must construct via
         // `default()` and mutate fields.
         if options.catalog.is_some() || options.schema.is_some() {
