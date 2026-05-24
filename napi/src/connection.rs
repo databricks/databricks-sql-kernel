@@ -19,14 +19,16 @@
 //! that matches the existing Node driver's mental model.
 //!
 //! M0 surface (Round 2):
-//! - `Connection.executeStatement(sql, options)` — builds a kernel
-//!   `Statement`, sets the spec, awaits `execute()`, wraps the result
-//!   in a JS-visible `Statement` opaque handle.
+//! - `Connection.executeStatement(sql)` — builds a kernel `Statement`,
+//!   sets the SQL, awaits `execute()`, wraps the result in a
+//!   JS-visible `Statement` opaque handle. Catalog / schema /
+//!   sessionConf are session-level (`openSession` options), matching
+//!   pyo3 — the SEA wire protocol carries them on `CreateSession`,
+//!   not per-statement. Positional / named parameters land in M1.
 //! - `Connection.close()` — explicit async close. Drop schedules a
 //!   fire-and-forget close on the captured runtime handle if explicit
 //!   close was never called.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -36,20 +38,6 @@ use crate::error::napi_err_from_kernel;
 use crate::runtime;
 use crate::statement::Statement;
 use crate::util::guarded;
-
-/// JS-visible per-execute options. M0 only carries
-/// initialCatalog / initialSchema / sessionConfig — parameters and
-/// per-statement overrides land in M1.
-#[napi(object)]
-pub struct ExecuteOptions {
-    /// Default catalog applied to this statement via session conf.
-    pub initial_catalog: Option<String>,
-    /// Default schema applied to this statement via session conf.
-    pub initial_schema: Option<String>,
-    /// Per-statement session conf overrides (forwarded to SEA
-    /// `parameters` / Thrift `confOverlay`).
-    pub session_config: Option<HashMap<String, String>>,
-}
 
 /// Opaque connection handle wrapping a kernel `Session`.
 ///
@@ -69,12 +57,12 @@ pub struct Connection {
 impl Connection {
     /// Execute a SQL statement and return a Statement handle that
     /// streams batches via `fetchNextBatch()`.
+    ///
+    /// No per-statement options: catalog / schema / sessionConf are
+    /// session-level (`openSession`). Positional / named parameters
+    /// land in M1 via `Statement::spec().param(…)` on the kernel.
     #[napi]
-    pub async fn execute_statement(
-        &self,
-        sql: String,
-        options: ExecuteOptions,
-    ) -> napi::Result<Statement> {
+    pub async fn execute_statement(&self, sql: String) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let guard = inner.lock().await;
@@ -82,23 +70,8 @@ impl Connection {
                 napi::Error::new(napi::Status::InvalidArg, "connection already closed")
             })?;
 
-            // Build a per-statement spec on the kernel's mutable
-            // Statement. Session conf overrides surface through the
-            // statement_conf overlay; M0 has no parameter binding.
             let mut stmt = session.statement();
             stmt.spec().sql(sql);
-
-            let mut overlay: HashMap<String, String> =
-                options.session_config.unwrap_or_default();
-            if let Some(catalog) = options.initial_catalog {
-                overlay.insert("default_catalog".to_string(), catalog);
-            }
-            if let Some(schema) = options.initial_schema {
-                overlay.insert("default_schema".to_string(), schema);
-            }
-            if !overlay.is_empty() {
-                stmt.spec().statement_conf(overlay);
-            }
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
             Ok(Statement::from_executed(executed))

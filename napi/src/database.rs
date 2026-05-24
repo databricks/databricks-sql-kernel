@@ -28,10 +28,11 @@
 //!   meaningful lives on `Session`. A wrapper class with no fields adds
 //!   a JS object allocation per session for no benefit.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{AuthConfig, Session};
+use databricks_sql_kernel::{AuthConfig, DefaultOpts, Session};
 
 use crate::connection::Connection;
 use crate::error::napi_err_from_kernel;
@@ -42,6 +43,16 @@ use crate::util::guarded;
 ///
 /// M0 supports PAT only — `token` is required. OAuth M2M / U2M variants
 /// land in M1 along with a discriminated-union shape on the JS side.
+///
+/// Catalog / schema / sessionConf are applied once at session creation
+/// and remain in effect for every statement run on the resulting
+/// `Connection`. The SEA wire protocol carries them on
+/// `CreateSession`, not on `ExecuteStatement` — so there is no
+/// per-statement override path in either this binding or pyo3.
+#[allow(
+    dead_code,
+    reason = "exported via napi macro codegen; not called from Rust"
+)]
 #[napi(object)]
 pub struct ConnectionOptions {
     /// Workspace host, e.g. `adb-…azuredatabricks.net`. The kernel
@@ -53,6 +64,18 @@ pub struct ConnectionOptions {
     /// Personal access token. Must be non-empty (the kernel rejects
     /// empty PATs at session construction).
     pub token: String,
+    /// Default catalog for statements executed on this session.
+    /// Routed through the kernel's `DefaultOpts` and onto the SEA
+    /// `CreateSession.catalog` wire field.
+    pub catalog: Option<String>,
+    /// Default schema for statements executed on this session.
+    /// Routed through the kernel's `DefaultOpts` and onto the SEA
+    /// `CreateSession.schema` wire field.
+    pub schema: Option<String>,
+    /// Server-bound session conf (Spark conf, `ANSI_MODE`, `TIMEZONE`,
+    /// query-tag presets, …). Forwarded verbatim to SEA
+    /// `session_confs`. Unknown keys are rejected server-side.
+    pub session_conf: Option<HashMap<String, String>>,
 }
 
 /// Open a Databricks SQL session over PAT auth and return an opaque
@@ -60,6 +83,10 @@ pub struct ConnectionOptions {
 ///
 /// The JS-visible name is `openSession` (napi-rs converts snake_case
 /// to camelCase for free functions).
+#[allow(
+    dead_code,
+    reason = "exported via napi macro codegen; not called from Rust"
+)]
 #[napi]
 pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection> {
     guarded(async move {
@@ -74,14 +101,28 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         // `http_path()` is the convenience setter that maps a bare
         // hostname + `/sql/1.0/warehouses/{id}` path into the kernel's
         // `ConnectionConfig`.
-        let session = Session::builder()
+        let mut builder = Session::builder()
             .http_path(options.host_name, options.http_path)
             .auth(AuthConfig::Pat {
                 token: options.token,
-            })
-            .open()
-            .await
-            .map_err(napi_err_from_kernel)?;
+            });
+        // Mirror pyo3 (`pyo3/src/session.rs`): set `DefaultOpts` only
+        // if at least one of catalog / schema was provided, so callers
+        // who pass neither don't get a non-`None` `DefaultOpts` on the
+        // config (which would defeat any future kernel-side
+        // distinction between "no defaults" and "empty defaults").
+        // `DefaultOpts` is `#[non_exhaustive]` — must construct via
+        // `default()` and mutate fields.
+        if options.catalog.is_some() || options.schema.is_some() {
+            let mut defaults = DefaultOpts::default();
+            defaults.catalog = options.catalog;
+            defaults.schema = options.schema;
+            builder = builder.defaults(defaults);
+        }
+        if let Some(conf) = options.session_conf {
+            builder = builder.session_conf(conf);
+        }
+        let session = builder.open().await.map_err(napi_err_from_kernel)?;
         Ok(Connection {
             inner: Arc::new(Mutex::new(Some(session))),
         })
