@@ -414,7 +414,10 @@ mod tests {
         }))
         .unwrap()
         .unwrap();
-        assert_eq!(result.get("query_tags").map(String::as_str), Some("k\\\\1:v"));
+        assert_eq!(
+            result.get("query_tags").map(String::as_str),
+            Some("k\\\\1:v")
+        );
     }
 
     #[test]
@@ -427,8 +430,7 @@ mod tests {
             statement_conf: Some(conf),
             query_tags: Some(tags),
         }))
-        .err()
-        .expect("must reject when both are set");
+        .expect_err("must reject when both are set");
         assert!(
             err.reason.contains("cannot supply both"),
             "error must explain the conflict: {}",
