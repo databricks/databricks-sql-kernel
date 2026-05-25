@@ -397,7 +397,7 @@ impl Default for ResultConfig {
         Self {
             cloudfetch_enabled: true,
             cloudfetch_link_prefetch_window: 10,
-            cloudfetch_max_chunks_in_memory: 4,
+            cloudfetch_max_chunks_in_memory: 16,
             complex_types_as_json: false,
         }
     }
