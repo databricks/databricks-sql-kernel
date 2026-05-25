@@ -79,8 +79,41 @@ pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
         start_row_offset: i64,
     ) -> Result<ChunkLinkFetchResult>;
 
-    /// Refetch a specific chunk link (used when link expires before download).
+    /// Refetch a specific chunk link.
+    ///
+    /// The current SEA streaming path uses [`Self::refetch_links_from`]
+    /// (batched refresh) on expiry. This single-link variant is kept
+    /// for callers that genuinely want a single link (e.g. tests, or
+    /// future Thrift transports where each link refresh is its own
+    /// RPC by construction).
+    #[allow(
+        dead_code,
+        reason = "preserved for single-link callers; SEA path uses refetch_links_from"
+    )]
     async fn refetch_link(&self, chunk_index: i64, row_offset: i64) -> Result<CloudFetchLink>;
+
+    /// Refetch the link batch starting at `chunk_index`.
+    ///
+    /// SEA's `get_result_chunks` returns links for the requested
+    /// chunk plus a server-decided forward window. When a single
+    /// presigned URL has expired, the URLs for subsequent chunks are
+    /// typically also near-expiry — refreshing the whole batch in
+    /// one RPC instead of N single-link refetches is the contract
+    /// we want.
+    ///
+    /// Returns the full list of links the server emitted. Callers
+    /// are responsible for walking the result and reconciling each
+    /// link with the current per-chunk state (e.g. skipping the
+    /// download re-trigger for chunks already in `Downloaded`).
+    ///
+    /// Implementations also refresh their internal cache from the
+    /// batch so subsequent `fetch_links` / `refetch_link` calls see
+    /// the new URLs without an extra round trip.
+    async fn refetch_links_from(
+        &self,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<Vec<CloudFetchLink>>;
 }
 
 /// SEA implementation of ChunkLinkFetcher with caching and proactive prefetching.
@@ -974,6 +1007,28 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         // Update cache with fresh link
         self.inner.links.insert(chunk_index, link.clone());
         Ok(link)
+    }
+
+    async fn refetch_links_from(
+        &self,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<Vec<CloudFetchLink>> {
+        let result = self
+            .inner
+            .client
+            .get_result_chunks(&self.inner.statement_id, chunk_index, row_offset)
+            .await?;
+
+        // Refresh the internal link cache with every link the server
+        // returned. The caller will reconcile per-chunk state in the
+        // streaming provider (which knows which chunks are already
+        // downloaded vs in-flight).
+        for link in &result.links {
+            self.inner.links.insert(link.chunk_index, link.clone());
+        }
+
+        Ok(result.links)
     }
 }
 

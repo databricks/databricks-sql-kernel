@@ -33,7 +33,7 @@ use dashmap::DashMap;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as TokioMutex, Notify};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 
@@ -138,6 +138,21 @@ pub struct StreamingCloudFetchProvider {
 
     // Tokio runtime handle for spawning tasks
     runtime_handle: tokio::runtime::Handle,
+
+    // Mutex around the batched link-refresh path.
+    //
+    // Several chunks expiring concurrently (the common shape: a
+    // burst of presigned URLs all near the 1h boundary) would each
+    // try to refresh the link cache. With this mutex, the first
+    // caller takes the lock and issues exactly one
+    // `refetch_links_from` RPC that covers the entire forward
+    // window; subsequent callers await the same lock, then each
+    // pulls the fresh link from the cache without a second
+    // round-trip.
+    //
+    // `Arc<...>` so spawned download tasks can hold their own clone
+    // without keeping the whole provider alive past stream end.
+    refresh_lock: Arc<TokioMutex<()>>,
 }
 
 impl std::fmt::Debug for StreamingCloudFetchProvider {
@@ -181,6 +196,7 @@ impl StreamingCloudFetchProvider {
             chunk_state_changed: Arc::new(Notify::new()),
             cancel_token: CancellationToken::new(),
             runtime_handle,
+            refresh_lock: Arc::new(TokioMutex::new(())),
         });
 
         // Start background initialization that fetches links and schedules downloads
@@ -382,6 +398,41 @@ impl StreamingCloudFetchProvider {
                 }
             }
 
+            // Proactive expiry check: if the cached link for this
+            // chunk is already expired (e.g. it sat in the queue
+            // longer than the presigned URL's TTL), refresh the
+            // whole forward batch before kicking off the download.
+            // Avoids the wasted-RTT failure-then-refresh path inside
+            // the download task.
+            let expired = self
+                .chunks
+                .get(&next_index)
+                .and_then(|e| e.link.as_ref().map(|l| l.is_expired()))
+                .unwrap_or(false);
+            if expired {
+                debug!(
+                    "Proactive refresh: cached link for chunk {} already expired",
+                    next_index
+                );
+                if let Err(e) = Self::refresh_links_batch(
+                    next_index,
+                    &self.link_fetcher,
+                    &self.chunks,
+                    &self.refresh_lock,
+                )
+                .await
+                {
+                    warn!(
+                        "Proactive batched refresh failed for chunk {}: {}; \
+                         will fall through to per-download retry path",
+                        next_index, e
+                    );
+                    // Don't abort scheduling — the download task's
+                    // own refresh attempt will surface the error
+                    // (and retry) when it actually tries to fetch.
+                }
+            }
+
             // Try to claim this chunk for download
             let claimed = {
                 if let Some(mut entry) = self.chunks.get_mut(&next_index) {
@@ -417,6 +468,7 @@ impl StreamingCloudFetchProvider {
             let downloader = Arc::clone(&self.chunk_downloader);
             let link_fetcher = Arc::clone(&self.link_fetcher);
             let chunks = self.chunks.clone();
+            let refresh_lock = Arc::clone(&self.refresh_lock);
             let chunk_state_changed = Arc::clone(&self.chunk_state_changed);
             let cancel_token = self.cancel_token.clone();
             let max_retries = self.config.max_retries;
@@ -429,6 +481,7 @@ impl StreamingCloudFetchProvider {
                     &downloader,
                     &link_fetcher,
                     &chunks,
+                    &refresh_lock,
                     max_retries,
                     retry_delay,
                     &cancel_token,
@@ -479,11 +532,13 @@ impl StreamingCloudFetchProvider {
     }
 
     /// Download a single chunk with retry and link refresh on expiry.
+    #[allow(clippy::too_many_arguments)]
     async fn download_chunk_with_retry(
         chunk_index: i64,
         downloader: &ChunkDownloader,
         link_fetcher: &Arc<dyn ChunkLinkFetcher>,
         chunks: &Arc<DashMap<i64, ChunkEntry>>,
+        refresh_lock: &Arc<TokioMutex<()>>,
         max_retries: u32,
         retry_delay: std::time::Duration,
         cancel_token: &CancellationToken,
@@ -495,7 +550,13 @@ impl StreamingCloudFetchProvider {
                 return Err(Error::invalid_state().message("Download cancelled"));
             }
 
-            // Get link (may need to refetch if expired)
+            // Get link (may need to refresh the whole forward batch
+            // if expired). We always go via the batched refresh path:
+            // refreshing all in-flight chunks in one RPC matches the
+            // shape of how SEA expires links (the whole presigned-URL
+            // batch tends to share an expiry window), and avoids N
+            // separate `refetch_link` calls when a burst of chunks
+            // expires concurrently.
             let link = {
                 let entry = chunks.get(&chunk_index);
                 let stored_link = entry.as_ref().and_then(|e| e.link.clone());
@@ -503,16 +564,22 @@ impl StreamingCloudFetchProvider {
                 match stored_link {
                     Some(link) if !link.is_expired() => link,
                     _ => {
-                        // Link missing or expired - refetch it
-                        debug!("Refetching expired link for chunk {}", chunk_index);
-                        let new_link = link_fetcher.refetch_link(chunk_index, 0).await?;
-
-                        // Store the new link
-                        if let Some(mut entry) = chunks.get_mut(&chunk_index) {
-                            entry.link = Some(new_link.clone());
-                        }
-
-                        new_link
+                        debug!(
+                            "Link for chunk {} missing or expired; \
+                             triggering batched refresh",
+                            chunk_index
+                        );
+                        Self::refresh_links_batch(chunk_index, link_fetcher, chunks, refresh_lock)
+                            .await?;
+                        chunks
+                            .get(&chunk_index)
+                            .and_then(|e| e.link.clone())
+                            .ok_or_else(|| {
+                                Error::invalid_state().message(format!(
+                                    "Link for chunk {} still missing after batched refresh",
+                                    chunk_index
+                                ))
+                            })?
                     }
                 }
             };
@@ -539,6 +606,123 @@ impl StreamingCloudFetchProvider {
                 }
             }
         }
+    }
+
+    /// Refresh presigned-URL links for `chunk_index` and every
+    /// subsequent chunk whose download is still pending or in flight.
+    ///
+    /// One RPC; per-chunk state reconciliation:
+    /// - `UrlFetched | DownloadFailed | DownloadRetry`: link replaced
+    ///   in cache. `schedule_downloads` will pick the chunk up using
+    ///   the fresh URL on its next loop.
+    /// - `Downloading`: link replaced in cache. The active download
+    ///   task will see the new link on its next retry iteration
+    ///   (this function is called from inside that task — see
+    ///   `download_chunk_with_retry`).
+    /// - `Downloaded | ProcessingFailed | Cancelled | Released`:
+    ///   bytes (or terminal state) are already in memory. We update
+    ///   the cached link for bookkeeping but do nothing else; the
+    ///   chunk doesn't need to be re-downloaded.
+    /// - `Pending` (no link cached): not in our refresh window, skip.
+    ///
+    /// The `refresh_lock` is taken before the RPC fires. Multiple
+    /// concurrent download tasks hitting expired URLs at the same
+    /// time will queue on the lock; only the first holder issues the
+    /// RPC, the rest find their now-fresh link already in cache when
+    /// they re-check.
+    ///
+    /// `start_chunk_index` is the chunk whose download just failed
+    /// (or is about to fail) — its server-side row offset is read
+    /// from the cached link if any so the RPC carries the right
+    /// `row_offset` for the bounded SEA API contract.
+    async fn refresh_links_batch(
+        start_chunk_index: i64,
+        link_fetcher: &Arc<dyn ChunkLinkFetcher>,
+        chunks: &Arc<DashMap<i64, ChunkEntry>>,
+        refresh_lock: &Arc<TokioMutex<()>>,
+    ) -> Result<()> {
+        let _guard = refresh_lock.lock().await;
+
+        // Re-check after taking the lock: another task may have just
+        // refreshed our chunk. Skip the RPC if so.
+        if let Some(entry) = chunks.get(&start_chunk_index) {
+            if let Some(ref link) = entry.link {
+                if !link.is_expired() {
+                    debug!(
+                        "Batched refresh for chunk {} skipped — already refreshed by another task",
+                        start_chunk_index
+                    );
+                    return Ok(());
+                }
+            }
+        }
+
+        // Derive `row_offset` from the existing cached link if any.
+        // The bounded SEA API contract requires `row_offset` on
+        // CloudFetch fetches (see PR #67 + PR #68); honour it here so
+        // the server-side cursor lands on the right row.
+        let row_offset = chunks
+            .get(&start_chunk_index)
+            .and_then(|e| e.link.as_ref().map(|l| l.row_offset))
+            .unwrap_or(0);
+
+        debug!(
+            "Issuing batched link refresh from chunk {} (row_offset={})",
+            start_chunk_index, row_offset
+        );
+        let refreshed = link_fetcher
+            .refetch_links_from(start_chunk_index, row_offset)
+            .await?;
+
+        for fresh in refreshed {
+            let ci = fresh.chunk_index;
+            if let Some(mut entry) = chunks.get_mut(&ci) {
+                match entry.state {
+                    // Pending links to download — replace and let
+                    // schedule_downloads pick up on next loop.
+                    ChunkState::UrlFetched
+                    | ChunkState::DownloadFailed(_)
+                    | ChunkState::DownloadRetry => {
+                        entry.link = Some(fresh);
+                        entry.state = ChunkState::UrlFetched;
+                    }
+                    // Download already in flight — the in-flight
+                    // task re-reads `entry.link` on each retry, so
+                    // updating the link in place is enough. Don't
+                    // touch the state machine; the running task
+                    // owns it.
+                    ChunkState::Downloading => {
+                        entry.link = Some(fresh);
+                    }
+                    // Terminal-ish or already-have-bytes states.
+                    // Keep the link metadata current (cheap; future
+                    // bookkeeping may read `entry.link.row_offset`
+                    // etc.) but do not change state or trigger any
+                    // download.
+                    ChunkState::Downloaded
+                    | ChunkState::ProcessingFailed(_)
+                    | ChunkState::Cancelled
+                    | ChunkState::Released => {
+                        entry.link = Some(fresh);
+                    }
+                    // Pending without a link — refresh response
+                    // covered a chunk we hadn't asked about yet.
+                    // Drop a link in and mark as ready to schedule.
+                    ChunkState::Pending => {
+                        entry.link = Some(fresh);
+                        entry.state = ChunkState::UrlFetched;
+                    }
+                }
+            } else {
+                // No entry yet — the refresh response covered a
+                // chunk we haven't seen at all. Create a fresh entry
+                // with the link; schedule_downloads will pick it up
+                // when it's in the consumer window.
+                chunks.insert(ci, ChunkEntry::with_link(fresh));
+            }
+        }
+
+        Ok(())
     }
 
     /// Wait for a specific chunk to be ready (Downloaded state).
@@ -695,6 +879,25 @@ mod tests {
                         .message(format!("Link not found for chunk {}", chunk_index))
                 })
         }
+
+        async fn refetch_links_from(
+            &self,
+            chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<Vec<CloudFetchLink>> {
+            // Test mock: return all links at chunk_index and beyond,
+            // ordered by chunk_index. Real SEA returns a server-
+            // decided batch starting at the requested index; this is
+            // good enough for state-machine tests.
+            let mut links: Vec<_> = self
+                .links_by_index
+                .iter()
+                .filter(|(idx, _)| **idx >= chunk_index)
+                .map(|(_, link)| link.clone())
+                .collect();
+            links.sort_by_key(|l| l.chunk_index);
+            Ok(links)
+        }
     }
 
     fn create_test_link(chunk_index: i64) -> CloudFetchLink {
@@ -830,5 +1033,266 @@ mod tests {
 
         let result = merge_batches_to_target(vec![b1, b2], 100).unwrap();
         assert_eq!(result[0].schema(), original_schema);
+    }
+
+    // --- refresh_links_batch unit tests ---
+    //
+    // These test the static method directly. They construct a tiny
+    // chunks DashMap by hand, prime it with entries in various
+    // states, then call `StreamingCloudFetchProvider::refresh_links_batch`
+    // and assert the right state transitions + RPC count.
+
+    use crate::types::cloudfetch::{ChunkEntry, ChunkState};
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+    /// Mock fetcher that records how many `refetch_links_from`
+    /// calls were made. Returns synthetic refreshed links with
+    /// distinct URLs so the test can tell new from stale.
+    #[derive(Debug)]
+    struct RefreshCountingMock {
+        refresh_calls: AtomicUsize,
+        // Range of chunk_indices the mock will return on each
+        // refresh, starting at the requested start_chunk_index.
+        window: i64,
+    }
+
+    impl RefreshCountingMock {
+        fn new(window: i64) -> Arc<Self> {
+            Arc::new(Self {
+                refresh_calls: AtomicUsize::new(0),
+                window,
+            })
+        }
+
+        fn fresh_link(chunk_index: i64) -> CloudFetchLink {
+            CloudFetchLink {
+                url: format!("https://storage.example.com/REFRESHED/chunk{}", chunk_index),
+                chunk_index,
+                row_offset: chunk_index * 1000,
+                row_count: 1000,
+                byte_count: 50000,
+                expiration: chrono::Utc::now() + chrono::Duration::hours(1),
+                http_headers: HashMap::new(),
+                next_chunk_index: Some(chunk_index + 1),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkLinkFetcher for RefreshCountingMock {
+        async fn fetch_links(
+            &self,
+            _start_chunk_index: i64,
+            _start_row_offset: i64,
+        ) -> Result<ChunkLinkFetchResult> {
+            unreachable!("not used by these tests")
+        }
+
+        async fn refetch_link(
+            &self,
+            _chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<CloudFetchLink> {
+            unreachable!("not used by these tests")
+        }
+
+        async fn refetch_links_from(
+            &self,
+            chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<Vec<CloudFetchLink>> {
+            self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst);
+            Ok((chunk_index..chunk_index + self.window)
+                .map(Self::fresh_link)
+                .collect())
+        }
+    }
+
+    /// Build a CloudFetchLink whose `expiration` is in the past.
+    fn expired_link(chunk_index: i64) -> CloudFetchLink {
+        CloudFetchLink {
+            expiration: chrono::Utc::now() - chrono::Duration::seconds(60),
+            ..create_test_link(chunk_index)
+        }
+    }
+
+    fn entry_with_state(link: CloudFetchLink, state: ChunkState) -> ChunkEntry {
+        ChunkEntry {
+            link: Some(link),
+            state,
+            batches: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_updates_link_for_urlfetched_chunks() {
+        // Chunks 0-2 all expired, all in UrlFetched state. One
+        // refresh covers them all. After: each has a non-expired
+        // URL with the REFRESHED prefix.
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        for i in 0..3 {
+            chunks.insert(i, entry_with_state(expired_link(i), ChunkState::UrlFetched));
+        }
+
+        let mock = RefreshCountingMock::new(3);
+        let lock = Arc::new(TokioMutex::new(()));
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+
+        StreamingCloudFetchProvider::refresh_links_batch(0, &fetcher, &chunks, &lock)
+            .await
+            .expect("refresh must succeed");
+
+        assert_eq!(
+            mock.refresh_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "exactly one batched refresh RPC for the window"
+        );
+        for i in 0..3 {
+            let entry = chunks.get(&i).unwrap();
+            assert!(matches!(entry.state, ChunkState::UrlFetched));
+            assert!(
+                entry.link.as_ref().unwrap().url.contains("REFRESHED"),
+                "chunk {} link was not refreshed",
+                i
+            );
+            assert!(!entry.link.as_ref().unwrap().is_expired());
+        }
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_preserves_downloaded_state() {
+        // Chunk 0 is Downloaded with its bytes in memory. The
+        // refresh updates its link (bookkeeping) but must not reset
+        // state to UrlFetched — that would force a re-download of
+        // bytes we already have.
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        let already_downloaded = ChunkEntry {
+            link: Some(expired_link(0)),
+            state: ChunkState::Downloaded,
+            // Real downloaded chunks carry batches; using None here
+            // keeps the test focussed on state-machine reconciliation.
+            batches: Some(vec![]),
+        };
+        chunks.insert(0, already_downloaded);
+        chunks.insert(1, entry_with_state(expired_link(1), ChunkState::UrlFetched));
+
+        let mock = RefreshCountingMock::new(2);
+        let lock = Arc::new(TokioMutex::new(()));
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+
+        StreamingCloudFetchProvider::refresh_links_batch(0, &fetcher, &chunks, &lock)
+            .await
+            .unwrap();
+
+        let c0 = chunks.get(&0).unwrap();
+        assert!(
+            matches!(c0.state, ChunkState::Downloaded),
+            "Downloaded state must be preserved"
+        );
+        assert!(c0.batches.is_some(), "Downloaded bytes must not be cleared");
+        assert!(
+            c0.link.as_ref().unwrap().url.contains("REFRESHED"),
+            "link was still updated for bookkeeping"
+        );
+
+        let c1 = chunks.get(&1).unwrap();
+        assert!(matches!(c1.state, ChunkState::UrlFetched));
+        assert!(c1.link.as_ref().unwrap().url.contains("REFRESHED"));
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_leaves_downloading_state_intact() {
+        // A chunk in Downloading state means an in-flight task owns
+        // the state machine. Refresh must NOT reset state to
+        // UrlFetched (which would let `schedule_downloads` race in
+        // and start a second download). Only the link is replaced;
+        // the in-flight task will see the fresh URL on its next
+        // retry-iteration of `download_chunk_with_retry`.
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(
+            5,
+            entry_with_state(expired_link(5), ChunkState::Downloading),
+        );
+
+        let mock = RefreshCountingMock::new(1);
+        let lock = Arc::new(TokioMutex::new(()));
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+
+        StreamingCloudFetchProvider::refresh_links_batch(5, &fetcher, &chunks, &lock)
+            .await
+            .unwrap();
+
+        let c5 = chunks.get(&5).unwrap();
+        assert!(
+            matches!(c5.state, ChunkState::Downloading),
+            "Downloading state must be preserved — the in-flight task owns it"
+        );
+        assert!(c5.link.as_ref().unwrap().url.contains("REFRESHED"));
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_resets_download_failed_to_urlfetched() {
+        // A chunk in DownloadFailed (transient) should be reset to
+        // UrlFetched with the fresh URL so schedule_downloads can
+        // pick it up on next loop.
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(
+            7,
+            entry_with_state(
+                expired_link(7),
+                ChunkState::DownloadFailed("network glitch".into()),
+            ),
+        );
+
+        let mock = RefreshCountingMock::new(1);
+        let lock = Arc::new(TokioMutex::new(()));
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+
+        StreamingCloudFetchProvider::refresh_links_batch(7, &fetcher, &chunks, &lock)
+            .await
+            .unwrap();
+
+        let c7 = chunks.get(&7).unwrap();
+        assert!(matches!(c7.state, ChunkState::UrlFetched));
+        assert!(c7.link.as_ref().unwrap().url.contains("REFRESHED"));
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_dedups_concurrent_calls() {
+        // Two concurrent calls — only one RPC should fire. The
+        // second caller takes the mutex after the first releases,
+        // sees the now-fresh link, and skips its own refetch.
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(0, entry_with_state(expired_link(0), ChunkState::UrlFetched));
+
+        let mock = RefreshCountingMock::new(1);
+        let lock = Arc::new(TokioMutex::new(()));
+
+        let fetcher_a: Arc<dyn ChunkLinkFetcher> = mock.clone();
+        let chunks_a = Arc::clone(&chunks);
+        let lock_a = Arc::clone(&lock);
+        let h1 = tokio::spawn(async move {
+            StreamingCloudFetchProvider::refresh_links_batch(0, &fetcher_a, &chunks_a, &lock_a)
+                .await
+        });
+
+        let fetcher_b: Arc<dyn ChunkLinkFetcher> = mock.clone();
+        let chunks_b = Arc::clone(&chunks);
+        let lock_b = Arc::clone(&lock);
+        let h2 = tokio::spawn(async move {
+            StreamingCloudFetchProvider::refresh_links_batch(0, &fetcher_b, &chunks_b, &lock_b)
+                .await
+        });
+
+        h1.await.unwrap().unwrap();
+        h2.await.unwrap().unwrap();
+
+        // The first holder did the work; the second holder
+        // re-checked, found the link non-expired, and skipped.
+        assert_eq!(
+            mock.refresh_calls.load(AtomicOrdering::SeqCst),
+            1,
+            "concurrent refreshes must dedup down to one RPC"
+        );
     }
 }
