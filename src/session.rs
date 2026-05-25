@@ -585,6 +585,7 @@ fn result_to_post_process_options(
 ) -> crate::reader::post_processor::PostProcessOptions {
     crate::reader::post_processor::PostProcessOptions {
         complex_types_as_json: result.complex_types_as_json,
+        intervals_as_string: result.intervals_as_string,
     }
 }
 

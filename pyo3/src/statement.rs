@@ -87,11 +87,10 @@ impl Statement {
     /// to re-encode to a kernel ``TypedValue`` would be a lossy
     /// round-trip; the kernel takes the string directly.
     ///
-    /// Named bindings, compound types (ARRAY/MAP/STRUCT), and
-    /// BINARY are not yet supported and raise
-    /// ``KernelError(code='InvalidArgument', ...)``. Bad value
-    /// literals (e.g. ``bind_param(1, "abc", "INT")``) also raise
-    /// at bind time, before ``execute()``.
+    /// Compound types (ARRAY/MAP/STRUCT) and BINARY are not yet
+    /// supported and raise ``KernelError(code='InvalidArgument',
+    /// ...)``. Bad value literals (e.g. ``bind_param(1, "abc",
+    /// "INT")``) also raise at bind time, before ``execute()``.
     #[pyo3(signature = (ordinal, value_str, sql_type))]
     fn bind_param(
         &mut self,
@@ -122,6 +121,32 @@ impl Statement {
             .stmt
             .spec()
             .param(ordinal as usize, typed)
+            .map_err(|e| to_py_err(py, e))?;
+        Ok(())
+    }
+
+    /// Bind a named parameter.
+    ///
+    /// The SQL must reference the binding as ``:name``. The canonical
+    /// SEA proto marks ``StatementParameter.name`` as
+    /// ``openapi_required=true``; named binding is the spec-required
+    /// public form. ``value_str`` and ``sql_type`` follow the same
+    /// conventions as ``bind_param``.
+    #[pyo3(signature = (name, value_str, sql_type))]
+    fn bind_named_param(
+        &mut self,
+        py: Python<'_>,
+        name: String,
+        value_str: Option<String>,
+        sql_type: String,
+    ) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        let typed =
+            parse_typed_value(&sql_type, value_str.as_deref()).map_err(|e| to_py_err(py, e))?;
+        inner
+            .stmt
+            .spec()
+            .param_named(name, typed)
             .map_err(|e| to_py_err(py, e))?;
         Ok(())
     }

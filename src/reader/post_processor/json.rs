@@ -470,7 +470,7 @@ fn base64_encode(bytes: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
-fn format_interval(array: &dyn Array, index: usize) -> Result<String> {
+pub(super) fn format_interval(array: &dyn Array, index: usize) -> Result<String> {
     match array.data_type() {
         DataType::Interval(arrow_schema::IntervalUnit::YearMonth) => {
             let months = array.as_primitive::<IntervalYearMonthType>().value(index);
@@ -529,7 +529,7 @@ fn format_day_time_interval(days: i64, nanos: i64) -> String {
     format!("{sign}{d} {h:02}:{m:02}:{s:02}.{nanos_rem:09}")
 }
 
-fn format_duration(array: &dyn Array, index: usize) -> Result<String> {
+pub(super) fn format_duration(array: &dyn Array, index: usize) -> Result<String> {
     let nanos: i128 = match array.data_type() {
         DataType::Duration(TimeUnit::Second) => {
             (array.as_primitive::<DurationSecondType>().value(index) as i128) * 1_000_000_000

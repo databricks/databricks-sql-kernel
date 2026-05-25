@@ -51,6 +51,18 @@ pub(crate) struct PostProcessOptions {
     /// columns containing compact JSON text per row. See
     /// [`ResultConfig::complex_types_as_json`](crate::config::ResultConfig::complex_types_as_json).
     pub complex_types_as_json: bool,
+    /// When `true`, `Interval(*)` and `Duration(*)` columns are
+    /// replaced with `Utf8` columns containing the canonical
+    /// Databricks text form (e.g. `"2-6"` for YEAR-MONTH,
+    /// `"3 12:30:15.000000000"` for DAY-TIME).
+    ///
+    /// Motivation: pyarrow's Python bindings can't decode Arrow's
+    /// `month_interval` type (id 21) at all — `.as_py()` / `.to_pylist()` /
+    /// `cast(string)` / `to_pandas()` all fail. The Python connector
+    /// requests this flag so interval results are usable from
+    /// Python; non-Python consumers can leave it `false` if they
+    /// have a working interval decoder.
+    pub intervals_as_string: bool,
 }
 
 /// Wrapper that runs all per-batch post-processing the kernel does
@@ -97,23 +109,36 @@ impl ResultPostProcessor {
             None => inner_schema.clone(),
         };
 
-        // 2. JSON-stringification rewrite: identify complex columns
-        //    in the augmented schema and turn them into nullable Utf8
-        //    while preserving the Databricks metadata.
+        // 2. Compute the set of column indices that need stringification.
+        //    JSON-rewrite covers complex types; interval-rewrite covers
+        //    `Interval(*)` and `Duration(*)`. Each is gated by its own
+        //    option; both produce a `Utf8` output column. The two sets
+        //    are disjoint by construction (`is_complex_type` returns
+        //    false for interval/duration), so a column is rewritten by
+        //    at most one transform.
         let mut json_columns: Vec<usize> = Vec::new();
-        let output_schema: SchemaRef = if options.complex_types_as_json {
-            let mut new_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
-            for (i, field) in augmented_schema.fields().iter().enumerate() {
-                if json::is_complex_type(field.data_type()) {
-                    json_columns.push(i);
-                    let metadata = field.metadata().clone();
-                    new_fields.push(
-                        Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata),
-                    );
-                } else {
-                    new_fields.push(field.as_ref().clone());
-                }
+        let mut interval_columns: Vec<usize> = Vec::new();
+        let mut new_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
+        let mut schema_changed = false;
+        for (i, field) in augmented_schema.fields().iter().enumerate() {
+            let dt = field.data_type();
+            if options.complex_types_as_json && json::is_complex_type(dt) {
+                json_columns.push(i);
+                let metadata = field.metadata().clone();
+                new_fields
+                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
+                schema_changed = true;
+            } else if options.intervals_as_string && is_interval_or_duration_type(dt) {
+                interval_columns.push(i);
+                let metadata = field.metadata().clone();
+                new_fields
+                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
+                schema_changed = true;
+            } else {
+                new_fields.push(field.as_ref().clone());
             }
+        }
+        let output_schema: SchemaRef = if schema_changed {
             Arc::new(Schema::new_with_metadata(
                 new_fields,
                 augmented_schema.metadata().clone(),
@@ -126,18 +151,20 @@ impl ResultPostProcessor {
         //
         // Cases:
         //  - `inner_schema == output_schema` (Arc-eq or
-        //    structurally identical): no work needed.
+        //    structurally identical) and no column rewrites: no work
+        //    needed.
         //  - Output schema differs only in field metadata (manifest
-        //    augmentation, no JSON rewrite): a single
+        //    augmentation, no column rewrites): a single
         //    `RecordBatch::try_new` re-project onto the augmented
         //    schema.
-        //  - JSON columns present: fused walk that re-projects
-        //    primitives and emits new Utf8 arrays for complex
+        //  - Any rewrites present: fused walk that re-projects
+        //    primitives and emits new Utf8 arrays for the rewritten
         //    columns.
         let needs_rebuild = !schemas_field_equal(&inner_schema, &output_schema);
-        let transform: Option<BatchTransform> = if !needs_rebuild && json_columns.is_empty() {
+        let has_rewrites = !json_columns.is_empty() || !interval_columns.is_empty();
+        let transform: Option<BatchTransform> = if !needs_rebuild && !has_rewrites {
             None
-        } else if json_columns.is_empty() {
+        } else if !has_rewrites {
             // Manifest-only path: cheap re-project. Reuses upstream
             // ArrayRefs unchanged.
             let target_schema = output_schema.clone();
@@ -151,13 +178,21 @@ impl ResultPostProcessor {
             }))
         } else {
             // Fused walk: re-project primitives, stringify complex
-            // columns. Captures only what each closure invocation
-            // actually needs.
+            // columns (JSON path), stringify intervals/durations
+            // (interval path). Captures only what each closure
+            // invocation actually needs.
             let target_schema = output_schema.clone();
             let augmented = augmented_schema.clone();
             let json_cols: Vec<usize> = json_columns;
+            let interval_cols: Vec<usize> = interval_columns;
             Some(Box::new(move |batch: &RecordBatch| {
-                build_json_batch(batch, &augmented, &target_schema, &json_cols)
+                build_rewritten_batch(
+                    batch,
+                    &augmented,
+                    &target_schema,
+                    &json_cols,
+                    &interval_cols,
+                )
             }))
         };
 
@@ -204,21 +239,33 @@ fn schemas_field_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 }
 
 /// Build a `RecordBatch` whose primitive columns are reprojected
-/// from `batch` and whose complex columns (indexed by `json_cols`)
-/// are replaced with `Utf8` arrays of compact JSON text.
-fn build_json_batch(
+/// from `batch`, complex columns (indexed by `json_cols`) are replaced
+/// with `Utf8` arrays of compact JSON text, and interval / duration
+/// columns (indexed by `interval_cols`) are replaced with `Utf8`
+/// arrays of canonical Databricks interval text.
+///
+/// `json_cols` and `interval_cols` are assumed to be sorted in
+/// ascending order (the constructor walks the schema linearly) and
+/// disjoint (`is_complex_type` returns false for intervals).
+fn build_rewritten_batch(
     batch: &RecordBatch,
     augmented: &SchemaRef,
     output: &SchemaRef,
     json_cols: &[usize],
+    interval_cols: &[usize],
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
 
     let mut next_json_idx = 0;
+    let mut next_interval_idx = 0;
     for (col_idx, column) in batch.columns().iter().enumerate() {
         let is_json = json_cols
             .get(next_json_idx)
+            .copied()
+            .is_some_and(|target| target == col_idx);
+        let is_interval = interval_cols
+            .get(next_interval_idx)
             .copied()
             .is_some_and(|target| target == col_idx);
         if is_json {
@@ -248,6 +295,27 @@ fn build_json_batch(
                 builder.append_value(&scratch);
             }
             columns.push(Arc::new(builder.finish()));
+        } else if is_interval {
+            next_interval_idx += 1;
+            let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
+            let dt = column.data_type();
+            for row in 0..num_rows {
+                if column.is_null(row) {
+                    builder.append_null();
+                    continue;
+                }
+                let s = match dt {
+                    DataType::Interval(_) => json::format_interval(column.as_ref(), row)?,
+                    DataType::Duration(_) => json::format_duration(column.as_ref(), row)?,
+                    other => {
+                        return Err(Error::internal().message(format!(
+                            "intervals_as_string: column {col_idx} expected Interval/Duration, got {other:?}"
+                        )));
+                    }
+                };
+                builder.append_value(&s);
+            }
+            columns.push(Arc::new(builder.finish()));
         } else {
             columns.push(column.clone());
         }
@@ -255,9 +323,15 @@ fn build_json_batch(
 
     RecordBatch::try_new(output.clone(), columns).map_err(|e| {
         Error::internal().message(format!(
-            "ResultPostProcessor: failed to assemble JSON-rewritten batch: {e}"
+            "ResultPostProcessor: failed to assemble rewritten batch: {e}"
         ))
     })
+}
+
+/// True iff `dt` is an Arrow `Interval(*)` or `Duration(*)` — the
+/// types the `intervals_as_string` post-processor stringifies.
+fn is_interval_or_duration_type(dt: &DataType) -> bool {
+    matches!(dt, DataType::Interval(_) | DataType::Duration(_))
 }
 
 #[cfg(test)]
@@ -372,6 +446,7 @@ mod tests {
 
         let opts = PostProcessOptions {
             complex_types_as_json: true,
+            ..Default::default()
         };
         let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
 
@@ -415,6 +490,7 @@ mod tests {
 
         let opts = PostProcessOptions {
             complex_types_as_json: true,
+            ..Default::default()
         };
         let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
         let out_batch = pp.next_batch().unwrap().unwrap();
@@ -452,6 +528,7 @@ mod tests {
 
         let opts = PostProcessOptions {
             complex_types_as_json: true,
+            ..Default::default()
         };
         let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
         let out = pp.next_batch().unwrap().unwrap();
@@ -478,6 +555,7 @@ mod tests {
 
         let opts = PostProcessOptions {
             complex_types_as_json: true,
+            ..Default::default()
         };
         let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
         let out = pp.next_batch().unwrap().unwrap();
