@@ -1,0 +1,124 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# napi-rs sub-crate CI. The napi/ directory is a *standalone* Cargo
+# workspace (see napi/Cargo.toml — `[workspace] members = ["."]`)
+# because it pins `tls-rustls` on the kernel while the root workspace
+# picks `tls-native` via pyo3. Feature-unification under a single
+# workspace would link both TLS stacks into the resulting cdylib.
+#
+# Consequence: every cargo invocation here runs from `napi/`, not the
+# repo root. Lockfile drift detection uses `--locked` against
+# `napi/Cargo.lock` rather than the kernel's root lock.
+#
+# Path-gated on `napi/**` so this workflow fires only when the
+# directory or its inputs change.
+
+name: napi Checks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "napi/**"
+      # Root Cargo.toml change can affect napi via its `path = ".."`
+      # kernel dep, so this workflow re-runs to catch mismatches.
+      - "Cargo.toml"
+      - ".github/workflows/napi-checks.yml"
+  pull_request:
+    branches: [main]
+    paths:
+      - "napi/**"
+      - "Cargo.toml"
+      - ".github/workflows/napi-checks.yml"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  # Cheap gate job — runs once, no toolchain installs. The check-and-test
+  # job depends on this and is skipped (no runner boot beyond the
+  # precondition runner itself) when the napi/ sub-crate doesn't
+  # exist. Avoids wasted setup cost on kernel-only PRs that trigger
+  # this workflow via root Cargo.toml changes before the napi crate
+  # has merged.
+  precondition:
+    name: "Check napi/ sub-crate exists"
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    outputs:
+      ready: ${{ steps.check.outputs.ready }}
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - name: "Check for napi/Cargo.toml"
+        id: check
+        run: |
+          if [[ -f "napi/Cargo.toml" ]]; then
+            echo "ready=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::napi/ sub-crate does not exist yet — skipping napi checks. (Workflow may fire on root Cargo.toml changes before the napi crate has merged.)"
+            echo "ready=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  check-and-test:
+    name: "napi fmt + clippy + test"
+    needs: precondition
+    if: needs.precondition.outputs.ready == 'true'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    defaults:
+      run:
+        # All cargo commands run from the napi/ standalone workspace.
+        working-directory: napi
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
+        with:
+          components: rustfmt, clippy
+
+      - name: cargo fmt --all -- --check
+        run: cargo fmt --all -- --check
+
+      # `--locked` makes the build fail if `napi/Cargo.lock` is out of
+      # sync with `napi/Cargo.toml` — catches contributors who bump a
+      # dep version in Cargo.toml without re-running `cargo update`.
+      # Mirrors the dual-Cargo.lock-drift concern from review.
+      - name: cargo clippy --all-targets --locked -- -D warnings
+        run: cargo clippy --all-targets --locked -- -D warnings
+
+      - name: cargo test --locked
+        # The napi crate's Rust-side unit tests (error envelope, panic
+        # guard, runtime handle, version) run here. No network, no
+        # secrets — purely cdylib + rlib in-tree tests.
+        run: cargo test --locked
+
+      # Release-profile build verifies the cdylib actually links with
+      # the production profile knobs (lto=true, codegen-units=1,
+      # strip="debuginfo"). Slower (~1m) but cheap insurance against
+      # release-only regressions that the debug-profile `cargo test`
+      # above wouldn't catch.
+      - name: cargo build --release --locked
+        run: cargo build --release --locked
