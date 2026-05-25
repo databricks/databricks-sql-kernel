@@ -994,8 +994,11 @@ mod tests {
         let data_type = out.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
         // INT → java.sql.Types.INTEGER = 4
         assert_eq!(data_type.value(0), 4);
-        // STRING → java.sql.Types.LONGVARCHAR = -1
-        assert_eq!(data_type.value(1), -1);
+        // STRING → java.sql.Types.VARCHAR = 12 (matches Thrift's
+        // released `getColumns` contract; prior kernel value was
+        // LONGVARCHAR = -1, which diverged from Thrift in 3,242
+        // cells of the comparator run).
+        assert_eq!(data_type.value(1), 12);
     }
 
     #[test]

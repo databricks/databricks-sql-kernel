@@ -31,28 +31,55 @@ use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
 use std::sync::Arc;
 
 // ─── JDBC `Types` integer codes used in TYPE_INFO ───────────────────
+//
+// Single source of truth lives in `metadata::type_mapping`. The
+// canonical mapping function `databricks_type_to_xdbc` (used by
+// `getColumns` per-row mapping) references the same constants — so
+// the `getTypeInfo` static table and the `getColumns` derivation
+// agree by construction. Drift between the two surfaces caused
+// silent bugs before unification (Databricks `FLOAT` reported as
+// JDBC `FLOAT` (6) by `getColumns` but `REAL` (7) by `getTypeInfo`,
+// `STRING` reported as `LONGVARCHAR` (-1) here while Thrift's
+// `getColumns` returns `VARCHAR` (12)).
+//
+// The underlying JDBC `Types` codes are `i16` (JDBC spec types them
+// as `short`); the `getTypeInfo` Arrow column is `i32`, so we widen
+// once per constant here.
 
-const JDBC_BIT: i32 = -7; // BOOLEAN
-const JDBC_TINYINT: i32 = -6;
-const JDBC_BIGINT: i32 = -5;
-const JDBC_LONGVARBINARY: i32 = -4;
-const JDBC_VARBINARY: i32 = -3;
-const JDBC_BINARY: i32 = -2;
-const JDBC_LONGVARCHAR: i32 = -1; // STRING
-const JDBC_CHAR: i32 = 1;
-const JDBC_NUMERIC: i32 = 2;
-const JDBC_DECIMAL: i32 = 3;
-const JDBC_INTEGER: i32 = 4;
-const JDBC_SMALLINT: i32 = 5;
-const JDBC_REAL: i32 = 7;
-const JDBC_DOUBLE: i32 = 8;
-const JDBC_VARCHAR: i32 = 12;
-const JDBC_DATE: i32 = 91;
-const JDBC_TIMESTAMP: i32 = 93;
-const JDBC_OTHER: i32 = 1111;
-const JDBC_JAVA_OBJECT: i32 = 2000;
-const JDBC_STRUCT: i32 = 2002;
-const JDBC_ARRAY: i32 = 2003;
+use crate::metadata::type_mapping as tm;
+
+#[allow(dead_code)]
+const JDBC_BIT: i32 = tm::JDBC_BIT as i32;
+const JDBC_TINYINT: i32 = tm::JDBC_TINYINT as i32;
+const JDBC_SMALLINT: i32 = tm::JDBC_SMALLINT as i32;
+const JDBC_INTEGER: i32 = tm::JDBC_INTEGER as i32;
+const JDBC_BIGINT: i32 = tm::JDBC_BIGINT as i32;
+const JDBC_FLOAT: i32 = tm::JDBC_FLOAT as i32;
+#[allow(dead_code)]
+const JDBC_REAL: i32 = tm::JDBC_REAL as i32;
+const JDBC_DOUBLE: i32 = tm::JDBC_DOUBLE as i32;
+const JDBC_DECIMAL: i32 = tm::JDBC_DECIMAL as i32;
+#[allow(dead_code)]
+const JDBC_NUMERIC: i32 = tm::JDBC_NUMERIC as i32;
+const JDBC_VARCHAR: i32 = tm::JDBC_VARCHAR as i32;
+#[allow(dead_code)]
+const JDBC_LONGVARCHAR: i32 = tm::JDBC_LONGVARCHAR as i32;
+const JDBC_CHAR: i32 = tm::JDBC_CHAR as i32;
+const JDBC_BINARY: i32 = tm::JDBC_BINARY as i32;
+#[allow(dead_code)]
+const JDBC_VARBINARY: i32 = tm::JDBC_VARBINARY as i32;
+#[allow(dead_code)]
+const JDBC_LONGVARBINARY: i32 = tm::JDBC_LONGVARBINARY as i32;
+const JDBC_DATE: i32 = tm::JDBC_DATE as i32;
+const JDBC_TIMESTAMP: i32 = tm::JDBC_TIMESTAMP as i32;
+const JDBC_OTHER: i32 = tm::JDBC_OTHER as i32;
+const JDBC_JAVA_OBJECT: i32 = tm::JDBC_JAVA_OBJECT as i32;
+const JDBC_STRUCT: i32 = tm::JDBC_STRUCT as i32;
+const JDBC_ARRAY: i32 = tm::JDBC_ARRAY as i32;
+/// JDBC `BOOLEAN` (4.0). Databricks `BOOLEAN` maps here; the older
+/// `JDBC_BIT` (-7) is retained above for any caller that asks for it
+/// explicitly.
+const JDBC_BOOLEAN: i32 = tm::JDBC_BOOLEAN as i32;
 
 // JDBC nullability codes for TYPE_INFO.NULLABLE
 const TYPE_NULLABLE_UNKNOWN: i32 = 2;
@@ -108,7 +135,12 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
     vec![
         R {
             type_name: "BOOLEAN",
-            data_type: JDBC_BIT,
+            // Match Thrift's `getColumns` surface: JDBC `BOOLEAN`
+            // (16), not the older `BIT` (-7). Pre-fix the kernel was
+            // emitting -7 here while `getColumns` emitted -7 too —
+            // both wrong relative to Thrift's 16. Unified at the
+            // `databricks_type_to_xdbc("BOOLEAN")` site too.
+            data_type: JDBC_BOOLEAN,
             column_size: Some(1),
             literal_prefix: None,
             literal_suffix: None,
@@ -122,7 +154,7 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
             local_type_name: Some("BOOLEAN"),
             minimum_scale: None,
             maximum_scale: None,
-            sql_data_type: Some(JDBC_BIT),
+            sql_data_type: Some(JDBC_BOOLEAN),
             sql_datetime_sub: None,
             num_prec_radix: None,
         },
@@ -208,7 +240,13 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
         },
         R {
             type_name: "FLOAT",
-            data_type: JDBC_REAL,
+            // Match Thrift: JDBC `FLOAT` (6), not `REAL` (7). The
+            // distinction matters per JDBC spec (FLOAT is at least
+            // 7 decimal digits, REAL is implementation-defined) and
+            // pre-fix the kernel was returning `REAL` here while
+            // `getColumns` returned `FLOAT` — silent drift between
+            // the two surfaces.
+            data_type: JDBC_FLOAT,
             column_size: Some(7),
             literal_prefix: None,
             literal_suffix: None,
@@ -222,7 +260,7 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
             local_type_name: Some("FLOAT"),
             minimum_scale: None,
             maximum_scale: None,
-            sql_data_type: Some(JDBC_REAL),
+            sql_data_type: Some(JDBC_FLOAT),
             sql_datetime_sub: None,
             num_prec_radix: Some(2),
         },
@@ -268,7 +306,13 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
         },
         R {
             type_name: "STRING",
-            data_type: JDBC_LONGVARCHAR,
+            // Match Thrift: JDBC `VARCHAR` (12), not `LONGVARCHAR`
+            // (-1). Databricks `STRING` is unbounded so `LONGVARCHAR`
+            // is technically more accurate, but Thrift emits 12 and
+            // existing Python clients (SQLAlchemy column
+            // introspection, pandas-read-sql) have been built against
+            // that.
+            data_type: JDBC_VARCHAR,
             column_size: Some(i32::MAX),
             literal_prefix: Some("'"),
             literal_suffix: Some("'"),
@@ -282,7 +326,7 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
             local_type_name: Some("STRING"),
             minimum_scale: None,
             maximum_scale: None,
-            sql_data_type: Some(JDBC_LONGVARCHAR),
+            sql_data_type: Some(JDBC_VARCHAR),
             sql_datetime_sub: None,
             num_prec_radix: None,
         },
@@ -528,7 +572,14 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
         },
         R {
             type_name: "VARBINARY",
-            data_type: JDBC_VARBINARY,
+            // Databricks doesn't have a distinct VARBINARY type;
+            // `databricks_type_to_xdbc("VARBINARY")` resolves to
+            // `JDBC_BINARY` (-2) because the underlying storage is
+            // identical to `BINARY` and that's what Thrift's
+            // `getColumns` reports. The row is kept here so SQL
+            // parsers that look up the alias find an answer; the
+            // answer is the same JDBC code as plain `BINARY`.
+            data_type: JDBC_BINARY,
             column_size: Some(i32::MAX),
             literal_prefix: Some("X'"),
             literal_suffix: Some("'"),
@@ -542,33 +593,23 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
             local_type_name: Some("VARBINARY"),
             minimum_scale: None,
             maximum_scale: None,
-            sql_data_type: Some(JDBC_VARBINARY),
+            sql_data_type: Some(JDBC_BINARY),
             sql_datetime_sub: None,
             num_prec_radix: None,
         },
-        R {
-            type_name: "LONGVARBINARY",
-            data_type: JDBC_LONGVARBINARY,
-            column_size: Some(i32::MAX),
-            literal_prefix: Some("X'"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("LONGVARBINARY"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_LONGVARBINARY),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
+        // (no LONGVARBINARY row — Databricks has no separate
+        // LONGVARBINARY storage type; all binary data goes through
+        // `BINARY`. The row was previously listed as a separate JDBC
+        // type with code -4 but no `databricks_type_to_xdbc` arm
+        // recognised "LONGVARBINARY", so the two surfaces disagreed.
+        // Dropped rather than fabricated.)
         R {
             type_name: "NUMERIC",
-            data_type: JDBC_NUMERIC,
+            // Databricks `NUMERIC` is an alias for `DECIMAL`; Thrift's
+            // `getColumns` reports both as `JDBC_DECIMAL` (3), and the
+            // canonical mapper does the same. The row used to claim
+            // `JDBC_NUMERIC` (2) here, which diverged from `getColumns`.
+            data_type: JDBC_DECIMAL,
             column_size: Some(38),
             literal_prefix: None,
             literal_suffix: None,
@@ -582,7 +623,7 @@ fn type_info_rows() -> Vec<TypeInfoRow> {
             local_type_name: Some("NUMERIC"),
             minimum_scale: Some(0),
             maximum_scale: Some(38),
-            sql_data_type: Some(JDBC_NUMERIC),
+            sql_data_type: Some(JDBC_DECIMAL),
             sql_datetime_sub: None,
             num_prec_radix: Some(10),
         },
@@ -732,6 +773,82 @@ mod tests {
         ] {
             assert!(collected.contains(required), "missing {required}");
         }
+    }
+
+    #[tokio::test]
+    async fn type_info_data_type_matches_canonical_mapper() {
+        // The `getTypeInfo` table and the `getColumns` per-row mapper
+        // must agree on JDBC codes — the unification is the entire
+        // point of having `metadata::type_mapping::JDBC_*` as the
+        // single source of truth. This test pins the contract: for
+        // every type registered in `type_info_rows`, calling
+        // `databricks_type_to_xdbc(TYPE_NAME)` returns the same code
+        // that appears in the row's `DATA_TYPE` column.
+        use crate::metadata::type_mapping::databricks_type_to_xdbc;
+        use arrow_array::Int32Array;
+
+        let mut r = type_info_reader();
+        let rb = r.next_batch().await.unwrap().unwrap();
+        let names = rb
+            .column_by_name("TYPE_NAME")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let data_types = rb
+            .column_by_name("DATA_TYPE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        for i in 0..rb.num_rows() {
+            let type_name = names.value(i);
+            let static_code = data_types.value(i);
+            let mapper_code = databricks_type_to_xdbc(type_name) as i32;
+            assert_eq!(
+                static_code, mapper_code,
+                "drift on {type_name}: getTypeInfo says {static_code}, \
+                 databricks_type_to_xdbc says {mapper_code}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn type_info_post_unification_codes() {
+        // Lock in the policy choices that flipped during the
+        // unification work. If any of these regress, both the
+        // static table and the canonical mapper need to move
+        // together.
+        use arrow_array::Int32Array;
+
+        let mut r = type_info_reader();
+        let rb = r.next_batch().await.unwrap().unwrap();
+        let names = rb
+            .column_by_name("TYPE_NAME")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let data_types = rb
+            .column_by_name("DATA_TYPE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        let mut by_name: std::collections::HashMap<&str, i32> =
+            std::collections::HashMap::new();
+        for i in 0..rb.num_rows() {
+            by_name.insert(names.value(i), data_types.value(i));
+        }
+
+        // Matches Thrift's released contract: BOOLEAN → 16,
+        // STRING → 12, FLOAT → 6, BINARY → -2.
+        assert_eq!(by_name["BOOLEAN"], 16, "BOOLEAN must be JDBC_BOOLEAN");
+        assert_eq!(by_name["STRING"], 12, "STRING must be JDBC_VARCHAR");
+        assert_eq!(by_name["FLOAT"], 6, "FLOAT must be JDBC_FLOAT");
+        assert_eq!(by_name["BINARY"], -2, "BINARY must be JDBC_BINARY");
     }
 
     #[tokio::test]
