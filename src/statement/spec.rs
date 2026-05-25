@@ -61,6 +61,13 @@ use std::collections::HashMap;
 ///   zone": the value is anchored to UTC on the wire; the server
 ///   may apply session-timezone interpretation in some display
 ///   contexts. Represented as a tz-aware `chrono::DateTime<Utc>`.
+///
+/// `Variant` carries Databricks `VARIANT` (schema-on-read JSON-like)
+/// values as opaque JSON text. The kernel does not parse the JSON —
+/// downstream consumers (Python's `json.loads`, Go's
+/// `json.Unmarshal`, Node's `JSON.parse`, etc.) decode per their
+/// language idioms. On the wire the SEA `param_type` is `"VARIANT"`
+/// and the value is the JSON string the caller provided.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TypedValue {
@@ -92,6 +99,8 @@ pub enum TypedValue {
     /// `TIMESTAMP_LTZ` — timezone-aware; always UTC on the wire.
     TimestampLtz(chrono::DateTime<chrono::Utc>),
     Interval(String),
+    /// `VARIANT` — opaque JSON text. See the enum-level docs.
+    Variant(String),
 }
 
 /// Wire-format requested for the result.
