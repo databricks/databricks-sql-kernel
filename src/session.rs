@@ -239,6 +239,7 @@ impl Session {
             sea.clone() as Arc<dyn Transport>,
             http_client,
             result_to_cloudfetch_config(&config.result),
+            result_to_post_process_options(&config.result),
             runtime_handle.clone(),
         );
         sea.set_reader_factory(reader_factory, runtime_handle.clone());
@@ -573,6 +574,17 @@ fn result_to_cloudfetch_config(
         link_prefetch_window: result.cloudfetch_link_prefetch_window,
         max_chunks_in_memory: result.cloudfetch_max_chunks_in_memory,
         ..Default::default()
+    }
+}
+
+/// Project the public [`ResultConfig`] onto the internal
+/// [`PostProcessOptions`](crate::reader::post_processor::PostProcessOptions)
+/// consumed by `ResultReaderFactory`.
+fn result_to_post_process_options(
+    result: &ResultConfig,
+) -> crate::reader::post_processor::PostProcessOptions {
+    crate::reader::post_processor::PostProcessOptions {
+        complex_types_as_json: result.complex_types_as_json,
     }
 }
 

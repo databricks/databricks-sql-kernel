@@ -372,6 +372,24 @@ pub struct ResultConfig {
     /// Maximum number of decompressed chunks held in memory at once.
     /// Bounds parallelism and peak RSS.
     pub cloudfetch_max_chunks_in_memory: usize,
+
+    /// When `true`, every column of complex type (`List` /
+    /// `LargeList` / `FixedSizeList` / `Map` / `Struct`, plus the
+    /// precise types `VARIANT` / `GEOMETRY` / `GEOGRAPHY` carried in
+    /// field metadata) is replaced with a `Utf8` column holding
+    /// compact JSON text per row.
+    ///
+    /// The JSON format matches what the Databricks server emits on
+    /// the Thrift wire when `complexTypesAsArrow=false` (compact —
+    /// no whitespace between separators, double-quoted strings,
+    /// JSON `null` for SQL NULL).
+    ///
+    /// Default `false`. Bindings that surface a flat-text view
+    /// (PySQL when `_use_arrow_native_complex_types=False`, JDBC
+    /// when `complexDatatypeSupport=false`) should set this `true`.
+    /// ADBC and any other Arrow-native consumer should leave it
+    /// `false`.
+    pub complex_types_as_json: bool,
 }
 
 impl Default for ResultConfig {
@@ -380,6 +398,7 @@ impl Default for ResultConfig {
             cloudfetch_enabled: true,
             cloudfetch_link_prefetch_window: 10,
             cloudfetch_max_chunks_in_memory: 4,
+            complex_types_as_json: false,
         }
     }
 }
