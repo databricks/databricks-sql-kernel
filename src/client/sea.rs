@@ -832,26 +832,25 @@ impl Transport for SeaRestTransport {
         // Same endpoint as CloudFetch chunk-link fetching, but on
         // the inline-Arrow path the response carries Arrow IPC bytes
         // in `attachment` instead of `external_links`. `row_offset`
-        // is sent as a query parameter — required from drivers per
-        // the bounded SEA API contract (and explicitly required for
-        // the SEA inline-Arrow path that ThriftServer routes via
-        // FETCH_ABSOLUTE).
-        let url = if row_offset > 0 {
-            format!(
-                "{}/statements/{}/result/chunks/{}?row_offset={}",
-                self.base_url(),
-                statement_id,
-                chunk_index,
-                row_offset
-            )
-        } else {
-            format!(
-                "{}/statements/{}/result/chunks/{}",
-                self.base_url(),
-                statement_id,
-                chunk_index
-            )
-        };
+        // is sent unconditionally on the inline path — required
+        // from drivers per the bounded SEA API contract, and the
+        // ThriftServer `FETCH_ABSOLUTE` cursor needs it to find
+        // the right row even when row_offset == 0 (the first
+        // chunk of a paginated inline result is still a fetch
+        // with row_offset = 0; omitting the parameter would be
+        // ambiguous from the server's perspective).
+        debug_assert!(
+            row_offset >= 0,
+            "row_offset must be non-negative on the SEA wire (got {row_offset})",
+        );
+        let row_offset = row_offset.max(0);
+        let url = format!(
+            "{}/statements/{}/result/chunks/{}?row_offset={}",
+            self.base_url(),
+            statement_id,
+            chunk_index,
+            row_offset,
+        );
 
         debug!(
             "Getting inline chunk {} at {} (row_offset={})",
@@ -897,11 +896,28 @@ impl Transport for SeaRestTransport {
 
         // Per the bounded SEA API contract, the chunk metadata we
         // need is on the response itself (top-level, not nested).
-        // Defaults are defensive: if the server omits these we still
-        // surface a usable chunk but with conservative metadata.
+        //
+        // `chunk_index` and `row_offset`: fall back to the values
+        // we sent in the request — the server is supposed to echo
+        // them back, but a missing field can be reconstructed from
+        // the request without ambiguity.
+        //
+        // `row_count`: cannot be defaulted. A missing `row_count`
+        // on a response that DOES carry an attachment is a server
+        // contract violation; defaulting it to 0 would silently
+        // corrupt the next-fetch row_offset (we compute
+        // `row_offset + row_count` for the continuation). Surface
+        // as `data_loss` so the consumer sees a typed error rather
+        // than silently-dropped rows.
         let chunk_idx = chunks_response.chunk_index.unwrap_or(chunk_index);
         let returned_row_offset = chunks_response.row_offset.unwrap_or(row_offset);
-        let row_count = chunks_response.row_count.unwrap_or(0);
+        let row_count = chunks_response.row_count.ok_or_else(|| {
+            Error::data_loss().message(format!(
+                "Inline chunk {} response carries `attachment` but no `row_count` — \
+                 cannot derive next-fetch row_offset safely. Body: {}",
+                chunk_idx, body,
+            ))
+        })?;
         let next_chunk_index = chunks_response.next_chunk_index;
 
         debug!(

@@ -188,6 +188,33 @@ impl ResultReaderFactory {
                     // chunk_index (= prev `next_chunk_index`) and
                     // row_offset (= prev `row_offset + row_count`)
                     // per the bounded SEA API contract.
+                    //
+                    // Rollout-skew guard: a pre-rollout server may
+                    // emit a multi-chunk inline-Arrow result without
+                    // populating `next_chunk_index` on the
+                    // attachment-bearing response. The manifest's
+                    // (deprecated but still emitted) `total_chunk_count`
+                    // distinguishes that case from a genuinely
+                    // single-chunk result. When the per-link signal
+                    // is absent but `total_chunk_count > 1`, we
+                    // refuse to silently truncate — instead surface
+                    // a clear error so the rollout asymmetry is
+                    // visible. Mirrors the PR #68 transition-period
+                    // fix on CloudFetch.
+                    let total_chunks = response.manifest.as_ref().and_then(|m| m.total_chunk_count);
+                    if result.inline_next_chunk_index.is_none()
+                        && total_chunks.is_some_and(|t| t > 1)
+                    {
+                        return Err(Error::data_loss().message(format!(
+                            "Inline-Arrow response is missing per-chunk \
+                             next_chunk_index but the manifest reports \
+                             total_chunk_count={}. Likely cause: server has not \
+                             rolled out the bounded SEA API per-chunk \
+                             continuation field. Refusing to silently truncate \
+                             a multi-chunk result.",
+                            total_chunks.unwrap(),
+                        )));
+                    }
                     if let Some(next_idx) = result.inline_next_chunk_index {
                         tracing::info!(
                             "Using inline-Arrow streaming reader: {} bytes initial chunk, \
@@ -195,6 +222,25 @@ impl ResultReaderFactory {
                             inline_data.len(),
                             next_idx,
                         );
+                        // Pass the manifest-derived schema as a
+                        // fallback for the case where the initial
+                        // chunk decodes to zero batches (paginated
+                        // results sometimes ship an empty leading
+                        // chunk). Without this, `schema()` would
+                        // return `None` and downstream wrappers
+                        // would reject the stream.
+                        let manifest_schema = response.manifest.as_ref().and_then(|m| {
+                            match self.extract_schema_from_manifest(Some(m)) {
+                                Ok(s) => Some(s),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to extract manifest schema for inline-Arrow \
+                                             streaming fallback; proceeding without it: {e}"
+                                    );
+                                    None
+                                }
+                            }
+                        });
                         return self.create_inline_streaming_reader(
                             statement_id,
                             inline_data.clone(),
@@ -203,6 +249,7 @@ impl ResultReaderFactory {
                             result.inline_row_count.unwrap_or(0),
                             Some(next_idx),
                             compression,
+                            manifest_schema,
                         );
                     }
 
@@ -363,6 +410,10 @@ impl ResultReaderFactory {
     /// Wraps the [`InlineStreamingProvider`] in a [`ResultReader`]
     /// adapter so the rest of the kernel can treat the inline
     /// streaming path identically to CloudFetch.
+    ///
+    /// `manifest_schema` is forwarded to the provider as a fallback
+    /// for the case where the initial chunk decodes to zero
+    /// batches. See the comment at the call-site for context.
     #[allow(clippy::too_many_arguments)]
     fn create_inline_streaming_reader(
         &self,
@@ -373,6 +424,7 @@ impl ResultReaderFactory {
         initial_row_count: i64,
         next_chunk_index: Option<i64>,
         compression: CompressionCodec,
+        manifest_schema: Option<SchemaRef>,
     ) -> Result<Box<dyn ResultReader + Send>> {
         tracing::debug!(
             "Creating inline-Arrow streaming reader: stmt={}, initial_chunk={}, \
@@ -383,6 +435,17 @@ impl ResultReaderFactory {
             self.config.inline_max_chunks_in_memory,
         );
 
+        // Note: `Arc::new(self.client.clone())` produces
+        // `Arc<Arc<dyn Transport>>` because the blanket impl of
+        // `InlineChunkSource` is on `Arc<dyn Transport>` (not on
+        // `dyn Transport`), and trait-objects of different traits
+        // don't share a vtable so direct coercion
+        // `Arc<dyn Transport>` → `Arc<dyn InlineChunkSource>`
+        // isn't legal. The outer `Arc::new` is the price of using a
+        // narrow trait so test mocks don't have to stub the full
+        // 20-method `Transport` surface; net cost is one extra
+        // pointer + one extra deref per RPC, negligible vs the SEA
+        // round-trip.
         let source: Arc<dyn crate::reader::inline::InlineChunkSource> =
             Arc::new(self.client.clone());
         let provider = InlineStreamingProvider::new(
@@ -395,6 +458,7 @@ impl ResultReaderFactory {
             next_chunk_index,
             compression,
             self.config.inline_max_chunks_in_memory,
+            manifest_schema,
             self.runtime_handle.clone(),
         )?;
 

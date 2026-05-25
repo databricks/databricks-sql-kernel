@@ -21,26 +21,38 @@
 //! consumer so the per-chunk SEA round-trip latency is hidden behind
 //! `RecordBatch` iteration.
 //!
-//! ## Design (modelled on JDBC's `StreamingChunkProvider`)
+//! ## Coordination
 //!
-//! ```text
-//! Server                Prefetch task             Consumer
-//! ──────                ─────────────             ────────
-//!                       fetch chunk N    ──┐
-//! responds with bytes ──> decode IPC      │
-//!                       push to window  ──┘──> [chunk N][chunk N+1]...
-//!                       (until window full)        │
-//!                                                  │
-//!                                              pull batch ◄── caller
-//! ```
+//! The producer (background prefetch task) and the consumer (kernel
+//! caller pulling batches) communicate through a bounded
+//! `tokio::sync::mpsc` channel:
 //!
-//! - One sequential prefetch task (the SEA inline contract is "one
-//!   `GetResultData` at a time" — there's no parallel download).
-//! - Bounded by `max_chunks_in_memory` (analogous to
-//!   `ResultConfig::cloudfetch_max_chunks_in_memory`).
-//! - When the consumer drains a chunk's batches, the entry is
-//!   popped, freeing a slot. A `Notify` wakes the prefetch task so
-//!   it can pull the next chunk in.
+//! - Sender: prefetch task pushes one `Result<InlineChunkEntry>` per
+//!   chunk. Channel capacity gives the rolling-window bound.
+//! - Receiver: consumer awaits one entry at a time, then walks its
+//!   batches synchronously.
+//!
+//! Why mpsc and not `Notify`: `tokio::sync::Notify::notify_waiters()`
+//! does NOT buffer permits. If the consumer drops a lock and the
+//! prefetch pushes+notifies before the consumer calls
+//! `.notified().await`, the wake is lost and the consumer hangs
+//! forever. mpsc's `send`/`recv` handle the wake correctly out of the
+//! box and add natural backpressure when the channel fills.
+//!
+//! Why one channel of `Result<...>` instead of separate data/error
+//! signals: errors become sticky for free — the prefetch task drops
+//! its sender after sending the error, so the receiver gets the
+//! `Err`, and every subsequent `recv()` returns `None` (channel
+//! closed) which we map to a recorded sticky error so consumers can't
+//! "scroll past" a transport failure.
+//!
+//! ## Cancellation / cleanup
+//!
+//! The provider stores the `JoinHandle` of its prefetch task and
+//! aborts it in `Drop`. Dropping the receiver also makes
+//! `Sender::send().await` return `Err`, causing the task's next loop
+//! iteration to exit naturally; the explicit `abort()` covers the
+//! case where the task is blocked on the SEA RPC itself.
 //!
 //! ## Bounded SEA API contract
 //!
@@ -57,10 +69,9 @@ use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
-use tokio::sync::{Mutex as TokioMutex, Notify};
+use tokio::sync::{mpsc, Mutex as TokioMutex};
+use tokio::task::JoinHandle;
 use tracing::{debug, error, instrument};
 
 /// Narrow source trait for inline-chunk fetches.
@@ -95,70 +106,59 @@ impl InlineChunkSource for Arc<dyn Transport> {
 #[derive(Debug)]
 struct InlineChunkEntry {
     chunk_index: i64,
-    /// Decoded Arrow batches, drained one at a time by `next_batch`.
-    /// `VecDeque` so we can `pop_front` in O(1).
-    batches: VecDeque<RecordBatch>,
-}
-
-/// Shared state between the prefetch task and the consumer.
-///
-/// `Arc<Inner>` so the spawned task holds its own clone without
-/// keeping the provider alive past stream end.
-#[derive(Debug)]
-struct Inner {
-    source: Arc<dyn InlineChunkSource>,
-    statement_id: String,
-    compression: CompressionCodec,
-
-    /// Rolling window of pre-decoded chunks, ordered by `chunk_index`.
-    /// Pushed to the back by the prefetch task; drained from the
-    /// front by the consumer.
-    ///
-    /// A `TokioMutex` (not `std::sync::Mutex`) so the consumer can
-    /// `.await` while holding it would be a footgun — we deliberately
-    /// only hold the lock for the duration of a `pop` or `push_back`.
-    chunks: TokioMutex<VecDeque<InlineChunkEntry>>,
-
-    /// `chunk_index` to ask for in the next `get_inline_chunk` call.
-    /// Initialised from the initial response; updated each prefetch
-    /// from the server-emitted `next_chunk_index`.
-    next_fetch_chunk_index: AtomicI64,
-
-    /// Row offset to send on the next `get_inline_chunk` call.
-    /// Initialised + updated alongside `next_fetch_chunk_index`.
-    next_fetch_row_offset: AtomicI64,
-
-    /// End-of-stream sentinel — flipped when the *previously fetched
-    /// chunk* had `next_chunk_index = None`. Once set, no further
-    /// prefetch is issued; the consumer drains the remaining
-    /// `chunks` window and then sees EOF.
-    end_of_stream: AtomicBool,
-
-    /// First-error sticky slot. The prefetch task records its first
-    /// failure here; the consumer surfaces it on the next pull.
-    /// Once set, the task exits — the kernel does not retry the SEA
-    /// path here (HTTP-level retries already happened inside the
-    /// transport).
-    error: TokioMutex<Option<Error>>,
-
-    /// Bound on the rolling window.
-    max_chunks_in_memory: usize,
-
-    /// Bell for the consumer ↔ prefetch handshake:
-    ///
-    /// - Prefetch task notifies when it pushes a chunk or sets an
-    ///   error / EOF.
-    /// - Consumer notifies when it pops a chunk (so prefetch can
-    ///   resume if the window was full).
-    notify: Notify,
+    /// Decoded Arrow batches. Iterating left to right; we drain by
+    /// `.into_iter()` once we own the entry on the consumer side, so
+    /// no shared interior mutability is needed.
+    batches: Vec<RecordBatch>,
 }
 
 /// Multi-chunk inline-Arrow streaming provider.
-#[derive(Debug)]
+///
+/// Holds the receiver for the prefetch task's chunk channel and a
+/// sticky-error slot for surfacing prefetch failures to callers that
+/// have already observed at least one error.
 pub(crate) struct InlineStreamingProvider {
-    inner: Arc<Inner>,
-    /// Cached schema. Set when the first batch is decoded.
+    /// Consumer state. `TokioMutex` because `next_batch(&self)` takes
+    /// `&self` for ergonomics (the kernel's `ResultReader` trait takes
+    /// `&mut self`, but we wrap this in an `Arc<InlineStreamingProvider>`
+    /// for spawned-task safety on the prefetch side; consumers are
+    /// single-threaded in practice).
+    consumer: TokioMutex<ConsumerState>,
+
+    /// Cached schema. Set on construction from either the initial
+    /// chunk's first batch OR — when the initial chunk is empty —
+    /// the manifest. `None` only when both sources are empty (legal
+    /// for a truly empty result set).
     schema: Option<SchemaRef>,
+
+    /// JoinHandle of the prefetch task. `Some(handle)` while the
+    /// task is running; `take()`n and `abort()`ed in `Drop`.
+    prefetch_handle: TokioMutex<Option<JoinHandle<()>>>,
+}
+
+impl std::fmt::Debug for InlineStreamingProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InlineStreamingProvider")
+            .field("schema_present", &self.schema.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Consumer-side mutable state. Wrapped in `TokioMutex` so
+/// `next_batch(&self)` can mutate.
+struct ConsumerState {
+    /// Channel of chunks pushed by the prefetch task.
+    rx: mpsc::Receiver<Result<InlineChunkEntry>>,
+    /// The current chunk we're walking through (if any).
+    current: Option<InlineChunkEntry>,
+    /// Index into `current.batches` for the next batch to yield.
+    cursor: usize,
+    /// Sticky-error slot. Once the prefetch task surfaces an error
+    /// (or the channel closes prematurely), this is set and every
+    /// subsequent `next_batch()` call returns the same error rather
+    /// than silently transitioning to "successful EOS". Cloned for
+    /// each surfacing so the slot itself survives.
+    sticky_error: Option<Error>,
 }
 
 impl InlineStreamingProvider {
@@ -166,25 +166,24 @@ impl InlineStreamingProvider {
     /// (which the kernel already received in the initial execute
     /// response — see `reader/mod.rs::create_inner_reader`).
     ///
-    /// The initial chunk is decoded synchronously so callers get a
-    /// usable schema back from `schema()` even before the background
-    /// prefetch task has done any work.
-    ///
     /// # Arguments
-    /// * `transport` — for issuing `get_inline_chunk` RPCs.
+    /// * `source` — for issuing `get_inline_chunk` RPCs.
     /// * `statement_id` — for the URL path.
     /// * `initial_attachment` — Arrow IPC bytes the kernel already
     ///   has from the initial execute response.
-    /// * `initial_chunk_index` — the first chunk's index (0 in
-    ///   practice; pass whatever the manifest reported).
-    /// * `initial_row_offset` / `initial_row_count` — same.
+    /// * `initial_chunk_index` / `initial_row_offset` /
+    ///   `initial_row_count` — initial chunk metadata.
     /// * `next_chunk_index` — server's `next_chunk_index` on the
     ///   initial chunk. `Some(N)` → more chunks to fetch starting at
     ///   N; `None` → single-chunk result, no further fetches.
     /// * `compression` — Arrow IPC compression codec from the
     ///   manifest.
-    /// * `max_chunks_in_memory` — bound on the rolling window
-    ///   (`ResultConfig::inline_max_chunks_in_memory`).
+    /// * `max_chunks_in_memory` — bound on the rolling window.
+    /// * `manifest_schema` — fallback schema extracted from the
+    ///   result manifest; used when the initial chunk decodes to
+    ///   zero batches (legal on paginated results where the first
+    ///   chunk is intentionally tiny). Pass `None` if no manifest
+    ///   is available.
     /// * `runtime_handle` — for spawning the prefetch task.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
@@ -197,166 +196,199 @@ impl InlineStreamingProvider {
         next_chunk_index: Option<i64>,
         compression: CompressionCodec,
         max_chunks_in_memory: usize,
+        manifest_schema: Option<SchemaRef>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Result<Arc<Self>> {
         // Decode the initial chunk synchronously so we can return a
         // schema-bearing provider to the caller.
         let initial_batches = parse_arrow_ipc(&initial_attachment, compression)?;
-        let schema = initial_batches.first().map(|b| b.schema());
+
+        // Schema source priority:
+        // 1. The first batch of the initial chunk (most-authoritative,
+        //    matches what consumers will actually iterate).
+        // 2. The manifest-derived schema (load-bearing for
+        //    paginated results where the initial chunk has zero
+        //    batches — without this fallback,
+        //    `ResultReaderAdapter::new` rejects the stream).
+        let schema = initial_batches
+            .first()
+            .map(|b| b.schema())
+            .or(manifest_schema);
 
         let initial_entry = InlineChunkEntry {
             chunk_index: initial_chunk_index,
-            batches: VecDeque::from(initial_batches),
+            batches: initial_batches,
         };
 
-        // Next-fetch state comes from the initial chunk's metadata.
-        // If `next_chunk_index` is None we are at end-of-stream
-        // already — the prefetch task will see the flag and exit
-        // without making any RPC.
-        let (next_idx, eos) = match next_chunk_index {
-            Some(idx) => (idx, false),
-            None => (0, true),
-        };
-        let next_row_offset = initial_row_offset + initial_row_count;
-
-        // Bound the window at >=1 so we always have room to push
-        // the chunk currently being decoded.
+        // Bound the window at >=1 so the channel can always accept
+        // at least one chunk from the prefetch task even if the
+        // caller passed 0 by mistake.
         let max_in_memory = max_chunks_in_memory.max(1);
 
-        let mut window = VecDeque::with_capacity(max_in_memory);
-        window.push_back(initial_entry);
+        // Channel capacity = max_in_memory - 1: the consumer always
+        // holds one chunk in `current`, so total chunks in memory =
+        // 1 (current) + channel.len() ≤ max_in_memory. mpsc requires
+        // capacity ≥ 1, so saturate at 1.
+        let channel_cap = max_in_memory.saturating_sub(1).max(1);
+        let (tx, rx) = mpsc::channel::<Result<InlineChunkEntry>>(channel_cap);
 
-        let inner = Arc::new(Inner {
-            source,
-            statement_id: statement_id.into(),
-            compression,
-            chunks: TokioMutex::new(window),
-            next_fetch_chunk_index: AtomicI64::new(next_idx),
-            next_fetch_row_offset: AtomicI64::new(next_row_offset),
-            end_of_stream: AtomicBool::new(eos),
-            error: TokioMutex::new(None),
-            max_chunks_in_memory: max_in_memory,
-            notify: Notify::new(),
-        });
+        let consumer = ConsumerState {
+            rx,
+            current: Some(initial_entry),
+            cursor: 0,
+            sticky_error: None,
+        };
 
-        // Spawn the prefetch task. It exits when end-of-stream is
-        // reached, an error fires, or the `Arc<Inner>` is dropped
-        // (when the last consumer goes away the only Arc holder is
-        // the task itself — `Inner` doesn't strong-cycle, so on
-        // drop-of-consumer the task notices via `chunks` lock
-        // returning a poisoned/no-longer-served chunks deque on
-        // next iteration; in practice we rely on `end_of_stream`
-        // being set when the consumer is done).
-        if !eos {
-            let task_inner = Arc::clone(&inner);
-            runtime_handle.spawn(async move {
-                Self::prefetch_loop(task_inner).await;
-            });
-        }
+        let prefetch_handle = if let Some(initial_next_idx) = next_chunk_index {
+            let statement_id = statement_id.into();
+            let initial_next_row = initial_row_offset.saturating_add(initial_row_count);
+            let task = PrefetchTask {
+                source,
+                statement_id,
+                compression,
+                tx,
+                next_chunk_index: initial_next_idx,
+                next_row_offset: initial_next_row,
+            };
+            Some(runtime_handle.spawn(async move {
+                task.run().await;
+            }))
+        } else {
+            // Single-chunk result: no prefetch task to spawn. Drop
+            // the sender so the receiver sees channel-closed
+            // immediately when it tries to recv after draining the
+            // initial chunk.
+            drop(tx);
+            None
+        };
 
-        Ok(Arc::new(Self { inner, schema }))
+        Ok(Arc::new(Self {
+            consumer: TokioMutex::new(consumer),
+            schema,
+            prefetch_handle: TokioMutex::new(prefetch_handle),
+        }))
     }
 
-    /// Decoded schema from the first chunk. `None` if the initial
-    /// chunk had no batches (empty result set).
+    /// Decoded schema. `None` only when the initial chunk had zero
+    /// batches AND no manifest schema was provided — the truly-empty
+    /// result case.
     pub(crate) fn schema(&self) -> Option<&SchemaRef> {
         self.schema.as_ref()
     }
 
     /// Pull the next Arrow batch.
     ///
-    /// - If the head chunk has batches buffered, drain one.
-    /// - When the head chunk is drained, pop it and notify the
-    ///   prefetch task (window slot freed). Then loop and try again.
-    /// - If the window is empty and not at EOS, await the prefetch
-    ///   task pushing the next chunk.
-    /// - If the window is empty and EOS is set, return `Ok(None)`.
-    /// - If the prefetch task recorded an error, surface it.
+    /// Semantics:
+    /// - Drains batches from the current chunk first.
+    /// - When current is drained, awaits the next chunk from the
+    ///   prefetch channel.
+    /// - If the prefetch task surfaced an error (via the channel),
+    ///   the error is stored sticky: every subsequent
+    ///   `next_batch()` call returns the same error rather than
+    ///   silently transitioning to `Ok(None)`. This matches JDBC's
+    ///   `StreamingChunkProvider` semantics.
+    /// - End-of-stream → `Ok(None)`.
     #[instrument(name = "inline_stream.next_batch", skip(self))]
     pub(crate) async fn next_batch(&self) -> Result<Option<RecordBatch>> {
+        let mut state = self.consumer.lock().await;
+
         loop {
-            // Check for prefetch error first — fail fast.
-            {
-                let mut err_slot = self.inner.error.lock().await;
-                if let Some(err) = err_slot.take() {
-                    return Err(err);
+            // Drain a batch from the current chunk first — even if
+            // the prefetch task has set a sticky error, the
+            // already-buffered batches were successfully fetched
+            // and the consumer should receive them before the
+            // error surfaces. Only when no more buffered data is
+            // available do we consult the sticky-error slot or the
+            // channel.
+            if let Some(ref current) = state.current {
+                if state.cursor < current.batches.len() {
+                    let batch = current.batches[state.cursor].clone();
+                    state.cursor += 1;
+                    return Ok(Some(batch));
                 }
+                // Current chunk fully drained; advance.
+                debug!(
+                    "Drained inline chunk {} ({} batches)",
+                    current.chunk_index,
+                    current.batches.len(),
+                );
+                state.current = None;
+                state.cursor = 0;
             }
 
-            // Try to drain a batch from the head chunk.
-            {
-                let mut guard = self.inner.chunks.lock().await;
-                if let Some(head) = guard.front_mut() {
-                    if let Some(batch) = head.batches.pop_front() {
-                        // Still more in this chunk — return it directly.
-                        return Ok(Some(batch));
-                    }
-                    // Head chunk drained — pop it and let the
-                    // prefetch task know there's room for one more.
-                    let popped = guard.pop_front().unwrap();
-                    debug!(
-                        "Drained inline chunk {} from rolling window; \
-                         {} chunks remain buffered",
-                        popped.chunk_index,
-                        guard.len()
-                    );
-                    drop(guard);
-                    self.inner.notify.notify_waiters();
-                    // Loop: there may already be more chunks in the
-                    // window behind the popped one.
-                    continue;
+            // Buffered chunk is drained. Sticky-error short-
+            // circuit: once we've surfaced an error, every
+            // subsequent call returns the same error. Consumers
+            // cannot scroll past a transport failure.
+            if let Some(ref e) = state.sticky_error {
+                return Err(e.clone());
+            }
+
+            // Need to recv the next chunk from the prefetch task.
+            match state.rx.recv().await {
+                Some(Ok(entry)) => {
+                    state.current = Some(entry);
+                    // Loop back to drain.
                 }
-                // Window empty.
-                if self.inner.end_of_stream.load(Ordering::Acquire) {
+                Some(Err(e)) => {
+                    // Store sticky and surface on this call.
+                    state.sticky_error = Some(e.clone());
+                    return Err(e);
+                }
+                None => {
+                    // Channel closed: clean EOS.
                     return Ok(None);
                 }
-                // Drop the lock before awaiting so the prefetch task
-                // can push.
-                drop(guard);
             }
-
-            // Wait for the prefetch task to push a chunk (or set EOS,
-            // or record an error). `notified()` is edge-triggered;
-            // capture it before the lock is dropped above ideally,
-            // but for now the loop's recheck-on-wake handles a race
-            // where the notification fires between the empty-check
-            // and `notified()`.
-            self.inner.notify.notified().await;
         }
     }
+}
 
-    /// Background loop: fetch chunks sequentially, decode, push into
-    /// the window. Pauses (via `notify`) when the window is full.
-    /// Exits on end-of-stream, error, or runtime shutdown.
-    async fn prefetch_loop(inner: Arc<Inner>) {
+impl Drop for InlineStreamingProvider {
+    fn drop(&mut self) {
+        // Abort the prefetch task so it stops issuing RPCs the
+        // consumer can no longer observe. The task may have already
+        // exited (EOS, error, or runtime shutdown); `abort()` on a
+        // finished JoinHandle is a no-op.
+        //
+        // Note: this `Drop` is sync, so we can't `.lock().await`. We
+        // use `try_lock` which succeeds because no other task can
+        // hold the lock at drop time (the provider's `Arc` count is
+        // zero, otherwise we wouldn't be in `Drop`).
+        if let Ok(mut guard) = self.prefetch_handle.try_lock() {
+            if let Some(handle) = guard.take() {
+                handle.abort();
+            }
+        }
+    }
+}
+
+/// Self-contained state for the background prefetch task. Holds
+/// everything the task needs so the loop body has no shared
+/// state with the consumer beyond the `tx` channel — easy to
+/// reason about, easy to abort.
+struct PrefetchTask {
+    source: Arc<dyn InlineChunkSource>,
+    statement_id: String,
+    compression: CompressionCodec,
+    tx: mpsc::Sender<Result<InlineChunkEntry>>,
+    next_chunk_index: i64,
+    next_row_offset: i64,
+}
+
+impl PrefetchTask {
+    async fn run(mut self) {
         loop {
-            // Stop if we've already hit EOS.
-            if inner.end_of_stream.load(Ordering::Acquire) {
-                debug!("inline prefetch: end-of-stream reached, task exiting");
-                return;
-            }
+            // The send path naturally pauses when the channel is
+            // full — that's our rolling-window backpressure. If
+            // the receiver has been dropped (consumer gone),
+            // `send().await` returns `Err` and we exit cleanly.
+            let chunk_index = self.next_chunk_index;
+            let row_offset = self.next_row_offset;
 
-            // Wait for window space if full.
-            loop {
-                let window_len = inner.chunks.lock().await.len();
-                if window_len < inner.max_chunks_in_memory {
-                    break;
-                }
-                debug!(
-                    "inline prefetch: window full ({}/{}), pausing",
-                    window_len, inner.max_chunks_in_memory
-                );
-                inner.notify.notified().await;
-            }
-
-            let chunk_index = inner.next_fetch_chunk_index.load(Ordering::Acquire);
-            let row_offset = inner.next_fetch_row_offset.load(Ordering::Acquire);
-
-            // Issue the SEA RPC. Errors are recorded sticky;
-            // consumer surfaces on next `next_batch()` pull.
-            let fetch_result = match inner
+            let fetch_result = match self
                 .source
-                .get_inline_chunk(&inner.statement_id, chunk_index, row_offset)
+                .get_inline_chunk(&self.statement_id, chunk_index, row_offset)
                 .await
             {
                 Ok(r) => r,
@@ -365,17 +397,36 @@ impl InlineStreamingProvider {
                         "inline prefetch: get_inline_chunk(chunk={}, row_offset={}) failed: {}",
                         chunk_index, row_offset, e
                     );
-                    *inner.error.lock().await = Some(e);
-                    inner.end_of_stream.store(true, Ordering::Release);
-                    inner.notify.notify_waiters();
+                    let _ = self.tx.send(Err(e)).await;
                     return;
                 }
             };
 
-            // Decode synchronously. Arrow IPC parsing is fast
-            // (microseconds per MB on the kernel's measurements) and
+            // Validate the server response. Self-loops and
+            // missing `next_chunk_index` on a non-terminal chunk
+            // would otherwise spin the prefetch loop forever.
+            //
+            // Strict-monotonic continuation: server-provided
+            // `next_chunk_index` MUST be > current chunk_index.
+            // Equal or less means the server emitted a self-loop
+            // (a server bug). Surface as a hard error sticky on
+            // the channel; do not synthesise our way past it.
+            if let Some(next) = fetch_result.next_chunk_index {
+                if next <= fetch_result.chunk_index {
+                    let err = Error::data_loss().message(format!(
+                        "Server returned non-monotonic next_chunk_index: \
+                         chunk={} next_chunk_index={}; refusing to spin",
+                        fetch_result.chunk_index, next,
+                    ));
+                    error!("inline prefetch: {}", err);
+                    let _ = self.tx.send(Err(err)).await;
+                    return;
+                }
+            }
+
+            // Decode synchronously. Arrow IPC parsing is fast and
             // doing it here keeps the consumer hot-path zero-CPU.
-            let batches = match parse_arrow_ipc(&fetch_result.bytes, inner.compression) {
+            let batches = match parse_arrow_ipc(&fetch_result.bytes, self.compression) {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
@@ -384,51 +435,63 @@ impl InlineStreamingProvider {
                         fetch_result.bytes.len(),
                         e
                     );
-                    *inner.error.lock().await = Some(e);
-                    inner.end_of_stream.store(true, Ordering::Release);
-                    inner.notify.notify_waiters();
+                    let _ = self.tx.send(Err(e)).await;
                     return;
                 }
             };
 
-            // Per the bounded SEA API contract: next-fetch state
-            // comes from the server's `next_chunk_index` and the
-            // chunk's own `row_offset + row_count`. Never synthesised.
-            let advance_to = fetch_result
-                .next_chunk_index
-                .unwrap_or(fetch_result.chunk_index + 1);
-            let next_row = fetch_result.row_offset + fetch_result.row_count;
-            inner
-                .next_fetch_chunk_index
-                .store(advance_to, Ordering::Release);
-            inner
-                .next_fetch_row_offset
-                .store(next_row, Ordering::Release);
-
-            if fetch_result.next_chunk_index.is_none() {
-                inner.end_of_stream.store(true, Ordering::Release);
-            }
-
             let chunk_idx = fetch_result.chunk_index;
             let batch_count = batches.len();
+            let server_next_idx = fetch_result.next_chunk_index;
 
-            // Push the new chunk onto the window.
-            {
-                let mut guard = inner.chunks.lock().await;
-                guard.push_back(InlineChunkEntry {
+            // Send the chunk to the consumer. If the consumer has
+            // dropped (Provider::drop ran), `send` returns Err
+            // and we exit.
+            if self
+                .tx
+                .send(Ok(InlineChunkEntry {
                     chunk_index: chunk_idx,
-                    batches: VecDeque::from(batches),
-                });
+                    batches,
+                }))
+                .await
+                .is_err()
+            {
                 debug!(
-                    "inline prefetch: pushed chunk {} ({} batches); \
-                     window now has {} chunks; eos={}",
+                    "inline prefetch: consumer dropped while sending chunk {}; \
+                     task exiting",
                     chunk_idx,
-                    batch_count,
-                    guard.len(),
-                    inner.end_of_stream.load(Ordering::Acquire),
                 );
+                return;
             }
-            inner.notify.notify_waiters();
+
+            debug!(
+                "inline prefetch: pushed chunk {} ({} batches); \
+                 next_chunk_index={:?}",
+                chunk_idx, batch_count, server_next_idx,
+            );
+
+            // Advance next-fetch cursors. Per the bounded SEA API
+            // contract: the kernel MUST NOT synthesise `chunk_index
+            // + 1` as the continuation. We use the server-emitted
+            // `next_chunk_index` directly and stop on `None`.
+            match server_next_idx {
+                Some(idx) => {
+                    self.next_chunk_index = idx;
+                    self.next_row_offset = fetch_result
+                        .row_offset
+                        .saturating_add(fetch_result.row_count);
+                }
+                None => {
+                    // End-of-stream signal from server. Drop the
+                    // sender so the receiver gets channel-closed
+                    // on its next recv() call — clean EOS.
+                    debug!(
+                        "inline prefetch: end-of-stream after chunk {}; closing channel",
+                        chunk_idx,
+                    );
+                    return;
+                }
+            }
         }
     }
 }
@@ -439,11 +502,9 @@ mod tests {
     use arrow_array::{Int32Array, RecordBatch};
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
 
-    /// One mock inline chunk: pre-built Arrow IPC bytes plus the
-    /// metadata the server would emit alongside it.
     #[derive(Clone, Debug)]
     struct MockChunk {
         bytes: Vec<u8>,
@@ -453,9 +514,8 @@ mod tests {
         next_chunk_index: Option<i64>,
     }
 
-    /// Mock chunk-source that serves a scripted list of inline
-    /// chunks in order. Records the RPC count so tests can assert
-    /// the prefetch bound was respected.
+    /// Mock chunk-source. Records the RPC count so tests can assert
+    /// the bound was respected.
     #[derive(Debug)]
     struct MockSource {
         chunks: StdMutex<Vec<MockChunk>>,
@@ -519,11 +579,16 @@ mod tests {
         buf
     }
 
-    /// Build a fixture: 3 inline chunks, indices 0/1/2, chunk 2 is
-    /// terminal (`next_chunk_index = None`). Chunk 0's bytes are
-    /// passed to `InlineStreamingProvider::new` directly as the
-    /// "initial attachment" — only chunks 1 and 2 are served by the
-    /// mock transport.
+    fn build_empty_ipc_bytes() -> Vec<u8> {
+        let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int32, false)]));
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &schema).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
     fn three_chunk_fixture() -> (Vec<u8>, MockChunk, MockChunk, MockChunk) {
         let c0 = MockChunk {
             bytes: build_ipc_bytes(&[1, 2, 3]),
@@ -555,7 +620,6 @@ mod tests {
 
     #[tokio::test]
     async fn streams_all_chunks_in_order() {
-        // Three-chunk fixture; assert all 9 rows arrive in order.
         let (initial_bytes, c0, c1, c2) = three_chunk_fixture();
         let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![c1.clone(), c2.clone()]);
 
@@ -568,10 +632,11 @@ mod tests {
             c0.row_count,
             c0.next_chunk_index,
             CompressionCodec::None,
-            /* max_chunks_in_memory */ 4,
+            4,
+            None,
             tokio::runtime::Handle::current(),
         )
-        .expect("provider build");
+        .unwrap();
 
         let mut batches = Vec::new();
         while let Some(b) = provider.next_batch().await.unwrap() {
@@ -580,8 +645,6 @@ mod tests {
 
         assert_eq!(batches.len(), 3, "one batch per chunk");
         assert_eq!(count_rows(&batches), 9);
-        // Spot-check the ordering: chunk 0 has [1,2,3], chunk 2 has
-        // [7,8,9]; the i32 values per-row prove ordering.
         let last = batches.last().unwrap();
         let arr = last
             .column(0)
@@ -593,10 +656,6 @@ mod tests {
 
     #[tokio::test]
     async fn respects_max_chunks_in_memory_bound() {
-        // Fixture is 3 chunks total. With max_chunks_in_memory = 1,
-        // the prefetch task must NOT race ahead and pull all chunks
-        // up front; it pulls one, waits for the consumer to drain,
-        // then pulls the next.
         let (initial_bytes, c0, c1, c2) = three_chunk_fixture();
         let mock = MockSource::new(vec![c1.clone(), c2.clone()]);
         let source: Arc<dyn InlineChunkSource> = mock.clone();
@@ -611,13 +670,11 @@ mod tests {
             c0.next_chunk_index,
             CompressionCodec::None,
             /* max_chunks_in_memory */ 1,
+            None,
             tokio::runtime::Handle::current(),
         )
-        .expect("provider build");
+        .unwrap();
 
-        // Drain everything. The kernel makes exactly 2 inline-chunk
-        // RPCs (for chunks 1 and 2; chunk 0 was the initial
-        // attachment).
         let _b0 = provider.next_batch().await.unwrap().unwrap();
         let _b1 = provider.next_batch().await.unwrap().unwrap();
         let _b2 = provider.next_batch().await.unwrap().unwrap();
@@ -632,9 +689,6 @@ mod tests {
 
     #[tokio::test]
     async fn single_chunk_no_prefetch_rpcs() {
-        // If the initial response is the *only* chunk (next_chunk_index
-        // is None on the server side), the streaming provider should
-        // make zero RPCs.
         let mock = MockSource::new(vec![]);
         let source: Arc<dyn InlineChunkSource> = mock.clone();
 
@@ -643,7 +697,7 @@ mod tests {
             chunk_index: 0,
             row_offset: 0,
             row_count: 1,
-            next_chunk_index: None, // single-chunk result
+            next_chunk_index: None,
         };
 
         let provider = InlineStreamingProvider::new(
@@ -656,6 +710,7 @@ mod tests {
             initial.next_chunk_index,
             CompressionCodec::None,
             4,
+            None,
             tokio::runtime::Handle::current(),
         )
         .unwrap();
@@ -664,17 +719,11 @@ mod tests {
         assert_eq!(b.num_rows(), 1);
         let eof = provider.next_batch().await.unwrap();
         assert!(eof.is_none());
-        assert_eq!(
-            mock.call_count(),
-            0,
-            "no inline-chunk RPC needed for a single-chunk inline result",
-        );
+        assert_eq!(mock.call_count(), 0);
     }
 
     #[tokio::test]
     async fn surfaces_prefetch_errors() {
-        // Mock the first prefetch RPC to be missing — provider
-        // should surface the error from `next_batch()`.
         let (initial_bytes, c0, _, _) = three_chunk_fixture();
         // Empty mock → first prefetch (chunk 1) returns Err.
         let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![]);
@@ -689,6 +738,7 @@ mod tests {
             c0.next_chunk_index,
             CompressionCodec::None,
             4,
+            None,
             tokio::runtime::Handle::current(),
         )
         .unwrap();
@@ -702,10 +752,232 @@ mod tests {
             .await
             .expect_err("prefetch failure must surface");
         assert!(
-            err.message.to_lowercase().contains("no chunk")
-                || err.message.to_lowercase().contains("chunk"),
+            err.message.to_lowercase().contains("chunk"),
             "error mentions the missing chunk: {}",
             err.message
         );
+    }
+
+    #[tokio::test]
+    async fn sticky_error_persists_across_calls() {
+        // P1 #3 regression guard. After an error is surfaced once,
+        // subsequent next_batch() calls must return the same error,
+        // NOT silently transition to Ok(None) (which would lie to
+        // consumers about result completeness).
+        let (initial_bytes, c0, _, _) = three_chunk_fixture();
+        let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![]);
+
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            initial_bytes,
+            c0.chunk_index,
+            c0.row_offset,
+            c0.row_count,
+            c0.next_chunk_index,
+            CompressionCodec::None,
+            4,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Drain chunk 0.
+        let _ = provider.next_batch().await.unwrap().unwrap();
+        // First failed call.
+        let err1 = provider.next_batch().await.unwrap_err();
+        // Subsequent calls must keep failing.
+        let err2 = provider.next_batch().await.unwrap_err();
+        let err3 = provider.next_batch().await.unwrap_err();
+        assert_eq!(err1.message, err2.message);
+        assert_eq!(err2.message, err3.message);
+    }
+
+    #[tokio::test]
+    async fn rejects_non_monotonic_next_chunk_index() {
+        // P1 #4 regression guard. If the server emits a self-loop
+        // (`next_chunk_index <= chunk_index`), the prefetch task
+        // would otherwise spin forever. Must surface as a sticky
+        // data_loss error.
+        let (initial_bytes, c0, _, _) = three_chunk_fixture();
+        let bad_chunk = MockChunk {
+            bytes: build_ipc_bytes(&[10]),
+            chunk_index: 1,
+            row_offset: 3,
+            row_count: 1,
+            next_chunk_index: Some(1), // self-loop
+        };
+        let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![bad_chunk]);
+
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            initial_bytes,
+            c0.chunk_index,
+            c0.row_offset,
+            c0.row_count,
+            c0.next_chunk_index,
+            CompressionCodec::None,
+            4,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Drain chunk 0 (initial attachment) — succeeds.
+        let _ = provider.next_batch().await.unwrap().unwrap();
+        // The prefetch task validates `next_chunk_index >
+        // chunk_index` BEFORE sending the chunk through the
+        // channel — a self-loop is fail-fast, the consumer never
+        // sees chunk 1's data. The next pull surfaces the error.
+        let err = provider.next_batch().await.unwrap_err();
+        assert!(
+            err.message
+                .to_lowercase()
+                .contains("non-monotonic next_chunk_index"),
+            "error should call out the self-loop: {}",
+            err.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_schema_fallback_when_initial_chunk_empty() {
+        // P1 #8 regression guard. When the initial chunk decodes to
+        // zero batches (legal on paginated results), the provider
+        // must fall back to the manifest-derived schema. Without
+        // the fallback, schema() returns None forever and
+        // ResultReaderAdapter::new rejects the stream.
+        let manifest_schema = Arc::new(Schema::new(vec![
+            Field::new("colA", DataType::Int32, false),
+            Field::new("colB", DataType::Int32, true),
+        ]));
+
+        let empty_bytes = build_empty_ipc_bytes();
+        let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![]);
+
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            empty_bytes,
+            0,
+            0,
+            0,
+            None, // single-chunk empty result
+            CompressionCodec::None,
+            4,
+            Some(manifest_schema.clone()),
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let schema = provider
+            .schema()
+            .expect("manifest fallback must produce a schema");
+        assert_eq!(schema.fields().len(), 2);
+        assert_eq!(schema.field(0).name(), "colA");
+        assert_eq!(schema.field(1).name(), "colB");
+    }
+
+    #[tokio::test]
+    async fn prefetch_task_exits_when_consumer_drops() {
+        // P0 #2 regression guard. The prefetch task must not keep
+        // RPC-ing after the consumer has dropped the provider.
+        // mpsc-based design gives us this for free: when the
+        // receiver drops, the next `tx.send().await` returns Err
+        // and the task exits.
+        let (initial_bytes, c0, c1, c2) = three_chunk_fixture();
+        let mock = MockSource::new(vec![c1.clone(), c2.clone()]);
+        let source: Arc<dyn InlineChunkSource> = mock.clone();
+
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            initial_bytes,
+            c0.chunk_index,
+            c0.row_offset,
+            c0.row_count,
+            c0.next_chunk_index,
+            CompressionCodec::None,
+            /* max_chunks_in_memory = */ 1,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Pull only the first batch (initial attachment); the
+        // prefetch task is now blocked trying to send chunk 1 into
+        // the bounded channel.
+        let _ = provider.next_batch().await.unwrap().unwrap();
+        // Drop the provider. The Drop impl aborts the prefetch
+        // task; the mpsc channel close path would also exit it on
+        // the next loop iteration.
+        drop(provider);
+
+        // Give tokio a moment to actually run the abort. Without
+        // this yield the test would be flaky because abort() is
+        // asynchronous (it sets a cancellation flag the task
+        // checks at await points).
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // The prefetch task at most made one more RPC (the one in
+        // flight when we dropped). It must not have made more.
+        let calls_after_drop = mock.call_count();
+        // Give a generous timeout — if the task were really still
+        // running, it would have made ALL the remaining calls (2
+        // in this fixture) in the next few millis.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let calls_after_wait = mock.call_count();
+        assert!(
+            calls_after_wait <= calls_after_drop + 1,
+            "prefetch task kept RPC-ing after consumer drop: \
+             {} calls right after drop, {} after a 50ms wait",
+            calls_after_drop,
+            calls_after_wait,
+        );
+    }
+
+    #[tokio::test]
+    async fn lost_wake_race_does_not_hang() {
+        // P0 #1 regression guard. With the old Notify-based
+        // implementation, a tight push/pop loop could lose the
+        // wake-up between the consumer's empty-check and the
+        // notified().await. With mpsc, recv() handles the wake
+        // correctly and this test completes cleanly.
+        //
+        // We exercise the race by setting max_chunks_in_memory = 1
+        // (channel capacity 1) and draining as fast as possible.
+        let (initial_bytes, c0, c1, c2) = three_chunk_fixture();
+        let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![c1.clone(), c2.clone()]);
+
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            initial_bytes,
+            c0.chunk_index,
+            c0.row_offset,
+            c0.row_count,
+            c0.next_chunk_index,
+            CompressionCodec::None,
+            1,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        let drain = async {
+            let mut total = 0;
+            while let Some(b) = provider.next_batch().await.unwrap() {
+                total += b.num_rows();
+            }
+            total
+        };
+
+        // 5s timeout — old impl could hang forever; new impl
+        // completes in microseconds.
+        let total = tokio::time::timeout(std::time::Duration::from_secs(5), drain)
+            .await
+            .expect("must complete within 5s — lost-wake hang detected");
+        assert_eq!(total, 9);
     }
 }
