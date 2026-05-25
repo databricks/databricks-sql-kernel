@@ -28,7 +28,7 @@
 //! ceiling so we observe the final error code.
 
 use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode, Session};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Open a session against `mock_server` using a PAT auth provider.
@@ -283,4 +283,37 @@ async fn http_path_setter_clears_prior_parse_error_on_success() {
         .await
         .expect("recovery http_path call should clear the sentinel");
     assert_eq!(session.session_id(), "sess-recover");
+}
+
+#[tokio::test]
+async fn session_close_sends_warehouse_id_query_param() {
+    // SEA requires `warehouse_id` as a query parameter on
+    // `DELETE /api/2.0/sql/sessions/{id}`. Without it the server
+    // returns HTTP 400 and the session leaks until idle timeout.
+    //
+    // wiremock's `expect(1)` + the DELETE matcher (path + query_param)
+    // together assert (a) the DELETE was hit, (b) at the right path,
+    // and (c) with `warehouse_id=test_wh` in the query string. The
+    // expectation is verified on `MockServer::drop`.
+    let server = MockServer::start().await;
+    mock_create_session_returns(
+        &server,
+        200,
+        r#"{"session_id":"sess-close-1","warehouse_id":"test_wh"}"#,
+    )
+    .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/sessions/sess-close-1"))
+        .and(query_param("warehouse_id", "test_wh"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session_against(&server)
+        .await
+        .expect("session must open");
+    session.close().await.expect("close must succeed");
+    // MockServer::drop runs the .expect(1) assertion when `server`
+    // goes out of scope at end-of-test.
 }

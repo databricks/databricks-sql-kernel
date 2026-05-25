@@ -447,7 +447,18 @@ impl Transport for SeaRestTransport {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
-        let url = format!("{}/sessions/{}", self.base_url(), session_id);
+        // SEA requires `warehouse_id` as a query parameter on
+        // `DELETE /api/2.0/sql/sessions/{id}`. Without it the server
+        // returns HTTP 400 ("Required field is not specified:
+        // warehouse_id"), the session never gets cleaned up via the
+        // explicit close path, and instead waits for the idle-timeout
+        // reaper to drop it.
+        let url = format!(
+            "{}/sessions/{}?warehouse_id={}",
+            self.base_url(),
+            session_id,
+            self.warehouse_id
+        );
 
         debug!("Deleting session at {}", url);
 
