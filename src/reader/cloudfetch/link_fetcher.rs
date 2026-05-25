@@ -1028,6 +1028,36 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             self.inner.links.insert(link.chunk_index, link.clone());
         }
 
+        // Mirror the continuation cursor updates from `fetch_links`:
+        // a refresh response is a normal `get_result_chunks`
+        // response, just used for the expiry-recovery path. If we
+        // drop its continuation metadata on the floor (as the
+        // initial implementation did), the prefetch loop happily
+        // keeps firing past the actual end of the result set when a
+        // refresh response carries `next_chunk_index = None`. Use
+        // `fetch_max` so an early-window refresh (start_chunk_index
+        // < current cursor) doesn't rewind progress.
+        if let Some(last_link) = result.links.last() {
+            let next_row_offset = last_link.row_offset.saturating_add(last_link.row_count);
+            self.inner
+                .next_row_offset
+                .fetch_max(next_row_offset, Ordering::Release);
+            let cont = decode_continuation(last_link, self.inner.total_chunk_count_hint);
+            if cont.used_total_chunk_count_fallback {
+                self.inner.warn_total_chunk_count_fallback("link refresh");
+            }
+            if cont.eos {
+                self.inner.all_links_fetched.store(true, Ordering::Release);
+            } else {
+                let advance_to = cont
+                    .next_fetch_index
+                    .max(last_link.chunk_index.saturating_add(1));
+                self.inner
+                    .next_server_fetch_index
+                    .fetch_max(advance_to, Ordering::Release);
+            }
+        }
+
         Ok(result.links)
     }
 }
