@@ -426,6 +426,17 @@ impl PrefetchTask {
 
             // Decode synchronously. Arrow IPC parsing is fast and
             // doing it here keeps the consumer hot-path zero-CPU.
+            //
+            // **Performance note:** on the current-thread tokio
+            // runtime, large LZ4-compressed chunks could starve
+            // the consumer task during decode. Today's perf
+            // measurements (per PR #67) show ~1-5 ms per 20 MB
+            // uncompressed Arrow IPC chunk — well inside the
+            // typical 10 ms responsiveness budget. If LZ4 push
+            // that into the tens-of-ms range, wrap this in
+            // `tokio::task::spawn_blocking` (the cost is one
+            // extra mpsc-channel-hop's worth of latency). Defer
+            // pending measurements that justify the complexity.
             let batches = match parse_arrow_ipc(&fetch_result.bytes, self.compression) {
                 Ok(b) => b,
                 Err(e) => {
@@ -979,5 +990,104 @@ mod tests {
             .await
             .expect("must complete within 5s — lost-wake hang detected");
         assert_eq!(total, 9);
+    }
+
+    /// Backpressure regression guard (PR #71 round-2, B-1).
+    ///
+    /// Pulls one batch (draining the initial chunk's only batch),
+    /// then sleeps long enough for the prefetch task to fill the
+    /// channel and block on `tx.send().await`. Asserts that the
+    /// RPC count plateaus at the expected bound *and stays there*
+    /// during the pause — proving the bounded channel is gating
+    /// the prefetch task, not letting it race ahead. Then resumes
+    /// draining and verifies the remaining chunks arrive.
+    ///
+    /// Without backpressure, the prefetch task would speedrun the
+    /// fixture during the sleep and `call_count` would be the
+    /// total chunks, not the bound.
+    #[tokio::test]
+    async fn slow_consumer_observes_backpressure_plateau() {
+        // Five-chunk fixture so there's room for multiple prefetched
+        // chunks to fit in a small channel and several to be left
+        // pending behind it.
+        let initial_bytes = build_ipc_bytes(&[1]);
+        let mut server_chunks: Vec<MockChunk> = Vec::new();
+        for i in 1..5 {
+            server_chunks.push(MockChunk {
+                bytes: build_ipc_bytes(&[(i as i32) + 1]),
+                chunk_index: i,
+                row_offset: i,
+                row_count: 1,
+                next_chunk_index: if i < 4 { Some(i + 1) } else { None },
+            });
+        }
+        let mock = MockSource::new(server_chunks);
+        let source: Arc<dyn InlineChunkSource> = mock.clone();
+
+        // max_chunks_in_memory = 2 → channel capacity = 1. So at
+        // any moment the prefetch task has at most: 1 chunk in
+        // the consumer's `current`, 1 chunk in the channel, 1
+        // chunk being prepared (sent but the sender call is what
+        // blocks). After the consumer drains the first chunk and
+        // pauses, prefetch makes 2 RPCs and then blocks on
+        // `tx.send().await` for the 3rd.
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            initial_bytes,
+            0, // initial_chunk_index
+            0, // initial_row_offset
+            1, // initial_row_count
+            Some(1),
+            CompressionCodec::None,
+            /* max_chunks_in_memory = */ 2,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Drain the initial chunk (1 batch). After this, the
+        // prefetch task can start filling the channel.
+        let _b0 = provider.next_batch().await.unwrap().unwrap();
+
+        // Sleep long enough for the prefetch task to fill the
+        // channel and block on send. The channel capacity is 1, so
+        // after this the task should have made exactly 1 RPC (chunk
+        // 1, currently sitting in the channel) and be blocked
+        // trying to send chunk 2.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let calls_at_plateau = mock.call_count();
+
+        // Sleep again. If the channel were truly bounded, the RPC
+        // count should NOT increase further during this pause.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let calls_after_more_sleep = mock.call_count();
+
+        assert_eq!(
+            calls_at_plateau, calls_after_more_sleep,
+            "backpressure regression: RPC count climbed during \
+             consumer pause ({} → {}) — channel is unbounded or \
+             capacity exceeds the configured max_chunks_in_memory",
+            calls_at_plateau, calls_after_more_sleep,
+        );
+        // And the count is bounded: max 2 RPCs queued (one in the
+        // channel, one being prepared to send). Anything more
+        // means we leaked the bound.
+        assert!(
+            calls_at_plateau <= 2,
+            "prefetch task raced past the channel bound: \
+             {} RPCs while consumer paused (expected ≤ 2)",
+            calls_at_plateau,
+        );
+
+        // Resume draining; everything should still arrive
+        // correctly. This proves backpressure didn't cause a
+        // permanent stall.
+        let mut total_batches = 1; // already drained chunk 0
+        while let Some(_b) = provider.next_batch().await.unwrap() {
+            total_batches += 1;
+        }
+        assert_eq!(total_batches, 5, "all 5 chunks must arrive after resume");
+        assert_eq!(mock.call_count(), 4, "exactly 4 RPCs total (chunks 1-4)");
     }
 }
