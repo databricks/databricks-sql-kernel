@@ -633,6 +633,7 @@ fn result_to_cloudfetch_config(
         enabled: result.cloudfetch_enabled,
         link_prefetch_window: result.cloudfetch_link_prefetch_window,
         max_chunks_in_memory: result.cloudfetch_max_chunks_in_memory,
+        inline_max_chunks_in_memory: result.inline_max_chunks_in_memory,
         ..Default::default()
     }
 }

@@ -30,7 +30,7 @@ use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::{SeaChunkLinkFetcher, SeaChunkLinkFetcherHandle};
 use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
-use crate::reader::inline::InlineArrowProvider;
+use crate::reader::inline::{InlineArrowProvider, InlineStreamingProvider};
 use crate::reader::post_processor::{PostProcessOptions, ResultPostProcessor};
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
@@ -178,6 +178,36 @@ impl ResultReaderFactory {
             // Priority 2: Inline Arrow (attachment present)
             if let Some(ref inline_data) = result.inline_arrow_data {
                 if !inline_data.is_empty() {
+                    // Multi-chunk inline-Arrow streaming path: kicks
+                    // in when the server emitted a `next_chunk_index`
+                    // alongside the initial inline attachment. The
+                    // streaming provider holds a rolling window of
+                    // pre-decoded chunks ahead of the consumer
+                    // (bounded by `inline_max_chunks_in_memory`); each
+                    // continuation `get_inline_chunk` carries both
+                    // chunk_index (= prev `next_chunk_index`) and
+                    // row_offset (= prev `row_offset + row_count`)
+                    // per the bounded SEA API contract.
+                    if let Some(next_idx) = result.inline_next_chunk_index {
+                        tracing::info!(
+                            "Using inline-Arrow streaming reader: {} bytes initial chunk, \
+                             next_chunk_index={}",
+                            inline_data.len(),
+                            next_idx,
+                        );
+                        return self.create_inline_streaming_reader(
+                            statement_id,
+                            inline_data.clone(),
+                            result.inline_chunk_index.unwrap_or(0),
+                            result.inline_row_offset.unwrap_or(0),
+                            result.inline_row_count.unwrap_or(0),
+                            Some(next_idx),
+                            compression,
+                        );
+                    }
+
+                    // Single-chunk inline: legacy fast path, parses
+                    // the whole result up front.
                     tracing::info!(
                         "Using inline Arrow reader: {} bytes of Arrow IPC data",
                         inline_data.len()
@@ -327,6 +357,49 @@ impl ResultReaderFactory {
 
         Ok(Box::new(InlineArrowReader::new(provider)))
     }
+
+    /// Build a multi-chunk inline-Arrow streaming reader.
+    ///
+    /// Wraps the [`InlineStreamingProvider`] in a [`ResultReader`]
+    /// adapter so the rest of the kernel can treat the inline
+    /// streaming path identically to CloudFetch.
+    #[allow(clippy::too_many_arguments)]
+    fn create_inline_streaming_reader(
+        &self,
+        statement_id: &str,
+        initial_attachment: Vec<u8>,
+        initial_chunk_index: i64,
+        initial_row_offset: i64,
+        initial_row_count: i64,
+        next_chunk_index: Option<i64>,
+        compression: CompressionCodec,
+    ) -> Result<Box<dyn ResultReader + Send>> {
+        tracing::debug!(
+            "Creating inline-Arrow streaming reader: stmt={}, initial_chunk={}, \
+             next_chunk={:?}, max_in_memory={}",
+            statement_id,
+            initial_chunk_index,
+            next_chunk_index,
+            self.config.inline_max_chunks_in_memory,
+        );
+
+        let source: Arc<dyn crate::reader::inline::InlineChunkSource> =
+            Arc::new(self.client.clone());
+        let provider = InlineStreamingProvider::new(
+            source,
+            statement_id.to_string(),
+            initial_attachment,
+            initial_chunk_index,
+            initial_row_offset,
+            initial_row_count,
+            next_chunk_index,
+            compression,
+            self.config.inline_max_chunks_in_memory,
+            self.runtime_handle.clone(),
+        )?;
+
+        Ok(Box::new(InlineStreamingReader::new(provider)))
+    }
 }
 
 /// Trait for result readers.
@@ -408,6 +481,38 @@ impl ResultReader for InlineArrowReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
+    }
+}
+
+/// Reader for multi-chunk inline-Arrow streaming.
+///
+/// Wraps [`InlineStreamingProvider`] to implement the [`ResultReader`]
+/// trait. The provider's prefetch task fills a bounded rolling
+/// window of decoded chunks; `next_batch` pulls one Arrow batch at
+/// a time from the head of that window.
+struct InlineStreamingReader {
+    provider: Arc<InlineStreamingProvider>,
+    /// Cached schema (extracted from the initial chunk).
+    schema: Option<SchemaRef>,
+}
+
+impl InlineStreamingReader {
+    fn new(provider: Arc<InlineStreamingProvider>) -> Self {
+        let schema = provider.schema().cloned();
+        Self { provider, schema }
+    }
+}
+
+#[async_trait]
+impl ResultReader for InlineStreamingReader {
+    async fn schema(&self) -> Result<SchemaRef> {
+        self.schema.clone().ok_or_else(|| {
+            Error::invalid_state().message("Schema not available for inline-Arrow streaming result")
+        })
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.provider.next_batch().await
     }
 }
 

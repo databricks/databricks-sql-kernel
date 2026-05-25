@@ -20,7 +20,7 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult, ExecuteResultData,
-    SessionInfo, Transport, TransportConfig,
+    InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::metadata::sql::SqlCommandBuilder;
@@ -210,6 +210,10 @@ impl SeaRestTransport {
             next_chunk_internal_link: result.next_chunk_internal_link.clone(),
             external_links,
             inline_arrow_data: result.attachment.clone(),
+            inline_chunk_index: result.chunk_index,
+            inline_row_offset: result.row_offset,
+            inline_row_count: result.row_count,
+            inline_next_chunk_index: result.next_chunk_index,
         })
     }
 
@@ -817,6 +821,105 @@ impl Transport for SeaRestTransport {
             result.has_more,
         );
         Ok(result)
+    }
+
+    async fn get_inline_chunk(
+        &self,
+        statement_id: &str,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<InlineChunkFetchResult> {
+        // Same endpoint as CloudFetch chunk-link fetching, but on
+        // the inline-Arrow path the response carries Arrow IPC bytes
+        // in `attachment` instead of `external_links`. `row_offset`
+        // is sent as a query parameter — required from drivers per
+        // the bounded SEA API contract (and explicitly required for
+        // the SEA inline-Arrow path that ThriftServer routes via
+        // FETCH_ABSOLUTE).
+        let url = if row_offset > 0 {
+            format!(
+                "{}/statements/{}/result/chunks/{}?row_offset={}",
+                self.base_url(),
+                statement_id,
+                chunk_index,
+                row_offset
+            )
+        } else {
+            format!(
+                "{}/statements/{}/result/chunks/{}",
+                self.base_url(),
+                statement_id,
+                chunk_index
+            )
+        };
+
+        debug!(
+            "Getting inline chunk {} at {} (row_offset={})",
+            chunk_index, url, row_offset
+        );
+
+        let request = self
+            .http_client
+            .inner()
+            .request(Method::GET, &url)
+            .build()
+            .map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request: {e}"))
+            })?;
+
+        let response = self
+            .http_client
+            .execute(request, RequestType::GetResultChunks)
+            .await?;
+        let body = response
+            .text()
+            .await
+            .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
+
+        let chunks_response: GetChunksResponse = serde_json::from_str(&body).map_err(|e| {
+            Error::data_loss().message(format!(
+                "Failed to parse inline chunk response: {e} - body: {body}"
+            ))
+        })?;
+
+        // Inline-Arrow path: bytes must be present in `attachment`.
+        // If the server returned an external_links response on what
+        // we expected to be the inline path, surface a clear error
+        // (probably the session conf didn't take effect server-side).
+        let bytes = chunks_response.attachment.ok_or_else(|| {
+            Error::data_loss().message(format!(
+                "Inline chunk {} response missing `attachment` field — \
+                 server may have ignored the can_cloud_download session \
+                 conf and returned a CloudFetch response. Body: {}",
+                chunk_index, body
+            ))
+        })?;
+
+        // Per the bounded SEA API contract, the chunk metadata we
+        // need is on the response itself (top-level, not nested).
+        // Defaults are defensive: if the server omits these we still
+        // surface a usable chunk but with conservative metadata.
+        let chunk_idx = chunks_response.chunk_index.unwrap_or(chunk_index);
+        let returned_row_offset = chunks_response.row_offset.unwrap_or(row_offset);
+        let row_count = chunks_response.row_count.unwrap_or(0);
+        let next_chunk_index = chunks_response.next_chunk_index;
+
+        debug!(
+            "Inline chunk {} response: row_offset={}, row_count={}, next_chunk_index={:?}, bytes={}",
+            chunk_idx,
+            returned_row_offset,
+            row_count,
+            next_chunk_index,
+            bytes.len(),
+        );
+
+        Ok(InlineChunkFetchResult {
+            bytes,
+            chunk_index: chunk_idx,
+            row_offset: returned_row_offset,
+            row_count,
+            next_chunk_index,
+        })
     }
 
     fn poll_config(&self) -> TransportConfig {
