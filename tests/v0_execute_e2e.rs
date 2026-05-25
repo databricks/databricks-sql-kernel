@@ -267,6 +267,13 @@ async fn bind_all_typed_values_round_trip() {
     let session = live_session().await;
     let date = chrono::NaiveDate::from_ymd_opt(2026, 5, 11).unwrap();
     let ts = date.and_hms_opt(12, 34, 56).unwrap();
+    // TIMESTAMP_LTZ binding uses a tz-aware UTC datetime. Chose a
+    // non-midnight wall-clock so a silent tz-conversion bug would
+    // shift the hours visibly.
+    let ts_ltz = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        date.and_hms_opt(8, 15, 0).unwrap(),
+        chrono::Utc,
+    );
     let mut stmt = session.statement();
     stmt.spec()
         .sql(
@@ -279,6 +286,8 @@ async fn bind_all_typed_values_round_trip() {
                  CAST(? AS DECIMAL(10,2)) AS c_dec, \
                  CAST(? AS DATE) AS c_date, \
                  CAST(? AS TIMESTAMP) AS c_ts, \
+                 CAST(? AS TIMESTAMP_NTZ) AS c_ts_ntz, \
+                 CAST(? AS TIMESTAMP_LTZ) AS c_ts_ltz, \
                  ? AS c_null",
         )
         .param(1, TypedValue::Bool(true))
@@ -307,7 +316,19 @@ async fn bind_all_typed_values_round_trip() {
         .unwrap()
         .param(8, TypedValue::Timestamp(ts))
         .unwrap()
-        .param(9, TypedValue::Null)
+        // TIMESTAMP_NTZ — same wall-clock as `ts`, distinct type name
+        // on the wire. Server returns naive datetime; `get_timestamp`
+        // reads it back as `NaiveDateTime`.
+        .param(9, TypedValue::TimestampNtz(ts))
+        .unwrap()
+        // TIMESTAMP_LTZ — tz-aware. Verified by comparing the
+        // underlying `naive_utc()` wall-clock via `get_timestamp`
+        // (the row API doesn't distinguish LTZ from TIMESTAMP at
+        // value level — the type-name distinction lives in column
+        // metadata, not in the accessor).
+        .param(10, TypedValue::TimestampLtz(ts_ltz))
+        .unwrap()
+        .param(11, TypedValue::Null)
         .unwrap();
     let mut exec = stmt.execute().await.expect("execute bind-all-types");
 
@@ -327,9 +348,17 @@ async fn bind_all_typed_values_round_trip() {
     assert_eq!(row.get_decimal(5).unwrap().as_deref(), Some("-123.45"));
     assert_eq!(row.get_date(6).unwrap(), Some(date));
     assert_eq!(row.get_timestamp(7).unwrap(), Some(ts));
+    // TIMESTAMP_NTZ reads back through the same `get_timestamp`
+    // accessor (the row API doesn't distinguish at value level;
+    // the type-name distinction is in column metadata).
+    assert_eq!(row.get_timestamp(8).unwrap(), Some(ts));
+    // TIMESTAMP_LTZ comes back as a tz-aware UTC value via the
+    // existing timestamp accessor. The wall-clock equals what we
+    // bound (i.e. no silent tz drift).
+    assert_eq!(row.get_timestamp(9).unwrap(), Some(ts_ltz.naive_utc()));
     // NULL parameter — server returns SQL NULL; STRING is the default
     // type for TypedValue::Null on the wire.
-    assert_eq!(row.get_str(8).unwrap(), None);
+    assert_eq!(row.get_str(10).unwrap(), None);
 
     exec.close().await.expect("close");
     session.close().await.expect("session close");

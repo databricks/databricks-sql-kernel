@@ -1,0 +1,132 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Configure JFrog Artifactory as the registry proxy for cargo / uv /
+# (future) npm. Required by go/hardened-gha: direct access to public
+# package registries (crates.io, pypi.org, etc.) is blocked at the
+# Databricks-protected runner; everything goes through
+# `databricks.jfrog.io`.
+#
+# Steps:
+#
+# 1. Exchange the workflow's GitHub OIDC ID token for a JFrog access
+#    token via `https://databricks.jfrog.io/access/api/v1/oidc/token`.
+# 2. Optionally write `~/.cargo/config.toml` pointing at the JFrog
+#    cargo proxy (`db-cargo-remote`). Replaces direct crates.io
+#    access for `cargo fetch` / `cargo install` / `cargo deny check`.
+# 3. Optionally export `UV_INDEX_URL` (and `PIP_INDEX_URL` for
+#    fallback compat) pointing at the JFrog PyPI proxy (`db-pypi`).
+#    Picked up by `uv sync` / `uv pip install` / any plain `pip`
+#    calls in the job.
+#
+# Calling workflows MUST add `permissions: id-token: write` to grant
+# the OIDC mint capability; without it the curl in step 1 fails 403.
+#
+# Reference: go/hardened-gha
+#   https://docs.google.com/document/d/1zoHgolfZO_IUBIU3w40NmYsoZ9eTRdAmjlfwYOxkj70
+
+name: Set up JFrog Artifactory access
+description: |
+  Exchange GitHub OIDC for a JFrog token and (optionally) configure
+  cargo / uv to route through the Databricks JFrog proxy.
+
+inputs:
+  cargo:
+    description: "Set 'true' to configure cargo to use the JFrog crates proxy."
+    required: false
+    default: "false"
+  uv:
+    description: |
+      Set 'true' to export UV_INDEX_URL (and PIP_INDEX_URL for compat)
+      pointing at the JFrog PyPI proxy. uv reads UV_INDEX_URL natively;
+      PIP_INDEX_URL is set for any tool that falls back to pip.
+    required: false
+    default: "false"
+
+runs:
+  using: composite
+  steps:
+    - name: Get JFrog OIDC token
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # Mint a GitHub OIDC ID token scoped to the `jfrog-github`
+        # audience. Requires `permissions: id-token: write` on the
+        # calling job.
+        ID_TOKEN=$(curl -sLS \
+          -H "User-Agent: actions/oidc-client" \
+          -H "Authorization: Bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=jfrog-github" | jq .value | tr -d '"')
+        echo "::add-mask::${ID_TOKEN}"
+
+        # Exchange for a JFrog access token (RFC 8693 token-exchange).
+        ACCESS_TOKEN=$(curl -sLS -XPOST -H "Content-Type: application/json" \
+          "https://databricks.jfrog.io/access/api/v1/oidc/token" \
+          -d "{\"grant_type\": \"urn:ietf:params:oauth:grant-type:token-exchange\", \"subject_token_type\":\"urn:ietf:params:oauth:token-type:id_token\", \"subject_token\": \"${ID_TOKEN}\", \"provider_name\": \"github-actions\"}" | jq .access_token | tr -d '"')
+        echo "::add-mask::${ACCESS_TOKEN}"
+
+        if [ -z "$ACCESS_TOKEN" ] || [ "$ACCESS_TOKEN" = "null" ]; then
+          echo "FAIL: Could not extract JFrog access token"
+          exit 1
+        fi
+
+        echo "JFROG_ACCESS_TOKEN=${ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        echo "JFrog OIDC token obtained successfully"
+
+    - name: Configure cargo to use JFrog
+      if: inputs.cargo == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        mkdir -p ~/.cargo
+        cat > ~/.cargo/config.toml << 'EOF'
+        [source.crates-io]
+        replace-with = "jfrog"
+
+        [source.jfrog]
+        registry = "sparse+https://databricks.jfrog.io/artifactory/api/cargo/db-cargo-remote/index/"
+
+        [registries.jfrog]
+        index = "sparse+https://databricks.jfrog.io/artifactory/api/cargo/db-cargo-remote/index/"
+        credential-provider = ["cargo:token"]
+        EOF
+
+        cat > ~/.cargo/credentials.toml << EOF
+        [registries.jfrog]
+        token = "Bearer ${JFROG_ACCESS_TOKEN}"
+        EOF
+        chmod 600 ~/.cargo/credentials.toml
+
+        # Exported for tools like cargo-deny / cargo-llvm-cov that
+        # may read the env directly rather than the credentials file.
+        echo "CARGO_REGISTRIES_JFROG_TOKEN=Bearer ${JFROG_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+
+        echo "Cargo configured to use JFrog registry"
+
+    - name: Configure uv / pip to use JFrog
+      if: inputs.uv == 'true'
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        # uv reads UV_INDEX_URL natively; PIP_INDEX_URL is set for
+        # fallback compatibility with tools that shell out to pip.
+        # Both URLs point at db-pypi via the JFrog OIDC service
+        # account.
+        INDEX_URL="https://gha-service-account:${JFROG_ACCESS_TOKEN}@databricks.jfrog.io/artifactory/api/pypi/db-pypi/simple"
+        echo "UV_INDEX_URL=${INDEX_URL}" >> "$GITHUB_ENV"
+        echo "PIP_INDEX_URL=${INDEX_URL}" >> "$GITHUB_ENV"
+        echo "uv / pip configured to use JFrog registry"

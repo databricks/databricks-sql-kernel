@@ -1,0 +1,53 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dependabot configuration for the kernel.
+#
+# Ecosystems intentionally covered:
+#   - cargo: keeps the Rust crate graph patched, complements
+#     `cargo-deny` (RustSec advisories already block merges).
+#   - github-actions: keeps the SHA-pinned actions current.
+#
+# Ecosystems intentionally NOT covered:
+#   - pip: per go/pinning-python-deps the kernel is an
+#     externally-published library; we use major-version bounds in
+#     pyo3/pyproject.toml + `uv sync` re-resolution per CI run, with
+#     no committed lockfile. Letting Dependabot rewrite pinned pip
+#     versions would conflict with that policy.
+
+version: 2
+updates:
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      # Batch patch + minor updates to reduce PR churn; security
+      # advisories still come through as individual PRs.
+      cargo-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    groups:
+      gha-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"

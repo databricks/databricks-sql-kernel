@@ -374,6 +374,24 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
             "TIMESTAMP",
             Some(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
         ),
+        // `TIMESTAMP_NTZ` carries the same naive datetime as `TIMESTAMP`
+        // but flags the type-name on the wire so the server treats it
+        // as explicitly no-timezone. Avoids the session-timezone
+        // interpretation `TIMESTAMP` is subject to in some DBR
+        // versions.
+        TypedValue::TimestampNtz(ts) => ok(
+            "TIMESTAMP_NTZ",
+            Some(ts.format("%Y-%m-%d %H:%M:%S%.f").to_string()),
+        ),
+        // `TIMESTAMP_LTZ` is tz-aware. The wire format is UTC; SEA
+        // accepts an ISO-8601 string with a `Z` suffix as the
+        // canonical form. We render with `%.f` so sub-second precision
+        // (microseconds) round-trips; the format omits it when the
+        // value has no fractional second.
+        TypedValue::TimestampLtz(ts) => ok(
+            "TIMESTAMP_LTZ",
+            Some(ts.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()),
+        ),
         TypedValue::Interval(s) => ok("INTERVAL", Some(s.clone())),
     }
 }
@@ -879,5 +897,32 @@ mod tests {
         let p = typed_value_to_sea_parameter(1, &TypedValue::Timestamp(ts)).unwrap();
         assert_eq!(p.param_type, "TIMESTAMP");
         assert_eq!(p.value.as_deref(), Some("2026-05-07 12:00:00"));
+    }
+
+    #[test]
+    fn typed_value_timestamp_ntz_emits_distinct_type_name() {
+        let ts = chrono::NaiveDate::from_ymd_opt(2026, 5, 7)
+            .unwrap()
+            .and_hms_micro_opt(12, 0, 0, 123_456)
+            .unwrap();
+        let p = typed_value_to_sea_parameter(1, &TypedValue::TimestampNtz(ts)).unwrap();
+        assert_eq!(p.param_type, "TIMESTAMP_NTZ");
+        // Sub-second precision round-trips with `%.f`.
+        assert_eq!(p.value.as_deref(), Some("2026-05-07 12:00:00.123456"));
+    }
+
+    #[test]
+    fn typed_value_timestamp_ltz_emits_utc_iso8601() {
+        let ts = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(2026, 5, 7)
+                .unwrap()
+                .and_hms_opt(12, 0, 0)
+                .unwrap(),
+            chrono::Utc,
+        );
+        let p = typed_value_to_sea_parameter(1, &TypedValue::TimestampLtz(ts)).unwrap();
+        assert_eq!(p.param_type, "TIMESTAMP_LTZ");
+        // `Z` suffix; ISO-8601 `T` separator (LTZ convention).
+        assert_eq!(p.value.as_deref(), Some("2026-05-07T12:00:00Z"));
     }
 }
