@@ -90,6 +90,18 @@ pub(crate) fn get_handle() -> &'static Handle {
 /// been called yet. Drop impls and other GC-thread call sites use this
 /// to short-circuit cleanup when no async entry point has ever run
 /// (i.e. there is no kernel state that needs closing either).
+///
+// TODO(PR #25 Drop impls): spawning cleanup work on the captured
+// handle from a Drop impl is racy at Node-process teardown — the
+// runtime may already be in shutdown when the V8 GC reaches our
+// objects, and a `Handle::spawn` on a halting runtime drops the
+// future silently. napi-rs exposes `napi_add_async_cleanup_hook`
+// for exactly this case: it runs the hook *before* the runtime
+// stops, so kernel `Session::close()` / `Statement::close()`
+// futures get a chance to finish their server-side cancel RPCs.
+// PR #25 introduces the first real Drop impls; this is the lock-in
+// point where the choice must be made (raw spawn vs. cleanup hook).
+// See napi-rs docs `napi::env::Env::add_async_cleanup_hook`.
 pub(crate) fn try_get_handle() -> Option<&'static Handle> {
     RUNTIME_HANDLE.get()
 }
