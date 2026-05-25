@@ -1,0 +1,29 @@
+# CODEOWNERS for databricks-sql-kernel.
+#
+# Patterns are evaluated bottom-to-top per GitHub semantics: the LAST
+# matching rule wins. Keep more-specific rules below more-general ones.
+#
+# All paths below require review from @databricks/eng-oss-sql-driver
+# (enforced by the `protect-main` ruleset's `require_code_owner_review`
+# rule). The team can sub-delegate review via informal channels; the
+# CODEOWNERS file enforces the gate.
+
+# CI workflows and CI configuration.
+.github/workflows/         @databricks/eng-oss-sql-driver
+.github/dependabot.yml     @databricks/eng-oss-sql-driver
+.github/actions/           @databricks/eng-oss-sql-driver
+
+# Self-referential: CODEOWNERS edits require team approval (prevents
+# silent weakening of the rule set).
+.github/CODEOWNERS         @databricks/eng-oss-sql-driver
+
+# Cargo dependency graph + license-policy gate. Adding a new crate
+# or relaxing license rules is a security-relevant change.
+/Cargo.toml                @databricks/eng-oss-sql-driver
+/Cargo.lock                @databricks/eng-oss-sql-driver
+/deny.toml                 @databricks/eng-oss-sql-driver
+/about.toml                @databricks/eng-oss-sql-driver
+
+# PyO3 sub-crate manifests — pip / Python dep changes flow through here.
+/pyo3/Cargo.toml           @databricks/eng-oss-sql-driver
+/pyo3/pyproject.toml       @databricks/eng-oss-sql-driver

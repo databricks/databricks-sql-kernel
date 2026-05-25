@@ -9,8 +9,27 @@ description = "Python bindings for the Databricks SQL Kernel (PyO3)"
 requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Databricks" }]
-dependencies = ["pyarrow>=14"]
+# Runtime dependency for downstream consumers. Major-version bound
+# per the go/pinning-python-deps externally-published-library rule:
+# exact pins make this wheel harder for end-users to install
+# alongside their own pyarrow consumers. The CI environment also
+# uses these bounds (no committed lockfile) — see the
+# `[dependency-groups].dev` block below + the workflow comment in
+# `.github/workflows/pyo3-checks.yml` for the policy rationale.
+dependencies = ["pyarrow>=14,<19"]
+
+# Dev / CI dependencies. PEP 735 standard; uv reads this directly.
+# CI runs `uv sync --group dev` (no `--frozen`, no committed
+# lockfile) per the externally-published-library policy in
+# go/pinning-python-deps. The major-version upper bounds below
+# plus the `db-pypi` JFrog proxy's 7-day age filter are the
+# baseline supply-chain protection; uv re-resolves on each CI run
+# within those bounds.
+[dependency-groups]
+dev = [
+    "maturin>=1.7,<2.0",
+    "pytest>=8.3,<9.0",
+]
 
 [tool.maturin]
 module-name = "databricks_sql_kernel"
-
