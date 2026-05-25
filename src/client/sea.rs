@@ -144,10 +144,25 @@ impl SeaRestTransport {
     ///
     /// Negative `row_offset` is treated the same as `0` (omitted) —
     /// the field is `i64` for arithmetic convenience upstream but the
-    /// SEA wire only accepts non-negative offsets.
+    /// SEA wire only accepts non-negative offsets. A debug-build
+    /// assertion catches the negative case so it surfaces at the
+    /// call-site during development rather than as a silent omission
+    /// in production. Pathological-but-valid values (`i64::MAX`)
+    /// serialise as-is; the server is expected to reject those, and
+    /// the kernel does not pre-validate row-position semantics.
+    ///
+    /// **Future**: if a second optional query parameter ever lands
+    /// on this URL, migrate to `reqwest::Url::parse(...).query_pairs_mut()`
+    /// — the `format!`-based concatenation only handles one
+    /// parameter cleanly and is easy to misuse (`?` vs `&` ordering)
+    /// when adding more.
     ///
     /// See: <https://docs.databricks.com/api/workspace/statementexecution>
     fn result_chunks_url(&self, statement_id: &str, chunk_index: i64, row_offset: i64) -> String {
+        debug_assert!(
+            row_offset >= 0,
+            "row_offset must be non-negative on the SEA wire (got {row_offset})",
+        );
         if row_offset > 0 {
             format!(
                 "{}/statements/{}/result/chunks/{}?row_offset={}",
@@ -1181,17 +1196,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn result_chunks_url_omits_row_offset_when_negative() {
-        // Defensive: row_offset is plumbed as i64 for arithmetic
-        // convenience upstream; a stray negative must not produce an
-        // invalid URL.
-        let client = create_test_client();
-        assert_eq!(
-            client.result_chunks_url("01abc", 7, -1),
-            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/7"
-        );
-    }
+    // Note: negative-row_offset behaviour is now gated by a
+    // `debug_assert!` in `result_chunks_url`. Debug builds (which is
+    // what `cargo test` runs by default) will panic on
+    // `row_offset < 0` so an upstream bug surfaces immediately
+    // during development. In release builds the assertion is
+    // compiled out and the URL builder silently omits the query
+    // parameter (treats negative the same as zero); intentional, so
+    // a stray negative in production can't produce a malformed URL.
 
     #[test]
     fn result_chunks_url_includes_row_offset_when_positive() {
@@ -1202,6 +1214,21 @@ mod tests {
         assert_eq!(
             client.result_chunks_url("01abc", 3, 12345),
             "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=12345"
+        );
+    }
+
+    #[test]
+    fn result_chunks_url_serialises_i64_max_row_offset() {
+        // Pathological: i64::MAX is a valid i64 and serialises as
+        // its decimal form. The kernel does not pre-validate
+        // row-position semantics; the server rejects nonsensical
+        // offsets at request-time. The URL builder must not panic
+        // or truncate for the legal range.
+        let client = create_test_client();
+        let url = client.result_chunks_url("01abc", 0, i64::MAX);
+        assert!(
+            url.ends_with(&format!("?row_offset={}", i64::MAX)),
+            "i64::MAX must serialise as decimal: got {url}",
         );
     }
 }

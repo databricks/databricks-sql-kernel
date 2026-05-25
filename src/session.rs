@@ -264,11 +264,26 @@ impl Session {
         // `can_cloud_download` directly via `session_conf` for any reason
         // (e.g., to force inline-Arrow even with CloudFetch enabled at the
         // kernel layer), their value wins.
+        //
+        // The presence check is **case-insensitive on the key** and
+        // **rejects empty values**: SEA session-conf keys are
+        // historically case-insensitive on the wire, and a stray
+        // `"Can_Cloud_Download"` from the user would otherwise let us
+        // inject the canonical-cased `"can_cloud_download"` alongside —
+        // shipping both keys with potentially different values. An
+        // empty-string user value (`"can_cloud_download": ""`) is
+        // treated the same as absence; the server's behaviour for
+        // empty session-conf values is undefined and we'd rather
+        // inject the kernel's canonical value than ship an ambiguous
+        // empty.
         let mut session_conf = config.session_conf.clone();
         if !config.result.cloudfetch_enabled {
-            session_conf
-                .entry("can_cloud_download".to_string())
-                .or_insert_with(|| "false".to_string());
+            let already_set = session_conf
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
+            if !already_set {
+                session_conf.insert("can_cloud_download".to_string(), "false".to_string());
+            }
         }
         let session_info = transport
             .create_session(
