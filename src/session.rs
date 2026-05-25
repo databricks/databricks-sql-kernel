@@ -252,11 +252,29 @@ impl Session {
             warehouse_id = %warehouse_id,
             "creating session"
         );
+
+        // When CloudFetch is disabled at the kernel layer, advertise this
+        // capability to SEA via the `can_cloud_download` session conf.
+        // Per the SEA inline-Arrow design (go/inline-arrow-sea, DD1), this
+        // tells the server to fall back to the inline-Arrow path for all
+        // result sizes instead of attempting cloud-fetch and erroring at
+        // fetch time.
+        //
+        // Don't clobber an explicit user value — if the caller wired
+        // `can_cloud_download` directly via `session_conf` for any reason
+        // (e.g., to force inline-Arrow even with CloudFetch enabled at the
+        // kernel layer), their value wins.
+        let mut session_conf = config.session_conf.clone();
+        if !config.result.cloudfetch_enabled {
+            session_conf
+                .entry("can_cloud_download".to_string())
+                .or_insert_with(|| "false".to_string());
+        }
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                crate::config::filter_session_conf(config.session_conf.clone()),
+                crate::config::filter_session_conf(session_conf),
             )
             .await?;
 

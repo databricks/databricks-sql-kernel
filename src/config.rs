@@ -363,7 +363,20 @@ pub struct TlsConfig {}
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResultConfig {
-    /// Whether to opt into CloudFetch for large results. Default: true.
+    /// Whether to opt into CloudFetch (cloud-storage-backed download of
+    /// large result sets via presigned URLs). Default: `true`.
+    ///
+    /// Setting this to `false` mirrors JDBC's `EnableQueryResultDownload=0`
+    /// behaviour. At session-create time the kernel sets the
+    /// `can_cloud_download` session conf to `"false"` so SEA serves
+    /// **all** result sizes via the inline-Arrow path, regardless of
+    /// result size — see the SEA inline-Arrow design (DD1) for the wire
+    /// contract. Users who need inline-only behaviour (e.g. workspaces
+    /// without cloud-storage egress) should set this to `false`.
+    ///
+    /// Disabling CloudFetch defeats the concurrent chunk-download
+    /// pipeline (`cloudfetch_max_chunks_in_memory`), since inline Arrow
+    /// is fetched one chunk at a time on the SEA path.
     pub cloudfetch_enabled: bool,
 
     /// Number of presigned URLs to prefetch ahead of the consumer.
@@ -499,6 +512,13 @@ pub struct SessionConfig {
 /// and uppercased before being sent.
 pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
     "ANSI_MODE",
+    // `CAN_CLOUD_DOWNLOAD` is the kernel-synthesised flag (set by
+    // `Session::open` when `ResultConfig::cloudfetch_enabled = false`)
+    // telling SEA to serve every result via the inline-Arrow path.
+    // Listed here so a user-supplied value (with any casing) survives
+    // the allowlist filter and so the kernel's own synthesis passes
+    // through normalisation without special-casing.
+    "CAN_CLOUD_DOWNLOAD",
     "COLLATION",
     "ENABLE_PHOTON",
     "LEGACY_TIME_PARSER_POLICY",

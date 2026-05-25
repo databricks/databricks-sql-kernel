@@ -129,6 +129,43 @@ impl SeaRestTransport {
         format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
     }
 
+    /// Build the `/result/chunks/{idx}` URL, optionally with the
+    /// `row_offset` query parameter set.
+    ///
+    /// `chunk_index` is a path parameter (the SEA REST contract).
+    /// `row_offset` is appended as a query parameter on the inline-
+    /// Arrow path — the SEA inline-Arrow design (go/inline-arrow-sea,
+    /// "OSS JDBC Driver" section) revives the previously deprecated
+    /// `row_offset` field for clients fetching by `chunk_index +
+    /// rowOffset` against ThriftServer's `FETCH_ABSOLUTE`-based inline
+    /// path. On the CloudFetch path (where the kernel passes
+    /// `row_offset = 0`) we omit the parameter entirely so we don't
+    /// perturb the existing wire shape that today's SEA accepts.
+    ///
+    /// Negative `row_offset` is treated the same as `0` (omitted) —
+    /// the field is `i64` for arithmetic convenience upstream but the
+    /// SEA wire only accepts non-negative offsets.
+    ///
+    /// See: <https://docs.databricks.com/api/workspace/statementexecution>
+    fn result_chunks_url(&self, statement_id: &str, chunk_index: i64, row_offset: i64) -> String {
+        if row_offset > 0 {
+            format!(
+                "{}/statements/{}/result/chunks/{}?row_offset={}",
+                self.base_url(),
+                statement_id,
+                chunk_index,
+                row_offset
+            )
+        } else {
+            format!(
+                "{}/statements/{}/result/chunks/{}",
+                self.base_url(),
+                statement_id,
+                chunk_index
+            )
+        }
+    }
+
     /// Convert SEA response to internal ExecuteResultData.
     fn convert_result_data(result: &crate::types::sea::ResultData) -> Result<ExecuteResultData> {
         let external_links = if let Some(ref links) = result.external_links {
@@ -623,16 +660,9 @@ impl Transport for SeaRestTransport {
         &self,
         statement_id: &str,
         chunk_index: i64,
-        _row_offset: i64, // Ignored - SEA uses chunk_index
+        row_offset: i64,
     ) -> Result<ChunkLinkFetchResult> {
-        // The chunk_index is a path parameter, not a query parameter
-        // See: https://docs.databricks.com/api/workspace/statementexecution
-        let url = format!(
-            "{}/statements/{}/result/chunks/{}",
-            self.base_url(),
-            statement_id,
-            chunk_index
-        );
+        let url = self.result_chunks_url(statement_id, chunk_index, row_offset);
 
         debug!("Getting result chunks at {}", url);
 
@@ -1138,5 +1168,40 @@ mod tests {
         assert!(!result.has_more);
         assert!(result.next_chunk_index.is_none());
         assert!(result.next_row_offset.is_none());
+    }
+
+    #[test]
+    fn result_chunks_url_omits_row_offset_when_zero() {
+        let client = create_test_client();
+        // CloudFetch path: row_offset=0 is the kernel default and must
+        // produce the legacy URL shape (no `?row_offset=...`).
+        assert_eq!(
+            client.result_chunks_url("01abc", 7, 0),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/7"
+        );
+    }
+
+    #[test]
+    fn result_chunks_url_omits_row_offset_when_negative() {
+        // Defensive: row_offset is plumbed as i64 for arithmetic
+        // convenience upstream; a stray negative must not produce an
+        // invalid URL.
+        let client = create_test_client();
+        assert_eq!(
+            client.result_chunks_url("01abc", 7, -1),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/7"
+        );
+    }
+
+    #[test]
+    fn result_chunks_url_includes_row_offset_when_positive() {
+        // Inline-Arrow path: row_offset>0 is appended as a query
+        // parameter so SEA can FETCH_ABSOLUTE into ThriftServer at
+        // the right rowOffset.
+        let client = create_test_client();
+        assert_eq!(
+            client.result_chunks_url("01abc", 3, 12345),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=12345"
+        );
     }
 }
