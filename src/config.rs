@@ -390,6 +390,22 @@ pub struct ResultConfig {
     /// ADBC and any other Arrow-native consumer should leave it
     /// `false`.
     pub complex_types_as_json: bool,
+
+    /// When `true`, `Interval(*)` and `Duration(*)` columns are
+    /// replaced with `Utf8` columns containing the canonical
+    /// Databricks text form (`"Y-M"` for YEAR-MONTH,
+    /// `"D HH:MM:SS.nnnnnnnnn"` for DAY-TIME / durations).
+    ///
+    /// Motivation: pyarrow's Python bindings can't decode Arrow's
+    /// `month_interval` (id 21) — `.as_py()` / `.to_pylist()` /
+    /// `cast(string)` / `to_pandas()` all fail with KeyError or
+    /// `ArrowNotImplementedError`, killing the result set. Bindings
+    /// that hand Arrow batches to pyarrow Python (the PySQL kernel
+    /// backend) should set this `true`. Rust consumers and bindings
+    /// with their own interval decoder can leave it `false`.
+    ///
+    /// Default `false`.
+    pub intervals_as_string: bool,
 }
 
 impl Default for ResultConfig {
@@ -399,6 +415,7 @@ impl Default for ResultConfig {
             cloudfetch_link_prefetch_window: 10,
             cloudfetch_max_chunks_in_memory: 4,
             complex_types_as_json: false,
+            intervals_as_string: false,
         }
     }
 }

@@ -186,7 +186,8 @@ pub fn record_batch_to_sea_parameters(batch: &RecordBatch) -> Result<Vec<Stateme
         };
 
         params.push(StatementParameter {
-            ordinal: (i + 1) as i32,
+            name: None,
+            ordinal: Some((i + 1) as i32),
             param_type,
             value,
         });
@@ -413,18 +414,31 @@ pub(crate) fn typed_value_to_sea_parameter(
 ) -> Result<StatementParameter> {
     let payload = typed_value_to_sea_payload(value)?;
     Ok(StatementParameter {
-        ordinal,
+        name: None,
+        ordinal: Some(ordinal),
         param_type: payload.type_name,
         value: payload.value,
     })
 }
 
-// Note: SEA's `StatementParameter` is positional-only today
-// (`ordinal` + `type` + `value`; no `name` field on the wire). Named
-// parameter bindings on `StatementSpec.named_params` aren't supported
-// at the wire layer yet — `Statement::execute` returns
-// `InvalidArgument` if any are present. Tracked as a §7 follow-up
-// pending SEA wire support for named bindings.
+/// Convert a named [`TypedValue`] binding to a SEA
+/// [`StatementParameter`]. The canonical SEA proto marks
+/// `StatementParameter.name` as `openapi_required=true` — named
+/// binding is the spec-required public form; positional is
+/// `PUBLIC_UNDOCUMENTED`. Returns `Err(InvalidArgument)` for variants
+/// the SEA wire protocol does not accept (today: `Binary`).
+pub(crate) fn named_typed_value_to_sea_parameter(
+    name: impl Into<String>,
+    value: &TypedValue,
+) -> Result<StatementParameter> {
+    let payload = typed_value_to_sea_payload(value)?;
+    Ok(StatementParameter {
+        name: Some(name.into()),
+        ordinal: None,
+        param_type: payload.type_name,
+        value: payload.value,
+    })
+}
 
 // ---------------------------------------------------------------------------
 // DESCRIBE QUERY result → Arrow Schema
@@ -646,7 +660,7 @@ mod tests {
         )]);
         let params = record_batch_to_sea_parameters(&batch).unwrap();
         assert_eq!(params.len(), 1);
-        assert_eq!(params[0].ordinal, 1);
+        assert_eq!(params[0].ordinal, Some(1));
         assert_eq!(params[0].param_type, "INT");
         assert_eq!(params[0].value, Some("42".to_string()));
     }
@@ -691,11 +705,11 @@ mod tests {
         ]);
         let params = record_batch_to_sea_parameters(&batch).unwrap();
         assert_eq!(params.len(), 3);
-        assert_eq!(params[0].ordinal, 1);
+        assert_eq!(params[0].ordinal, Some(1));
         assert_eq!(params[0].param_type, "INT");
-        assert_eq!(params[1].ordinal, 2);
+        assert_eq!(params[1].ordinal, Some(2));
         assert_eq!(params[1].param_type, "STRING");
-        assert_eq!(params[2].ordinal, 3);
+        assert_eq!(params[2].ordinal, Some(3));
         assert_eq!(params[2].param_type, "DOUBLE");
     }
 
@@ -788,12 +802,14 @@ mod tests {
     fn test_statement_parameter_serialization() {
         let params = vec![
             StatementParameter {
-                ordinal: 1,
+                name: None,
+                ordinal: Some(1),
                 param_type: "INT".to_string(),
                 value: Some("100".to_string()),
             },
             StatementParameter {
-                ordinal: 2,
+                name: None,
+                ordinal: Some(2),
                 param_type: "STRING".to_string(),
                 value: None,
             },
@@ -804,6 +820,29 @@ mod tests {
         assert!(json.contains(r#""type":"INT""#));
         assert!(json.contains(r#""value":"100""#));
         assert!(json.contains(r#""value":null"#));
+        // Positional params must not emit a `name` field — the
+        // canonical SEA proto distinguishes named vs positional by
+        // which field is set.
+        assert!(!json.contains(r#""name""#), "json={json}");
+    }
+
+    #[test]
+    fn test_named_statement_parameter_serialization() {
+        // Named binding is the spec-required public form (canonical
+        // proto marks `name` as openapi_required=true). When `name`
+        // is set, `ordinal` must be omitted from the wire payload.
+        let params = vec![StatementParameter {
+            name: Some("n".to_string()),
+            ordinal: None,
+            param_type: "INT".to_string(),
+            value: Some("42".to_string()),
+        }];
+
+        let json = serde_json::to_string(&params).unwrap();
+        assert!(json.contains(r#""name":"n""#), "json={json}");
+        assert!(json.contains(r#""type":"INT""#));
+        assert!(json.contains(r#""value":"42""#));
+        assert!(!json.contains(r#""ordinal""#), "json={json}");
     }
 
     // ─── TypedValue → SEA tests ─────────────────────────────────────
@@ -811,7 +850,8 @@ mod tests {
     #[test]
     fn typed_value_null_emits_string_type_with_no_value() {
         let p = typed_value_to_sea_parameter(1, &TypedValue::Null).unwrap();
-        assert_eq!(p.ordinal, 1);
+        assert_eq!(p.ordinal, Some(1));
+        assert_eq!(p.name, None);
         assert_eq!(p.param_type, "STRING");
         assert_eq!(p.value, None);
     }
@@ -835,7 +875,7 @@ mod tests {
         ];
         for (v, expect_type, expect_value) in cases {
             let p = typed_value_to_sea_parameter(7, &v).unwrap();
-            assert_eq!(p.ordinal, 7);
+            assert_eq!(p.ordinal, Some(7));
             assert_eq!(p.param_type, expect_type, "type for {v:?}");
             assert_eq!(p.value.as_deref(), Some(expect_value), "value for {v:?}");
         }
@@ -864,6 +904,24 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         // The error message must mention the workaround (hex+unhex)
         // so callers can fix their query without reading source.
+        assert!(err.message.contains("unhex"), "{}", err.message);
+    }
+
+    #[test]
+    fn named_typed_value_sets_name_and_clears_ordinal() {
+        let p = named_typed_value_to_sea_parameter("n", &TypedValue::Int32(42)).unwrap();
+        assert_eq!(p.name.as_deref(), Some("n"));
+        assert_eq!(p.ordinal, None);
+        assert_eq!(p.param_type, "INT");
+        assert_eq!(p.value.as_deref(), Some("42"));
+    }
+
+    #[test]
+    fn named_typed_value_binary_is_rejected() {
+        use crate::kernel_error::ErrorCode;
+        let err = named_typed_value_to_sea_parameter("b", &TypedValue::Binary(vec![0xCA, 0xFE]))
+            .unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(err.message.contains("unhex"), "{}", err.message);
     }
 

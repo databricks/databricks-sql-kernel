@@ -35,7 +35,7 @@ use crate::reader::post_processor::{PostProcessOptions, ResultPostProcessor};
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
 use arrow_array::RecordBatch;
-use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef};
+use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use std::sync::Arc;
 
@@ -198,7 +198,7 @@ impl ResultReaderFactory {
                     "Using empty reader: no result data present for {:?} statement",
                     response.status.state
                 );
-                let schema = self.extract_schema_from_manifest(response.manifest.as_ref())?;
+                let schema = Self::extract_schema_from_manifest(response.manifest.as_ref())?;
                 Ok(Box::new(EmptyReader::new(schema)))
             }
             StatementState::Pending | StatementState::Running => Err(Error::invalid_state()
@@ -219,7 +219,7 @@ impl ResultReaderFactory {
     /// Extract Arrow schema from the result manifest.
     ///
     /// Falls back to an empty schema if no manifest is available.
-    fn extract_schema_from_manifest(&self, manifest: Option<&ResultManifest>) -> Result<SchemaRef> {
+    fn extract_schema_from_manifest(manifest: Option<&ResultManifest>) -> Result<SchemaRef> {
         let Some(manifest) = manifest else {
             tracing::warn!("No manifest available for empty result set, using empty schema");
             return Ok(Arc::new(Schema::empty()));
@@ -230,38 +230,32 @@ impl ResultReaderFactory {
             .columns
             .iter()
             .map(|col| {
-                let data_type = Self::map_databricks_type(&col.type_name);
+                // Pass `type_text` (e.g. `"DECIMAL(10,2)"` or
+                // `"INTERVAL YEAR TO MONTH"`) rather than `type_name`
+                // (e.g. `"DECIMAL"` or `"INTERVAL"`) so the shared mapper
+                // can recover precision/scale / interval qualifier. The
+                // non-empty result path uses the Arrow schema embedded in
+                // the wire payload (which already encodes these); only
+                // this empty-result path has to reconstruct the Arrow type
+                // from the manifest, and reconstructing without those
+                // produces wrong defaults that diverge from the Thrift
+                // backend's wire schema for the same query.
+                //
+                // `type_interval_type` (`"YEAR_MONTH"` / `"DAY_TIME"`) is
+                // the canonical hint for INTERVAL columns; passing it
+                // through lets the mapper choose
+                // `IntervalUnit::YearMonth` vs `IntervalUnit::DayTime`
+                // without re-parsing the `type_text`.
+                let data_type =
+                    crate::metadata::type_mapping::databricks_type_to_arrow_with_interval(
+                        &col.type_text,
+                        col.type_interval_type.as_deref(),
+                    );
                 Field::new(&col.name, data_type, true) // nullable by default
             })
             .collect();
 
         Ok(Arc::new(Schema::new(fields)))
-    }
-
-    /// Map Databricks SQL type names to Arrow DataTypes.
-    fn map_databricks_type(type_name: &str) -> DataType {
-        // Databricks type names from the API
-        match type_name.to_uppercase().as_str() {
-            "BOOLEAN" => DataType::Boolean,
-            "BYTE" | "TINYINT" => DataType::Int8,
-            "SHORT" | "SMALLINT" => DataType::Int16,
-            "INT" | "INTEGER" => DataType::Int32,
-            "LONG" | "BIGINT" => DataType::Int64,
-            "FLOAT" | "REAL" => DataType::Float32,
-            "DOUBLE" => DataType::Float64,
-            "STRING" => DataType::Utf8,
-            "BINARY" => DataType::Binary,
-            "DATE" => DataType::Date32,
-            "TIMESTAMP" | "TIMESTAMP_NTZ" => {
-                DataType::Timestamp(arrow_schema::TimeUnit::Microsecond, None)
-            }
-            // For complex types and unknown types, fall back to string
-            // The actual Arrow IPC data will have the correct type
-            _ => {
-                tracing::debug!("Unknown Databricks type '{}', mapping to Utf8", type_name);
-                DataType::Utf8
-            }
-        }
     }
 
     fn create_cloudfetch_reader(
@@ -604,6 +598,7 @@ mod tests {
     use crate::reader::test_utils::{ErrorReader, MockReader, SchemaErrorReader};
     use crate::types::sea::{ColumnInfo, ResultManifest, ResultSchema};
     use arrow_array::StringArray;
+    use arrow_schema::DataType;
 
     fn make_test_batch(values: Vec<&str>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
@@ -692,32 +687,144 @@ mod tests {
     }
 
     #[test]
-    fn test_map_databricks_types() {
+    fn test_extract_schema_from_manifest_primitives() {
+        // The simple-primitive cases the previous private mapper covered.
+        // Verifies the shared `databricks_type_to_arrow` still produces
+        // the same Arrow types for these so behaviour didn't regress when
+        // the duplicate was removed.
+        let manifest = make_manifest(vec![
+            make_column_info("a", "BOOLEAN", "BOOLEAN", 0, None, None, None),
+            make_column_info("b", "INT", "INT", 1, None, None, None),
+            make_column_info("c", "BIGINT", "BIGINT", 2, None, None, None),
+            make_column_info("d", "STRING", "STRING", 3, None, None, None),
+            make_column_info("e", "DOUBLE", "DOUBLE", 4, None, None, None),
+        ]);
+        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Boolean);
+        assert_eq!(schema.field(1).data_type(), &DataType::Int32);
+        assert_eq!(schema.field(2).data_type(), &DataType::Int64);
+        assert_eq!(schema.field(3).data_type(), &DataType::Utf8);
+        assert_eq!(schema.field(4).data_type(), &DataType::Float64);
+    }
+
+    #[test]
+    fn test_extract_schema_from_manifest_decimal_carries_precision_scale() {
+        // Regression test for the comparator bucket-C cause #1:
+        // empty-result schema for a DECIMAL column was previously
+        // `Utf8` (because the local mapper fell through to the catch-all
+        // and ignored type_text/type_precision/type_scale), producing
+        // a divergence vs Thrift's `Decimal128(p, s)`.
+        let manifest = make_manifest(vec![make_column_info(
+            "decimal_column",
+            "DECIMAL",
+            "DECIMAL(10,2)",
+            0,
+            Some(10),
+            Some(2),
+            None,
+        )]);
+        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(10, 2));
+    }
+
+    #[test]
+    fn test_extract_schema_from_manifest_interval_void() {
+        // INTERVAL and VOID were both falling through to Utf8 in the
+        // previous private mapper — bucket-C cause #1 sub-cases.
+        //
+        // Canonical SEA `type_text` for INTERVAL columns is
+        // `"INTERVAL YEAR TO MONTH"` / `"INTERVAL DAY TO SECOND"` —
+        // the parser must split on whitespace to recognise the
+        // `INTERVAL` base. `type_interval_type` (`"YEAR_MONTH"` /
+        // `"DAY_TIME"`) is the canonical disambiguator and is
+        // preferred over the keyword-match fallback.
+        let manifest = make_manifest(vec![
+            make_column_info(
+                "ym",
+                "INTERVAL",
+                "INTERVAL YEAR TO MONTH",
+                0,
+                None,
+                None,
+                Some("YEAR_MONTH"),
+            ),
+            make_column_info(
+                "ds",
+                "INTERVAL",
+                "INTERVAL DAY TO SECOND",
+                1,
+                None,
+                None,
+                Some("DAY_TIME"),
+            ),
+            make_column_info("v", "VOID", "VOID", 2, None, None, None),
+        ]);
+        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
         assert_eq!(
-            ResultReaderFactory::map_databricks_type("BOOLEAN"),
-            DataType::Boolean
+            schema.field(0).data_type(),
+            &DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
+            "INTERVAL YEAR TO MONTH must map to IntervalUnit::YearMonth"
         );
         assert_eq!(
-            ResultReaderFactory::map_databricks_type("INT"),
-            DataType::Int32
+            schema.field(1).data_type(),
+            &DataType::Interval(arrow_schema::IntervalUnit::DayTime),
+            "INTERVAL DAY TO SECOND must map to IntervalUnit::DayTime"
+        );
+        // VOID must surface as `Null`, not as Utf8 — Thrift's surface for
+        // a `CAST(NULL AS VOID)` column carries a null type.
+        assert_eq!(schema.field(2).data_type(), &DataType::Null);
+    }
+
+    #[test]
+    fn test_extract_schema_from_manifest_interval_keyword_fallback() {
+        // When `type_interval_type` is absent, the mapper falls back to
+        // keyword-matching the `type_text`. Bare `"INTERVAL"` (no
+        // qualifier) historically meant DAY_TIME; preserve that.
+        let manifest = make_manifest(vec![
+            make_column_info("ym", "INTERVAL", "INTERVAL YEAR TO MONTH", 0, None, None, None),
+            make_column_info("ds", "INTERVAL", "INTERVAL DAY TO SECOND", 1, None, None, None),
+            make_column_info("bare", "INTERVAL", "INTERVAL", 2, None, None, None),
+        ]);
+        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        assert_eq!(
+            schema.field(0).data_type(),
+            &DataType::Interval(arrow_schema::IntervalUnit::YearMonth)
         );
         assert_eq!(
-            ResultReaderFactory::map_databricks_type("BIGINT"),
-            DataType::Int64
+            schema.field(1).data_type(),
+            &DataType::Interval(arrow_schema::IntervalUnit::DayTime)
         );
         assert_eq!(
-            ResultReaderFactory::map_databricks_type("STRING"),
-            DataType::Utf8
+            schema.field(2).data_type(),
+            &DataType::Interval(arrow_schema::IntervalUnit::DayTime)
         );
-        assert_eq!(
-            ResultReaderFactory::map_databricks_type("DOUBLE"),
-            DataType::Float64
-        );
-        // Unknown types fall back to Utf8
-        assert_eq!(
-            ResultReaderFactory::map_databricks_type("UNKNOWN_TYPE"),
-            DataType::Utf8
-        );
+    }
+
+    #[test]
+    fn test_extract_schema_from_manifest_complex_types_parse_into_nested_arrow() {
+        // ARRAY / MAP / STRUCT carry their structure in the manifest's
+        // `type_text` field; the empty-result schema now reconstructs the
+        // matching nested Arrow type so the empty-result path agrees
+        // with the non-empty wire-payload schema. The actual parsing
+        // lives in `metadata::type_mapping::databricks_type_to_arrow`;
+        // this asserts the factory plumbs `type_text` through correctly.
+        let manifest = make_manifest(vec![
+            make_column_info("a", "ARRAY", "ARRAY<INT>", 0, None, None, None),
+            make_column_info("m", "MAP", "MAP<STRING,INT>", 1, None, None, None),
+            make_column_info("s", "STRUCT", "STRUCT<x:INT>", 2, None, None, None),
+        ]);
+        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        assert!(matches!(schema.field(0).data_type(), DataType::List(_)));
+        assert!(matches!(schema.field(1).data_type(), DataType::Map(_, _)));
+        assert!(matches!(schema.field(2).data_type(), DataType::Struct(_)));
+    }
+
+    #[test]
+    fn test_extract_schema_from_manifest_no_manifest_returns_empty() {
+        // Pre-existing fallback path: no manifest at all → empty schema,
+        // no warning, no panic. Lock in.
+        let schema = ResultReaderFactory::extract_schema_from_manifest(None).unwrap();
+        assert_eq!(schema.fields().len(), 0);
     }
 
     // --- Schema augmentation tests ---
