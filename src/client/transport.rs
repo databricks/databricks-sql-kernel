@@ -126,7 +126,13 @@ pub(crate) struct ChunkLinkFetchResult {
         reason = "consumed by ResultStream chunk pagination in PR 4"
     )]
     pub next_chunk_index: Option<i64>,
-    /// For row-offset based backends (Thrift).
+    /// For row-offset based backends (Thrift), and as observability /
+    /// diagnostic info on the SEA path. Internally maintained by the
+    /// link fetcher; not currently read by the streaming provider.
+    #[allow(
+        dead_code,
+        reason = "Thrift consumer wiring TBD; SEA path tracks row offset internally"
+    )]
     pub next_row_offset: Option<i64>,
 }
 

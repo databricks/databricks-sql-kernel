@@ -615,10 +615,25 @@ impl Transport for SeaRestTransport {
 
         let has_more = next_chunk_index.is_some();
 
+        // Per the bounded-SEA-API contract for OSS drivers, the
+        // server-provided `external_links[].row_offset` is what the
+        // next fetch must send back. We propagate the last link's
+        // `row_offset + row_count` as the offset for the *next* fetch
+        // (i.e. the row position immediately after the last row in
+        // the batch we just received). On a fetch that returned no
+        // more chunks (`has_more=false`), the row offset is moot;
+        // emit `None` so downstream code doesn't store stale state.
+        let next_row_offset = if has_more {
+            links.last().map(|l| l.row_offset + l.row_count)
+        } else {
+            None
+        };
+
         debug!(
-            "Chunks response: {} links, next_chunk_index={:?}, has_more={}",
+            "Chunks response: {} links, next_chunk_index={:?}, next_row_offset={:?}, has_more={}",
             links.len(),
             next_chunk_index,
+            next_row_offset,
             has_more
         );
 
@@ -626,7 +641,7 @@ impl Transport for SeaRestTransport {
             links,
             has_more,
             next_chunk_index,
-            next_row_offset: None, // SEA doesn't use row offset
+            next_row_offset,
         })
     }
 

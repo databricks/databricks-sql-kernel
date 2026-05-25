@@ -89,7 +89,10 @@ pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
 /// - Makes API calls to the SEA get_result_chunks endpoint
 /// - Caches fetched links in a concurrent DashMap
 /// - Tracks the highest chunk index fetched to avoid redundant API calls
-/// - Uses `total_chunk_count` from the manifest to determine end-of-stream
+/// - Uses each link's server-emitted `next_chunk_index` to advance and
+///   to detect end-of-stream — per the bounded SEA API contract for
+///   OSS drivers, `total_chunk_count` from the manifest is deprecated
+///   and no longer consulted by the kernel.
 /// - **Proactively prefetches links** when consumer position approaches the
 ///   prefetch boundary (similar to JDBC's `linkPrefetchWindow`)
 ///
@@ -110,11 +113,16 @@ pub(crate) struct SeaChunkLinkFetcher {
     statement_id: String,
     /// Cached links by chunk index
     links: DashMap<i64, CloudFetchLink>,
-    /// Highest chunk index we've fetched + 1 (next index to fetch from server)
+    /// Next chunk index to ask the server for. Initialised from the
+    /// last initial link's `next_chunk_index` (the server tells us
+    /// where the stream continues). Updated after each batch from the
+    /// same field on the most-recently-fetched link.
     next_server_fetch_index: AtomicI64,
-    /// Total number of chunks from manifest
-    total_chunk_count: Option<i64>,
-    /// Whether we've fetched all links
+    /// End-of-stream sentinel. Flips to `true` the moment the server
+    /// returns a fetch whose last link has `next_chunk_index = None`.
+    /// Per the bounded SEA API contract for OSS drivers, this is the
+    /// authoritative end-of-stream signal — `total_chunk_count` is
+    /// deprecated for OSS-driver use and not consulted here.
     all_links_fetched: AtomicBool,
     /// Current consumer position (highest chunk index requested)
     current_consumer_index: AtomicI64,
@@ -139,7 +147,6 @@ impl std::fmt::Debug for SeaChunkLinkFetcher {
                 "next_server_fetch_index",
                 &self.next_server_fetch_index.load(Ordering::Relaxed),
             )
-            .field("total_chunk_count", &self.total_chunk_count)
             .field(
                 "all_links_fetched",
                 &self.all_links_fetched.load(Ordering::Relaxed),
@@ -160,46 +167,62 @@ impl std::fmt::Debug for SeaChunkLinkFetcher {
 impl SeaChunkLinkFetcher {
     /// Create a new SEA link fetcher with caching and prefetching.
     ///
+    /// End-of-stream and "where does the next fetch start" are both
+    /// derived from the last initial link's server-provided
+    /// `next_chunk_index` and `row_offset + row_count`. Per the
+    /// bounded SEA API contract for OSS drivers, `total_chunk_count`
+    /// from the manifest is deprecated for driver use; the server-
+    /// emitted `next_chunk_index` on each link is the authoritative
+    /// continuation signal.
+    ///
     /// # Arguments
     /// * `client` - The Databricks client to use for API calls
     /// * `statement_id` - The statement ID to fetch links for
-    /// * `initial_links` - Links from the initial execute response
-    /// * `total_chunk_count` - Total number of chunks from result manifest
+    /// * `initial_links` - Links from the initial execute response.
+    ///   Must be ordered by `chunk_index`; the last link's
+    ///   `next_chunk_index` decides whether more chunks remain.
     /// * `link_prefetch_window` - Number of chunks to prefetch ahead of consumer
     /// * `runtime_handle` - Tokio runtime handle for spawning prefetch tasks
     pub(crate) fn new(
         client: Arc<dyn Transport>,
         statement_id: impl Into<String>,
         initial_links: &[CloudFetchLink],
-        total_chunk_count: Option<i64>,
         link_prefetch_window: i64,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
         let statement_id = statement_id.into();
         let links = DashMap::new();
-        let mut max_chunk_index = -1i64;
 
-        // Store initial links
+        // Store initial links.
         for link in initial_links {
-            max_chunk_index = max_chunk_index.max(link.chunk_index);
             links.insert(link.chunk_index, link.clone());
         }
 
-        let next_server_fetch_index = max_chunk_index + 1;
-
-        // Determine if we already have all links
-        let all_links_fetched = if let Some(total) = total_chunk_count {
-            next_server_fetch_index >= total
-        } else {
-            false
+        // The last link's `next_chunk_index` is the server's
+        // continuation token. Absent → end-of-stream; present →
+        // that's where the next fetch starts.
+        //
+        // When the caller passes no initial links at all we start
+        // at chunk 0 with `all_links_fetched=false` and let the
+        // first server fetch (sync fallback or async prefetch)
+        // discover the rest. An empty `initial_links` is the
+        // "kernel constructed before the first server response"
+        // shape used in tests; it does *not* mean end-of-stream.
+        let last_link = initial_links.last();
+        let (next_server_fetch_index, all_links_fetched, next_row_offset) = match last_link {
+            Some(link) => match link.next_chunk_index {
+                Some(idx) => (idx, false, link.row_offset + link.row_count),
+                None => (link.chunk_index + 1, true, link.row_offset + link.row_count),
+            },
+            None => (0, false, 0),
         };
 
         debug!(
-            "SeaChunkLinkFetcher: {} initial links, next_server_fetch={}, total_chunks={:?}, \
-             all_fetched={}, prefetch_window={}",
+            "SeaChunkLinkFetcher: {} initial links, next_server_fetch={}, \
+             next_row_offset={}, all_fetched={}, prefetch_window={}",
             initial_links.len(),
             next_server_fetch_index,
-            total_chunk_count,
+            next_row_offset,
             all_links_fetched,
             link_prefetch_window
         );
@@ -209,14 +232,13 @@ impl SeaChunkLinkFetcher {
             statement_id,
             links,
             next_server_fetch_index: AtomicI64::new(next_server_fetch_index),
-            total_chunk_count,
             all_links_fetched: AtomicBool::new(all_links_fetched),
             current_consumer_index: AtomicI64::new(0),
             link_prefetch_window,
             prefetch_in_progress: AtomicBool::new(false),
             runtime_handle,
             prefetch_lock: TokioMutex::new(()),
-            next_row_offset: AtomicI64::new(0),
+            next_row_offset: AtomicI64::new(next_row_offset),
         }
     }
 
@@ -321,43 +343,66 @@ impl SeaChunkLinkFetcher {
                 .await
             {
                 Ok(result) => {
-                    // Cache the new links and track highest index
-                    let mut max_chunk_index = server_fetch_idx - 1;
+                    // Cache the new links.
                     for link in &result.links {
-                        max_chunk_index = max_chunk_index.max(link.chunk_index);
                         self.links.insert(link.chunk_index, link.clone());
                     }
 
-                    // Update next server fetch index
-                    let new_next_index = max_chunk_index + 1;
-                    self.next_server_fetch_index
-                        .fetch_max(new_next_index, Ordering::Release);
-
-                    // Update row offset if provided
-                    if let Some(offset) = result.next_row_offset {
-                        self.next_row_offset.store(offset, Ordering::Release);
-                    }
-
-                    debug!(
-                        "Prefetch loop: fetched {} links (chunks up to {}), next_server_fetch={}",
-                        result.links.len(),
-                        max_chunk_index,
-                        new_next_index
-                    );
-
-                    // Check if we've fetched all links
-                    if let Some(total) = self.total_chunk_count {
-                        if new_next_index >= total {
-                            debug!(
-                                "Prefetch loop: all links fetched (up to chunk {}, total={})",
-                                max_chunk_index, total
-                            );
-                            self.all_links_fetched.store(true, Ordering::Release);
-                            break;
+                    // The server-emitted `next_chunk_index` on the
+                    // last link in the batch is the continuation
+                    // signal. Absent (`None`) → no more chunks;
+                    // present → that's the next chunk_index to ask
+                    // for. We never synthesise `chunk_index + 1` —
+                    // the bounded SEA API contract makes the server
+                    // the source of truth for chunk boundaries.
+                    //
+                    // Note on parallel downloads: setting
+                    // `all_links_fetched = true` here just stops the
+                    // *prefetch loop*. In-flight chunk downloads
+                    // continue independently (see streaming_provider
+                    // and its `end_of_stream` flag, which it
+                    // explicitly checks alongside whether the
+                    // current chunk is still in its in-memory cache
+                    // before returning end-of-stream to the caller).
+                    if let Some(last_link) = result.links.last() {
+                        let next_row_offset = last_link.row_offset + last_link.row_count;
+                        self.next_row_offset
+                            .store(next_row_offset, Ordering::Release);
+                        match last_link.next_chunk_index {
+                            Some(idx) => {
+                                self.next_server_fetch_index
+                                    .fetch_max(idx, Ordering::Release);
+                                debug!(
+                                    "Prefetch loop: fetched {} links (last chunk {}), \
+                                     next_server_fetch={}, next_row_offset={}",
+                                    result.links.len(),
+                                    last_link.chunk_index,
+                                    idx,
+                                    next_row_offset,
+                                );
+                            }
+                            None => {
+                                debug!(
+                                    "Prefetch loop: end-of-stream marker on link {} \
+                                     (next_chunk_index absent); link discovery done",
+                                    last_link.chunk_index,
+                                );
+                                self.all_links_fetched.store(true, Ordering::Release);
+                                break;
+                            }
                         }
                     } else if !result.has_more {
-                        debug!("Prefetch loop: no more links (has_more=false)");
+                        // Defensive: server returned no links and
+                        // signalled no more. Treat as end-of-stream
+                        // for link discovery.
+                        debug!("Prefetch loop: empty response with has_more=false");
                         self.all_links_fetched.store(true, Ordering::Release);
+                        break;
+                    } else {
+                        // Empty batch but `has_more` — server hiccup
+                        // or the prefetcher got rate-limited. Bail
+                        // and let the consumer-driven path retry.
+                        debug!("Prefetch loop: empty batch with has_more=true; bailing");
                         break;
                     }
                 }
@@ -422,17 +467,17 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         // Trigger async prefetch if needed (non-blocking)
         self.inner.maybe_trigger_prefetch();
 
-        // If we already have all links, return what we have from cache
+        // If we already have all links, return what we have from cache.
+        // Walk contiguously from `start_chunk_index` until we hit a
+        // gap — that handles both the known case (server returned
+        // contiguous chunk_index = 0,1,2,...) and any future hole
+        // without depending on `total_chunk_count`.
         if fetcher.all_links_fetched.load(Ordering::Acquire) {
-            // Return cached links starting from start_chunk_index
             let mut links = Vec::new();
-            let total = fetcher.total_chunk_count.unwrap_or(i64::MAX);
-            for i in start_chunk_index..total {
-                if let Some(link) = fetcher.links.get(&i) {
-                    links.push(link.clone());
-                } else {
-                    break;
-                }
+            let mut i = start_chunk_index;
+            while let Some(link) = fetcher.links.get(&i) {
+                links.push(link.clone());
+                i += 1;
             }
             return Ok(ChunkLinkFetchResult {
                 links,
@@ -476,47 +521,50 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             .get_result_chunks(&fetcher.statement_id, start_chunk_index, start_row_offset)
             .await?;
 
-        // Cache the new links and track highest index
-        let mut max_chunk_index = start_chunk_index - 1;
+        // Cache the new links.
         for link in &result.links {
-            max_chunk_index = max_chunk_index.max(link.chunk_index);
             fetcher.links.insert(link.chunk_index, link.clone());
         }
 
-        // Update next server fetch index
-        let new_next_index = max_chunk_index + 1;
-        fetcher
-            .next_server_fetch_index
-            .fetch_max(new_next_index, Ordering::Release);
-
-        // Update row offset if provided
-        if let Some(offset) = result.next_row_offset {
-            fetcher.next_row_offset.store(offset, Ordering::Release);
-        }
-
-        // Check if we've fetched all links based on total_chunk_count
-        if let Some(total) = fetcher.total_chunk_count {
-            if new_next_index >= total {
-                debug!(
-                    "SeaChunkLinkFetcher: all links fetched (up to chunk {}, total={})",
-                    max_chunk_index, total
-                );
-                fetcher.all_links_fetched.store(true, Ordering::Release);
+        // Advance `next_server_fetch_index` / `next_row_offset` from
+        // the *last link's* server-emitted metadata. End-of-stream
+        // (for link discovery) is the absence of `next_chunk_index`
+        // on the last link in the batch — never derived from
+        // `total_chunk_count` or `chunk_index + 1` arithmetic.
+        let next_chunk_index = match result.links.last() {
+            Some(last_link) => {
+                let next_row_offset = last_link.row_offset + last_link.row_count;
+                fetcher
+                    .next_row_offset
+                    .store(next_row_offset, Ordering::Release);
+                match last_link.next_chunk_index {
+                    Some(idx) => {
+                        fetcher
+                            .next_server_fetch_index
+                            .fetch_max(idx, Ordering::Release);
+                        Some(idx)
+                    }
+                    None => {
+                        fetcher.all_links_fetched.store(true, Ordering::Release);
+                        None
+                    }
+                }
             }
-        } else if !result.has_more {
-            fetcher.all_links_fetched.store(true, Ordering::Release);
-        }
+            None => {
+                // Empty response. Trust the server's `has_more`.
+                if !result.has_more {
+                    fetcher.all_links_fetched.store(true, Ordering::Release);
+                }
+                None
+            }
+        };
 
-        // Return result with corrected has_more based on our tracking
+        let has_more = !fetcher.all_links_fetched.load(Ordering::Acquire);
         Ok(ChunkLinkFetchResult {
             links: result.links,
-            has_more: !fetcher.all_links_fetched.load(Ordering::Acquire),
-            next_chunk_index: if fetcher.all_links_fetched.load(Ordering::Acquire) {
-                None
-            } else {
-                Some(new_next_index)
-            },
-            next_row_offset: result.next_row_offset,
+            has_more,
+            next_chunk_index: if has_more { next_chunk_index } else { None },
+            next_row_offset: Some(fetcher.next_row_offset.load(Ordering::Acquire)),
         })
     }
 
@@ -748,6 +796,10 @@ mod tests {
         }
     }
 
+    /// Test link with `next_chunk_index = Some(chunk_index + 1)`.
+    /// Use [`create_test_link_terminal`] for the final link of a
+    /// stream so the bounded-API end-of-stream sentinel is set
+    /// correctly.
     fn create_test_link(chunk_index: i64) -> CloudFetchLink {
         CloudFetchLink {
             url: format!("https://storage.example.com/chunk{}", chunk_index),
@@ -761,32 +813,48 @@ mod tests {
         }
     }
 
+    /// Final link in a stream. `next_chunk_index = None` marks
+    /// end-of-stream for link discovery (the kernel's contract per
+    /// the bounded SEA API doc).
+    fn create_test_link_terminal(chunk_index: i64) -> CloudFetchLink {
+        CloudFetchLink {
+            next_chunk_index: None,
+            ..create_test_link(chunk_index)
+        }
+    }
+
     #[tokio::test]
     async fn test_sea_link_fetcher_fetch_links() {
+        // Mock server returns chunks 0, 1, 2 with 2 being terminal.
+        // Note: because the handle's constructor immediately triggers
+        // an async prefetch, the cache may already be fully
+        // populated by the time we call `fetch_links` below. So we
+        // assert on the *first* link of the returned set rather than
+        // a strict length: prefetch-completed and prefetch-pending
+        // both produce correct kernel behaviour, just different
+        // batch sizes.
         let links = vec![
             vec![create_test_link(0)],
             vec![create_test_link(1)],
-            vec![create_test_link(2)],
+            vec![create_test_link_terminal(2)],
         ];
         let client = Arc::new(MockDatabricksClient::new(links));
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &[], // no initial links
-            Some(3),
             128,
             tokio::runtime::Handle::current(),
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
-        // Fetch first chunk
+        // Fetch starting at chunk 0: first link in the result should
+        // be chunk 0, and there is more to come.
         let result = handle.fetch_links(0, 0).await.unwrap();
-        assert_eq!(result.links.len(), 1);
+        assert!(!result.links.is_empty());
         assert_eq!(result.links[0].chunk_index, 0);
-        assert!(result.has_more);
-        assert_eq!(result.next_chunk_index, Some(1));
 
-        // Fetch last chunk
+        // Fetching from the last chunk index: only that link, no more.
         let result = handle.fetch_links(2, 0).await.unwrap();
         assert_eq!(result.links.len(), 1);
         assert_eq!(result.links[0].chunk_index, 2);
@@ -799,17 +867,17 @@ mod tests {
         let links = vec![
             vec![create_test_link(0)],
             vec![create_test_link(1)],
-            vec![create_test_link(2)],
+            vec![create_test_link_terminal(2)],
         ];
         let client = Arc::new(MockDatabricksClient::new(links));
 
-        // Provide initial links (chunk 0)
+        // Initial link points at chunk 1 next; not terminal so the
+        // fetcher knows more is coming.
         let initial_links = vec![create_test_link(0)];
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &initial_links,
-            Some(3),
             128,
             tokio::runtime::Handle::current(),
         );
@@ -826,13 +894,13 @@ mod tests {
 
     #[tokio::test]
     async fn test_sea_link_fetcher_fetch_links_end_of_stream() {
-        let links = vec![vec![create_test_link(0)]];
+        // Single terminal chunk.
+        let links = vec![vec![create_test_link_terminal(0)]];
         let client = Arc::new(MockDatabricksClient::new(links));
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &[],
-            Some(1),
             128,
             tokio::runtime::Handle::current(),
         );
@@ -850,15 +918,14 @@ mod tests {
         // When refetch_link(chunk_index, _) is called, it fetches chunk[chunk_index] from the server
         // and searches for a link with matching chunk_index
         let links = vec![
-            vec![create_test_link(0)], // chunk 0 contains link for chunk 0
-            vec![create_test_link(1)], // chunk 1 contains link for chunk 1
+            vec![create_test_link(0)],          // non-terminal
+            vec![create_test_link_terminal(1)], // terminal
         ];
         let client = Arc::new(MockDatabricksClient::new(links));
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &[],
-            Some(2),
             128,
             tokio::runtime::Handle::current(),
         );
@@ -874,13 +941,12 @@ mod tests {
 
     #[tokio::test]
     async fn test_sea_link_fetcher_refetch_link_not_found() {
-        let links = vec![vec![create_test_link(0)]];
+        let links = vec![vec![create_test_link_terminal(0)]];
         let client = Arc::new(MockDatabricksClient::new(links));
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &[],
-            Some(1),
             128,
             tokio::runtime::Handle::current(),
         );
@@ -893,16 +959,17 @@ mod tests {
 
     #[tokio::test]
     async fn test_sea_link_fetcher_all_links_fetched_flag() {
-        let links = vec![vec![create_test_link(0)]];
+        let links = vec![vec![create_test_link_terminal(0)]];
         let client = Arc::new(MockDatabricksClient::new(links));
 
-        // Provide all initial links (total_chunk_count = 1)
-        let initial_links = vec![create_test_link(0)];
+        // Initial link is terminal — fetcher should detect
+        // all_links_fetched at construction time without ever
+        // hitting the mock server.
+        let initial_links = vec![create_test_link_terminal(0)];
         let fetcher = SeaChunkLinkFetcher::new(
             client,
             "test-statement",
             &initial_links,
-            Some(1), // total_chunk_count = 1, and we have chunk 0
             128,
             tokio::runtime::Handle::current(),
         );

@@ -151,19 +151,14 @@ impl ResultReaderFactory {
             // Priority 1: CloudFetch (external_links present)
             if let Some(ref external_links) = result.external_links {
                 if !external_links.is_empty() {
-                    let total_chunk_count =
-                        response.manifest.as_ref().and_then(|m| m.total_chunk_count);
-
                     tracing::info!(
-                        "Using CloudFetch reader: {} external links, total_chunks={:?}",
+                        "Using CloudFetch reader: {} initial external links",
                         external_links.len(),
-                        total_chunk_count
                     );
 
                     return self.create_cloudfetch_reader(
                         statement_id,
                         external_links,
-                        total_chunk_count,
                         compression,
                     );
                 }
@@ -262,22 +257,22 @@ impl ResultReaderFactory {
         &self,
         statement_id: &str,
         external_links: &[CloudFetchLink],
-        total_chunk_count: Option<i64>,
         compression: CompressionCodec,
     ) -> Result<Box<dyn ResultReader + Send>> {
         tracing::debug!(
-            "Creating CloudFetch reader: {} initial links, total_chunks={:?}, prefetch_window={}",
+            "Creating CloudFetch reader: {} initial links, prefetch_window={}",
             external_links.len(),
-            total_chunk_count,
             self.config.link_prefetch_window
         );
 
-        // Create link fetcher with caching and prefetching built-in
+        // Create link fetcher with caching and prefetching built-in.
+        // End-of-stream is derived from `next_chunk_index` on each
+        // link (per the bounded SEA API contract), so the manifest's
+        // `total_chunk_count` is no longer plumbed through.
         let fetcher = SeaChunkLinkFetcher::new(
             self.client.clone(),
             statement_id.to_string(),
             external_links,
-            total_chunk_count,
             self.config.link_prefetch_window as i64,
             self.runtime_handle.clone(),
         );
