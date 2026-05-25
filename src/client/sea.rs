@@ -368,14 +368,15 @@ impl SeaRestTransport {
             .await?;
         let response = self.wait_for_completion(response).await?;
         let reader_factory = self.reader_factory()?;
-        // `create_reader` wraps in a `ManifestAugmentingReader`
+        // `create_reader` wraps in a `ResultPostProcessor`
         // internally, so the reader returned here already carries
         // the server-reported per-column metadata
         // (`databricks.type_name` etc.) on its schema and on every
         // emitted batch. Bindings (PySQL, future ADBC) read those
         // attributes to recover the precise type for columns whose
         // Arrow shape collapses (VARIANT → Utf8, intervals → Interval,
-        // GEOMETRY/GEOGRAPHY → Utf8).
+        // GEOMETRY/GEOGRAPHY → Utf8). The post-processor also handles
+        // the optional complex-types-as-JSON rewrite in the same pass.
         let reader = reader_factory.create_reader(&response.statement_id, &response)?;
 
         // `server_state` carries the terminal state forward so the
