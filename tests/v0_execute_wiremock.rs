@@ -302,10 +302,18 @@ async fn execute_validates_missing_sql() {
 }
 
 #[tokio::test]
-async fn execute_rejects_named_params_in_v0() {
+async fn execute_sends_named_params_in_wire_form() {
+    // Named binding is the spec-required public form (canonical SEA
+    // proto marks `StatementParameter.name` as openapi_required=true).
+    // The kernel must forward `StatementSpec.named_params` to the
+    // SEA `parameters` array with `name` set and `ordinal` omitted.
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = str_batch("v", vec!["bound"]);
+    mount_execute(&server, succeeded_inline_body("stmt-named", &batch)).await;
 
     let session = open_session(&server).await;
     let mut stmt = session.statement();
@@ -313,12 +321,10 @@ async fn execute_rejects_named_params_in_v0() {
         .sql("SELECT :x")
         .param_named("x", TypedValue::Int64(1))
         .expect("param_named");
-    let err = match stmt.execute().await {
-        Ok(_) => panic!("named params not yet wired on the wire"),
-        Err(e) => e,
-    };
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
-    assert!(err.message.contains("named"), "{}", err.message);
+    let mut exec = stmt.execute().await.expect("execute with named params");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches[0].num_rows(), 1);
+    exec.close().await.expect("close");
 }
 
 #[tokio::test]
