@@ -28,7 +28,7 @@ use arrow_array::RecordBatch;
 use reqwest::Method;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, warn};
+use tracing::{debug, instrument, warn};
 
 /// Downloads Arrow data from cloud storage presigned URLs.
 ///
@@ -70,6 +70,17 @@ impl ChunkDownloader {
     ///
     /// # Returns
     /// Parsed RecordBatches from the downloaded Arrow IPC data
+    #[instrument(
+        name = "cloudfetch.download",
+        skip_all,
+        fields(
+            chunk_index = link.chunk_index,
+            byte_count_expected = link.byte_count,
+            byte_count_actual = tracing::field::Empty,
+            download_ms = tracing::field::Empty,
+            batches = tracing::field::Empty,
+        )
+    )]
     pub async fn download(&self, link: &CloudFetchLink) -> Result<Vec<RecordBatch>> {
         let start = Instant::now();
 
@@ -105,6 +116,10 @@ impl ChunkDownloader {
         let size_mb = bytes.len() as f64 / 1024.0 / 1024.0;
         let speed_mbps = size_mb / elapsed.as_secs_f64();
 
+        let span = tracing::Span::current();
+        span.record("byte_count_actual", bytes.len() as u64);
+        span.record("download_ms", elapsed.as_millis() as u64);
+
         debug!(
             "Downloaded chunk {}: {:.2} MB in {:.2}s ({:.2} MB/s)",
             link.chunk_index,
@@ -122,6 +137,8 @@ impl ChunkDownloader {
 
         // Parse Arrow IPC data
         let batches = parse_arrow_ipc(&bytes, self.compression)?;
+
+        span.record("batches", batches.len() as u64);
 
         debug!(
             "Parsed chunk {}: {} batches, {} total rows",

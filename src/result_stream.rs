@@ -57,6 +57,7 @@ use arrow_array::{Array, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{NaiveDate, NaiveDateTime};
 use std::sync::Arc;
+use tracing::instrument;
 
 /// Cheap-clone reference to a result schema. The kernel hands one
 /// `Arc<Schema>` per result stream out of the wrapped reader; callers
@@ -510,17 +511,28 @@ impl ResultStream {
     /// network-driving variants). The `async fn` signature is the
     /// **forward-compatible** API the spec mandates; PR 5 swaps the
     /// body for a real async path without breaking callers.
+    #[instrument(
+        name = "result_stream.next_batch",
+        skip_all,
+        fields(
+            rows = tracing::field::Empty,
+            exhausted = tracing::field::Empty,
+        )
+    )]
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.exhausted {
+            tracing::Span::current().record("exhausted", true);
             return Ok(None);
         }
         match self.reader.next_batch()? {
             Some(rb) => {
+                tracing::Span::current().record("rows", rb.num_rows() as u64);
                 self.current = Some(ResultBatch::Arrow(rb));
                 self.current_row_idx = 0;
                 Ok(self.current.as_ref())
             }
             None => {
+                tracing::Span::current().record("exhausted", true);
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;

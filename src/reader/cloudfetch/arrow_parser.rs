@@ -26,6 +26,7 @@ use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use lz4_flex::frame::FrameDecoder;
 use std::io::{Cursor, Read};
+use tracing::instrument;
 
 /// Parse Arrow IPC data into RecordBatches.
 ///
@@ -47,8 +48,24 @@ use std::io::{Cursor, Read};
 /// # Errors
 /// - If LZ4 decompression fails
 /// - If Arrow IPC parsing fails
+#[instrument(
+    name = "arrow.parse_ipc",
+    skip_all,
+    fields(
+        input_bytes = data.len(),
+        compression = ?compression,
+        decompressed_bytes = tracing::field::Empty,
+        decompress_us = tracing::field::Empty,
+        parse_us = tracing::field::Empty,
+        batches = tracing::field::Empty,
+        rows = tracing::field::Empty,
+    )
+)]
 pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec<RecordBatch>> {
+    let span = tracing::Span::current();
+
     // 1. Decompress if needed
+    let decompress_start = std::time::Instant::now();
     let decompressed: Vec<u8>;
     let bytes: &[u8] = match compression {
         CompressionCodec::Lz4Frame => {
@@ -62,8 +79,14 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
         }
         CompressionCodec::None => data,
     };
+    span.record("decompressed_bytes", bytes.len() as u64);
+    span.record(
+        "decompress_us",
+        decompress_start.elapsed().as_micros() as u64,
+    );
 
     // 2. Parse Arrow IPC stream
+    let parse_start = std::time::Instant::now();
     let cursor = Cursor::new(bytes);
     let reader = StreamReader::try_new(cursor, None)
         .map_err(|e| Error::io().message(format!("Failed to create Arrow IPC reader: {}", e)))?;
@@ -73,6 +96,12 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::io().message(format!("Failed to read Arrow batches: {}", e)))?;
+    span.record("parse_us", parse_start.elapsed().as_micros() as u64);
+    span.record("batches", batches.len() as u64);
+    span.record(
+        "rows",
+        batches.iter().map(|b| b.num_rows()).sum::<usize>() as u64,
+    );
 
     Ok(batches)
 }

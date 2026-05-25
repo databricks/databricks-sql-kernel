@@ -37,7 +37,7 @@ use crate::types::sea::StatementState;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{warn, Instrument};
+use tracing::{instrument, warn, Instrument};
 
 /// Server-side execution status.
 ///
@@ -177,6 +177,15 @@ impl ExecutedAsyncStatement {
     /// terminal state, returns `Error::timeout()` (same shape the
     /// sync polling path produces). The caller may issue a fresh
     /// `status()` or `await_result()` to resume.
+    #[instrument(
+        name = "async.await_result",
+        skip_all,
+        fields(
+            statement_id = %self.statement_id,
+            poll_count = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+        )
+    )]
     pub async fn await_result(&self) -> Result<ResultStream> {
         let _g = self.session.log_span().clone().entered();
         self.valid.check()?;
@@ -186,6 +195,8 @@ impl ExecutedAsyncStatement {
         // a caller's `SessionBuilder` tuning applies to both modes.
         let cfg = self.session.transport().poll_config();
         let start = std::time::Instant::now();
+        let mut poll_count: u32 = 0;
+        let span = tracing::Span::current();
 
         // RAII guard: if the future is dropped mid-poll (timeout,
         // tokio::select! loser, task cancellation), spawn a
@@ -204,22 +215,30 @@ impl ExecutedAsyncStatement {
                 .await?;
             match StatementStatus::from_sea_response(&response) {
                 StatementStatus::Succeeded | StatementStatus::Closed => {
+                    span.record("poll_count", poll_count);
+                    span.record("elapsed_ms", start.elapsed().as_millis() as u64);
                     cancel_guard.defuse();
                     return self.materialise_result().await;
                 }
                 StatementStatus::Failed(e) => {
+                    span.record("poll_count", poll_count);
+                    span.record("elapsed_ms", start.elapsed().as_millis() as u64);
                     // Server already decided this is terminal — no
                     // need to fire a redundant cancel.
                     cancel_guard.defuse();
                     return Err(e);
                 }
                 StatementStatus::Cancelled => {
+                    span.record("poll_count", poll_count);
+                    span.record("elapsed_ms", start.elapsed().as_millis() as u64);
                     cancel_guard.defuse();
                     return Err(Error::invalid_state()
                         .message(format!("Statement {} was cancelled", self.statement_id)));
                 }
                 StatementStatus::Pending | StatementStatus::Running => {
                     if start.elapsed() > cfg.poll_timeout {
+                        span.record("poll_count", poll_count);
+                        span.record("elapsed_ms", start.elapsed().as_millis() as u64);
                         // Internal poll-timeout: we asked to wait,
                         // we gave up. Leave the cancel guard armed
                         // so the server stops charging DBUs on the
@@ -230,6 +249,7 @@ impl ExecutedAsyncStatement {
                             self.statement_id, cfg.poll_timeout
                         )));
                     }
+                    poll_count += 1;
                     tokio::time::sleep(cfg.poll_interval).await;
                 }
             }

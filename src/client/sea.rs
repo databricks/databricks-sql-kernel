@@ -35,7 +35,7 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
-use tracing::debug;
+use tracing::{debug, instrument};
 
 /// Internal terminal-outcome for a single SEA statement response.
 ///
@@ -253,20 +253,42 @@ impl SeaRestTransport {
     }
 
     /// Wait for statement to complete, polling status.
+    #[instrument(
+        name = "sea.wait_for_completion",
+        skip_all,
+        fields(
+            statement_id = %response.statement_id,
+            poll_count = tracing::field::Empty,
+            elapsed_ms = tracing::field::Empty,
+        )
+    )]
     async fn wait_for_completion(&self, response: ExecuteResponse) -> Result<ExecuteResponse> {
         let start = std::time::Instant::now();
         let mut current_response = response;
+        let mut poll_count: u32 = 0;
+        let span = tracing::Span::current();
 
         loop {
             match Self::terminal_outcome(current_response) {
-                StatementOutcome::Done(r) => return Ok(r),
-                StatementOutcome::Err(e) => return Err(e),
+                StatementOutcome::Done(r) => {
+                    span.record("poll_count", poll_count);
+                    span.record("elapsed_ms", start.elapsed().as_millis() as u64);
+                    return Ok(r);
+                }
+                StatementOutcome::Err(e) => {
+                    span.record("poll_count", poll_count);
+                    span.record("elapsed_ms", start.elapsed().as_millis() as u64);
+                    return Err(e);
+                }
                 StatementOutcome::NotReady(r) => {
                     if start.elapsed() > self.config.poll_timeout {
+                        span.record("poll_count", poll_count);
+                        span.record("elapsed_ms", start.elapsed().as_millis() as u64);
                         return Err(Error::timeout().message("Statement execution timed out"));
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
+                    poll_count += 1;
                     debug!("Polling statement status: {}", r.statement_id);
                     current_response = self.get_statement_status(&r.statement_id).await?;
                 }
@@ -275,6 +297,15 @@ impl SeaRestTransport {
     }
 
     /// Call the execute statement API endpoint (without polling or reader creation).
+    #[instrument(
+        name = "sea.call_execute_api",
+        skip_all,
+        fields(
+            session_id = %session_id,
+            sql_len = sql.len(),
+            request_type = ?request_type,
+        )
+    )]
     async fn call_execute_api(
         &self,
         session_id: &str,
