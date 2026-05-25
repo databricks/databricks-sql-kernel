@@ -527,3 +527,69 @@ async fn row_accessors_walk_succeeded_result() {
     assert!(stream.next_row_in_batch().is_none());
     exec.close().await.expect("close");
 }
+
+// ─── Cancel-after-parent-drop regression guard (PR #25 / #29) ─────
+//
+// Pins the kernel-level contract that the napi binding (PR #29) must
+// counteract.
+//
+// The kernel `Statement` (mutable) shares a `ValidityFlag` with each
+// `ExecutedStatement` / `ExecutedAsyncStatement` it produces. Dropping
+// the parent calls `valid.invalidate()` on that shared flag — so any
+// subsequent `ExecutedStatement::cancel` short-circuits locally with
+// `KernelError(InvalidStatementHandle)` without a wire round-trip.
+//
+// `close()` is **not** validity-checked: dropping the parent still
+// lets the server-side `CloseStatement` round-trip run so the server
+// resource is released. The asymmetry is intentional — cancel must
+// be cheap on a zombie handle (no wire) while close must always
+// reach the server when possible.
+//
+// The cancel-lifecycle bug surfaced by PR #25 is that the napi
+// `Connection::execute_statement` wrapper drops the parent kernel
+// `Statement` at end of its closure, leaving the JS-visible
+// `Statement` holding only the `ExecutedStatement`. The next
+// `Statement.cancel()` from JS hits the short-circuit above and
+// returns `InvalidStatementHandle`.
+//
+// PR #29 fixes the binding by wrapping the inner state in a
+// `StatementInner { _parent, executed }` struct that keeps the
+// parent alive for the wrapper's lifetime.
+//
+// This test pins the **kernel invariant** the fix is designed
+// around. If the kernel ever weakens the parent-drop semantics
+// (e.g. doesn't invalidate on Drop), this test fails loudly and
+// the binding's fix can be reviewed for whether it's still needed.
+// If the kernel keeps the semantics, the binding-side regression
+// guard (added separately once #29 lands) holds the binding to
+// account.
+
+#[tokio::test]
+async fn kernel_invariant_parent_drop_invalidates_executed_cancel() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-parent-drop", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let exec = stmt.execute().await.expect("execute");
+
+    // This is the exact shape the napi binding's
+    // `Connection::execute_statement` produces today (PR #25): the
+    // kernel `Statement` (`stmt`) is dropped at end of the closure
+    // while the caller keeps holding the `ExecutedStatement`
+    // (`exec`). PR #29 fixes the binding by stashing `stmt` alongside
+    // `exec` so the parent outlives the executed handle.
+    drop(stmt);
+
+    let err = exec
+        .cancel()
+        .await
+        .expect_err("cancel after parent Statement drop must short-circuit");
+    assert_eq!(err.code, ErrorCode::InvalidStatementHandle);
+}

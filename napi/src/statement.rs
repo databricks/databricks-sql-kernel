@@ -169,8 +169,16 @@ impl Statement {
     /// fetched, and remains available after `close()` — the kernel
     /// materialises the schema eagerly so JS callers can build error
     /// reports against a disposed statement.
+    ///
+    /// Sync because the body has no `.await` — `encode_ipc_stream` is
+    /// pure CPU work over an `Arc<Schema>` already cached on the
+    /// wrapper. Mirrors `pyo3/src/statement.rs::arrow_schema` (sync).
+    /// napi-rs converts a panic in a sync `#[napi]` entry point into a
+    /// thrown JS error via its own macro-expanded boundary, so the
+    /// `util::guarded` `catch_unwind` wrapper that the `async fn`
+    /// entry points use is not required for this method.
     #[napi]
-    pub async fn schema(&self) -> napi::Result<ArrowSchema> {
+    pub fn schema(&self) -> napi::Result<ArrowSchema> {
         let bytes = encode_ipc_stream(&self.schema, None)?;
         Ok(ArrowSchema {
             ipc_bytes: bytes.into(),
@@ -207,9 +215,18 @@ impl Statement {
     /// network error, server-side error). Idempotent — a second call
     /// on an already-closed statement returns `Ok`.
     ///
-    /// On `Err`, the kernel leaves its internal `closed` flag false
-    /// so `Drop`'s fire-and-forget cleanup retries; the caller still
-    /// sees the error and can surface it to logs / telemetry.
+    /// **Errors are terminal from the JS side.** The kernel executed
+    /// handle is taken out of `inner` BEFORE the wire `CloseStatement`
+    /// runs (so `Drop` knows there's nothing left to clean up). On
+    /// `Err`, the napi `inner` is already `None`, so a JS-side retry
+    /// sees a closed statement and returns `Ok(())` without re-
+    /// attempting the wire call. The kernel-level `ExecutedStatement`
+    /// has been consumed at that point and the value is dropped on
+    /// the way out of the closure — the kernel's `ExecutedStatement::
+    /// Drop` then fires-and-forgets a single retry on the captured
+    /// runtime. The JS caller can log the error but cannot drive a
+    /// further retry. If you need retry-on-failure semantics for
+    /// `CloseStatement`, layer them above this method.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -285,7 +302,16 @@ fn encode_ipc_stream(
     fn arrow_err(e: impl std::fmt::Display) -> napi::Error {
         napi::Error::new(napi::Status::GenericFailure, e.to_string())
     }
-    let mut buf: Vec<u8> = Vec::new();
+    // Pre-size the buffer so a typical 500KB batch doesn't reallocate
+    // ~17 times growing from `Vec::new()`'s default capacity of 0.
+    // `get_array_memory_size` is the kernel-side memory footprint (close
+    // enough to the IPC-encoded size for capacity-hint purposes — IPC
+    // adds ~hundreds of bytes of framing per batch, not orders of
+    // magnitude). 4 KiB slack covers the schema-header on the
+    // schema-only path (`batch = None`) and the framing overhead on
+    // the schema+batch path.
+    let estimated = batch.map(|rb| rb.get_array_memory_size()).unwrap_or(0) + 4096;
+    let mut buf: Vec<u8> = Vec::with_capacity(estimated);
     {
         let mut writer = StreamWriter::try_new(&mut buf, schema).map_err(arrow_err)?;
         if let Some(rb) = batch {

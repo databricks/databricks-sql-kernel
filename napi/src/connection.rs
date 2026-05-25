@@ -111,9 +111,15 @@ impl Connection {
     /// warehouse stopped, network error). Idempotent — a second call
     /// on an already-closed connection returns `Ok`.
     ///
-    /// On `Err`, the kernel leaves its internal `closed` flag false
-    /// so `Drop`'s fire-and-forget cleanup retries; the caller still
-    /// sees the error and can surface it to logs / telemetry.
+    /// **Errors are terminal from the JS side.** The kernel session
+    /// handle is consumed (`take()`) BEFORE the wire `DeleteSession`
+    /// runs, because `Session::close` takes `self` by value. On `Err`,
+    /// the napi `inner` is already `None`, so a JS-side retry sees a
+    /// closed connection and returns `Ok(())` without re-attempting
+    /// the wire call. The kernel's own `Drop` fire-and-forget retry
+    /// runs once in the background — the JS caller can log the error
+    /// but cannot drive a retry. If you need retry-on-failure
+    /// semantics for `DeleteSession`, layer them above this method.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);

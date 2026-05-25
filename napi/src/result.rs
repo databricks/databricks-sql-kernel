@@ -25,6 +25,8 @@ use napi::bindgen_prelude::Buffer;
 /// the schema header so the JS-side reader is stateless).
 #[napi(object)]
 pub struct ArrowBatch {
+    /// Arrow IPC stream payload (schema header + 1 record-batch
+    /// message). Decode with `apache-arrow`'s `RecordBatchReader`.
     pub ipc_bytes: Buffer,
 }
 
@@ -32,5 +34,8 @@ pub struct ArrowBatch {
 /// record-batch messages). Returned by `Statement.schema()`.
 #[napi(object)]
 pub struct ArrowSchema {
+    /// Arrow IPC stream payload (schema header only, no record-batch
+    /// messages). Decode with `apache-arrow`'s `RecordBatchReader` —
+    /// the reader will expose the schema and immediately end.
     pub ipc_bytes: Buffer,
 }
