@@ -393,6 +393,11 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
             Some(ts.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()),
         ),
         TypedValue::Interval(s) => ok("INTERVAL", Some(s.clone())),
+        // `VARIANT` — pass-through. The kernel doesn't validate the
+        // JSON; the server parses on receipt and rejects malformed
+        // input with its own error. The connector or caller is
+        // expected to have produced valid JSON.
+        TypedValue::Variant(s) => ok("VARIANT", Some(s.clone())),
     }
 }
 
@@ -924,5 +929,21 @@ mod tests {
         assert_eq!(p.param_type, "TIMESTAMP_LTZ");
         // `Z` suffix; ISO-8601 `T` separator (LTZ convention).
         assert_eq!(p.value.as_deref(), Some("2026-05-07T12:00:00Z"));
+    }
+
+    #[test]
+    fn typed_value_variant_emits_json_pass_through() {
+        // Object form.
+        let json = r#"{"k":1,"nested":{"a":[true,null,"x"]}}"#;
+        let p = typed_value_to_sea_parameter(1, &TypedValue::Variant(json.into())).unwrap();
+        assert_eq!(p.param_type, "VARIANT");
+        assert_eq!(p.value.as_deref(), Some(json));
+
+        // Scalar JSON values are also valid VARIANT contents.
+        for raw in [r#""hello""#, "42", "true", "null"] {
+            let p = typed_value_to_sea_parameter(1, &TypedValue::Variant(raw.into())).unwrap();
+            assert_eq!(p.param_type, "VARIANT");
+            assert_eq!(p.value.as_deref(), Some(raw));
+        }
     }
 }
