@@ -148,14 +148,18 @@ impl ExecutedAsyncStatement {
     /// locally — without hitting the wire — if the parent `Statement`
     /// has already invalidated this handle.
     pub async fn status(&self) -> Result<StatementStatus> {
-        let _g = self.session.log_span().clone().entered();
-        self.valid.check()?;
-        let response = self
-            .session
-            .transport()
-            .statement_status(&self.statement_id)
-            .await?;
-        Ok(StatementStatus::from_sea_response(&response))
+        let span = self.session.log_span().clone();
+        async {
+            self.valid.check()?;
+            let response = self
+                .session
+                .transport()
+                .statement_status(&self.statement_id)
+                .await?;
+            Ok(StatementStatus::from_sea_response(&response))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Block until the server reaches a terminal state, then return
@@ -178,62 +182,66 @@ impl ExecutedAsyncStatement {
     /// sync polling path produces). The caller may issue a fresh
     /// `status()` or `await_result()` to resume.
     pub async fn await_result(&self) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        self.valid.check()?;
-
-        // Poll cadence + ceiling come from the transport's config —
-        // same source the sync `wait_for_completion` path uses, so
-        // a caller's `SessionBuilder` tuning applies to both modes.
-        let cfg = self.session.transport().poll_config();
-        let start = std::time::Instant::now();
-
-        // RAII guard: if the future is dropped mid-poll (timeout,
-        // tokio::select! loser, task cancellation), spawn a
-        // best-effort `cancel_statement` so the server stops
-        // charging DBUs on a now-orphaned query. Defused once we
-        // reach a terminal state on the success or error path.
-        let cancel_guard =
-            AwaitResultCancelGuard::new(Arc::clone(&self.session), self.statement_id.clone());
-
-        loop {
+        let span = self.session.log_span().clone();
+        async {
             self.valid.check()?;
-            let response = self
-                .session
-                .transport()
-                .statement_status(&self.statement_id)
-                .await?;
-            match StatementStatus::from_sea_response(&response) {
-                StatementStatus::Succeeded | StatementStatus::Closed => {
-                    cancel_guard.defuse();
-                    return self.materialise_result().await;
-                }
-                StatementStatus::Failed(e) => {
-                    // Server already decided this is terminal — no
-                    // need to fire a redundant cancel.
-                    cancel_guard.defuse();
-                    return Err(e);
-                }
-                StatementStatus::Cancelled => {
-                    cancel_guard.defuse();
-                    return Err(Error::invalid_state()
-                        .message(format!("Statement {} was cancelled", self.statement_id)));
-                }
-                StatementStatus::Pending | StatementStatus::Running => {
-                    if start.elapsed() > cfg.poll_timeout {
-                        // Internal poll-timeout: we asked to wait,
-                        // we gave up. Leave the cancel guard armed
-                        // so the server stops charging DBUs on the
-                        // now-orphaned query when we return — same
-                        // policy as a caller-initiated future drop.
-                        return Err(Error::timeout().message(format!(
-                            "Statement {} did not reach a terminal state within {:?}",
-                            self.statement_id, cfg.poll_timeout
-                        )));
+
+            // Poll cadence + ceiling come from the transport's config —
+            // same source the sync `wait_for_completion` path uses, so
+            // a caller's `SessionBuilder` tuning applies to both modes.
+            let cfg = self.session.transport().poll_config();
+            let start = std::time::Instant::now();
+
+            // RAII guard: if the future is dropped mid-poll (timeout,
+            // tokio::select! loser, task cancellation), spawn a
+            // best-effort `cancel_statement` so the server stops
+            // charging DBUs on a now-orphaned query. Defused once we
+            // reach a terminal state on the success or error path.
+            let cancel_guard =
+                AwaitResultCancelGuard::new(Arc::clone(&self.session), self.statement_id.clone());
+
+            loop {
+                self.valid.check()?;
+                let response = self
+                    .session
+                    .transport()
+                    .statement_status(&self.statement_id)
+                    .await?;
+                match StatementStatus::from_sea_response(&response) {
+                    StatementStatus::Succeeded | StatementStatus::Closed => {
+                        cancel_guard.defuse();
+                        return self.materialise_result().await;
                     }
-                    tokio::time::sleep(cfg.poll_interval).await;
+                    StatementStatus::Failed(e) => {
+                        // Server already decided this is terminal — no
+                        // need to fire a redundant cancel.
+                        cancel_guard.defuse();
+                        return Err(e);
+                    }
+                    StatementStatus::Cancelled => {
+                        cancel_guard.defuse();
+                        return Err(Error::invalid_state()
+                            .message(format!("Statement {} was cancelled", self.statement_id)));
+                    }
+                    StatementStatus::Pending | StatementStatus::Running => {
+                        if start.elapsed() > cfg.poll_timeout {
+                            // Internal poll-timeout: we asked to wait,
+                            // we gave up. Leave the cancel guard armed
+                            // so the server stops charging DBUs on the
+                            // now-orphaned query when we return — same
+                            // policy as a caller-initiated future drop.
+                            return Err(Error::timeout().message(format!(
+                                "Statement {} did not reach a terminal state within {:?}",
+                                self.statement_id, cfg.poll_timeout
+                            )));
+                        }
+                        tokio::time::sleep(cfg.poll_interval).await;
+                    }
                 }
             }
         }
+        .instrument(span)
+        .await
     }
 
     /// Fetch the result without polling. Errors if the statement has
@@ -243,9 +251,13 @@ impl ExecutedAsyncStatement {
     /// message pointing callers at [`status`](Self::status). Useful
     /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
-        let _g = self.session.log_span().clone().entered();
-        self.valid.check()?;
-        self.materialise_result().await
+        let span = self.session.log_span().clone();
+        async {
+            self.valid.check()?;
+            self.materialise_result().await
+        }
+        .instrument(span)
+        .await
     }
 
     /// Internal: resolve the reader for an (expected to be) terminal
@@ -260,7 +272,7 @@ impl ExecutedAsyncStatement {
             .fetch_completed_result(&self.statement_id)
             .await?
         {
-            Some(result) => ResultStream::from_reader(result.reader),
+            Some(result) => ResultStream::from_reader(result.reader).await,
             None => {
                 // Re-read the status so the error message names the
                 // observed state (Pending vs Running). Best-effort —

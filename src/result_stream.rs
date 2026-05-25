@@ -432,15 +432,19 @@ fn type_mismatch(col: usize, expected: &str, actual: &DataType) -> Error {
 /// the polymorphism is hidden.
 #[non_exhaustive]
 pub struct ResultStream {
-    /// Wrapped synchronous reader. The reader's `next_batch` is
-    /// already sync and does no I/O for in-memory readers; for
-    /// CloudFetch / inline readers it `block_on`s the runtime
-    /// internally. PR 5 generalises this to drive truly-async
-    /// fetches without `block_on`.
+    /// Wrapped async reader. The reader's `next_batch` is `async fn`
+    /// — for in-memory readers the future is immediately ready; for
+    /// CloudFetch it drives the underlying `StreamingCloudFetchProvider`
+    /// directly. No `block_on` is performed anywhere on this path, so
+    /// `ResultStream::next_batch` is safe to `.await` from any tokio
+    /// runtime (including napi-rs's).
     reader: Box<dyn ResultReader>,
 
-    /// Cached schema. Filled in eagerly by [`ResultStream::from_reader`]
-    /// so [`ResultStream::schema`] is non-fallible.
+    /// Cached schema. Filled in eagerly by
+    /// [`ResultStream::from_reader`] (which is `async` because pulling
+    /// the schema from a CloudFetch reader forces the first chunk to
+    /// download) so [`ResultStream::schema`] is non-fallible and
+    /// synchronous.
     schema: SchemaRef,
 
     /// The most recent batch returned by [`ResultStream::next_batch`].
@@ -470,10 +474,13 @@ impl ResultStream {
     ///
     /// Pulls the reader's schema eagerly so `ResultStream::schema`
     /// is non-fallible and available before any batches are
-    /// requested. v0 only ever wraps Arrow-producing readers, so
-    /// every batch is wrapped in [`ResultBatch::Arrow`].
-    pub(crate) fn from_reader(reader: Box<dyn ResultReader>) -> Result<Self> {
-        let schema = reader.schema()?;
+    /// requested. `async` because the CloudFetch reader resolves its
+    /// schema by forcing the first chunk to download; in-memory and
+    /// inline readers resolve immediately. v0 only ever wraps
+    /// Arrow-producing readers, so every batch is wrapped in
+    /// [`ResultBatch::Arrow`].
+    pub(crate) async fn from_reader(reader: Box<dyn ResultReader>) -> Result<Self> {
+        let schema = reader.schema().await?;
         Ok(Self {
             reader,
             schema,
@@ -506,15 +513,15 @@ impl ResultStream {
     /// are non-breaking).
     ///
     /// **v0 implementation note.** The wrapped `ResultReader` is
-    /// synchronous (it `block_on`s internally for the
-    /// network-driving variants). The `async fn` signature is the
-    /// **forward-compatible** API the spec mandates; PR 5 swaps the
-    /// body for a real async path without breaking callers.
+    /// async-native — `next_batch` awaits the underlying provider
+    /// (CloudFetch / inline / in-memory) directly. No `block_on` is
+    /// performed on this path, so calling from a tokio runtime
+    /// (napi-rs, PyO3 async) is safe.
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.exhausted {
             return Ok(None);
         }
-        match self.reader.next_batch()? {
+        match self.reader.next_batch().await? {
             Some(rb) => {
                 self.current = Some(ResultBatch::Arrow(rb));
                 self.current_row_idx = 0;
@@ -583,10 +590,16 @@ impl ResultStream {
     /// where carrying a borrow across a host-language boundary
     /// isn't expressible.
     ///
-    /// The wrapped reader is synchronous (it `block_on`s the
-    /// runtime internally for CloudFetch), so this iterator does
-    /// not need a separate tokio handle — `next()` is a plain
-    /// blocking call. Errors are surfaced once; subsequent calls
+    /// The wrapped reader is async; `next()` drives it via
+    /// [`crate::util::runtime::block_on_current_runtime`], which uses
+    /// `tokio::task::block_in_place` + the current runtime handle when
+    /// called from inside a multi-thread tokio runtime, and falls back
+    /// to `futures::executor::block_on` when no runtime is on the
+    /// thread (e.g. plain Rust callers, the C ABI shim). This keeps
+    /// CloudFetch readers (which await tokio primitives internally)
+    /// safe from the nested-`block_on` panic that motivated issue #19,
+    /// while still letting in-memory readers iterate without a tokio
+    /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
     pub fn into_owned_batches(self) -> OwnedBatchIter {
         OwnedBatchIter {
@@ -614,7 +627,14 @@ impl Iterator for OwnedBatchIter {
         if self.done {
             return None;
         }
-        match self.reader.next_batch() {
+        // Runtime-aware blocking poll: uses block_in_place + the
+        // current Handle when there's a tokio runtime on this thread
+        // (the case for CloudFetch readers, which await tokio
+        // primitives); falls back to futures::executor::block_on for
+        // plain-thread callers driving in-memory readers. Prevents
+        // the nested-block_on panic from issue #19 on the sync
+        // iterator path.
+        match crate::util::runtime::block_on_current_runtime(self.reader.next_batch()) {
             Ok(Some(batch)) => Some(Ok(batch)),
             Ok(None) => {
                 self.done = true;
@@ -645,10 +665,12 @@ mod tests {
         Arc::new(ArrowSchema::new(fields))
     }
 
-    fn stream_with(batch: RecordBatch) -> ResultStream {
+    async fn stream_with(batch: RecordBatch) -> ResultStream {
         let schema = batch.schema();
         let reader = InMemoryReader::new(schema, vec![batch]);
-        ResultStream::from_reader(Box::new(reader)).expect("from_reader")
+        ResultStream::from_reader(Box::new(reader))
+            .await
+            .expect("from_reader")
     }
 
     async fn advance_to_first_row(stream: &mut ResultStream) {
@@ -668,7 +690,7 @@ mod tests {
         let schema = schema_for(vec![Field::new("s", DataType::Utf8, true)]);
         let arr: ArrayRef = Arc::new(StringArray::from(vec![Some("hi"), None]));
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
 
         let r = first_row(&mut stream);
@@ -695,7 +717,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_i64(0).unwrap(), Some(1));
@@ -709,7 +731,7 @@ mod tests {
         let schema = schema_for(vec![Field::new("a", DataType::Int64, false)]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![1_i64]))]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         let err = r.get_i32(0).unwrap_err();
@@ -732,7 +754,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_u8(0).unwrap(), Some(7));
@@ -754,7 +776,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert!((r.get_f64(0).unwrap().unwrap() - 1.5).abs() < f64::EPSILON);
@@ -778,7 +800,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_bool(0).unwrap(), Some(true));
@@ -797,7 +819,7 @@ mod tests {
                 .unwrap(),
         );
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("-123.45"));
@@ -818,7 +840,7 @@ mod tests {
                 .unwrap(),
         );
         let batch = RecordBatch::try_new(schema, vec![arr]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_decimal(0).unwrap().as_deref(), Some("-123.456"));
@@ -848,7 +870,7 @@ mod tests {
             ],
         )
         .unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         assert_eq!(r.get_date(0).unwrap(), Some(date));
@@ -860,7 +882,7 @@ mod tests {
         let schema = schema_for(vec![Field::new("s", DataType::Utf8, false)]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["x"]))]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         let r = first_row(&mut stream);
         let err = r.get_i64(0).unwrap_err();
@@ -873,7 +895,7 @@ mod tests {
         let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1, 2, 3]))]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         advance_to_first_row(&mut stream).await;
         assert_eq!(
             stream
@@ -915,7 +937,7 @@ mod tests {
         .unwrap();
         let b2 = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![30]))]).unwrap();
         let reader = InMemoryReader::new(b1.schema(), vec![b1, b2]);
-        let mut stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+        let mut stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
 
         stream.next_batch().await.unwrap().unwrap();
         assert!(stream.next_row_in_batch().is_some());
@@ -941,7 +963,7 @@ mod tests {
         let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
         let batch =
             RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap();
-        let mut stream = stream_with(batch);
+        let mut stream = stream_with(batch).await;
         // Pull and exhaust.
         stream.next_batch().await.unwrap();
         assert!(stream.next_batch().await.unwrap().is_none());
@@ -949,15 +971,17 @@ mod tests {
         assert!(stream.next_batch().await.unwrap().is_none());
     }
 
-    #[test]
-    fn into_owned_batches_yields_then_terminates() {
-        // Pure-sync iterator path — no tokio needed.
+    #[tokio::test]
+    async fn into_owned_batches_yields_then_terminates() {
+        // Stream construction is async (schema pulled via async fn);
+        // the iterator itself is sync and drives in-memory readers via
+        // `futures::executor::block_on`.
         let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
         let b1 = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1, 2]))])
             .unwrap();
         let b2 = RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![3]))]).unwrap();
         let reader = InMemoryReader::new(b1.schema(), vec![b1.clone(), b2.clone()]);
-        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+        let stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
 
         let mut iter = stream.into_owned_batches();
         let first = iter.next().unwrap().unwrap();
@@ -968,14 +992,14 @@ mod tests {
         assert!(iter.next().is_none(), "still None on subsequent calls");
     }
 
-    #[test]
-    fn into_owned_batches_stops_after_error() {
+    #[tokio::test]
+    async fn into_owned_batches_stops_after_error() {
         // ErrorReader yields one Err then would yield None; iterator
         // surfaces the error once and terminates.
         use crate::reader::test_utils::ErrorReader;
         let schema = schema_for(vec![Field::new("a", DataType::Int32, false)]);
         let reader = ErrorReader { schema };
-        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+        let stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
 
         let mut iter = stream.into_owned_batches();
         let first = iter.next().unwrap();
@@ -984,8 +1008,8 @@ mod tests {
         assert!(iter.next().is_none());
     }
 
-    #[test]
-    fn into_owned_batches_yields_batch_then_error_then_none() {
+    #[tokio::test]
+    async fn into_owned_batches_yields_batch_then_error_then_none() {
         // BatchThenErrorReader: one Ok(Some(batch)), then Err.
         // Iterator must yield the batch, surface the error, then
         // fuse to None forever.
@@ -1000,7 +1024,7 @@ mod tests {
             schema: batch.schema(),
             batch: Some(batch),
         };
-        let stream = ResultStream::from_reader(Box::new(reader)).unwrap();
+        let stream = ResultStream::from_reader(Box::new(reader)).await.unwrap();
 
         let mut iter = stream.into_owned_batches();
         let first = iter.next().expect("first yields a batch");

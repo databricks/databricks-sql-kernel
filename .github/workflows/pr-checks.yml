@@ -100,3 +100,29 @@ jobs:
         # run the v0_*_e2e suites — those are #[ignore]'d and require
         # a live workspace; `rust-e2e.yml` runs them separately.
         run: cargo test --workspace
+
+  check-tls-rustls:
+    name: Build (tls-rustls feature)
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+
+      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
+        with:
+          toolchain: stable
+          components: clippy
+
+      - name: cargo check (tls-rustls)
+        # Default features pull in `tls-native`; the napi binding crate
+        # opts INTO `tls-rustls` instead. Without this job, a feature-
+        # gated cfg typo or a dep update that breaks rustls compilation
+        # would only surface when the downstream napi build breaks.
+        run: cargo check --no-default-features --features tls-rustls
+
+      - name: cargo clippy (tls-rustls)
+        # Keep clippy honest under both backends so warnings caught
+        # under tls-native don't disappear under tls-rustls and vice
+        # versa.
+        run: cargo clippy --no-default-features --features tls-rustls --all-targets -- -D warnings

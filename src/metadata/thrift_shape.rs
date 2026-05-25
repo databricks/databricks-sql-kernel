@@ -633,13 +633,14 @@ impl ThriftReshapingReader {
     }
 }
 
+#[async_trait::async_trait]
 impl ResultReader for ThriftReshapingReader {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        match self.upstream.next_batch()? {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        match self.upstream.next_batch().await? {
             Some(b) => Ok(Some((self.reshape)(&b)?)),
             None => Ok(None),
         }

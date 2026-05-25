@@ -41,6 +41,7 @@ use crate::types::sea::ResultManifest;
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
+use async_trait::async_trait;
 use std::sync::Arc;
 
 /// Optional per-batch transforms the post-processor applies.
@@ -83,12 +84,12 @@ impl ResultPostProcessor {
     /// per-column metadata; `None` for upstreams that don't have one
     /// (e.g. legacy paths). `options` toggles optional transforms
     /// (today: complex-type JSON stringification).
-    pub(crate) fn new(
+    pub(crate) async fn new(
         inner: Box<dyn ResultReader + Send>,
         manifest: Option<&ResultManifest>,
         options: PostProcessOptions,
     ) -> Result<Self> {
-        let inner_schema = inner.schema()?;
+        let inner_schema = inner.schema().await?;
 
         // 1. Compute the output schema after manifest augmentation
         //    (no-op when manifest is None).
@@ -169,13 +170,14 @@ impl ResultPostProcessor {
     }
 }
 
+#[async_trait]
 impl ResultReader for ResultPostProcessor {
-    fn schema(&self) -> Result<SchemaRef> {
+    async fn schema(&self) -> Result<SchemaRef> {
         Ok(self.schema.clone())
     }
 
-    fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
-        let Some(batch) = self.inner.next_batch()? else {
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        let Some(batch) = self.inner.next_batch().await? else {
             return Ok(None);
         };
         match &self.transform {
@@ -299,8 +301,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn pass_through_when_no_manifest_and_json_off() {
+    #[tokio::test]
+    async fn pass_through_when_no_manifest_and_json_off() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -309,16 +311,18 @@ mod tests {
         .unwrap();
         let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
 
-        let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default()).unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
+            .await
+            .unwrap();
         // No transform should have been installed.
         assert!(pp.transform.is_none());
-        let out = pp.next_batch().unwrap().unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.schema().field(0).metadata().len(), 0);
     }
 
-    #[test]
-    fn manifest_only_attaches_metadata_to_batches() {
+    #[tokio::test]
+    async fn manifest_only_attaches_metadata_to_batches() {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
         let batch = RecordBatch::try_new(
             schema.clone(),
@@ -330,10 +334,11 @@ mod tests {
 
         let mut pp =
             ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
+                .await
                 .unwrap();
         assert!(pp.transform.is_some());
 
-        let out = pp.next_batch().unwrap().unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(
             out.schema()
                 .field(0)
@@ -343,8 +348,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn json_path_rewrites_list_column_to_utf8() {
+    #[tokio::test]
+    async fn json_path_rewrites_list_column_to_utf8() {
         // Build a one-row batch with a list<int32> column.
         let mut list_b = ListBuilder::new(arrow_array::builder::Int32Builder::new());
         list_b.values().append_value(1);
@@ -373,14 +378,14 @@ mod tests {
         let opts = PostProcessOptions {
             complex_types_as_json: true,
         };
-        let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, opts).await.unwrap();
 
         // Output schema should expose Utf8 for the complex column.
-        let out_schema = pp.schema().unwrap();
+        let out_schema = pp.schema().await.unwrap();
         assert_eq!(out_schema.field(0).data_type(), &DataType::Utf8);
         assert_eq!(out_schema.field(1).data_type(), &DataType::Int32);
 
-        let out_batch = pp.next_batch().unwrap().unwrap();
+        let out_batch = pp.next_batch().await.unwrap().unwrap();
         let arr = out_batch
             .column(0)
             .as_any()
@@ -396,8 +401,8 @@ mod tests {
         assert_eq!(other.value(0), 7);
     }
 
-    #[test]
-    fn json_path_handles_null_list_value() {
+    #[tokio::test]
+    async fn json_path_handles_null_list_value() {
         let mut list_b = ListBuilder::new(arrow_array::builder::Int32Builder::new());
         list_b.append(false); // null
         list_b.values().append_value(1);
@@ -416,8 +421,8 @@ mod tests {
         let opts = PostProcessOptions {
             complex_types_as_json: true,
         };
-        let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
-        let out_batch = pp.next_batch().unwrap().unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, opts).await.unwrap();
+        let out_batch = pp.next_batch().await.unwrap().unwrap();
         let arr = out_batch
             .column(0)
             .as_any()
@@ -427,8 +432,8 @@ mod tests {
         assert_eq!(arr.value(1), "[1]");
     }
 
-    #[test]
-    fn json_path_struct_renders_fields_in_order() {
+    #[tokio::test]
+    async fn json_path_struct_renders_fields_in_order() {
         let fields: Fields = vec![
             Field::new("a", DataType::Utf8, true),
             Field::new("b", DataType::Int32, true),
@@ -453,8 +458,8 @@ mod tests {
         let opts = PostProcessOptions {
             complex_types_as_json: true,
         };
-        let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
-        let out = pp.next_batch().unwrap().unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, opts).await.unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
         let arr = out
             .column(0)
             .as_any()
@@ -463,8 +468,8 @@ mod tests {
         assert_eq!(arr.value(0), "{\"a\":\"foo\",\"b\":1}");
     }
 
-    #[test]
-    fn json_path_map_renders_object() {
+    #[tokio::test]
+    async fn json_path_map_renders_object() {
         let mut b = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         b.keys().append_value("k");
         b.values().append_value("v");
@@ -479,8 +484,8 @@ mod tests {
         let opts = PostProcessOptions {
             complex_types_as_json: true,
         };
-        let mut pp = ResultPostProcessor::new(inner, None, opts).unwrap();
-        let out = pp.next_batch().unwrap().unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, opts).await.unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
         let arr = out
             .column(0)
             .as_any()
@@ -489,8 +494,8 @@ mod tests {
         assert_eq!(arr.value(0), "{\"k\":\"v\"}");
     }
 
-    #[test]
-    fn json_off_leaves_complex_columns_intact() {
+    #[tokio::test]
+    async fn json_off_leaves_complex_columns_intact() {
         let mut list_b = ListBuilder::new(arrow_array::builder::Int32Builder::new());
         list_b.values().append_value(1);
         list_b.append(true);
@@ -501,9 +506,11 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![Arc::new(list_arr) as _]).unwrap();
         let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
 
-        let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default()).unwrap();
-        assert_eq!(pp.schema().unwrap().field(0).data_type(), &list_dt);
-        let out = pp.next_batch().unwrap().unwrap();
+        let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(pp.schema().await.unwrap().field(0).data_type(), &list_dt);
+        let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &list_dt);
     }
 }

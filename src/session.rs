@@ -66,7 +66,7 @@ use crate::statement::mutable::Statement;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info_span, Span};
+use tracing::{debug, info_span, Instrument, Span};
 
 /// Crate-internal session state. Wrapped in `Arc` and shared with
 /// every child handle (`Statement`, `ExecutedStatement`, …) so the
@@ -325,15 +325,19 @@ impl Session {
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {
             return Ok(());
         }
-        let _g = self.inner.log_span.clone().entered();
-        self.inner
-            .transport
-            .delete_session(&self.inner.session_id)
-            .await?;
-        self.inner
-            .closed
-            .store(true, std::sync::atomic::Ordering::Release);
-        Ok(())
+        let span = self.inner.log_span.clone();
+        async {
+            self.inner
+                .transport
+                .delete_session(&self.inner.session_id)
+                .await?;
+            self.inner
+                .closed
+                .store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 }
 

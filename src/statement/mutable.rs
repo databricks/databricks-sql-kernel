@@ -64,7 +64,7 @@ use crate::statement::validity::ValidityFlag;
 use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::warn;
+use tracing::{warn, Instrument};
 
 /// Lifecycle owner for a single statement spec.
 ///
@@ -136,48 +136,57 @@ impl Statement {
     /// short-circuit to `InvalidStatementHandle` without hitting the
     /// wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        let _g = self.session.log_span().clone().entered();
+        // `instrument` (rather than `.entered()`) so the resulting
+        // future stays `Send` — napi-rs's `execute_tokio_future` and
+        // `tokio::spawn` both require `Send`, and `EnteredSpan` is
+        // `!Send`. Clone the span up-front to avoid double-borrowing
+        // `self.session` (once in the async body, once on the
+        // `.instrument()` argument).
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            let (sql, exec_params) = self.prepare_for_dispatch(None)?;
 
-        self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch(None)?;
+            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let guard = cancel_state.guard();
 
-        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
-        let guard = cancel_state.guard();
+            // SeaRestTransport::execute_statement polls to completion
+            // (10s server-side wait_timeout, then GetStatementStatus
+            // loop until terminal).
+            let result = self
+                .session
+                .transport()
+                .execute_statement(self.session.session_id(), &sql, &exec_params)
+                .await?;
 
-        // SeaRestTransport::execute_statement polls to completion
-        // (server's default ~10s wait, then GetStatementStatus loop
-        // until terminal).
-        let result = self
-            .session
-            .transport()
-            .execute_statement(self.session.session_id(), &sql, &exec_params)
-            .await?;
+            cancel_state.observe(&result.statement_id);
+            guard.defuse();
 
-        cancel_state.observe(&result.statement_id);
-        guard.defuse();
+            let valid = ValidityFlag::new();
+            // Only `Closed` triggers the short-circuit. `Succeeded` means
+            // the server still owns the statement and we must issue
+            // CloseStatement. `Failed` / `Canceled` are terminal but still
+            // server-side-tracked — also fall through to the standard close
+            // path. See `prepare_for_dispatch` for why omitting
+            // `wait_timeout` typically yields `Closed` on the inline-result
+            // fast path.
+            let already_closed = result.server_state == StatementState::Closed;
+            let closed = Arc::new(AtomicBool::new(already_closed));
+            self.last_statement_id = Some(result.statement_id.clone());
+            self.last_valid = Some(valid.clone());
+            self.last_closed = Some(Arc::clone(&closed));
 
-        let valid = ValidityFlag::new();
-        // Only `Closed` triggers the short-circuit. `Succeeded` means
-        // the server still owns the statement and we must issue
-        // CloseStatement. `Failed` / `Canceled` are terminal but still
-        // server-side-tracked — also fall through to the standard close
-        // path. See `prepare_for_dispatch` for why omitting
-        // `wait_timeout` typically yields `Closed` on the inline-result
-        // fast path.
-        let already_closed = result.server_state == StatementState::Closed;
-        let closed = Arc::new(AtomicBool::new(already_closed));
-        self.last_statement_id = Some(result.statement_id.clone());
-        self.last_valid = Some(valid.clone());
-        self.last_closed = Some(Arc::clone(&closed));
-
-        let result_stream = ResultStream::from_reader(result.reader)?;
-        Ok(ExecutedStatement::new(
-            Arc::clone(&self.session),
-            result.statement_id,
-            valid,
-            result_stream,
-            closed,
-        ))
+            let result_stream = ResultStream::from_reader(result.reader).await?;
+            Ok(ExecutedStatement::new(
+                Arc::clone(&self.session),
+                result.statement_id,
+                valid,
+                result_stream,
+                closed,
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
@@ -189,38 +198,41 @@ impl Statement {
     /// `fetch_result`. Long-running queries that would blow past
     /// `execute()`'s sync polling budget belong on this path.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
-        let _g = self.session.log_span().clone().entered();
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
-        self.invalidate_prior().await;
-        let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
+            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let guard = cancel_state.guard();
 
-        let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
-        let guard = cancel_state.guard();
+            let response = self
+                .session
+                .transport()
+                .submit_statement(self.session.session_id(), &sql, &exec_params)
+                .await?;
 
-        let response = self
-            .session
-            .transport()
-            .submit_statement(self.session.session_id(), &sql, &exec_params)
-            .await?;
+            cancel_state.observe(&response.statement_id);
+            guard.defuse();
 
-        cancel_state.observe(&response.statement_id);
-        guard.defuse();
+            let valid = ValidityFlag::new();
+            // submit path always uses wait_timeout=0s, so the server can't
+            // return CLOSED yet; start the flag false and let later close()
+            // calls flip it.
+            let closed = Arc::new(AtomicBool::new(false));
+            self.last_statement_id = Some(response.statement_id.clone());
+            self.last_valid = Some(valid.clone());
+            self.last_closed = Some(Arc::clone(&closed));
 
-        let valid = ValidityFlag::new();
-        // submit path always uses wait_timeout=0s, so the server can't
-        // return CLOSED yet; start the flag false and let later close()
-        // calls flip it.
-        let closed = Arc::new(AtomicBool::new(false));
-        self.last_statement_id = Some(response.statement_id.clone());
-        self.last_valid = Some(valid.clone());
-        self.last_closed = Some(Arc::clone(&closed));
-
-        Ok(ExecutedAsyncStatement::new(
-            Arc::clone(&self.session),
-            response.statement_id,
-            valid,
-            closed,
-        ))
+            Ok(ExecutedAsyncStatement::new(
+                Arc::clone(&self.session),
+                response.statement_id,
+                valid,
+                closed,
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Explicit close. Cancels and closes any executed handle this
@@ -250,9 +262,13 @@ impl Statement {
     /// for callers that forget to call `close()` explicitly, but
     /// the explicit path is the supported one.
     pub async fn close(mut self) -> Result<()> {
-        let _g = self.session.log_span().clone().entered();
-        self.invalidate_prior().await;
-        Ok(())
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            Ok(())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Shared spec-validation + `ExecuteParams` builder used by both

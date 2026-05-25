@@ -36,7 +36,19 @@ arrow-select = "57"
 arrow-ipc = "57"
 
 # HTTP client and async runtime
-reqwest = { version = "0.12", features = ["json", "gzip", "stream", "native-tls"] }
+#
+# TLS backend is selected by Cargo features (see `[features]` below).
+# Default = `tls-native` to preserve compatibility for direct-Rust and
+# C-ABI consumers (e.g. future ODBC), which historically use the system
+# OpenSSL via `native-tls`.
+#
+# The napi-rs binding crate (`napi/`) opts INTO `tls-rustls` instead:
+# napi modules are loaded into Node.js processes that statically link
+# OpenSSL 3.x, and dynamically linking against the system's OpenSSL 1.1
+# (which `native-tls` pulls in on Linux) collides with Node's symbols at
+# module load time and segfaults the process before any Rust code runs.
+# `rustls` is pure Rust + ring and avoids the conflict entirely.
+reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -65,7 +77,14 @@ async-trait = "0.1"
 thiserror = "2"
 
 # OAuth dependencies
-oauth2 = "5"         # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
+#
+# oauth2 5.x enables `default = ["reqwest", "rustls-tls"]`, which would
+# silently pull `reqwest/rustls-tls` into the kernel build and unify
+# both TLS stacks even when the consumer asked for only `tls-native`.
+# Strip defaults and re-enable just the `reqwest` integration here; the
+# kernel's own `tls-native` / `tls-rustls` feature controls the TLS
+# backend for reqwest, and oauth2 inherits whichever the consumer picks.
+oauth2 = { version = "5", default-features = false, features = ["reqwest"] }  # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
 sha2 = "0.10"        # SHA-256 for token cache key generation
 open = "5"           # Browser launch for interactive OAuth flows
 dirs = "5"           # Cross-platform config directory (~/.config/)
@@ -74,6 +93,43 @@ dirs = "5"           # Cross-platform config directory (~/.config/)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 tempfile = "3"
+
+# TLS backend selection.
+#
+# Default is `tls-native` (reqwest's `native-tls` backend) to preserve
+# compatibility for direct-Rust use and the C-ABI / ODBC path. The napi
+# binding crate (`napi/`) sets `default-features = false` on the kernel
+# dependency and explicitly enables `tls-rustls` instead, to avoid the
+# OpenSSL-symbol clash with the host Node.js process at module load
+# time.
+#
+# These features are MUTUALLY EXCLUSIVE in intent: a binary that ends
+# up with both `reqwest/native-tls` AND `reqwest/rustls-tls` active
+# links both TLS stacks. In a napi cdylib that defeats the whole reason
+# for the rustls switch — system OpenSSL gets linked in anyway and
+# clashes with Node.js's statically linked OpenSSL at module load.
+#
+# Mutual exclusivity is enforced two ways:
+#
+#   1. `src/lib.rs` has `compile_error!` guards that fail the build if
+#      both features are active OR if neither is (a consumer who set
+#      `default-features = false` and forgot to opt back in).
+#
+#   2. The kernel's own oauth2 dep uses `default-features = false` so
+#      that the kernel workspace doesn't transitively enable rustls via
+#      oauth2's own default features. Without this, `cargo tree -i
+#      reqwest -f "{p} {f}"` showed rustls-tls active even in the pure
+#      `tls-native` build (oauth2 5.x defaults are
+#      `["reqwest", "rustls-tls"]`).
+#
+# The napi crate also lives in its own workspace (not a member of this
+# kernel workspace) so it can pin different transitive feature choices,
+# but that separation is no longer load-bearing for the TLS feature
+# guarantee — items 1 and 2 above are.
+[features]
+default = ["tls-native"]
+tls-native = ["reqwest/native-tls"]
+tls-rustls = ["reqwest/rustls-tls"]
 
 [lib]
 name = "databricks_sql_kernel"
