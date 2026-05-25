@@ -23,7 +23,8 @@
 //! ```
 
 use databricks_sql_kernel::{
-    AuthConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultStream, Session, TypedValue,
+    AuthConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig, ResultStream,
+    Session, TypedValue,
 };
 use std::env;
 
@@ -511,4 +512,143 @@ async fn cloudfetch_drain_works_on_current_thread_runtime() {
     );
     exec.close().await.expect("close");
     session.close().await.expect("session close");
+}
+
+/// Open a live session with `complex_types_as_json` toggled.
+async fn live_session_with_complex_json(complex_types_as_json: bool) -> Session {
+    let host = env_var("DATABRICKS_HOST").expect("DATABRICKS_HOST required");
+    let path = env_var("DATABRICKS_HTTP_PATH").expect("DATABRICKS_HTTP_PATH required");
+    let token = env_var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN required");
+
+    let mut result = ResultConfig::default();
+    result.complex_types_as_json = complex_types_as_json;
+
+    Session::builder()
+        .http_path(host, path)
+        .auth(AuthConfig::Pat { token })
+        .result(result)
+        .open()
+        .await
+        .expect("Session::open against live workspace")
+}
+
+/// **End-to-end check that `complex_types_as_json=true` flips complex
+/// columns to compact-JSON `Utf8` strings.**
+///
+/// Runs the same `SELECT` against two sessions: one with the flag
+/// off (default — server returns native Arrow `List` / `Map` /
+/// `Struct`) and one with the flag on (kernel post-processes those
+/// columns into `Utf8` compact JSON, matching the Thrift wire form
+/// that PySQL/JDBC consumers already see).
+///
+/// We don't byte-compare against a captured Thrift fixture here —
+/// that's the job of the `databricks-driver-test` comparator suite.
+/// What this test catches is the kernel-side wiring: schema rewrite,
+/// per-row JSON encoding for the three top-level complex shapes, and
+/// nested recursion.
+#[tokio::test]
+#[ignore]
+async fn complex_types_as_json_flag_stringifies_complex_columns() {
+    use arrow_array::Array;
+
+    let sql = "SELECT \
+                   ARRAY(1, 2, 3)                                    AS c_arr, \
+                   MAP('k1', 'v1', 'k2', 'v2')                       AS c_map, \
+                   NAMED_STRUCT('a', 'foo', 'b', 1)                  AS c_struct, \
+                   ARRAY(NAMED_STRUCT('a', 'x', 'b', 1),
+                         NAMED_STRUCT('a', 'y', 'b', 2))             AS c_arr_struct";
+
+    // 1. Default (Arrow-native) — sanity check that the server is
+    //    returning native complex shapes, not Utf8.
+    {
+        let session = live_session_with_complex_json(false).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql(sql);
+        let mut exec = stmt.execute().await.expect("execute (default)");
+        let stream = exec.result_stream_mut();
+        let batch = stream.next_batch().await.unwrap().expect("batch (default)");
+        let ResultBatch::Arrow(batch) = batch else {
+            panic!("expected Arrow batch");
+        };
+        let schema = batch.schema();
+        assert!(
+            matches!(schema.field(0).data_type(), arrow_schema::DataType::List(_)),
+            "c_arr should be List (got {:?})",
+            schema.field(0).data_type()
+        );
+        assert!(
+            matches!(
+                schema.field(1).data_type(),
+                arrow_schema::DataType::Map(_, _)
+            ),
+            "c_map should be Map (got {:?})",
+            schema.field(1).data_type()
+        );
+        assert!(
+            matches!(
+                schema.field(2).data_type(),
+                arrow_schema::DataType::Struct(_)
+            ),
+            "c_struct should be Struct (got {:?})",
+            schema.field(2).data_type()
+        );
+        exec.close().await.expect("close (default)");
+        session.close().await.expect("session close (default)");
+    }
+
+    // 2. `complex_types_as_json = true` — every complex column is
+    //    rewritten to Utf8 carrying compact JSON.
+    {
+        let session = live_session_with_complex_json(true).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql(sql);
+        let mut exec = stmt.execute().await.expect("execute (json)");
+        let stream = exec.result_stream_mut();
+        let batch = stream.next_batch().await.unwrap().expect("batch (json)");
+        let ResultBatch::Arrow(batch) = batch else {
+            panic!("expected Arrow batch");
+        };
+        let schema = batch.schema();
+        for (i, name) in ["c_arr", "c_map", "c_struct", "c_arr_struct"]
+            .iter()
+            .enumerate()
+        {
+            assert_eq!(
+                schema.field(i).data_type(),
+                &arrow_schema::DataType::Utf8,
+                "{name} should be Utf8 (got {:?})",
+                schema.field(i).data_type()
+            );
+        }
+
+        let strs: Vec<&str> = (0..4)
+            .map(|i| {
+                batch
+                    .column(i)
+                    .as_any()
+                    .downcast_ref::<arrow_array::StringArray>()
+                    .unwrap_or_else(|| panic!("column {i} is not Utf8"))
+                    .value(0)
+            })
+            .collect();
+
+        assert_eq!(strs[0], "[1,2,3]", "c_arr");
+        // MAP entry order is not guaranteed across Spark planner
+        // changes, so assert the parsed key/value pairs instead of a
+        // string literal.
+        let map_json: serde_json::Value =
+            serde_json::from_str(strs[1]).expect("c_map should be valid JSON");
+        let map_obj = map_json.as_object().expect("c_map should be a JSON object");
+        assert_eq!(map_obj.len(), 2, "c_map should have 2 entries");
+        assert_eq!(map_obj.get("k1").and_then(|v| v.as_str()), Some("v1"));
+        assert_eq!(map_obj.get("k2").and_then(|v| v.as_str()), Some("v2"));
+        assert_eq!(strs[2], "{\"a\":\"foo\",\"b\":1}", "c_struct");
+        assert_eq!(
+            strs[3], "[{\"a\":\"x\",\"b\":1},{\"a\":\"y\",\"b\":2}]",
+            "c_arr_struct"
+        );
+
+        exec.close().await.expect("close (json)");
+        session.close().await.expect("session close (json)");
+    }
 }
