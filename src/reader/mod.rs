@@ -151,14 +151,25 @@ impl ResultReaderFactory {
             // Priority 1: CloudFetch (external_links present)
             if let Some(ref external_links) = result.external_links {
                 if !external_links.is_empty() {
+                    // `total_chunk_count` is forwarded purely as a
+                    // transition-period guard. The link fetcher uses
+                    // it only when the server hasn't yet rolled out
+                    // `external_links[].next_chunk_index` (the
+                    // bounded SEA API authoritative signal). See
+                    // `SeaChunkLinkFetcher::decode_continuation` for
+                    // the bridge logic.
+                    let total_chunk_count =
+                        response.manifest.as_ref().and_then(|m| m.total_chunk_count);
                     tracing::info!(
-                        "Using CloudFetch reader: {} initial external links",
+                        "Using CloudFetch reader: {} initial external links, total_chunks={:?}",
                         external_links.len(),
+                        total_chunk_count,
                     );
 
                     return self.create_cloudfetch_reader(
                         statement_id,
                         external_links,
+                        total_chunk_count,
                         compression,
                     );
                 }
@@ -257,22 +268,28 @@ impl ResultReaderFactory {
         &self,
         statement_id: &str,
         external_links: &[CloudFetchLink],
+        total_chunk_count: Option<i64>,
         compression: CompressionCodec,
     ) -> Result<Box<dyn ResultReader + Send>> {
         tracing::debug!(
-            "Creating CloudFetch reader: {} initial links, prefetch_window={}",
+            "Creating CloudFetch reader: {} initial links, prefetch_window={}, total_chunks={:?}",
             external_links.len(),
-            self.config.link_prefetch_window
+            self.config.link_prefetch_window,
+            total_chunk_count,
         );
 
         // Create link fetcher with caching and prefetching built-in.
-        // End-of-stream is derived from `next_chunk_index` on each
-        // link (per the bounded SEA API contract), so the manifest's
-        // `total_chunk_count` is no longer plumbed through.
+        // End-of-stream is derived from per-link `next_chunk_index`
+        // (the bounded SEA API authoritative signal). The
+        // `total_chunk_count` parameter is forwarded purely as a
+        // transition-period guard for servers that haven't rolled
+        // out the per-link field yet — see
+        // `SeaChunkLinkFetcher::decode_continuation`.
         let fetcher = SeaChunkLinkFetcher::new(
             self.client.clone(),
             statement_id.to_string(),
             external_links,
+            total_chunk_count,
             self.config.link_prefetch_window as i64,
             self.runtime_handle.clone(),
         );

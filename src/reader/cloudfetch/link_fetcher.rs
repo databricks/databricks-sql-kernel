@@ -91,8 +91,10 @@ pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
 /// - Tracks the highest chunk index fetched to avoid redundant API calls
 /// - Uses each link's server-emitted `next_chunk_index` to advance and
 ///   to detect end-of-stream — per the bounded SEA API contract for
-///   OSS drivers, `total_chunk_count` from the manifest is deprecated
-///   and no longer consulted by the kernel.
+///   OSS drivers. `total_chunk_count` from the manifest is deprecated
+///   but is still consulted **as a transition-period guard** for
+///   servers that haven't rolled out the per-link field; see
+///   [`decode_continuation`] for the bridge logic.
 /// - **Proactively prefetches links** when consumer position approaches the
 ///   prefetch boundary (similar to JDBC's `linkPrefetchWindow`)
 ///
@@ -121,9 +123,26 @@ pub(crate) struct SeaChunkLinkFetcher {
     /// End-of-stream sentinel. Flips to `true` the moment the server
     /// returns a fetch whose last link has `next_chunk_index = None`.
     /// Per the bounded SEA API contract for OSS drivers, this is the
-    /// authoritative end-of-stream signal — `total_chunk_count` is
-    /// deprecated for OSS-driver use and not consulted here.
+    /// authoritative end-of-stream signal. We also consult the
+    /// deprecated `total_chunk_count` manifest hint **only** as a
+    /// transition-period safety net: if a server hasn't rolled out
+    /// the per-link field yet, `next_chunk_index` would always be
+    /// `None` and the kernel would silently truncate after the first
+    /// batch. The hint lets us detect that case and keep fetching.
+    /// See [`decode_continuation`].
     all_links_fetched: AtomicBool,
+    /// **Transition-period only.** The deprecated manifest
+    /// `total_chunk_count`, if any. Used purely to detect servers
+    /// that haven't rolled out `external_links[].next_chunk_index`
+    /// yet: when `next_chunk_index = None` AND `total_chunk_count`
+    /// says more chunks remain, we fall back to
+    /// `last_chunk.chunk_index + 1` and log a warning so the rollout
+    /// asymmetry is visible. Will be removed once the bounded SEA
+    /// API is live on all server versions the kernel targets.
+    total_chunk_count_hint: Option<i64>,
+    /// Sticky one-shot flag for the warning above. Avoids spamming
+    /// logs on every batch.
+    fallback_warned: AtomicBool,
     /// Current consumer position (highest chunk index requested)
     current_consumer_index: AtomicI64,
     /// Number of chunks to prefetch ahead of consumer position
@@ -164,16 +183,86 @@ impl std::fmt::Debug for SeaChunkLinkFetcher {
     }
 }
 
+/// Outcome of decoding `(last_link, total_chunk_count_hint)` into
+/// the next-fetch continuation state.
+///
+/// The bounded SEA API contract makes the per-link
+/// `external_links[].next_chunk_index` the authoritative
+/// continuation signal. `total_chunk_count` is deprecated for OSS-
+/// driver use, but it remains populated by current SEA servers and
+/// the kernel uses it **only as a transition-period guard**: a
+/// server that hasn't rolled out the per-link field yet would
+/// always emit `next_chunk_index = None`, which (without this
+/// guard) the kernel would interpret as immediate end-of-stream
+/// after the first batch — silently truncating multi-batch
+/// results.
+#[derive(Debug)]
+struct Continuation {
+    /// `chunk_index` to ask the server for next, OR a placeholder
+    /// when at end-of-stream (`eos == true`).
+    next_fetch_index: i64,
+    /// Whether the kernel has discovered all the chunks the server
+    /// will ever produce for this statement.
+    eos: bool,
+    /// True if the kernel reached its decision using the deprecated
+    /// `total_chunk_count` hint rather than the per-link field. The
+    /// caller emits a one-shot warning so the rollout asymmetry is
+    /// visible in production logs.
+    used_total_chunk_count_fallback: bool,
+}
+
+/// Combine the server-emitted per-link `next_chunk_index` with the
+/// deprecated `total_chunk_count` manifest hint.
+///
+/// Branches:
+///
+/// 1. `last_link.next_chunk_index = Some(N)` — trust the bounded
+///    SEA API contract. Continue at N, eos = false.
+/// 2. `last_link.next_chunk_index = None`, `total_chunk_count`
+///    absent or says we're at-or-past the last chunk — trust the
+///    per-link signal. eos = true.
+/// 3. `last_link.next_chunk_index = None`, `total_chunk_count`
+///    says more chunks remain — **fallback path**: the server
+///    hasn't rolled out the new field yet. Continue at
+///    `last_chunk.chunk_index + 1`, eos = false, log a warning.
+fn decode_continuation(last_link: &CloudFetchLink, total_chunk_count: Option<i64>) -> Continuation {
+    let next_after = last_link.chunk_index.saturating_add(1);
+    match last_link.next_chunk_index {
+        Some(idx) => Continuation {
+            next_fetch_index: idx,
+            eos: false,
+            used_total_chunk_count_fallback: false,
+        },
+        None => {
+            // No per-link continuation signal. Decide via
+            // total_chunk_count if available.
+            let more_remaining = total_chunk_count.is_some_and(|total| next_after < total);
+            if more_remaining {
+                Continuation {
+                    next_fetch_index: next_after,
+                    eos: false,
+                    used_total_chunk_count_fallback: true,
+                }
+            } else {
+                Continuation {
+                    next_fetch_index: next_after,
+                    eos: true,
+                    used_total_chunk_count_fallback: false,
+                }
+            }
+        }
+    }
+}
+
 impl SeaChunkLinkFetcher {
     /// Create a new SEA link fetcher with caching and prefetching.
     ///
-    /// End-of-stream and "where does the next fetch start" are both
-    /// derived from the last initial link's server-provided
-    /// `next_chunk_index` and `row_offset + row_count`. Per the
-    /// bounded SEA API contract for OSS drivers, `total_chunk_count`
-    /// from the manifest is deprecated for driver use; the server-
-    /// emitted `next_chunk_index` on each link is the authoritative
-    /// continuation signal.
+    /// End-of-stream and "where does the next fetch start" come
+    /// from [`decode_continuation`], which combines the per-link
+    /// `next_chunk_index` (authoritative per the bounded SEA API
+    /// contract) with the deprecated `total_chunk_count` manifest
+    /// hint (used **only** as a transition-period guard against
+    /// servers that haven't rolled out the per-link field).
     ///
     /// # Arguments
     /// * `client` - The Databricks client to use for API calls
@@ -181,12 +270,16 @@ impl SeaChunkLinkFetcher {
     /// * `initial_links` - Links from the initial execute response.
     ///   Must be ordered by `chunk_index`; the last link's
     ///   `next_chunk_index` decides whether more chunks remain.
+    /// * `total_chunk_count` - Transition-period guard hint from
+    ///   the manifest. Passed `None` if absent or if the caller is
+    ///   confident the bounded-API server is live.
     /// * `link_prefetch_window` - Number of chunks to prefetch ahead of consumer
     /// * `runtime_handle` - Tokio runtime handle for spawning prefetch tasks
     pub(crate) fn new(
         client: Arc<dyn Transport>,
         statement_id: impl Into<String>,
         initial_links: &[CloudFetchLink],
+        total_chunk_count: Option<i64>,
         link_prefetch_window: i64,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
@@ -198,47 +291,87 @@ impl SeaChunkLinkFetcher {
             links.insert(link.chunk_index, link.clone());
         }
 
-        // The last link's `next_chunk_index` is the server's
-        // continuation token. Absent → end-of-stream; present →
-        // that's where the next fetch starts.
-        //
-        // When the caller passes no initial links at all we start
-        // at chunk 0 with `all_links_fetched=false` and let the
-        // first server fetch (sync fallback or async prefetch)
-        // discover the rest. An empty `initial_links` is the
-        // "kernel constructed before the first server response"
-        // shape used in tests; it does *not* mean end-of-stream.
-        let last_link = initial_links.last();
-        let (next_server_fetch_index, all_links_fetched, next_row_offset) = match last_link {
-            Some(link) => match link.next_chunk_index {
-                Some(idx) => (idx, false, link.row_offset + link.row_count),
-                None => (link.chunk_index + 1, true, link.row_offset + link.row_count),
-            },
-            None => (0, false, 0),
-        };
+        // Compute continuation. Highest chunk_index in the initial
+        // batch is the floor for `next_server_fetch_index` — guards
+        // against a hypothetical (or buggy) server response with a
+        // non-monotonic `next_chunk_index` that points backwards.
+        let max_initial_chunk = initial_links
+            .iter()
+            .map(|l| l.chunk_index)
+            .max()
+            .unwrap_or(-1);
+        let initial_floor = max_initial_chunk.saturating_add(1);
+
+        let (next_server_fetch_index, all_links_fetched, next_row_offset, fallback_used) =
+            match initial_links.last() {
+                Some(link) => {
+                    let cont = decode_continuation(link, total_chunk_count);
+                    // Clamp to floor: if the server emitted a
+                    // `next_chunk_index` ≤ already-cached
+                    // `chunk_index`, force forward progress so the
+                    // prefetch loop can't re-issue the same RPC.
+                    let next_idx = cont.next_fetch_index.max(initial_floor);
+                    let next_row = link.row_offset.saturating_add(link.row_count);
+                    (
+                        next_idx,
+                        cont.eos,
+                        next_row,
+                        cont.used_total_chunk_count_fallback,
+                    )
+                }
+                // No initial links → "kernel constructed before the
+                // first server response" shape used by tests. Start
+                // at chunk 0; eos = false so the first server fetch
+                // can populate the cache.
+                None => (0, false, 0, false),
+            };
 
         debug!(
             "SeaChunkLinkFetcher: {} initial links, next_server_fetch={}, \
-             next_row_offset={}, all_fetched={}, prefetch_window={}",
+             next_row_offset={}, all_fetched={}, prefetch_window={}, total_chunk_count={:?}",
             initial_links.len(),
             next_server_fetch_index,
             next_row_offset,
             all_links_fetched,
-            link_prefetch_window
+            link_prefetch_window,
+            total_chunk_count,
         );
 
-        Self {
+        let fetcher = Self {
             client,
             statement_id,
             links,
             next_server_fetch_index: AtomicI64::new(next_server_fetch_index),
             all_links_fetched: AtomicBool::new(all_links_fetched),
+            total_chunk_count_hint: total_chunk_count,
+            fallback_warned: AtomicBool::new(false),
             current_consumer_index: AtomicI64::new(0),
             link_prefetch_window,
             prefetch_in_progress: AtomicBool::new(false),
             runtime_handle,
             prefetch_lock: TokioMutex::new(()),
             next_row_offset: AtomicI64::new(next_row_offset),
+        };
+        if fallback_used {
+            fetcher.warn_total_chunk_count_fallback("initial response");
+        }
+        fetcher
+    }
+
+    /// Emit a one-shot warning when the kernel falls back to the
+    /// deprecated `total_chunk_count` continuation signal because
+    /// the server hasn't populated `external_links[].next_chunk_index`
+    /// yet. Production telemetry can grep for this to know when to
+    /// remove the fallback path.
+    fn warn_total_chunk_count_fallback(&self, site: &str) {
+        if !self.fallback_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                statement_id = %self.statement_id,
+                total_chunk_count = ?self.total_chunk_count_hint,
+                "Server did not populate `external_links[].next_chunk_index` ({site}); \
+                 falling back to `total_chunk_count` for continuation. Remove the \
+                 fallback path once the bounded-SEA-API rollout is complete.",
+            );
         }
     }
 
@@ -348,49 +481,53 @@ impl SeaChunkLinkFetcher {
                         self.links.insert(link.chunk_index, link.clone());
                     }
 
-                    // The server-emitted `next_chunk_index` on the
-                    // last link in the batch is the continuation
-                    // signal. Absent (`None`) → no more chunks;
-                    // present → that's the next chunk_index to ask
-                    // for. We never synthesise `chunk_index + 1` —
-                    // the bounded SEA API contract makes the server
-                    // the source of truth for chunk boundaries.
+                    // The continuation signal comes from
+                    // `decode_continuation`: prefer the per-link
+                    // `next_chunk_index` (bounded SEA API
+                    // contract); fall back to `total_chunk_count`
+                    // only when the server hasn't rolled out the
+                    // new field. Forward progress is guarded —
+                    // `fetch_max` and a separate
+                    // `max(chunk_index+1)` floor prevent a
+                    // non-monotonic server response from driving
+                    // `next_server_fetch_index` backwards.
                     //
-                    // Note on parallel downloads: setting
-                    // `all_links_fetched = true` here just stops the
-                    // *prefetch loop*. In-flight chunk downloads
-                    // continue independently (see streaming_provider
-                    // and its `end_of_stream` flag, which it
-                    // explicitly checks alongside whether the
-                    // current chunk is still in its in-memory cache
-                    // before returning end-of-stream to the caller).
+                    // Setting `all_links_fetched = true` here just
+                    // stops the prefetch loop; in-flight chunk
+                    // downloads continue independently.
                     if let Some(last_link) = result.links.last() {
-                        let next_row_offset = last_link.row_offset + last_link.row_count;
+                        let next_row_offset =
+                            last_link.row_offset.saturating_add(last_link.row_count);
                         self.next_row_offset
                             .store(next_row_offset, Ordering::Release);
-                        match last_link.next_chunk_index {
-                            Some(idx) => {
-                                self.next_server_fetch_index
-                                    .fetch_max(idx, Ordering::Release);
-                                debug!(
-                                    "Prefetch loop: fetched {} links (last chunk {}), \
-                                     next_server_fetch={}, next_row_offset={}",
-                                    result.links.len(),
-                                    last_link.chunk_index,
-                                    idx,
-                                    next_row_offset,
-                                );
-                            }
-                            None => {
-                                debug!(
-                                    "Prefetch loop: end-of-stream marker on link {} \
-                                     (next_chunk_index absent); link discovery done",
-                                    last_link.chunk_index,
-                                );
-                                self.all_links_fetched.store(true, Ordering::Release);
-                                break;
-                            }
+                        let cont = decode_continuation(last_link, self.total_chunk_count_hint);
+                        if cont.used_total_chunk_count_fallback {
+                            self.warn_total_chunk_count_fallback("prefetch loop");
                         }
+                        if cont.eos {
+                            debug!(
+                                "Prefetch loop: end-of-stream on link {} \
+                                 (next_chunk_index absent, total_chunk_count agrees)",
+                                last_link.chunk_index,
+                            );
+                            self.all_links_fetched.store(true, Ordering::Release);
+                            break;
+                        }
+                        // Forward-progress floor: never let
+                        // next_server_fetch_index regress.
+                        let advance_to = cont
+                            .next_fetch_index
+                            .max(last_link.chunk_index.saturating_add(1));
+                        self.next_server_fetch_index
+                            .fetch_max(advance_to, Ordering::Release);
+                        debug!(
+                            "Prefetch loop: fetched {} links (last chunk {}), \
+                             next_server_fetch={}, next_row_offset={}",
+                            result.links.len(),
+                            last_link.chunk_index,
+                            advance_to,
+                            next_row_offset,
+                        );
                     } else if !result.has_more {
                         // Defensive: server returned no links and
                         // signalled no more. Treat as end-of-stream
@@ -399,10 +536,33 @@ impl SeaChunkLinkFetcher {
                         self.all_links_fetched.store(true, Ordering::Release);
                         break;
                     } else {
-                        // Empty batch but `has_more` — server hiccup
-                        // or the prefetcher got rate-limited. Bail
-                        // and let the consumer-driven path retry.
-                        debug!("Prefetch loop: empty batch with has_more=true; bailing");
+                        // Empty batch but `has_more` is true. Force
+                        // forward progress so the loop can't spin
+                        // re-issuing the same RPC (P1 #2 in PR #68
+                        // review). Two strategies:
+                        // 1. If the server gave us a
+                        //    `next_chunk_index` hint, use it.
+                        // 2. Otherwise bump past
+                        //    `server_fetch_idx` ourselves.
+                        // Either way, on the next iteration we'll
+                        // ask for a *different* chunk index, which
+                        // breaks the loop. If the server keeps
+                        // returning empty-with-has_more, that's a
+                        // server bug we surface via the
+                        // `current_consumer_index` heuristic in
+                        // streaming_provider (consumer never
+                        // advances → chunks_in_memory stays full
+                        // → prefetch pauses).
+                        let advance_to = result
+                            .next_chunk_index
+                            .unwrap_or_else(|| server_fetch_idx.saturating_add(1));
+                        self.next_server_fetch_index
+                            .fetch_max(advance_to, Ordering::Release);
+                        debug!(
+                            "Prefetch loop: empty batch with has_more=true; \
+                             advancing next_server_fetch from {} to {}",
+                            server_fetch_idx, advance_to,
+                        );
                         break;
                     }
                 }
@@ -490,23 +650,30 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         // Check if we need to fetch from server
         let server_fetch_index = fetcher.next_server_fetch_index.load(Ordering::Acquire);
 
-        // If request is for links we should already have, return from cache
+        // If request is for links we should already have, return
+        // from cache. Walk contiguously and STOP at the first hole
+        // — a `for i in start..server_fetch_index` with silent
+        // `is_none()` skip would return a non-contiguous slice and
+        // hang the streaming provider's wait_for_chunk on the
+        // first missing index (P1 #1 in PR #68 review).
         if start_chunk_index < server_fetch_index {
             let mut links = Vec::new();
-            for i in start_chunk_index..server_fetch_index {
-                if let Some(link) = fetcher.links.get(&i) {
-                    links.push(link.clone());
-                }
+            let mut i = start_chunk_index;
+            while i < server_fetch_index {
+                let Some(link) = fetcher.links.get(&i) else {
+                    break;
+                };
+                links.push(link.clone());
+                i = i.saturating_add(1);
             }
+            // `i` is now either `server_fetch_index` (no holes) or
+            // the first missing chunk_index — in either case it's
+            // where the next continuation should pick up.
             let has_more = !fetcher.all_links_fetched.load(Ordering::Acquire);
             return Ok(ChunkLinkFetchResult {
                 links,
                 has_more,
-                next_chunk_index: if has_more {
-                    Some(server_fetch_index)
-                } else {
-                    None
-                },
+                next_chunk_index: if has_more { Some(i) } else { None },
                 next_row_offset: None,
             });
         }
@@ -526,34 +693,52 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             fetcher.links.insert(link.chunk_index, link.clone());
         }
 
-        // Advance `next_server_fetch_index` / `next_row_offset` from
-        // the *last link's* server-emitted metadata. End-of-stream
-        // (for link discovery) is the absence of `next_chunk_index`
-        // on the last link in the batch — never derived from
-        // `total_chunk_count` or `chunk_index + 1` arithmetic.
+        // Advance `next_server_fetch_index` / `next_row_offset` via
+        // `decode_continuation` so both the prefetch loop and the
+        // sync-fallback path share the same bridge logic for the
+        // total_chunk_count rollout.
         let next_chunk_index = match result.links.last() {
             Some(last_link) => {
-                let next_row_offset = last_link.row_offset + last_link.row_count;
+                let next_row_offset = last_link.row_offset.saturating_add(last_link.row_count);
                 fetcher
                     .next_row_offset
                     .store(next_row_offset, Ordering::Release);
-                match last_link.next_chunk_index {
-                    Some(idx) => {
-                        fetcher
-                            .next_server_fetch_index
-                            .fetch_max(idx, Ordering::Release);
-                        Some(idx)
-                    }
-                    None => {
-                        fetcher.all_links_fetched.store(true, Ordering::Release);
-                        None
-                    }
+                let cont = decode_continuation(last_link, fetcher.total_chunk_count_hint);
+                if cont.used_total_chunk_count_fallback {
+                    fetcher.warn_total_chunk_count_fallback("sync fallback");
+                }
+                if cont.eos {
+                    fetcher.all_links_fetched.store(true, Ordering::Release);
+                    None
+                } else {
+                    let advance_to = cont
+                        .next_fetch_index
+                        .max(last_link.chunk_index.saturating_add(1));
+                    fetcher
+                        .next_server_fetch_index
+                        .fetch_max(advance_to, Ordering::Release);
+                    Some(advance_to)
                 }
             }
             None => {
-                // Empty response. Trust the server's `has_more`.
+                // Empty response. Honour the server's has_more
+                // signal AND defend against an empty-with-has_more
+                // spin (P1 #2 in PR #68 review): force forward
+                // progress on next_server_fetch_index so the next
+                // call asks for a different chunk index. The
+                // server is expected to either yield links or
+                // signal end-of-stream — a perpetual "I have more
+                // but here are zero links" loop is a server bug we
+                // refuse to amplify into an infinite local retry.
                 if !result.has_more {
                     fetcher.all_links_fetched.store(true, Ordering::Release);
+                } else {
+                    let advance_to = result
+                        .next_chunk_index
+                        .unwrap_or_else(|| start_chunk_index.saturating_add(1));
+                    fetcher
+                        .next_server_fetch_index
+                        .fetch_max(advance_to, Ordering::Release);
                 }
                 None
             }
@@ -843,6 +1028,7 @@ mod tests {
             client,
             "test-statement",
             &[], // no initial links
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
@@ -878,6 +1064,7 @@ mod tests {
             client,
             "test-statement",
             &initial_links,
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
@@ -901,6 +1088,7 @@ mod tests {
             client,
             "test-statement",
             &[],
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
@@ -926,6 +1114,7 @@ mod tests {
             client,
             "test-statement",
             &[],
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
@@ -947,6 +1136,7 @@ mod tests {
             client,
             "test-statement",
             &[],
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
@@ -970,11 +1160,284 @@ mod tests {
             client,
             "test-statement",
             &initial_links,
+            None,
             128,
             tokio::runtime::Handle::current(),
         );
 
         // Should be marked as all fetched since we have all chunks
         assert!(fetcher.all_links_fetched());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Continuation tests (PR #68 P1.3 feedback).
+    //
+    // These exercise the bounded-SEA-API control flow directly,
+    // bypassing the async prefetch race so a regression in
+    // `next_chunk_index` advancement / `row_offset` arithmetic /
+    // EOS detection actually fails the test.
+    //
+    // `link_prefetch_window = 0` keeps the prefetch loop from
+    // racing ahead of the consumer-driven `fetch_links` call.
+    // ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_terminal_on_first_batch_single_chunk() {
+        // Single terminal link in the initial response → fetcher
+        // must initialise with `all_links_fetched = true` and zero
+        // server-fetch RPCs are needed.
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let initial = vec![create_test_link_terminal(0)];
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &initial,
+            None,
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        assert!(
+            fetcher.all_links_fetched(),
+            "terminal initial link must flip all_links_fetched",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_multi_batch_continuation() {
+        // 2-batch fixture: initial = chunk 0 (non-terminal,
+        // next_chunk_index = 1). Mock server returns chunk 1
+        // (terminal) when asked for `chunk_index = 1`. Drive sync
+        // `fetch_links` and assert state after each call.
+        //
+        // MockDatabricksClient indexes the response Vec by
+        // `chunk_index`, so position 1 = chunk 1's response.
+        let server_chunks = vec![
+            vec![],                             // index 0: never asked
+            vec![create_test_link_terminal(1)], // index 1: chunk 1, terminal
+        ];
+        let client = Arc::new(MockDatabricksClient::new(server_chunks));
+
+        // Use a non-terminal initial chunk so the kernel knows to
+        // continue.
+        let initial = vec![create_test_link(0)];
+        let fetcher = SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "stmt",
+            &initial,
+            None,
+            /* link_prefetch_window = */ 0,
+            tokio::runtime::Handle::current(),
+        );
+        // Wrap directly in the handle without triggering the prefetch
+        // bell — `link_prefetch_window=0` keeps it idle anyway.
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // After construction the fetcher has only chunk 0.
+        assert!(handle.inner.has_link(0));
+        assert!(!handle.inner.has_link(1));
+        assert!(!handle.inner.all_links_fetched());
+
+        // Drive the next-batch fetch. Mock returns chunk 1
+        // (terminal), so the fetcher must flip EOS.
+        let result = handle.fetch_links(1, 0).await.unwrap();
+        assert!(
+            result.links.iter().any(|l| l.chunk_index == 1),
+            "second fetch must surface chunk 1",
+        );
+        assert!(
+            handle.inner.has_link(1),
+            "chunk 1 must be cached after fetch",
+        );
+        assert!(
+            handle.inner.all_links_fetched(),
+            "terminal link must flip EOS for link discovery",
+        );
+        // `next_chunk_index` of the returned result must be None on
+        // the terminal batch.
+        assert!(
+            !result.has_more,
+            "has_more must be false after terminal batch",
+        );
+        assert!(result.next_chunk_index.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_row_offset_advancement() {
+        // Initial chunk: row_offset=0, row_count=1000 →
+        // next_row_offset must be 1000. After a continuation that
+        // returns a chunk with row_offset=1000, row_count=500, the
+        // fetcher's tracked next_row_offset must be 1500.
+        let server_chunk = CloudFetchLink {
+            url: "https://example.com/chunk1".to_string(),
+            chunk_index: 1,
+            row_offset: 1000,
+            row_count: 500,
+            byte_count: 50000,
+            expiration: chrono::Utc::now() + chrono::Duration::hours(1),
+            http_headers: HashMap::new(),
+            next_chunk_index: None, // terminal
+        };
+        // Server-side Vec indexed by chunk_index — pad slot 0 with
+        // an empty response (never asked).
+        let client = Arc::new(MockDatabricksClient::new(vec![vec![], vec![server_chunk]]));
+
+        let initial = vec![create_test_link(0)]; // row_offset=0, row_count=1000
+        let fetcher = SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "stmt",
+            &initial,
+            None,
+            /* link_prefetch_window = */ 0,
+            tokio::runtime::Handle::current(),
+        );
+        assert_eq!(
+            fetcher.next_row_offset.load(Ordering::Acquire),
+            1000,
+            "initial next_row_offset must be initial_link.row_offset + row_count",
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        let _ = handle.fetch_links(1, 1000).await.unwrap();
+
+        assert_eq!(
+            handle.inner.next_row_offset.load(Ordering::Acquire),
+            1500,
+            "next_row_offset must advance to last_link.row_offset + row_count",
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // total_chunk_count transition-period fallback (PR #68 P0).
+    // ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_total_chunk_count_fallback_keeps_fetching() {
+        // **P0 regression guard.** Today's SEA servers don't yet
+        // populate `external_links[].next_chunk_index`. Without the
+        // total_chunk_count fallback, the kernel would interpret
+        // `next_chunk_index = None` on a non-terminal chunk as
+        // end-of-stream and silently drop chunks 1..N.
+        //
+        // Setup: initial link emits NO per-link next_chunk_index
+        // (`create_test_link_no_next`), but manifest says
+        // total_chunk_count = 2 (so chunk 1 must still be fetched).
+        // Mock returns chunk 1, also without per-link next, but
+        // total_chunk_count says it's the last one.
+        let server_chunk_1 = create_test_link_no_next(1);
+        let client = Arc::new(MockDatabricksClient::new(vec![
+            vec![], // index 0: never asked
+            vec![server_chunk_1],
+        ]));
+
+        let initial = vec![create_test_link_no_next(0)];
+        let fetcher = SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "stmt",
+            &initial,
+            /* total_chunk_count = */ Some(2),
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        // Crucial: fetcher must NOT mark all_links_fetched at
+        // construction even though the per-link signal would say so.
+        assert!(
+            !fetcher.all_links_fetched(),
+            "fallback path must keep fetching when total_chunk_count says more remain",
+        );
+        assert_eq!(
+            fetcher.next_server_fetch_index.load(Ordering::Acquire),
+            1,
+            "next fetch must target chunk 1 (initial last_chunk + 1) via fallback",
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // Drive the continuation fetch.
+        let result = handle.fetch_links(1, 0).await.unwrap();
+        assert!(
+            result.links.iter().any(|l| l.chunk_index == 1),
+            "second fetch must surface chunk 1",
+        );
+        // Per-link signal still None on chunk 1, but
+        // total_chunk_count = 2 → last_chunk + 1 == 2 == total →
+        // EOS reached.
+        assert!(
+            handle.inner.all_links_fetched(),
+            "fallback path must flip EOS once last_chunk + 1 == total_chunk_count",
+        );
+    }
+
+    /// Helper: link whose `next_chunk_index` is `None` (simulates a
+    /// pre-rollout SEA server that doesn't emit the per-link field).
+    fn create_test_link_no_next(chunk_index: i64) -> CloudFetchLink {
+        CloudFetchLink {
+            next_chunk_index: None,
+            ..create_test_link(chunk_index)
+        }
+    }
+
+    #[test]
+    fn test_decode_continuation_per_link_wins_when_present() {
+        // Bounded-API path: per-link `next_chunk_index = Some` →
+        // used directly, no fallback.
+        let link = create_test_link(0); // next_chunk_index = Some(1)
+        let cont = decode_continuation(&link, /* total */ Some(100));
+        assert_eq!(cont.next_fetch_index, 1);
+        assert!(!cont.eos);
+        assert!(!cont.used_total_chunk_count_fallback);
+    }
+
+    #[test]
+    fn test_decode_continuation_fallback_when_per_link_missing_and_total_more() {
+        // Pre-rollout path: per-link None, total says more.
+        let link = create_test_link_no_next(0);
+        let cont = decode_continuation(&link, Some(3));
+        assert_eq!(cont.next_fetch_index, 1, "fallback continues from chunk+1");
+        assert!(!cont.eos);
+        assert!(cont.used_total_chunk_count_fallback);
+    }
+
+    #[test]
+    fn test_decode_continuation_eos_when_per_link_none_and_total_agrees() {
+        // Bounded-API path on terminal chunk: per-link None,
+        // total_chunk_count says we're at-or-past the end. EOS.
+        let link = create_test_link_no_next(2); // chunk 2 of 3
+        let cont = decode_continuation(&link, Some(3));
+        assert!(cont.eos);
+        assert!(!cont.used_total_chunk_count_fallback);
+    }
+
+    #[test]
+    fn test_decode_continuation_eos_when_per_link_none_and_no_total() {
+        // No fallback available; trust the per-link signal.
+        let link = create_test_link_no_next(0);
+        let cont = decode_continuation(&link, None);
+        assert!(cont.eos);
+        assert!(!cont.used_total_chunk_count_fallback);
+    }
+
+    #[tokio::test]
+    async fn test_constructor_clamps_non_monotonic_next_chunk_index() {
+        // Defensive: if the server emits `next_chunk_index <
+        // chunk_index` (a server bug), the fetcher must not let
+        // `next_server_fetch_index` regress and cause the prefetch
+        // loop to re-issue the same RPC.
+        let bad_link = CloudFetchLink {
+            chunk_index: 5,
+            next_chunk_index: Some(3), // backwards
+            ..create_test_link(5)
+        };
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &[bad_link],
+            None,
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        assert!(
+            fetcher.next_server_fetch_index.load(Ordering::Acquire) >= 6,
+            "non-monotonic next_chunk_index must be clamped to max(chunk_index) + 1",
+        );
     }
 }

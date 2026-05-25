@@ -127,8 +127,18 @@ pub(crate) struct ChunkLinkFetchResult {
     )]
     pub next_chunk_index: Option<i64>,
     /// For row-offset based backends (Thrift), and as observability /
-    /// diagnostic info on the SEA path. Internally maintained by the
-    /// link fetcher; not currently read by the streaming provider.
+    /// diagnostic info on the SEA path.
+    ///
+    /// **Ownership note:** This field is *populated* by `Transport`
+    /// implementations from the wire response but is intentionally
+    /// **not** consumed by `SeaChunkLinkFetcher` — the fetcher
+    /// recomputes its own `next_row_offset` from
+    /// `last_link.row_offset + last_link.row_count` because the
+    /// bounded SEA API contract designates the per-link metadata as
+    /// authoritative. Keeping the field populated (rather than
+    /// `None`) gives future Thrift transport wiring a place to land
+    /// without churning the `ChunkLinkFetchResult` shape; for SEA
+    /// the field is diagnostic only.
     #[allow(
         dead_code,
         reason = "Thrift consumer wiring TBD; SEA path tracks row offset internally"

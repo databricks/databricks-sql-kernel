@@ -604,12 +604,23 @@ impl Transport for SeaRestTransport {
         // The next_chunk_index may be:
         // 1. At the top level of the response, OR
         // 2. Inside the external_link (each link knows its next chunk)
-        // Prefer top-level, fall back to link-level
+        //
+        // Prefer top-level, fall back to the *last* link's
+        // `next_chunk_index`. The previous code read `links.first()`
+        // — wrong if the batch contains multiple links, since only
+        // the last link's continuation pointer is meaningful. Today
+        // the SEA chunk-fetch endpoint typically returns a single
+        // link per response so the bug was latent, but
+        // `ChunkLinkFetchResult.next_chunk_index` is `#[allow(dead_code)]`
+        // for exactly the reason that any consumer wiring it back
+        // in would surface the inconsistency. Keep `first()`/`last()`
+        // aligned with `next_row_offset` below, both reading from
+        // `.last()`.
         let next_chunk_index = chunks_response.next_chunk_index.or_else(|| {
             chunks_response
                 .external_links
                 .as_ref()
-                .and_then(|links| links.first())
+                .and_then(|links| links.last())
                 .and_then(|link| link.next_chunk_index)
         });
 
@@ -618,13 +629,14 @@ impl Transport for SeaRestTransport {
         // Per the bounded-SEA-API contract for OSS drivers, the
         // server-provided `external_links[].row_offset` is what the
         // next fetch must send back. We propagate the last link's
-        // `row_offset + row_count` as the offset for the *next* fetch
-        // (i.e. the row position immediately after the last row in
-        // the batch we just received). On a fetch that returned no
-        // more chunks (`has_more=false`), the row offset is moot;
-        // emit `None` so downstream code doesn't store stale state.
+        // `row_offset + row_count` as the offset for the *next*
+        // fetch. `saturating_add` so a malicious/buggy server
+        // emitting `i64::MAX` row counts can't trigger an arithmetic
+        // panic in debug builds.
         let next_row_offset = if has_more {
-            links.last().map(|l| l.row_offset + l.row_count)
+            links
+                .last()
+                .map(|l| l.row_offset.saturating_add(l.row_count))
         } else {
             None
         };
