@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 
 use databricks_sql_kernel::{Error as KernelError, Session};
 
+use crate::async_statement::AsyncStatement;
 use crate::error::napi_err_from_kernel;
 use crate::runtime;
 use crate::statement::Statement;
@@ -249,6 +250,52 @@ impl Connection {
             // via the shared ValidityFlag — see `StatementInner` docs
             // in `statement.rs` for the rationale.
             Ok(Statement::from_executed(stmt, executed))
+        })
+        .await
+    }
+
+    /// Submit a SQL statement asynchronously and return an
+    /// `AsyncStatement` handle. The kernel's `Statement::submit()`
+    /// sends `wait_timeout=0s`, so the server returns immediately
+    /// with a `statement_id` while the query is still
+    /// `Pending`/`Running`. JS drives polling via the returned
+    /// handle's `status()` / `awaitResult()` methods.
+    ///
+    /// `options` carries the same per-statement knobs as
+    /// `executeStatement` (`statementConf` + `queryTags`). The
+    /// merging + serialisation are shared via
+    /// `build_merged_statement_conf`.
+    ///
+    /// Long-running queries that would blow past the sync polling
+    /// budget should use this path. Cancel-while-pending is
+    /// supported through `AsyncStatement.cancel()`; drop-cancel
+    /// during `awaitResult()` is handled by the kernel's
+    /// `AwaitResultCancelGuard` (fire-and-forget
+    /// `cancel_statement` if the future is dropped mid-poll).
+    #[napi]
+    pub async fn submit_statement(
+        &self,
+        sql: String,
+        options: Option<ExecuteOptions>,
+    ) -> napi::Result<AsyncStatement> {
+        let inner = Arc::clone(&self.inner);
+        let merged_conf = build_merged_statement_conf(options)?;
+        guarded(async move {
+            let guard = inner.lock().await;
+            let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+
+            let mut stmt = session.statement();
+            stmt.spec().sql(sql);
+            if let Some(conf) = merged_conf {
+                stmt.spec().statement_conf(conf);
+            }
+
+            let executed_async = stmt.submit().await.map_err(napi_err_from_kernel)?;
+            // Pass the parent kernel `Statement` into the JS wrapper
+            // for the same validity-flag lifetime reason as the sync
+            // path (see `AsyncStatementInner` docs in
+            // `async_statement.rs`).
+            Ok(AsyncStatement::from_executed_async(stmt, executed_async))
         })
         .await
     }

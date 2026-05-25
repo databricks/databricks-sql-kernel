@@ -39,6 +39,7 @@
 #[macro_use]
 extern crate napi_derive;
 
+pub(crate) mod async_statement;
 pub(crate) mod connection;
 pub(crate) mod database;
 pub(crate) mod error;
