@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{AuthConfig, DefaultOpts, Session};
+use databricks_sql_kernel::{AuthConfig, DefaultOpts, HttpConfig, Session};
 
 use crate::connection::Connection;
 use crate::error::napi_err_from_kernel;
@@ -70,6 +70,17 @@ pub struct ConnectionOptions {
     /// query-tag presets, …). Forwarded verbatim to SEA
     /// `session_confs`. Unknown keys are rejected server-side.
     pub session_conf: Option<HashMap<String, String>>,
+    /// Maximum number of pooled HTTP connections per host. Routes
+    /// through the kernel's [`HttpConfig::pool_max_idle_per_host`].
+    /// Tunes the underlying `reqwest` connection pool — higher values
+    /// reduce reconnect overhead when many statements run
+    /// concurrently against the same warehouse. `None` falls back to
+    /// the kernel default (100). Mirrors the Python connector's
+    /// `max_connections` kwarg on the SEA backend.
+    ///
+    /// Napi-rs serialises `u32` as JS `number`; values up to
+    /// `2^32 - 1` round-trip safely (any reasonable pool size fits).
+    pub max_connections: Option<u32>,
 }
 
 /// Open a Databricks SQL session over PAT auth and return an opaque
@@ -114,6 +125,15 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         }
         if let Some(conf) = options.session_conf {
             builder = builder.session_conf(conf);
+        }
+        // `HttpConfig` is `#[non_exhaustive]` — must construct via
+        // `default()` then mutate. Only override when the JS caller
+        // explicitly set `maxConnections`; otherwise leave the field
+        // unset so the kernel's default (100, post-PR-#30) applies.
+        if let Some(max) = options.max_connections {
+            let mut http = HttpConfig::default();
+            http.pool_max_idle_per_host = max as usize;
+            builder = builder.http(http);
         }
         let session = builder.open().await.map_err(napi_err_from_kernel)?;
         let session_id = session.session_id().to_owned();
