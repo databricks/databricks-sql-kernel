@@ -214,6 +214,41 @@ fn utf8_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     }
 }
 
+/// Like `utf8_column`, but substitutes `""` for null entries instead
+/// of preserving them as Arrow nulls. Used for JDBC string fields
+/// where the spec allows null but downstream consumers (Java
+/// `String`-handling code, SQLAlchemy reflection, etc.) routinely
+/// crash on null and the Thrift backend has historically returned
+/// `""` for the same fields. Today only `REMARKS`.
+fn utf8_column_or_empty(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    let n = batch.num_rows();
+    let Some(idx) = column_index(batch.schema_ref(), name) else {
+        return Ok(Arc::new(StringArray::from(vec![Some(""); n])));
+    };
+    let col = batch.column(idx);
+    let casted = if col.data_type() == &DataType::Utf8 {
+        Arc::clone(col)
+    } else {
+        arrow_cast::cast(col.as_ref(), &DataType::Utf8).map_err(|e| {
+            Error::data_loss().message(format!(
+                "unexpected non-Utf8 type for SHOW response column {name:?}: {e}"
+            ))
+        })?
+    };
+    let strs = casted
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| {
+            Error::data_loss().message(format!(
+                "utf8_column_or_empty: column {name:?} cast did not yield StringArray"
+            ))
+        })?;
+    let values: Vec<&str> = (0..n)
+        .map(|i| if strs.is_null(i) { "" } else { strs.value(i) })
+        .collect();
+    Ok(Arc::new(StringArray::from(values)))
+}
+
 /// Build an all-null `Utf8` column of `len` rows. Used for JDBC columns
 /// that have no server-side source (`TYPE_CAT`, `SELF_REFERENCING_COL_NAME`,
 /// `COLUMN_DEF`, …).
@@ -268,15 +303,28 @@ fn null_int8(len: usize) -> ArrayRef {
 }
 
 /// Map a server-side `"true"` / `"false"` string column to JDBC's
-/// `"YES"` / `"NO"` / `""` convention. Used for `IS_NULLABLE` and
-/// `IS_AUTO_INCREMENT` in `reshape_columns`; both follow the same
-/// rule (JDBC defines an empty string when the value is "unknown",
-/// which we use for null / unrecognised inputs). Missing source
-/// column → all-empty string array.
+/// `"YES"` / `"NO"` / `""` convention. Used for `IS_NULLABLE` —
+/// when the server doesn't give a definitive boolean we fall back
+/// to `""` (JDBC's "unknown" sentinel). For `IS_AUTO_INCREMENT` use
+/// [`bool_string_to_yn_with_default`] with `"NO"` instead, since
+/// Databricks tables don't support auto-increment and "unknown" is
+/// strictly less informative than the known-correct answer.
 fn bool_string_to_yn(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    bool_string_to_yn_with_default(batch, name, "")
+}
+
+/// Variant of [`bool_string_to_yn`] where the caller picks the fallback
+/// value used when the server returns null, a non-`"true"`/`"false"`
+/// string, or omits the source column entirely. Server-provided
+/// `"true"` / `"false"` always win.
+fn bool_string_to_yn_with_default(
+    batch: &RecordBatch,
+    name: &str,
+    default: &str,
+) -> Result<ArrayRef> {
     let n = batch.num_rows();
     let Some(idx) = column_index(batch.schema_ref(), name) else {
-        return Ok(Arc::new(StringArray::from(vec![Some(""); n])));
+        return Ok(Arc::new(StringArray::from(vec![Some(default); n])));
     };
     let arr = batch.column(idx);
     let strs = arrow_cast::cast(arr.as_ref(), &DataType::Utf8).map_err(|e| {
@@ -290,12 +338,12 @@ fn bool_string_to_yn(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     let labels: Vec<&str> = (0..n)
         .map(|i| {
             if strs.is_null(i) {
-                ""
+                default
             } else {
                 match strs.value(i) {
                     "true" => "YES",
                     "false" => "NO",
-                    _ => "",
+                    _ => default,
                 }
             }
         })
@@ -367,11 +415,12 @@ pub(crate) fn reshape_tables(
         // driver's behaviour when SHOW TABLES doesn't expose tableType.
         Arc::new(StringArray::from(vec![Some("TABLE"); n]))
     };
-    let remarks = if column_index(batch.schema_ref(), "remarks").is_some() {
-        utf8_column(batch, "remarks")?
-    } else {
-        Arc::new(StringArray::from(vec![Some(""); n]))
-    };
+    // REMARKS is contractually nullable per the JDBC spec, but the Thrift
+    // backend has historically emitted `""` for tables without a comment
+    // and most string-handling consumers expect a `String`, not `null`.
+    // `utf8_column_or_empty` covers both branches: column present with
+    // null entries → `""`; column absent → all `""`.
+    let remarks = utf8_column_or_empty(batch, "remarks")?;
     let reshaped = RecordBatch::try_new(
         GET_TABLES_SCHEMA.clone(),
         vec![
@@ -389,12 +438,21 @@ pub(crate) fn reshape_tables(
     )
     .map_err(|e| Error::data_loss().message(format!("reshape tables: {e}")))?;
 
-    // Apply table_types filter, if requested. JDBC's contract:
-    // null/empty = no filter; otherwise keep only rows whose
-    // TABLE_TYPE is in the list.
+    // Apply table_types filter, if requested. The JDBC `DatabaseMetaData.
+    // getTables(...)` Javadoc specifies that `null` types returns all
+    // types, but is silent on what an *explicit empty array* means.
+    // Two interpretations exist in the wild:
+    //   - Empty == null (returns all rows). Convenient, but conflates
+    //     "I didn't filter" with "I asked for nothing".
+    //   - Empty == "filter accepting nothing" (returns zero rows). Literal
+    //     reading of the filter contract.
+    // The Databricks Thrift backend follows the literal reading: zero
+    // rows on `types=[]`. We match Thrift here for cross-backend parity
+    // (verified via the python-comparator). Callers that want "all
+    // types" should pass `None`, not `Some(&[])`.
     let filtered = match table_types {
-        Some(types) if !types.is_empty() => filter_tables_by_type(&reshaped, types)?,
-        _ => reshaped,
+        None => reshaped,
+        Some(types) => filter_tables_by_type(&reshaped, types)?,
     };
     // Sort to match the JDBC driver's `getTables` row order
     // (`TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME`). JDBC's
@@ -529,12 +587,23 @@ pub(crate) fn reshape_columns(
         }
         None => Arc::new(Int32Array::from(vec![2_i32; n])),
     };
-    let remarks = utf8_column(batch, "remarks")?;
+    // REMARKS: JDBC allows null, but the Thrift backend has historically
+    // returned "" and string-handling consumers expect a `String`. Map
+    // null → "" at the kernel layer.
+    let remarks = utf8_column_or_empty(batch, "remarks")?;
     let ordinal_position = int32_column(batch, "ordinalPosition")?;
-    // IS_NULLABLE / IS_AUTO_INCREMENT: server emits "true"/"false";
-    // JDBC contract is "YES"/"NO"/"" (empty for unknown).
+    // IS_NULLABLE: server emits "true"/"false"; JDBC contract is
+    // "YES"/"NO"/"" (empty when unknown). The "unknown" sentinel is
+    // appropriate here — the server doesn't always know nullability for
+    // computed columns / views.
     let is_nullable_str = bool_string_to_yn(batch, "isNullable")?;
-    let is_autoincrement = bool_string_to_yn(batch, "isAutoIncrement")?;
+    // IS_AUTO_INCREMENT: Databricks tables don't support auto-increment
+    // columns, so when the server omits this field (or returns null /
+    // an unrecognised value) the correct JDBC answer is "NO", not the
+    // "unknown" sentinel "". Server-provided "true" / "false" still
+    // wins — if Databricks ever ships identity columns, this honours
+    // them. Code comment + grep makes the assumption findable.
+    let is_autoincrement = bool_string_to_yn_with_default(batch, "isAutoIncrement", "NO")?;
 
     RecordBatch::try_new(
         GET_COLUMNS_SCHEMA.clone(),
@@ -825,9 +894,23 @@ mod tests {
     }
 
     #[test]
-    fn tables_empty_types_filter_passes_everything() {
+    fn tables_empty_types_filter_returns_zero_rows() {
+        // Matches Thrift's behavior: explicit `Some(&[])` is a filter
+        // that accepts no table types, so the result is empty.
+        // `None` (caller didn't pass a type filter at all) is the
+        // separate "all types" path — see `tables_none_types_passes_all`.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), Some(&[])).unwrap();
+        assert_eq!(out.num_rows(), 0);
+    }
+
+    #[test]
+    fn tables_none_types_passes_all() {
+        // The all-types path — distinct from the explicit-empty path
+        // above. Locks the contract so future refactors don't quietly
+        // re-merge the two.
+        let b = server_tables_full();
+        let out = reshape_tables(&b, Some("main"), None).unwrap();
         assert_eq!(out.num_rows(), 3);
     }
 
@@ -933,5 +1016,116 @@ mod tests {
             .unwrap();
         assert_eq!(is_nullable.value(0), "NO");
         assert_eq!(is_nullable.value(1), "YES");
+    }
+
+    #[test]
+    fn columns_remarks_null_becomes_empty_string() {
+        // `server_columns_full` builds REMARKS as `[None, None]`. After
+        // reshape, both rows must be `""` (not null), matching Thrift's
+        // historical behaviour and downstream consumers that expect a
+        // `String`. REMARKS is JDBC column index 11.
+        let b = server_columns_full();
+        let out = reshape_columns(&b, Some("main")).unwrap();
+        let remarks = out
+            .column(11)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(!remarks.is_null(0), "REMARKS row 0 should be '', not null");
+        assert!(!remarks.is_null(1), "REMARKS row 1 should be '', not null");
+        assert_eq!(remarks.value(0), "");
+        assert_eq!(remarks.value(1), "");
+    }
+
+    #[test]
+    fn columns_is_auto_increment_defaults_to_no() {
+        // Databricks doesn't support auto-increment, so when the server
+        // returns "false" (or omits the column entirely) the JDBC value
+        // is "NO". IS_AUTO_INCREMENT is JDBC column index 22.
+        let b = server_columns_full();
+        let out = reshape_columns(&b, Some("main")).unwrap();
+        let is_ai = out
+            .column(22)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(is_ai.value(0), "NO");
+        assert_eq!(is_ai.value(1), "NO");
+    }
+
+    #[test]
+    fn columns_is_auto_increment_honors_server_true() {
+        // The `"NO"` default in `bool_string_to_yn_with_default` is a
+        // fallback for the server-silent case; if Databricks ever ships
+        // identity columns and the server emits `"true"`, the kernel
+        // honours it. Synthetic input with explicit `"true"` values.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_name", DataType::Utf8, false),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("columnType", DataType::Utf8, false),
+            Field::new("isNullable", DataType::Utf8, true),
+            Field::new("ordinalPosition", DataType::Int32, true),
+            Field::new("isAutoIncrement", DataType::Utf8, true),
+        ]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id"])),
+                Arc::new(StringArray::from(vec!["main"])),
+                Arc::new(StringArray::from(vec!["s"])),
+                Arc::new(StringArray::from(vec!["t"])),
+                Arc::new(StringArray::from(vec!["INT"])),
+                Arc::new(StringArray::from(vec![Some("false")])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("true")])),
+            ],
+        )
+        .unwrap();
+        let out = reshape_columns(&b, Some("main")).unwrap();
+        let is_ai = out
+            .column(22)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(is_ai.value(0), "YES");
+    }
+
+    #[test]
+    fn columns_is_auto_increment_no_when_column_missing() {
+        // If the server doesn't include `isAutoIncrement` at all (e.g.
+        // an older DBR's SHOW COLUMNS variant), the kernel still returns
+        // "NO" rather than "" — same domain reasoning.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_name", DataType::Utf8, false),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("columnType", DataType::Utf8, false),
+            Field::new("isNullable", DataType::Utf8, true),
+            Field::new("ordinalPosition", DataType::Int32, true),
+            // isAutoIncrement intentionally absent
+        ]));
+        let b = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["id"])),
+                Arc::new(StringArray::from(vec!["main"])),
+                Arc::new(StringArray::from(vec!["s"])),
+                Arc::new(StringArray::from(vec!["t"])),
+                Arc::new(StringArray::from(vec!["INT"])),
+                Arc::new(StringArray::from(vec![Some("false")])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+            ],
+        )
+        .unwrap();
+        let out = reshape_columns(&b, Some("main")).unwrap();
+        let is_ai = out
+            .column(22)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(is_ai.value(0), "NO");
     }
 }

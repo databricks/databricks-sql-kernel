@@ -172,11 +172,22 @@ pub struct ExternalLink {
     pub next_chunk_index: Option<i64>,
 }
 
-/// A positional parameter for a parameterized SEA statement execution.
+/// A bound parameter for a parameterized SEA statement execution.
+///
+/// Exactly one of `name` or `ordinal` should be set. `name` is the
+/// public, spec-required binding form (canonical proto marks
+/// `StatementParameter.name` as `openapi_required=true`); `ordinal`
+/// is the `PUBLIC_UNDOCUMENTED` positional form. Server accepts both.
 #[derive(Debug, Clone, Serialize)]
 pub struct StatementParameter {
-    /// 1-based position of the parameter in the SQL statement.
-    pub ordinal: i32,
+    /// Named parameter identifier. When `Some`, the SQL uses
+    /// `:name`-style markers and `ordinal` should be `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// 1-based position of the parameter in the SQL statement. When
+    /// `Some`, the SQL uses `?` markers and `name` should be `None`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ordinal: Option<i32>,
     /// Databricks SQL type name (e.g., "INT", "STRING", "DOUBLE", "TIMESTAMP").
     #[serde(rename = "type")]
     pub param_type: String,

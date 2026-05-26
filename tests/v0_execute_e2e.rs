@@ -102,6 +102,71 @@ async fn select_with_positional_params() {
 
 #[tokio::test]
 #[ignore]
+async fn select_with_named_params() {
+    // Named binding is the spec-required public form per the canonical
+    // SEA proto (`StatementParameter.name` is openapi_required=true).
+    // This proves the server accepts named bindings when the kernel
+    // populates `name` instead of `ordinal` on the wire.
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT :n AS n, :s AS s, :b AS b")
+        .param_named("n", TypedValue::Int64(42))
+        .unwrap()
+        .param_named("s", TypedValue::String("hello".into()))
+        .unwrap()
+        .param_named("b", TypedValue::Bool(true))
+        .unwrap();
+    let mut exec = stmt.execute().await.expect("execute with named params");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+    assert_eq!(row.get_i64(0).unwrap(), Some(42));
+    assert_eq!(row.get_str(1).unwrap(), Some("hello"));
+    assert_eq!(row.get_bool(2).unwrap(), Some(true));
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+#[tokio::test]
+#[ignore]
+async fn mixed_positional_and_named_params_is_server_side_error() {
+    // The kernel can serialise mixed positional + named bindings in
+    // the same `parameters` array — but the server rejects with
+    // `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME` when any
+    // parameter has a `name` set and another doesn't. This test
+    // documents the server contract: bindings must be uniformly
+    // positional or uniformly named.
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT ? AS pos, :n AS named")
+        .param(1, TypedValue::Int64(7))
+        .unwrap()
+        .param_named("n", TypedValue::Int64(99))
+        .unwrap();
+    let err = stmt
+        .execute()
+        .await
+        .err()
+        .expect("server should reject mixed bindings");
+    // Surfaced as DataLoss because the FAILED response is parsed via
+    // the generic execute-response path and the kernel's error
+    // classifier hasn't decoded BAD_REQUEST → InvalidArgument here.
+    // The important assertion is the BAD_REQUEST / MISSING_NAME
+    // text — the kernel correctly forwarded the mixed payload and
+    // surfaced the server-side rejection without losing context.
+    let msg = err.message;
+    assert!(
+        msg.contains("MISSING_NAME") || msg.contains("BAD_REQUEST"),
+        "expected MISSING_NAME / BAD_REQUEST in error, got: {msg}"
+    );
+    session.close().await.expect("session close");
+}
+
+#[tokio::test]
+#[ignore]
 async fn multi_batch_range_succeeds() {
     let session = live_session().await;
     let mut stmt = session.statement();

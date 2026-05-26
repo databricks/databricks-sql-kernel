@@ -135,7 +135,13 @@ tls-rustls = ["reqwest/rustls-tls"]
 name = "databricks_sql_kernel"
 crate-type = ["lib", "cdylib", "staticlib"]
 
-# Workspace — the kernel is the root crate; language bindings live as
-# sibling members. PyO3 first; napi-rs / etc. slot in here later.
+# Workspace — the kernel is the root crate; pyo3 is a sibling member.
+#
+# The napi binding crate (`napi/`) is deliberately NOT a member: it
+# uses `tls-rustls` while pyo3 uses the default `tls-native`, and a
+# single-workspace build would unify both kernel features and link
+# both TLS stacks (defeating the rustls switch — see [features]
+# comment above). napi declares its own `[workspace]` at `napi/Cargo.toml`
+# and reaches the kernel via `path = ".."`.
 [workspace]
 members = [".", "pyo3"]

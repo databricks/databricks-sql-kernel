@@ -80,6 +80,8 @@ impl Session {
         catalog=None,
         schema=None,
         session_conf=None,
+        complex_types_as_json=false,
+        intervals_as_string=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -91,6 +93,8 @@ impl Session {
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
+        complex_types_as_json: bool,
+        intervals_as_string: bool,
     ) -> PyResult<Self> {
         // Resolve auth_type: default to "pat" only when the caller
         // also passed access_token. This keeps existing PAT callers
@@ -139,6 +143,14 @@ impl Session {
             }
             if let Some(conf) = session_conf {
                 builder = builder.session_conf(conf);
+            }
+            // Merge result-config knobs into one `ResultConfig` so two
+            // toggles don't clobber each other when both are set.
+            if complex_types_as_json || intervals_as_string {
+                let mut result = databricks_sql_kernel::ResultConfig::default();
+                result.complex_types_as_json = complex_types_as_json;
+                result.intervals_as_string = intervals_as_string;
+                builder = builder.result(result);
             }
             builder.open().await
         })?;
