@@ -837,8 +837,7 @@ mod tests {
             .downcast_ref::<Int32Array>()
             .unwrap();
 
-        let mut by_name: std::collections::HashMap<&str, i32> =
-            std::collections::HashMap::new();
+        let mut by_name: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
         for i in 0..rb.num_rows() {
             by_name.insert(names.value(i), data_types.value(i));
         }
