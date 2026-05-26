@@ -15,11 +15,12 @@
 //! `databricks-sea-native` — napi-rs binding crate for the Databricks
 //! SQL Node.js driver's SEA (Statement Execution API) path.
 //!
-//! **Skeleton commit.** This commit lands the crate's infrastructure:
-//! Cargo manifest, build script, error envelope formatter, tokio
-//! runtime helper, `tracing` logger bridge, and shared utilities.
-//! The actual `#[napi]` classes (`Database`, `Connection`, `Statement`,
-//! `ResultStream`) are added in the follow-up commit.
+//! Surface: `openSession()` (free function) → `Connection` (opaque
+//! class with `executeStatement` / `close` / `sessionId`) →
+//! `Statement` (opaque class with `fetchNextBatch` / `schema` /
+//! `cancel` / `close` / `statementId`). Results cross the FFI as
+//! Arrow IPC bytes (`ArrowBatch` / `ArrowSchema` POJOs in
+//! `result.rs`); the TS adapter decodes them via `apache-arrow`.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 // Skeleton-PR state: every `pub(crate)` item in this crate (error
@@ -38,9 +39,13 @@
 #[macro_use]
 extern crate napi_derive;
 
+pub(crate) mod connection;
+pub(crate) mod database;
 pub(crate) mod error;
 pub(crate) mod logger;
+pub(crate) mod result;
 pub(crate) mod runtime;
+pub(crate) mod statement;
 pub(crate) mod util;
 
 /// Returns the native binding's crate version (`CARGO_PKG_VERSION`).
