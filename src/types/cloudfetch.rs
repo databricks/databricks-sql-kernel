@@ -107,6 +107,17 @@ impl CloudFetchLink {
         Utc::now() + chrono::Duration::seconds(LINK_EXPIRY_BUFFER_SECS) >= self.expiration
     }
 
+    /// Row offset of the next chunk after this one (i.e. the
+    /// cursor where the next page of results should start).
+    ///
+    /// Computed as `row_offset + row_count` with `saturating_add`
+    /// so a pathological server response can't cause arithmetic
+    /// overflow when the kernel uses this to advance its
+    /// continuation cursor.
+    pub fn row_offset_after(&self) -> i64 {
+        self.row_offset.saturating_add(self.row_count)
+    }
+
     /// Convert from SEA API response type.
     pub fn from_external_link(link: &ExternalLink) -> Result<Self> {
         let expiration = DateTime::parse_from_rfc3339(&link.expiration)

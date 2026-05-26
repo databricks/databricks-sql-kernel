@@ -143,6 +143,30 @@ pub(crate) struct SeaChunkLinkFetcher {
     /// Sticky one-shot flag for the warning above. Avoids spamming
     /// logs on every batch.
     fallback_warned: AtomicBool,
+    /// Sticky one-shot flag: server emitted neither
+    /// `next_chunk_index` nor `total_chunk_count`. The kernel
+    /// assumes end-of-stream in that case (only safe default),
+    /// but operationally this is a contract regression worth
+    /// surfacing.
+    silent_eos_warned: AtomicBool,
+    /// Sticky one-shot flag: server emitted a non-monotonic
+    /// `next_chunk_index` (pointing backwards or at an
+    /// already-cached chunk) and the kernel clamped to forward
+    /// progress. An operator triaging "results look wrong" needs
+    /// this breadcrumb to correlate with a server bug.
+    non_monotonic_warned: AtomicBool,
+    /// Sticky one-shot flag: prefetch loop has advanced past a
+    /// sanity ceiling. If the server keeps emitting
+    /// `next_chunk_index = Some(N)` indefinitely, the prefetch
+    /// loop will issue unbounded RPCs and grow the link cache
+    /// without bound (memory is bounded for *downloads* via
+    /// `max_chunks_in_memory` but NOT for link metadata).
+    runaway_prefetch_warned: AtomicBool,
+    /// Sticky one-shot flag: server returned an empty batch with
+    /// `has_more = true`. The kernel forces forward progress to
+    /// avoid spinning, but the empty-with-has_more shape is a
+    /// server bug worth surfacing in production logs.
+    empty_with_has_more_warned: AtomicBool,
     /// Current consumer position (highest chunk index requested)
     current_consumer_index: AtomicI64,
     /// Number of chunks to prefetch ahead of consumer position
@@ -209,6 +233,13 @@ struct Continuation {
     /// caller emits a one-shot warning so the rollout asymmetry is
     /// visible in production logs.
     used_total_chunk_count_fallback: bool,
+    /// True when *both* signals were absent — `next_chunk_index =
+    /// None` AND `total_chunk_count = None`. The kernel assumes
+    /// end-of-stream in this case (the only safe default), but a
+    /// pre-rollout server emitting neither signal silently
+    /// truncates multi-batch results. The caller emits a one-shot
+    /// warning so post-rollout regressions are visible.
+    used_silent_eos: bool,
 }
 
 /// Combine the server-emitted per-link `next_chunk_index` with the
@@ -219,38 +250,46 @@ struct Continuation {
 /// 1. `last_link.next_chunk_index = Some(N)` — trust the bounded
 ///    SEA API contract. Continue at N, eos = false.
 /// 2. `last_link.next_chunk_index = None`, `total_chunk_count`
-///    absent or says we're at-or-past the last chunk — trust the
+///    present and says we're at-or-past the last chunk — trust the
 ///    per-link signal. eos = true.
 /// 3. `last_link.next_chunk_index = None`, `total_chunk_count`
 ///    says more chunks remain — **fallback path**: the server
 ///    hasn't rolled out the new field yet. Continue at
 ///    `last_chunk.chunk_index + 1`, eos = false, log a warning.
+/// 4. `last_link.next_chunk_index = None`, `total_chunk_count =
+///    None` — **silent-EOS path**: neither signal present. Assume
+///    end-of-stream (the only safe default — we have no way to
+///    know whether more chunks exist), but flag the case so the
+///    caller can warn. A bounded-API server should always emit
+///    at least one of the two; reaching this branch indicates a
+///    pre-rollout server or a contract regression.
 fn decode_continuation(last_link: &CloudFetchLink, total_chunk_count: Option<i64>) -> Continuation {
     let next_after = last_link.chunk_index.saturating_add(1);
-    match last_link.next_chunk_index {
-        Some(idx) => Continuation {
+    match (last_link.next_chunk_index, total_chunk_count) {
+        (Some(idx), _) => Continuation {
             next_fetch_index: idx,
             eos: false,
             used_total_chunk_count_fallback: false,
+            used_silent_eos: false,
         },
-        None => {
-            // No per-link continuation signal. Decide via
-            // total_chunk_count if available.
-            let more_remaining = total_chunk_count.is_some_and(|total| next_after < total);
-            if more_remaining {
-                Continuation {
-                    next_fetch_index: next_after,
-                    eos: false,
-                    used_total_chunk_count_fallback: true,
-                }
-            } else {
-                Continuation {
-                    next_fetch_index: next_after,
-                    eos: true,
-                    used_total_chunk_count_fallback: false,
-                }
-            }
-        }
+        (None, Some(total)) if next_after < total => Continuation {
+            next_fetch_index: next_after,
+            eos: false,
+            used_total_chunk_count_fallback: true,
+            used_silent_eos: false,
+        },
+        (None, Some(_)) => Continuation {
+            next_fetch_index: next_after,
+            eos: true,
+            used_total_chunk_count_fallback: false,
+            used_silent_eos: false,
+        },
+        (None, None) => Continuation {
+            next_fetch_index: next_after,
+            eos: true,
+            used_total_chunk_count_fallback: false,
+            used_silent_eos: true,
+        },
     }
 }
 
@@ -302,29 +341,39 @@ impl SeaChunkLinkFetcher {
             .unwrap_or(-1);
         let initial_floor = max_initial_chunk.saturating_add(1);
 
-        let (next_server_fetch_index, all_links_fetched, next_row_offset, fallback_used) =
-            match initial_links.last() {
-                Some(link) => {
-                    let cont = decode_continuation(link, total_chunk_count);
-                    // Clamp to floor: if the server emitted a
-                    // `next_chunk_index` ≤ already-cached
-                    // `chunk_index`, force forward progress so the
-                    // prefetch loop can't re-issue the same RPC.
-                    let next_idx = cont.next_fetch_index.max(initial_floor);
-                    let next_row = link.row_offset.saturating_add(link.row_count);
-                    (
-                        next_idx,
-                        cont.eos,
-                        next_row,
-                        cont.used_total_chunk_count_fallback,
-                    )
-                }
-                // No initial links → "kernel constructed before the
-                // first server response" shape used by tests. Start
-                // at chunk 0; eos = false so the first server fetch
-                // can populate the cache.
-                None => (0, false, 0, false),
-            };
+        // Compute continuation from the last initial link, if any.
+        // The constructor can't use `apply_continuation` directly
+        // (no `&self` yet — we're building it) so it inlines the
+        // same sequence and emits the warnings post-build.
+        let (
+            next_server_fetch_index,
+            all_links_fetched,
+            next_row_offset,
+            fallback_used,
+            non_monotonic_clamp,
+        ) = match initial_links.last() {
+            Some(link) => {
+                let cont = decode_continuation(link, total_chunk_count);
+                // Clamp to floor: if the server emitted a
+                // `next_chunk_index` ≤ already-cached
+                // `chunk_index`, force forward progress so the
+                // prefetch loop can't re-issue the same RPC.
+                let next_idx = cont.next_fetch_index.max(initial_floor);
+                let clamp_fired = !cont.eos && cont.next_fetch_index < initial_floor;
+                (
+                    next_idx,
+                    cont.eos,
+                    link.row_offset_after(),
+                    cont.used_total_chunk_count_fallback,
+                    clamp_fired.then_some((cont.next_fetch_index, link.chunk_index)),
+                )
+            }
+            // No initial links → "kernel constructed before the
+            // first server response" shape used by tests. Start
+            // at chunk 0; eos = false so the first server fetch
+            // can populate the cache.
+            None => (0, false, 0, false, None),
+        };
 
         debug!(
             "SeaChunkLinkFetcher: {} initial links, next_server_fetch={}, \
@@ -345,6 +394,10 @@ impl SeaChunkLinkFetcher {
             all_links_fetched: AtomicBool::new(all_links_fetched),
             total_chunk_count_hint: total_chunk_count,
             fallback_warned: AtomicBool::new(false),
+            silent_eos_warned: AtomicBool::new(false),
+            non_monotonic_warned: AtomicBool::new(false),
+            runaway_prefetch_warned: AtomicBool::new(false),
+            empty_with_has_more_warned: AtomicBool::new(false),
             current_consumer_index: AtomicI64::new(0),
             link_prefetch_window,
             prefetch_in_progress: AtomicBool::new(false),
@@ -354,6 +407,23 @@ impl SeaChunkLinkFetcher {
         };
         if fallback_used {
             fetcher.warn_total_chunk_count_fallback("initial response");
+        }
+        // Capture any silent-EOS signal so a pre-rollout server is
+        // visible from the very first batch.
+        if let Some(link) = initial_links.last() {
+            if link.next_chunk_index.is_none() && total_chunk_count.is_none() {
+                fetcher.warn_silent_eos("initial response");
+            }
+        }
+        // Capture any non-monotonic-clamp event for the same
+        // reason — server bug visibility from batch 1.
+        if let Some((server_emitted, last_chunk)) = non_monotonic_clamp {
+            fetcher.warn_non_monotonic_clamp(
+                "initial response",
+                server_emitted,
+                initial_floor,
+                last_chunk,
+            );
         }
         fetcher
     }
@@ -373,6 +443,167 @@ impl SeaChunkLinkFetcher {
                  fallback path once the bounded-SEA-API rollout is complete.",
             );
         }
+    }
+
+    /// One-shot warning for the silent-EOS branch — server emitted
+    /// neither `next_chunk_index` nor `total_chunk_count`. The
+    /// kernel can only assume end-of-stream (no signal to do
+    /// otherwise). A bounded-API server should always emit at
+    /// least one signal; reaching this branch indicates a
+    /// pre-rollout server or a contract regression that silently
+    /// truncates multi-batch results.
+    fn warn_silent_eos(&self, site: &str) {
+        if !self.silent_eos_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                statement_id = %self.statement_id,
+                "Server emitted neither `next_chunk_index` nor `total_chunk_count` ({site}); \
+                 assuming end-of-stream. If this query has more than one batch of links, \
+                 results are silently truncated — likely a pre-rollout server or contract \
+                 regression.",
+            );
+        }
+    }
+
+    /// One-shot warning when the server emits a non-monotonic
+    /// `next_chunk_index` (pointing at or behind a chunk the
+    /// kernel has already cached). The kernel clamps to forward
+    /// progress, but the operator triaging "results look wrong"
+    /// needs the breadcrumb to correlate with a server bug.
+    fn warn_non_monotonic_clamp(
+        &self,
+        site: &str,
+        server_emitted: i64,
+        clamped_to: i64,
+        last_chunk_index: i64,
+    ) {
+        if !self.non_monotonic_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                statement_id = %self.statement_id,
+                server_next_chunk_index = server_emitted,
+                last_chunk_index,
+                clamped_to,
+                "Server emitted non-monotonic `next_chunk_index` ({site}); \
+                 clamping forward to avoid re-issuing the same RPC. \
+                 Likely a server bug — kernel result-ordering is unaffected, \
+                 but downstream consumers may see latency from re-fetches.",
+            );
+        }
+    }
+
+    /// One-shot warning when the prefetch loop has advanced past
+    /// a sanity ceiling. Without this, a server emitting
+    /// `next_chunk_index = Some(N)` indefinitely would cause
+    /// unbounded growth in the link-metadata cache (downloads are
+    /// bounded by `max_chunks_in_memory`; metadata is not).
+    fn warn_runaway_prefetch(&self, site: &str, current_index: i64, ceiling: i64) {
+        if !self.runaway_prefetch_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                statement_id = %self.statement_id,
+                next_server_fetch_index = current_index,
+                ceiling,
+                total_chunk_count = ?self.total_chunk_count_hint,
+                "Prefetch loop has advanced past the runaway-detection ceiling ({site}); \
+                 link-cache memory will grow unbounded if the server keeps emitting \
+                 `next_chunk_index = Some(N)`. Likely a server bug.",
+            );
+        }
+    }
+
+    /// One-shot warning when the server returns an empty batch
+    /// with `has_more = true`. The kernel forces forward progress
+    /// to avoid spinning, but the empty-with-has_more shape is a
+    /// server bug we want surfaced in production logs.
+    fn warn_empty_with_has_more(&self, site: &str, advanced_from: i64, advanced_to: i64) {
+        if !self.empty_with_has_more_warned.swap(true, Ordering::AcqRel) {
+            tracing::warn!(
+                statement_id = %self.statement_id,
+                advanced_from,
+                advanced_to,
+                "Server returned an empty batch with has_more=true ({site}); \
+                 forcing forward progress to avoid an infinite loop. Likely a server bug.",
+            );
+        }
+    }
+
+    /// Sanity ceiling for runaway-prefetch detection.
+    ///
+    /// `10 × total_chunk_count_hint` when known (so a server that
+    /// overshoots its own claimed chunk count by 10× is still
+    /// flagged), else a hard floor of 10,000. Either way: if the
+    /// prefetch loop crosses this threshold without hitting EOS,
+    /// something is wrong upstream.
+    fn runaway_prefetch_ceiling(&self) -> i64 {
+        self.total_chunk_count_hint
+            .map(|n| n.saturating_mul(10))
+            .unwrap_or(10_000)
+            .max(10_000)
+    }
+
+    /// Apply a `decode_continuation` result to the fetcher's
+    /// atomic state, emitting any one-shot warnings required.
+    ///
+    /// Three sites share this invariant — constructor, prefetch
+    /// loop, and sync fallback — and a previous round of review
+    /// (F8) called out that hand-rolling the sequence at each
+    /// site is exactly the kind of code that rots. This helper
+    /// is the single source of truth for the order of
+    /// operations:
+    ///
+    /// 1. Update `next_row_offset` via `fetch_max` (must not
+    ///    regress — sync-fallback and prefetch run concurrently).
+    /// 2. Emit `total_chunk_count` fallback warning if relevant.
+    /// 3. Emit silent-EOS warning if relevant.
+    /// 4. Either flip `all_links_fetched` (eos case) or
+    ///    `fetch_max` the new `next_server_fetch_index` (forward
+    ///    progress). The forward-progress case also clamps to
+    ///    `last_chunk.chunk_index + 1` so a non-monotonic server
+    ///    response can't drive the cursor backwards.
+    /// 5. Emit runaway-prefetch warning if the new cursor has
+    ///    crossed the sanity ceiling.
+    ///
+    /// Returns the post-update `next_server_fetch_index` (for
+    /// callers that need to report it, e.g. building a
+    /// `ChunkLinkFetchResult`).
+    fn apply_continuation(&self, last_link: &CloudFetchLink, site: &str) -> i64 {
+        // 1. Row-offset cursor — `fetch_max` so a slow sync-fallback
+        //    completing late can never regress a faster prefetch.
+        let next_row = last_link.row_offset_after();
+        self.next_row_offset.fetch_max(next_row, Ordering::Release);
+
+        // 2/3. Decode + warn.
+        let cont = decode_continuation(last_link, self.total_chunk_count_hint);
+        if cont.used_total_chunk_count_fallback {
+            self.warn_total_chunk_count_fallback(site);
+        }
+        if cont.used_silent_eos {
+            self.warn_silent_eos(site);
+        }
+
+        // 4. Either EOS or forward progress (with clamp).
+        if cont.eos {
+            self.all_links_fetched.store(true, Ordering::Release);
+            return self.next_server_fetch_index.load(Ordering::Acquire);
+        }
+        let clamp_floor = last_link.chunk_index.saturating_add(1);
+        let advance_to = cont.next_fetch_index.max(clamp_floor);
+        if cont.next_fetch_index < clamp_floor {
+            self.warn_non_monotonic_clamp(
+                site,
+                cont.next_fetch_index,
+                advance_to,
+                last_link.chunk_index,
+            );
+        }
+        self.next_server_fetch_index
+            .fetch_max(advance_to, Ordering::Release);
+
+        // 5. Runaway-prefetch sanity check.
+        let ceiling = self.runaway_prefetch_ceiling();
+        if advance_to > ceiling {
+            self.warn_runaway_prefetch(site, advance_to, ceiling);
+        }
+
+        advance_to
     }
 
     /// Check if a link is cached.
@@ -496,37 +727,17 @@ impl SeaChunkLinkFetcher {
                     // stops the prefetch loop; in-flight chunk
                     // downloads continue independently.
                     if let Some(last_link) = result.links.last() {
-                        let next_row_offset =
-                            last_link.row_offset.saturating_add(last_link.row_count);
-                        self.next_row_offset
-                            .store(next_row_offset, Ordering::Release);
-                        let cont = decode_continuation(last_link, self.total_chunk_count_hint);
-                        if cont.used_total_chunk_count_fallback {
-                            self.warn_total_chunk_count_fallback("prefetch loop");
-                        }
-                        if cont.eos {
-                            debug!(
-                                "Prefetch loop: end-of-stream on link {} \
-                                 (next_chunk_index absent, total_chunk_count agrees)",
-                                last_link.chunk_index,
-                            );
-                            self.all_links_fetched.store(true, Ordering::Release);
+                        let last_chunk_index = last_link.chunk_index;
+                        let links_count = result.links.len();
+                        let advance_to = self.apply_continuation(last_link, "prefetch loop");
+                        if self.all_links_fetched.load(Ordering::Acquire) {
+                            debug!("Prefetch loop: end-of-stream on link {}", last_chunk_index,);
                             break;
                         }
-                        // Forward-progress floor: never let
-                        // next_server_fetch_index regress.
-                        let advance_to = cont
-                            .next_fetch_index
-                            .max(last_link.chunk_index.saturating_add(1));
-                        self.next_server_fetch_index
-                            .fetch_max(advance_to, Ordering::Release);
                         debug!(
                             "Prefetch loop: fetched {} links (last chunk {}), \
-                             next_server_fetch={}, next_row_offset={}",
-                            result.links.len(),
-                            last_link.chunk_index,
-                            advance_to,
-                            next_row_offset,
+                             next_server_fetch={}",
+                            links_count, last_chunk_index, advance_to,
                         );
                     } else if !result.has_more {
                         // Defensive: server returned no links and
@@ -538,8 +749,7 @@ impl SeaChunkLinkFetcher {
                     } else {
                         // Empty batch but `has_more` is true. Force
                         // forward progress so the loop can't spin
-                        // re-issuing the same RPC (P1 #2 in PR #68
-                        // review). Two strategies:
+                        // re-issuing the same RPC. Two strategies:
                         // 1. If the server gave us a
                         //    `next_chunk_index` hint, use it.
                         // 2. Otherwise bump past
@@ -552,16 +762,17 @@ impl SeaChunkLinkFetcher {
                         // `current_consumer_index` heuristic in
                         // streaming_provider (consumer never
                         // advances → chunks_in_memory stays full
-                        // → prefetch pauses).
+                        // → prefetch pauses) AND via the
+                        // `empty_with_has_more_warned` one-shot.
                         let advance_to = result
                             .next_chunk_index
                             .unwrap_or_else(|| server_fetch_idx.saturating_add(1));
                         self.next_server_fetch_index
                             .fetch_max(advance_to, Ordering::Release);
-                        debug!(
-                            "Prefetch loop: empty batch with has_more=true; \
-                             advancing next_server_fetch from {} to {}",
-                            server_fetch_idx, advance_to,
+                        self.warn_empty_with_has_more(
+                            "prefetch loop",
+                            server_fetch_idx,
+                            advance_to,
                         );
                         break;
                     }
@@ -637,7 +848,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             let mut i = start_chunk_index;
             while let Some(link) = fetcher.links.get(&i) {
                 links.push(link.clone());
-                i += 1;
+                i = i.saturating_add(1);
             }
             return Ok(ChunkLinkFetchResult {
                 links,
@@ -693,42 +904,28 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             fetcher.links.insert(link.chunk_index, link.clone());
         }
 
-        // Advance `next_server_fetch_index` / `next_row_offset` via
-        // `decode_continuation` so both the prefetch loop and the
-        // sync-fallback path share the same bridge logic for the
-        // total_chunk_count rollout.
+        // Advance via the shared `apply_continuation` helper so
+        // prefetch-loop and sync-fallback share the same bridge
+        // logic for the total_chunk_count rollout, the same
+        // forward-progress clamp, and the same one-shot warnings.
         let next_chunk_index = match result.links.last() {
             Some(last_link) => {
-                let next_row_offset = last_link.row_offset.saturating_add(last_link.row_count);
-                fetcher
-                    .next_row_offset
-                    .store(next_row_offset, Ordering::Release);
-                let cont = decode_continuation(last_link, fetcher.total_chunk_count_hint);
-                if cont.used_total_chunk_count_fallback {
-                    fetcher.warn_total_chunk_count_fallback("sync fallback");
-                }
-                if cont.eos {
-                    fetcher.all_links_fetched.store(true, Ordering::Release);
+                let advance_to = fetcher.apply_continuation(last_link, "sync fallback");
+                if fetcher.all_links_fetched.load(Ordering::Acquire) {
                     None
                 } else {
-                    let advance_to = cont
-                        .next_fetch_index
-                        .max(last_link.chunk_index.saturating_add(1));
-                    fetcher
-                        .next_server_fetch_index
-                        .fetch_max(advance_to, Ordering::Release);
                     Some(advance_to)
                 }
             }
             None => {
                 // Empty response. Honour the server's has_more
                 // signal AND defend against an empty-with-has_more
-                // spin (P1 #2 in PR #68 review): force forward
-                // progress on next_server_fetch_index so the next
-                // call asks for a different chunk index. The
-                // server is expected to either yield links or
-                // signal end-of-stream — a perpetual "I have more
-                // but here are zero links" loop is a server bug we
+                // spin: force forward progress on
+                // next_server_fetch_index so the next call asks
+                // for a different chunk index. The server is
+                // expected to either yield links or signal
+                // end-of-stream — a perpetual "I have more but
+                // here are zero links" loop is a server bug we
                 // refuse to amplify into an infinite local retry.
                 if !result.has_more {
                     fetcher.all_links_fetched.store(true, Ordering::Release);
@@ -739,6 +936,11 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
                     fetcher
                         .next_server_fetch_index
                         .fetch_max(advance_to, Ordering::Release);
+                    fetcher.warn_empty_with_has_more(
+                        "sync fallback",
+                        start_chunk_index,
+                        advance_to,
+                    );
                 }
                 None
             }
@@ -1408,11 +1610,49 @@ mod tests {
 
     #[test]
     fn test_decode_continuation_eos_when_per_link_none_and_no_total() {
-        // No fallback available; trust the per-link signal.
+        // Silent-EOS branch: neither signal present. Decode falls
+        // through to "assume end-of-stream" (the only safe default)
+        // but flags the case via `used_silent_eos` so the caller
+        // can fire a one-shot warning.
         let link = create_test_link_no_next(0);
         let cont = decode_continuation(&link, None);
         assert!(cont.eos);
         assert!(!cont.used_total_chunk_count_fallback);
+        assert!(
+            cont.used_silent_eos,
+            "(None, None) must surface as silent-EOS so caller can warn",
+        );
+    }
+
+    #[test]
+    fn test_decode_continuation_used_silent_eos_false_in_other_branches() {
+        // The silent-EOS flag must be exclusive — it should NOT
+        // fire in any of the other three branches.
+
+        // 1. per-link Some → no silent-EOS
+        let link_with_next = create_test_link(0);
+        let cont = decode_continuation(&link_with_next, None);
+        assert!(
+            !cont.used_silent_eos,
+            "per-link Some must not flag silent-EOS"
+        );
+
+        // 2. per-link None + total says more remaining → fallback path
+        let link_no_next = create_test_link_no_next(0);
+        let cont = decode_continuation(&link_no_next, Some(5));
+        assert!(
+            !cont.used_silent_eos,
+            "fallback path must not flag silent-EOS"
+        );
+        assert!(cont.used_total_chunk_count_fallback);
+
+        // 3. per-link None + total says at-end → trust per-link
+        let cont = decode_continuation(&link_no_next, Some(1));
+        assert!(
+            !cont.used_silent_eos,
+            "explicit-EOS via total must not flag silent-EOS"
+        );
+        assert!(cont.eos);
     }
 
     #[tokio::test]
@@ -1420,7 +1660,9 @@ mod tests {
         // Defensive: if the server emits `next_chunk_index <
         // chunk_index` (a server bug), the fetcher must not let
         // `next_server_fetch_index` regress and cause the prefetch
-        // loop to re-issue the same RPC.
+        // loop to re-issue the same RPC. AND it must fire the
+        // one-shot `non_monotonic_warned` flag so an operator
+        // can correlate "results look wrong" with the server bug.
         let bad_link = CloudFetchLink {
             chunk_index: 5,
             next_chunk_index: Some(3), // backwards
@@ -1438,6 +1680,171 @@ mod tests {
         assert!(
             fetcher.next_server_fetch_index.load(Ordering::Acquire) >= 6,
             "non-monotonic next_chunk_index must be clamped to max(chunk_index) + 1",
+        );
+        assert!(
+            fetcher.non_monotonic_warned.load(Ordering::Acquire),
+            "non-monotonic clamp must fire the sticky warning flag",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_constructor_warns_silent_eos_when_neither_signal_present() {
+        // G1: a pre-rollout server that emits neither
+        // `next_chunk_index` nor `total_chunk_count` causes the
+        // kernel to assume EOS. Verify the sticky warning fires.
+        let link_neither = CloudFetchLink {
+            chunk_index: 0,
+            next_chunk_index: None,
+            ..create_test_link(0)
+        };
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &[link_neither],
+            None, // total_chunk_count also absent
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        assert!(
+            fetcher.silent_eos_warned.load(Ordering::Acquire),
+            "silent-EOS branch must fire the sticky warning flag",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_constructor_does_not_warn_silent_eos_when_total_present() {
+        // Mirror: if `total_chunk_count` is present, we're either
+        // in the "fallback" path or the "explicit EOS via total"
+        // path — neither is silent-EOS.
+        let link_neither = CloudFetchLink {
+            chunk_index: 0,
+            next_chunk_index: None,
+            ..create_test_link(0)
+        };
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &[link_neither],
+            Some(1), // total says we're at the last chunk
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        assert!(
+            !fetcher.silent_eos_warned.load(Ordering::Acquire),
+            "explicit-EOS via total must NOT trip silent-EOS warning",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_warn_helpers_are_sticky_one_shot() {
+        // Every `warn_*` helper uses `swap(true)` so subsequent
+        // calls are no-ops. Verify this contract for each of the
+        // four new warnings; otherwise a chatty server would spam
+        // production logs.
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &[],
+            None,
+            0,
+            tokio::runtime::Handle::current(),
+        );
+
+        // Each warn helper takes the swap-true path on first
+        // call (returns prior false), no-op afterwards. We
+        // observe the side effect via the AtomicBool field.
+        for _ in 0..3 {
+            fetcher.warn_silent_eos("test");
+            fetcher.warn_non_monotonic_clamp("test", 3, 6, 5);
+            fetcher.warn_runaway_prefetch("test", 100_000, 10_000);
+            fetcher.warn_empty_with_has_more("test", 0, 1);
+        }
+
+        assert!(fetcher.silent_eos_warned.load(Ordering::Acquire));
+        assert!(fetcher.non_monotonic_warned.load(Ordering::Acquire));
+        assert!(fetcher.runaway_prefetch_warned.load(Ordering::Acquire));
+        assert!(fetcher.empty_with_has_more_warned.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn test_runaway_prefetch_ceiling_uses_hint_or_floor() {
+        // Ceiling = max(10 × total_chunk_count_hint, 10_000).
+        // A small known total still gives us the 10k floor;
+        // a large known total gives us 10×.
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+
+        let with_small_total = SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "stmt",
+            &[],
+            Some(50),
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        // 10 × 50 = 500, but floor = 10_000 wins
+        assert_eq!(with_small_total.runaway_prefetch_ceiling(), 10_000);
+
+        let with_large_total = SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "stmt",
+            &[],
+            Some(5_000),
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        // 10 × 5_000 = 50_000 beats the floor
+        assert_eq!(with_large_total.runaway_prefetch_ceiling(), 50_000);
+
+        let without_total = SeaChunkLinkFetcher::new(
+            client as Arc<dyn Transport>,
+            "stmt",
+            &[],
+            None,
+            0,
+            tokio::runtime::Handle::current(),
+        );
+        // No hint → hard floor only
+        assert_eq!(without_total.runaway_prefetch_ceiling(), 10_000);
+    }
+
+    #[tokio::test]
+    async fn test_apply_continuation_uses_fetch_max_for_row_offset() {
+        // G2: `next_row_offset` must use `fetch_max`, not `store`,
+        // so a late sync-fallback finishing after a faster
+        // prefetch can't regress the cursor.
+        let client = Arc::new(MockDatabricksClient::new(vec![]));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "stmt",
+            &[],
+            None,
+            0,
+            tokio::runtime::Handle::current(),
+        );
+
+        // Pre-seed the cursor to a high value (simulates a fast
+        // prefetch that already ran).
+        fetcher.next_row_offset.store(5_000, Ordering::Release);
+
+        // Now have `apply_continuation` see a link with a *lower*
+        // row_offset_after (simulates a late sync-fallback).
+        let late_link = CloudFetchLink {
+            chunk_index: 1,
+            row_offset: 1_000,
+            row_count: 1_000,
+            ..create_test_link(1)
+        };
+        let _ = fetcher.apply_continuation(&late_link, "test");
+
+        // Cursor MUST stay at 5_000 — `fetch_max` keeps the
+        // higher value.
+        assert_eq!(
+            fetcher.next_row_offset.load(Ordering::Acquire),
+            5_000,
+            "late sync-fallback must not regress next_row_offset (fetch_max contract)",
         );
     }
 }
