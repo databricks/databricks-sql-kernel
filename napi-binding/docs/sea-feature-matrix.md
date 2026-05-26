@@ -37,6 +37,47 @@ Legend: **Y** = implemented/merged, **PR** = implemented in open PR (not yet mer
 
 ---
 
+## Quick-reference — implementations landing in this PR round (2026-05-25)
+
+Six feature PRs land the implementation work; PR #77 (this doc) records the status delta and 3 matrix corrections.
+
+| Feature           | Status      | Kernel PR | NodeJS PR | Test coverage                                      |
+| ----------------- | ----------- | --------- | --------- | -------------------------------------------------- |
+| F1 maxConnections | Implemented | [#74](https://github.com/databricks/databricks-sql-kernel/pull/74) | [#392](https://github.com/databricks/databricks-sql-nodejs/pull/392) | 9 unit + 3 live e2e (pecotesting) |
+| F2 Arrow complex types (not JSON) | Locked (kernel default) | (default, no kernel change) | [#392](https://github.com/databricks/databricks-sql-nodejs/pull/392) | 1 live e2e (pecotesting) |
+| F3 statement conf map | Implemented (napi) | [#75](https://github.com/databricks/databricks-sql-kernel/pull/75) | [#393](https://github.com/databricks/databricks-sql-nodejs/pull/393) | 8 Rust unit + 8 NodeJS unit + 4 live e2e |
+| F3 query tags | Implemented (byte-identical Thrift wire shape) | [#75](https://github.com/databricks/databricks-sql-kernel/pull/75) | [#393](https://github.com/databricks/databricks-sql-nodejs/pull/393) | 5 Rust parity tests + 4 live e2e |
+| F3b async execute (submit + poll + await_result) | Implemented (napi surface only — facade integration deferred) | [#76](https://github.com/databricks/databricks-sql-kernel/pull/76) | [#394](https://github.com/databricks/databricks-sql-nodejs/pull/394) | 3 live e2e |
+| F4 fetchAll (drain to rows) | Verified zero-code-change | (n/a) | [#393](https://github.com/databricks/databricks-sql-nodejs/pull/393) | 5 live e2e (pecotesting) |
+
+**Total live e2e: 16/16 against pecotesting (independently reproduced by DA in own check-worktree).**
+
+### Comparison to Python (reference implementation)
+
+| Feature | Python `use_sea=True` | Python `use_kernel=True` (pyo3) | NodeJS SEA (this round) |
+|---|---|---|---|
+| `max_connections` | `max_connections=` kwarg → urllib3 `maxsize` | inherited via kernel | `maxConnections` (SEA-only; Thrift gap) |
+| Complex types as Arrow | `_use_arrow_native_complex_types=True` (default) | inherited via kernel | kernel default `complex_types_as_json=false` |
+| Statement conf + query tags | `statement_conf=` / `query_tags=` | `query_tags` raises `NotSupportedError` | napi `ExecuteOptions.statementConf` / `queryTags`; **public NodeJS `ExecuteStatementOptions` follow-up needed** (see Statement conf map row note in §3) |
+| Async execute | `async_op=True` (submit + poll loop) | `submit()` + `await_result()` | napi `AsyncStatement` + `AsyncResultHandle`; **`SeaAsyncOperationBackend` facade-level integration is the next increment** |
+| `fetchall_arrow()` | yes | yes | `DBSQLOperation.fetchAll` already routes through `SeaOperationBackend.fetchChunk` — no SEA-side adapter change needed; regression-locked in #393 |
+
+### Deferred (need kernel changes — separate kernel PRs, not in this round)
+
+- **Positional + named params** — needs JS↔napi `TypedValue` mapping. Python `use_sea=True` exposes via `TSparkParameter`; Thrift exposes too. Outside this PR scope.
+- **Row limit** — needs kernel `StatementSpec.row_limit` field (currently only on internal `ExecuteParams`; see note 5).
+- **`TIMESTAMP` / `TIMESTAMP_NTZ` / `TIMESTAMP_LTZ` / `VARIANT` params** — covered by positional-params follow-up. `TIMESTAMP_NTZ`/`LTZ`/`VARIANT` are also Thrift gaps per the parity rubric.
+- **Max rows per fetch** — concept does not map cleanly between SEA Arrow-batch streaming and Thrift's direct-results first-batch hint (see note 6).
+- **Wait timeout / `queryTimeout`** — Thrift exposes it (matrix correction below); SEA-side wait_timeout would be a separate config knob.
+
+### Three matrix corrections in this PR
+
+1. **Thrift `queryTimeout`** — matrix previously said N; Thrift code has `ExecuteStatementOptions.queryTimeout` at `lib/contracts/IDBSQLSession.ts:13`. Corrected to Y.
+2. **Thrift `rowLimit`** — matrix previously said Y; Thrift `ExecuteStatementOptions` has no `rowLimit` field. Only way to cap rows is `LIMIT N` in SQL. Corrected to N.
+3. **`maxRows per fetch` semantics** — Thrift's `maxRows` is a direct-results first-batch hint, NOT a per-fetch row cap (which is Python `use_sea`'s `max_rows=`). Same name, different semantics — clarified in note 6.
+
+---
+
 ## 1. Metadata Methods
 
 NodeJS column legend:
@@ -96,6 +137,8 @@ NodeJS column legend:
 
 **Note 6 — max_rows_per_fetch (Section 3) — semantics divergence:** Thrift's `ExecuteStatementOptions.maxRows` is a **direct-results first-batch hint** (`getDirectResultsOptions(maxRows, ...)` populates the inline first-batch row count on `TExecuteStatementReq`). Python `use_sea`'s `max_rows=` is a **per-fetch row cap** governing how many rows each `fetch_many_arrow` call returns. The two are not the same feature despite sharing a name — Thrift's affects how much data the server inlines in the execute response (vs. CloudFetch external links); Python's affects pagination by the connector. The SEA path through the kernel does Arrow-batch streaming with server-driven batch sizing, so neither semantic maps cleanly to a single napi knob. Listed as "deferred — concept does not map cleanly" for NodeJS SEA. This is a matrix correction (the prior single-row treatment conflated the two semantics).
 
+**Note 7 — Statement conf map + query tags napi-only scope (Section 3):** PR #75 (kernel napi `ExecuteOptions.statementConf`) + PR #393 (NodeJS adapter wiring) plumb the field through `SeaNativeLoader → Connection.executeStatement(sql, options?)` so the SEA execution path honors `statementConf` end-to-end. **However, the public NodeJS surface `ExecuteStatementOptions` (`lib/contracts/IDBSQLSession.ts:7-30`) does NOT yet expose `statementConf` to user code** — it remains internal-only for now. Wiring it to the public API is a follow-up increment after these PRs land. Query tags follow the same shape: the wire-level `serializeQueryTags`-byte-identical encoding is correct at the napi layer; surfacing as `executeStatement(sql, { queryTags: {...} })` on the public NodeJS API is the same follow-up. This is the scope-down DA flagged on PR #77 round-3 review.
+
 ---
 
 ## 3. Statement / Execution Features
@@ -118,8 +161,8 @@ NodeJS column legend:
 | Max rows per fetch                         | Y (server-driven batch sizing, see note 6) | N                | N                                           | Y (`max_rows=`)       | N (concept does not map cleanly — see note 6) | N | Y (`maxRows` on `ExecuteStatementOptions` — note 6: this is "direct-results first-batch hint" not "per-fetch row cap", semantics differ from Python `use_sea`) |
 | Wait timeout / queryTimeout                | Y                  | N                                 | N                                           | Y                     | N                   | N (explicitly rejected) | Y (`queryTimeout` on `ExecuteStatementOptions` — matrix correction; was previously N)               |
 | Statement ID access                        | Y                  | Y                                 | Y                                           | Y                     | Y                   | Y                       | Y               |
-| Statement conf map                         | Y                  | N                                 | N (`query_tags` raises `NotSupportedError`) | Y                     | PR (#75 / #393 — `ExecuteOptions.statementConf`) | PR (#75 / #393)         | Y               |
-| Query tags                                 | N/A (via `statement_conf["query_tags"]`) | N/A    | N (`NotSupportedError`)                     | Y                     | PR (#75 / #393 — byte-identical Thrift `serializeQueryTags` wire shape) | PR (#75 / #393) | Y               |
+| Statement conf map                         | Y                  | N                                 | N (`query_tags` raises `NotSupportedError`) | Y                     | PR (#75 / #393 — `ExecuteOptions.statementConf` at napi level only; **not exposed on public NodeJS `ExecuteStatementOptions` — follow-up needed to wire to public API**, see note 7) | PR (#75 / #393, napi-only)         | Y               |
+| Query tags                                 | N/A (via `statement_conf["query_tags"]`) | N/A    | N (`NotSupportedError`)                     | Y                     | PR (#75 / #393 — byte-identical Thrift `serializeQueryTags` wire shape; napi-only surface, same caveat as Statement conf map row) | PR (#75 / #393, napi-only) | Y               |
 
 
 ---
