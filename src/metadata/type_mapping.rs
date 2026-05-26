@@ -148,11 +148,7 @@ const MAX_PARSE_DEPTH: usize = 64;
 /// only consulted at the `INTERVAL` arm — it has no meaning for
 /// nested composites, so passing it down is harmless and lets the
 /// caller specify it once.
-fn parse_type(
-    s: &str,
-    type_interval_type: Option<&str>,
-    depth: usize,
-) -> Option<DataType> {
+fn parse_type(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
     if depth >= MAX_PARSE_DEPTH {
         return None;
     }
@@ -279,11 +275,7 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// `list_(t)` default also uses `"item"`. Using anything else would
 /// make the empty-result schema fail field-level equality against
 /// the non-empty Arrow IPC payload.
-fn parse_array(
-    s: &str,
-    type_interval_type: Option<&str>,
-    depth: usize,
-) -> Option<DataType> {
+fn parse_array(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
     let inner_dt = parse_type(inner, type_interval_type, depth + 1)?;
     Some(DataType::List(Arc::new(Field::new_list_field(
@@ -293,11 +285,7 @@ fn parse_array(
 
 /// Parse `MAP<K, V>` into Arrow's canonical `Map(entries: Struct{key, value})`.
 /// Field names `"entries"` / `"key"` / `"value"` match pyarrow.map_(k, v).
-fn parse_map(
-    s: &str,
-    type_interval_type: Option<&str>,
-    depth: usize,
-) -> Option<DataType> {
+fn parse_map(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
     let parts = split_top_level_commas(inner);
     if parts.len() != 2 {
@@ -319,11 +307,7 @@ fn parse_map(
 /// Parse `STRUCT<name:type, name:type, ...>` into `Struct(Fields::from([Field; N]))`.
 /// Each child field is nullable (SEA's manifest doesn't carry per-field
 /// nullability) — same convention used elsewhere in the kernel.
-fn parse_struct(
-    s: &str,
-    type_interval_type: Option<&str>,
-    depth: usize,
-) -> Option<DataType> {
+fn parse_struct(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
     if inner.is_empty() {
         return Some(DataType::Struct(Fields::empty()));
@@ -820,7 +804,10 @@ mod tests {
         assert_eq!(databricks_type_to_xdbc("ARRAY<STRING>"), JDBC_ARRAY);
         assert_eq!(databricks_type_to_xdbc("ARRAY<ARRAY<INT>>"), JDBC_ARRAY);
         assert_eq!(databricks_type_to_xdbc("MAP<STRING,INT>"), JDBC_JAVA_OBJECT);
-        assert_eq!(databricks_type_to_xdbc("MAP<STRING, STRING>"), JDBC_JAVA_OBJECT);
+        assert_eq!(
+            databricks_type_to_xdbc("MAP<STRING, STRING>"),
+            JDBC_JAVA_OBJECT
+        );
         assert_eq!(databricks_type_to_xdbc("STRUCT<a:INT>"), JDBC_STRUCT);
         assert_eq!(
             databricks_type_to_xdbc("STRUCT<a:INT, b:STRING>"),
@@ -977,9 +964,7 @@ mod tests {
         // Server-controlled `type_text` could nest arbitrarily;
         // without a depth guard the recursive parser would blow the
         // stack. 64 levels of nesting is well past anything real.
-        let deep = "ARRAY<".repeat(MAX_PARSE_DEPTH + 1)
-            + "INT"
-            + &">".repeat(MAX_PARSE_DEPTH + 1);
+        let deep = "ARRAY<".repeat(MAX_PARSE_DEPTH + 1) + "INT" + &">".repeat(MAX_PARSE_DEPTH + 1);
         assert_eq!(databricks_type_to_arrow(&deep), DataType::Utf8);
     }
 
@@ -993,7 +978,10 @@ mod tests {
         match dt {
             DataType::Decimal128(p, s) => {
                 assert!(p >= 1, "precision must clamp to >= 1, got {p}");
-                assert!((-38..=38).contains(&s), "scale must be in [-38,38], got {s}");
+                assert!(
+                    (-38..=38).contains(&s),
+                    "scale must be in [-38,38], got {s}"
+                );
             }
             other => panic!("expected Decimal128, got {other:?}"),
         }

@@ -781,8 +781,24 @@ mod tests {
         // keyword-matching the `type_text`. Bare `"INTERVAL"` (no
         // qualifier) historically meant DAY_TIME; preserve that.
         let manifest = make_manifest(vec![
-            make_column_info("ym", "INTERVAL", "INTERVAL YEAR TO MONTH", 0, None, None, None),
-            make_column_info("ds", "INTERVAL", "INTERVAL DAY TO SECOND", 1, None, None, None),
+            make_column_info(
+                "ym",
+                "INTERVAL",
+                "INTERVAL YEAR TO MONTH",
+                0,
+                None,
+                None,
+                None,
+            ),
+            make_column_info(
+                "ds",
+                "INTERVAL",
+                "INTERVAL DAY TO SECOND",
+                1,
+                None,
+                None,
+                None,
+            ),
             make_column_info("bare", "INTERVAL", "INTERVAL", 2, None, None, None),
         ]);
         let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
