@@ -26,6 +26,79 @@
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, TimeUnit};
 use std::sync::Arc;
 
+// ─── JDBC `Types` integer codes ─────────────────────────────────────
+//
+// Single source of truth for the kernel. Both
+// [`databricks_type_to_xdbc`] (used by `getColumns` per-row mapping)
+// and `metadata::static_data::type_info_rows` (used by `getTypeInfo`)
+// must agree on which Databricks SQL type maps to which JDBC code —
+// drift between the two surfaces produced silent bugs in the past
+// (e.g. Databricks `FLOAT` was reported as `JDBC FLOAT` (6) by
+// `getColumns` but `JDBC REAL` (7) by `getTypeInfo`). Lifting the
+// constants here, and having `static_data` `use` them, makes the
+// drift structurally impossible.
+//
+// Values are `i16` because JDBC `Types` codes fit in `short`; the
+// `getTypeInfo` Arrow column happens to be `i32` so callers there
+// cast at the use site.
+//
+// Mapping policy for the subset that diverges between Thrift and
+// kernel: **match the Thrift backend's released behaviour** so the
+// kernel can be a drop-in replacement without breaking existing
+// SQLAlchemy / pandas-read-sql consumers. Where Thrift and kernel
+// happen to agree (most types), this is a no-op restatement; where
+// they differ, the comment notes the policy choice.
+
+/// JDBC `BIT` (-7). Predates `JDBC_BOOLEAN`; kept for completeness
+/// of the reference table. Databricks `BOOLEAN` maps to
+/// [`JDBC_BOOLEAN`], not to `BIT` — see the mapper for the parity
+/// rationale.
+#[allow(dead_code)]
+pub(crate) const JDBC_BIT: i16 = -7;
+pub(crate) const JDBC_TINYINT: i16 = -6;
+pub(crate) const JDBC_BIGINT: i16 = -5;
+/// JDBC `LONGVARBINARY` (-4). Databricks has no `LONGVARBINARY`
+/// type; kept here for the reference table only.
+#[allow(dead_code)]
+pub(crate) const JDBC_LONGVARBINARY: i16 = -4;
+/// JDBC `VARBINARY` (-3). Databricks `VARBINARY` (treated as an
+/// alias for `BINARY` in the SQL parser) maps to [`JDBC_BINARY`],
+/// matching Thrift. Kept here for the reference table.
+#[allow(dead_code)]
+pub(crate) const JDBC_VARBINARY: i16 = -3;
+pub(crate) const JDBC_BINARY: i16 = -2;
+/// JDBC `LONGVARCHAR` (-1). Databricks `STRING` is unbounded so this
+/// is technically the more accurate JDBC code, but Thrift emits
+/// `JDBC_VARCHAR` (12) and existing Python clients consume that.
+/// Kept here for completeness; the mapper uses `JDBC_VARCHAR`.
+#[allow(dead_code)]
+pub(crate) const JDBC_LONGVARCHAR: i16 = -1;
+pub(crate) const JDBC_CHAR: i16 = 1;
+/// JDBC `NUMERIC` (2). Databricks `NUMERIC` is an alias for
+/// `DECIMAL`; both surfaces emit [`JDBC_DECIMAL`]. Kept for the
+/// reference table.
+#[allow(dead_code)]
+pub(crate) const JDBC_NUMERIC: i16 = 2;
+pub(crate) const JDBC_DECIMAL: i16 = 3;
+pub(crate) const JDBC_INTEGER: i16 = 4;
+pub(crate) const JDBC_SMALLINT: i16 = 5;
+pub(crate) const JDBC_FLOAT: i16 = 6;
+pub(crate) const JDBC_REAL: i16 = 7;
+pub(crate) const JDBC_DOUBLE: i16 = 8;
+pub(crate) const JDBC_VARCHAR: i16 = 12;
+/// JDBC `BOOLEAN` (4.0). Databricks `BOOLEAN` maps here; the older
+/// `JDBC_BIT` (-7) is supported for legacy callers that ask for it
+/// explicitly but is **not** the value `getColumns` / `getTypeInfo`
+/// surface for a Databricks `BOOLEAN` column — Thrift returns 16,
+/// and we match.
+pub(crate) const JDBC_BOOLEAN: i16 = 16;
+pub(crate) const JDBC_DATE: i16 = 91;
+pub(crate) const JDBC_TIMESTAMP: i16 = 93;
+pub(crate) const JDBC_OTHER: i16 = 1111;
+pub(crate) const JDBC_JAVA_OBJECT: i16 = 2000;
+pub(crate) const JDBC_STRUCT: i16 = 2002;
+pub(crate) const JDBC_ARRAY: i16 = 2003;
+
 /// Map a Databricks SQL type spec to an Arrow `DataType`.
 ///
 /// Accepts both bare names (e.g. `"INT"`) and full type-text shapes
@@ -319,31 +392,85 @@ pub fn arrow_type_to_databricks(dt: &DataType) -> String {
     }
 }
 
-/// Map Databricks type to XDBC/JDBC type code.
+/// Map a Databricks SQL type spec to the JDBC `Types` integer code,
+/// matching the Thrift backend's `getColumns` surface for parity with
+/// existing SQLAlchemy / pandas-read-sql consumers.
+///
+/// Accepts both bare names (e.g. `"INT"`) and the parameterised /
+/// composite forms emitted by the server (`"DECIMAL(10,2)"`,
+/// `"VARCHAR(255)"`, `"ARRAY<INT>"`, `"MAP<STRING,INT>"`,
+/// `"STRUCT<a:INT>"`). The splitter strips the parameter or composite
+/// tail to find the base name. **Whitespace is intentionally not a
+/// delimiter** — qualified `"INTERVAL YEAR TO MONTH"` should not match
+/// the bare-`"INTERVAL"` arm; it falls through to `JDBC_OTHER`, which
+/// is what Thrift returns for the same input.
+///
+/// Unknown types fall back to [`JDBC_OTHER`] (1111) — Thrift's
+/// behaviour. Earlier kernel versions claimed VARCHAR (12) for
+/// unknowns, but that's silent misinformation.
 pub fn databricks_type_to_xdbc(type_name: &str) -> i16 {
     let type_upper = type_name.to_uppercase();
-    let base_type = type_upper.split('(').next().unwrap_or(&type_upper).trim();
+
+    // Cut the base name at the first `<` (composite tail) or `(`
+    // (parameter tail). Whitespace is *not* split — see fn-level doc.
+    let split_at = type_upper
+        .char_indices()
+        .find(|(_, c)| matches!(c, '<' | '('))
+        .map(|(i, _)| i);
+    let base_type = match split_at {
+        Some(i) => type_upper[..i].trim(),
+        None => type_upper.trim(),
+    };
 
     match base_type {
-        "BOOLEAN" | "BOOL" => -7,                              // JDBC BIT
-        "TINYINT" | "BYTE" => -6,                              // JDBC TINYINT
-        "SMALLINT" | "SHORT" => 5,                             // JDBC SMALLINT
-        "INT" | "INTEGER" => 4,                                // JDBC INTEGER
-        "BIGINT" | "LONG" => -5,                               // JDBC BIGINT
-        "FLOAT" | "REAL" => 6,                                 // JDBC FLOAT
-        "DOUBLE" => 8,                                         // JDBC DOUBLE
-        "DECIMAL" | "DEC" | "NUMERIC" => 3,                    // JDBC DECIMAL
-        "STRING" | "TEXT" => -1,                               // JDBC LONGVARCHAR
-        "VARCHAR" => 12,                                       // JDBC VARCHAR
-        "CHAR" => 1,                                           // JDBC CHAR
-        "BINARY" | "VARBINARY" => -3,                          // JDBC VARBINARY
-        "DATE" => 91,                                          // JDBC DATE
-        "TIMESTAMP" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" => 93, // JDBC TIMESTAMP
-        "ARRAY" => 2003,                                       // JDBC ARRAY
-        "MAP" => 2000,                                         // JDBC JAVA_OBJECT
-        "STRUCT" => 2002,                                      // JDBC STRUCT
-        "INTERVAL" => 12,                                      // JDBC VARCHAR (matches JDBC driver)
-        _ => 12,                                               // Default to VARCHAR
+        // ── Boolean ──────────────────────────────────────────────
+        // Thrift returns JDBC `BOOLEAN` (16). The older `BIT` (-7) is
+        // semantically equivalent but predates JDBC 4.0; Thrift uses
+        // `BOOLEAN` and that's the released contract consumers expect.
+        "BOOLEAN" | "BOOL" => JDBC_BOOLEAN,
+        // ── Integers ─────────────────────────────────────────────
+        "TINYINT" | "BYTE" => JDBC_TINYINT,
+        "SMALLINT" | "SHORT" => JDBC_SMALLINT,
+        "INT" | "INTEGER" => JDBC_INTEGER,
+        "BIGINT" | "LONG" => JDBC_BIGINT,
+        // ── Floating point ───────────────────────────────────────
+        // Thrift returns JDBC `FLOAT` (6) for Databricks `FLOAT`, not
+        // `REAL` (7). Match it. `JDBC_REAL` stays a public const so
+        // any consumer that explicitly asks for it can still find it.
+        "FLOAT" | "REAL" => JDBC_FLOAT,
+        "DOUBLE" => JDBC_DOUBLE,
+        "DECIMAL" | "DEC" | "NUMERIC" => JDBC_DECIMAL,
+        // ── Character ────────────────────────────────────────────
+        // Databricks `STRING` is unbounded so `LONGVARCHAR` (-1) is
+        // technically more accurate, but Thrift emits `VARCHAR` (12)
+        // — and existing Python clients (SQLAlchemy column
+        // introspection, pandas-read-sql) have been built against
+        // that. Match Thrift for drop-in parity.
+        "STRING" | "TEXT" => JDBC_VARCHAR,
+        "VARCHAR" => JDBC_VARCHAR,
+        "CHAR" => JDBC_CHAR,
+        // ── Binary ───────────────────────────────────────────────
+        // Thrift returns `BINARY` (-2), not `VARBINARY` (-3). Match.
+        "BINARY" | "VARBINARY" => JDBC_BINARY,
+        // ── Date / time ──────────────────────────────────────────
+        "DATE" => JDBC_DATE,
+        "TIMESTAMP" | "TIMESTAMP_NTZ" | "TIMESTAMP_LTZ" => JDBC_TIMESTAMP,
+        // ── Composites ───────────────────────────────────────────
+        "ARRAY" => JDBC_ARRAY,
+        "MAP" => JDBC_JAVA_OBJECT,
+        "STRUCT" => JDBC_STRUCT,
+        // ── Interval ─────────────────────────────────────────────
+        // **Bare** `"INTERVAL"` only — qualified forms like
+        // `"INTERVAL YEAR TO MONTH"` deliberately don't match (the
+        // splitter doesn't cut on whitespace) and fall through to
+        // `JDBC_OTHER`, matching Thrift's behaviour for those.
+        "INTERVAL" => JDBC_VARCHAR,
+        // ── Unknown ──────────────────────────────────────────────
+        // `JDBC_OTHER` (1111) is the JDBC sentinel "I don't know what
+        // this is". Earlier kernel versions returned `VARCHAR` here
+        // which silently misrepresented variants / geo / qualified
+        // intervals / future types as strings.
+        _ => JDBC_OTHER,
     }
 }
 
@@ -637,29 +764,106 @@ mod tests {
 
     #[test]
     fn test_databricks_type_to_xdbc() {
-        assert_eq!(databricks_type_to_xdbc("BOOLEAN"), -7);
-        assert_eq!(databricks_type_to_xdbc("TINYINT"), -6);
-        assert_eq!(databricks_type_to_xdbc("SMALLINT"), 5);
-        assert_eq!(databricks_type_to_xdbc("INT"), 4);
-        assert_eq!(databricks_type_to_xdbc("BIGINT"), -5);
-        assert_eq!(databricks_type_to_xdbc("FLOAT"), 6);
-        assert_eq!(databricks_type_to_xdbc("DOUBLE"), 8);
-        assert_eq!(databricks_type_to_xdbc("DECIMAL"), 3);
-        assert_eq!(databricks_type_to_xdbc("STRING"), -1);
-        assert_eq!(databricks_type_to_xdbc("VARCHAR"), 12);
-        assert_eq!(databricks_type_to_xdbc("CHAR"), 1);
-        assert_eq!(databricks_type_to_xdbc("BINARY"), -3);
-        assert_eq!(databricks_type_to_xdbc("DATE"), 91);
-        assert_eq!(databricks_type_to_xdbc("TIMESTAMP"), 93);
-        assert_eq!(databricks_type_to_xdbc("ARRAY"), 2003);
-        assert_eq!(databricks_type_to_xdbc("MAP"), 2000);
-        assert_eq!(databricks_type_to_xdbc("STRUCT"), 2002);
+        // Codes here must match Thrift's `getColumns` surface for
+        // parity. See the docstring on `databricks_type_to_xdbc` for
+        // the policy choices that differ from a naive JDBC mapping
+        // (BOOLEAN → 16 not -7; STRING → 12 not -1; BINARY → -2 not
+        // -3; FLOAT → 6 not 7).
+        assert_eq!(databricks_type_to_xdbc("BOOLEAN"), JDBC_BOOLEAN);
+        assert_eq!(databricks_type_to_xdbc("BOOL"), JDBC_BOOLEAN);
+        assert_eq!(databricks_type_to_xdbc("TINYINT"), JDBC_TINYINT);
+        assert_eq!(databricks_type_to_xdbc("BYTE"), JDBC_TINYINT);
+        assert_eq!(databricks_type_to_xdbc("SMALLINT"), JDBC_SMALLINT);
+        assert_eq!(databricks_type_to_xdbc("SHORT"), JDBC_SMALLINT);
+        assert_eq!(databricks_type_to_xdbc("INT"), JDBC_INTEGER);
+        assert_eq!(databricks_type_to_xdbc("INTEGER"), JDBC_INTEGER);
+        assert_eq!(databricks_type_to_xdbc("BIGINT"), JDBC_BIGINT);
+        assert_eq!(databricks_type_to_xdbc("LONG"), JDBC_BIGINT);
+        assert_eq!(databricks_type_to_xdbc("FLOAT"), JDBC_FLOAT);
+        assert_eq!(databricks_type_to_xdbc("REAL"), JDBC_FLOAT);
+        assert_eq!(databricks_type_to_xdbc("DOUBLE"), JDBC_DOUBLE);
+        assert_eq!(databricks_type_to_xdbc("DECIMAL"), JDBC_DECIMAL);
+        assert_eq!(databricks_type_to_xdbc("DEC"), JDBC_DECIMAL);
+        assert_eq!(databricks_type_to_xdbc("NUMERIC"), JDBC_DECIMAL);
+        assert_eq!(databricks_type_to_xdbc("STRING"), JDBC_VARCHAR);
+        assert_eq!(databricks_type_to_xdbc("TEXT"), JDBC_VARCHAR);
+        assert_eq!(databricks_type_to_xdbc("VARCHAR"), JDBC_VARCHAR);
+        assert_eq!(databricks_type_to_xdbc("CHAR"), JDBC_CHAR);
+        assert_eq!(databricks_type_to_xdbc("BINARY"), JDBC_BINARY);
+        assert_eq!(databricks_type_to_xdbc("VARBINARY"), JDBC_BINARY);
+        assert_eq!(databricks_type_to_xdbc("DATE"), JDBC_DATE);
+        assert_eq!(databricks_type_to_xdbc("TIMESTAMP"), JDBC_TIMESTAMP);
+        assert_eq!(databricks_type_to_xdbc("TIMESTAMP_NTZ"), JDBC_TIMESTAMP);
+        assert_eq!(databricks_type_to_xdbc("TIMESTAMP_LTZ"), JDBC_TIMESTAMP);
+        assert_eq!(databricks_type_to_xdbc("ARRAY"), JDBC_ARRAY);
+        assert_eq!(databricks_type_to_xdbc("MAP"), JDBC_JAVA_OBJECT);
+        assert_eq!(databricks_type_to_xdbc("STRUCT"), JDBC_STRUCT);
     }
 
     #[test]
     fn test_databricks_type_to_xdbc_with_params() {
-        assert_eq!(databricks_type_to_xdbc("DECIMAL(10,2)"), 3);
-        assert_eq!(databricks_type_to_xdbc("VARCHAR(255)"), 12);
+        // Parameter-style tail (DECIMAL precision/scale, VARCHAR
+        // length): splitter cuts on `(` to find the base name.
+        assert_eq!(databricks_type_to_xdbc("DECIMAL(10,2)"), JDBC_DECIMAL);
+        assert_eq!(databricks_type_to_xdbc("DECIMAL(38, 0)"), JDBC_DECIMAL);
+        assert_eq!(databricks_type_to_xdbc("VARCHAR(255)"), JDBC_VARCHAR);
+        assert_eq!(databricks_type_to_xdbc("CHAR(10)"), JDBC_CHAR);
+    }
+
+    #[test]
+    fn test_databricks_type_to_xdbc_with_composite_brackets() {
+        // Composite tail `<...>`: splitter cuts on `<` to find the
+        // base name. Pre-fix the splitter only handled `(` so these
+        // all fell through to the default code, hiding real
+        // composite columns under "OTHER".
+        assert_eq!(databricks_type_to_xdbc("ARRAY<INT>"), JDBC_ARRAY);
+        assert_eq!(databricks_type_to_xdbc("ARRAY<STRING>"), JDBC_ARRAY);
+        assert_eq!(databricks_type_to_xdbc("ARRAY<ARRAY<INT>>"), JDBC_ARRAY);
+        assert_eq!(databricks_type_to_xdbc("MAP<STRING,INT>"), JDBC_JAVA_OBJECT);
+        assert_eq!(databricks_type_to_xdbc("MAP<STRING, STRING>"), JDBC_JAVA_OBJECT);
+        assert_eq!(databricks_type_to_xdbc("STRUCT<a:INT>"), JDBC_STRUCT);
+        assert_eq!(
+            databricks_type_to_xdbc("STRUCT<a:INT, b:STRING>"),
+            JDBC_STRUCT
+        );
+    }
+
+    #[test]
+    fn test_databricks_type_to_xdbc_interval_handling() {
+        // Bare `"INTERVAL"` maps to VARCHAR (12), matching the
+        // Databricks JDBC driver's longstanding behaviour.
+        assert_eq!(databricks_type_to_xdbc("INTERVAL"), JDBC_VARCHAR);
+        // Qualified intervals (`INTERVAL YEAR TO MONTH`, `INTERVAL
+        // DAY TO SECOND`) deliberately do NOT match the bare branch
+        // — the splitter doesn't cut on whitespace. They fall
+        // through to `JDBC_OTHER` (1111), matching Thrift. This used
+        // to silently emit 12 here while Thrift reported 1111 —
+        // 128 cell diffs in the comparator run that drove this fix.
+        assert_eq!(
+            databricks_type_to_xdbc("INTERVAL YEAR TO MONTH"),
+            JDBC_OTHER
+        );
+        assert_eq!(
+            databricks_type_to_xdbc("INTERVAL DAY TO SECOND"),
+            JDBC_OTHER
+        );
+        assert_eq!(
+            databricks_type_to_xdbc("INTERVAL HOUR TO MINUTE"),
+            JDBC_OTHER
+        );
+    }
+
+    #[test]
+    fn test_databricks_type_to_xdbc_unknown_falls_back_to_other() {
+        // The default arm now returns `JDBC_OTHER` (1111). Prior
+        // behaviour claimed unknown types were VARCHAR (12), silently
+        // misrepresenting variants, geo types, and future Databricks
+        // types as strings. Matches Thrift.
+        assert_eq!(databricks_type_to_xdbc("GEOGRAPHY"), JDBC_OTHER);
+        assert_eq!(databricks_type_to_xdbc("GEOMETRY"), JDBC_OTHER);
+        assert_eq!(databricks_type_to_xdbc("VARIANT"), JDBC_OTHER);
+        assert_eq!(databricks_type_to_xdbc("OBJECT"), JDBC_OTHER);
+        assert_eq!(databricks_type_to_xdbc("UNKNOWN_FUTURE_TYPE"), JDBC_OTHER);
     }
 
     #[test]
