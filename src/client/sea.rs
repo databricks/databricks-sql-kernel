@@ -394,6 +394,75 @@ impl SeaRestTransport {
     }
 }
 
+/// Convert a parsed `GetChunksResponse` into the kernel-facing
+/// `ChunkLinkFetchResult`. Extracted from `get_result_chunks`
+/// so the continuation derivation (top-level vs per-link
+/// `next_chunk_index`, `next_row_offset` from `.last()`,
+/// `has_more` flag) is unit-testable without setting up a
+/// wiremock for `/result/chunks/{N}`.
+///
+/// Continuation derivation:
+/// - `next_chunk_index` prefers the top-level field, falling
+///   back to the *last* link's `next_chunk_index` if the
+///   top-level is absent.
+/// - `next_row_offset` comes from the last link's
+///   `row_offset + row_count` (saturating).
+/// - `has_more = next_chunk_index.is_some()`.
+fn derive_chunk_fetch_result(chunks_response: GetChunksResponse) -> Result<ChunkLinkFetchResult> {
+    let links = if let Some(ref external_links) = chunks_response.external_links {
+        external_links
+            .iter()
+            .map(CloudFetchLink::from_external_link)
+            .collect::<Result<Vec<_>>>()?
+    } else {
+        vec![]
+    };
+
+    // The `next_chunk_index` may be:
+    // 1. At the top level of the response, OR
+    // 2. Inside the external_link (each link knows its next chunk)
+    //
+    // Prefer top-level, fall back to the *last* link's
+    // `next_chunk_index`. A previous version of this code read
+    // `links.first()` — wrong if the batch contains multiple
+    // links, since only the last link's continuation pointer is
+    // meaningful. Today the SEA chunk-fetch endpoint typically
+    // returns a single link per response so the bug was latent,
+    // but extracting this into a unit-testable function makes a
+    // regression to `.first()` impossible to land silently.
+    let next_chunk_index = chunks_response.next_chunk_index.or_else(|| {
+        chunks_response
+            .external_links
+            .as_ref()
+            .and_then(|links| links.last())
+            .and_then(|link| link.next_chunk_index)
+    });
+
+    let has_more = next_chunk_index.is_some();
+
+    // Per the bounded-SEA-API contract for OSS drivers, the
+    // server-provided `external_links[].row_offset` is what the
+    // next fetch must send back. We propagate the last link's
+    // `row_offset + row_count` as the offset for the *next*
+    // fetch. `saturating_add` so a malicious/buggy server
+    // emitting `i64::MAX` row counts can't trigger an arithmetic
+    // panic in debug builds.
+    let next_row_offset = if has_more {
+        links
+            .last()
+            .map(|l| l.row_offset.saturating_add(l.row_count))
+    } else {
+        None
+    };
+
+    Ok(ChunkLinkFetchResult {
+        links,
+        has_more,
+        next_chunk_index,
+        next_row_offset,
+    })
+}
+
 #[async_trait]
 impl Transport for SeaRestTransport {
     async fn create_session(
@@ -591,43 +660,15 @@ impl Transport for SeaRestTransport {
             ))
         })?;
 
-        // Convert external links to CloudFetchLinks
-        let links = if let Some(ref external_links) = chunks_response.external_links {
-            external_links
-                .iter()
-                .map(CloudFetchLink::from_external_link)
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            vec![]
-        };
-
-        // The next_chunk_index may be:
-        // 1. At the top level of the response, OR
-        // 2. Inside the external_link (each link knows its next chunk)
-        // Prefer top-level, fall back to link-level
-        let next_chunk_index = chunks_response.next_chunk_index.or_else(|| {
-            chunks_response
-                .external_links
-                .as_ref()
-                .and_then(|links| links.first())
-                .and_then(|link| link.next_chunk_index)
-        });
-
-        let has_more = next_chunk_index.is_some();
-
+        let result = derive_chunk_fetch_result(chunks_response)?;
         debug!(
-            "Chunks response: {} links, next_chunk_index={:?}, has_more={}",
-            links.len(),
-            next_chunk_index,
-            has_more
+            "Chunks response: {} links, next_chunk_index={:?}, next_row_offset={:?}, has_more={}",
+            result.links.len(),
+            result.next_chunk_index,
+            result.next_row_offset,
+            result.has_more,
         );
-
-        Ok(ChunkLinkFetchResult {
-            links,
-            has_more,
-            next_chunk_index,
-            next_row_offset: None, // SEA doesn't use row offset
-        })
+        Ok(result)
     }
 
     fn poll_config(&self) -> TransportConfig {
@@ -953,5 +994,149 @@ mod tests {
         let client = create_test_client();
         let types = client.list_table_types();
         assert_eq!(types, vec!["SYSTEM TABLE", "TABLE", "VIEW", "METRIC_VIEW"]);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // `derive_chunk_fetch_result` — guards the `.last()`-vs-`.first()`
+    // continuation derivation. The bug this protects against:
+    // reading `links.first().next_chunk_index` would return the
+    // wrong continuation pointer when SEA returns a multi-link
+    // batch. Today's SEA chunk-fetch typically returns single-link
+    // responses (so the bug was latent), but a future regression
+    // to `.first()` would silently truncate or rewind the cursor.
+    // ──────────────────────────────────────────────────────────────
+
+    fn test_external_link(
+        chunk_index: i64,
+        row_offset: i64,
+        row_count: i64,
+        next_chunk_index: Option<i64>,
+    ) -> crate::types::sea::ExternalLink {
+        crate::types::sea::ExternalLink {
+            external_link: format!("https://storage.example.com/chunk{}", chunk_index),
+            expiration: "2099-12-31T23:59:59Z".to_string(),
+            chunk_index,
+            row_offset,
+            row_count,
+            byte_count: row_count * 100,
+            http_headers: None,
+            next_chunk_index,
+        }
+    }
+
+    #[test]
+    fn test_derive_chunk_fetch_result_multi_link_uses_last_for_continuation() {
+        // The critical regression guard: response carries 3 links
+        // where the *first* link has a `next_chunk_index` (mid-stream)
+        // but the *last* link has `None` (end-of-stream). The
+        // derived `has_more` must be `false` (matching the last
+        // link's signal), and `next_row_offset` must come from
+        // the last link's `row_offset + row_count`.
+        let response = crate::types::sea::GetChunksResponse {
+            statement_id: None,
+            chunk_index: None,
+            row_offset: None,
+            row_count: None,
+            // Top-level next_chunk_index absent — forces fallback
+            // to per-link inspection.
+            next_chunk_index: None,
+            external_links: Some(vec![
+                test_external_link(0, 0, 1000, Some(1)),
+                test_external_link(1, 1000, 1000, Some(2)),
+                // Last link signals end-of-stream.
+                test_external_link(2, 2000, 1000, None),
+            ]),
+        };
+
+        let result = derive_chunk_fetch_result(response).unwrap();
+
+        assert_eq!(result.links.len(), 3);
+        assert!(
+            !result.has_more,
+            "last-link `next_chunk_index = None` must surface as has_more=false; \
+             a regression to `links.first()` would set has_more=true here",
+        );
+        assert!(result.next_chunk_index.is_none());
+        assert_eq!(
+            result.next_row_offset, None,
+            "next_row_offset is gated by has_more — must be None at EOS",
+        );
+    }
+
+    #[test]
+    fn test_derive_chunk_fetch_result_multi_link_mid_stream_uses_last() {
+        // Mid-stream multi-link response: last link points to
+        // chunk N. Derived `next_chunk_index` and `next_row_offset`
+        // come from the *last* link, not the first.
+        let response = crate::types::sea::GetChunksResponse {
+            statement_id: None,
+            chunk_index: None,
+            row_offset: None,
+            row_count: None,
+            next_chunk_index: None,
+            external_links: Some(vec![
+                test_external_link(5, 5000, 1000, Some(6)),
+                test_external_link(6, 6000, 1000, Some(7)),
+                // Last link's next_chunk_index = 8 (and row_offset
+                // + row_count = 7000 + 500 = 7500). A `.first()`
+                // reader would report next=6 and offset=6000 — wrong.
+                test_external_link(7, 7000, 500, Some(8)),
+            ]),
+        };
+
+        let result = derive_chunk_fetch_result(response).unwrap();
+
+        assert!(result.has_more);
+        assert_eq!(
+            result.next_chunk_index,
+            Some(8),
+            "must use links.last().next_chunk_index, not links.first()",
+        );
+        assert_eq!(
+            result.next_row_offset,
+            Some(7500),
+            "next_row_offset must come from last link's row_offset + row_count",
+        );
+    }
+
+    #[test]
+    fn test_derive_chunk_fetch_result_top_level_next_chunk_wins() {
+        // When the top-level `next_chunk_index` is present, it
+        // takes precedence over per-link signals. (Same precedence
+        // rule the production code follows.)
+        let response = crate::types::sea::GetChunksResponse {
+            statement_id: None,
+            chunk_index: None,
+            row_offset: None,
+            row_count: None,
+            next_chunk_index: Some(99),
+            external_links: Some(vec![test_external_link(5, 5000, 1000, Some(6))]),
+        };
+
+        let result = derive_chunk_fetch_result(response).unwrap();
+        assert_eq!(
+            result.next_chunk_index,
+            Some(99),
+            "top-level next_chunk_index must win over per-link",
+        );
+    }
+
+    #[test]
+    fn test_derive_chunk_fetch_result_empty_response_no_more() {
+        // No links + no top-level signal → end-of-stream.
+        let response = crate::types::sea::GetChunksResponse {
+            statement_id: None,
+            chunk_index: None,
+            row_offset: None,
+            row_count: None,
+            next_chunk_index: None,
+            external_links: None,
+        };
+
+        let result = derive_chunk_fetch_result(response).unwrap();
+        assert!(result.links.is_empty());
+        assert!(!result.has_more);
+        assert!(result.next_chunk_index.is_none());
+        assert!(result.next_row_offset.is_none());
     }
 }
