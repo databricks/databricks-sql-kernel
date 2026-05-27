@@ -258,7 +258,7 @@ pub struct CreateSessionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
-    pub session_configuration: HashMap<String, String>,
+    pub session_confs: HashMap<String, String>,
 }
 
 /// Response from session creation.
@@ -315,6 +315,26 @@ mod tests {
         let json = r#""PENDING""#;
         let state: StatementState = serde_json::from_str(json).unwrap();
         assert_eq!(state, StatementState::Pending);
+    }
+
+    #[test]
+    fn test_create_session_request_uses_session_confs_wire_name() {
+        // SEA v2 deserializer expects `session_confs` (proto field 4).
+        // Any other name (e.g. `session_configuration`) is silently
+        // dropped and the session opens with default confs.
+        let mut confs = HashMap::new();
+        confs.insert("USE_CACHED_RESULT".to_string(), "false".to_string());
+        let req = CreateSessionRequest {
+            warehouse_id: "wh-1".to_string(),
+            catalog: None,
+            schema: None,
+            session_confs: confs,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(
+            json.contains("\"session_confs\""),
+            "expected `session_confs` on the wire, got: {json}"
+        );
     }
 
     #[test]
