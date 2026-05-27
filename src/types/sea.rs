@@ -108,12 +108,24 @@ pub struct ColumnInfo {
 }
 
 /// Information about a result chunk (metadata only).
+///
+/// `byte_count` is `Option<i64>` because the bounded SEA API contract
+/// for OSS drivers marks the field as deprecated ("Driver to stop
+/// using these soon"). New server versions may omit it on a
+/// per-`ChunkInfo` basis; relying on it being a required `i64` would
+/// fail deserialisation the moment a partial `chunks` array shipped
+/// without the field.
+///
+/// `chunk_index` / `row_offset` / `row_count` stay required: the
+/// bounded API keeps them populated, and they are the load-bearing
+/// fields for chunk continuation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ChunkInfo {
     pub chunk_index: i64,
     pub row_offset: i64,
     pub row_count: i64,
-    pub byte_count: i64,
+    #[serde(default)]
+    pub byte_count: Option<i64>,
 }
 
 /// Result data from a chunk fetch or initial execution response.
@@ -383,6 +395,35 @@ mod tests {
         assert!(response.manifest.is_some());
         let manifest = response.manifest.unwrap();
         assert_eq!(manifest.total_row_count, Some(100));
+    }
+
+    #[test]
+    fn test_chunk_info_byte_count_optional() {
+        // Per the bounded SEA API contract, `byte_count` on
+        // ChunkInfo is deprecated and the server may stop emitting
+        // it. Verify deserialisation succeeds when the field is
+        // absent — without #[serde(default)] this would fail
+        // with "missing field `byte_count`".
+        let json = r#"{
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": 1000
+        }"#;
+
+        let info: ChunkInfo = serde_json::from_str(json).expect("byte_count must be optional");
+        assert_eq!(info.chunk_index, 0);
+        assert_eq!(info.row_count, 1000);
+        assert!(info.byte_count.is_none());
+
+        // Also verify present-and-populated still works.
+        let json = r#"{
+            "chunk_index": 1,
+            "row_offset": 1000,
+            "row_count": 500,
+            "byte_count": 12345
+        }"#;
+        let info: ChunkInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.byte_count, Some(12345));
     }
 
     #[test]

@@ -363,7 +363,27 @@ pub struct TlsConfig {}
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct ResultConfig {
-    /// Whether to opt into CloudFetch for large results. Default: true.
+    /// Whether to opt into CloudFetch (cloud-storage-backed download of
+    /// large result sets via presigned URLs). Default: `true`.
+    ///
+    /// Setting this to `false` mirrors JDBC's `EnableQueryResultDownload=0`
+    /// behaviour. At session-create time the kernel sets the
+    /// `can_cloud_download` session conf to `"false"` so SEA serves
+    /// **all** result sizes via the inline-Arrow path, regardless of
+    /// result size — see the SEA inline-Arrow design (DD1) for the wire
+    /// contract. Users who need inline-only behaviour (e.g. workspaces
+    /// without cloud-storage egress) should set this to `false`.
+    ///
+    /// Disabling CloudFetch routes results to the inline-Arrow
+    /// path. The kernel today supports the **single-attachment**
+    /// inline path; the multi-chunk inline path is on the SEA
+    /// inline-Arrow rollout (DD1) and is tracked as a follow-up
+    /// (`InlineArrowProvider::new` consumes one attachment, and
+    /// `src/reader/mod.rs` returns `Error::not_implemented` for
+    /// inline responses that carry a `next_chunk_internal_link`).
+    /// Once multi-chunk lands, this path will not match
+    /// CloudFetch's concurrent chunk-download pipeline
+    /// (`cloudfetch_max_chunks_in_memory`).
     pub cloudfetch_enabled: bool,
 
     /// Number of presigned URLs to prefetch ahead of the consumer.
@@ -474,9 +494,35 @@ pub struct SessionConfig {
     pub auth: AuthConfig,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /
-    /// Thrift `configuration`. The kernel passes this through
-    /// unmodified — typed sub-structs above translate the *client-side*
-    /// knobs.
+    /// Thrift `configuration`. Typed sub-structs above translate
+    /// the *client-side* knobs; this map carries everything else.
+    ///
+    /// The kernel passes user-supplied entries through unchanged,
+    /// **except** for keys synthesised from typed client-side
+    /// knobs that have a wire counterpart:
+    ///
+    /// - [`ResultConfig::cloudfetch_enabled`] `= false` synthesises
+    ///   `can_cloud_download = "false"` (case-insensitive on the
+    ///   key) so SEA serves results inline. If the user already
+    ///   supplied a non-empty `can_cloud_download` value under
+    ///   any casing, the user's value wins and no synthesis
+    ///   happens. The synthesis path also purges empty-string
+    ///   case-variants the user may have left in the map (the
+    ///   server's behaviour for empty values is undefined) so the
+    ///   wire body carries at most one `can_cloud_download`-shaped
+    ///   key.
+    ///
+    /// Future typed-knob → session_conf synthesis follows the
+    /// same pattern (the wrapping `inject_default(...)` helper can
+    /// be lifted out once a second knob lands here).
+    ///
+    /// **Boolean-valued conf keys** (e.g. `can_cloud_download`)
+    /// should use the exact strings `"true"` / `"false"`. SEA
+    /// accepts these literally; other forms (`"True"`, `"yes"`,
+    /// `"1"`) either fail at session-create or behave as
+    /// undefined on the server. The kernel does not pre-validate
+    /// — its posture is "trust the user's session_conf" — so
+    /// non-canonical values flow to the server as-is.
     pub session_conf: HashMap<String, String>,
 
     pub http: HttpConfig,
@@ -499,6 +545,13 @@ pub struct SessionConfig {
 /// and uppercased before being sent.
 pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
     "ANSI_MODE",
+    // `CAN_CLOUD_DOWNLOAD` is the kernel-synthesised flag (set by
+    // `Session::open` when `ResultConfig::cloudfetch_enabled = false`)
+    // telling SEA to serve every result via the inline-Arrow path.
+    // Listed here so a user-supplied value (with any casing) survives
+    // the allowlist filter and so the kernel's own synthesis passes
+    // through normalisation without special-casing.
+    "CAN_CLOUD_DOWNLOAD",
     "COLLATION",
     "ENABLE_PHOTON",
     "LEGACY_TIME_PARSER_POLICY",

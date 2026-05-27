@@ -129,6 +129,71 @@ impl SeaRestTransport {
         format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
     }
 
+    /// Build the `/result/chunks/{idx}` URL, optionally with the
+    /// `row_offset` query parameter set.
+    ///
+    /// `chunk_index` is a path parameter (the SEA REST contract).
+    /// `row_offset` is appended as a query parameter on the inline-
+    /// Arrow path — the SEA inline-Arrow design (go/inline-arrow-sea,
+    /// "OSS JDBC Driver" section) revives the previously deprecated
+    /// `row_offset` field for clients fetching by `chunk_index +
+    /// rowOffset` against ThriftServer's `FETCH_ABSOLUTE`-based inline
+    /// path. On the CloudFetch path (where the kernel passes
+    /// `row_offset = 0`) we omit the parameter entirely so we don't
+    /// perturb the existing wire shape that today's SEA accepts.
+    ///
+    /// Negative `row_offset` is treated the same as `0` (omitted) —
+    /// the field is `i64` for arithmetic convenience upstream but the
+    /// SEA wire only accepts non-negative offsets. A debug-build
+    /// assertion catches the negative case so it surfaces at the
+    /// call-site during development rather than as a silent omission
+    /// in production. Pathological-but-valid values (`i64::MAX`)
+    /// serialise as-is; the server is expected to reject those, and
+    /// the kernel does not pre-validate row-position semantics.
+    ///
+    /// **Invariant** (preserve when calling this helper): the kernel
+    /// never *synthesises* a non-zero `row_offset`. Non-zero values
+    /// are only ever echoed back from a prior server
+    /// `next_row_offset` response. SEA versions that haven't shipped
+    /// the inline-Arrow row-offset path return `next_row_offset = None`
+    /// in `GetChunksResponse`, so the kernel naturally keeps
+    /// `row_offset = 0` and the `?row_offset=N` query parameter
+    /// never appears on the wire. If a future change starts
+    /// originating row offsets client-side (e.g. for cursor
+    /// resumption), it must coordinate with the SEA rollout so a
+    /// workspace rollback can't strand the kernel sending
+    /// `?row_offset=N` to a server that doesn't recognise it.
+    ///
+    /// **Future**: if a second optional query parameter ever lands
+    /// on this URL, migrate to `reqwest::Url::parse(...).query_pairs_mut()`
+    /// — the `format!`-based concatenation only handles one
+    /// parameter cleanly and is easy to misuse (`?` vs `&` ordering)
+    /// when adding more.
+    ///
+    /// See: <https://docs.databricks.com/api/workspace/statementexecution>
+    fn result_chunks_url(&self, statement_id: &str, chunk_index: i64, row_offset: i64) -> String {
+        debug_assert!(
+            row_offset >= 0,
+            "row_offset must be non-negative on the SEA wire (got {row_offset})",
+        );
+        if row_offset > 0 {
+            format!(
+                "{}/statements/{}/result/chunks/{}?row_offset={}",
+                self.base_url(),
+                statement_id,
+                chunk_index,
+                row_offset
+            )
+        } else {
+            format!(
+                "{}/statements/{}/result/chunks/{}",
+                self.base_url(),
+                statement_id,
+                chunk_index
+            )
+        }
+    }
+
     /// Convert SEA response to internal ExecuteResultData.
     fn convert_result_data(result: &crate::types::sea::ResultData) -> Result<ExecuteResultData> {
         let external_links = if let Some(ref links) = result.external_links {
@@ -623,16 +688,9 @@ impl Transport for SeaRestTransport {
         &self,
         statement_id: &str,
         chunk_index: i64,
-        _row_offset: i64, // Ignored - SEA uses chunk_index
+        row_offset: i64,
     ) -> Result<ChunkLinkFetchResult> {
-        // The chunk_index is a path parameter, not a query parameter
-        // See: https://docs.databricks.com/api/workspace/statementexecution
-        let url = format!(
-            "{}/statements/{}/result/chunks/{}",
-            self.base_url(),
-            statement_id,
-            chunk_index
-        );
+        let url = self.result_chunks_url(statement_id, chunk_index, row_offset);
 
         debug!("Getting result chunks at {}", url);
 
@@ -1138,5 +1196,165 @@ mod tests {
         assert!(!result.has_more);
         assert!(result.next_chunk_index.is_none());
         assert!(result.next_row_offset.is_none());
+    }
+
+    #[test]
+    fn result_chunks_url_omits_row_offset_when_zero() {
+        let client = create_test_client();
+        // CloudFetch path: row_offset=0 is the kernel default and must
+        // produce the legacy URL shape (no `?row_offset=...`).
+        assert_eq!(
+            client.result_chunks_url("01abc", 7, 0),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/7"
+        );
+    }
+
+    // Note: negative-row_offset behaviour is now gated by a
+    // `debug_assert!` in `result_chunks_url`. Debug builds (which is
+    // what `cargo test` runs by default) will panic on
+    // `row_offset < 0` so an upstream bug surfaces immediately
+    // during development. In release builds the assertion is
+    // compiled out and the URL builder silently omits the query
+    // parameter (treats negative the same as zero); intentional, so
+    // a stray negative in production can't produce a malformed URL.
+
+    #[test]
+    fn result_chunks_url_includes_row_offset_when_positive() {
+        // Inline-Arrow path: row_offset>0 is appended as a query
+        // parameter so SEA can FETCH_ABSOLUTE into ThriftServer at
+        // the right rowOffset.
+        let client = create_test_client();
+        assert_eq!(
+            client.result_chunks_url("01abc", 3, 12345),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=12345"
+        );
+    }
+
+    #[test]
+    fn result_chunks_url_appends_row_offset_at_inclusivity_edge() {
+        // Branch boundary is `row_offset > 0`. Test `row_offset = 1`
+        // explicitly so a refactor that swaps `>` to `>=` (which
+        // would still match `12345` and `i64::MAX`) is caught.
+        let client = create_test_client();
+        assert_eq!(
+            client.result_chunks_url("01abc", 3, 1),
+            "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=1"
+        );
+    }
+
+    #[test]
+    fn result_chunks_url_serialises_i64_max_row_offset() {
+        // Pathological: i64::MAX is a valid i64 and serialises as
+        // its decimal form. The kernel does not pre-validate
+        // row-position semantics; the server rejects nonsensical
+        // offsets at request-time. The URL builder must not panic
+        // or truncate for the legal range.
+        let client = create_test_client();
+        let url = client.result_chunks_url("01abc", 0, i64::MAX);
+        assert!(
+            url.ends_with(&format!("?row_offset={}", i64::MAX)),
+            "i64::MAX must serialise as decimal: got {url}",
+        );
+    }
+
+    /// Build a `SeaRestTransport` pointed at a wiremock-controlled
+    /// host so we can assert wire-level behaviour rather than just
+    /// URL-string output.
+    fn create_test_client_against(host: &str) -> SeaRestTransport {
+        let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(HttpClientConfig::default(), retry_configs).unwrap(),
+        );
+        let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
+        http_client.set_auth_provider(auth);
+        SeaRestTransport::new(
+            http_client,
+            host,
+            "warehouse-123",
+            TransportConfig::default(),
+        )
+    }
+
+    #[tokio::test]
+    async fn get_result_chunks_sends_row_offset_query_param_on_wire() {
+        // Pin the wire shape of the inline-Arrow row_offset query
+        // parameter against accidental refactors. The unit-test
+        // assertions on `result_chunks_url` would all pass even if
+        // a refactor short-circuited the helper call from
+        // `get_result_chunks` (e.g. shadowing `row_offset` with
+        // `0`). Driving through the public `Transport` trait
+        // catches that.
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Server contract: `/result/chunks/{idx}?row_offset=N` returns
+        // an inline-Arrow result chunk page. Empty external_links is
+        // fine — the test only cares about the request shape.
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/01abc/result/chunks/3"))
+            .and(query_param("row_offset", "100"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"external_links":[],"next_chunk_index":null}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against(&server.uri());
+        let _ = transport
+            .get_result_chunks("01abc", 3, 100)
+            .await
+            .expect("get_result_chunks must succeed against the mock");
+
+        // The `expect(1)` on the Mock + the matcher on
+        // `query_param("row_offset", "100")` together assert that
+        // exactly one request landed with that exact wire shape.
+        // wiremock's drop-time check verifies the expectation; we
+        // also assert it explicitly so a failure surfaces in this
+        // test's panic message rather than wiremock's.
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn get_result_chunks_omits_row_offset_when_zero_on_wire() {
+        // Mirror of the above: when the caller passes
+        // `row_offset = 0`, the wire URL must NOT carry the
+        // `?row_offset=...` query parameter. Confirms the omission
+        // contract end-to-end, not just in URL formatting.
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        // Mount a permissive mock: matches the path but inspects
+        // the recorded request afterwards to assert there's no
+        // `row_offset` query parameter.
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/01abc/result/chunks/3"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"external_links":[],"next_chunk_index":null}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against(&server.uri());
+        let _ = transport
+            .get_result_chunks("01abc", 3, 0)
+            .await
+            .expect("get_result_chunks must succeed against the mock");
+
+        let recorded = server.received_requests().await.unwrap();
+        let req = recorded
+            .iter()
+            .find(|r| r.url.path().ends_with("/result/chunks/3"))
+            .expect("chunk-fetch request must be recorded");
+        assert!(
+            req.url.query().is_none() || !req.url.query().unwrap().contains("row_offset"),
+            "row_offset=0 must NOT appear on the wire; got query: {:?}",
+            req.url.query(),
+        );
     }
 }
