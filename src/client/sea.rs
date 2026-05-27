@@ -1313,6 +1313,7 @@ mod tests {
                 // Last link signals end-of-stream.
                 test_external_link(2, 2000, 1000, None),
             ]),
+            attachment: None,
         };
 
         let result = derive_chunk_fetch_result(response).unwrap();
@@ -1349,6 +1350,7 @@ mod tests {
                 // reader would report next=6 and offset=6000 — wrong.
                 test_external_link(7, 7000, 500, Some(8)),
             ]),
+            attachment: None,
         };
 
         let result = derive_chunk_fetch_result(response).unwrap();
@@ -1378,6 +1380,7 @@ mod tests {
             row_count: None,
             next_chunk_index: Some(99),
             external_links: Some(vec![test_external_link(5, 5000, 1000, Some(6))]),
+            attachment: None,
         };
 
         let result = derive_chunk_fetch_result(response).unwrap();
@@ -1398,6 +1401,7 @@ mod tests {
             row_count: None,
             next_chunk_index: None,
             external_links: None,
+            attachment: None,
         };
 
         let result = derive_chunk_fetch_result(response).unwrap();

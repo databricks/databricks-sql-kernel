@@ -263,7 +263,7 @@ impl ResultReaderFactory {
                         // return `None` and downstream wrappers
                         // would reject the stream.
                         let manifest_schema = response.manifest.as_ref().and_then(|m| {
-                            match self.extract_schema_from_manifest(Some(m)) {
+                            match Self::extract_schema_from_manifest(Some(m)) {
                                 Ok(s) => Some(s),
                                 Err(e) => {
                                     tracing::warn!(
@@ -1459,6 +1459,10 @@ mod tests {
         StatementStatus {
             state: StatementState::Succeeded,
             error: None::<ServiceError>,
+            num_modified_rows: None,
+            display_message: None,
+            diagnostic_info: None,
+            error_details_json: None,
         }
     }
 
