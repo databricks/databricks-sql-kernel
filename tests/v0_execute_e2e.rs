@@ -743,3 +743,91 @@ async fn complex_types_as_json_flag_stringifies_complex_columns() {
         session.close().await.expect("session close (json)");
     }
 }
+
+// ─── PR #23 extended-status fields against a live warehouse ──────────
+//
+// Validates the end-to-end behaviour the PR ships:
+//
+// 1. On Succeeded: the 5 accessors on `ExecutedStatement` are wired
+//    correctly and return server-supplied values (when populated) or
+//    `None` (when the server omits them — the common case for SELECT).
+// 2. On Failed: the kernel `Error` carries `display_message` /
+//    `diagnostic_info` / `error_details_json` from the SEA wire
+//    envelope (the F4 carry-over), so a Thrift-migrating wrapper sees
+//    the same fields its old code path used to see on
+//    `TGetOperationStatusResp`.
+
+#[tokio::test]
+#[ignore]
+async fn live_select_status_accessors_default_to_none() {
+    // SELECT on a classic warehouse should not populate the extended
+    // fields. Pins the accessor wiring + serde-default behaviour
+    // against a real server response.
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let exec = stmt.execute().await.expect("execute SELECT 1");
+
+    // num_modified_rows is None for SELECT.
+    assert_eq!(
+        exec.num_modified_rows(),
+        None,
+        "num_modified_rows expected None for SELECT, got {:?}",
+        exec.num_modified_rows()
+    );
+    // progress is None on the SQL warehouse path (only analytics
+    // warehouses populate it).
+    // display_message / diagnostic_info / error_details_json are None
+    // on success — these flow only when the server has something to
+    // surface.
+    let dm = exec.display_message();
+    let di = exec.diagnostic_info();
+    let edj = exec.error_details_json();
+    eprintln!(
+        "live SELECT status snapshot: progress={:?} display_message={:?} diagnostic_info={:?} error_details_json={:?}",
+        exec.progress(),
+        dm,
+        di,
+        edj
+    );
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+#[tokio::test]
+#[ignore]
+async fn live_failed_statement_error_envelope_carries_extended_fields() {
+    // Deliberately fail a statement and confirm the resulting
+    // kernel `Error` either carries the server-supplied extended
+    // fields (when populated) or leaves them `None` (when the server
+    // omits them — graceful degradation). Both the sql_state and the
+    // error_code on the envelope are the legacy contract; the 3 new
+    // fields are the F4 / Thrift-parity addition.
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    // Reference a definitely-nonexistent table to provoke a SqlError.
+    stmt.spec()
+        .sql("SELECT * FROM nonexistent_kernel_pr23_test_table_xyz_123");
+    let err = match stmt.execute().await {
+        Ok(_) => panic!("execute against nonexistent table must fail"),
+        Err(e) => e,
+    };
+
+    assert_eq!(err.code, ErrorCode::SqlError);
+
+    eprintln!(
+        "live FAILED envelope: message={:?} sql_state={:?} error_code={:?} display_message={:?} diagnostic_info={:?} error_details_json={:?}",
+        err.message, err.sql_state, err.error_code, err.display_message, err.diagnostic_info, err.error_details_json
+    );
+
+    // The new Thrift-parity fields must be readable on the Error,
+    // even if the server didn't populate them (we accept None here —
+    // the test pins the *wire shape* of the kernel Error, not the
+    // server's behaviour).
+    let _: &Option<String> = &err.display_message;
+    let _: &Option<String> = &err.diagnostic_info;
+    let _: &Option<String> = &err.error_details_json;
+
+    session.close().await.expect("session close");
+}

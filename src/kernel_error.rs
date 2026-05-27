@@ -187,6 +187,32 @@ pub struct Error {
     /// not parsed.
     pub location: Option<String>,
 
+    /// Server-supplied user-facing message captured from the SEA
+    /// `StatementStatus.display_message` envelope on terminal-error
+    /// statements (`FAILED` / `CANCELED` / `CLOSED-no-data`). Mirrors
+    /// the same-named field on the Thrift `TGetOperationStatusResp` so
+    /// wrappers that surface a Thrift-shaped operation status to their
+    /// host language can populate it on the error envelope too.
+    ///
+    /// Independent of [`Error::message`] — `message` is the
+    /// kernel-formatted summary, `display_message` is the raw
+    /// server-supplied string.
+    pub display_message: Option<String>,
+
+    /// Server-supplied diagnostic detail captured from the SEA
+    /// `StatementStatus.diagnostic_info` envelope on terminal-error
+    /// statements. Multi-line text with stack frames or operator
+    /// context. Intended for support / log surfaces, not user-facing.
+    /// Mirrors the same-named Thrift field.
+    pub diagnostic_info: Option<String>,
+
+    /// Server-supplied JSON blob with extended error details, captured
+    /// from the SEA `StatementStatus.error_details_json` envelope on
+    /// terminal-error statements. Pass-through string — wrappers parse
+    /// if they need structured access. Mirrors the same-named Thrift
+    /// field.
+    pub error_details_json: Option<String>,
+
     /// Underlying cause. Boxed to keep the struct stack-friendly.
     pub cause: Option<Box<Error>>,
 }
@@ -207,6 +233,9 @@ impl Error {
             retryable: false,
             query_id: None,
             location: None,
+            display_message: None,
+            diagnostic_info: None,
+            error_details_json: None,
             cause: None,
         }
     }
@@ -396,6 +425,34 @@ impl Error {
 
     pub fn with_query_id(mut self, query_id: impl Into<String>) -> Self {
         self.query_id = Some(query_id.into());
+        self
+    }
+
+    /// Attach the server-supplied `display_message` from a terminal-
+    /// error SEA `StatementStatus` envelope. Wrappers surfacing a
+    /// Thrift-shaped operation-status object to their host language
+    /// should populate this on the error so callers see the same
+    /// field they would have read from `TGetOperationStatusResp` on
+    /// the Thrift path.
+    pub fn with_display_message(mut self, msg: impl Into<String>) -> Self {
+        self.display_message = Some(msg.into());
+        self
+    }
+
+    /// Attach the server-supplied `diagnostic_info` from a terminal-
+    /// error SEA `StatementStatus` envelope. Multi-line operator /
+    /// stack context; for support surfaces, not user-facing.
+    pub fn with_diagnostic_info(mut self, info: impl Into<String>) -> Self {
+        self.diagnostic_info = Some(info.into());
+        self
+    }
+
+    /// Attach the server-supplied `error_details_json` blob from a
+    /// terminal-error SEA `StatementStatus` envelope. Unbounded
+    /// pass-through string; wrappers parse if they need structured
+    /// access.
+    pub fn with_error_details_json(mut self, json: impl Into<String>) -> Self {
+        self.error_details_json = Some(json.into());
         self
     }
 

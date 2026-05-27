@@ -33,7 +33,13 @@ pub struct StatementExecutionResponse {
 }
 
 /// Status of a statement execution.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `#[non_exhaustive]` — external Rust callers can read fields directly
+/// but cannot use a struct literal. Adding new wire-shape fields stays
+/// non-breaking for downstream crates (in-crate construction is
+/// unaffected).
+#[non_exhaustive]
+#[derive(Clone, Deserialize)]
 pub struct StatementStatus {
     pub state: StatementState,
     #[serde(default)]
@@ -50,18 +56,51 @@ pub struct StatementStatus {
     /// Server-supplied user-facing message (e.g. "Statement was
     /// canceled by the user" or progress hints). Distinct from
     /// `error.message`; populated on non-error states too.
+    ///
+    /// **PII / sensitive-data note:** server-supplied free-form text
+    /// may include fragments of the original SQL or parameter values.
+    /// Wrappers forwarding this to centralised logs should redact or
+    /// truncate per their own PII policy.
     #[serde(default)]
     pub display_message: Option<String>,
     /// Server-supplied diagnostic detail — multi-line text with
     /// stack frames or operator context. Intended for log / support
     /// surfaces, not user-facing strings.
+    ///
+    /// **PII / sensitive-data note:** like `display_message`, this is
+    /// server-supplied free-form text and may include SQL fragments
+    /// or values. Redact before centralised logging.
     #[serde(default)]
     pub diagnostic_info: Option<String>,
     /// Server-supplied JSON blob with extended error details.
     /// Pass-through string — wrappers parse if they need structured
     /// access.
+    ///
+    /// **Unbounded:** the server can return a multi-MB blob. Wrappers
+    /// surfacing this should bound size before logging.
     #[serde(default)]
     pub error_details_json: Option<String>,
+}
+
+impl std::fmt::Debug for StatementStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Truncate unbounded server-supplied free-form strings so a
+        // `?status` in a tracing span doesn't dump multi-MB blobs.
+        // Presence + length are the load-bearing signal; the content
+        // itself goes through dedicated accessors on `ExecutedStatement`.
+        fn summarise(s: &Option<String>) -> Option<String> {
+            s.as_ref().map(|v| format!("<{} chars>", v.len()))
+        }
+        f.debug_struct("StatementStatus")
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .field("num_modified_rows", &self.num_modified_rows)
+            .field("progress", &self.progress)
+            .field("display_message", &summarise(&self.display_message))
+            .field("diagnostic_info", &summarise(&self.diagnostic_info))
+            .field("error_details_json", &summarise(&self.error_details_json))
+            .finish()
+    }
 }
 
 /// Possible states of a statement during execution.

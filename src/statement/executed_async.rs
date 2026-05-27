@@ -25,6 +25,21 @@
 //! the handle short-circuits to `InvalidStatementHandle` locally when
 //! the parent `Statement` is re-executed, avoiding wasted network
 //! round-trips on zombie handles.
+//!
+//! ## Extended SEA status fields (`num_modified_rows`, `progress`,
+//! `display_message`, `diagnostic_info`, `error_details_json`)
+//!
+//! These accessors live on the **sync** [`crate::ExecutedStatement`]
+//! handle only. Async-consumption callers who need them should use
+//! [`crate::statement::mutable::Statement::execute`] (which drives the
+//! polling loop internally and returns a sync handle) rather than
+//! `submit()`. The async surface is shaped for the
+//! poll-loop-without-metadata use case; mirroring the 5 accessors here
+//! requires storing a status snapshot per-poll, which is tracked as a
+//! follow-up. Wrappers presenting a Thrift-shaped operation API to
+//! their host language (e.g. the napi binding's `Statement` class
+//! mirroring `IOperation`) route through the sync handle so the
+//! extended fields are available alongside fetch / cancel / close.
 
 use crate::client::ExecuteResponse;
 use crate::kernel_error::Error;
@@ -43,6 +58,16 @@ use tracing::{warn, Instrument};
 ///
 /// Mirrors the SEA `Status` enum. `Failed` carries the underlying
 /// `Error` so callers see `vendor_code` / `sql_state` / etc.
+//
+// `large_enum_variant`: `Failed(Error)` is intentionally inline rather
+// than boxed. `Error` has grown to ~216 bytes after picking up the
+// Thrift-parity `display_message` / `diagnostic_info` /
+// `error_details_json` fields, but this enum is constructed at most
+// once per `status()` poll and immediately matched on by the caller —
+// the per-call size is irrelevant in practice, and boxing here would
+// force every pyo3 / direct-Rust caller pattern-matching on
+// `Failed(err)` to update.
+#[allow(clippy::large_enum_variant)]
 #[non_exhaustive]
 #[derive(Debug)]
 pub enum StatementStatus {

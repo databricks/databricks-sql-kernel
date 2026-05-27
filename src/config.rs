@@ -36,12 +36,13 @@
 //! - [`LoggingConfig`] (filter, file)
 //! - [`TransportMode`]
 //!
-//! Configs whose shape we are still settling are reserved as empty
-//! `#[non_exhaustive]` structs so the public type names exist (and
-//! `SessionBuilder` setters compile) without committing to fields:
+//! [`TlsConfig`] now carries custom-CA + self-signed / hostname
+//! relaxation knobs; configs whose shape we are still settling stay
+//! as empty `#[non_exhaustive]` structs so the public type names
+//! exist (and `SessionBuilder` setters compile) without committing
+//! to fields:
 //!
 //! - [`ProxyConfig`]
-//! - [`TlsConfig`]
 //! - [`TelemetryConfig`]
 //!
 //! All structs are `#[non_exhaustive]` so v1+ can grow new fields
@@ -354,6 +355,24 @@ pub struct ProxyConfig {}
 ///
 /// The kernel exposes only fields that the internal rustls plumbing
 /// already supports — cert pinning and FIPS mode are *not* in scope.
+///
+/// ```no_run
+/// # use databricks_sql_kernel::TlsConfig;
+/// // From a file path:
+/// let from_file = TlsConfig {
+///     custom_ca_cert: Some(std::fs::read("/etc/ssl/corp-ca.pem").unwrap()),
+///     ..TlsConfig::default()
+/// };
+///
+/// // From an in-memory buffer (the napi-rs `Buffer` / pyo3 `bytes`
+/// // path — no tempfile shim needed):
+/// let pem_bytes: Vec<u8> = b"-----BEGIN CERTIFICATE-----\n...".to_vec();
+/// let from_bytes = TlsConfig {
+///     custom_ca_cert: Some(pem_bytes),
+///     ..TlsConfig::default()
+/// };
+/// # let _ = (from_file, from_bytes);
+/// ```
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct TlsConfig {
@@ -366,6 +385,11 @@ pub struct TlsConfig {
     /// for foreign-language wrappers — napi-rs / pyo3 callers pass a
     /// `Buffer` / `bytes` directly without needing to materialise a
     /// tempfile.
+    ///
+    /// **Multi-cert bundles (root + intermediate):** the kernel splits
+    /// the PEM into individual certificates and adds each as a root,
+    /// so a concatenated `cat root.pem intermediate.pem` blob works
+    /// transparently regardless of the active TLS backend.
     pub custom_ca_cert: Option<Vec<u8>>,
 
     /// Accept self-signed server certificates.

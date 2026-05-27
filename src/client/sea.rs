@@ -53,6 +53,24 @@ enum StatementOutcome {
     Err(Error),
 }
 
+/// Copy the SEA extended status fields (`display_message`,
+/// `diagnostic_info`, `error_details_json`) from a wire status onto a
+/// kernel `Error`. Mirrors the Thrift `TGetOperationStatusResp` /
+/// `TStatus` contract where the same fields ride on the operation
+/// status across terminal-error states.
+fn carry_extended_status(mut error: Error, status: &crate::types::sea::StatementStatus) -> Error {
+    if let Some(msg) = status.display_message.as_ref() {
+        error = error.with_display_message(msg);
+    }
+    if let Some(info) = status.diagnostic_info.as_ref() {
+        error = error.with_diagnostic_info(info);
+    }
+    if let Some(json) = status.error_details_json.as_ref() {
+        error = error.with_error_details_json(json);
+    }
+    error
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -230,10 +248,16 @@ impl SeaRestTransport {
                     }
                 }
 
-                StatementOutcome::Err(error)
+                // Carry the extended status fields onto the Error so
+                // wrappers see what Thrift's `TGetOperationStatusResp`
+                // surfaces on terminal-error states.
+                StatementOutcome::Err(carry_extended_status(error, &response.status))
             }
             StatementState::Canceled => {
-                StatementOutcome::Err(Error::invalid_state().message("Statement was canceled"))
+                let error = Error::invalid_state()
+                    .message("Statement was canceled")
+                    .with_query_id(&response.statement_id);
+                StatementOutcome::Err(carry_extended_status(error, &response.status))
             }
             StatementState::Closed => {
                 // Closed with result data is valid for inline results
@@ -243,7 +267,10 @@ impl SeaRestTransport {
                 if response.result.is_some() {
                     StatementOutcome::Done(response)
                 } else {
-                    StatementOutcome::Err(Error::invalid_state().message("Statement was closed"))
+                    let error = Error::invalid_state()
+                        .message("Statement was closed")
+                        .with_query_id(&response.statement_id);
+                    StatementOutcome::Err(carry_extended_status(error, &response.status))
                 }
             }
             StatementState::Pending | StatementState::Running => {
@@ -267,7 +294,11 @@ impl SeaRestTransport {
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
-                    debug!("Polling statement status: {}", r.statement_id);
+                    debug!(
+                        statement_id = %r.statement_id,
+                        progress = ?r.status.progress,
+                        "Polling statement status"
+                    );
                     current_response = self.get_statement_status(&r.statement_id).await?;
                 }
             }
