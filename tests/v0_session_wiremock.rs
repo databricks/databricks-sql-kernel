@@ -348,7 +348,7 @@ async fn create_session_with_cloudfetch_disabled_sends_can_cloud_download_false(
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
         .and(body_partial_json(serde_json::json!({
-            "session_configuration": { "can_cloud_download": "false" }
+            "session_confs": { "CAN_CLOUD_DOWNLOAD": "false" }
         })))
         .respond_with(
             ResponseTemplate::new(200)
@@ -375,7 +375,7 @@ async fn create_session_respects_user_supplied_can_cloud_download() {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
         .and(body_partial_json(serde_json::json!({
-            "session_configuration": { "can_cloud_download": "true" }
+            "session_confs": { "CAN_CLOUD_DOWNLOAD": "true" }
         })))
         .respond_with(
             ResponseTemplate::new(200)
@@ -415,6 +415,12 @@ async fn create_session_respects_user_value_case_insensitively() {
     // already-set value and NOT inject a second `can_cloud_download`
     // alongside. Otherwise both keys would land in the wire body and
     // the server's last-write-wins behaviour would be a coin flip.
+    //
+    // Note on key casing: `filter_session_conf` uppercases every
+    // allowlisted key (the wire normalisation that PR #80 added), so
+    // the key on the wire is `CAN_CLOUD_DOWNLOAD` regardless of what
+    // the user supplied — but the user's *value* survives because
+    // we detect "already set" case-insensitively before injecting.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
@@ -443,8 +449,11 @@ async fn create_session_respects_user_value_case_insensitively() {
         .await
         .expect("session must open");
 
-    // Verify the wire request only contains the user's `Can_Cloud_Download`
-    // key and not a kernel-injected `can_cloud_download`.
+    // Verify the wire request contains exactly one
+    // can_cloud_download-shaped key, post-uppercase, carrying the
+    // user-supplied value `"true"`. A regression that double-inserts
+    // would either produce a second key or override the value to
+    // `"false"`.
     let recorded = server.received_requests().await.unwrap();
     let create = recorded
         .iter()
@@ -452,21 +461,27 @@ async fn create_session_respects_user_value_case_insensitively() {
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
     let session_conf_obj = body
-        .get("session_configuration")
+        .get("session_confs")
         .and_then(|v| v.as_object())
-        .expect("session_configuration present");
-    let matches: Vec<&String> = session_conf_obj
-        .keys()
-        .filter(|k| k.eq_ignore_ascii_case("can_cloud_download"))
+        .expect("session_confs present");
+    let matches: Vec<(&String, &serde_json::Value)> = session_conf_obj
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("can_cloud_download"))
         .collect();
     assert_eq!(
         matches.len(),
         1,
         "exactly one can_cloud_download-shaped key must be present; got {matches:?}",
     );
+    let (key, value) = matches[0];
     assert_eq!(
-        matches[0], "Can_Cloud_Download",
-        "the user-supplied key (with its original casing) must survive",
+        key, "CAN_CLOUD_DOWNLOAD",
+        "the allowlist filter uppercases the key on the wire",
+    );
+    assert_eq!(
+        value.as_str(),
+        Some("true"),
+        "the user-supplied value must survive the injection check",
     );
 }
 
@@ -481,7 +496,7 @@ async fn create_session_empty_user_value_is_overridden() {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
         .and(body_partial_json(serde_json::json!({
-            "session_configuration": { "can_cloud_download": "false" }
+            "session_confs": { "CAN_CLOUD_DOWNLOAD": "false" }
         })))
         .respond_with(
             ResponseTemplate::new(200)
@@ -495,6 +510,123 @@ async fn create_session_empty_user_value_is_overridden() {
     session_conf.insert("can_cloud_download".to_string(), "".to_string());
     let mut result = ResultConfig::default();
     result.cloudfetch_enabled = false;
+    Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+        })
+        .result(result)
+        .session_conf(session_conf)
+        .open()
+        .await
+        .expect("session must open");
+}
+
+#[tokio::test]
+async fn create_session_noncanonical_case_with_empty_value_purges_and_injects() {
+    // Cross-product cell of the case-insensitive / empty-value
+    // matrix: user passes `"Can_Cloud_Download" -> ""` with
+    // CloudFetch disabled. The kernel must:
+    //   1. Recognise the value is empty (treat it as "not set").
+    //   2. Purge the case-variant before injecting the canonical
+    //      key — otherwise BOTH `Can_Cloud_Download: ""` and
+    //      `can_cloud_download: "false"` ship in the wire body
+    //      and the server picks one non-deterministically.
+    // Asserts the recorded body has exactly one
+    // can_cloud_download-shaped key whose value is `"false"`.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"session_id":"sess-cross","warehouse_id":"test_wh"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut session_conf = std::collections::HashMap::new();
+    session_conf.insert("Can_Cloud_Download".to_string(), "".to_string());
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+        })
+        .result(result)
+        .session_conf(session_conf)
+        .open()
+        .await
+        .expect("session must open");
+
+    let recorded = server.received_requests().await.unwrap();
+    let create = recorded
+        .iter()
+        .find(|r| r.url.path() == "/api/2.0/sql/sessions")
+        .unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+    let session_conf_obj = body
+        .get("session_confs")
+        .and_then(|v| v.as_object())
+        .expect("session_confs present");
+    let matches: Vec<(&String, &serde_json::Value)> = session_conf_obj
+        .iter()
+        .filter(|(k, _)| k.eq_ignore_ascii_case("can_cloud_download"))
+        .collect();
+    assert_eq!(
+        matches.len(),
+        1,
+        "exactly one can_cloud_download-shaped key must be present after \
+         purge-and-inject; got {matches:?}",
+    );
+    let (key, value) = matches[0];
+    assert_eq!(
+        key, "CAN_CLOUD_DOWNLOAD",
+        "the allowlist filter uppercases the kernel-injected key on the wire",
+    );
+    assert_eq!(
+        value.as_str(),
+        Some("false"),
+        "the kernel must have injected the canonical \"false\" value",
+    );
+}
+
+#[tokio::test]
+async fn create_session_with_cloudfetch_enabled_respects_user_inline_request() {
+    // Mirror of `create_session_respects_user_supplied_can_cloud_download`.
+    // Setup: kernel CloudFetch ENABLED, but the user explicitly wants
+    // inline-Arrow (sets `can_cloud_download=false` themselves). The
+    // kernel must not strip the user's value — `session_conf` is the
+    // user's wire surface and the kernel only ever *injects* on the
+    // `!cloudfetch_enabled` branch, never overrides.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .and(body_partial_json(serde_json::json!({
+            "session_confs": { "CAN_CLOUD_DOWNLOAD": "false" }
+        })))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"session_id":"sess-mirror","warehouse_id":"test_wh"}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut session_conf = std::collections::HashMap::new();
+    session_conf.insert("can_cloud_download".to_string(), "false".to_string());
+    // cloudfetch_enabled defaults to true; user is overriding to inline.
+    let result = ResultConfig::default();
+    assert!(
+        result.cloudfetch_enabled,
+        "test prereq: ResultConfig defaults to cloudfetch_enabled=true",
+    );
     Session::builder()
         .connection(
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
@@ -556,7 +688,7 @@ async fn create_session_with_cloudfetch_enabled_omits_can_cloud_download() {
     let body: serde_json::Value = serde_json::from_slice(&create_session_req.body)
         .expect("create-session body must be valid JSON");
     let session_conf = body
-        .get("session_configuration")
+        .get("session_confs")
         .cloned()
         .unwrap_or(serde_json::Value::Null);
     if let Some(obj) = session_conf.as_object() {

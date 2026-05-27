@@ -260,28 +260,39 @@ impl Session {
         // result sizes instead of attempting cloud-fetch and erroring at
         // fetch time.
         //
-        // Don't clobber an explicit user value — if the caller wired
-        // `can_cloud_download` directly via `session_conf` for any reason
-        // (e.g., to force inline-Arrow even with CloudFetch enabled at the
-        // kernel layer), their value wins.
+        // Don't clobber an explicit non-empty user value — if the caller
+        // wired `can_cloud_download` directly via `session_conf` for any
+        // reason (e.g., to force inline-Arrow even with CloudFetch enabled
+        // at the kernel layer), their value wins.
         //
-        // The presence check is **case-insensitive on the key** and
-        // **rejects empty values**: SEA session-conf keys are
-        // historically case-insensitive on the wire, and a stray
-        // `"Can_Cloud_Download"` from the user would otherwise let us
-        // inject the canonical-cased `"can_cloud_download"` alongside —
-        // shipping both keys with potentially different values. An
-        // empty-string user value (`"can_cloud_download": ""`) is
-        // treated the same as absence; the server's behaviour for
-        // empty session-conf values is undefined and we'd rather
-        // inject the kernel's canonical value than ship an ambiguous
-        // empty.
+        // **Case-insensitive key match** because SEA session-conf keys
+        // are historically case-insensitive on the wire; without this, a
+        // stray `"Can_Cloud_Download"` from the user would coexist with
+        // the kernel's canonical-cased `"can_cloud_download"` and we'd
+        // ship both keys (potentially with different values) — server
+        // would pick one non-deterministically.
+        //
+        // **Empty-string user values are purged**: an empty value is
+        // ambiguous (server behaviour undefined) and the kernel prefers
+        // to inject its canonical `"false"` instead of shipping the
+        // ambiguous empty. Purge-then-insert guarantees the wire body
+        // carries at most one `can_cloud_download` key regardless of
+        // case-variants the caller supplied.
         let mut session_conf = config.session_conf.clone();
         if !config.result.cloudfetch_enabled {
-            let already_set = session_conf
+            let has_nonempty_user_value = session_conf
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
-            if !already_set {
+            tracing::debug!(
+                cloudfetch_enabled = false,
+                user_value_present = has_nonempty_user_value,
+                "evaluating can_cloud_download injection",
+            );
+            if !has_nonempty_user_value {
+                // Drop every case-variant (including empty-value ones)
+                // before inserting the canonical key so we can't ship
+                // duplicates that differ only in case.
+                session_conf.retain(|k, _| !k.eq_ignore_ascii_case("can_cloud_download"));
                 session_conf.insert("can_cloud_download".to_string(), "false".to_string());
             }
         }
