@@ -162,6 +162,33 @@ fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
     .to_string()
 }
 
+/// `FAILED` body with the three SEA extended status fields populated.
+/// Pins the kernel's `Error.display_message` / `diagnostic_info` /
+/// `error_details_json` carry on the sync polling path.
+fn failed_body_with_extended_fields(
+    statement_id: &str,
+    message: &str,
+    sql_state: &str,
+    display_message: &str,
+    diagnostic_info: &str,
+    error_details_json: &str,
+) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": {
+            "state": "FAILED",
+            "error": {
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": format!("{message}. SQLSTATE: {sql_state}"),
+            },
+            "display_message": display_message,
+            "diagnostic_info": diagnostic_info,
+            "error_details_json": error_details_json,
+        },
+    })
+    .to_string()
+}
+
 async fn mount_execute(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
@@ -789,4 +816,56 @@ async fn polling_path_carries_terminal_status_not_initial() {
     assert_eq!(exec.error_details_json(), Some(r#"{"errorClass":"NONE"}"#));
 
     exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_failed_carries_extended_status_fields_onto_error() {
+    // Pins the sync polling path's terminal-error contract: when the
+    // SEA wire response on a FAILED statement includes
+    // `display_message` / `diagnostic_info` / `error_details_json`,
+    // the kernel `Error` returned from `Statement::execute()` carries
+    // all three. Mirrors the Thrift `TGetOperationStatusResp` field
+    // set so a Thrift-migrating wrapper (e.g. the napi binding's JS
+    // Error envelope) sees identical content regardless of which
+    // path surfaced the failure. Regression guard for the
+    // `terminal_outcome::Failed → carry_extended_status` wiring at
+    // `src/client/sea.rs`.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let body = failed_body_with_extended_fields(
+        "stmt-fail-ext",
+        "table not found",
+        "42P01",
+        "User-facing reason from server",
+        "operator=Scan; stage=Analyze; full stack ...",
+        r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#,
+    );
+    mount_execute(&server, body).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT * FROM does_not_exist");
+    let err = match stmt.execute().await {
+        Ok(_) => panic!("execute should fail on FAILED state"),
+        Err(e) => e,
+    };
+
+    assert_eq!(err.code, ErrorCode::SqlError);
+    assert_eq!(err.sql_state.as_deref(), Some("42P01"));
+    assert_eq!(
+        err.display_message.as_deref(),
+        Some("User-facing reason from server"),
+        "display_message must carry through from FAILED wire envelope"
+    );
+    assert_eq!(
+        err.diagnostic_info.as_deref(),
+        Some("operator=Scan; stage=Analyze; full stack ...")
+    );
+    assert_eq!(
+        err.error_details_json.as_deref(),
+        Some(r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#)
+    );
 }

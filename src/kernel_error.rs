@@ -617,6 +617,43 @@ impl From<arrow_schema::ArrowError> for Error {
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
+// ─── SEA extended-status carry helpers ──────────────────────────────
+
+/// Copy the SEA extended status fields (`display_message`,
+/// `diagnostic_info`, `error_details_json`) from a wire status onto a
+/// kernel [`Error`].
+///
+/// Mirrors the Thrift `TGetOperationStatusResp` / `TStatus` contract
+/// where the same fields ride on the operation status across
+/// terminal-error states. Called by both the sync polling path
+/// (`client::sea::SeaRestTransport::terminal_outcome`) and the async
+/// poll-driver paths (`statement::executed_async::StatementStatus::
+/// from_sea_response`'s `Failed` arm + `await_result`'s `Cancelled`
+/// arm) so a Thrift-migrating wrapper sees the same field set on the
+/// returned `Error` regardless of which kernel handle the caller is
+/// driving.
+///
+/// `pub(crate)` — internal to the kernel; downstream consumers should
+/// read the fields off the returned `Error` directly. The wire-shape
+/// `types::sea::StatementStatus` is referenced by full path to avoid
+/// pulling the dependency into the `kernel_error` module's public
+/// imports.
+pub(crate) fn carry_extended_status(
+    mut error: Error,
+    status: &crate::types::sea::StatementStatus,
+) -> Error {
+    if let Some(msg) = status.display_message.as_ref() {
+        error = error.with_display_message(msg);
+    }
+    if let Some(info) = status.diagnostic_info.as_ref() {
+        error = error.with_diagnostic_info(info);
+    }
+    if let Some(json) = status.error_details_json.as_ref() {
+        error = error.with_error_details_json(json);
+    }
+    error
+}
+
 // ─── SQLSTATE extraction helpers ────────────────────────────────────
 
 /// Extract a SQLSTATE from a free-form error message.

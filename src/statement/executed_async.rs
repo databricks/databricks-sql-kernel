@@ -128,7 +128,17 @@ impl StatementStatus {
                         error = error.with_error_code(ec);
                     }
                 }
-                StatementStatus::Failed(error)
+                // Mirror the sync path: carry the SEA extended status
+                // fields (display_message / diagnostic_info /
+                // error_details_json) onto the returned Error so the
+                // napi binding's JS Error envelope sees the same field
+                // set Thrift's `TGetOperationStatusResp` exposed on
+                // failed operations, regardless of which kernel handle
+                // surfaced the failure.
+                StatementStatus::Failed(crate::kernel_error::carry_extended_status(
+                    error,
+                    &response.status,
+                ))
             }
         }
     }
@@ -365,8 +375,18 @@ impl ExecutedAsyncStatement {
                     }
                     StatementStatus::Cancelled => {
                         cancel_guard.defuse();
-                        return Err(Error::invalid_state()
-                            .message(format!("Statement {} was cancelled", self.statement_id)));
+                        // Carry the SEA extended status fields onto
+                        // the returned Error — mirrors the sync
+                        // `terminal_outcome::Canceled` arm so the
+                        // Cancelled-state envelope contract is
+                        // identical across kernel handles.
+                        let error = Error::invalid_state()
+                            .message(format!("Statement {} was cancelled", self.statement_id))
+                            .with_query_id(&self.statement_id);
+                        return Err(crate::kernel_error::carry_extended_status(
+                            error,
+                            &response.status,
+                        ));
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
                         if start.elapsed() > cfg.poll_timeout {

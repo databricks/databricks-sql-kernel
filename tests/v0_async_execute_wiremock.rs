@@ -170,6 +170,54 @@ fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
     .to_string()
 }
 
+/// `FAILED` body with the three SEA extended status fields populated.
+/// Pins the async polling path's `Error.display_message` /
+/// `diagnostic_info` / `error_details_json` carry — the async
+/// equivalent of the sync `failed_body_with_extended_fields`.
+fn failed_body_with_extended_fields(
+    statement_id: &str,
+    message: &str,
+    sql_state: &str,
+    display_message: &str,
+    diagnostic_info: &str,
+    error_details_json: &str,
+) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": {
+            "state": "FAILED",
+            "error": {
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": format!("{message}. SQLSTATE: {sql_state}"),
+            },
+            "display_message": display_message,
+            "diagnostic_info": diagnostic_info,
+            "error_details_json": error_details_json,
+        },
+    })
+    .to_string()
+}
+
+/// `CANCELED` body with the three SEA extended status fields
+/// populated. Used to pin the async path's
+/// `await_result::StatementStatus::Cancelled` arm carrying the
+/// extended fields onto the returned `Error`.
+fn cancelled_body_with_extended_fields(
+    statement_id: &str,
+    display_message: &str,
+    diagnostic_info: &str,
+) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": {
+            "state": "CANCELED",
+            "display_message": display_message,
+            "diagnostic_info": diagnostic_info,
+        },
+    })
+    .to_string()
+}
+
 fn cancelled_body(statement_id: &str) -> String {
     json!({
         "statement_id": statement_id,
@@ -821,4 +869,117 @@ async fn async_status_call_refreshes_cached_status() {
     );
 
     async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_await_result_failed_carries_extended_status_fields_onto_error() {
+    // Pins the async polling path's terminal-error contract,
+    // companion to the sync-path `execute_failed_carries_extended_status_fields_onto_error`
+    // in `tests/v0_execute_wiremock.rs`. Regression guard for the
+    // `executed_async.rs::from_sea_response::Failed` carry. Prior to
+    // the carry being added, the kernel `Error` returned from
+    // `await_result()` would have NONE of these three fields populated
+    // even when the SEA wire response did — silently breaking the
+    // Thrift-parity contract documented at `napi/src/error.rs`.
+    use databricks_sql_kernel::ErrorCode;
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-async-fail-ext")).await;
+    mount_status_sequence(
+        &server,
+        "stmt-async-fail-ext",
+        vec![failed_body_with_extended_fields(
+            "stmt-async-fail-ext",
+            "table not found",
+            "42P01",
+            "User-facing reason from server",
+            "operator=Scan; stage=Analyze; full stack ...",
+            r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND"}"#,
+        )],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT * FROM does_not_exist");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    let err = match async_exec.await_result().await {
+        Ok(_) => panic!("await_result on FAILED should error"),
+        Err(e) => e,
+    };
+
+    assert_eq!(err.code, ErrorCode::SqlError);
+    assert_eq!(err.sql_state.as_deref(), Some("42P01"));
+    assert_eq!(
+        err.display_message.as_deref(),
+        Some("User-facing reason from server"),
+        "async await_result must carry display_message from FAILED wire envelope (Thrift-parity contract)"
+    );
+    assert_eq!(
+        err.diagnostic_info.as_deref(),
+        Some("operator=Scan; stage=Analyze; full stack ...")
+    );
+    assert_eq!(
+        err.error_details_json.as_deref(),
+        Some(r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND"}"#)
+    );
+}
+
+#[tokio::test]
+async fn async_await_result_cancelled_carries_extended_status_fields_onto_error() {
+    // Pins the Cancelled arm of `await_result`. The server can
+    // include `display_message` (e.g. "Statement was canceled by the
+    // user") on a CANCELED response; the kernel must carry it onto
+    // the returned Error. Regression guard for the
+    // `executed_async.rs::await_result` Cancelled-arm carry.
+    use databricks_sql_kernel::ErrorCode;
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-async-cancel-ext")).await;
+    mount_status_sequence(
+        &server,
+        "stmt-async-cancel-ext",
+        vec![cancelled_body_with_extended_fields(
+            "stmt-async-cancel-ext",
+            "Statement was canceled by the user",
+            "operator=Scan; cancelled-mid-execute",
+        )],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    let err = match async_exec.await_result().await {
+        Ok(_) => panic!("await_result on CANCELED should error"),
+        Err(e) => e,
+    };
+    // Cancelled maps to InvalidArgument per the kernel's invalid-state
+    // helper today; assert the message + extended fields rather than
+    // pinning the code (the categorisation may move under ErrorCode
+    // taxonomy expansion).
+    assert!(
+        err.message.contains("cancelled"),
+        "message should mention cancellation, got: {}",
+        err.message
+    );
+    assert_eq!(
+        err.display_message.as_deref(),
+        Some("Statement was canceled by the user"),
+        "Cancelled arm must carry display_message from CANCELED wire envelope"
+    );
+    assert_eq!(
+        err.diagnostic_info.as_deref(),
+        Some("operator=Scan; cancelled-mid-execute")
+    );
+    let _ = ErrorCode::SqlError; // silence unused-import warning if the assert above changes
 }
