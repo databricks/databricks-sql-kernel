@@ -91,14 +91,27 @@ pub struct TlsConfig {
     /// for dev/test only.
     /// Default: false.
     pub allow_hostname_mismatch: Option<bool>,
-    /// Path to a PEM-encoded CA certificate file to add to the trust store.
+    /// Path to a PEM-encoded CA certificate file to add to the trust
+    /// store. Internal-only — the public [`crate::config::TlsConfig`]
+    /// surface does not expose a path-based loader; the only public
+    /// path to a custom CA is `custom_ca_cert: Vec<u8>` (mapped to
+    /// `trusted_certificate_pem` below). Direct-Rust kernel consumers
+    /// that need file-based loading can construct an
+    /// [`HttpClientConfig`] manually.
     pub trusted_certificate_path: Option<String>,
     /// PEM-encoded CA certificate bytes to add to the trust store.
-    /// Alternative to `trusted_certificate_path` for callers that
-    /// have the cert in-memory (e.g. foreign-language wrappers
-    /// passing `Buffer` / `bytes` without a tempfile shim). When
-    /// both are set, the path is read first, then the in-memory PEM
-    /// is added as an additional root.
+    /// Populated from the public [`crate::config::TlsConfig::custom_ca_cert`]
+    /// field — foreign-language wrappers (napi-rs `Buffer`, pyo3
+    /// `bytes`) pass the cert in-memory without needing a tempfile
+    /// shim.
+    ///
+    /// When BOTH `trusted_certificate_path` AND
+    /// `trusted_certificate_pem` are set on an internally-constructed
+    /// `HttpClientConfig`, the file is loaded first and then the
+    /// in-memory PEM is added as an additional root. From the public
+    /// surface only the in-memory variant is reachable (the path
+    /// field has no public projection), so the "both set" case is
+    /// unreachable for `SessionBuilder` callers today.
     pub trusted_certificate_pem: Option<Vec<u8>>,
 }
 

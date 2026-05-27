@@ -738,3 +738,65 @@ async fn executed_statement_status_fields_default_to_none() {
 
     exec.close().await.expect("close");
 }
+
+#[tokio::test]
+async fn polling_path_carries_terminal_status_not_initial() {
+    // Regression guard against the kernel surfacing the FIRST status
+    // response instead of the TERMINAL one.
+    //
+    // Setup: the POST /statements returns RUNNING with no extended
+    // fields. The polling GET /statements/{id} then returns SUCCEEDED
+    // with all 5 extended fields populated. The kernel's
+    // `wait_for_completion` loop must hand the **terminal** status
+    // (the final GET) to `ExecutedStatement::new`, not the initial
+    // POST response. If the kernel ever regresses to carrying forward
+    // the first response, this test fails because the accessors will
+    // see `None` instead of the populated terminal values.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // Initial execute returns RUNNING — no extended fields. The
+    // kernel must NOT latch this onto the ExecutedStatement.
+    mount_execute(&server, running_body("stmt-poll-status")).await;
+
+    // Polled GET returns SUCCEEDED with the 5 extended fields
+    // populated. This is the status the kernel must carry forward.
+    let batch = int64_batch("n", vec![42]);
+    mount_status(
+        &server,
+        "stmt-poll-status",
+        succeeded_inline_body_with_status(
+            "stmt-poll-status",
+            &batch,
+            Some(11),
+            Some(1.0),
+            Some("Done after retry"),
+            Some("operator=Project; stage=Execute"),
+            Some(r#"{"errorClass":"NONE"}"#),
+        ),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let exec = stmt
+        .execute()
+        .await
+        .expect("execute should poll to terminal SUCCEEDED");
+
+    // All 5 must reflect the TERMINAL poll, not the initial RUNNING
+    // response (which had no extended fields).
+    assert_eq!(exec.num_modified_rows(), Some(11));
+    assert_eq!(exec.progress(), Some(1.0));
+    assert_eq!(exec.display_message(), Some("Done after retry"));
+    assert_eq!(
+        exec.diagnostic_info(),
+        Some("operator=Project; stage=Execute")
+    );
+    assert_eq!(exec.error_details_json(), Some(r#"{"errorClass":"NONE"}"#));
+
+    exec.close().await.expect("close");
+}
