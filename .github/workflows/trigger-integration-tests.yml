@@ -1,0 +1,318 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cross-repo integration-test trigger.
+#
+# This workflow does not run the tests. Tests live in
+# databricks/databricks-driver-test (the internal repo) and run against
+# the workspace credentials + mitmproxy infrastructure that lives there.
+# This workflow only fires a repository_dispatch event into that repo
+# and reports the result back as the "Kernel Integration Tests" check
+# on the kernel PR.
+#
+# Modeled on adbc-drivers/databricks's `trigger-integration-tests.yml`
+# (the C# ADBC equivalent). Differences:
+#   - Single language (Rust) — no per-language path-filter fan-out.
+#   - Source paths are kernel-relative: src/**, napi/**, pyo3/**,
+#     Cargo.{toml,lock}, .github/workflows/**.
+#   - Dispatched event-type is `kernel-pr-test`.
+#   - Check-run name is "Kernel Integration Tests" — must match the
+#     name created by databricks-sql-kernel-integration-tests.yml in
+#     the internal repo, and must match what branch-protection lists
+#     as the required status check.
+#
+# Security model is identical to the C# version: only maintainers can
+# add the `integration-test` label; the label is auto-removed on new
+# commits so each push gets re-reviewed before tests run against the
+# internal workspace.
+
+name: Trigger Integration Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+
+jobs:
+  # =============================================================================
+  # Security: auto-remove `integration-test` label on new commits so each
+  # push to a PR gets re-reviewed before tests run against the internal
+  # workspace.
+  # =============================================================================
+  remove-label-on-new-commit:
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check if integration-test label exists
+        id: check-label
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasLabel = labels.includes('integration-test');
+            console.log(`integration-test label exists: ${hasLabel}`);
+            return hasLabel;
+
+      - name: Remove integration-test label
+        if: steps.check-label.outputs.result == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'integration-test'
+              });
+              console.log('Removed integration-test label');
+            } catch (error) {
+              if (error.status === 404) {
+                console.log('Label already removed or does not exist');
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Comment on PR about label removal
+        if: steps.check-label.outputs.result == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const isFromFork = pr.head.repo.full_name !== pr.base.repo.full_name;
+            const repoType = isFromFork ? '**fork PR**' : 'PR';
+
+            const body = [
+              'Integration test approval reset',
+              '',
+              `New commits were pushed to this ${repoType}. The \`integration-test\` label has been automatically removed for security.`,
+              '',
+              '**A maintainer must re-review the changes and re-add the label to trigger tests again.**',
+              '',
+              `**Latest commit**: ${pr.head.sha.substring(0, 7)}`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  # =============================================================================
+  # On non-label PR events, auto-pass the "Kernel Integration Tests" check
+  # so it doesn't block merging. The real run happens in the merge queue
+  # (or earlier, when a maintainer adds the label).
+  # =============================================================================
+  skip-integration-tests-pr:
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Skip Kernel Integration Tests
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped on PR - runs in merge queue',
+                summary: 'Integration tests are skipped on PRs and run as a required gate in the merge queue. A maintainer can run them earlier by adding the `integration-test` label.'
+              }
+            });
+
+  # =============================================================================
+  # Label-triggered dispatch: maintainer added `integration-test` -> fire
+  # tests in the internal repo for this PR's head SHA.
+  # =============================================================================
+  trigger-tests-pr:
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      contains(github.event.pull_request.labels.*.name, 'integration-test')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App Token (internal repo)
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+
+      - name: Sanitize PR title
+        id: sanitize
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          result-encoding: string
+          script: |
+            const title = context.payload.pull_request.title || '';
+            return title.replace(/[\\"\n\r\t]/g, ' ').substring(0, 200);
+
+      - name: Dispatch kernel tests to internal repo
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: kernel-pr-test
+          client-payload: |
+            {
+              "pr_number": "${{ github.event.pull_request.number }}",
+              "commit_sha": "${{ github.event.pull_request.head.sha }}",
+              "pr_repo": "${{ github.repository }}",
+              "pr_url": "${{ github.event.pull_request.html_url }}",
+              "pr_title": "${{ steps.sanitize.outputs.result }}",
+              "pr_author": "${{ github.event.pull_request.user.login }}"
+            }
+
+      - name: Comment on PR
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: 'Kernel integration tests triggered. [View workflow run](https://github.com/databricks/databricks-driver-test/actions/workflows/databricks-sql-kernel-integration-tests.yml)'
+            });
+
+  # =============================================================================
+  # Merge-queue gate: tests are a required status check before merge. If
+  # nothing under the kernel-source path filter changed, auto-pass.
+  # Otherwise dispatch and let the internal repo report the result.
+  # =============================================================================
+  merge-queue-kernel:
+    if: github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Check if kernel source files changed
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.merge_group.base_sha }}" \
+            "${{ github.event.merge_group.head_sha }}")
+          # Path set mirrors the in-repo rust-e2e.yml's source filter
+          # (src/**, tests/**, Cargo.toml, Cargo.lock, workflow files)
+          # plus napi/ and pyo3/ wrappers. `tests/` is included because a
+          # test-only change can still break kernel-protocol invariants
+          # that integration tests catch.
+          if echo "$CHANGED" | grep -qE "^(src/|tests/|napi/|pyo3/|Cargo\.toml|Cargo\.lock|\.github/workflows/)"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "kernel source files changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no kernel source files changed"
+          fi
+
+      - name: Auto-pass (no kernel source changes)
+        if: steps.changed.outputs.changed != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped - no kernel source changes',
+                summary: 'No kernel source files changed in this merge group.'
+              }
+            });
+
+      - name: Extract PR number
+        if: steps.changed.outputs.changed == 'true'
+        id: extract-pr
+        run: |
+          REF="${{ github.event.merge_group.head_ref }}"
+          if [[ $REF =~ pr-([0-9]+) ]]; then
+            echo "pr_number=${BASH_REMATCH[1]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: failed to extract PR number from merge group ref: '$REF'" >&2
+            exit 1
+          fi
+
+      - name: Generate GitHub App Token (internal repo)
+        if: steps.changed.outputs.changed == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+
+      - name: Dispatch kernel tests
+        if: steps.changed.outputs.changed == 'true'
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: kernel-pr-test
+          client-payload: |
+            {
+              "pr_number": "${{ steps.extract-pr.outputs.pr_number }}",
+              "commit_sha": "${{ github.event.merge_group.head_sha }}",
+              "pr_repo": "${{ github.repository }}",
+              "pr_url": "https://github.com/${{ github.repository }}/pull/${{ steps.extract-pr.outputs.pr_number }}",
+              "pr_title": "Merge queue validation",
+              "pr_author": "merge-queue"
+            }
+
+      - name: Fail check on dispatch error
+        if: failure() && steps.changed.outputs.changed == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'completed',
+              conclusion: 'failure',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Failed - error dispatching tests',
+                summary: 'An error occurred while dispatching kernel integration tests. Check the workflow run logs.'
+              }
+            });
