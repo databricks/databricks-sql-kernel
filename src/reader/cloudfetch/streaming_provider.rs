@@ -660,15 +660,59 @@ impl StreamingCloudFetchProvider {
                                 ))
                             })?;
                         if cached.is_expired() {
-                            // Pre-refresh cache had a stale link;
-                            // post-refresh check inside
-                            // `refresh_links_batch` already catches
-                            // this case. Belt-and-braces.
-                            return Err(Error::invalid_state().message(format!(
-                                "Link for chunk {} is still expired after refresh \
-                                 (likely client/server clock skew or a server bug)",
-                                chunk_index
-                            )));
+                            // The link is still expired after the
+                            // refresh call returned `Ok(())`. Two
+                            // distinct root causes, surfaced with
+                            // distinct errors so operators don't
+                            // get a misleading clock-skew message
+                            // for the benign concurrent-disjoint
+                            // case.
+                            //
+                            // (a) **Clock skew / server bug**: a
+                            //     refresh ran *for our chunk* but
+                            //     the link is still flagged
+                            //     expired. The URL is the new one
+                            //     from the server. The local-vs-
+                            //     server clock or `LINK_EXPIRY_BUFFER_SECS`
+                            //     is off, or the server emitted a
+                            //     stale link.
+                            // (b) **Concurrent disjoint window**:
+                            //     a refresh ran but didn't cover
+                            //     our chunk (loser-of-claim path
+                            //     returned Ok). The URL is
+                            //     unchanged — same one we started
+                            //     with. Surfaces as `Unavailable`
+                            //     so the caller can retry without
+                            //     conflating with the clock-skew
+                            //     diagnosis.
+                            //
+                            // `refresh_links_batch` itself now
+                            // returns Err for the
+                            // MAX_CLAIM_RETRIES exhaustion case,
+                            // so reaching this branch with an
+                            // unchanged URL means we were in a
+                            // disjoint-window race that resolved
+                            // within the retry budget but still
+                            // didn't refresh our chunk (e.g. the
+                            // winner's window was strictly before
+                            // our chunk_index).
+                            let url_unchanged = stored_link
+                                .as_ref()
+                                .is_some_and(|prev| prev.url == cached.url);
+                            return Err(if url_unchanged {
+                                Error::unavailable().message(format!(
+                                    "Link for chunk {} not refreshed by the concurrent \
+                                     refresh window (URL unchanged); retry would help",
+                                    chunk_index,
+                                ))
+                            } else {
+                                Error::invalid_state().message(format!(
+                                    "Link for chunk {} is still expired after refresh \
+                                     (URL changed but `is_expired()` still true — \
+                                     likely client/server clock skew or a server bug)",
+                                    chunk_index,
+                                ))
+                            });
                         }
                         cached
                     }
@@ -831,21 +875,43 @@ impl StreamingCloudFetchProvider {
             .get(&start_chunk_index)
             .and_then(|e| e.link.as_ref().map(|l| l.url.clone()));
 
-        // Acquire-style CAS to claim "I'm the one refreshing".
-        // `compare_exchange` returns `Ok(prev)` only when prev was
-        // exactly `false` — i.e. nobody else was refreshing.
-        let won_claim = coordinator
-            .in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
+        // Disjoint-window retry budget. The loser-of-claim path
+        // (below) waits on `done` for whoever owns the claim. If
+        // the winner's refresh window didn't cover *our* chunk
+        // (e.g. two download tasks for disjoint chunk ranges hit
+        // expiry within the same lock window), the wait resolves
+        // with our chunk still stale. Without this loop we'd
+        // return `Ok(())` and the caller's post-refresh
+        // `is_expired()` check would surface a misleading
+        // "still expired — clock skew" error for what is
+        // actually a benign disjoint-window race.
+        //
+        // Three iterations covers the realistic worst case (two
+        // concurrent disjoint-window refreshers + ours); a hard
+        // bound avoids pathological churn if the server keeps
+        // emitting non-overlapping refresh batches.
+        const MAX_CLAIM_RETRIES: u32 = 3;
 
-        if !won_claim {
+        for claim_attempt in 0..MAX_CLAIM_RETRIES {
+            // Acquire-style CAS to claim "I'm the one refreshing".
+            // `compare_exchange` returns `Ok(prev)` only when prev was
+            // exactly `false` — i.e. nobody else was refreshing.
+            let won_claim = coordinator
+                .in_progress
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok();
+
+            if won_claim {
+                break;
+            }
+
             // Another task is mid-refresh. Wait for its `done`
             // signal — cancel-aware, so a provider drop unblocks
             // us. Then re-check the cache; the other refresh may
             // have already refreshed our chunk.
             debug!(
                 statement_id = %sid,
+                claim_attempt,
                 "Batched refresh for chunk {} deferred — another task is refreshing; \
                  waiting on done signal",
                 start_chunk_index,
@@ -881,14 +947,21 @@ impl StreamingCloudFetchProvider {
                     }
                 }
             }
-            // Other refresh didn't cover us (or its result still
-            // looked stale). Fall through and try to claim again.
-            // We loop via the public caller's retry path — return
-            // `Ok(())` here and let `download_chunk_with_retry`
-            // re-attempt; if the link is still expired the caller
-            // will surface the consistent "still expired after
-            // refresh" error.
-            return Ok(());
+            // Disjoint-window case: the winning refresh ran but
+            // didn't cover our chunk. Loop back to retry the CAS
+            // claim ourselves. If we never win after
+            // MAX_CLAIM_RETRIES, surface a typed error so the
+            // caller doesn't conflate this with the clock-skew
+            // path.
+            if claim_attempt + 1 == MAX_CLAIM_RETRIES {
+                return Err(Error::unavailable().message(format!(
+                    "Concurrent refresh contention: claim CAS lost {} times for chunk {} \
+                     and each winning refresh covered a disjoint window. Likely \
+                     pathological concurrent expiry across very different chunk ranges; \
+                     consider lowering the per-task fan-out or filing a bug.",
+                    MAX_CLAIM_RETRIES, start_chunk_index,
+                )));
+            }
         }
 
         // We hold the claim. Make sure we release it on any exit
@@ -1748,6 +1821,105 @@ mod tests {
             mock.refresh_calls.load(AtomicOrdering::SeqCst),
             1,
             "concurrent refreshes must dedup down to one RPC"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_batch_disjoint_window_loser_retries_claim() {
+        // Loser-of-claim disjoint-window gap (round-3 follow-up):
+        // when Task A wins the CAS and refreshes a window that
+        // does NOT cover Task B's chunk, Task B must loop back to
+        // retry the CAS itself rather than returning `Ok(())` and
+        // letting the caller surface a misleading "still expired
+        // — clock skew" error.
+        //
+        // Mock semantics: returns ONLY the chunk_index it was
+        // asked about (window = 1). So a refresh starting at
+        // chunk 0 covers chunk 0 only; a refresh starting at
+        // chunk 50 covers chunk 50 only.
+        //
+        // Test setup: two concurrent refresh requests for chunks
+        // 0 and 50. Both starting links are expired. After both
+        // complete:
+        // - Both chunks must have fresh URLs in the cache.
+        // - Exactly TWO RPC calls were made (one per disjoint
+        //   window).
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(0, entry_with_state(expired_link(0), ChunkState::UrlFetched));
+        chunks.insert(
+            50,
+            entry_with_state(expired_link(50), ChunkState::UrlFetched),
+        );
+
+        // window=1 → each refresh returns ONE link (only the
+        // chunk_index it was asked about). So a refresh for
+        // chunk 0 cannot cover chunk 50 and vice versa.
+        let mock = RefreshCountingMock::new(1);
+        let coordinator = Arc::new(RefreshCoordinator::default());
+        let cancel = CancellationToken::new();
+
+        let fetcher_a: Arc<dyn ChunkLinkFetcher> = mock.clone();
+        let chunks_a = Arc::clone(&chunks);
+        let coordinator_a = Arc::clone(&coordinator);
+        let cancel_a = cancel.clone();
+        let h1 = tokio::spawn(async move {
+            StreamingCloudFetchProvider::refresh_links_batch(
+                0,
+                &fetcher_a,
+                &chunks_a,
+                &coordinator_a,
+                &cancel_a,
+                None,
+            )
+            .await
+        });
+
+        let fetcher_b: Arc<dyn ChunkLinkFetcher> = mock.clone();
+        let chunks_b = Arc::clone(&chunks);
+        let coordinator_b = Arc::clone(&coordinator);
+        let cancel_b = cancel.clone();
+        let h2 = tokio::spawn(async move {
+            StreamingCloudFetchProvider::refresh_links_batch(
+                50,
+                &fetcher_b,
+                &chunks_b,
+                &coordinator_b,
+                &cancel_b,
+                None,
+            )
+            .await
+        });
+
+        // Both calls must succeed — no "still expired" error
+        // should surface for the disjoint-window case.
+        h1.await.unwrap().expect("chunk 0 refresh must succeed");
+        h2.await.unwrap().expect("chunk 50 refresh must succeed");
+
+        // Both chunks have been refreshed (URLs contain
+        // "REFRESHED" from the mock).
+        for ci in [0, 50] {
+            let cached = chunks
+                .get(&ci)
+                .and_then(|e| e.link.as_ref().map(|l| l.url.clone()))
+                .expect("chunk must be cached");
+            assert!(
+                cached.contains("REFRESHED"),
+                "chunk {} URL must be refreshed after disjoint-window retry; got {}",
+                ci,
+                cached,
+            );
+        }
+
+        // Exactly two RPCs — one per disjoint window. The loser's
+        // retry-claim path is what makes the second RPC happen;
+        // without it, the loser would return `Ok(())` after
+        // waiting on `done` and the caller would surface a
+        // bogus clock-skew error.
+        assert_eq!(
+            mock.refresh_calls.load(AtomicOrdering::SeqCst),
+            2,
+            "disjoint windows must each get their own RPC \
+             (the loser retries CAS instead of returning Ok)",
         );
     }
 
