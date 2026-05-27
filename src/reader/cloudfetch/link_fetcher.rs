@@ -79,8 +79,52 @@ pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
         start_row_offset: i64,
     ) -> Result<ChunkLinkFetchResult>;
 
-    /// Refetch a specific chunk link (used when link expires before download).
+    /// Refetch a specific chunk link.
+    ///
+    /// The current SEA streaming path uses [`Self::refetch_links_from`]
+    /// (batched refresh) on expiry. This single-link variant is kept
+    /// for callers that genuinely want a single link (e.g. tests, or
+    /// future Thrift transports where each link refresh is its own
+    /// RPC by construction).
+    #[allow(
+        dead_code,
+        reason = "preserved for single-link callers; SEA path uses refetch_links_from"
+    )]
     async fn refetch_link(&self, chunk_index: i64, row_offset: i64) -> Result<CloudFetchLink>;
+
+    /// Refetch the link batch starting at `chunk_index`.
+    ///
+    /// SEA's `get_result_chunks` returns links for the requested
+    /// chunk plus a server-decided forward window. When a single
+    /// presigned URL has expired, the URLs for subsequent chunks are
+    /// typically also near-expiry — refreshing the whole batch in
+    /// one RPC instead of N single-link refetches is the contract
+    /// we want.
+    ///
+    /// Returns the full list of links the server emitted. Callers
+    /// are responsible for walking the result and reconciling each
+    /// link with the current per-chunk state (e.g. skipping the
+    /// download re-trigger for chunks already in `Downloaded`).
+    ///
+    /// Implementations also refresh their internal cache from the
+    /// batch so subsequent `fetch_links` / `refetch_link` calls see
+    /// the new URLs without an extra round trip.
+    async fn refetch_links_from(
+        &self,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<Vec<CloudFetchLink>>;
+
+    /// Identifier of the statement this fetcher is bound to, if
+    /// known. Used by downstream consumers (e.g. the streaming
+    /// provider) to attach a `statement_id` field to log lines so
+    /// operators can filter by query.
+    ///
+    /// Default implementation returns `None` — mock fetchers and
+    /// non-SEA transports don't need to surface anything.
+    fn statement_id(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// SEA implementation of ChunkLinkFetcher with caching and proactive prefetching.
@@ -866,7 +910,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         // — a `for i in start..server_fetch_index` with silent
         // `is_none()` skip would return a non-contiguous slice and
         // hang the streaming provider's wait_for_chunk on the
-        // first missing index (P1 #1 in PR #68 review).
+        // first missing index.
         if start_chunk_index < server_fetch_index {
             let mut links = Vec::new();
             let mut i = start_chunk_index;
@@ -974,6 +1018,77 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         // Update cache with fresh link
         self.inner.links.insert(chunk_index, link.clone());
         Ok(link)
+    }
+
+    async fn refetch_links_from(
+        &self,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<Vec<CloudFetchLink>> {
+        let result = self
+            .inner
+            .client
+            .get_result_chunks(&self.inner.statement_id, chunk_index, row_offset)
+            .await?;
+
+        // The SEA contract today caps the number of links in a
+        // single `get_result_chunks` response to ~empirical bounds
+        // (≤ a few hundred chunks per page). If SEA ever changes
+        // and a page returns thousands of links, the downstream
+        // reconciliation loop (which mutates a DashMap entry per
+        // link) is a quiet O(N) hotspot. `debug_assert!` makes the
+        // assumption loud in debug builds without paying for it in
+        // release.
+        debug_assert!(
+            result.links.len() <= 10_000,
+            "implausibly large refresh response ({} links) — \
+             SEA contract may have changed; review the cap",
+            result.links.len(),
+        );
+
+        // Refresh the internal link cache with every link the server
+        // returned. The caller will reconcile per-chunk state in the
+        // streaming provider (which knows which chunks are already
+        // downloaded vs in-flight).
+        for link in &result.links {
+            self.inner.links.insert(link.chunk_index, link.clone());
+        }
+
+        // Mirror the continuation cursor updates from `fetch_links`:
+        // a refresh response is a normal `get_result_chunks`
+        // response, just used for the expiry-recovery path. If we
+        // drop its continuation metadata on the floor (as the
+        // initial implementation did), the prefetch loop happily
+        // keeps firing past the actual end of the result set when a
+        // refresh response carries `next_chunk_index = None`. Use
+        // `fetch_max` so an early-window refresh (start_chunk_index
+        // < current cursor) doesn't rewind progress.
+        if let Some(last_link) = result.links.last() {
+            let next_row_offset = last_link.row_offset.saturating_add(last_link.row_count);
+            self.inner
+                .next_row_offset
+                .fetch_max(next_row_offset, Ordering::Release);
+            let cont = decode_continuation(last_link, self.inner.total_chunk_count_hint);
+            if cont.used_total_chunk_count_fallback {
+                self.inner.warn_total_chunk_count_fallback("link refresh");
+            }
+            if cont.eos {
+                self.inner.all_links_fetched.store(true, Ordering::Release);
+            } else {
+                let advance_to = cont
+                    .next_fetch_index
+                    .max(last_link.chunk_index.saturating_add(1));
+                self.inner
+                    .next_server_fetch_index
+                    .fetch_max(advance_to, Ordering::Release);
+            }
+        }
+
+        Ok(result.links)
+    }
+
+    fn statement_id(&self) -> Option<&str> {
+        Some(&self.inner.statement_id)
     }
 }
 
@@ -1349,6 +1464,162 @@ mod tests {
         assert!(result.is_err());
     }
 
+    // ──────────────────────────────────────────────────────────────
+    // refetch_links_from coverage — exercises the batched-refresh
+    // entry point used by the streaming provider's expiry path.
+    // The SEA impl writes the cache, advances the row-offset and
+    // server-fetch cursors, and reconciles EOS — none of which
+    // was tested directly before (only via mocks at the trait
+    // level inside the streaming provider).
+    // ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_sea_link_fetcher_refetch_links_from_writes_cache() {
+        // After `refetch_links_from`, every link in the response
+        // must be in the internal cache so subsequent
+        // `fetch_links` / `refetch_link` calls see the new URLs
+        // without an extra round trip.
+        let links = vec![
+            vec![create_test_link(0)],
+            vec![create_test_link(1)],
+            vec![create_test_link_terminal(2)],
+        ];
+        let client = Arc::new(MockDatabricksClient::new(links));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "test-statement",
+            &[],
+            None,
+            128,
+            tokio::runtime::Handle::current(),
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // Request a refresh batch from chunk 1 onward.
+        let refreshed = handle.refetch_links_from(1, 1000).await.unwrap();
+
+        // Mock returns one link per `get_result_chunks` call —
+        // the chunk at the requested index. Refresh response is
+        // a single link for chunk 1.
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].chunk_index, 1);
+
+        // Cache was updated.
+        assert!(handle.inner.has_link(1));
+    }
+
+    #[tokio::test]
+    async fn test_sea_link_fetcher_refetch_links_from_advances_eos() {
+        // When `refetch_links_from` returns a terminal link
+        // (`next_chunk_index = None`), the `all_links_fetched`
+        // flag must flip so subsequent `fetch_links` calls
+        // short-circuit instead of hitting the server again.
+        let links = vec![vec![create_test_link_terminal(0)]];
+        let client = Arc::new(MockDatabricksClient::new(links));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "test-statement",
+            &[],
+            None,
+            128,
+            tokio::runtime::Handle::current(),
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // Pre-condition: not yet at EOS.
+        assert!(!handle.inner.all_links_fetched.load(Ordering::Acquire));
+
+        let _ = handle.refetch_links_from(0, 0).await.unwrap();
+
+        // Post-condition: EOS flipped on after the terminal link
+        // landed in the refresh response.
+        assert!(
+            handle.inner.all_links_fetched.load(Ordering::Acquire),
+            "terminal link in refresh response must flip all_links_fetched",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sea_link_fetcher_refetch_links_from_advances_cursor() {
+        // `refetch_links_from` mirrors `fetch_links`'s cursor
+        // advancement (`next_server_fetch_index` via `fetch_max`,
+        // `next_row_offset` via `fetch_max`). A subsequent
+        // prefetch must NOT re-issue the chunk we just refreshed.
+        let links = vec![
+            vec![create_test_link(0)],
+            vec![create_test_link(1)],
+            vec![create_test_link_terminal(2)],
+        ];
+        let client = Arc::new(MockDatabricksClient::new(links));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "test-statement",
+            &[],
+            None,
+            128,
+            tokio::runtime::Handle::current(),
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // Pre-condition: cursor at 0.
+        assert_eq!(
+            handle.inner.next_server_fetch_index.load(Ordering::Acquire),
+            0
+        );
+        assert_eq!(handle.inner.next_row_offset.load(Ordering::Acquire), 0);
+
+        // Refresh from chunk 0. The non-terminal link's
+        // continuation should advance the cursor past 0.
+        let _ = handle.refetch_links_from(0, 0).await.unwrap();
+
+        // `next_server_fetch_index` advances past the refreshed
+        // index — refresh of chunk 0 should leave it at 1 (or
+        // higher, depending on the test link's `next_chunk_index`
+        // hint).
+        let new_idx = handle.inner.next_server_fetch_index.load(Ordering::Acquire);
+        assert!(
+            new_idx >= 1,
+            "next_server_fetch_index must advance past refreshed chunk; got {}",
+            new_idx,
+        );
+
+        // `next_row_offset` advances past chunk 0's rows
+        // (row_offset=0 + row_count=1000 = 1000).
+        let new_offset = handle.inner.next_row_offset.load(Ordering::Acquire);
+        assert_eq!(
+            new_offset, 1000,
+            "next_row_offset must advance to row_offset + row_count",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_sea_link_fetcher_refetch_links_from_empty_response() {
+        // A `get_result_chunks` call past end-of-stream returns
+        // `ChunkLinkFetchResult::end_of_stream()` (empty links,
+        // `has_more = false`). `refetch_links_from` must handle
+        // this gracefully — no panic on empty `.last()`, no
+        // bogus cursor update.
+        let links = vec![vec![create_test_link_terminal(0)]];
+        let client = Arc::new(MockDatabricksClient::new(links));
+        let fetcher = SeaChunkLinkFetcher::new(
+            client,
+            "test-statement",
+            &[],
+            None,
+            128,
+            tokio::runtime::Handle::current(),
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+
+        // Ask for a chunk past the end — mock returns
+        // end_of_stream (empty links).
+        let refreshed = handle.refetch_links_from(99, 0).await.unwrap();
+        assert!(
+            refreshed.is_empty(),
+            "past-EOS request should return empty vec, not error",
+        );
+    }
+
     #[tokio::test]
     async fn test_sea_link_fetcher_all_links_fetched_flag() {
         let links = vec![vec![create_test_link_terminal(0)]];
@@ -1372,7 +1643,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Continuation tests (PR #68 P1.3 feedback).
+    // Continuation tests.
     //
     // These exercise the bounded-SEA-API control flow directly,
     // bypassing the async prefetch race so a regression in
@@ -1509,7 +1780,7 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // total_chunk_count transition-period fallback (PR #68 P0).
+    // total_chunk_count transition-period fallback.
     // ──────────────────────────────────────────────────────────────
 
     #[tokio::test]

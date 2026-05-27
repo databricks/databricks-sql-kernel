@@ -184,6 +184,17 @@ pub struct ChunkEntry {
     pub state: ChunkState,
     /// Parsed record batches (populated when state is Downloaded).
     pub batches: Option<Vec<RecordBatch>>,
+    /// Most recent failure reason, preserved across state
+    /// transitions that erase it from `ChunkState` itself.
+    ///
+    /// `ChunkState::DownloadFailed(reason)` carries the reason
+    /// while it's set, but the retry loop transitions
+    /// `DownloadFailed → DownloadRetry` (where the reason no
+    /// longer lives in the state). Without this field an operator
+    /// can't correlate the chunk's failure history during the
+    /// retry-sleep window. Last writer wins — only the most
+    /// recent reason is preserved.
+    pub last_failure_reason: Option<String>,
 }
 
 impl ChunkEntry {
@@ -193,6 +204,7 @@ impl ChunkEntry {
             link: None,
             state: ChunkState::Pending,
             batches: None,
+            last_failure_reason: None,
         }
     }
 
@@ -202,6 +214,7 @@ impl ChunkEntry {
             link: Some(link),
             state: ChunkState::UrlFetched,
             batches: None,
+            last_failure_reason: None,
         }
     }
 }
