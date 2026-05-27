@@ -226,6 +226,12 @@ pub struct ExecuteStatementRequest {
     pub on_wait_timeout: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub row_limit: Option<i64>,
+    /// Server-side compression for external-link result chunks. Set to
+    /// `Some("LZ4_FRAME")` so the cloud-fetch payload is LZ4-compressed
+    /// (matches Python/JDBC SEA default). Without it the server returns
+    /// uncompressed arrow bytes, doubling network transfer.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub result_compression: Option<String>,
     /// Positional parameters for parameterized queries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<StatementParameter>,
@@ -362,6 +368,7 @@ mod tests {
             wait_timeout: Some("30s".to_string()),
             on_wait_timeout: None,
             row_limit: None,
+            result_compression: None,
             parameters: vec![],
         };
 

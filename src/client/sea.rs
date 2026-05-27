@@ -363,6 +363,7 @@ impl SeaRestTransport {
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
             row_limit: params.row_limit,
+            result_compression: Some("LZ4_FRAME".to_string()),
             parameters: params.parameters.clone(),
         };
 

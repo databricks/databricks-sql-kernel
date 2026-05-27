@@ -52,11 +52,33 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
     let decompressed: Vec<u8>;
     let bytes: &[u8] = match compression {
         CompressionCodec::Lz4Frame => {
-            let mut decoder = FrameDecoder::new(Cursor::new(data));
+            // Databricks LZ4_FRAME payloads concatenate multiple LZ4
+            // frames in one buffer (one frame per server-side arrow
+            // record batch). FrameDecoder::read_to_end short-circuits
+            // at the first frame's end marker, so we must loop and
+            // peel each frame off in sequence. Mirrors the Python
+            // connector's `_decompress_data` (cloudfetch/downloader.py).
             let mut buf = Vec::new();
-            decoder
-                .read_to_end(&mut buf)
-                .map_err(|e| Error::io().message(format!("LZ4 decompression failed: {}", e)))?;
+            let mut remaining = data;
+            while !remaining.is_empty() {
+                let mut decoder = FrameDecoder::new(Cursor::new(remaining));
+                let before = buf.len();
+                decoder.read_to_end(&mut buf).map_err(|e| {
+                    Error::io().message(format!("LZ4 decompression failed: {}", e))
+                })?;
+                let consumed = decoder.into_inner().position() as usize;
+                if consumed == 0 {
+                    // Defensive: avoid infinite loop if decoder makes no progress.
+                    return Err(Error::io().message(format!(
+                        "LZ4 decoder stalled with {} bytes remaining",
+                        remaining.len()
+                    )));
+                }
+                if buf.len() == before && consumed == remaining.len() {
+                    break;
+                }
+                remaining = &remaining[consumed..];
+            }
             decompressed = buf;
             &decompressed
         }
@@ -164,6 +186,56 @@ mod tests {
 
         let result = parse_arrow_ipc(&compressed, CompressionCodec::Lz4Frame).unwrap();
 
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0].num_rows(), 100);
+    }
+
+    #[test]
+    fn test_parse_multi_frame_compressed_arrow_ipc() {
+        // Databricks LZ4_FRAME payloads split a single IPC stream across
+        // multiple consecutive LZ4 frames in one buffer. Reproduce by
+        // splitting one IPC stream's bytes into two halves and encoding
+        // each half as its own LZ4 frame. The decoder must peel both
+        // frames; FrameDecoder::read_to_end on its own stops at the
+        // first frame's end-marker.
+        use lz4_flex::frame::FrameEncoder;
+        use std::io::Write;
+
+        let batch = create_test_batch(100);
+        let ipc_data = create_test_arrow_ipc(std::slice::from_ref(&batch));
+        assert!(
+            ipc_data.len() > 32,
+            "test fixture too small to split meaningfully"
+        );
+        let mid = ipc_data.len() / 2;
+
+        let encode = |bytes: &[u8]| {
+            let mut out = Vec::new();
+            let mut enc = FrameEncoder::new(&mut out);
+            enc.write_all(bytes).unwrap();
+            enc.finish().unwrap();
+            out
+        };
+
+        let mut multi_frame = encode(&ipc_data[..mid]);
+        multi_frame.extend(encode(&ipc_data[mid..]));
+
+        // Sanity-check: feeding only the first frame to the decoder
+        // cannot reconstruct the full batch (the IPC stream is
+        // truncated). We treat any non-success outcome as the
+        // sanity-check passing — the exact error/empty shape from
+        // arrow_ipc on a truncated stream isn't part of our contract.
+        let only_first =
+            parse_arrow_ipc(&encode(&ipc_data[..mid]), CompressionCodec::Lz4Frame);
+        let truncated_yields_batch = matches!(&only_first, Ok(batches) if !batches.is_empty());
+        assert!(
+            !truncated_yields_batch,
+            "first frame alone must not yield a complete batch"
+        );
+
+        // Full multi-frame payload must decompress both frames and
+        // recover the complete batch.
+        let result = parse_arrow_ipc(&multi_frame, CompressionCodec::Lz4Frame).unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].num_rows(), 100);
     }
