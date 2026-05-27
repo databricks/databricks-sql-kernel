@@ -490,9 +490,103 @@ pub struct SessionConfig {
     pub transport: Option<TransportMode>,
 }
 
+// ─── session_conf allowlist ─────────────────────────────────────────────────
+
+/// Known session-conf keys, sourced from
+/// <https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters>
+/// plus the additional keys the Java driver accepts (`ENABLE_PHOTON`,
+/// `QUERY_TAGS`). Keys are matched case-insensitively against this list
+/// and uppercased before being sent.
+pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
+    "ANSI_MODE",
+    "COLLATION",
+    "ENABLE_PHOTON",
+    "LEGACY_TIME_PARSER_POLICY",
+    "MAX_FILE_PARTITION_BYTES",
+    "QUERY_TAGS",
+    "READ_ONLY_EXTERNAL_METASTORE",
+    "STATEMENT_TIMEOUT",
+    "TIMEZONE",
+    "USE_CACHED_RESULT",
+];
+
+/// Filter a caller-supplied `session_conf` map against
+/// [`SESSION_CONF_ALLOWLIST`]. Unknown keys are dropped with a
+/// `tracing::warn!`; known keys are normalized to uppercase (the
+/// server echoes uppercase, so SET-readback matches).
+pub(crate) fn filter_session_conf(
+    raw: std::collections::HashMap<String, String>,
+) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len());
+    for (k, v) in raw {
+        let upper = k.to_ascii_uppercase();
+        if SESSION_CONF_ALLOWLIST.contains(&upper.as_str()) {
+            out.insert(upper, v);
+        } else {
+            tracing::warn!(
+                key = %k,
+                "dropping unknown session_conf key (not in kernel allowlist); \
+                 see https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters"
+            );
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── session_conf allowlist ────────────────────────────────────
+
+    #[test]
+    fn session_conf_filter_keeps_known_keys_uppercased() {
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("use_cached_result".to_string(), "false".to_string());
+        raw.insert("ANSI_MODE".to_string(), "true".to_string());
+        let out = filter_session_conf(raw);
+        assert_eq!(
+            out.get("USE_CACHED_RESULT").map(String::as_str),
+            Some("false")
+        );
+        assert_eq!(out.get("ANSI_MODE").map(String::as_str), Some("true"));
+        assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn session_conf_filter_drops_unknown_keys() {
+        let mut raw = std::collections::HashMap::new();
+        raw.insert("ANSI_MOD".to_string(), "true".to_string()); // typo
+        raw.insert("NOT_A_REAL_PARAM".to_string(), "x".to_string());
+        raw.insert("TIMEZONE".to_string(), "UTC".to_string());
+        let out = filter_session_conf(raw);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get("TIMEZONE").map(String::as_str), Some("UTC"));
+    }
+
+    #[test]
+    fn session_conf_allowlist_covers_jdbc_set() {
+        // Parity check: every key the Java driver accepts must be
+        // accepted here too (we add COLLATION which JDBC currently
+        // lacks but the docs list).
+        for jdbc_key in [
+            "ANSI_MODE",
+            "ENABLE_PHOTON",
+            "LEGACY_TIME_PARSER_POLICY",
+            "MAX_FILE_PARTITION_BYTES",
+            "READ_ONLY_EXTERNAL_METASTORE",
+            "STATEMENT_TIMEOUT",
+            "TIMEZONE",
+            "USE_CACHED_RESULT",
+            "QUERY_TAGS",
+        ] {
+            assert!(
+                SESSION_CONF_ALLOWLIST.contains(&jdbc_key),
+                "missing JDBC-compatible key: {jdbc_key}"
+            );
+        }
+    }
 
     // ─── ConnectionConfig parsing ──────────────────────────────────
 

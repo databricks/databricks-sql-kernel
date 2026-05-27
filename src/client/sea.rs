@@ -477,7 +477,7 @@ impl Transport for SeaRestTransport {
             warehouse_id: self.warehouse_id.clone(),
             catalog: catalog.map(|s| s.to_string()),
             schema: schema.map(|s| s.to_string()),
-            session_configuration: session_config,
+            session_confs: session_config,
         };
 
         debug!("Creating session at {}", url);

@@ -256,7 +256,7 @@ impl Session {
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                config.session_conf.clone(),
+                crate::config::filter_session_conf(config.session_conf.clone()),
             )
             .await?;
 
