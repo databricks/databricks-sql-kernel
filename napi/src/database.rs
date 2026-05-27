@@ -28,7 +28,21 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{AuthConfig, DefaultOpts, Session};
+use databricks_sql_kernel::{AuthConfig, DefaultOpts, HttpConfig, Session};
+
+/// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
+///
+/// Applied by [`open_session`] when the JS caller does not pass
+/// `maxConnections`. Matches the JDBC driver's `HttpConnectionPoolSize`
+/// default (100) and closes the throughput gap vs the NodeJS Thrift
+/// driver's `maxSockets: Infinity` pool for bursty workloads
+/// (concurrent `executeStatement`, parallel CloudFetch chunk downloads).
+///
+/// The kernel core's [`HttpConfig::pool_max_idle_per_host`] default
+/// remains at the conservative kernel value (10) — each binding
+/// chooses its own user-facing default. The pyo3 binding inherits
+/// the kernel default; this constant is napi-specific.
+pub const NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 100;
 
 use crate::connection::Connection;
 use crate::error::napi_err_from_kernel;
@@ -70,6 +84,27 @@ pub struct ConnectionOptions {
     /// query-tag presets, …). Forwarded verbatim to SEA
     /// `session_confs`. Unknown keys are rejected server-side.
     pub session_conf: Option<HashMap<String, String>>,
+    /// Maximum number of pooled HTTP connections per host. Routes
+    /// through the kernel's [`HttpConfig::pool_max_idle_per_host`].
+    /// Tunes the underlying `reqwest` connection pool — higher values
+    /// reduce reconnect overhead when many statements run
+    /// concurrently against the same warehouse.
+    ///
+    /// When the JS caller does NOT provide `maxConnections`, the napi
+    /// binding applies a NodeJS-driver-appropriate default of
+    /// [`NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST`] (100) — chosen to match
+    /// the JDBC driver's `HttpConnectionPoolSize` default and to close
+    /// the throughput gap vs the NodeJS Thrift driver's
+    /// `maxSockets: Infinity` pool for bursty workloads. The kernel
+    /// core's [`HttpConfig::pool_max_idle_per_host`] default remains
+    /// at the conservative kernel value (10); each binding chooses
+    /// its own user-facing default. Mirrors the Python connector's
+    /// `max_connections` kwarg on the SEA backend, which exposes the
+    /// knob but keeps its own urllib3-aligned default of 10.
+    ///
+    /// Napi-rs serialises `u32` as JS `number`; values up to
+    /// `2^32 - 1` round-trip safely (any reasonable pool size fits).
+    pub max_connections: Option<u32>,
 }
 
 /// Open a Databricks SQL session over PAT auth and return an opaque
@@ -115,6 +150,19 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         if let Some(conf) = options.session_conf {
             builder = builder.session_conf(conf);
         }
+        // `HttpConfig` is `#[non_exhaustive]` — must construct via
+        // `default()` then mutate. The napi binding ALWAYS sets
+        // `pool_max_idle_per_host` so the NodeJS-driver-appropriate
+        // default ([`NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST`] = 100)
+        // applies even when the JS caller doesn't pass `maxConnections`.
+        // The kernel core's `HttpConfig::default()` (10) is intentionally
+        // conservative; each binding chooses its own user-facing default.
+        let mut http = HttpConfig::default();
+        http.pool_max_idle_per_host = options
+            .max_connections
+            .map(|max| max as usize)
+            .unwrap_or(NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST);
+        builder = builder.http(http);
         let session = builder.open().await.map_err(napi_err_from_kernel)?;
         let session_id = session.session_id().to_owned();
         Ok(Connection {

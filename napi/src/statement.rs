@@ -37,12 +37,38 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch,
+    Statement as KernelStatement,
 };
 
 use crate::error::napi_err_from_kernel;
 use crate::result::{ArrowBatch, ArrowSchema};
 use crate::runtime;
 use crate::util::guarded;
+
+/// Inner state for the JS-visible `Statement` wrapper.
+///
+/// **Why we also hold the parent kernel `Statement`:** the kernel's
+/// `Statement::Drop` (`src/statement/mutable.rs:341-361`) invalidates
+/// its produced `ExecutedStatement` via the shared `ValidityFlag`. If
+/// the binding wrapper held only the `ExecutedStatement`, the parent
+/// kernel `Statement` constructed in `Connection::execute_statement`
+/// would drop at the end of that function, flipping the validity flag
+/// and rendering every subsequent `cancel()` / `close()` call against
+/// the executed handle a no-op that throws
+/// `InvalidStatementHandle("executed-statement handle has been
+/// invalidated by a re-execute on its parent Statement")`.
+///
+/// Keeping the kernel `Statement` alive in the same `Arc<Mutex<…>>`
+/// as the `ExecutedStatement` ties their lifetimes together — the
+/// validity flag stays set for as long as JS holds the wrapper.
+struct StatementInner {
+    /// The kernel's `Statement` (mutable). Kept alive solely to
+    /// prevent its `Drop` from invalidating `executed`.
+    _parent: KernelStatement,
+    /// The executed handle — drives `fetchNextBatch` / `cancel` /
+    /// `close`.
+    executed: ExecutedStatement,
+}
 
 /// Opaque executed-statement handle.
 ///
@@ -62,7 +88,11 @@ use crate::util::guarded;
 /// disposed statement can still read them.
 #[napi]
 pub struct Statement {
-    inner: Arc<Mutex<Option<ExecutedStatement>>>,
+    /// Wraps the kernel `Statement` + `ExecutedStatement` pair so the
+    /// parent's `Drop` doesn't fire (and invalidate the executed
+    /// handle via the shared `ValidityFlag`) while JS still holds
+    /// this wrapper. See `StatementInner` docs above.
+    inner: Arc<Mutex<Option<StatementInner>>>,
     /// Schema captured at construction. Available even after `close()`.
     schema: SchemaRef,
     /// Server-issued id. Available even after `close()` for log
@@ -79,13 +109,20 @@ pub struct Statement {
 impl Statement {
     /// Crate-internal constructor — called from
     /// `Connection::execute_statement` once the kernel hands back the
-    /// `ExecutedStatement`. Caches `schema` and `statement_id` so
-    /// they're readable after `close()`.
-    pub(crate) fn from_executed(executed: ExecutedStatement) -> Self {
+    /// `ExecutedStatement`. The parent kernel `Statement` is passed
+    /// in alongside so its `Drop` doesn't fire while the JS side
+    /// still holds the executed handle (see `StatementInner` docs
+    /// above). `schema` and `statement_id` are read off the executed
+    /// handle here and cached on the wrapper so they remain readable
+    /// after `close()` for log correlation / error reporting.
+    pub(crate) fn from_executed(parent: KernelStatement, executed: ExecutedStatement) -> Self {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
         Self {
-            inner: Arc::new(Mutex::new(Some(executed))),
+            inner: Arc::new(Mutex::new(Some(StatementInner {
+                _parent: parent,
+                executed,
+            }))),
             schema,
             statement_id,
             finished: Arc::new(AtomicBool::new(false)),
@@ -119,7 +156,8 @@ impl Statement {
         let finished = Arc::clone(&self.finished);
         guarded(async move {
             let mut guard = inner.lock().await;
-            let executed = guard.as_mut().ok_or_else(statement_closed_err)?;
+            let inner_state = guard.as_mut().ok_or_else(statement_closed_err)?;
+            let executed = &mut inner_state.executed;
 
             let stream = executed.result_stream_mut();
             let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
@@ -204,8 +242,12 @@ impl Statement {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let guard = inner.lock().await;
-            let executed = guard.as_ref().ok_or_else(statement_closed_err)?;
-            executed.cancel().await.map_err(napi_err_from_kernel)
+            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
+            inner_state
+                .executed
+                .cancel()
+                .await
+                .map_err(napi_err_from_kernel)
         })
         .await
     }
@@ -231,14 +273,22 @@ impl Statement {
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
-            // Take the handle out so `Drop` knows there's nothing left
-            // to clean up.
-            let executed = {
+            // Take the inner state out so `Drop` knows there's nothing
+            // left to clean up. The parent kernel `Statement`'s Drop
+            // runs here too — but only AFTER the executed handle's
+            // close has finished, so we still observe a clean
+            // server-side close result before the validity flag flips.
+            let inner_state = {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            if let Some(executed) = executed {
-                executed.close().await.map_err(napi_err_from_kernel)?;
+            if let Some(inner_state) = inner_state {
+                inner_state
+                    .executed
+                    .close()
+                    .await
+                    .map_err(napi_err_from_kernel)?;
+                // _parent drops here, after close has resolved.
             }
             Ok(())
         })
@@ -261,12 +311,16 @@ impl Drop for Statement {
         };
         let inner = Arc::clone(&self.inner);
         handle.spawn(async move {
-            // Drop the executed statement on the runtime. The kernel's
+            // Drop the inner state on the runtime. The kernel's
             // `ExecutedStatement::Drop` already spawns a fire-and-forget
             // `close_statement` against its own captured handle, so we
             // just need to ensure the value is dropped inside a tokio
             // context (the kernel's Drop reads `runtime_handle.clone()`
-            // and spawns; that handle is the same one we captured here).
+            // and spawns; that handle is the same one we captured
+            // here). The kernel `Statement` we kept alive in
+            // `_parent` drops at the same time, but it only owns
+            // local state (its Drop is non-async — see
+            // `src/statement/mutable.rs:341-361`).
             let _taken = {
                 let mut guard = inner.lock().await;
                 guard.take()
