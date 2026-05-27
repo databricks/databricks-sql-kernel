@@ -211,6 +211,14 @@ pub struct Error {
     /// terminal-error statements. Pass-through string — wrappers parse
     /// if they need structured access. Mirrors the same-named Thrift
     /// field.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` on the
+    /// SQL cluster (`internal()`, default false in
+    /// `DatabricksSQLConf.scala` — not settable via session-conf).
+    /// Most workspaces will return `None` here even on terminal-
+    /// error statements; admin-enabled workspaces return content
+    /// shaped like `{"errorClass": "...", "messageTemplate": "..."}`.
     pub error_details_json: Option<String>,
 
     /// Underlying cause. Boxed to keep the struct stack-friendly.

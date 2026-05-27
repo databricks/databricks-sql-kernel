@@ -563,3 +563,262 @@ async fn await_result_drop_fires_cancel_statement() {
         "await_result drop should fire at least one cancel_statement; got {cancel_calls}"
     );
 }
+
+// ─── Extended SEA status fields on the async handle (PR #23) ────────
+//
+// The accessors `num_modified_rows()` / `display_message()` /
+// `diagnostic_info()` / `error_details_json()` on
+// `ExecutedAsyncStatement` reflect the most recent
+// `StatementStatus` this handle has observed (initial submit
+// response, or any subsequent `status()` / `await_result` poll).
+// The tests below pin three load-bearing properties:
+//
+//   1. After `await_result()` resolves to terminal SUCCEEDED, the
+//      accessors return the TERMINAL poll's extended fields, not the
+//      initial PENDING / RUNNING ones.
+//   2. When `submit()` returns immediately with an already-terminal
+//      response (server completed the query during the wait window),
+//      the accessors expose those fields even without the caller
+//      driving a single `status()` poll.
+//   3. A `status()` call updates the cached snapshot — a later
+//      accessor reflects that poll, not the initial-submit response.
+
+fn succeeded_inline_body_with_status(
+    statement_id: &str,
+    batch: &RecordBatch,
+    num_modified_rows: Option<i64>,
+    display_message: Option<&str>,
+    diagnostic_info: Option<&str>,
+    error_details_json: Option<&str>,
+) -> String {
+    let ipc = arrow_ipc_bytes(batch);
+    let attachment = STANDARD.encode(&ipc);
+    let columns: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            json!({
+                "name": f.name(),
+                "type_name": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    _ => "STRING",
+                },
+                "type_text": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    _ => "STRING",
+                },
+                "position": i as i32,
+            })
+        })
+        .collect();
+
+    let mut status = json!({ "state": "SUCCEEDED" });
+    let status_obj = status.as_object_mut().unwrap();
+    if let Some(n) = num_modified_rows {
+        status_obj.insert("num_modified_rows".to_string(), json!(n));
+    }
+    if let Some(m) = display_message {
+        status_obj.insert("display_message".to_string(), json!(m));
+    }
+    if let Some(d) = diagnostic_info {
+        status_obj.insert("diagnostic_info".to_string(), json!(d));
+    }
+    if let Some(e) = error_details_json {
+        status_obj.insert("error_details_json".to_string(), json!(e));
+    }
+
+    json!({
+        "statement_id": statement_id,
+        "status": status,
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": batch.num_columns() as i32,
+                "columns": columns,
+            },
+            "total_chunk_count": 1,
+            "total_row_count": batch.num_rows() as i64,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": batch.num_rows() as i64,
+            "byte_count": ipc.len() as i64,
+            "attachment": attachment,
+        },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn async_await_result_caches_terminal_status_for_accessors() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // Initial submit returns PENDING — no extended fields.
+    mount_submit(&server, pending_body("stmt-async-status")).await;
+
+    // First poll RUNNING (no fields), then terminal SUCCEEDED with
+    // all extended fields populated. The handle must reflect the
+    // terminal poll's values, not the initial PENDING snapshot.
+    let batch = int64_batch("n", vec![1]);
+    mount_status_sequence(
+        &server,
+        "stmt-async-status",
+        vec![
+            running_body("stmt-async-status"),
+            succeeded_inline_body_with_status(
+                "stmt-async-status",
+                &batch,
+                Some(17),
+                Some("All good (terminal)"),
+                Some("operator=Scan; stage=Execute"),
+                Some(r#"{"errorClass":"NONE"}"#),
+            ),
+        ],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    // Before any poll: accessors reflect the initial PENDING
+    // submit response, which had no extended fields.
+    assert_eq!(async_exec.num_modified_rows(), None);
+    assert_eq!(async_exec.display_message(), None);
+
+    // Drive polling to completion. The poll loop overwrites the
+    // cached status on every wire response — the terminal poll's
+    // extended fields must now be visible.
+    let _stream = async_exec
+        .await_result()
+        .await
+        .expect("await_result should reach SUCCEEDED");
+
+    assert_eq!(async_exec.num_modified_rows(), Some(17));
+    assert_eq!(
+        async_exec.display_message().as_deref(),
+        Some("All good (terminal)")
+    );
+    assert_eq!(
+        async_exec.diagnostic_info().as_deref(),
+        Some("operator=Scan; stage=Execute")
+    );
+    assert_eq!(
+        async_exec.error_details_json().as_deref(),
+        Some(r#"{"errorClass":"NONE"}"#)
+    );
+
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_submit_caches_initial_terminal_status() {
+    // If the server completes the query inside the
+    // `submit_statement` request (returns SUCCEEDED on the initial
+    // response with all fields populated), the accessors expose
+    // those values immediately — no poll needed. This matches
+    // Thrift's behaviour where `executeStatement` with direct
+    // results already carries the operation status fields.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_submit(
+        &server,
+        succeeded_inline_body_with_status(
+            "stmt-async-fast",
+            &batch,
+            Some(5),
+            Some("Done at submit time"),
+            None,
+            None,
+        ),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    // Without a single poll, accessors must already expose what the
+    // initial submit response carried.
+    assert_eq!(async_exec.num_modified_rows(), Some(5));
+    assert_eq!(
+        async_exec.display_message().as_deref(),
+        Some("Done at submit time")
+    );
+    assert_eq!(async_exec.diagnostic_info(), None);
+    assert_eq!(async_exec.error_details_json(), None);
+
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_status_call_refreshes_cached_status() {
+    // `status()` must refresh the cached snapshot used by the
+    // extended-field accessors, not just return the enum.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // Submit returns PENDING (no extended fields).
+    mount_submit(&server, pending_body("stmt-async-refresh")).await;
+
+    // A status() poll returns SUCCEEDED with extended fields. The
+    // status() call itself must overwrite the cached snapshot.
+    let batch = int64_batch("n", vec![1]);
+    mount_status_sequence(
+        &server,
+        "stmt-async-refresh",
+        vec![succeeded_inline_body_with_status(
+            "stmt-async-refresh",
+            &batch,
+            Some(99),
+            Some("Refreshed via status()"),
+            None,
+            None,
+        )],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let async_exec = stmt.submit().await.expect("submit");
+
+    // Before status(): accessors reflect PENDING (no fields).
+    assert_eq!(async_exec.num_modified_rows(), None);
+
+    let s = async_exec.status().await.expect("status");
+    // The terminal status arm of the enum.
+    assert!(
+        matches!(
+            s,
+            databricks_sql_kernel::StatementStatus::Succeeded
+                | databricks_sql_kernel::StatementStatus::Closed
+        ),
+        "expected Succeeded/Closed enum variant, got {s:?}"
+    );
+
+    // After status(): accessors reflect the status() poll's values.
+    assert_eq!(async_exec.num_modified_rows(), Some(99));
+    assert_eq!(
+        async_exec.display_message().as_deref(),
+        Some("Refreshed via status()")
+    );
+
+    async_exec.close().await.expect("close");
+}

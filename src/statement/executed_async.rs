@@ -29,17 +29,20 @@
 //! ## Extended SEA status fields (`num_modified_rows`,
 //! `display_message`, `diagnostic_info`, `error_details_json`)
 //!
-//! These accessors live on the **sync** [`crate::ExecutedStatement`]
-//! handle only. Async-consumption callers who need them should use
-//! [`crate::statement::mutable::Statement::execute`] (which drives the
-//! polling loop internally and returns a sync handle) rather than
-//! `submit()`. The async surface is shaped for the
-//! poll-loop-without-metadata use case; mirroring the accessors here
-//! requires storing a status snapshot per-poll, which is tracked as a
-//! follow-up. Wrappers presenting a Thrift-shaped operation API to
-//! their host language (e.g. the napi binding's `Statement` class
-//! mirroring `IOperation`) route through the sync handle so the
-//! extended fields are available alongside fetch / cancel / close.
+//! Mirrored from the sync [`crate::ExecutedStatement`] handle:
+//! [`ExecutedAsyncStatement::num_modified_rows`] /
+//! [`ExecutedAsyncStatement::display_message`] /
+//! [`ExecutedAsyncStatement::diagnostic_info`] /
+//! [`ExecutedAsyncStatement::error_details_json`] all return the value
+//! from the most recent SEA `StatementStatus` this handle has
+//! observed (initial `submit_statement` response or any subsequent
+//! `status()` / `await_result` poll). The Thrift `IOperation.status()`
+//! contract — same field set available on the same handle regardless
+//! of how the caller drove polling — is preserved on both kernel
+//! consumption modes. Wrappers presenting a Thrift-shaped operation
+//! API to their host language (e.g. the napi binding's `Statement`
+//! class) can route through whichever handle their language idiom
+//! prefers; field availability is identical.
 
 use crate::client::ExecuteResponse;
 use crate::kernel_error::Error;
@@ -143,6 +146,25 @@ pub struct ExecutedAsyncStatement {
     /// short-circuited) `close()`. Tells `Drop` to skip its
     /// fire-and-forget cleanup.
     closed: Arc<AtomicBool>,
+    /// Last SEA `StatementStatus` observed by this handle (initial
+    /// `submit_statement` response or any subsequent `status()` /
+    /// `await_result` poll). Read by the `num_modified_rows()` /
+    /// `display_message()` / `diagnostic_info()` / `error_details_json()`
+    /// accessors — matching the same field set the sync
+    /// [`crate::ExecutedStatement`] exposes so the napi binding's
+    /// `Statement` JS class (which mirrors the Thrift
+    /// `TGetOperationStatusResp` field set) sees a uniform contract
+    /// whether the kernel handle was produced via `execute()` or
+    /// `submit()`.
+    ///
+    /// `std::sync::Mutex` (not `tokio::sync::Mutex`): the guard is
+    /// only held across the cheap `Option::clone()` /
+    /// `Option::replace` paths inside the accessors and the poll
+    /// loop's post-await write. Holding it across `.await` would
+    /// pessimise scheduling without buying anything — the accessors
+    /// don't `.await` and the poll loop releases the lock before
+    /// every network round-trip.
+    latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
 }
 
 impl ExecutedAsyncStatement {
@@ -154,17 +176,107 @@ impl ExecutedAsyncStatement {
     /// `wait_timeout=0s`, so the server returns `Pending`/`Running` and
     /// the flag starts `false`; the share-and-flip pattern still
     /// applies once the caller (or `Drop`) closes either handle.
+    ///
+    /// `initial_status` is the SEA `StatementStatus` from the
+    /// `submit_statement` response — the very first observation the
+    /// kernel has of this server-side statement. Stored so accessors
+    /// return useful values even before the caller drives a single
+    /// `status()` / `await_result()` poll (e.g. when the server
+    /// already finished by the time `submit` returned).
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
         valid: ValidityFlag,
         closed: Arc<AtomicBool>,
+        initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
         Self {
             session,
             statement_id,
             valid,
             closed,
+            latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+        }
+    }
+
+    /// Number of rows modified by the statement (UPDATE / INSERT /
+    /// DELETE / MERGE). Reflects the most recent SEA
+    /// `StatementStatus` this handle has seen (initial submit
+    /// response, or any subsequent `status()` / `await_result()`
+    /// poll). Absent on SELECT and on warehouses that don't surface
+    /// the counter.
+    ///
+    /// Mirrors the same-named accessor on the sync
+    /// [`crate::ExecutedStatement`] and the same-named optional field
+    /// on the Thrift `TGetOperationStatusResp`.
+    pub fn num_modified_rows(&self) -> Option<i64> {
+        self.latest_status
+            .lock()
+            .ok()
+            .and_then(|s| s.num_modified_rows)
+    }
+
+    /// Server-supplied user-facing message. Reflects the most recent
+    /// SEA `StatementStatus` this handle has seen.
+    ///
+    /// **PII / sensitive-data note:** server-supplied free-form text
+    /// may include SQL fragments or parameter values. Redact before
+    /// centralised logging.
+    pub fn display_message(&self) -> Option<String> {
+        self.latest_status
+            .lock()
+            .ok()
+            .and_then(|s| s.display_message.clone())
+    }
+
+    /// Server-supplied diagnostic detail — multi-line operator /
+    /// stack context. Reflects the most recent SEA `StatementStatus`
+    /// this handle has seen.
+    ///
+    /// **PII / sensitive-data note:** like `display_message`, this is
+    /// server-supplied free-form text and may include SQL fragments
+    /// or values. Redact before centralised logging.
+    pub fn diagnostic_info(&self) -> Option<String> {
+        self.latest_status
+            .lock()
+            .ok()
+            .and_then(|s| s.diagnostic_info.clone())
+    }
+
+    /// Server-supplied JSON blob with extended error details.
+    /// Reflects the most recent SEA `StatementStatus` this handle has
+    /// seen.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` set on
+    /// the cluster (per `DatabricksSQLConf` — internal flag, default
+    /// false, not settable via session-conf). Outside of admin-
+    /// enabled workspaces the field is always None even on Failed
+    /// statements that otherwise populate `display_message` /
+    /// `diagnostic_info`.
+    ///
+    /// **Unbounded:** when populated, content is `{"errorClass": "...",
+    /// "messageTemplate": "..."}` server-side, but the kernel passes
+    /// the string through verbatim — wrappers parse if they need
+    /// structured access and bound size before logging.
+    pub fn error_details_json(&self) -> Option<String> {
+        self.latest_status
+            .lock()
+            .ok()
+            .and_then(|s| s.error_details_json.clone())
+    }
+
+    /// Internal helper — overwrite the cached `StatementStatus` with
+    /// a fresh poll's response. Called by `status()` /
+    /// `await_result()` after every successful
+    /// `statement_status` RPC. Lock poisoning is intentionally
+    /// swallowed: a poisoned lock here would only happen if a panic
+    /// landed mid-write, and the recovery path is to keep the prior
+    /// status visible (worse: a fresh poll's status lost; better:
+    /// the handle's accessor surface keeps working).
+    fn record_latest_status(&self, fresh: crate::types::sea::StatementStatus) {
+        if let Ok(mut guard) = self.latest_status.lock() {
+            *guard = fresh;
         }
     }
 
@@ -181,6 +293,10 @@ impl ExecutedAsyncStatement {
                 .transport()
                 .statement_status(&self.statement_id)
                 .await?;
+            // Cache the wire status so the extended-field accessors
+            // reflect what THIS handle has observed (instead of the
+            // stale initial-submit snapshot).
+            self.record_latest_status(response.status.clone());
             Ok(StatementStatus::from_sea_response(&response))
         }
         .instrument(span)
@@ -232,6 +348,10 @@ impl ExecutedAsyncStatement {
                     .transport()
                     .statement_status(&self.statement_id)
                     .await?;
+                // Cache the wire status so the extended-field
+                // accessors reflect THIS poll's observation — not the
+                // initial-submit snapshot that's now stale by minutes.
+                self.record_latest_status(response.status.clone());
                 match StatementStatus::from_sea_response(&response) {
                     StatementStatus::Succeeded | StatementStatus::Closed => {
                         cancel_guard.defuse();

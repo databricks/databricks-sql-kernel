@@ -84,6 +84,19 @@ pub struct StatementStatus {
     /// Pass-through string — wrappers parse if they need structured
     /// access.
     ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` set on
+    /// the underlying SQL cluster. The flag is declared in
+    /// `DatabricksSQLConf.scala` as `internal()` with
+    /// `createWithDefault(false)`, so it is NOT settable from a
+    /// client session-configuration request (verified empirically on
+    /// 2026-05-27: pecotesting returns `[CONFIG_NOT_AVAILABLE]
+    /// SQLSTATE: 42K0I` when the client attempts to SET it). When the
+    /// flag is off the field is `None` even on terminal-error
+    /// statements that otherwise populate `display_message` /
+    /// `diagnostic_info`. When populated, the content format is
+    /// `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
     /// **Unbounded:** the server can return a multi-MB blob. Wrappers
     /// surfacing this should bound size before logging.
     #[serde(default)]

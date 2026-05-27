@@ -173,8 +173,18 @@ impl ExecutedStatement {
     /// only. The corresponding details for Failed statements flow
     /// through the returned `Error`, not this accessor.
     ///
-    /// **Unbounded:** the server can return a multi-MB blob. Wrappers
-    /// surfacing this should bound size before logging.
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` set on
+    /// the underlying SQL cluster. The flag is `internal()` and
+    /// false-by-default in `DatabricksSQLConf.scala`, so it is NOT
+    /// settable from a client session-configuration request. Most
+    /// workspaces will return `None` here; admin-enabled workspaces
+    /// return content shaped like
+    /// `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
+    /// **Unbounded:** when populated, the server can return a
+    /// multi-MB blob. Wrappers surfacing this should bound size
+    /// before logging.
     pub fn error_details_json(&self) -> Option<&str> {
         self.status.error_details_json.as_deref()
     }

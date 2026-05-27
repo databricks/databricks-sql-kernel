@@ -222,8 +222,17 @@ impl Statement {
     /// Server-supplied JSON blob with extended error details. Mirrors
     /// Thrift's `TGetOperationStatusResp.errorDetailsJson`.
     /// Pass-through string — JS callers parse with `JSON.parse` if
-    /// they need structured access. **Unbounded:** server can return
-    /// a multi-MB blob; size before logging.
+    /// they need structured access.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` on the
+    /// underlying SQL cluster. The flag is internal-only / default-
+    /// false in the Databricks runtime, so for most JS callers this
+    /// will return `null`. Admin-enabled workspaces return content
+    /// shaped like `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
+    /// **Unbounded:** when populated, server can return a multi-MB
+    /// blob; size before logging.
     #[napi]
     pub async fn error_details_json(&self) -> napi::Result<Option<String>> {
         let inner = Arc::clone(&self.inner);

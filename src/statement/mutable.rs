@@ -230,6 +230,13 @@ impl Statement {
                 response.statement_id,
                 valid,
                 closed,
+                // Seed the executed handle with the SEA status the
+                // server returned on the initial `submit_statement`
+                // response. Subsequent `status()` / `await_result()`
+                // polls overwrite it, but accessors return useful
+                // values immediately even before the caller drives
+                // the first poll.
+                response.status,
             ))
         }
         .instrument(span)
