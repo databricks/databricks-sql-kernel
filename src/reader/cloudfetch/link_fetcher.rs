@@ -595,7 +595,6 @@ mod tests {
                     state: StatementState::Succeeded,
                     error: None,
                     num_modified_rows: None,
-                    progress: None,
                     display_message: None,
                     diagnostic_info: None,
                     error_details_json: None,

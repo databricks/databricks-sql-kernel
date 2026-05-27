@@ -171,21 +171,16 @@ impl Statement {
         .await
     }
 
-    /// Fractional completion as reported by the server, intended to be
-    /// in `[0.0, 1.0]`. `null` outside analytics warehouses. Not
-    /// clamped — JS callers rendering progress bars should validate.
-    /// The SEA wire field corresponds to Thrift's richer
-    /// `TProgressUpdateResp` task-completion ratio.
-    #[napi]
-    pub async fn progress(&self) -> napi::Result<Option<f64>> {
-        let inner = Arc::clone(&self.inner);
-        guarded(async move {
-            let guard = inner.lock().await;
-            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.progress())
-        })
-        .await
-    }
+    // TODO(pr23-followup): mirror a `progress()` accessor here once
+    // the kernel exposes one. Empirically, the SEA server does not
+    // populate progress today (verified 2026-05-27 against pecotesting:
+    // a 37s heavy TPC-H query polled 7 times with
+    // `getProgressUpdate=true` on the Thrift NodeJS path returned
+    // `progressUpdateResponse = null` on every poll). When the server
+    // grows progress support, expose it here under the same name JS
+    // callers expect from Thrift's `TGetOperationStatusResp.progressUpdateResponse`
+    // — likely as a struct mirroring `TProgressUpdateResp`, not a bare
+    // float.
 
     /// Server-supplied user-facing message. Mirrors Thrift's
     /// `TGetOperationStatusResp.displayMessage`. **PII / sensitive-

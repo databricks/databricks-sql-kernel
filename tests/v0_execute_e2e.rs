@@ -775,8 +775,6 @@ async fn live_select_status_accessors_default_to_none() {
         "num_modified_rows expected None for SELECT, got {:?}",
         exec.num_modified_rows()
     );
-    // progress is None on the SQL warehouse path (only analytics
-    // warehouses populate it).
     // display_message / diagnostic_info / error_details_json are None
     // on success — these flow only when the server has something to
     // surface.
@@ -784,11 +782,8 @@ async fn live_select_status_accessors_default_to_none() {
     let di = exec.diagnostic_info();
     let edj = exec.error_details_json();
     eprintln!(
-        "live SELECT status snapshot: progress={:?} display_message={:?} diagnostic_info={:?} error_details_json={:?}",
-        exec.progress(),
-        dm,
-        di,
-        edj
+        "live SELECT status snapshot: display_message={:?} diagnostic_info={:?} error_details_json={:?}",
+        dm, di, edj
     );
 
     exec.close().await.expect("close");

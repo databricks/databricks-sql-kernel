@@ -121,17 +121,18 @@ impl ExecutedStatement {
         self.status.num_modified_rows
     }
 
-    /// Fractional completion as reported by the server, intended to be
-    /// in `[0.0, 1.0]`. Populated on analytics warehouses; absent
-    /// elsewhere. On a terminal `ExecutedStatement` this is typically
-    /// `Some(1.0)` when populated at all.
-    ///
-    /// **Not clamped:** the value is passed through verbatim. Wrappers
-    /// rendering progress bars should clamp or treat NaN as absent
-    /// before display.
-    pub fn progress(&self) -> Option<f64> {
-        self.status.progress
-    }
+    // TODO(pr23-followup): add `progress()` once the SEA server emits
+    // a progress field. Verified empirically on 2026-05-27 that a 37s
+    // TPC-H query against a SQL warehouse returns no
+    // `progressUpdateResponse` even on the Thrift path that explicitly
+    // requests it (`getProgressUpdate=true`). The SDK Java
+    // `StatementStatus` model also has no progress field. Adding an
+    // accessor that always returns None would mislead callers; revisit
+    // when the SEA server grows progress support, ideally surfacing
+    // the same struct shape Thrift uses
+    // (`TProgressUpdateResp { headerNames, rows, footerSummary,
+    // progressedPercentage, status, startTime }`) rather than a bare
+    // `Option<f64>`.
 
     /// Server-supplied user-facing message. Distinct from the
     /// `error.message` that the kernel folds into `Error::sql_error()`

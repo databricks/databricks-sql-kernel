@@ -373,6 +373,32 @@ pub struct ProxyConfig {}
 /// };
 /// # let _ = (from_file, from_bytes);
 /// ```
+//
+// TODO(pr23-followup): the public Thrift NodeJS driver does NOT
+// expose programmatic TLS config — its `ConnectionOptions` has no
+// `ca` / `cert` / `key` field, and its `HttpConnection.createHttpsAgent`
+// builds the agent with `rejectUnauthorized: false` HARDCODED
+// (verified at `~/databricks-sql-nodejs/lib/connection/connections/HttpConnection.ts:67-77`,
+// 2026-05-27). The only "TLS knobs" Thrift NodeJS users have today
+// are the Node process-level env vars `NODE_EXTRA_CA_CERTS` and
+// `NODE_TLS_REJECT_UNAUTHORIZED`, and even those are inert against
+// the Thrift driver's hardcoded-permissive agent.
+//
+// The kernel surface here is intentionally STRICTER than Thrift's
+// (default = full validation, opt-in relaxations) and richer (custom
+// CA bundles, programmatic mTLS room). Motivated by:
+//   1. Python connector parity — `databricks-sql-connector` exposes
+//      `_tls_no_verify` / `_tls_verify_hostname` /
+//      `_tls_trusted_ca_file` / `_tls_client_cert_*`. The kernel must
+//      back those when pyo3 wires them up.
+//   2. Doing better than Thrift's hardcoded-insecure default on the
+//      SEA NodeJS path (napi binding).
+//
+// Revisit when (a) the napi binding wires these onto `ConnectionOptions`
+// for JS callers, and (b) we decide whether to honour Node's
+// `NODE_EXTRA_CA_CERTS` env var on the SEA path the way Node's own
+// https stack does — likely yes, for ergonomic parity with the rest
+// of the Node ecosystem.
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct TlsConfig {

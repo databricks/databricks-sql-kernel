@@ -69,7 +69,7 @@ pub(crate) struct SessionInfo {
 /// statement ID (for cancellation/cleanup), a reader over the result
 /// data, optionally the SEA manifest for metadata propagation, and
 /// the terminal `StatementStatus` so callers can surface
-/// `num_modified_rows` / `progress` / etc. without a second
+/// `num_modified_rows` / `display_message` / etc. without a second
 /// GetStatementStatus round-trip.
 pub(crate) struct ExecuteResult {
     pub statement_id: String,
@@ -88,8 +88,9 @@ pub(crate) struct ExecuteResult {
     /// instead and requires an explicit close.
     ///
     /// The full status is carried (not just the state) so the
-    /// `ExecutedStatement` can expose `num_modified_rows` / `progress`
-    /// / etc. without a second GetStatementStatus round-trip.
+    /// `ExecutedStatement` can expose `num_modified_rows` /
+    /// `display_message` / etc. without a second GetStatementStatus
+    /// round-trip.
     pub status: StatementStatus,
 }
 

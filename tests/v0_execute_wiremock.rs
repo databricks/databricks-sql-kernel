@@ -599,12 +599,10 @@ async fn kernel_invariant_parent_drop_invalidates_executed_cancel() {
 /// Build a SEA `SUCCEEDED` body with the 5 extended status fields
 /// populated. Mirrors `succeeded_inline_body` but injects status
 /// fields the kernel surfaces via `ExecutedStatement::*` getters.
-#[allow(clippy::too_many_arguments)]
 fn succeeded_inline_body_with_status(
     statement_id: &str,
     batch: &RecordBatch,
     num_modified_rows: Option<i64>,
-    progress: Option<f64>,
     display_message: Option<&str>,
     diagnostic_info: Option<&str>,
     error_details_json: Option<&str>,
@@ -638,9 +636,6 @@ fn succeeded_inline_body_with_status(
     let status_obj = status.as_object_mut().unwrap();
     if let Some(n) = num_modified_rows {
         status_obj.insert("num_modified_rows".to_string(), json!(n));
-    }
-    if let Some(p) = progress {
-        status_obj.insert("progress".to_string(), json!(p));
     }
     if let Some(m) = display_message {
         status_obj.insert("display_message".to_string(), json!(m));
@@ -691,7 +686,6 @@ async fn executed_statement_surfaces_extended_status_fields() {
             "stmt-status",
             &batch,
             Some(7),
-            Some(1.0),
             Some("All good"),
             Some("operator=Scan"),
             Some(r#"{"k":"v"}"#),
@@ -705,7 +699,6 @@ async fn executed_statement_surfaces_extended_status_fields() {
     let exec = stmt.execute().await.expect("execute");
 
     assert_eq!(exec.num_modified_rows(), Some(7));
-    assert_eq!(exec.progress(), Some(1.0));
     assert_eq!(exec.display_message(), Some("All good"));
     assert_eq!(exec.diagnostic_info(), Some("operator=Scan"));
     assert_eq!(exec.error_details_json(), Some(r#"{"k":"v"}"#));
@@ -731,7 +724,6 @@ async fn executed_statement_status_fields_default_to_none() {
     let exec = stmt.execute().await.expect("execute");
 
     assert_eq!(exec.num_modified_rows(), None);
-    assert_eq!(exec.progress(), None);
     assert_eq!(exec.display_message(), None);
     assert_eq!(exec.diagnostic_info(), None);
     assert_eq!(exec.error_details_json(), None);
@@ -761,7 +753,7 @@ async fn polling_path_carries_terminal_status_not_initial() {
     // kernel must NOT latch this onto the ExecutedStatement.
     mount_execute(&server, running_body("stmt-poll-status")).await;
 
-    // Polled GET returns SUCCEEDED with the 5 extended fields
+    // Polled GET returns SUCCEEDED with the extended fields
     // populated. This is the status the kernel must carry forward.
     let batch = int64_batch("n", vec![42]);
     mount_status(
@@ -771,7 +763,6 @@ async fn polling_path_carries_terminal_status_not_initial() {
             "stmt-poll-status",
             &batch,
             Some(11),
-            Some(1.0),
             Some("Done after retry"),
             Some("operator=Project; stage=Execute"),
             Some(r#"{"errorClass":"NONE"}"#),
@@ -787,10 +778,9 @@ async fn polling_path_carries_terminal_status_not_initial() {
         .await
         .expect("execute should poll to terminal SUCCEEDED");
 
-    // All 5 must reflect the TERMINAL poll, not the initial RUNNING
-    // response (which had no extended fields).
+    // All accessors must reflect the TERMINAL poll, not the initial
+    // RUNNING response (which had no extended fields).
     assert_eq!(exec.num_modified_rows(), Some(11));
-    assert_eq!(exec.progress(), Some(1.0));
     assert_eq!(exec.display_message(), Some("Done after retry"));
     assert_eq!(
         exec.diagnostic_info(),

@@ -26,7 +26,7 @@
 //! the parent `Statement` is re-executed, avoiding wasted network
 //! round-trips on zombie handles.
 //!
-//! ## Extended SEA status fields (`num_modified_rows`, `progress`,
+//! ## Extended SEA status fields (`num_modified_rows`,
 //! `display_message`, `diagnostic_info`, `error_details_json`)
 //!
 //! These accessors live on the **sync** [`crate::ExecutedStatement`]
@@ -34,7 +34,7 @@
 //! [`crate::statement::mutable::Statement::execute`] (which drives the
 //! polling loop internally and returns a sync handle) rather than
 //! `submit()`. The async surface is shaped for the
-//! poll-loop-without-metadata use case; mirroring the 5 accessors here
+//! poll-loop-without-metadata use case; mirroring the accessors here
 //! requires storing a status snapshot per-poll, which is tracked as a
 //! follow-up. Wrappers presenting a Thrift-shaped operation API to
 //! their host language (e.g. the napi binding's `Statement` class

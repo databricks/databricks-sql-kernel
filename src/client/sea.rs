@@ -296,7 +296,7 @@ impl SeaRestTransport {
                     tokio::time::sleep(self.config.poll_interval).await;
                     debug!(
                         statement_id = %r.statement_id,
-                        progress = ?r.status.progress,
+                        state = ?r.status.state,
                         "Polling statement status"
                     );
                     current_response = self.get_statement_status(&r.statement_id).await?;
@@ -415,7 +415,7 @@ impl SeaRestTransport {
         // The full `status` is carried forward so the executed handle
         // can skip a redundant CloseStatement when the server already
         // cleaned up (status.state=Closed) AND expose
-        // num_modified_rows / progress / etc. without a second
+        // num_modified_rows / display_message / etc. without a second
         // GetStatementStatus round-trip.
         Ok(ExecuteResult {
             statement_id: response.statement_id,
