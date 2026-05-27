@@ -27,6 +27,7 @@
 //! connector backend surfaces those as ``NotSupportedError``.
 
 use chrono::{NaiveDate, NaiveDateTime};
+use databricks_sql_kernel::statement::spec::geo_wire;
 use databricks_sql_kernel::{Error, Result, TypedValue};
 
 /// Parse a Databricks SQL type name + string-encoded value into a
@@ -105,6 +106,8 @@ pub(crate) fn parse_typed_value(sql_type: &str, value_str: Option<&str>) -> Resu
         // `null` literal, not as SQL NULL.
         "VARIANT" => Ok(TypedValue::Variant(s.to_owned())),
         _ if upper.starts_with("DECIMAL(") => parse_decimal(sql_type, s),
+        _ if is_geo_type_name(&upper, geo_wire::GEOGRAPHY) => parse_geography(&upper, s),
+        _ if is_geo_type_name(&upper, geo_wire::GEOMETRY) => parse_geometry(&upper, s),
         _ if is_compound_type_name(&upper) => Err(invalid(
             "compound parameter types (ARRAY/MAP/STRUCT) are not yet supported",
         )),
@@ -112,6 +115,20 @@ pub(crate) fn parse_typed_value(sql_type: &str, value_str: Option<&str>) -> Resu
             "unsupported parameter SQL type: {sql_type:?}"
         ))),
     }
+}
+
+/// True iff `upper` is the bare geo family name or the SRID-decorated
+/// form (e.g. `"GEOGRAPHY"`, `"GEOGRAPHY(4326)"`). The closing paren
+/// is required so we don't false-positive on hypothetical
+/// `"GEOGRAPHYX"`.
+fn is_geo_type_name(upper: &str, family: &str) -> bool {
+    if upper == family {
+        return true;
+    }
+    if let Some(rest) = upper.strip_prefix(family) {
+        return rest.starts_with('(') && rest.ends_with(')');
+    }
+    false
 }
 
 /// True iff `upper` is one of ARRAY/MAP/STRUCT exactly, or one of
@@ -273,6 +290,125 @@ fn parse_timestamp_ltz(s: &str) -> Result<TypedValue> {
         }
     }
     Err(invalid_msg(format!("invalid TIMESTAMP_LTZ literal {s:?}")))
+}
+
+/// Parse a `GEOGRAPHY` binding.
+///
+/// `upper` is the uppercased type-name as received from the
+/// connector — bare `"GEOGRAPHY"` or SRID-decorated
+/// `"GEOGRAPHY(4326)"`. `value` is the textual binding —
+/// either bare WKT (`"POINT(1 2)"`) or EWKT
+/// (`"SRID=4326;POINT(1 2)"`).
+///
+/// SRID precedence: if both the type-name and the value carry an
+/// SRID, they MUST agree. Disagreement is an `InvalidArgument`
+/// error — silently picking one would hide a connector bug.
+fn parse_geography(upper: &str, value: &str) -> Result<TypedValue> {
+    let (wkt, srid) = parse_ewkt_with_type_srid(upper, geo_wire::GEOGRAPHY, value)?;
+    Ok(TypedValue::Geography {
+        wkt,
+        srid,
+        wkb: None,
+    })
+}
+
+/// Parse a `GEOMETRY` binding. Same rules as `parse_geography`.
+fn parse_geometry(upper: &str, value: &str) -> Result<TypedValue> {
+    let (wkt, srid) = parse_ewkt_with_type_srid(upper, geo_wire::GEOMETRY, value)?;
+    Ok(TypedValue::Geometry {
+        wkt,
+        srid,
+        wkb: None,
+    })
+}
+
+/// Common geo-binding parser. Returns `(wkt, srid)` where `wkt` has
+/// no `SRID=N;` prefix.
+fn parse_ewkt_with_type_srid(
+    upper: &str,
+    family: &str,
+    value: &str,
+) -> Result<(String, Option<i32>)> {
+    let type_srid = extract_type_srid(upper, family)?;
+    let (value_srid, wkt) = split_ewkt(value)?;
+
+    // Reject empty WKT at the kernel boundary. The server would
+    // also reject this, but doing it locally gives a clearer
+    // error message that names the type-family and avoids a
+    // round-trip on what's almost certainly a connector bug.
+    // `"SRID=4326;"` (SRID prefix but no WKT body) is the most
+    // likely shape that lands here — `split_ewkt` happily strips
+    // the prefix and leaves an empty body.
+    if wkt.trim().is_empty() {
+        return Err(invalid_msg(format!(
+            "{family} binding has empty WKT body (value: {value:?})"
+        )));
+    }
+
+    let srid = match (type_srid, value_srid) {
+        (Some(t), Some(v)) if t != v => {
+            return Err(invalid_msg(format!(
+                "SRID mismatch: {family} type-name says {t} but value EWKT prefix says {v}"
+            )));
+        }
+        (Some(t), _) => Some(t),
+        (None, Some(v)) => Some(v),
+        (None, None) => None,
+    };
+
+    Ok((wkt.to_owned(), srid))
+}
+
+/// Pull the SRID out of a decorated type-name like
+/// `"GEOGRAPHY(4326)"`. Returns `Ok(None)` for the bare form.
+fn extract_type_srid(upper: &str, family: &str) -> Result<Option<i32>> {
+    let Some(rest) = upper.strip_prefix(family) else {
+        return Ok(None);
+    };
+    if rest.is_empty() {
+        return Ok(None);
+    }
+    // Must be `(N)` — `is_geo_type_name` already accepted the shape.
+    let inner = rest
+        .strip_prefix('(')
+        .and_then(|r| r.strip_suffix(')'))
+        .ok_or_else(|| invalid_msg(format!("malformed {family} type-name: {upper:?}")))?;
+    inner
+        .trim()
+        .parse::<i32>()
+        .map(Some)
+        .map_err(|e| invalid_msg(format!("invalid {family} SRID {inner:?}: {e}")))
+}
+
+/// Split an EWKT string into `(srid, wkt_body)`. If there's no
+/// `SRID=N;` prefix the SRID is `None` and the whole string is the
+/// WKT body. Whitespace inside the prefix is tolerated
+/// (`"SRID = 4326 ; POINT(...)"`).
+fn split_ewkt(value: &str) -> Result<(Option<i32>, &str)> {
+    let trimmed = value.trim_start();
+    // Case-insensitive ASCII match on the EWKT SRID prefix
+    // (`geo_wire::EWKT_SRID_PREFIX`, today literally `"SRID="`).
+    // Operating on bytes is safe here because the prefix is pure
+    // ASCII; a non-ASCII byte at index 0 fails the comparison
+    // without splitting a UTF-8 code point.
+    let prefix = geo_wire::EWKT_SRID_PREFIX.as_bytes();
+    let bytes = trimmed.as_bytes();
+    if bytes.len() < prefix.len() || !bytes[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        return Ok((None, value));
+    }
+    // Find the `;` that terminates the SRID prefix.
+    let after_eq = &trimmed[prefix.len()..];
+    let semi = after_eq.find(';').ok_or_else(|| {
+        invalid_msg(format!(
+            "malformed EWKT: missing ';' after SRID prefix: {value:?}"
+        ))
+    })?;
+    let srid_text = after_eq[..semi].trim();
+    let srid: i32 = srid_text
+        .parse()
+        .map_err(|e| invalid_msg(format!("invalid EWKT SRID {srid_text:?}: {e}")))?;
+    let wkt = after_eq[semi + 1..].trim_start();
+    Ok((Some(srid), wkt))
 }
 
 fn parse_decimal(sql_type: &str, value: &str) -> Result<TypedValue> {
@@ -591,6 +727,115 @@ mod tests {
         // pre-validate at the kernel boundary.
         let v = parse_typed_value("VARIANT", Some("not even close to json")).unwrap();
         assert!(matches!(v, TypedValue::Variant(_)));
+    }
+
+    #[test]
+    fn geography_decorated_type_with_ewkt_value() {
+        // The most common shape: connector tells us SRID via the
+        // type-name AND embeds it in the value EWKT prefix.
+        let v = parse_typed_value("GEOGRAPHY(4326)", Some("SRID=4326;POINT(1 2)")).unwrap();
+        match v {
+            TypedValue::Geography { wkt, srid, wkb } => {
+                assert_eq!(wkt, "POINT(1 2)");
+                assert_eq!(srid, Some(4326));
+                assert!(wkb.is_none(), "wkb stays None on the EWKT path");
+            }
+            other => panic!("expected Geography, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn geography_bare_type_with_ewkt_value() {
+        // Connector lacks the SRID decorator in the type-name, but
+        // the value EWKT carries one. SRID comes from the value.
+        let v = parse_typed_value("GEOGRAPHY", Some("SRID=4326;POINT(1 2)")).unwrap();
+        let TypedValue::Geography { wkt, srid, .. } = v else {
+            panic!("expected Geography");
+        };
+        assert_eq!(wkt, "POINT(1 2)");
+        assert_eq!(srid, Some(4326));
+    }
+
+    #[test]
+    fn geography_decorated_type_with_bare_wkt_value() {
+        // SRID only in the type-name. Value has no EWKT prefix.
+        let v = parse_typed_value("GEOGRAPHY(4326)", Some("POINT(1 2)")).unwrap();
+        let TypedValue::Geography { wkt, srid, .. } = v else {
+            panic!("expected Geography");
+        };
+        assert_eq!(wkt, "POINT(1 2)");
+        assert_eq!(srid, Some(4326));
+    }
+
+    #[test]
+    fn geography_bare_type_with_bare_wkt_value() {
+        // No SRID anywhere — legal per the SEA design (`srid: None`).
+        let v = parse_typed_value("GEOGRAPHY", Some("POINT(1 2)")).unwrap();
+        let TypedValue::Geography { wkt, srid, .. } = v else {
+            panic!("expected Geography");
+        };
+        assert_eq!(wkt, "POINT(1 2)");
+        assert!(srid.is_none());
+    }
+
+    #[test]
+    fn geography_rejects_srid_mismatch() {
+        // Connector bug: type-name and EWKT prefix disagree. Better
+        // to surface as InvalidArgument than to silently pick one.
+        let e = parse_typed_value("GEOGRAPHY(4326)", Some("SRID=3857;POINT(1 2)")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn geometry_round_trips_like_geography() {
+        // GEOMETRY uses the same parser; sanity-check the dispatch.
+        let v = parse_typed_value("GEOMETRY(0)", Some("LINESTRING(0 0,1 1)")).unwrap();
+        let TypedValue::Geometry { wkt, srid, wkb } = v else {
+            panic!("expected Geometry");
+        };
+        assert_eq!(wkt, "LINESTRING(0 0,1 1)");
+        assert_eq!(srid, Some(0));
+        assert!(wkb.is_none());
+    }
+
+    #[test]
+    fn geo_type_name_does_not_overreach() {
+        // `GEOGRAPHYX` / `GEOMETRYBUFFER` must NOT match — same
+        // discipline as the compound-type matcher.
+        let e = parse_typed_value("GEOGRAPHYX", Some("POINT(1 2)")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        let e = parse_typed_value("GEOMETRYBUFFER", Some("POINT(1 2)")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn geography_rejects_malformed_ewkt() {
+        // SRID= prefix with no terminating ';'.
+        let e = parse_typed_value("GEOGRAPHY", Some("SRID=4326 POINT(1 2)")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+        // Non-numeric SRID in the prefix.
+        let e = parse_typed_value("GEOGRAPHY", Some("SRID=abc;POINT(1 2)")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn geography_rejects_empty_wkt_body() {
+        // Various shapes that produce an empty WKT body after the
+        // EWKT split. Each should surface as `InvalidArgument` at
+        // the kernel boundary rather than round-tripping to the
+        // server.
+        for empty_shape in [
+            "",           // wholly empty
+            "   ",        // only whitespace
+            "SRID=4326;", // SRID prefix with no body
+            "SRID=4326;   ",
+        ] {
+            let e = parse_typed_value("GEOGRAPHY", Some(empty_shape)).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidArgument, "case {empty_shape:?}",);
+        }
+        // Same expectation for GEOMETRY.
+        let e = parse_typed_value("GEOMETRY", Some("")).unwrap_err();
+        assert_eq!(e.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
