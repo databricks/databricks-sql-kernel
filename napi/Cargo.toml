@@ -97,6 +97,13 @@ arrow-ipc = "57"
 # `src/error.rs` without bouncing through a hand-rolled escaper.
 serde_json = "1"
 
+# Date/time parsing for the params codec. Already a kernel transitive
+# dep (the kernel's `TypedValue::Date`/`Timestamp{,Ntz,Ltz}` variants
+# wrap `chrono` types directly); declared here so `params.rs` can name
+# `NaiveDate` / `NaiveDateTime` / `DateTime<Utc>` for literal parsing.
+# Version kept in lock-step with the kernel's `chrono` dep.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+
 [build-dependencies]
 napi-build = "2"
 

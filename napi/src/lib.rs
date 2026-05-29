@@ -43,6 +43,7 @@ pub(crate) mod connection;
 pub(crate) mod database;
 pub(crate) mod error;
 pub(crate) mod logger;
+pub(crate) mod params;
 pub(crate) mod result;
 pub(crate) mod runtime;
 pub(crate) mod statement;
