@@ -30,12 +30,62 @@
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{Error as KernelError, Session};
+use databricks_sql_kernel::{Error as KernelError, Session, TypedValue};
 
 use crate::error::napi_err_from_kernel;
+use crate::params::{parse_typed_value, TypedValueInput};
 use crate::runtime;
 use crate::statement::Statement;
 use crate::util::guarded;
+
+/// JS-visible options bag for `Connection.executeStatement`.
+///
+/// All fields are optional. The default-everything shape (no options
+/// argument on the JS side, or `{}`) is equivalent to the parameterless
+/// `executeStatement(sql)` form preserved from the napi-skeleton PR.
+///
+/// Today the only field is `positional_params`. Keeping the surface as
+/// a struct — rather than overloading per-call — lets future
+/// statement-level knobs (named params, conf overlay, result format)
+/// land non-breakingly. Mirrors `StatementSpec`'s plain-data shape
+/// kernel-side.
+#[allow(
+    dead_code,
+    reason = "exported via napi macro codegen; not called from Rust"
+)]
+#[napi(object)]
+pub struct ExecuteOptions {
+    /// Positional parameters, in 1-based wire order. Index `i` in this
+    /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
+    /// Each entry is a `{ sqlType, value }` pair — `value` is the
+    /// string-encoded literal or `null` for SQL NULL.
+    ///
+    /// Mirrors `StatementSpec::positional_params` (kernel-side) and
+    /// `pyo3::Statement::bind_param` (pyo3-side). The JS adapter is
+    /// expected to stringify values before crossing the FFI — see
+    /// `DBSQLParameter.toSparkParameter()` on the Node-driver side for
+    /// the canonical stringification rules.
+    pub positional_params: Option<Vec<TypedValueInput>>,
+}
+
+/// Translate the JS-side `ExecuteOptions.positional_params` into the
+/// kernel's `Vec<TypedValue>`. Each entry is parsed through
+/// [`parse_typed_value`] so the validation surface (bad literal, bad
+/// DECIMAL precision, unsupported type) is the same as the pyo3
+/// binding's.
+///
+/// Returns `Err` on the FIRST malformed entry — the JS caller sees the
+/// first failure's structured envelope, and the kernel never receives
+/// a partially-bound spec. Matches how pyo3 surfaces bind failures
+/// (eager, per-call).
+fn decode_positional_params(inputs: Vec<TypedValueInput>) -> Result<Vec<TypedValue>, napi::Error> {
+    inputs
+        .into_iter()
+        .map(|tv| {
+            parse_typed_value(&tv.sql_type, tv.value.as_deref()).map_err(napi_err_from_kernel)
+        })
+        .collect()
+}
 
 /// Closed-state error builder. Mirrors `statement::statement_closed_err`
 /// — route through the kernel envelope so the TS reviver mints a typed
@@ -88,10 +138,33 @@ impl Connection {
     /// Execute a SQL statement and return a Statement handle that
     /// streams batches via `fetchNextBatch()`.
     ///
-    /// No per-statement options: catalog / schema / sessionConf are
-    /// session-level (`openSession`).
+    /// `options` is optional. The `positional_params` field, when
+    /// present, is the typed-value codec input the kernel binds against
+    /// the `?` placeholders in `sql`. Catalog / schema / sessionConf
+    /// remain session-level (`openSession`) — the SEA wire protocol
+    /// carries them on `CreateSession`, not per-statement.
+    ///
+    /// Bind-time errors (bad DECIMAL precision, unsupported SQL type,
+    /// non-finite FLOAT/DOUBLE) surface as `KernelError(code=
+    /// 'InvalidArgument')` BEFORE the wire `ExecuteStatement` call —
+    /// matches the pyo3 binding's eager-bind contract and the JDBC /
+    /// ODBC drivers' "fail at setParameter" expectation.
     #[napi]
-    pub async fn execute_statement(&self, sql: String) -> napi::Result<Statement> {
+    pub async fn execute_statement(
+        &self,
+        sql: String,
+        options: Option<ExecuteOptions>,
+    ) -> napi::Result<Statement> {
+        // Decode params BEFORE acquiring the session lock — bind-time
+        // validation failures should not block other concurrent
+        // executors waiting on the mutex. The kernel `StatementSpec`
+        // is plain data and accepts a pre-built `Vec<TypedValue>` via
+        // the `positional_params` field, so we can do this work on the
+        // caller's tokio task.
+        let positional = match options.and_then(|o| o.positional_params) {
+            Some(inputs) => decode_positional_params(inputs)?,
+            None => Vec::new(),
+        };
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             let guard = inner.lock().await;
@@ -99,6 +172,13 @@ impl Connection {
 
             let mut stmt = session.statement();
             stmt.spec().sql(sql);
+            if !positional.is_empty() {
+                // Set the whole vec at once — `StatementSpec::positional_params`
+                // is a public field, so direct assignment is the
+                // intended kernel surface. Avoids the per-call `param(i,
+                // v)` resize loop that's there for sparse-bind cases.
+                stmt.spec().positional_params = positional;
+            }
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper.
@@ -217,5 +297,125 @@ mod tests {
             session_id: "session-survives-close".to_owned(),
         };
         assert_eq!(conn.session_id(), "session-survives-close");
+    }
+
+    // ─── decode_positional_params ──────────────────────────────────
+    //
+    // The decode happens BEFORE the session lock — these tests pin
+    // that contract at the helper level. End-to-end behavior is
+    // covered by the params.rs codec tests; here we focus on the
+    // happy-path Vec composition and the error-envelope shape.
+
+    #[test]
+    fn decode_positional_params_empty_vec_round_trips() {
+        let got = decode_positional_params(Vec::new()).expect("empty decode succeeds");
+        assert!(got.is_empty());
+    }
+
+    #[test]
+    fn decode_positional_params_10_type_matrix() {
+        // The C5 cluster's headline 10-type matrix, end-to-end through
+        // the decode helper rather than through `parse_typed_value`
+        // directly. Confirms the `TypedValueInput` → `TypedValue`
+        // mapping survives the Vec round trip.
+        let inputs = vec![
+            TypedValueInput {
+                sql_type: "INT".into(),
+                value: Some("42".into()),
+            },
+            TypedValueInput {
+                sql_type: "BIGINT".into(),
+                value: Some("9999999999".into()),
+            },
+            TypedValueInput {
+                sql_type: "FLOAT".into(),
+                value: Some("3.14".into()),
+            },
+            TypedValueInput {
+                sql_type: "DOUBLE".into(),
+                value: Some("2.718281828459045".into()),
+            },
+            TypedValueInput {
+                sql_type: "STRING".into(),
+                value: Some("hello world".into()),
+            },
+            TypedValueInput {
+                sql_type: "BOOLEAN".into(),
+                value: Some("true".into()),
+            },
+            TypedValueInput {
+                sql_type: "DATE".into(),
+                value: Some("2026-05-15".into()),
+            },
+            TypedValueInput {
+                sql_type: "TIMESTAMP".into(),
+                value: Some("2026-05-15 12:30:45".into()),
+            },
+            TypedValueInput {
+                sql_type: "DECIMAL(10,2)".into(),
+                value: Some("-123.45".into()),
+            },
+        ];
+        let decoded = decode_positional_params(inputs).expect("10-type decode succeeds");
+        assert_eq!(decoded.len(), 9);
+        // BINARY — pin the bind-time-rejection contract through the
+        // helper. The 10th type in the matrix produces an
+        // InvalidArgument envelope rather than aborting the whole vec
+        // silently.
+        let err = decode_positional_params(vec![TypedValueInput {
+            sql_type: "BINARY".into(),
+            value: Some("cafe".into()),
+        }])
+        .unwrap_err();
+        let reason = err.reason.as_str();
+        assert!(
+            reason.starts_with(crate::error::ERROR_SENTINEL),
+            "BINARY rejection must be enveloped, got: {reason}"
+        );
+        assert!(
+            reason.contains(r#""code":"InvalidArgument""#),
+            "BINARY rejection must carry InvalidArgument, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn decode_positional_params_short_circuits_on_first_bad_entry() {
+        // First bad entry stops decoding — the JS caller sees one
+        // structured envelope rather than a multi-error report. The
+        // good entry that follows must not contribute to the result.
+        let inputs = vec![
+            TypedValueInput {
+                sql_type: "INT".into(),
+                value: Some("42".into()),
+            },
+            TypedValueInput {
+                sql_type: "DECIMAL(10,2)".into(),
+                value: Some("not-a-number".into()),
+            },
+            TypedValueInput {
+                sql_type: "STRING".into(),
+                value: Some("should-not-decode".into()),
+            },
+        ];
+        let err = decode_positional_params(inputs).unwrap_err();
+        let reason = err.reason.as_str();
+        assert!(reason.starts_with(crate::error::ERROR_SENTINEL));
+        assert!(
+            reason.contains("DECIMAL"),
+            "first failure should be the DECIMAL one, got: {reason}"
+        );
+    }
+
+    #[test]
+    fn decode_positional_params_null_value_becomes_kernel_null() {
+        // `value: None` ⇒ `TypedValue::Null` regardless of `sql_type` —
+        // matches the connector's VoidParameter shape and pyo3.
+        let inputs = vec![TypedValueInput {
+            sql_type: "INT".into(),
+            value: None,
+        }];
+        let decoded = decode_positional_params(inputs).expect("null decode succeeds");
+        assert_eq!(decoded.len(), 1);
+        assert!(matches!(decoded[0], TypedValue::Null));
     }
 }
