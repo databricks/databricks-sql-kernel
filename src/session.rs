@@ -252,11 +252,55 @@ impl Session {
             warehouse_id = %warehouse_id,
             "creating session"
         );
+
+        // When CloudFetch is disabled at the kernel layer, advertise this
+        // capability to SEA via the `can_cloud_download` session conf.
+        // Per the SEA inline-Arrow design (go/inline-arrow-sea, DD1), this
+        // tells the server to fall back to the inline-Arrow path for all
+        // result sizes instead of attempting cloud-fetch and erroring at
+        // fetch time.
+        //
+        // Don't clobber an explicit non-empty user value — if the caller
+        // wired `can_cloud_download` directly via `session_conf` for any
+        // reason (e.g., to force inline-Arrow even with CloudFetch enabled
+        // at the kernel layer), their value wins.
+        //
+        // **Case-insensitive key match** because SEA session-conf keys
+        // are historically case-insensitive on the wire; without this, a
+        // stray `"Can_Cloud_Download"` from the user would coexist with
+        // the kernel's canonical-cased `"can_cloud_download"` and we'd
+        // ship both keys (potentially with different values) — server
+        // would pick one non-deterministically.
+        //
+        // **Empty-string user values are purged**: an empty value is
+        // ambiguous (server behaviour undefined) and the kernel prefers
+        // to inject its canonical `"false"` instead of shipping the
+        // ambiguous empty. Purge-then-insert guarantees the wire body
+        // carries at most one `can_cloud_download` key regardless of
+        // case-variants the caller supplied.
+        let mut session_conf = config.session_conf.clone();
+        if !config.result.cloudfetch_enabled {
+            let has_nonempty_user_value = session_conf
+                .iter()
+                .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
+            tracing::debug!(
+                cloudfetch_enabled = false,
+                user_value_present = has_nonempty_user_value,
+                "evaluating can_cloud_download injection",
+            );
+            if !has_nonempty_user_value {
+                // Drop every case-variant (including empty-value ones)
+                // before inserting the canonical key so we can't ship
+                // duplicates that differ only in case.
+                session_conf.retain(|k, _| !k.eq_ignore_ascii_case("can_cloud_download"));
+                session_conf.insert("can_cloud_download".to_string(), "false".to_string());
+            }
+        }
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                config.session_conf.clone(),
+                crate::config::filter_session_conf(session_conf),
             )
             .await?;
 

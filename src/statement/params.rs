@@ -22,7 +22,7 @@
 
 use crate::kernel_error::{Error, Result};
 use crate::metadata::type_mapping::{arrow_type_to_databricks, databricks_type_to_arrow};
-use crate::statement::spec::TypedValue;
+use crate::statement::spec::{geo_wire, TypedValue};
 use crate::types::sea::StatementParameter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
@@ -399,6 +399,44 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
         // input with its own error. The connector or caller is
         // expected to have produced valid JSON.
         TypedValue::Variant(s) => ok("VARIANT", Some(s.clone())),
+        // `GEOGRAPHY` and `GEOMETRY` — bind as EWKT today. The
+        // `param_type` carries the SRID decorator when present
+        // (e.g. `GEOGRAPHY(4326)`), matching the form the server
+        // emits in column metadata. The `value` is EWKT (`SRID=N;
+        // WKT`) when SRID is set; bare WKT when not.
+        //
+        // Binding via WKB is not yet wired — when SEA grows the
+        // binary geo input path, this arm gets a branch on
+        // `wkb.is_some()` to send the binary form instead. The
+        // variant's optional `wkb` field is already in place to
+        // make that change additive.
+        TypedValue::Geography { wkt, srid, .. } => ok(
+            geo_param_type(geo_wire::GEOGRAPHY, *srid),
+            Some(geo_param_value(wkt, *srid)),
+        ),
+        TypedValue::Geometry { wkt, srid, .. } => ok(
+            geo_param_type(geo_wire::GEOMETRY, *srid),
+            Some(geo_param_value(wkt, *srid)),
+        ),
+    }
+}
+
+/// Format the SEA `param_type` for a geospatial value. Appends an
+/// `(SRID)` decorator when the SRID is set, matching the form the
+/// server emits in column metadata (e.g. `GEOGRAPHY(4326)`).
+fn geo_param_type(family: &str, srid: Option<i32>) -> String {
+    match srid {
+        Some(s) => format!("{family}({s})"),
+        None => family.to_owned(),
+    }
+}
+
+/// Format the SEA `value` field for a geospatial binding. EWKT
+/// (`SRID=N;WKT`) when an SRID is present; bare WKT otherwise.
+fn geo_param_value(wkt: &str, srid: Option<i32>) -> String {
+    match srid {
+        Some(s) => format!("{}{};{}", geo_wire::EWKT_SRID_PREFIX, s, wkt),
+        None => wkt.to_owned(),
     }
 }
 
@@ -1003,5 +1041,65 @@ mod tests {
             assert_eq!(p.param_type, "VARIANT");
             assert_eq!(p.value.as_deref(), Some(raw));
         }
+    }
+
+    #[test]
+    fn typed_value_geography_with_srid_emits_ewkt_and_decorated_type() {
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Geography {
+                wkt: "POINT(1 2)".into(),
+                srid: Some(4326),
+                wkb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "GEOGRAPHY(4326)");
+        assert_eq!(p.value.as_deref(), Some("SRID=4326;POINT(1 2)"));
+    }
+
+    #[test]
+    fn typed_value_geography_without_srid_emits_bare_wkt() {
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Geography {
+                wkt: "POINT(1 2)".into(),
+                srid: None,
+                wkb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "GEOGRAPHY");
+        assert_eq!(p.value.as_deref(), Some("POINT(1 2)"));
+    }
+
+    #[test]
+    fn typed_value_geometry_with_srid_emits_ewkt() {
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Geometry {
+                wkt: "LINESTRING(0 0,1 1)".into(),
+                srid: Some(0),
+                wkb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "GEOMETRY(0)");
+        assert_eq!(p.value.as_deref(), Some("SRID=0;LINESTRING(0 0,1 1)"));
+    }
+
+    #[test]
+    fn typed_value_geometry_without_srid_emits_bare_wkt() {
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Geometry {
+                wkt: "LINESTRING(0 0,1 1)".into(),
+                srid: None,
+                wkb: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "GEOMETRY");
+        assert_eq!(p.value.as_deref(), Some("LINESTRING(0 0,1 1)"));
     }
 }

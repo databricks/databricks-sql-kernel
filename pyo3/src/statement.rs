@@ -78,7 +78,15 @@ impl Statement {
     /// ``"VARCHAR"`` / ``"CHAR"``, ``"DATE"``, ``"TIMESTAMP"``,
     /// ``"TIMESTAMP_NTZ"``, ``"TIMESTAMP_LTZ"``, ``"INTERVAL"``,
     /// ``"DECIMAL(p,s)"`` and ``"DECIMAL(p)"`` (scale defaults to
-    /// 0). See ``pyo3/src/params.rs`` for the authoritative mapping.
+    /// 0), ``"GEOGRAPHY"`` / ``"GEOGRAPHY(srid)"``, and
+    /// ``"GEOMETRY"`` / ``"GEOMETRY(srid)"``. See
+    /// ``pyo3/src/params.rs`` for the authoritative mapping.
+    ///
+    /// For ``GEOGRAPHY`` / ``GEOMETRY``, the ``value_str`` is either
+    /// EWKT (``"SRID=4326;POINT(1 2)"``) or bare WKT
+    /// (``"POINT(1 2)"``). If both the type-name and the value carry
+    /// an SRID, they must agree — mismatch raises
+    /// ``KernelError(code='InvalidArgument', ...)``.
     ///
     /// This shape — string value + type name — exists because the
     /// connector's ``TSparkParameter`` already string-serialises
