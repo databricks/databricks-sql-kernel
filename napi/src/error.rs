@@ -76,13 +76,20 @@ use serde_json::{json, Map, Value};
 pub(crate) const ERROR_SENTINEL: &str = "__databricks_error__:";
 
 /// Map a kernel [`Error`] into a `napi::Error`. Preserves the kernel
-/// `ErrorCode` (mapped to the closest napi `Status`), and stuffs eight
-/// of the ten structured kernel-`Error` fields (`code`, `message`,
-/// `sql_state`, `error_code`, `vendor_code`, `http_status`, `retryable`,
-/// `query_id`) into a JSON envelope on the reason so the TS layer can
-/// reconstruct the typed error class. `location` and `cause` are
-/// intentionally omitted from the v1 envelope — see the module-level
-/// doc for rationale.
+/// `ErrorCode` (mapped to the closest napi `Status`), and stuffs the
+/// structured kernel-`Error` fields into a JSON envelope on the reason
+/// so the TS layer can reconstruct the typed error class. `location`
+/// and `cause` are intentionally omitted from the v1 envelope — see
+/// the module-level doc for rationale.
+///
+/// **Wire-shape superset of pyo3 for Thrift parity:** the envelope
+/// also carries `displayMessage` / `diagnosticInfo` / `errorDetailsJson`
+/// — the three SEA extended-status fields that ride on the wire across
+/// terminal-error states. These mirror the same-named fields on the
+/// NodeJS Thrift driver's `TGetOperationStatusResp`, so JS callers
+/// migrating from Thrift to the SEA-backed binding see the same field
+/// set on a failed statement. The pyo3 binding does NOT (yet) attach
+/// these — pyo3's `attach_attrs` stays at the original 8 fields.
 ///
 /// The whole JSON-envelope-on-`reason` scheme is interim. The follow-up
 /// PR that lands the first `#[napi]` entry points (PR #25) is expected
@@ -135,6 +142,21 @@ pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
     }
     if let Some(qid) = e.query_id {
         obj.insert("queryId".to_owned(), Value::from(qid));
+    }
+    // Thrift-parity extended status fields: surfaced on the napi
+    // envelope so a JS caller's catch-block sees the same fields the
+    // Thrift driver's `TGetOperationStatusResp` exposes. Only
+    // populated on terminal-error states (`FAILED` / `CANCELED` /
+    // `CLOSED-no-data`) — the kernel's
+    // `terminal_outcome::carry_extended_status` is the upstream.
+    if let Some(dm) = e.display_message {
+        obj.insert("displayMessage".to_owned(), Value::from(dm));
+    }
+    if let Some(di) = e.diagnostic_info {
+        obj.insert("diagnosticInfo".to_owned(), Value::from(di));
+    }
+    if let Some(ej) = e.error_details_json {
+        obj.insert("errorDetailsJson".to_owned(), Value::from(ej));
     }
 
     // `to_string` on a JSON object is infallible: every field above is
@@ -291,21 +313,26 @@ mod tests {
         );
     }
 
-    /// Parity guard: the napi envelope must surface the same kernel
+    /// Parity guard: the napi envelope must carry the same kernel
     /// `Error` field set that pyo3's typed `KernelError` exposes via
     /// `setattr`. The two bindings diverge on *wire mechanism* (typed
     /// exception attrs vs JSON envelope) and on *naming convention*
-    /// (snake_case attrs in pyo3 vs camelCase JSON keys in napi) — but
-    /// the *field set* must stay aligned or downstream wrappers that
-    /// claim Python ↔ Node parity will silently drop information when
-    /// crossing the language boundary.
+    /// (snake_case attrs in pyo3 vs camelCase JSON keys in napi).
+    ///
+    /// **Thrift-parity superset.** The napi envelope is a strict
+    /// superset of pyo3's field set: it adds `displayMessage` /
+    /// `diagnosticInfo` / `errorDetailsJson` so JS consumers see the
+    /// same fields the NodeJS Thrift driver's `TGetOperationStatusResp`
+    /// exposes on terminal-error states. The pyo3 binding may grow
+    /// these later via a separate `attach_attrs` extension; the two
+    /// bindings stay in sync on the *pyo3-side 8 fields*, and napi
+    /// extends from there for its host-language's contract.
     ///
     /// pyo3 attaches via `attach_attrs(...)` in `pyo3/src/errors.rs:67`:
     /// `code, message, sql_state, error_code, vendor_code, http_status,
     /// retryable, query_id`. Both bindings intentionally omit `location`
     /// (kernel-internal `file:line` for `Internal` errors) and `cause`
-    /// (recursive — needs an explicit schema decision). This test pins
-    /// the envelope to that 8-field contract.
+    /// (recursive — needs an explicit schema decision).
     ///
     /// Reviewer-flagged at PR #27 / error.rs:76 — see comment text
     /// `pyo3 attaches kernel error fields as Python attributes…`.
@@ -321,6 +348,11 @@ mod tests {
         e.http_status = Some(503);
         e.retryable = true;
         e.query_id = Some("01eedeadbeefdeadbeefdeadbeefdead".to_string());
+        // Thrift-parity extension fields: populated too so the
+        // superset relation is exercised in the same fixture.
+        e.display_message = Some("Statement failed at operator Scan".to_string());
+        e.diagnostic_info = Some("operator=Scan; stage=Compile".to_string());
+        e.error_details_json = Some(r#"{"errorClass":"COMPILE_FAILURE"}"#.to_string());
         // Set the *intentionally-omitted* fields too — the test should
         // confirm they do NOT appear on the wire.
         e.location = Some("kernel/src/foo.rs:42".to_string());
@@ -335,10 +367,10 @@ mod tests {
             .as_object()
             .expect("envelope payload must be a JSON object");
 
-        // Mirrors pyo3's `attach_attrs` field list, in pyo3's snake_case
-        // → napi's camelCase. Update both lists together when the
-        // contract changes.
-        let expected_keys: &[&str] = &[
+        // pyo3's `attach_attrs` field list, in pyo3's snake_case →
+        // napi's camelCase. These 8 keys must stay in lockstep across
+        // bindings — any divergence on these is a parity regression.
+        let pyo3_parity_keys: &[&str] = &[
             "code",       // pyo3: "code"
             "message",    // pyo3: "message"
             "sqlState",   // pyo3: "sql_state"
@@ -348,11 +380,27 @@ mod tests {
             "retryable",  // pyo3: "retryable"
             "queryId",    // pyo3: "query_id"
         ];
-        for k in expected_keys {
+        for k in pyo3_parity_keys {
             assert!(
                 obj.contains_key(*k),
                 "envelope is missing the `{k}` key — pyo3 sets this via \
                  setattr, napi binding must keep parity. payload: {payload}"
+            );
+        }
+
+        // Thrift-parity superset: these 3 are napi-only today (pyo3
+        // may add them later via attach_attrs). They mirror the
+        // same-named optional fields on the NodeJS Thrift
+        // `TGetOperationStatusResp`.
+        let thrift_parity_keys: &[&str] = &[
+            "displayMessage",   // Thrift: displayMessage
+            "diagnosticInfo",   // Thrift: diagnosticInfo
+            "errorDetailsJson", // Thrift: errorDetailsJson
+        ];
+        for k in thrift_parity_keys {
+            assert!(
+                obj.contains_key(*k),
+                "envelope is missing the Thrift-parity key `{k}`. payload: {payload}"
             );
         }
 
@@ -369,16 +417,61 @@ mod tests {
             );
         }
 
-        // No surprise keys: the wire shape stays the documented set
-        // (exact-size check, not subset). A future field addition
-        // requires updating both pyo3's attach_attrs and this list.
+        // No surprise keys: the wire shape stays the documented set.
+        // Exact-size check (not subset) catches accidental additions.
+        let expected_total = pyo3_parity_keys.len() + thrift_parity_keys.len();
         assert_eq!(
             obj.len(),
-            expected_keys.len(),
-            "envelope has unexpected extra keys vs the pyo3 parity set. \
-             expected: {expected_keys:?}, got: {:?}",
+            expected_total,
+            "envelope has unexpected extra keys. expected pyo3 parity \
+             {pyo3_parity_keys:?} + thrift parity {thrift_parity_keys:?}, \
+             got: {:?}",
             obj.keys().collect::<Vec<_>>()
         );
+    }
+
+    /// Thrift parity: on a non-terminal-error code (where the kernel
+    /// doesn't populate the SEA extended fields) the three Thrift
+    /// extension keys are omitted from the envelope. Mirrors the
+    /// optional-field-omitted-when-None convention the existing
+    /// envelope already enforces for the pyo3-parity fields.
+    #[test]
+    fn envelope_omits_thrift_extension_fields_when_unpopulated() {
+        let e = KernelError::invalid_argument().message("bad arg");
+        let napi_err = napi_err_from_kernel(e);
+        let payload = &napi_err.reason.to_string()[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        let obj = v.as_object().unwrap();
+        for absent in &["displayMessage", "diagnosticInfo", "errorDetailsJson"] {
+            assert!(
+                !obj.contains_key(*absent),
+                "key `{absent}` should be omitted when kernel field is \
+                 None, got: {payload}"
+            );
+        }
+    }
+
+    /// Wire round-trip for the Thrift parity fields: when the kernel
+    /// `Error` carries the 3 extended-status strings, the envelope
+    /// surfaces them under their camelCase keys with verbatim content.
+    /// Pins the exact key names so the TS adapter's typed-error
+    /// reviver can rely on them.
+    #[test]
+    fn envelope_surfaces_thrift_extension_fields_verbatim() {
+        let dm = "Statement was canceled by user; runtime 42s";
+        let di = "operator=Scan->Filter->Project; stage=Execute; thread=0xfe";
+        let ej = r#"{"errorClass":"USER_CANCELLATION","detail":{"reason":"sigint"}}"#;
+        let e = KernelError::sql_error()
+            .message("canceled")
+            .with_display_message(dm)
+            .with_diagnostic_info(di)
+            .with_error_details_json(ej);
+        let napi_err = napi_err_from_kernel(e);
+        let payload = &napi_err.reason.to_string()[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["displayMessage"], dm);
+        assert_eq!(v["diagnosticInfo"], di);
+        assert_eq!(v["errorDetailsJson"], ej);
     }
 
     /// Optional fields are omitted from the wire shape when `None` (no
@@ -404,6 +497,11 @@ mod tests {
             "httpStatus",
             "retryable",
             "queryId",
+            // Thrift-parity extension fields also follow the
+            // omit-when-None convention.
+            "displayMessage",
+            "diagnosticInfo",
+            "errorDetailsJson",
         ] {
             assert!(
                 !obj.contains_key(*absent),

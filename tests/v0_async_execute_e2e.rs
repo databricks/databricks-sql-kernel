@@ -236,3 +236,49 @@ async fn re_submit_invalidates_prior_async_handle() {
     async_exec_y.close().await.expect("close Y");
     session.close().await.expect("session close");
 }
+
+// ─── PR #23: extended status accessors on the async handle ──────────
+//
+// These mirror the sync-handle live-warehouse tests in
+// `v0_execute_e2e.rs`. They run a real submit + await_result against
+// pecotesting (or whatever workspace `DATABRICKS_*` env vars point
+// at) and assert that the four extended-field accessors on
+// `ExecutedAsyncStatement` reflect the terminal poll's status.
+//
+// As with the sync e2e, the SEA SQL warehouse path does NOT populate
+// these fields on a simple SELECT today — the test asserts the
+// accessor wiring (no panic, accessor returns the wire-shape `None`)
+// rather than expecting non-None values from the server.
+
+#[tokio::test]
+#[ignore]
+async fn live_async_handle_exposes_extended_status_accessors() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let async_exec = stmt.submit().await.expect("submit SELECT 1");
+
+    // Drive to terminal so the cached status reflects the final
+    // wire response (not the initial `PENDING` / `RUNNING` from
+    // submit).
+    let _stream = async_exec
+        .await_result()
+        .await
+        .expect("await_result should reach SUCCEEDED on SELECT 1");
+
+    // The accessors must compile and resolve without panicking. The
+    // SEA wire emits None for these on SQL-warehouse SELECT today;
+    // log the snapshot so a future server-side expansion is visible
+    // in the test output without flipping the assertion.
+    eprintln!(
+        "live async_exec status snapshot: num_modified_rows={:?} display_message={:?} diagnostic_info={:?} error_details_json={:?}",
+        async_exec.num_modified_rows(),
+        async_exec.display_message(),
+        async_exec.diagnostic_info(),
+        async_exec.error_details_json(),
+    );
+    assert_eq!(async_exec.num_modified_rows(), None);
+
+    async_exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
