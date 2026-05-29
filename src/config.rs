@@ -36,12 +36,13 @@
 //! - [`LoggingConfig`] (filter, file)
 //! - [`TransportMode`]
 //!
-//! Configs whose shape we are still settling are reserved as empty
-//! `#[non_exhaustive]` structs so the public type names exist (and
-//! `SessionBuilder` setters compile) without committing to fields:
+//! [`TlsConfig`] now carries custom-CA + self-signed / hostname
+//! relaxation knobs; configs whose shape we are still settling stay
+//! as empty `#[non_exhaustive]` structs so the public type names
+//! exist (and `SessionBuilder` setters compile) without committing
+//! to fields:
 //!
 //! - [`ProxyConfig`]
-//! - [`TlsConfig`]
 //! - [`TelemetryConfig`]
 //!
 //! All structs are `#[non_exhaustive]` so v1+ can grow new fields
@@ -343,13 +344,113 @@ impl Default for HttpConfig {
 #[derive(Debug, Clone, Default)]
 pub struct ProxyConfig {}
 
-// ─── TLS (reserved) ─────────────────────────────────────────────────────────
+// ─── TLS ────────────────────────────────────────────────────────────────────
 
-/// Reserved for v0.1. Fields land once the TLS story (custom CA bundles,
-/// cert pinning, FIPS mode) is settled.
+/// TLS settings for the HTTP client.
+///
+/// All defaults match the most secure stance: validate the system trust
+/// store, require a valid certificate chain, and verify hostnames. Any
+/// non-default field is a *relaxation* — flip these for dev / on-prem
+/// boxes with self-signed certs, never against production.
+///
+/// The kernel exposes only fields that the internal rustls plumbing
+/// already supports — cert pinning and FIPS mode are *not* in scope.
+///
+/// ```no_run
+/// # use databricks_sql_kernel::TlsConfig;
+/// // From a file path:
+/// let from_file = TlsConfig {
+///     custom_ca_cert: Some(std::fs::read("/etc/ssl/corp-ca.pem").unwrap()),
+///     ..TlsConfig::default()
+/// };
+///
+/// // From an in-memory buffer (the napi-rs `Buffer` / pyo3 `bytes`
+/// // path — no tempfile shim needed):
+/// let pem_bytes: Vec<u8> = b"-----BEGIN CERTIFICATE-----\n...".to_vec();
+/// let from_bytes = TlsConfig {
+///     custom_ca_cert: Some(pem_bytes),
+///     ..TlsConfig::default()
+/// };
+/// # let _ = (from_file, from_bytes);
+/// ```
+//
+// TODO(pr23-followup): the public Thrift NodeJS driver does NOT
+// expose programmatic TLS config — its `ConnectionOptions` has no
+// `ca` / `cert` / `key` field, and its `HttpConnection.createHttpsAgent`
+// builds the agent with `rejectUnauthorized: false` HARDCODED
+// (verified at `~/databricks-sql-nodejs/lib/connection/connections/HttpConnection.ts:67-77`,
+// 2026-05-27). The only "TLS knobs" Thrift NodeJS users have today
+// are the Node process-level env vars `NODE_EXTRA_CA_CERTS` and
+// `NODE_TLS_REJECT_UNAUTHORIZED`, and even those are inert against
+// the Thrift driver's hardcoded-permissive agent.
+//
+// The kernel surface here is intentionally STRICTER than Thrift's
+// (default = full validation, opt-in relaxations) and richer (custom
+// CA bundles, programmatic mTLS room). Motivated by:
+//   1. Python connector parity — `databricks-sql-connector` exposes
+//      `_tls_no_verify` / `_tls_verify_hostname` /
+//      `_tls_trusted_ca_file` / `_tls_client_cert_*`. The kernel must
+//      back those when pyo3 wires them up.
+//   2. Doing better than Thrift's hardcoded-insecure default on the
+//      SEA NodeJS path (napi binding).
+//
+// Revisit when (a) the napi binding wires these onto `ConnectionOptions`
+// for JS callers, and (b) we decide whether to honour Node's
+// `NODE_EXTRA_CA_CERTS` env var on the SEA path the way Node's own
+// https stack does — likely yes, for ergonomic parity with the rest
+// of the Node ecosystem.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub struct TlsConfig {}
+#[derive(Clone, Default)]
+pub struct TlsConfig {
+    /// PEM-encoded CA certificate bytes to add to the trust store on
+    /// top of the system roots. Use this when connecting through a
+    /// corporate proxy that re-signs TLS or to an on-prem Databricks
+    /// deployment using an internal CA.
+    ///
+    /// Carrying bytes (rather than a path) keeps the surface friendly
+    /// for foreign-language wrappers — napi-rs / pyo3 callers pass a
+    /// `Buffer` / `bytes` directly without needing to materialise a
+    /// tempfile.
+    ///
+    /// **Multi-cert bundles (root + intermediate):** the kernel splits
+    /// the PEM into individual certificates and adds each as a root,
+    /// so a concatenated `cat root.pem intermediate.pem` blob works
+    /// transparently regardless of the active TLS backend.
+    pub custom_ca_cert: Option<Vec<u8>>,
+
+    /// Accept self-signed server certificates.
+    ///
+    /// Note: the underlying reqwest backend does not distinguish
+    /// "self-signed only" from "fully unvalidated" — setting this to
+    /// `true` disables ALL chain validation (CA trust, expiration,
+    /// etc.) via `danger_accept_invalid_certs(true)`. Use only in
+    /// development.
+    pub accept_self_signed: bool,
+
+    /// Skip the certificate-hostname-vs-SNI match check. Use only
+    /// when connecting via an IP literal or a hostname the cert
+    /// wasn't issued for in a development / lab environment.
+    pub skip_hostname_verification: bool,
+}
+
+impl std::fmt::Debug for TlsConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsConfig")
+            .field(
+                "custom_ca_cert",
+                &self
+                    .custom_ca_cert
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            .field("accept_self_signed", &self.accept_self_signed)
+            .field(
+                "skip_hostname_verification",
+                &self.skip_hostname_verification,
+            )
+            .finish()
+    }
+}
 
 // ─── Result management (CloudFetch + future result knobs) ───────────────────
 
@@ -786,5 +887,33 @@ mod tests {
         assert!(!s.contains("supersecret"), "subject_token leaked: {s}");
         assert!(s.contains("<redacted>"));
         assert!(s.contains("databricks"));
+    }
+
+    // ─── TlsConfig ─────────────────────────────────────────────────
+
+    #[test]
+    fn tls_config_default_is_strict() {
+        let tls = TlsConfig::default();
+        assert!(tls.custom_ca_cert.is_none());
+        assert!(!tls.accept_self_signed);
+        assert!(!tls.skip_hostname_verification);
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_ca_cert_bytes() {
+        // The PEM bytes themselves aren't secret, but a multi-kB blob
+        // in every log line is unhelpful — Debug should summarise.
+        let tls = TlsConfig {
+            custom_ca_cert: Some(b"-----BEGIN CERTIFICATE-----...".to_vec()),
+            accept_self_signed: false,
+            skip_hostname_verification: false,
+        };
+        let s = format!("{tls:?}");
+        assert!(s.contains("<"), "expected byte-count summary, got: {s}");
+        assert!(
+            s.contains("bytes>"),
+            "expected byte-count summary, got: {s}"
+        );
+        assert!(!s.contains("BEGIN CERTIFICATE"), "raw bytes leaked: {s}");
     }
 }

@@ -295,10 +295,22 @@ impl SeaRestTransport {
                     }
                 }
 
-                StatementOutcome::Err(error)
+                // Carry the extended status fields onto the Error so
+                // wrappers see what Thrift's `TGetOperationStatusResp`
+                // surfaces on terminal-error states.
+                StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                    error,
+                    &response.status,
+                ))
             }
             StatementState::Canceled => {
-                StatementOutcome::Err(Error::invalid_state().message("Statement was canceled"))
+                let error = Error::invalid_state()
+                    .message("Statement was canceled")
+                    .with_query_id(&response.statement_id);
+                StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                    error,
+                    &response.status,
+                ))
             }
             StatementState::Closed => {
                 // Closed with result data is valid for inline results
@@ -308,7 +320,13 @@ impl SeaRestTransport {
                 if response.result.is_some() {
                     StatementOutcome::Done(response)
                 } else {
-                    StatementOutcome::Err(Error::invalid_state().message("Statement was closed"))
+                    let error = Error::invalid_state()
+                        .message("Statement was closed")
+                        .with_query_id(&response.statement_id);
+                    StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                        error,
+                        &response.status,
+                    ))
                 }
             }
             StatementState::Pending | StatementState::Running => {
@@ -332,7 +350,11 @@ impl SeaRestTransport {
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
-                    debug!("Polling statement status: {}", r.statement_id);
+                    debug!(
+                        statement_id = %r.statement_id,
+                        state = ?r.status.state,
+                        "Polling statement status"
+                    );
                     current_response = self.get_statement_status(&r.statement_id).await?;
                 }
             }
@@ -363,6 +385,7 @@ impl SeaRestTransport {
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
             row_limit: params.row_limit,
+            result_compression: Some("LZ4_FRAME".to_string()),
             parameters: params.parameters.clone(),
         };
 
@@ -446,15 +469,16 @@ impl SeaRestTransport {
             .create_reader(&response.statement_id, &response)
             .await?;
 
-        // `server_state` carries the terminal state forward so the
-        // executed handle can skip a redundant CloseStatement when
-        // the server already cleaned up (state=Closed).
-        let server_state = response.status.state;
+        // The full `status` is carried forward so the executed handle
+        // can skip a redundant CloseStatement when the server already
+        // cleaned up (status.state=Closed) AND expose
+        // num_modified_rows / display_message / etc. without a second
+        // GetStatementStatus round-trip.
         Ok(ExecuteResult {
             statement_id: response.statement_id,
             reader,
             manifest: response.manifest,
-            server_state,
+            status: response.status,
         })
     }
 }
@@ -667,12 +691,11 @@ impl Transport for SeaRestTransport {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
                 let reader = reader_factory.create_reader(&r.statement_id, &r).await?;
-                let server_state = r.status.state;
                 Ok(Some(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
-                    server_state,
+                    status: r.status,
                 }))
             }
             StatementOutcome::NotReady(_) => Ok(None),

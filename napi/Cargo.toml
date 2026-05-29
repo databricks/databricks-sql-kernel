@@ -34,16 +34,16 @@
 members = ["."]
 
 [package]
-name = "databricks-sea-native"
+name = "databricks-sql-kernel-napi"
 version = "0.1.0"
 edition = "2021"
 authors = ["Databricks"]
 license = "Apache-2.0"
-description = "Databricks SQL Node.js SEA native binding (napi-rs)"
+description = "Databricks SQL Kernel — Node.js native binding (napi-rs)"
 publish = false
 
 [lib]
-# `rlib` alongside `cdylib` so `cargo test -p databricks-sea-native`
+# `rlib` alongside `cdylib` so `cargo test -p databricks-sql-kernel-napi`
 # can pick up `#[cfg(test)]` modules in src/**. With only `cdylib`,
 # cargo silently reports "running 0 tests / ok" even when `#[test]`
 # functions exist — a real footgun for any later Rust-side test.
