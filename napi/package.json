@@ -1,7 +1,7 @@
 {
-  "name": "@databricks/sea-native-linux-x64-gnu",
+  "name": "@databricks/sql-kernel-linux-x64-gnu",
   "version": "0.1.0",
-  "description": "Databricks SQL Node.js SEA native binding (linux-x64-gnu).",
+  "description": "Databricks SQL Kernel — Node.js native binding (linux-x64-gnu).",
   "main": "index.js",
   "types": "index.d.ts",
   "files": [
@@ -14,7 +14,7 @@
     "node": ">=18.0.0"
   },
   "napi": {
-    "binaryName": "sea-native",
+    "binaryName": "sql-kernel",
     "targets": [
       "x86_64-unknown-linux-gnu"
     ]

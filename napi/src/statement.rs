@@ -187,7 +187,7 @@ impl Statement {
                     return Err(napi_err_from_kernel(
                         KernelError::invalid_argument().message(format!(
                             "non-Arrow ResultBatch variant from kernel — \
-                             databricks-sea-native v{} cannot decode this batch \
+                             databricks-sql-kernel-napi v{} cannot decode this batch \
                              shape, upgrade the binding",
                             env!("CARGO_PKG_VERSION"),
                         )),
