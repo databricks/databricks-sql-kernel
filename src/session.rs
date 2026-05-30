@@ -43,9 +43,10 @@
 //! signature we may need to reshape. The methods will be added once
 //! the server contract stabilises.
 
-use crate::auth::{
-    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, PersonalAccessToken,
-};
+use crate::auth::AuthProvider;
+use crate::auth::PersonalAccessToken;
+#[cfg(feature = "oauth")]
+use crate::auth::{AuthorizationCodeProvider, ClientCredentialsProvider};
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
     build_retry_configs, RequestCategory, RetryConfig, RetryConfigOverrides,
@@ -653,6 +654,12 @@ fn result_to_post_process_options(
 
 /// Build the auth provider for a given [`AuthConfig`]. `host` is the
 /// workspace URL — used for OIDC discovery on M2M / U2M flows.
+//
+// `host` and `http_client` are only consumed by the OAuth match arms;
+// under `--no-default-features` they look unused, which would trip
+// clippy's `-D warnings`. Conditional `#[allow]` keeps the parameter
+// names readable when the feature is on.
+#[cfg_attr(not(feature = "oauth"), allow(unused_variables))]
 async fn build_auth_provider(
     auth: &AuthConfig,
     host: &str,
@@ -667,6 +674,7 @@ async fn build_auth_provider(
             }
             Ok(Arc::new(PersonalAccessToken::new(token.clone())))
         }
+        #[cfg(feature = "oauth")]
         AuthConfig::OAuthM2M {
             client_id,
             client_secret,
@@ -692,6 +700,7 @@ async fn build_auth_provider(
             .await?;
             Ok(Arc::new(provider))
         }
+        #[cfg(feature = "oauth")]
         AuthConfig::OAuthU2M {
             client_id,
             redirect_port,
@@ -717,6 +726,7 @@ async fn build_auth_provider(
             .await?;
             Ok(Arc::new(provider))
         }
+        #[cfg(feature = "oauth")]
         AuthConfig::OAuthFederation { .. } => Err(Error::invalid_argument()
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()

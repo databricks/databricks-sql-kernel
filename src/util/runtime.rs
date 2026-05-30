@@ -40,6 +40,12 @@
 /// issue #19), and any caller driving the kernel from a runtime
 /// context should also be on multi-thread for the same concurrent-IO
 /// reasons.
+///
+/// **`#[cfg(feature = "oauth")]`** — the only callsites are the
+/// OAuth providers' sync `AuthProvider::get_auth_header` impls
+/// (`auth/oauth/m2m.rs` + `auth/oauth/u2m.rs`). PAT auth is fully
+/// synchronous and doesn't need the runtime bridge.
+#[cfg(feature = "oauth")]
 pub(crate) fn block_on_in_runtime<F>(runtime_handle: &tokio::runtime::Handle, fut: F) -> F::Output
 where
     F: std::future::Future,

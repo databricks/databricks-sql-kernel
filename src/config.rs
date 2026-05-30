@@ -200,6 +200,7 @@ pub enum AuthConfig {
 
     /// OAuth 2.0 machine-to-machine (client credentials grant).
     /// Used for service-principal authentication.
+    #[cfg(feature = "oauth")]
     OAuthM2M {
         client_id: String,
         client_secret: String,
@@ -215,6 +216,7 @@ pub enum AuthConfig {
     /// `redirect_port`, opens the user's browser to the workspace's
     /// authorize endpoint, and exchanges the returned code for a
     /// token.
+    #[cfg(feature = "oauth")]
     OAuthU2M {
         /// OAuth client ID. `None` → `"databricks-cli"` (the public
         /// CLI client registered on every workspace).
@@ -243,6 +245,7 @@ pub enum AuthConfig {
     /// [`Session::open`](crate::Session::open) with this variant
     /// returns `ErrorCode::InvalidArgument` until the implementation
     /// lands.
+    #[cfg(feature = "oauth")]
     OAuthFederation {
         subject_token: String,
         subject_token_type: String,
@@ -277,6 +280,7 @@ impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Pat { .. } => f.write_str("Pat { token: <redacted> }"),
+            #[cfg(feature = "oauth")]
             Self::OAuthM2M {
                 client_id, scopes, ..
             } => f
@@ -285,6 +289,7 @@ impl std::fmt::Debug for AuthConfig {
                 .field("client_secret", &"<redacted>")
                 .field("scopes", scopes)
                 .finish(),
+            #[cfg(feature = "oauth")]
             Self::OAuthU2M {
                 client_id,
                 redirect_port,
@@ -296,6 +301,7 @@ impl std::fmt::Debug for AuthConfig {
                 .field("redirect_port", redirect_port)
                 .field("scopes", scopes)
                 .finish(),
+            #[cfg(feature = "oauth")]
             Self::OAuthFederation {
                 subject_token_type,
                 audience,
@@ -862,6 +868,7 @@ mod tests {
         assert!(s.contains("<redacted>"));
     }
 
+    #[cfg(feature = "oauth")]
     #[test]
     fn debug_oauth_m2m_redacts_secret() {
         let c = AuthConfig::OAuthM2M {
@@ -876,6 +883,7 @@ mod tests {
         assert!(s.contains("<redacted>"));
     }
 
+    #[cfg(feature = "oauth")]
     #[test]
     fn debug_oauth_federation_redacts_subject_token() {
         let c = AuthConfig::OAuthFederation {

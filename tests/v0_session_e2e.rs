@@ -68,6 +68,7 @@ async fn open_with_pat_against_live_warehouse() {
         .expect("explicit close() should succeed");
 }
 
+#[cfg(feature = "oauth")]
 #[tokio::test]
 #[ignore]
 async fn open_with_oauth_m2m_against_live_warehouse() {
@@ -98,6 +99,7 @@ async fn open_with_oauth_m2m_against_live_warehouse() {
     session.close().await.expect("close()");
 }
 
+#[cfg(feature = "oauth")]
 #[tokio::test]
 #[ignore]
 async fn open_with_oauth_u2m_against_live_warehouse() {

@@ -15,10 +15,12 @@
 //! Authentication mechanisms for the Databricks ADBC driver.
 
 pub mod config;
+#[cfg(feature = "oauth")]
 pub mod oauth;
 pub mod pat;
 
 pub use config::{AuthConfig, AuthType};
+#[cfg(feature = "oauth")]
 pub use oauth::{AuthorizationCodeProvider, ClientCredentialsProvider};
 pub use pat::PersonalAccessToken;
 

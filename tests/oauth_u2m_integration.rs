@@ -12,6 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+// Whole-file gate: every test here exercises `crate::auth::oauth`, which
+// is only compiled when the `oauth` feature is on. Under `--no-default-features`
+// the module is absent and these tests can't link.
+#![cfg(feature = "oauth")]
+
 //! Wiremock integration tests for OAuth U2M refresh token flow.
 //!
 //! These tests use the wiremock crate to simulate OIDC discovery and token endpoints,

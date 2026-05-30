@@ -84,10 +84,17 @@ thiserror = "2"
 # Strip defaults and re-enable just the `reqwest` integration here; the
 # kernel's own `tls-native` / `tls-rustls` feature controls the TLS
 # backend for reqwest, and oauth2 inherits whichever the consumer picks.
-oauth2 = { version = "5", default-features = false, features = ["reqwest"] }  # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
-sha2 = "0.10"        # SHA-256 for token cache key generation
-open = "5"           # Browser launch for interactive OAuth flows
-dirs = "5"           # Cross-platform config directory (~/.config/)
+# OAuth surface is gated behind the `oauth` Cargo feature (default on, so
+# existing consumers — pyo3, napi, kernel CI — see no behavior change). The
+# `databricks-sql-kernel` perf benchmark in `databricks-eng/universe` opts
+# out via `--no-default-features --features tls-native`, because it only
+# authenticates with PAT and shipping ~12k lines of unused `oauth2` / `open`
+# / `dirs` / `sha2` source through universe's Rust-crate vendoring is wasted
+# review surface.
+oauth2 = { version = "5", default-features = false, features = ["reqwest"], optional = true }  # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
+sha2 = { version = "0.10", optional = true }   # SHA-256 for token cache key generation
+open = { version = "5", optional = true }      # Browser launch for interactive OAuth flows
+dirs = { version = "5", optional = true }      # Cross-platform config directory (~/.config/)
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
@@ -127,9 +134,20 @@ tempfile = "3"
 # but that separation is no longer load-bearing for the TLS feature
 # guarantee — items 1 and 2 above are.
 [features]
-default = ["tls-native"]
+# Default keeps `oauth` enabled so existing consumers (pyo3, napi, kernel CI,
+# any direct-Rust caller using `AuthConfig::OAuthM2M` / `OAuthU2M`) build
+# identically to before this feature gate was added. The `oauth`-off build
+# is exercised by the universe-side perf benchmark and is also a useful
+# build-time sanity check for any future consumer that only uses PAT.
+default = ["tls-native", "oauth"]
 tls-native = ["reqwest/native-tls"]
 tls-rustls = ["reqwest/rustls-tls"]
+# Pulls in oauth2 + the helper crates used only by OAuth flows (token cache
+# hashing, config-dir resolution, browser launch). `auth/oauth/*` modules and
+# the `OAuthM2M` / `OAuthU2M` / `OAuthFederation` variants of `AuthConfig`
+# are `#[cfg(feature = "oauth")]`-gated; turning the feature off leaves
+# `AuthConfig::Pat` and a clean `build_auth_provider` with one match arm.
+oauth = ["dep:oauth2", "dep:sha2", "dep:open", "dep:dirs"]
 
 [lib]
 name = "databricks_sql_kernel"
