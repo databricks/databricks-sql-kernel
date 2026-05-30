@@ -488,10 +488,8 @@ impl SessionBuilder {
     /// ```no_run
     /// # use databricks_sql_kernel::{TlsConfig, Session};
     /// # fn build() -> Result<(), Box<dyn std::error::Error>> {
-    /// let tls = TlsConfig {
-    ///     custom_ca_cert: Some(std::fs::read("/etc/ssl/corp-ca.pem")?),
-    ///     ..TlsConfig::default()
-    /// };
+    /// let mut tls = TlsConfig::default();
+    /// tls.custom_ca_cert = Some(std::fs::read("/etc/ssl/corp-ca.pem")?);
     /// let _builder = Session::builder().tls(tls);
     /// # Ok(()) }
     /// ```
