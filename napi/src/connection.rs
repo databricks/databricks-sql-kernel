@@ -33,6 +33,7 @@ use tokio::sync::Mutex;
 
 use databricks_sql_kernel::{Error as KernelError, Session, TypedValue};
 
+use crate::async_statement::AsyncStatement;
 use crate::error::napi_err_from_kernel;
 use crate::params::{parse_typed_value, TypedValueInput};
 use crate::runtime;
@@ -356,6 +357,77 @@ impl Connection {
             // via the shared ValidityFlag — see `StatementInner` docs
             // in `statement.rs` for the rationale.
             Ok(Statement::from_executed(stmt, executed))
+        })
+        .await
+    }
+
+    /// Submit a SQL statement and return immediately with an
+    /// `AsyncStatement` handle, without blocking until the query
+    /// finishes. The kernel's `Statement::submit()` sends
+    /// `wait_timeout=0s`, so the server responds as soon as it has a
+    /// `statement_id` (state `Pending`/`Running`); JS drives polling
+    /// via `AsyncStatement.status()` and materialises results with
+    /// `AsyncStatement.awaitResult()`.
+    ///
+    /// This is the async-execution path the Thrift backend always
+    /// uses (`runAsync: true`): the SEA backend submits, returns a
+    /// pending operation handle, and polls to terminal during
+    /// fetch. Option semantics (statementConf / queryTags /
+    /// rowLimit / queryTimeoutSecs / positional + named params) are
+    /// identical to `executeStatement`; only the blocking-vs-pending
+    /// return contract differs.
+    #[napi]
+    pub async fn submit_statement(
+        &self,
+        sql: String,
+        mut options: Option<ExecuteOptions>,
+    ) -> napi::Result<AsyncStatement> {
+        let inner = Arc::clone(&self.inner);
+        // Same option decoding as `execute_statement` — malformed
+        // params surface as InvalidArgument before any wire round-trip.
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
+        let positional_params = options
+            .as_mut()
+            .and_then(|o| o.positional_params.take())
+            .map(decode_positional_params)
+            .transpose()?
+            .unwrap_or_default();
+        let named_params = options
+            .as_mut()
+            .and_then(|o| o.named_params.take())
+            .map(decode_named_params)
+            .transpose()?
+            .unwrap_or_default();
+        let merged_conf = build_merged_statement_conf(options)?;
+        guarded(async move {
+            let guard = inner.lock().await;
+            let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+
+            let mut stmt = session.statement();
+            stmt.spec().sql(sql);
+            if let Some(conf) = merged_conf {
+                stmt.spec().statement_conf(conf);
+            }
+            stmt.spec()
+                .row_limit(row_limit)
+                .query_timeout_secs(query_timeout_secs);
+            for (i, value) in positional_params.into_iter().enumerate() {
+                stmt.spec()
+                    .param(i + 1, value)
+                    .map_err(napi_err_from_kernel)?;
+            }
+            for (name, value) in named_params {
+                stmt.spec()
+                    .param_named(name, value)
+                    .map_err(napi_err_from_kernel)?;
+            }
+
+            let executed_async = stmt.submit().await.map_err(napi_err_from_kernel)?;
+            // Pass the parent kernel `Statement` into the JS wrapper so
+            // its `Drop` doesn't invalidate the executed-async handle
+            // via the shared ValidityFlag while JS still holds it.
+            Ok(AsyncStatement::from_executed_async(stmt, executed_async))
         })
         .await
     }
