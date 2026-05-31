@@ -323,32 +323,46 @@ impl Connection {
         // (`lib/utils/queryTags.ts`).
         let merged_conf = build_merged_statement_conf(options)?;
         guarded(async move {
-            let guard = inner.lock().await;
-            let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+            // Build the kernel `Statement` while holding the session lock,
+            // then RELEASE the lock before `execute().await`. `Session::statement()`
+            // returns an owned `Statement` (it clones the session's internal
+            // `Arc`), so the built statement is independent of the guard — we
+            // do not need to hold the mutex across the network round-trip.
+            // This unblocks concurrent `Promise.all([executeStatement(...)])`
+            // (they serialise only for the microsecond statement-build, not the
+            // wire call) and stops `close()` from blocking behind an in-flight
+            // execute. See jira-candidate 2026-05-24-napi-cancel-during-fetch
+            // (connection-side half).
+            let mut stmt = {
+                let guard = inner.lock().await;
+                let session = guard.as_ref().ok_or_else(connection_closed_err)?;
 
-            let mut stmt = session.statement();
-            stmt.spec().sql(sql);
-            if let Some(conf) = merged_conf {
-                stmt.spec().statement_conf(conf);
-            }
-            // `None` leaves the kernel's omit-the-field default in place,
-            // so threading unconditionally is safe and keeps the spec the
-            // single source of truth.
-            stmt.spec()
-                .row_limit(row_limit)
-                .query_timeout_secs(query_timeout_secs);
-            // Bind positional params 1-based on the wire.
-            for (i, value) in positional_params.into_iter().enumerate() {
+                let mut stmt = session.statement();
+                stmt.spec().sql(sql);
+                if let Some(conf) = merged_conf {
+                    stmt.spec().statement_conf(conf);
+                }
+                // `None` leaves the kernel's omit-the-field default in place,
+                // so threading unconditionally is safe and keeps the spec the
+                // single source of truth.
                 stmt.spec()
-                    .param(i + 1, value)
-                    .map_err(napi_err_from_kernel)?;
-            }
-            // Bind named params (`:name`).
-            for (name, value) in named_params {
-                stmt.spec()
-                    .param_named(name, value)
-                    .map_err(napi_err_from_kernel)?;
-            }
+                    .row_limit(row_limit)
+                    .query_timeout_secs(query_timeout_secs);
+                // Bind positional params 1-based on the wire.
+                for (i, value) in positional_params.into_iter().enumerate() {
+                    stmt.spec()
+                        .param(i + 1, value)
+                        .map_err(napi_err_from_kernel)?;
+                }
+                // Bind named params (`:name`).
+                for (name, value) in named_params {
+                    stmt.spec()
+                        .param_named(name, value)
+                        .map_err(napi_err_from_kernel)?;
+                }
+                stmt
+                // session lock released here
+            };
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper.

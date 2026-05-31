@@ -771,11 +771,26 @@ impl Transport for SeaRestTransport {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
             })?;
 
-        // Ignore errors on statement close (best effort cleanup)
-        let _ = self
+        // Surface the wire error so the caller's retry-on-failure path can
+        // run — `ExecutedStatement::close` / `ExecutedAsyncStatement::close`
+        // only flip their `closed` flag on success, so a swallowed error here
+        // would make their store-on-success semantics dead code (and a failed
+        // explicit close would look like it succeeded). The HTTP client has
+        // already applied the SEA retry policy, so callers see only the
+        // post-retry result; the `Drop` fire-and-forget fallback close still
+        // runs on the kernel side if the explicit close errored.
+        if let Err(e) = self
             .http_client
             .execute(request, RequestType::CloseStatement)
-            .await;
+            .await
+        {
+            tracing::warn!(
+                statement_id = %statement_id,
+                error = %e,
+                "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"
+            );
+            return Err(e);
+        }
 
         debug!("Closed statement: {}", statement_id);
 
