@@ -28,7 +28,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, Session};
+use databricks_sql_kernel::{
+    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ResultConfig, Session,
+};
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
 ///
@@ -146,6 +148,19 @@ pub struct ConnectionOptions {
     /// Napi-rs serialises `u32` as JS `number`; values up to
     /// `2^32 - 1` round-trip safely (any reasonable pool size fits).
     pub max_connections: Option<u32>,
+    /// Render `INTERVAL` / `DURATION` result columns as strings
+    /// (`ResultConfig.intervals_as_string`). The kernel default is
+    /// native Arrow `month_interval` / `duration[us]` types; the NodeJS
+    /// Thrift driver surfaces intervals as strings, so the SEA driver
+    /// sets this `true` for byte-compatible parity. Omitted ⇒ kernel
+    /// default (native Arrow interval types).
+    pub intervals_as_string: Option<bool>,
+    /// Render complex (`ARRAY` / `MAP` / `STRUCT` / `VARIANT`) result
+    /// columns as JSON strings (`ResultConfig.complex_types_as_json`)
+    /// instead of native Arrow nested types. Omitted ⇒ kernel default
+    /// (native Arrow nested types, which the NodeJS Arrow decoder
+    /// already renders identically to the Thrift path).
+    pub complex_types_as_json: Option<bool>,
 }
 
 /// Require a non-empty `Option<String>` field for a given auth mode,
@@ -238,6 +253,19 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         if let Some(conf) = options.session_conf {
             builder = builder.session_conf(conf);
         }
+        // Result-config knobs (interval / complex-type rendering). Merge
+        // into one `ResultConfig` so the two toggles don't clobber each
+        // other when both are set. Only wire it when at least one is
+        // requested, leaving the kernel default otherwise. `ResultConfig`
+        // is `#[non_exhaustive]` — construct via `default()` then mutate.
+        let intervals_as_string = options.intervals_as_string.unwrap_or(false);
+        let complex_types_as_json = options.complex_types_as_json.unwrap_or(false);
+        if intervals_as_string || complex_types_as_json {
+            let mut result = ResultConfig::default();
+            result.intervals_as_string = intervals_as_string;
+            result.complex_types_as_json = complex_types_as_json;
+            builder = builder.result(result);
+        }
         // `HttpConfig` is `#[non_exhaustive]` — must construct via
         // `default()` then mutate. The napi binding ALWAYS sets
         // `pool_max_idle_per_host` so the NodeJS-driver-appropriate
@@ -281,6 +309,8 @@ mod tests {
             schema: None,
             session_conf: None,
             max_connections: None,
+            intervals_as_string: None,
+            complex_types_as_json: None,
         }
     }
 
