@@ -66,6 +66,31 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tracing::{warn, Instrument};
 
+/// Resolve the SEA `(wait_timeout, on_wait_timeout)` pair for an execute /
+/// submit dispatch. Pure so the precedence rules are unit-testable without
+/// a live `Session`.
+///
+/// - `caller_wait_secs = Some(s)` — the caller pinned the wait shape
+///   (e.g. `submit` passes `"0s"` for async). Respected verbatim with
+///   `CONTINUE`; overriding it would make async submit block.
+/// - `caller_wait_secs = None` — the sync `execute` path. A per-statement
+///   `spec_query_timeout_secs` then bounds the server wait and `CANCEL`s
+///   the statement on elapse (JDBC `setQueryTimeout` / Python `use_sea`'s
+///   `wait_timeout` semantics). With no spec timeout, both are omitted so
+///   the server applies its default (~10s wait + auto-close on success).
+fn resolve_wait_timeout(
+    caller_wait_secs: Option<&str>,
+    spec_query_timeout_secs: Option<u32>,
+) -> (Option<String>, Option<String>) {
+    match caller_wait_secs {
+        Some(s) => (Some(s.to_string()), Some("CONTINUE".to_string())),
+        None => match spec_query_timeout_secs {
+            Some(secs) => (Some(format!("{secs}s")), Some("CANCEL".to_string())),
+            None => (None, None),
+        },
+    }
+}
+
 /// Lifecycle owner for a single statement spec.
 ///
 /// Mutable, reusable. Mutate the spec in place via [`Statement::spec`],
@@ -300,13 +325,12 @@ impl Statement {
         if self.spec.result_format != ResultFormat::Arrow {
             return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
         }
-        // `wait_timeout = None` means "omit the field"; the server
-        // applies its default (~10s wait + auto-close on success).
-        // `on_wait_timeout` only matters when wait_timeout is set,
-        // so mirror the presence.
+        let (wait_timeout, on_wait_timeout) =
+            resolve_wait_timeout(wait_timeout_secs, self.spec.query_timeout_secs);
         let mut exec_params = ExecuteParams {
-            wait_timeout: wait_timeout_secs.map(|s| s.to_string()),
-            on_wait_timeout: wait_timeout_secs.map(|_| "CONTINUE".to_string()),
+            wait_timeout,
+            on_wait_timeout,
+            row_limit: self.spec.row_limit,
             ..ExecuteParams::default()
         };
         for (i, value) in self.spec.positional_params.iter().enumerate() {
@@ -454,5 +478,37 @@ impl Drop for Statement {
         // caller dropped the handle before this `Statement`, the
         // handle's own `Drop` already spawned the close. There is no
         // remaining cleanup obligation here.
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_wait_timeout;
+
+    #[test]
+    fn async_submit_caller_value_is_respected_verbatim() {
+        // submit() pins "0s" for async; never overridden, even if a spec
+        // query_timeout is set (overriding would make submit block).
+        let (wait, on_wait) = resolve_wait_timeout(Some("0s"), Some(30));
+        assert_eq!(wait.as_deref(), Some("0s"));
+        assert_eq!(on_wait.as_deref(), Some("CONTINUE"));
+    }
+
+    #[test]
+    fn sync_with_query_timeout_cancels_on_elapse() {
+        // execute() passes None; a spec query_timeout bounds the wait and
+        // CANCELs the statement on elapse (server statement-timeout).
+        let (wait, on_wait) = resolve_wait_timeout(None, Some(30));
+        assert_eq!(wait.as_deref(), Some("30s"));
+        assert_eq!(on_wait.as_deref(), Some("CANCEL"));
+    }
+
+    #[test]
+    fn sync_without_query_timeout_omits_field() {
+        // No caller pin and no spec timeout: omit both so the server uses
+        // its default (~10s wait + auto-close on success).
+        let (wait, on_wait) = resolve_wait_timeout(None, None);
+        assert_eq!(wait, None);
+        assert_eq!(on_wait, None);
     }
 }

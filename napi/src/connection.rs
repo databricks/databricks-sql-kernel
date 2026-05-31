@@ -51,10 +51,11 @@ use crate::util::guarded;
 ///   produces (`lib/utils/queryTags.ts`). Backslashes in keys are
 ///   doubled; backslash/colon/comma in values are backslash-escaped.
 ///
-/// Positional parameters, named parameters, row limit, and wait
-/// timeout are deferred: they require either a non-trivial JS↔napi
-/// `TypedValue` mapping (params) or a kernel-side `StatementSpec`
-/// extension (`row_limit`/`wait_timeout`). Both land in follow-on PRs.
+/// `rowLimit` (SEA `row_limit`) and `queryTimeoutSecs` (the per-statement
+/// server wait timeout) are exposed here and threaded onto the kernel
+/// `StatementSpec`. Positional and named parameters remain deferred: they
+/// require a non-trivial JS↔napi `TypedValue` mapping and land in a
+/// follow-on PR.
 ///
 /// **Tag-order caveat (M4 parity note).** The napi `queryTags` field
 /// is a Rust `HashMap<String, String>` whose iteration order is
@@ -90,6 +91,17 @@ pub struct ExecuteOptions {
     /// HashMap-iteration-order vs `Object.keys`-iteration-order
     /// divergence and the byte-identical-Thrift-parity workaround.
     pub query_tags: Option<HashMap<String, String>>,
+    /// Server-side cap on the number of rows this statement returns
+    /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
+    /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
+    pub row_limit: Option<i64>,
+    /// Per-statement server wait timeout in whole seconds. Bounds how
+    /// long the server waits before cancelling the statement
+    /// (`on_wait_timeout = CANCEL`), surfacing as a timeout — the
+    /// server statement timeout (JDBC `setQueryTimeout`). Maps to
+    /// `StatementSpec.query_timeout_secs`. Distinct from the
+    /// connection-level transport timeout. The SEA wire caps it at 50s.
+    pub query_timeout_secs: Option<u32>,
 }
 
 /// Closed-state error builder. Mirrors `statement::statement_closed_err`
@@ -227,6 +239,10 @@ impl Connection {
         options: Option<ExecuteOptions>,
     ) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
+        // Pull the scalar knobs out before `build_merged_statement_conf`
+        // consumes `options` (both `i64`/`u32` are `Copy`).
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
         // Merge `query_tags` into `statement_conf` at the napi boundary
         // so the kernel sees a single conf map. Serialise the tag
         // map to the comma-separated `key:value` wire shape NodeJS
@@ -242,6 +258,12 @@ impl Connection {
             if let Some(conf) = merged_conf {
                 stmt.spec().statement_conf(conf);
             }
+            // `None` leaves the kernel's omit-the-field default in place,
+            // so threading unconditionally is safe and keeps the spec the
+            // single source of truth.
+            stmt.spec()
+                .row_limit(row_limit)
+                .query_timeout_secs(query_timeout_secs);
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper.
@@ -375,6 +397,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: Some(HashMap::new()),
             query_tags: Some(HashMap::new()),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap();
         assert!(result.is_none(), "empty maps → no statement_conf");
@@ -387,6 +411,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: Some(conf),
             query_tags: None,
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap()
         .unwrap();
@@ -400,6 +426,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: None,
             query_tags: Some(tags),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap()
         .unwrap();
@@ -417,6 +445,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: None,
             query_tags: Some(tags),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap()
         .unwrap();
@@ -433,6 +463,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: None,
             query_tags: Some(tags),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap()
         .unwrap();
@@ -451,6 +483,8 @@ mod tests {
         let err = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: Some(conf),
             query_tags: Some(tags),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .expect_err("must reject when both are set");
         assert!(
@@ -472,6 +506,8 @@ mod tests {
         let result = build_merged_statement_conf(Some(ExecuteOptions {
             statement_conf: Some(conf),
             query_tags: Some(HashMap::new()),
+            row_limit: None,
+            query_timeout_secs: None,
         }))
         .unwrap()
         .unwrap();
