@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
-    Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch,
+    Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch, ResultStream,
     Statement as KernelStatement,
 };
 
@@ -70,6 +70,30 @@ struct StatementInner {
     executed: ExecutedStatement,
 }
 
+/// Discriminated inner state for `Statement`.
+enum AnyInner {
+    /// Produced by `Connection::execute_statement`. Boxed to keep the
+    /// enum size close to the `Metadata` variant (StatementInner is
+    /// large; ResultStream is much smaller).
+    Executed(Box<StatementInner>),
+    /// Produced by metadata methods — wraps a bare `ResultStream`.
+    Metadata(ResultStream),
+}
+
+impl AnyInner {
+    /// Borrow the underlying result stream regardless of variant. The
+    /// executed-statement variant delegates to its
+    /// `ExecutedStatement::result_stream_mut`; the metadata variant
+    /// returns the bare `ResultStream` directly. Used by
+    /// `fetch_next_batch` to share one streaming path across both.
+    fn result_stream_mut(&mut self) -> &mut ResultStream {
+        match self {
+            AnyInner::Executed(s) => s.executed.result_stream_mut(),
+            AnyInner::Metadata(rs) => rs,
+        }
+    }
+}
+
 /// Opaque executed-statement handle.
 ///
 /// **Current concurrency shape** — every method takes `inner.lock()`
@@ -88,21 +112,31 @@ struct StatementInner {
 /// disposed statement can still read them.
 #[napi]
 pub struct Statement {
-    /// Wraps the kernel `Statement` + `ExecutedStatement` pair so the
-    /// parent's `Drop` doesn't fire (and invalidate the executed
-    /// handle via the shared `ValidityFlag`) while JS still holds
-    /// this wrapper. See `StatementInner` docs above.
-    inner: Arc<Mutex<Option<StatementInner>>>,
+    /// Discriminated inner state: the `Executed` variant wraps the
+    /// kernel `Statement` + `ExecutedStatement` pair (the parent kept
+    /// alive to prevent its `Drop` from invalidating the executed
+    /// handle via the shared `ValidityFlag`); the `Metadata` variant
+    /// wraps a bare `ResultStream` produced by `Metadata::list_*` /
+    /// `primary_keys` / `foreign_keys` / `type_info` / `table_types`.
+    inner: Arc<Mutex<Option<AnyInner>>>,
     /// Schema captured at construction. Available even after `close()`.
+    /// For the `Executed` variant this is the executed handle's
+    /// schema; for the `Metadata` variant it's the result-stream's
+    /// schema. Either way, cached so JS callers can build error
+    /// reports against a disposed statement.
     schema: SchemaRef,
-    /// Server-issued id. Available even after `close()` for log
-    /// correlation.
+    /// Server-issued statement id. Populated for the `Executed`
+    /// variant; empty string for the `Metadata` variant (the kernel
+    /// does not emit a statement id for SHOW/information_schema
+    /// queries driven through `Metadata`).
     statement_id: String,
     /// Set to `true` when `fetchNextBatch` observes the natural end of
     /// the stream (`None`). `cancel()` short-circuits to `Ok(())` when
     /// this is set, matching the JDBC `Statement.cancel()` no-op-after-
     /// completion contract — without it, a defensive cancel after the
     /// stream is drained surfaces an opaque server-side error.
+    /// (Irrelevant for the `Metadata` variant where cancel is already
+    /// a no-op kernel-side; harmless to carry the field regardless.)
     finished: Arc<AtomicBool>,
 }
 
@@ -119,12 +153,34 @@ impl Statement {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
         Self {
-            inner: Arc::new(Mutex::new(Some(StatementInner {
-                _parent: parent,
-                executed,
-            }))),
+            inner: Arc::new(Mutex::new(Some(AnyInner::Executed(Box::new(
+                StatementInner {
+                    _parent: parent,
+                    executed,
+                },
+            ))))),
             schema,
             statement_id,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Crate-internal constructor for metadata calls. Wraps a bare
+    /// `ResultStream` returned by `Metadata::list_*` / `primary_keys` /
+    /// `foreign_keys` / `type_info` / `table_types`. Cancel is a no-op
+    /// for metadata streams (the kernel has no in-flight cancellation
+    /// surface for them); close just drops the stream.
+    ///
+    /// `schema` is captured from the stream so the `schema()` getter
+    /// works after close. `statement_id` is empty (kernel does not
+    /// emit one for metadata queries). `finished` defaults false and
+    /// is unread on this path (cancel is already a no-op).
+    pub(crate) fn from_result_stream(stream: ResultStream) -> Self {
+        let schema = stream.schema();
+        Self {
+            inner: Arc::new(Mutex::new(Some(AnyInner::Metadata(stream)))),
+            schema,
+            statement_id: String::new(),
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -157,9 +213,14 @@ impl Statement {
         guarded(async move {
             let mut guard = inner.lock().await;
             let inner_state = guard.as_mut().ok_or_else(statement_closed_err)?;
-            let executed = &mut inner_state.executed;
-
-            let stream = executed.result_stream_mut();
+            // `result_stream_mut` returns `&mut ResultStream` for both
+            // variants — the executed-path borrows from its
+            // `ExecutedStatement`, the metadata-path borrows from its
+            // bare `ResultStream`. The IPC schema header serialised
+            // into every batch payload comes from the cached
+            // `self.schema` captured outside the lock (see method
+            // start), so no need to re-fetch from the stream.
+            let stream = inner_state.result_stream_mut();
             let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
             let Some(batch) = maybe_batch else {
                 // End of stream — record so a defensive cancel after
@@ -225,11 +286,15 @@ impl Statement {
 
     /// Server-side cancel.
     ///
-    /// Short-circuits to `Ok(())` if `fetchNextBatch` has already
-    /// returned `null` (stream naturally exhausted) — matches the
-    /// JDBC `Statement.cancel()` no-op-after-completion contract, so
-    /// JS callers can fire cancel defensively without distinguishing
-    /// "real cancel" from "raced with natural completion."
+    /// For executed statements: short-circuits to `Ok(())` if
+    /// `fetchNextBatch` has already returned `null` (stream
+    /// naturally exhausted) — matches the JDBC `Statement.cancel()`
+    /// no-op-after-completion contract, so JS callers can fire cancel
+    /// defensively without distinguishing "real cancel" from "raced
+    /// with natural completion."
+    ///
+    /// For metadata streams: no-op (the kernel has no in-flight
+    /// cancellation surface for metadata calls today).
     ///
     /// Returns `KernelError(InvalidStatementHandle)` if the statement
     /// has been explicitly `close()`d.
@@ -243,17 +308,19 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            inner_state
-                .executed
-                .cancel()
-                .await
-                .map_err(napi_err_from_kernel)
+            match inner_state {
+                AnyInner::Executed(s) => s.executed.cancel().await.map_err(napi_err_from_kernel),
+                // Metadata streams have no server-side cancel handle.
+                AnyInner::Metadata(_) => Ok(()),
+            }
         })
         .await
     }
 
-    /// Explicit close. Awaits the server-side `CloseStatement` so the
-    /// JS caller can observe failures (auth revoked mid-session,
+    /// Explicit close.
+    ///
+    /// For executed statements: awaits the server-side `CloseStatement`
+    /// so the JS caller can observe failures (auth revoked mid-session,
     /// network error, server-side error). Idempotent — a second call
     /// on an already-closed statement returns `Ok`.
     ///
@@ -269,26 +336,27 @@ impl Statement {
     /// runtime. The JS caller can log the error but cannot drive a
     /// further retry. If you need retry-on-failure semantics for
     /// `CloseStatement`, layer them above this method.
+    ///
+    /// For metadata streams: drops the stream (no server round-trip
+    /// needed — metadata results have no in-flight server-side
+    /// resource to release).
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             // Take the inner state out so `Drop` knows there's nothing
-            // left to clean up. The parent kernel `Statement`'s Drop
-            // runs here too — but only AFTER the executed handle's
-            // close has finished, so we still observe a clean
-            // server-side close result before the validity flag flips.
+            // left to clean up.
             let inner_state = {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            if let Some(inner_state) = inner_state {
-                inner_state
-                    .executed
-                    .close()
-                    .await
-                    .map_err(napi_err_from_kernel)?;
-                // _parent drops here, after close has resolved.
+            match inner_state {
+                Some(AnyInner::Executed(s)) => {
+                    s.executed.close().await.map_err(napi_err_from_kernel)?;
+                    // _parent drops here, after close has resolved.
+                }
+                // Metadata stream: just drop it.
+                Some(AnyInner::Metadata(_)) | None => {}
             }
             Ok(())
         })
