@@ -28,7 +28,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{AuthConfig, DefaultOpts, HttpConfig, Session};
+use databricks_sql_kernel::{AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, Session};
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
 ///
@@ -49,8 +49,35 @@ use crate::error::napi_err_from_kernel;
 use crate::runtime;
 use crate::util::guarded;
 
-/// JS-visible options for opening a Databricks SQL session over PAT.
-/// `token` is required.
+/// Authentication mode selector crossing the napi boundary. The string
+/// literals are what napi-rs emits from this `#[napi(string_enum)]` — the
+/// NodeJS SEA adapter (`SeaAuth`) matches them verbatim (`'Pat'`,
+/// `'OAuthM2m'`, `'OAuthU2m'`).
+///
+/// Mirrors the kernel [`AuthConfig`] variants this binding supports.
+/// `OAuthFederation` / `External` are intentionally not exposed yet — the
+/// kernel marks federation as not-yet-implemented and `External` is a
+/// Rust-trait escape hatch with no JS-callback bridge.
+#[napi(string_enum)]
+#[derive(Default)]
+pub enum AuthMode {
+    /// Personal access token (`token`).
+    #[default]
+    Pat,
+    /// OAuth 2.0 machine-to-machine — `oauthClientId` + `oauthClientSecret`.
+    OAuthM2m,
+    /// OAuth 2.0 user-to-machine (browser flow) — optional `oauthClientId`
+    /// + `oauthRedirectPort`.
+    OAuthU2m,
+}
+
+/// JS-visible options for opening a Databricks SQL session.
+///
+/// Authentication is selected by `authMode` (default [`AuthMode::Pat`]):
+/// - `Pat` — `token` required.
+/// - `OAuthM2m` — `oauthClientId` + `oauthClientSecret` required.
+/// - `OAuthU2m` — `oauthClientId` / `oauthRedirectPort` optional (kernel
+///   defaults to the `databricks-cli` client on port 8020).
 ///
 /// Catalog / schema / sessionConf are applied once at session creation
 /// and remain in effect for every statement run on the resulting
@@ -69,9 +96,23 @@ pub struct ConnectionOptions {
     /// JDBC-style HTTP path, e.g. `/sql/1.0/warehouses/abc123`. The
     /// kernel parses out the warehouse id.
     pub http_path: String,
-    /// Personal access token. Must be non-empty (the kernel rejects
-    /// empty PATs at session construction).
-    pub token: String,
+    /// Authentication mode. Omitted ⇒ [`AuthMode::Pat`] (back-compat:
+    /// existing PAT callers pass only `token`).
+    pub auth_mode: Option<AuthMode>,
+    /// Personal access token. Required (and non-empty) for
+    /// [`AuthMode::Pat`]; ignored otherwise.
+    pub token: Option<String>,
+    /// OAuth client id. Required for [`AuthMode::OAuthM2m`]; optional for
+    /// [`AuthMode::OAuthU2m`] (kernel defaults to `databricks-cli`).
+    pub oauth_client_id: Option<String>,
+    /// OAuth client secret. Required for [`AuthMode::OAuthM2m`].
+    pub oauth_client_secret: Option<String>,
+    /// Localhost callback port for the [`AuthMode::OAuthU2m`] browser
+    /// flow. Omitted ⇒ kernel default (8020).
+    pub oauth_redirect_port: Option<u16>,
+    /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
+    /// (`["all-apis"]` for M2M; `["all-apis", "offline_access"]` for U2M).
+    pub oauth_scopes: Option<Vec<String>>,
     /// Default catalog for statements executed on this session.
     /// Routed through the kernel's `DefaultOpts` and onto the SEA
     /// `CreateSession.catalog` wire field.
@@ -107,8 +148,53 @@ pub struct ConnectionOptions {
     pub max_connections: Option<u32>,
 }
 
-/// Open a Databricks SQL session over PAT auth and return an opaque
-/// `Connection` wrapping the kernel `Session`.
+/// Require a non-empty `Option<String>` field for a given auth mode,
+/// returning a typed `InvalidArgument` naming the JS field otherwise.
+fn require_field(value: &Option<String>, js_name: &str, mode: &str) -> napi::Result<String> {
+    value.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
+        napi_err_from_kernel(
+            KernelError::invalid_argument()
+                .message(format!("authMode {mode} requires a non-empty `{js_name}`")),
+        )
+    })
+}
+
+/// Map the JS `ConnectionOptions` auth fields onto the kernel
+/// [`AuthConfig`]. Per-mode required-field validation lives here at the
+/// binding boundary so the kernel always receives a fully-formed variant.
+/// Pure (borrows `options`) so it is unit-testable without opening a
+/// session.
+fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
+    match options.auth_mode.unwrap_or_default() {
+        AuthMode::Pat => Ok(AuthConfig::Pat {
+            token: require_field(&options.token, "token", "Pat")?,
+        }),
+        AuthMode::OAuthM2m => Ok(AuthConfig::OAuthM2M {
+            client_id: require_field(&options.oauth_client_id, "oauthClientId", "OAuthM2m")?,
+            client_secret: require_field(
+                &options.oauth_client_secret,
+                "oauthClientSecret",
+                "OAuthM2m",
+            )?,
+            scopes: options.oauth_scopes.clone(),
+            token_url_override: None,
+        }),
+        AuthMode::OAuthU2m => Ok(AuthConfig::OAuthU2M {
+            // All U2M fields are optional — the kernel fills `databricks-cli`
+            // / port 8020 / default scopes when omitted.
+            client_id: options.oauth_client_id.clone(),
+            redirect_port: options.oauth_redirect_port,
+            scopes: options.oauth_scopes.clone(),
+            token_url_override: None,
+            callback_timeout: None,
+        }),
+    }
+}
+
+/// Open a Databricks SQL session and return an opaque `Connection`
+/// wrapping the kernel `Session`. Authentication is selected by
+/// `options.auth_mode` (PAT / OAuth M2M / OAuth U2M) — see
+/// [`build_auth_config`].
 ///
 /// The JS-visible name is `openSession` (napi-rs converts snake_case
 /// to camelCase for free functions).
@@ -125,6 +211,10 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         // runtime that's driving this future.
         let _ = runtime::get_handle();
 
+        // Resolve auth before the builder moves `host_name` / `http_path`
+        // out of `options` (validation can fail fast, before any network).
+        let auth_config = build_auth_config(&options)?;
+
         // SessionConfig is `#[non_exhaustive]` — go through the
         // builder, which is the only public path that constructs it.
         // `http_path()` is the convenience setter that maps a bare
@@ -132,9 +222,7 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         // `ConnectionConfig`.
         let mut builder = Session::builder()
             .http_path(options.host_name, options.http_path)
-            .auth(AuthConfig::Pat {
-                token: options.token,
-            });
+            .auth(auth_config);
         // Only wire `DefaultOpts` when at least one of catalog / schema
         // was provided; otherwise leave the config's `defaults` field
         // `None` so the kernel can distinguish "no defaults" from
@@ -171,4 +259,104 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         })
     })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal options with only the required transport fields set;
+    /// auth fields default to "absent" so each test sets what it needs.
+    fn base() -> ConnectionOptions {
+        ConnectionOptions {
+            host_name: "adb-1.azuredatabricks.net".to_owned(),
+            http_path: "/sql/1.0/warehouses/abc".to_owned(),
+            auth_mode: None,
+            token: None,
+            oauth_client_id: None,
+            oauth_client_secret: None,
+            oauth_redirect_port: None,
+            oauth_scopes: None,
+            catalog: None,
+            schema: None,
+            session_conf: None,
+            max_connections: None,
+        }
+    }
+
+    #[test]
+    fn default_mode_is_pat_and_requires_token() {
+        let mut o = base();
+        // No authMode + no token → fail-fast InvalidArgument.
+        assert!(build_auth_config(&o).is_err());
+        o.token = Some("dapi-xxx".to_owned());
+        assert!(matches!(
+            build_auth_config(&o).unwrap(),
+            AuthConfig::Pat { .. }
+        ));
+    }
+
+    #[test]
+    fn pat_rejects_empty_token() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::Pat);
+        o.token = Some(String::new());
+        assert!(build_auth_config(&o).is_err());
+    }
+
+    #[test]
+    fn m2m_requires_client_id_and_secret() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthM2m);
+        assert!(build_auth_config(&o).is_err(), "missing both");
+        o.oauth_client_id = Some("cid".to_owned());
+        assert!(build_auth_config(&o).is_err(), "missing secret");
+        o.oauth_client_secret = Some("sec".to_owned());
+        o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthM2M {
+                client_id,
+                client_secret,
+                scopes,
+                ..
+            } => {
+                assert_eq!(client_id, "cid");
+                assert_eq!(client_secret, "sec");
+                assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+            }
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_fields_are_all_optional() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthU2m);
+        // Bare U2M: kernel fills databricks-cli / port 8020 / default scopes.
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                client_id,
+                redirect_port,
+                ..
+            } => {
+                assert!(client_id.is_none());
+                assert!(redirect_port.is_none());
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+        // Explicit overrides thread through.
+        o.oauth_client_id = Some("custom-cli".to_owned());
+        o.oauth_redirect_port = Some(9000);
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                client_id,
+                redirect_port,
+                ..
+            } => {
+                assert_eq!(client_id.as_deref(), Some("custom-cli"));
+                assert_eq!(redirect_port, Some(9000));
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
 }
