@@ -44,10 +44,10 @@ use crate::util::guarded;
 /// argument on the JS side, or `{}`) is equivalent to the parameterless
 /// `executeStatement(sql)` form preserved from the napi-skeleton PR.
 ///
-/// Today the only field is `positional_params`. Keeping the surface as
-/// a struct — rather than overloading per-call — lets future
-/// statement-level knobs (named params, conf overlay, result format)
-/// land non-breakingly. Mirrors `StatementSpec`'s plain-data shape
+/// Carries `positional_params` (`?`) and `named_params` (`:name`) — both
+/// decoded through the same `parse_typed_value` codec. Keeping the surface
+/// as a struct lets future statement-level knobs (conf overlay, result
+/// format) land non-breakingly. Mirrors `StatementSpec`'s plain-data shape
 /// kernel-side.
 #[allow(
     dead_code,
@@ -66,6 +66,44 @@ pub struct ExecuteOptions {
     /// `DBSQLParameter.toSparkParameter()` on the Node-driver side for
     /// the canonical stringification rules.
     pub positional_params: Option<Vec<TypedValueInput>>,
+    /// Named parameters (`:name` placeholders). Each carries its `name`
+    /// alongside the `{ sqlType, value? }` pair, decoded via the same
+    /// [`parse_typed_value`] codec and bound with `StatementSpec::param_named`.
+    /// Named is the SEA-spec-required public param form
+    /// (`StatementParameter.name` is `openapi_required`); positional is the
+    /// documented-undocumented variant. Mutually exclusive with
+    /// `positional_params` at the SQL level (`?` vs `:name`).
+    pub named_params: Option<Vec<NamedTypedValueInput>>,
+}
+
+/// A named bound parameter — a [`TypedValueInput`] plus its `:name`. Kept a
+/// distinct napi object (rather than an optional `name` on `TypedValueInput`)
+/// so the positional surface stays a clean ordered list with no name field.
+#[allow(
+    dead_code,
+    reason = "exported via napi macro codegen; not called from Rust"
+)]
+#[napi(object)]
+pub struct NamedTypedValueInput {
+    pub name: String,
+    pub sql_type: String,
+    pub value: Option<String>,
+}
+
+/// Translate `ExecuteOptions.named_params` into `(name, TypedValue)` pairs,
+/// parsing each value through the same [`parse_typed_value`] codec as the
+/// positional path. Returns `Err` on the first malformed entry.
+fn decode_named_params(
+    inputs: Vec<NamedTypedValueInput>,
+) -> Result<Vec<(String, TypedValue)>, napi::Error> {
+    inputs
+        .into_iter()
+        .map(|nv| {
+            parse_typed_value(&nv.sql_type, nv.value.as_deref())
+                .map(|tv| (nv.name, tv))
+                .map_err(napi_err_from_kernel)
+        })
+        .collect()
 }
 
 /// Translate the JS-side `ExecuteOptions.positional_params` into the
@@ -161,9 +199,19 @@ impl Connection {
         // is plain data and accepts a pre-built `Vec<TypedValue>` via
         // the `positional_params` field, so we can do this work on the
         // caller's tokio task.
-        let positional = match options.and_then(|o| o.positional_params) {
-            Some(inputs) => decode_positional_params(inputs)?,
-            None => Vec::new(),
+        let (positional, named) = match options {
+            Some(o) => {
+                let positional = match o.positional_params {
+                    Some(inputs) => decode_positional_params(inputs)?,
+                    None => Vec::new(),
+                };
+                let named = match o.named_params {
+                    Some(inputs) => decode_named_params(inputs)?,
+                    None => Vec::new(),
+                };
+                (positional, named)
+            }
+            None => (Vec::new(), Vec::new()),
         };
         let inner = Arc::clone(&self.inner);
         guarded(async move {
@@ -178,6 +226,12 @@ impl Connection {
                 // intended kernel surface. Avoids the per-call `param(i,
                 // v)` resize loop that's there for sparse-bind cases.
                 stmt.spec().positional_params = positional;
+            }
+            // Bind named params (`:name`) via the spec builder.
+            for (name, value) in named {
+                stmt.spec()
+                    .param_named(name, value)
+                    .map_err(napi_err_from_kernel)?;
             }
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
