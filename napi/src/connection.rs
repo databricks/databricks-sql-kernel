@@ -54,8 +54,8 @@ use crate::util::guarded;
 ///
 /// `rowLimit` (SEA `row_limit`) and `queryTimeoutSecs` (the per-statement
 /// server wait timeout) are exposed here and threaded onto the kernel
-/// `StatementSpec`. `positionalParams` carries `?`-placeholder bindings
-/// (decoded via `params::parse_typed_value`); named params remain deferred.
+/// `StatementSpec`. `positionalParams` (`?`) and `namedParams` (`:name`)
+/// carry bound query parameters, decoded via `params::parse_typed_value`.
 ///
 /// **Tag-order caveat (M4 parity note).** The napi `queryTags` field
 /// is a Rust `HashMap<String, String>` whose iteration order is
@@ -108,6 +108,28 @@ pub struct ExecuteOptions {
     /// string-encoded literal or `null` for SQL NULL. Mirrors
     /// `StatementSpec::positional_params`; decoded via [`parse_typed_value`].
     pub positional_params: Option<Vec<TypedValueInput>>,
+    /// Named parameters (`:name` placeholders). Each carries its `name`
+    /// alongside the `{ sqlType, value? }` pair. Mapped to a kernel
+    /// `TypedValue` via the same [`parse_typed_value`] codec and bound with
+    /// `StatementSpec::param_named`. Named is the SEA-spec-required public
+    /// param form (`StatementParameter.name` is `openapi_required`);
+    /// positional is the documented-undocumented variant. The two are
+    /// mutually exclusive at the SQL level (`?` vs `:name`).
+    pub named_params: Option<Vec<NamedTypedValueInput>>,
+}
+
+/// A named bound parameter — a [`TypedValueInput`] plus its `:name`. Kept a
+/// distinct napi object (rather than an optional `name` on `TypedValueInput`)
+/// so the positional surface stays a clean ordered list with no name field.
+#[allow(
+    dead_code,
+    reason = "exported via napi macro codegen; not called from Rust"
+)]
+#[napi(object)]
+pub struct NamedTypedValueInput {
+    pub name: String,
+    pub sql_type: String,
+    pub value: Option<String>,
 }
 
 /// Translate `ExecuteOptions.positional_params` into the kernel's
@@ -120,6 +142,22 @@ fn decode_positional_params(inputs: Vec<TypedValueInput>) -> Result<Vec<TypedVal
         .into_iter()
         .map(|tv| {
             parse_typed_value(&tv.sql_type, tv.value.as_deref()).map_err(napi_err_from_kernel)
+        })
+        .collect()
+}
+
+/// Translate `ExecuteOptions.named_params` into `(name, TypedValue)` pairs,
+/// parsing each value through the same [`parse_typed_value`] codec as the
+/// positional path. Returns `Err` on the first malformed entry.
+fn decode_named_params(
+    inputs: Vec<NamedTypedValueInput>,
+) -> Result<Vec<(String, TypedValue)>, napi::Error> {
+    inputs
+        .into_iter()
+        .map(|nv| {
+            parse_typed_value(&nv.sql_type, nv.value.as_deref())
+                .map(|tv| (nv.name, tv))
+                .map_err(napi_err_from_kernel)
         })
         .collect()
 }
@@ -272,6 +310,12 @@ impl Connection {
             .map(decode_positional_params)
             .transpose()?
             .unwrap_or_default();
+        let named_params = options
+            .as_mut()
+            .and_then(|o| o.named_params.take())
+            .map(decode_named_params)
+            .transpose()?
+            .unwrap_or_default();
         // Merge `query_tags` into `statement_conf` at the napi boundary
         // so the kernel sees a single conf map. Serialise the tag
         // map to the comma-separated `key:value` wire shape NodeJS
@@ -297,6 +341,12 @@ impl Connection {
             for (i, value) in positional_params.into_iter().enumerate() {
                 stmt.spec()
                     .param(i + 1, value)
+                    .map_err(napi_err_from_kernel)?;
+            }
+            // Bind named params (`:name`).
+            for (name, value) in named_params {
+                stmt.spec()
+                    .param_named(name, value)
                     .map_err(napi_err_from_kernel)?;
             }
 
@@ -435,6 +485,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap();
         assert!(result.is_none(), "empty maps → no statement_conf");
@@ -450,6 +501,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -466,6 +518,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -486,6 +539,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -505,6 +559,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -526,6 +581,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .expect_err("must reject when both are set");
         assert!(
@@ -550,6 +606,7 @@ mod tests {
             row_limit: None,
             query_timeout_secs: None,
             positional_params: None,
+            named_params: None,
         }))
         .unwrap()
         .unwrap();
