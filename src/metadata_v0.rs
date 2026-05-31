@@ -134,6 +134,8 @@ impl<'a> Identifier<'a> {
     /// Rejects:
     /// - Empty string — meaningless as an identifier; almost always a
     ///   bug at the wrapper layer.
+    /// - Strings consisting only of whitespace — would backtick-escape
+    ///   to a blank token and produce a server-side parse error.
     /// - Embedded NUL bytes (`\0`) — would terminate the string at the
     ///   first FFI / C ABI boundary and silently truncate the
     ///   identifier in transit.
@@ -147,6 +149,9 @@ impl<'a> Identifier<'a> {
     pub fn new(s: &'a str) -> Result<Self> {
         if s.is_empty() {
             return Err(Error::invalid_argument().message("identifier must not be empty"));
+        }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument().message("identifier must not be all whitespace"));
         }
         if s.len() > MAX_IDENTIFIER_BYTES {
             return Err(Error::invalid_argument().message(format!(
@@ -194,6 +199,8 @@ impl<'a> LikePattern<'a> {
     ///
     /// Rejects:
     /// - Empty string — callers should pass `None` for "match all".
+    /// - Strings consisting only of whitespace — callers should pass
+    ///   `None` for "match all".
     /// - Embedded NUL bytes — same FFI-truncation hazard as
     ///   [`Identifier::new`].
     /// - Strings exceeding 255 bytes.
@@ -205,6 +212,10 @@ impl<'a> LikePattern<'a> {
         if s.is_empty() {
             return Err(Error::invalid_argument()
                 .message("LIKE pattern must not be empty (pass None for \"match all\")"));
+        }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument()
+                .message("LIKE pattern must not be all whitespace (pass None for \"match all\")"));
         }
         if s.len() > MAX_LIKE_PATTERN_BYTES {
             return Err(Error::invalid_argument().message(format!(
@@ -668,5 +679,31 @@ mod tests {
         let s = "a".repeat(MAX_LIKE_PATTERN_BYTES + 1);
         let err = LikePattern::new(&s).expect_err("oversize pattern rejected");
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn identifier_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = Identifier::new(s).expect_err("whitespace-only identifier rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn like_pattern_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = LikePattern::new(s).expect_err("whitespace-only pattern rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
     }
 }
