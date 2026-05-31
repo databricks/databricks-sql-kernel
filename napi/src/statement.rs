@@ -305,8 +305,18 @@ impl Statement {
             return Ok(());
         }
         let inner = Arc::clone(&self.inner);
+        let finished = Arc::clone(&self.finished);
         guarded(async move {
             let guard = inner.lock().await;
+            // Re-check `finished` after acquiring the lock to close the
+            // fetch-vs-cancel TOCTOU: a concurrent `fetch_next_batch` may have
+            // drained to completion and set `finished` while this cancel was
+            // queued on the mutex. Without the re-check we'd dispatch a
+            // `CancelStatement` against an already-terminal statement (a
+            // redundant, wire-benign-but-wasteful RPC).
+            if finished.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
             match inner_state {
                 AnyInner::Executed(s) => s.executed.cancel().await.map_err(napi_err_from_kernel),
@@ -587,5 +597,19 @@ mod tests {
         assert!(!stmt.finished.load(Ordering::Acquire));
         stmt.finished.store(true, Ordering::Release);
         assert!(stmt.finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancel_short_circuits_when_finished_even_on_closed_inner() {
+        // `finished = true` must short-circuit cancel to Ok(()) BEFORE the
+        // closed-state check — so a cancel racing a just-completed fetch is a
+        // no-op, not a CancelStatement RPC (and not a closed-handle error).
+        let stmt = Statement {
+            inner: Arc::new(Mutex::new(None)), // closed
+            schema: make_schema(),
+            statement_id: "x".to_owned(),
+            finished: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(stmt.cancel().await.is_ok());
     }
 }

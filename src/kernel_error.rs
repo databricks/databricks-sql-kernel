@@ -133,6 +133,30 @@ pub enum ErrorCode {
     SqlError,
 }
 
+impl ErrorCode {
+    /// Stable string slug for cross-binding wire formats. Single source of
+    /// truth shared by the pyo3 (`code_str`) and napi (`error_code_str`)
+    /// bindings — keeping the mapping here makes drift across bindings
+    /// structurally impossible.
+    pub fn slug(&self) -> &'static str {
+        match self {
+            ErrorCode::InvalidArgument => "InvalidArgument",
+            ErrorCode::Unauthenticated => "Unauthenticated",
+            ErrorCode::PermissionDenied => "PermissionDenied",
+            ErrorCode::NotFound => "NotFound",
+            ErrorCode::ResourceExhausted => "ResourceExhausted",
+            ErrorCode::Unavailable => "Unavailable",
+            ErrorCode::Timeout => "Timeout",
+            ErrorCode::Cancelled => "Cancelled",
+            ErrorCode::DataLoss => "DataLoss",
+            ErrorCode::Internal => "Internal",
+            ErrorCode::InvalidStatementHandle => "InvalidStatementHandle",
+            ErrorCode::NetworkError => "NetworkError",
+            ErrorCode::SqlError => "SqlError",
+        }
+    }
+}
+
 /// Typed kernel error.
 ///
 /// `cause` chains preserve the underlying provenance — a `SqlError`
