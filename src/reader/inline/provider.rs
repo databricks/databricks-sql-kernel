@@ -38,6 +38,37 @@ pub struct InlineArrowProvider {
     schema: Option<SchemaRef>,
 }
 
+/// Clamp a sequence of record batches to an authoritative logical row
+/// count (`manifest.total_row_count`), slicing the batch that crosses the
+/// boundary and dropping any rows past it. `None` (or a negative count)
+/// leaves the batches untouched. Pure so the boundary arithmetic is
+/// unit-testable. See [`InlineArrowProvider::new`] for why the manifest
+/// count, not the raw Arrow row count, is authoritative.
+fn clamp_to_total_rows(
+    batches: Vec<RecordBatch>,
+    total_row_count: Option<i64>,
+) -> Vec<RecordBatch> {
+    let Some(limit) = total_row_count.filter(|n| *n >= 0).map(|n| n as usize) else {
+        return batches;
+    };
+    let mut out = Vec::with_capacity(batches.len());
+    let mut remaining = limit;
+    for batch in batches {
+        if remaining == 0 {
+            break;
+        }
+        if batch.num_rows() <= remaining {
+            remaining -= batch.num_rows();
+            out.push(batch);
+        } else {
+            // This batch crosses the boundary — keep only `remaining` rows.
+            out.push(batch.slice(0, remaining));
+            remaining = 0;
+        }
+    }
+    out
+}
+
 impl InlineArrowProvider {
     /// Create a new provider from raw Arrow IPC bytes.
     ///
@@ -46,6 +77,14 @@ impl InlineArrowProvider {
     /// # Arguments
     /// * `attachment` - Raw Arrow IPC bytes (decoded from base64)
     /// * `compression` - Compression codec used (from manifest.result_compression)
+    /// * `total_row_count` - Authoritative logical row count from
+    ///   `manifest.total_row_count`. When `Some`, the decoded batches are
+    ///   clamped to this count: with a `row_limit` applied the SEA server
+    ///   returns one extra look-ahead Arrow row beyond the logical count
+    ///   (`manifest.truncated = true`), and the manifest count — not the
+    ///   raw Arrow row count — is the result size. Mirrors the Python SEA
+    ///   connector, which bounds its `ArrowQueue` by `total_row_count`.
+    ///   `None` leaves the batches unclamped.
     ///
     /// # Returns
     /// A new provider with parsed batches ready for iteration
@@ -53,7 +92,11 @@ impl InlineArrowProvider {
     /// # Errors
     /// - If decompression fails
     /// - If Arrow IPC parsing fails
-    pub fn new(attachment: Vec<u8>, compression: CompressionCodec) -> Result<Self> {
+    pub fn new(
+        attachment: Vec<u8>,
+        compression: CompressionCodec,
+        total_row_count: Option<i64>,
+    ) -> Result<Self> {
         if attachment.is_empty() {
             tracing::debug!("Empty attachment, creating empty provider");
             return Ok(Self {
@@ -69,9 +112,11 @@ impl InlineArrowProvider {
         );
 
         // Reuse the shared Arrow IPC parser (same format as CloudFetch)
-        let batches = parse_arrow_ipc(&attachment, compression).map_err(|e| {
+        let parsed = parse_arrow_ipc(&attachment, compression).map_err(|e| {
             Error::io().message(format!("Failed to parse inline Arrow data: {}", e))
         })?;
+
+        let batches = clamp_to_total_rows(parsed, total_row_count);
 
         let schema = batches.first().map(|b| b.schema());
 
@@ -156,7 +201,8 @@ mod tests {
         let batch = create_test_batch(100);
         let ipc_data = create_test_arrow_ipc(&[batch]);
 
-        let mut provider = InlineArrowProvider::new(ipc_data, CompressionCodec::None).unwrap();
+        let mut provider =
+            InlineArrowProvider::new(ipc_data, CompressionCodec::None, None).unwrap();
 
         // Check schema
         assert!(provider.schema().is_some());
@@ -189,7 +235,7 @@ mod tests {
         }
 
         let mut provider =
-            InlineArrowProvider::new(compressed, CompressionCodec::Lz4Frame).unwrap();
+            InlineArrowProvider::new(compressed, CompressionCodec::Lz4Frame, None).unwrap();
 
         let batch = provider.next_batch().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 100);
@@ -201,7 +247,8 @@ mod tests {
         let batch2 = create_test_batch(30);
         let ipc_data = create_test_arrow_ipc(&[batch1, batch2]);
 
-        let mut provider = InlineArrowProvider::new(ipc_data, CompressionCodec::None).unwrap();
+        let mut provider =
+            InlineArrowProvider::new(ipc_data, CompressionCodec::None, None).unwrap();
 
         // First batch
         let batch = provider.next_batch().unwrap().unwrap();
@@ -217,7 +264,7 @@ mod tests {
 
     #[test]
     fn test_inline_provider_with_empty_data() {
-        let provider = InlineArrowProvider::new(vec![], CompressionCodec::None).unwrap();
+        let provider = InlineArrowProvider::new(vec![], CompressionCodec::None, None).unwrap();
 
         assert!(provider.schema().is_none());
         assert!(!provider.has_more());
@@ -227,7 +274,53 @@ mod tests {
     fn test_inline_provider_with_invalid_data() {
         let invalid_data = b"this is not valid arrow ipc data".to_vec();
 
-        let result = InlineArrowProvider::new(invalid_data, CompressionCodec::None);
+        let result = InlineArrowProvider::new(invalid_data, CompressionCodec::None, None);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn clamp_none_is_passthrough() {
+        let batches = vec![create_test_batch(10)];
+        let out = clamp_to_total_rows(batches, None);
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+    }
+
+    #[test]
+    fn clamp_slices_across_batches() {
+        // 4 + 4 + 4 = 12 rows; clamp to 10 -> 4 + 4 + 2.
+        let batches = vec![
+            create_test_batch(4),
+            create_test_batch(4),
+            create_test_batch(4),
+        ];
+        let out = clamp_to_total_rows(batches, Some(10));
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 10);
+        assert_eq!(out.len(), 3);
+        assert_eq!(out[2].num_rows(), 2);
+    }
+
+    #[test]
+    fn clamp_above_actual_is_noop() {
+        let batches = vec![create_test_batch(5)];
+        let out = clamp_to_total_rows(batches, Some(1000));
+        assert_eq!(out.iter().map(|b| b.num_rows()).sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn inline_provider_clamps_look_ahead_row_to_manifest_count() {
+        // Reproduces the row_limit=N -> N+1 server look-ahead: an 11-row
+        // Arrow attachment with manifest.total_row_count = 10 must surface
+        // exactly 10 rows (parity with Python use_sea and Thrift).
+        let batch = create_test_batch(11);
+        let ipc = create_test_arrow_ipc(&[batch]);
+        let mut provider = InlineArrowProvider::new(ipc, CompressionCodec::None, Some(10)).unwrap();
+        let mut total = 0;
+        while let Some(b) = provider.next_batch().unwrap() {
+            total += b.num_rows();
+        }
+        assert_eq!(
+            total, 10,
+            "must clamp the +1 look-ahead row to the manifest count"
+        );
     }
 }
