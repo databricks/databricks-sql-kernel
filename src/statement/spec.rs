@@ -68,6 +68,24 @@ use std::collections::HashMap;
 /// `json.Unmarshal`, Node's `JSON.parse`, etc.) decode per their
 /// language idioms. On the wire the SEA `param_type` is `"VARIANT"`
 /// and the value is the JSON string the caller provided.
+///
+/// `Geography` and `Geometry` carry Databricks' geospatial types.
+/// Two representations are tracked in the same variant for
+/// forward-compatibility with SEA's upcoming binary geo path:
+///
+/// - `wkt`: well-known-text body without an `SRID=N;` prefix
+///   (e.g. `"POINT(1 2)"`). Always populated.
+/// - `srid`: spatial reference system identifier (e.g. `4326` for
+///   WGS 84). `None` when the binding / column has no SRID.
+/// - `wkb`: well-known-binary representation. `None` on the EWKT
+///   path (today's SEA default for non-JDBC clients). Will be
+///   `Some(bytes)` once SEA's per-client-agent binary geo path
+///   ships and the kernel opts in — see the SEA Geospatial Arrow
+///   design doc for the gating model.
+///
+/// The kernel does not currently parse WKT into geometric primitives;
+/// downstream consumers that need typed primitives (e.g. shapely on
+/// Python, orb on Go) decode `wkt` or `wkb` themselves.
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub enum TypedValue {
@@ -101,6 +119,20 @@ pub enum TypedValue {
     Interval(String),
     /// `VARIANT` — opaque JSON text. See the enum-level docs.
     Variant(String),
+    /// `GEOGRAPHY` — see the enum-level docs for the EWKT vs WKB
+    /// representation contract.
+    Geography {
+        wkt: String,
+        srid: Option<i32>,
+        wkb: Option<Vec<u8>>,
+    },
+    /// `GEOMETRY` — see the enum-level docs for the EWKT vs WKB
+    /// representation contract.
+    Geometry {
+        wkt: String,
+        srid: Option<i32>,
+        wkb: Option<Vec<u8>>,
+    },
 }
 
 /// Wire-format requested for the result.
@@ -113,6 +145,27 @@ pub enum TypedValue {
 pub enum ResultFormat {
     #[default]
     Arrow,
+}
+
+/// Wire-format constants for [`TypedValue::Geography`] /
+/// [`TypedValue::Geometry`].
+///
+/// These literals are the contract with the SEA server: the
+/// `param_type` family names and the EWKT `SRID=N;` prefix syntax.
+/// Centralised here so the bind-side dispatch (pyo3 parser), the
+/// bind-side payload mapper (`typed_value_to_sea_payload`), and
+/// any future result-side reader all reference one source of truth.
+/// Match callers use `.eq_ignore_ascii_case(...)` against the
+/// uppercased input; emitting code writes these strings verbatim
+/// to the wire.
+pub mod geo_wire {
+    /// SEA `param_type` family name for [`super::TypedValue::Geography`].
+    pub const GEOGRAPHY: &str = "GEOGRAPHY";
+    /// SEA `param_type` family name for [`super::TypedValue::Geometry`].
+    pub const GEOMETRY: &str = "GEOMETRY";
+    /// EWKT prefix marker — appears as `"SRID=N;"` at the head of
+    /// the value field when an SRID is bound or emitted.
+    pub const EWKT_SRID_PREFIX: &str = "SRID=";
 }
 
 /// Plain-data description of a statement to execute.

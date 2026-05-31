@@ -107,6 +107,17 @@ impl CloudFetchLink {
         Utc::now() + chrono::Duration::seconds(LINK_EXPIRY_BUFFER_SECS) >= self.expiration
     }
 
+    /// Row offset of the next chunk after this one (i.e. the
+    /// cursor where the next page of results should start).
+    ///
+    /// Computed as `row_offset + row_count` with `saturating_add`
+    /// so a pathological server response can't cause arithmetic
+    /// overflow when the kernel uses this to advance its
+    /// continuation cursor.
+    pub fn row_offset_after(&self) -> i64 {
+        self.row_offset.saturating_add(self.row_count)
+    }
+
     /// Convert from SEA API response type.
     pub fn from_external_link(link: &ExternalLink) -> Result<Self> {
         let expiration = DateTime::parse_from_rfc3339(&link.expiration)
@@ -173,6 +184,17 @@ pub struct ChunkEntry {
     pub state: ChunkState,
     /// Parsed record batches (populated when state is Downloaded).
     pub batches: Option<Vec<RecordBatch>>,
+    /// Most recent failure reason, preserved across state
+    /// transitions that erase it from `ChunkState` itself.
+    ///
+    /// `ChunkState::DownloadFailed(reason)` carries the reason
+    /// while it's set, but the retry loop transitions
+    /// `DownloadFailed → DownloadRetry` (where the reason no
+    /// longer lives in the state). Without this field an operator
+    /// can't correlate the chunk's failure history during the
+    /// retry-sleep window. Last writer wins — only the most
+    /// recent reason is preserved.
+    pub last_failure_reason: Option<String>,
 }
 
 impl ChunkEntry {
@@ -182,6 +204,7 @@ impl ChunkEntry {
             link: None,
             state: ChunkState::Pending,
             batches: None,
+            last_failure_reason: None,
         }
     }
 
@@ -191,6 +214,7 @@ impl ChunkEntry {
             link: Some(link),
             state: ChunkState::UrlFetched,
             batches: None,
+            last_failure_reason: None,
         }
     }
 }

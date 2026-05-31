@@ -31,9 +31,10 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{Error as KernelError, Session};
+use databricks_sql_kernel::{Error as KernelError, Session, TypedValue};
 
 use crate::error::napi_err_from_kernel;
+use crate::params::{parse_typed_value, TypedValueInput};
 use crate::runtime;
 use crate::statement::Statement;
 use crate::util::guarded;
@@ -53,9 +54,8 @@ use crate::util::guarded;
 ///
 /// `rowLimit` (SEA `row_limit`) and `queryTimeoutSecs` (the per-statement
 /// server wait timeout) are exposed here and threaded onto the kernel
-/// `StatementSpec`. Positional and named parameters remain deferred: they
-/// require a non-trivial JS↔napi `TypedValue` mapping and land in a
-/// follow-on PR.
+/// `StatementSpec`. `positionalParams` carries `?`-placeholder bindings
+/// (decoded via `params::parse_typed_value`); named params remain deferred.
 ///
 /// **Tag-order caveat (M4 parity note).** The napi `queryTags` field
 /// is a Rust `HashMap<String, String>` whose iteration order is
@@ -102,6 +102,26 @@ pub struct ExecuteOptions {
     /// `StatementSpec.query_timeout_secs`. Distinct from the
     /// connection-level transport timeout. The SEA wire caps it at 50s.
     pub query_timeout_secs: Option<u32>,
+    /// Positional parameters, in 1-based wire order. Index `i` in this
+    /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
+    /// Each entry is a `{ sqlType, value }` pair — `value` is the
+    /// string-encoded literal or `null` for SQL NULL. Mirrors
+    /// `StatementSpec::positional_params`; decoded via [`parse_typed_value`].
+    pub positional_params: Option<Vec<TypedValueInput>>,
+}
+
+/// Translate `ExecuteOptions.positional_params` into the kernel's
+/// `Vec<TypedValue>`, parsing each entry through [`parse_typed_value`]
+/// (same validation surface as the pyo3 binding). Returns `Err` on the
+/// first malformed entry so the kernel never receives a partially-bound
+/// spec.
+fn decode_positional_params(inputs: Vec<TypedValueInput>) -> Result<Vec<TypedValue>, napi::Error> {
+    inputs
+        .into_iter()
+        .map(|tv| {
+            parse_typed_value(&tv.sql_type, tv.value.as_deref()).map_err(napi_err_from_kernel)
+        })
+        .collect()
 }
 
 /// Closed-state error builder. Mirrors `statement::statement_closed_err`
@@ -236,13 +256,22 @@ impl Connection {
     pub async fn execute_statement(
         &self,
         sql: String,
-        options: Option<ExecuteOptions>,
+        mut options: Option<ExecuteOptions>,
     ) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
         // Pull the scalar knobs out before `build_merged_statement_conf`
         // consumes `options` (both `i64`/`u32` are `Copy`).
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
         let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
+        // Decode positional params before `options` is consumed below; a
+        // malformed entry surfaces as InvalidArgument here, before any wire
+        // round-trip.
+        let positional_params = options
+            .as_mut()
+            .and_then(|o| o.positional_params.take())
+            .map(decode_positional_params)
+            .transpose()?
+            .unwrap_or_default();
         // Merge `query_tags` into `statement_conf` at the napi boundary
         // so the kernel sees a single conf map. Serialise the tag
         // map to the comma-separated `key:value` wire shape NodeJS
@@ -264,6 +293,12 @@ impl Connection {
             stmt.spec()
                 .row_limit(row_limit)
                 .query_timeout_secs(query_timeout_secs);
+            // Bind positional params 1-based on the wire.
+            for (i, value) in positional_params.into_iter().enumerate() {
+                stmt.spec()
+                    .param(i + 1, value)
+                    .map_err(napi_err_from_kernel)?;
+            }
 
             let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper.
@@ -399,6 +434,7 @@ mod tests {
             query_tags: Some(HashMap::new()),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap();
         assert!(result.is_none(), "empty maps → no statement_conf");
@@ -413,6 +449,7 @@ mod tests {
             query_tags: None,
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -428,6 +465,7 @@ mod tests {
             query_tags: Some(tags),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -447,6 +485,7 @@ mod tests {
             query_tags: Some(tags),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -465,6 +504,7 @@ mod tests {
             query_tags: Some(tags),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap()
         .unwrap();
@@ -485,6 +525,7 @@ mod tests {
             query_tags: Some(tags),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .expect_err("must reject when both are set");
         assert!(
@@ -508,6 +549,7 @@ mod tests {
             query_tags: Some(HashMap::new()),
             row_limit: None,
             query_timeout_secs: None,
+            positional_params: None,
         }))
         .unwrap()
         .unwrap();

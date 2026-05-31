@@ -114,8 +114,7 @@ impl Connection {
     pub async fn list_catalogs(&self) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
-            let stream =
-                run_on_blocking(move || async move { meta.list_catalogs().await }).await?;
+            let stream = run_on_blocking(move || async move { meta.list_catalogs().await }).await?;
             Ok(Statement::from_result_stream(stream))
         })
         .await

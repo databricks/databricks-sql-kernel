@@ -44,6 +44,7 @@ pub(crate) mod database;
 pub(crate) mod error;
 pub(crate) mod logger;
 pub(crate) mod metadata;
+pub(crate) mod params;
 pub(crate) mod result;
 pub(crate) mod runtime;
 pub(crate) mod statement;
