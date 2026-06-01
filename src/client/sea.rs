@@ -271,8 +271,13 @@ impl SeaRestTransport {
                     .and_then(|e| e.message.clone())
                     .unwrap_or_else(|| "Unknown error".to_string());
 
-                // Server-reported execution error → SqlError with the
-                // structured fields populated from the envelope.
+                // Server-reported failure → SqlError. The server's
+                // `error_code` slug is NOT used to pick the categorical
+                // bucket: SEA returns the generic `BAD_REQUEST` slug for
+                // genuine SQL errors too (e.g. `TABLE_OR_VIEW_NOT_FOUND`,
+                // SQLSTATE 42P01 — verified live), so it is not a reliable
+                // InvalidArgument signal. The slug + SQLSTATE are carried
+                // below for wrappers that want finer-grained mapping.
                 let mut error = Error::sql_error()
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);
@@ -532,6 +537,14 @@ impl SeaRestTransport {
     /// to clean up shows up in traces with the failing-phase
     /// attribution (`wait_for_completion` vs `create_reader`).
     async fn close_orphaned_statement(&self, statement_id: &str, phase: &str) {
+        // A synchronously-rejected request (e.g. a `BAD_REQUEST`
+        // parameter-binding failure) returns FAILED with no
+        // `statement_id` — nothing was opened server-side, so there is
+        // nothing to close. Skip rather than issue a CloseStatement for
+        // an empty id.
+        if statement_id.is_empty() {
+            return;
+        }
         debug!(
             statement_id = %statement_id,
             phase = %phase,
@@ -1213,6 +1226,51 @@ mod tests {
     fn test_base_url() {
         let client = create_test_client();
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
+    }
+
+    #[test]
+    fn terminal_outcome_failed_envelope_without_statement_id_surfaces_full_error() {
+        // A synchronously-rejected request (e.g. a parameter-binding
+        // `BAD_REQUEST`) comes back FAILED with no statement_id. The
+        // envelope must surface as a SqlError carrying the real server
+        // message, parsed SQLSTATE, and the `error_code` slug — NOT an
+        // opaque DataLoss parse failure. The slug is deliberately NOT
+        // remapped to InvalidArgument: SEA returns `BAD_REQUEST` for
+        // genuine SQL errors too (TABLE_OR_VIEW_NOT_FOUND etc.), so it's
+        // not a reliable caller-error signal. (The mutually-exclusive
+        // param case that motivated this is caught client-side at bind
+        // time; see `statement::mutable`.)
+        use crate::types::sea::{ServiceError, StatementState, StatementStatus};
+        let response = ExecuteResponse {
+            statement_id: String::new(),
+            status: StatementStatus {
+                state: StatementState::Failed,
+                error: Some(ServiceError {
+                    error_code: Some("BAD_REQUEST".to_string()),
+                    message: Some(
+                        "[INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME] ... SQLSTATE: 22023"
+                            .to_string(),
+                    ),
+                    sql_state: None,
+                }),
+                num_modified_rows: None,
+                display_message: None,
+                diagnostic_info: None,
+                error_details_json: None,
+            },
+            manifest: None,
+            result: None,
+        };
+        match SeaRestTransport::terminal_outcome(response) {
+            StatementOutcome::Err(e) => {
+                assert_eq!(e.code, crate::kernel_error::ErrorCode::SqlError);
+                assert_eq!(e.error_code.as_deref(), Some("BAD_REQUEST"));
+                assert!(e.message.contains("MISSING_NAME"));
+                // SQLSTATE parsed from the message text.
+                assert_eq!(e.sql_state.as_deref(), Some("22023"));
+            }
+            _ => panic!("expected Err outcome for a FAILED response"),
+        }
     }
 
     #[test]

@@ -180,11 +180,15 @@ pub struct StatementSpec {
     pub sql: Option<String>,
 
     /// Positional parameters, 1-based on the wire. Index `i` in this Vec
-    /// corresponds to ordinal `i + 1`.
+    /// corresponds to ordinal `i + 1`. Mutually exclusive with
+    /// `named_params` (see below).
     pub positional_params: Vec<TypedValue>,
 
-    /// Named parameters. Mutually compatible with `positional_params`; the
-    /// kernel forwards both to the SEA `parameters` field.
+    /// Named parameters. Mutually exclusive with `positional_params`:
+    /// `execute()` / `submit()` return `ErrorCode::InvalidArgument` if
+    /// both are non-empty. The SEA server rejects a mixed `parameters`
+    /// array with `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME`, so the
+    /// kernel rejects at bind time before the wire.
     pub named_params: HashMap<String, TypedValue>,
 
     /// Per-statement conf overlay. Maps to SEA `parameters` /

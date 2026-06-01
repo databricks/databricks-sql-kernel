@@ -205,17 +205,10 @@ fn build_statement(
     positional_params: Vec<TypedValue>,
     named_params: Vec<(String, TypedValue)>,
 ) -> napi::Result<databricks_sql_kernel::Statement> {
-    // Positional and named params are mutually exclusive (the public docs
-    // promise it). Reject at bind time with a clear InvalidArgument rather
-    // than letting both loops run and surfacing an opaque server error —
-    // mirrors the dual-`query_tags` rejection discipline.
-    if !positional_params.is_empty() && !named_params.is_empty() {
-        return Err(napi_err_from_kernel(
-            KernelError::invalid_argument()
-                .message("positional and named parameters are mutually exclusive; pass only one"),
-        ));
-    }
-
+    // Positional/named mutual-exclusivity is enforced in the kernel's
+    // `build_execute_params` (StatementSpec dispatch), so every binding
+    // — napi, pyo3, direct Rust — gets the same bind-time InvalidArgument.
+    // No napi-layer guard needed here.
     let mut stmt = session.statement();
     stmt.spec().sql(sql);
     // Set the explicit per-statement conf overlay first (only when non-empty)

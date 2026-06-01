@@ -137,6 +137,10 @@ impl StatementStatus {
                 let error_msg = service_error
                     .and_then(|e| e.message.clone())
                     .unwrap_or_else(|| "Unknown error".to_string());
+                // Server-reported failure → SqlError. See the sync path
+                // (`SeaClient::terminal_outcome`) for why the `error_code`
+                // slug is carried but not used to pick the bucket: SEA's
+                // `BAD_REQUEST` is overloaded across genuine SQL errors.
                 let mut error = Error::sql_error()
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);

@@ -113,6 +113,16 @@ fn build_execute_params(
     if spec.result_format != ResultFormat::Arrow {
         return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
     }
+    // Positional and named parameters are mutually exclusive: the SEA
+    // server rejects a mixed `parameters` array with
+    // `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME` (a `BAD_REQUEST`).
+    // Reject at bind time in the kernel so every binding (napi, pyo3,
+    // direct Rust) gets the same InvalidArgument before the wire,
+    // rather than an opaque server round-trip failure.
+    if !spec.positional_params.is_empty() && !spec.named_params.is_empty() {
+        return Err(Error::invalid_argument()
+            .message("positional and named parameters are mutually exclusive; pass only one"));
+    }
     let (wait_timeout, on_wait_timeout) =
         resolve_wait_timeout(wait_timeout_secs, spec.query_timeout_secs);
     let mut exec_params = ExecuteParams {
@@ -592,5 +602,25 @@ mod tests {
         // Malformed/incomplete spec fails before any wire dispatch.
         let spec = StatementSpec::new();
         assert!(build_execute_params(&spec, None).is_err());
+    }
+
+    #[test]
+    fn build_execute_params_rejects_mixed_positional_and_named() {
+        // Positional + named bindings are mutually exclusive — the
+        // kernel rejects at bind time so every binding (napi, pyo3,
+        // direct Rust) gets InvalidArgument before the wire instead of
+        // an opaque server `BAD_REQUEST` / `MISSING_NAME`.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ? AS pos, :n AS named");
+        spec.param(1, TypedValue::Int64(7)).unwrap();
+        spec.param_named("n", TypedValue::Int64(99)).unwrap();
+        let err = build_execute_params(&spec, None)
+            .expect_err("mixed positional + named must be rejected");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("mutually exclusive"),
+            "expected 'mutually exclusive' in error, got: {}",
+            err.message
+        );
     }
 }

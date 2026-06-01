@@ -24,6 +24,14 @@ use std::collections::HashMap;
 /// Response from statement execution or status polling.
 #[derive(Debug, Clone, Deserialize)]
 pub struct StatementExecutionResponse {
+    // The server omits `statement_id` when it rejects a request
+    // synchronously — e.g. a parameter-binding `BAD_REQUEST` returns
+    // HTTP 200 with `{"status":{"state":"FAILED","error":{...}}}` and
+    // no id (no statement was ever opened). Defaulting to "" lets the
+    // FAILED envelope deserialize so the error classifier sees the
+    // `error_code` slug, instead of dying in serde and surfacing an
+    // opaque `DataLoss` parse error.
+    #[serde(default)]
     pub statement_id: String,
     pub status: StatementStatus,
     #[serde(default)]
@@ -491,6 +499,31 @@ mod tests {
         assert!(response.manifest.is_some());
         let manifest = response.manifest.unwrap();
         assert_eq!(manifest.total_row_count, Some(100));
+    }
+
+    #[test]
+    fn test_failed_response_without_statement_id_deserializes() {
+        // A synchronously-rejected request (e.g. mixed positional +
+        // named params) comes back HTTP 200 with a FAILED envelope and
+        // NO `statement_id` — no statement was ever opened. Without the
+        // `#[serde(default)]` on `statement_id` this fails to parse and
+        // the error surfaces as an opaque `DataLoss` ("missing field
+        // `statement_id`") instead of the server's actual BAD_REQUEST.
+        let json = r#"{
+            "status": {
+                "state": "FAILED",
+                "error": {
+                    "error_code": "BAD_REQUEST",
+                    "message": "[INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME] ... SQLSTATE: 22023"
+                }
+            }
+        }"#;
+
+        let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.statement_id, "");
+        assert_eq!(response.status.state, StatementState::Failed);
+        let err = response.status.error.expect("error envelope present");
+        assert_eq!(err.error_code.as_deref(), Some("BAD_REQUEST"));
     }
 
     #[test]
