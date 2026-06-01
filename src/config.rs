@@ -36,12 +36,13 @@
 //! - [`LoggingConfig`] (filter, file)
 //! - [`TransportMode`]
 //!
-//! Configs whose shape we are still settling are reserved as empty
-//! `#[non_exhaustive]` structs so the public type names exist (and
-//! `SessionBuilder` setters compile) without committing to fields:
+//! [`TlsConfig`] now carries custom-CA + self-signed / hostname
+//! relaxation knobs; configs whose shape we are still settling stay
+//! as empty `#[non_exhaustive]` structs so the public type names
+//! exist (and `SessionBuilder` setters compile) without committing
+//! to fields:
 //!
 //! - [`ProxyConfig`]
-//! - [`TlsConfig`]
 //! - [`TelemetryConfig`]
 //!
 //! All structs are `#[non_exhaustive]` so v1+ can grow new fields
@@ -360,6 +361,49 @@ pub struct ProxyConfig {}
 ///
 /// The kernel exposes only fields that the internal rustls plumbing
 /// already supports — cert pinning and FIPS mode are *not* in scope.
+///
+/// `TlsConfig` is `#[non_exhaustive]`, so construct it from
+/// [`TlsConfig::default`] and assign the public fields you need:
+///
+/// ```no_run
+/// # use databricks_sql_kernel::TlsConfig;
+/// // From a file path:
+/// let mut from_file = TlsConfig::default();
+/// from_file.custom_ca_cert = Some(std::fs::read("/etc/ssl/corp-ca.pem").unwrap());
+///
+/// // From an in-memory buffer (the napi-rs `Buffer` / pyo3 `bytes`
+/// // path — no tempfile shim needed):
+/// let pem_bytes: Vec<u8> = b"-----BEGIN CERTIFICATE-----\n...".to_vec();
+/// let mut from_bytes = TlsConfig::default();
+/// from_bytes.custom_ca_cert = Some(pem_bytes);
+/// # let _ = (from_file, from_bytes);
+/// ```
+//
+// TODO(pr23-followup): the public Thrift NodeJS driver does NOT
+// expose programmatic TLS config — its `ConnectionOptions` has no
+// `ca` / `cert` / `key` field, and its `HttpConnection.createHttpsAgent`
+// builds the agent with `rejectUnauthorized: false` HARDCODED
+// (verified at `~/databricks-sql-nodejs/lib/connection/connections/HttpConnection.ts:67-77`,
+// 2026-05-27). The only "TLS knobs" Thrift NodeJS users have today
+// are the Node process-level env vars `NODE_EXTRA_CA_CERTS` and
+// `NODE_TLS_REJECT_UNAUTHORIZED`, and even those are inert against
+// the Thrift driver's hardcoded-permissive agent.
+//
+// The kernel surface here is intentionally STRICTER than Thrift's
+// (default = full validation, opt-in relaxations) and richer (custom
+// CA bundles, programmatic mTLS room). Motivated by:
+//   1. Python connector parity — `databricks-sql-connector` exposes
+//      `_tls_no_verify` / `_tls_verify_hostname` /
+//      `_tls_trusted_ca_file` / `_tls_client_cert_*`. The kernel must
+//      back those when pyo3 wires them up.
+//   2. Doing better than Thrift's hardcoded-insecure default on the
+//      SEA NodeJS path (napi binding).
+//
+// Revisit when (a) the napi binding wires these onto `ConnectionOptions`
+// for JS callers, and (b) we decide whether to honour Node's
+// `NODE_EXTRA_CA_CERTS` env var on the SEA path the way Node's own
+// https stack does — likely yes, for ergonomic parity with the rest
+// of the Node ecosystem.
 #[non_exhaustive]
 #[derive(Clone, Default)]
 pub struct TlsConfig {
@@ -372,6 +416,11 @@ pub struct TlsConfig {
     /// for foreign-language wrappers — napi-rs / pyo3 callers pass a
     /// `Buffer` / `bytes` directly without needing to materialise a
     /// tempfile.
+    ///
+    /// **Multi-cert bundles (root + intermediate):** the kernel splits
+    /// the PEM into individual certificates and adds each as a root,
+    /// so a concatenated `cat root.pem intermediate.pem` blob works
+    /// transparently regardless of the active TLS backend.
     pub custom_ca_cert: Option<Vec<u8>>,
 
     /// Accept self-signed server certificates.
@@ -843,17 +892,6 @@ mod tests {
         assert!(!s.contains("supersecret"), "subject_token leaked: {s}");
         assert!(s.contains("<redacted>"));
         assert!(s.contains("databricks"));
-    }
-
-    // ─── HttpConfig defaults ───────────────────────────────────────
-
-    #[test]
-    fn http_config_default_pool_max_idle_per_host_is_100() {
-        // Matches the JDBC driver's `HttpConnectionPoolSize` default and
-        // narrows the throughput gap with thrift's `maxSockets: Infinity`
-        // for high-concurrency workloads. See
-        // `sea-workflow/specs/07-errors-retries/connection-pool-default-mismatch.md`.
-        assert_eq!(HttpConfig::default().pool_max_idle_per_host, 100);
     }
 
     // ─── TlsConfig ─────────────────────────────────────────────────

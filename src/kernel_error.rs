@@ -211,6 +211,40 @@ pub struct Error {
     /// not parsed.
     pub location: Option<String>,
 
+    /// Server-supplied user-facing message captured from the SEA
+    /// `StatementStatus.display_message` envelope on terminal-error
+    /// statements (`FAILED` / `CANCELED` / `CLOSED-no-data`). Mirrors
+    /// the same-named field on the Thrift `TGetOperationStatusResp` so
+    /// wrappers that surface a Thrift-shaped operation status to their
+    /// host language can populate it on the error envelope too.
+    ///
+    /// Independent of [`Error::message`] — `message` is the
+    /// kernel-formatted summary, `display_message` is the raw
+    /// server-supplied string.
+    pub display_message: Option<String>,
+
+    /// Server-supplied diagnostic detail captured from the SEA
+    /// `StatementStatus.diagnostic_info` envelope on terminal-error
+    /// statements. Multi-line text with stack frames or operator
+    /// context. Intended for support / log surfaces, not user-facing.
+    /// Mirrors the same-named Thrift field.
+    pub diagnostic_info: Option<String>,
+
+    /// Server-supplied JSON blob with extended error details, captured
+    /// from the SEA `StatementStatus.error_details_json` envelope on
+    /// terminal-error statements. Pass-through string — wrappers parse
+    /// if they need structured access. Mirrors the same-named Thrift
+    /// field.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` on the
+    /// SQL cluster (`internal()`, default false in
+    /// `DatabricksSQLConf.scala` — not settable via session-conf).
+    /// Most workspaces will return `None` here even on terminal-
+    /// error statements; admin-enabled workspaces return content
+    /// shaped like `{"errorClass": "...", "messageTemplate": "..."}`.
+    pub error_details_json: Option<String>,
+
     /// Underlying cause. Boxed to keep the struct stack-friendly.
     pub cause: Option<Box<Error>>,
 }
@@ -231,6 +265,9 @@ impl Error {
             retryable: false,
             query_id: None,
             location: None,
+            display_message: None,
+            diagnostic_info: None,
+            error_details_json: None,
             cause: None,
         }
     }
@@ -423,6 +460,34 @@ impl Error {
         self
     }
 
+    /// Attach the server-supplied `display_message` from a terminal-
+    /// error SEA `StatementStatus` envelope. Wrappers surfacing a
+    /// Thrift-shaped operation-status object to their host language
+    /// should populate this on the error so callers see the same
+    /// field they would have read from `TGetOperationStatusResp` on
+    /// the Thrift path.
+    pub fn with_display_message(mut self, msg: impl Into<String>) -> Self {
+        self.display_message = Some(msg.into());
+        self
+    }
+
+    /// Attach the server-supplied `diagnostic_info` from a terminal-
+    /// error SEA `StatementStatus` envelope. Multi-line operator /
+    /// stack context; for support surfaces, not user-facing.
+    pub fn with_diagnostic_info(mut self, info: impl Into<String>) -> Self {
+        self.diagnostic_info = Some(info.into());
+        self
+    }
+
+    /// Attach the server-supplied `error_details_json` blob from a
+    /// terminal-error SEA `StatementStatus` envelope. Unbounded
+    /// pass-through string; wrappers parse if they need structured
+    /// access.
+    pub fn with_error_details_json(mut self, json: impl Into<String>) -> Self {
+        self.error_details_json = Some(json.into());
+        self
+    }
+
     pub fn with_cause(mut self, cause: Error) -> Self {
         self.cause = Some(Box::new(cause));
         self
@@ -575,6 +640,43 @@ impl From<arrow_schema::ArrowError> for Error {
 
 /// Convenience alias.
 pub type Result<T> = std::result::Result<T, Error>;
+
+// ─── SEA extended-status carry helpers ──────────────────────────────
+
+/// Copy the SEA extended status fields (`display_message`,
+/// `diagnostic_info`, `error_details_json`) from a wire status onto a
+/// kernel [`Error`].
+///
+/// Mirrors the Thrift `TGetOperationStatusResp` / `TStatus` contract
+/// where the same fields ride on the operation status across
+/// terminal-error states. Called by both the sync polling path
+/// (`client::sea::SeaRestTransport::terminal_outcome`) and the async
+/// poll-driver paths (`statement::executed_async::StatementStatus::
+/// from_sea_response`'s `Failed` arm + `await_result`'s `Cancelled`
+/// arm) so a Thrift-migrating wrapper sees the same field set on the
+/// returned `Error` regardless of which kernel handle the caller is
+/// driving.
+///
+/// `pub(crate)` — internal to the kernel; downstream consumers should
+/// read the fields off the returned `Error` directly. The wire-shape
+/// `types::sea::StatementStatus` is referenced by full path to avoid
+/// pulling the dependency into the `kernel_error` module's public
+/// imports.
+pub(crate) fn carry_extended_status(
+    mut error: Error,
+    status: &crate::types::sea::StatementStatus,
+) -> Error {
+    if let Some(msg) = status.display_message.as_ref() {
+        error = error.with_display_message(msg);
+    }
+    if let Some(info) = status.diagnostic_info.as_ref() {
+        error = error.with_diagnostic_info(info);
+    }
+    if let Some(json) = status.error_details_json.as_ref() {
+        error = error.with_error_details_json(json);
+    }
+    error
+}
 
 // ─── SQLSTATE extraction helpers ────────────────────────────────────
 

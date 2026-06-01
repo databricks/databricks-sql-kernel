@@ -45,9 +45,10 @@
 //! ## Re-execution
 //!
 //! Calling `execute()` or `submit()` again on the same `Statement`
-//! auto-cancels + closes any prior executed handle. The spec persists
-//! across re-executions; only the executed handle is replaced. The
-//! prior handle becomes invalid; subsequent calls on it return
+//! auto-closes any prior executed handle (fire-and-forget — see
+//! [`Statement::invalidate_prior`]). The spec persists across
+//! re-executions; only the executed handle is replaced. The prior
+//! handle becomes invalid; subsequent calls on it return
 //! `ErrorCode::InvalidStatementHandle`. The invalidation propagates
 //! via the [`ValidityFlag`] shared with each executed handle, so the
 //! stale handle short-circuits locally — no network round-trip. See
@@ -101,8 +102,10 @@ pub struct Statement {
     spec: StatementSpec,
     /// Server-issued id of the most recent executed handle from this
     /// `Statement`. `None` until the first `execute()` / `submit()`.
-    /// On re-execute, the kernel reads this slot, fires CancelStatement
-    /// + CloseStatement against it, then overwrites with the new id.
+    /// On re-execute, the kernel reads this slot and spawns a fire-and-
+    /// forget `CloseStatement` against it (skipped if the server already
+    /// auto-closed via the inline-result fast path), then overwrites
+    /// with the new id.
     last_statement_id: Option<String>,
     /// Validity flag shared with the most recent executed handle.
     /// `Some` while a handle is live; `None` between constructions and
@@ -113,8 +116,8 @@ pub struct Statement {
     /// Pre-set to `true` when the server returned `state=CLOSED` in its
     /// execute response (the inline-result fast path), and flipped to
     /// `true` by `ExecutedStatement::close`. Lets `invalidate_prior`
-    /// skip the CancelStatement + CloseStatement round-trips when the
-    /// server side is already gone.
+    /// skip the `CloseStatement` round-trip entirely when the server
+    /// side is already gone.
     last_closed: Option<Arc<AtomicBool>>,
 }
 
@@ -155,11 +158,12 @@ impl Statement {
     /// longer than 10s.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
-    /// it is auto-cancelled and closed before issuing the new
-    /// ExecuteStatement, and the prior handle's
-    /// [`ValidityFlag`] is flipped so subsequent calls on it
-    /// short-circuit to `InvalidStatementHandle` without hitting the
-    /// wire.
+    /// the kernel spawns a fire-and-forget `CloseStatement` against it
+    /// before issuing the new ExecuteStatement (skipped when the
+    /// inline-result fast path already returned `state=CLOSED`), and
+    /// the prior handle's [`ValidityFlag`] is flipped so subsequent
+    /// calls on it short-circuit to `InvalidStatementHandle` without
+    /// hitting the wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
         // `instrument` (rather than `.entered()`) so the resulting
         // future stays `Send` — napi-rs's `execute_tokio_future` and
@@ -255,6 +259,13 @@ impl Statement {
                 response.statement_id,
                 valid,
                 closed,
+                // Seed the executed handle with the SEA status the
+                // server returned on the initial `submit_statement`
+                // response. Subsequent `status()` / `await_result()`
+                // polls overwrite it, but accessors return useful
+                // values immediately even before the caller drives
+                // the first poll.
+                response.status,
             ))
         }
         .instrument(span)
@@ -347,19 +358,39 @@ impl Statement {
         Ok((sql, exec_params))
     }
 
-    /// Auto-cancel + close any prior executed handle this `Statement`
-    /// produced. Errors are swallowed because re-execute should never
-    /// fail because the *prior* server-side resource refused to clean
-    /// up.
+    /// Auto-close any prior executed handle this `Statement` produced.
+    ///
+    /// Happy path: by the time the caller is starting a *new*
+    /// `execute()`, the prior statement has already completed
+    /// server-side (either auto-closed via the inline-result fast
+    /// path's `state=CLOSED`, or sitting in `SUCCEEDED` after the
+    /// consumer drained the result stream). There is nothing in
+    /// flight to cancel — `cancel_statement` would be a wasted
+    /// round-trip asking the server to interrupt a query that's
+    /// already done. Skip it and only fire `close_statement` to
+    /// release the server-side handle.
+    ///
+    /// `close_statement` is spawned fire-and-forget so the next
+    /// `execute()` can fire without waiting on the cleanup RPC.
+    /// On cluster networks each saved RTT is ~5-20ms; on tight
+    /// re-execute loops over cloud-fetched results that's a
+    /// measurable per-iter win. Correctness is preserved because
+    /// the server's close_statement is idempotent and a transient
+    /// failure is harmless — the server reclaims the handle at
+    /// session expiry. Mirrors `ExecutedStatement::drop`.
+    ///
+    /// In-flight cancel (interrupting a still-running query) is
+    /// handled separately by [`MidExecuteCancelGuard`], which fires
+    /// only when `execute()` itself is dropped mid-await.
     async fn invalidate_prior(&mut self) {
         if let Some(valid) = self.last_valid.take() {
             valid.invalidate();
         }
         // If the shared `closed` flag is already set, the server side
-        // is gone (either the server auto-closed on the inline-result
-        // fast path, or the caller already closed the executed
-        // handle). Flip it to claim the cleanup duty in case it
-        // wasn't set yet, and skip the round-trips.
+        // is gone (server auto-closed on the inline-result fast path,
+        // or the caller already closed the executed handle). Flip it
+        // to claim the cleanup duty in case it wasn't set yet, and
+        // skip the round-trip.
         let already_closed = self
             .last_closed
             .take()
@@ -369,24 +400,16 @@ impl Statement {
             if already_closed {
                 return;
             }
-            // Best-effort cancel + close. We don't await the cancel
-            // separately — close is idempotent and the server
-            // releases resources on close regardless of cancel
-            // status.
-            if let Err(e) = self.session.transport().cancel_statement(&prior_id).await {
-                warn!(
-                    statement_id = %prior_id,
-                    error = %e,
-                    "auto-cancel of prior statement failed; closing anyway"
-                );
-            }
-            if let Err(e) = self.session.transport().close_statement(&prior_id).await {
-                warn!(
-                    statement_id = %prior_id,
-                    error = %e,
-                    "auto-close of prior statement failed; will be reclaimed by session close"
-                );
-            }
+            let transport = Arc::clone(self.session.transport());
+            self.session.runtime_handle().spawn(async move {
+                if let Err(e) = transport.close_statement(&prior_id).await {
+                    warn!(
+                        statement_id = %prior_id,
+                        error = %e,
+                        "auto-close of prior statement failed; will be reclaimed by session close"
+                    );
+                }
+            });
         }
     }
 }

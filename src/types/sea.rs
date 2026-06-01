@@ -33,7 +33,25 @@ pub struct StatementExecutionResponse {
 }
 
 /// Status of a statement execution.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `#[non_exhaustive]` — external Rust callers can read fields directly
+/// but cannot use a struct literal. Adding new wire-shape fields stays
+/// non-breaking for downstream crates (in-crate construction is
+/// unaffected).
+//
+// TODO(pr23-followup): add a `progress` field once the SEA server
+// actually emits one. Empirically verified against pecotesting on
+// 2026-05-27 — a 37s heavy TPC-H query against a SQL warehouse, polled
+// 7 times with `getProgressUpdate=true` on the Thrift path, returned
+// `progressUpdateResponse = null` on every poll. Adding the field to
+// the kernel before the wire supports it ships an Option<...> that's
+// always None, locks us into a shape (`f64`) that doesn't match
+// Thrift's `TProgressUpdateResp` struct (headerNames / rows /
+// footerSummary / progressedPercentage), and creates user-visible
+// API churn when the server finally does grow progress support. Hold
+// off until then.
+#[non_exhaustive]
+#[derive(Clone, Deserialize)]
 pub struct StatementStatus {
     pub state: StatementState,
     #[serde(default)]
@@ -43,25 +61,66 @@ pub struct StatementStatus {
     /// surface the counter.
     #[serde(default)]
     pub num_modified_rows: Option<i64>,
-    /// Fractional completion in `[0.0, 1.0]`. Populated on analytics
-    /// warehouses; absent (or always 1.0 on terminal) elsewhere.
-    #[serde(default)]
-    pub progress: Option<f64>,
     /// Server-supplied user-facing message (e.g. "Statement was
     /// canceled by the user" or progress hints). Distinct from
     /// `error.message`; populated on non-error states too.
+    ///
+    /// **PII / sensitive-data note:** server-supplied free-form text
+    /// may include fragments of the original SQL or parameter values.
+    /// Wrappers forwarding this to centralised logs should redact or
+    /// truncate per their own PII policy.
     #[serde(default)]
     pub display_message: Option<String>,
     /// Server-supplied diagnostic detail — multi-line text with
     /// stack frames or operator context. Intended for log / support
     /// surfaces, not user-facing strings.
+    ///
+    /// **PII / sensitive-data note:** like `display_message`, this is
+    /// server-supplied free-form text and may include SQL fragments
+    /// or values. Redact before centralised logging.
     #[serde(default)]
     pub diagnostic_info: Option<String>,
     /// Server-supplied JSON blob with extended error details.
     /// Pass-through string — wrappers parse if they need structured
     /// access.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` set on
+    /// the underlying SQL cluster. The flag is declared in
+    /// `DatabricksSQLConf.scala` as `internal()` with
+    /// `createWithDefault(false)`, so it is NOT settable from a
+    /// client session-configuration request (verified empirically on
+    /// 2026-05-27: pecotesting returns `[CONFIG_NOT_AVAILABLE]
+    /// SQLSTATE: 42K0I` when the client attempts to SET it). When the
+    /// flag is off the field is `None` even on terminal-error
+    /// statements that otherwise populate `display_message` /
+    /// `diagnostic_info`. When populated, the content format is
+    /// `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
+    /// **Unbounded:** the server can return a multi-MB blob. Wrappers
+    /// surfacing this should bound size before logging.
     #[serde(default)]
     pub error_details_json: Option<String>,
+}
+
+impl std::fmt::Debug for StatementStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Truncate unbounded server-supplied free-form strings so a
+        // `?status` in a tracing span doesn't dump multi-MB blobs.
+        // Presence + length are the load-bearing signal; the content
+        // itself goes through dedicated accessors on `ExecutedStatement`.
+        fn summarise(s: &Option<String>) -> Option<String> {
+            s.as_ref().map(|v| format!("<{} chars>", v.len()))
+        }
+        f.debug_struct("StatementStatus")
+            .field("state", &self.state)
+            .field("error", &self.error)
+            .field("num_modified_rows", &self.num_modified_rows)
+            .field("display_message", &summarise(&self.display_message))
+            .field("diagnostic_info", &summarise(&self.diagnostic_info))
+            .field("error_details_json", &summarise(&self.error_details_json))
+            .finish()
+    }
 }
 
 /// Possible states of a statement during execution.
@@ -597,13 +656,16 @@ mod tests {
 
     #[test]
     fn test_statement_status_with_extended_fields() {
-        // SEA response with all five extended status fields populated.
+        // SEA response with the extended status fields populated. The
+        // wire field `progress` was empirically absent on the SQL
+        // warehouse path (see the field-level TODO in `StatementStatus`)
+        // and has been dropped from the kernel until a server-side
+        // shape is settled.
         let json = r#"{
             "statement_id": "stmt-extended",
             "status": {
                 "state": "SUCCEEDED",
                 "num_modified_rows": 42,
-                "progress": 0.875,
                 "display_message": "Statement completed",
                 "diagnostic_info": "operator=Scan; rows=42",
                 "error_details_json": "{\"trace\":\"...\"}"
@@ -613,7 +675,6 @@ mod tests {
         let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status.state, StatementState::Succeeded);
         assert_eq!(response.status.num_modified_rows, Some(42));
-        assert_eq!(response.status.progress, Some(0.875));
         assert_eq!(
             response.status.display_message,
             Some("Statement completed".to_string())
@@ -639,10 +700,27 @@ mod tests {
 
         let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status.num_modified_rows, None);
-        assert_eq!(response.status.progress, None);
         assert_eq!(response.status.display_message, None);
         assert_eq!(response.status.diagnostic_info, None);
         assert_eq!(response.status.error_details_json, None);
+    }
+
+    #[test]
+    fn test_statement_status_ignores_unknown_progress_field() {
+        // Forward-compat: if the SEA server starts emitting a
+        // `progress` field, the kernel must not break — it's just an
+        // unknown JSON key today and `serde(default)` on the modelled
+        // fields means we ignore it. Pin this behaviour so a future
+        // strict-mode bump can't silently break the kernel.
+        let json = r#"{
+            "statement_id": "stmt-progress",
+            "status": {
+                "state": "RUNNING",
+                "progress": 0.5
+            }
+        }"#;
+        let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status.state, StatementState::Running);
     }
 
     #[test]

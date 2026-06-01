@@ -478,9 +478,20 @@ impl SessionBuilder {
         self
     }
 
-    /// TLS settings (custom CA, hostname-mismatch tolerance, …).
-    /// Reserved in v0 (`#[non_exhaustive]` empty struct); fields land
-    /// in v0.1.
+    /// TLS settings — custom CA bundle, self-signed acceptance,
+    /// hostname-verification skip. See [`TlsConfig`] for the field
+    /// list. Default is the most secure stance: validate against the
+    /// system trust store, require a valid certificate chain, and
+    /// verify hostnames.
+    ///
+    /// ```no_run
+    /// # use databricks_sql_kernel::{TlsConfig, Session};
+    /// # fn build() -> Result<(), Box<dyn std::error::Error>> {
+    /// let mut tls = TlsConfig::default();
+    /// tls.custom_ca_cert = Some(std::fs::read("/etc/ssl/corp-ca.pem")?);
+    /// let _builder = Session::builder().tls(tls);
+    /// # Ok(()) }
+    /// ```
     pub fn tls(mut self, tls: TlsConfig) -> Self {
         self.tls = Some(tls);
         self
@@ -581,8 +592,10 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
     };
     // Touch the still-reserved proxy config so a future field addition
     // (without setting it through here) shows up as a compile error
-    // rather than a silently-dropped option.
-    let ProxyConfig { .. } = config.proxy.clone().unwrap_or_default();
+    // rather than a silently-dropped option. Explicit `ProxyConfig {}`
+    // (NOT `{ .. }`) — the `..` rest pattern would defeat the
+    // tripwire by silently accepting any new field.
+    let ProxyConfig {} = config.proxy.clone().unwrap_or_default();
     let _ = &mut hcc;
     hcc
 }

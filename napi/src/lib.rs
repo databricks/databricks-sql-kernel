@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! `databricks-sea-native` — napi-rs binding crate for the Databricks
-//! SQL Node.js driver's SEA (Statement Execution API) path.
+//! `databricks-sql-kernel-napi` — napi-rs binding crate for the
+//! Databricks SQL Kernel, consumed by the Databricks SQL Node.js driver.
 //!
 //! Surface: `openSession()` (free function) → `Connection` (opaque
 //! class with `executeStatement` / `close` / `sessionId`) →

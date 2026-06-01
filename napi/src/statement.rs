@@ -196,6 +196,110 @@ impl Statement {
         &self.statement_id
     }
 
+    // ─── SEA extended status accessors (Thrift parity) ─────────────────
+    //
+    // Mirror the same-named optional fields on the NodeJS Thrift
+    // driver's `TGetOperationStatusResp`. Populated whenever the SEA
+    // server sets them on the terminal `StatementStatus` envelope; the
+    // kernel stores the status struct once at construction so the
+    // accessors are read-only and lock-free at the kernel layer.
+    //
+    // These methods are `async` because the napi binding's inner
+    // state sits inside `Arc<Mutex<Option<StatementInner>>>` and the
+    // lock shape mirrors `fetchNextBatch` / `cancel` — a brief tokio
+    // mutex held across the kernel accessor call. After `close()` the
+    // inner state has been taken; the accessors throw an
+    // `InvalidStatementHandle` error in that case, matching the
+    // existing `cancel()` semantics.
+
+    /// Number of rows modified by the statement (UPDATE / INSERT /
+    /// DELETE / MERGE). `null` for SELECT and on warehouses that don't
+    /// surface the counter. Mirrors Thrift's
+    /// `TGetOperationStatusResp.numModifiedRows`.
+    #[napi]
+    pub async fn num_modified_rows(&self) -> napi::Result<Option<i64>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
+            Ok(inner_state.executed.num_modified_rows())
+        })
+        .await
+    }
+
+    // TODO(pr23-followup): mirror a `progress()` accessor here once
+    // the kernel exposes one. Empirically, the SEA server does not
+    // populate progress today (verified 2026-05-27 against pecotesting:
+    // a 37s heavy TPC-H query polled 7 times with
+    // `getProgressUpdate=true` on the Thrift NodeJS path returned
+    // `progressUpdateResponse = null` on every poll). When the server
+    // grows progress support, expose it here under the same name JS
+    // callers expect from Thrift's `TGetOperationStatusResp.progressUpdateResponse`
+    // — likely as a struct mirroring `TProgressUpdateResp`, not a bare
+    // float.
+
+    /// Server-supplied user-facing message. Mirrors Thrift's
+    /// `TGetOperationStatusResp.displayMessage`. **PII / sensitive-
+    /// data note:** may contain SQL fragments or parameter values —
+    /// redact before centralised logging.
+    ///
+    /// Populated on `Succeeded` / `Closed-with-inline-data` paths.
+    /// On terminal-error states (`Failed` / `Cancelled` /
+    /// `Closed-no-data`) the kernel returns an Error instead of a
+    /// `Statement`, and the same field rides on the JS Error envelope
+    /// under the same `displayMessage` key.
+    #[napi]
+    pub async fn display_message(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
+            Ok(inner_state.executed.display_message().map(str::to_owned))
+        })
+        .await
+    }
+
+    /// Server-supplied diagnostic detail — multi-line operator /
+    /// stack context. Mirrors Thrift's
+    /// `TGetOperationStatusResp.diagnosticInfo`. For support surfaces,
+    /// not user-facing. Same reachability + PII caveats as
+    /// `displayMessage`.
+    #[napi]
+    pub async fn diagnostic_info(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
+            Ok(inner_state.executed.diagnostic_info().map(str::to_owned))
+        })
+        .await
+    }
+
+    /// Server-supplied JSON blob with extended error details. Mirrors
+    /// Thrift's `TGetOperationStatusResp.errorDetailsJson`.
+    /// Pass-through string — JS callers parse with `JSON.parse` if
+    /// they need structured access.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` on the
+    /// underlying SQL cluster. The flag is internal-only / default-
+    /// false in the Databricks runtime, so for most JS callers this
+    /// will return `null`. Admin-enabled workspaces return content
+    /// shaped like `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
+    /// **Unbounded:** when populated, server can return a multi-MB
+    /// blob; size before logging.
+    #[napi]
+    pub async fn error_details_json(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
+            Ok(inner_state.executed.error_details_json().map(str::to_owned))
+        })
+        .await
+    }
+
     /// Pull the next batch of results. Returns `null` when the stream
     /// is exhausted. The returned `ArrowBatch.ipcBytes` is a complete
     /// Arrow IPC stream (schema header + 1 record-batch message)
@@ -248,7 +352,7 @@ impl Statement {
                     return Err(napi_err_from_kernel(
                         KernelError::invalid_argument().message(format!(
                             "non-Arrow ResultBatch variant from kernel — \
-                             databricks-sea-native v{} cannot decode this batch \
+                             databricks-sql-kernel-napi v{} cannot decode this batch \
                              shape, upgrade the binding",
                             env!("CARGO_PKG_VERSION"),
                         )),
