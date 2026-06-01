@@ -14,13 +14,28 @@
 
 //! Inline Arrow results support.
 //!
-//! This module handles inline Arrow results that are embedded directly in the
-//! API response (via the `attachment` field) rather than being downloaded from
-//! cloud storage via CloudFetch.
+//! This module handles inline Arrow results that are embedded directly
+//! in the API response (via the `attachment` field) rather than being
+//! downloaded from cloud storage via CloudFetch.
 //!
-//! Inline results are used for small result sets where the overhead of CloudFetch
-//! (presigned URL generation, separate HTTP download) would be inefficient.
+//! Two paths live here:
+//!
+//! - [`InlineArrowProvider`] (in [`provider`]) — single-chunk case.
+//!   The whole result fits in one `attachment`; we parse it up front
+//!   and yield batches synchronously. Used when the initial execute
+//!   response embeds the full result and `next_chunk_index` is
+//!   absent.
+//!
+//! - [`InlineStreamingProvider`] (in [`streaming`]) — multi-chunk
+//!   case. The server returns one chunk at a time via
+//!   `GET /result/chunks/{idx}?row_offset=N`; the kernel maintains a
+//!   bounded rolling window of pre-decoded chunks ahead of the
+//!   consumer. Used when CloudFetch is disabled
+//!   (`can_cloud_download=false` session conf) and the result is
+//!   large enough that the server paginates it.
 
 mod provider;
+mod streaming;
 
 pub use provider::InlineArrowProvider;
+pub(crate) use streaming::{InlineChunkSource, InlineStreamingProvider};

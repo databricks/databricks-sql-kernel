@@ -1202,6 +1202,15 @@ mod tests {
             })
         }
 
+        async fn get_inline_chunk(
+            &self,
+            _statement_id: &str,
+            _chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<crate::client::InlineChunkFetchResult> {
+            unimplemented!("get_inline_chunk not used by the link-fetcher mock")
+        }
+
         fn poll_config(&self) -> crate::client::TransportConfig {
             crate::client::TransportConfig::default()
         }

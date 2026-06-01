@@ -30,7 +30,7 @@ use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::{SeaChunkLinkFetcher, SeaChunkLinkFetcherHandle};
 use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
-use crate::reader::inline::InlineArrowProvider;
+use crate::reader::inline::{InlineArrowProvider, InlineStreamingProvider};
 use crate::reader::post_processor::{PostProcessOptions, ResultPostProcessor};
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
@@ -178,6 +178,116 @@ impl ResultReaderFactory {
             // Priority 2: Inline Arrow (attachment present)
             if let Some(ref inline_data) = result.inline_arrow_data {
                 if !inline_data.is_empty() {
+                    // Multi-chunk inline-Arrow streaming path: kicks
+                    // in when the server emitted a `next_chunk_index`
+                    // alongside the initial inline attachment. The
+                    // streaming provider holds a rolling window of
+                    // pre-decoded chunks ahead of the consumer
+                    // (bounded by `inline_max_chunks_in_memory`); each
+                    // continuation `get_inline_chunk` carries both
+                    // chunk_index (= prev `next_chunk_index`) and
+                    // row_offset (= prev `row_offset + row_count`)
+                    // per the bounded SEA API contract.
+                    //
+                    // Rollout-skew guard: a pre-rollout server may
+                    // emit a multi-chunk inline-Arrow result without
+                    // populating `next_chunk_index` on the
+                    // attachment-bearing response. The manifest's
+                    // (deprecated but still emitted) `total_chunk_count`
+                    // distinguishes that case from a genuinely
+                    // single-chunk result. When the per-link signal
+                    // is absent but `total_chunk_count > 1`, we
+                    // refuse to silently truncate — instead surface
+                    // a clear error so the rollout asymmetry is
+                    // visible. Mirrors the PR #68 transition-period
+                    // fix on CloudFetch.
+                    let total_chunks = response.manifest.as_ref().and_then(|m| m.total_chunk_count);
+                    if result.inline_next_chunk_index.is_none() {
+                        if let Some(total) = total_chunks {
+                            if total > 1 {
+                                return Err(Error::data_loss().message(format!(
+                                    "Inline-Arrow response is missing per-chunk \
+                                     next_chunk_index but the manifest reports \
+                                     total_chunk_count={}. Likely cause: server has not \
+                                     rolled out the bounded SEA API per-chunk \
+                                     continuation field. Refusing to silently truncate \
+                                     a multi-chunk result.",
+                                    total,
+                                )));
+                            }
+                        }
+                    }
+                    if let Some(next_idx) = result.inline_next_chunk_index {
+                        // Strict: when the server has opted into the
+                        // multi-chunk streaming path (signalled by
+                        // emitting `next_chunk_index`), the per-chunk
+                        // metadata MUST be present too. Defaulting
+                        // `row_count` to 0 would silently corrupt the
+                        // next-fetch row_offset (we compute
+                        // `row_offset + row_count` for the
+                        // continuation). Symmetric with the strict
+                        // handling in `sea.rs::get_inline_chunk` for
+                        // continuation responses.
+                        let inline_chunk_index = result.inline_chunk_index.ok_or_else(|| {
+                            Error::data_loss().message(
+                                "Inline-Arrow initial response has \
+                                 next_chunk_index but is missing chunk_index — \
+                                 server contract violation",
+                            )
+                        })?;
+                        let inline_row_offset = result.inline_row_offset.ok_or_else(|| {
+                            Error::data_loss().message(
+                                "Inline-Arrow initial response has \
+                                 next_chunk_index but is missing row_offset — \
+                                 server contract violation",
+                            )
+                        })?;
+                        let inline_row_count = result.inline_row_count.ok_or_else(|| {
+                            Error::data_loss().message(
+                                "Inline-Arrow initial response has \
+                                 next_chunk_index but is missing row_count — \
+                                 cannot derive next-fetch row_offset safely",
+                            )
+                        })?;
+                        tracing::info!(
+                            "Using inline-Arrow streaming reader: {} bytes initial chunk, \
+                             next_chunk_index={}",
+                            inline_data.len(),
+                            next_idx,
+                        );
+                        // Pass the manifest-derived schema as a
+                        // fallback for the case where the initial
+                        // chunk decodes to zero batches (paginated
+                        // results sometimes ship an empty leading
+                        // chunk). Without this, `schema()` would
+                        // return `None` and downstream wrappers
+                        // would reject the stream.
+                        let manifest_schema = response.manifest.as_ref().and_then(|m| {
+                            match Self::extract_schema_from_manifest(Some(m)) {
+                                Ok(s) => Some(s),
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "Failed to extract manifest schema for inline-Arrow \
+                                             streaming fallback; proceeding without it: {e}"
+                                    );
+                                    None
+                                }
+                            }
+                        });
+                        return self.create_inline_streaming_reader(
+                            statement_id,
+                            inline_data.clone(),
+                            inline_chunk_index,
+                            inline_row_offset,
+                            inline_row_count,
+                            Some(next_idx),
+                            compression,
+                            manifest_schema,
+                        );
+                    }
+
+                    // Single-chunk inline: legacy fast path, parses
+                    // the whole result up front.
                     tracing::info!(
                         "Using inline Arrow reader: {} bytes of Arrow IPC data",
                         inline_data.len()
@@ -335,6 +445,66 @@ impl ResultReaderFactory {
 
         Ok(Box::new(InlineArrowReader::new(provider)))
     }
+
+    /// Build a multi-chunk inline-Arrow streaming reader.
+    ///
+    /// Wraps the [`InlineStreamingProvider`] in a [`ResultReader`]
+    /// adapter so the rest of the kernel can treat the inline
+    /// streaming path identically to CloudFetch.
+    ///
+    /// `manifest_schema` is forwarded to the provider as a fallback
+    /// for the case where the initial chunk decodes to zero
+    /// batches. See the comment at the call-site for context.
+    #[allow(clippy::too_many_arguments)]
+    fn create_inline_streaming_reader(
+        &self,
+        statement_id: &str,
+        initial_attachment: Vec<u8>,
+        initial_chunk_index: i64,
+        initial_row_offset: i64,
+        initial_row_count: i64,
+        next_chunk_index: Option<i64>,
+        compression: CompressionCodec,
+        manifest_schema: Option<SchemaRef>,
+    ) -> Result<Box<dyn ResultReader + Send>> {
+        tracing::debug!(
+            "Creating inline-Arrow streaming reader: stmt={}, initial_chunk={}, \
+             next_chunk={:?}, max_in_memory={}",
+            statement_id,
+            initial_chunk_index,
+            next_chunk_index,
+            self.config.inline_max_chunks_in_memory,
+        );
+
+        // Note: `Arc::new(self.client.clone())` produces
+        // `Arc<Arc<dyn Transport>>` because the blanket impl of
+        // `InlineChunkSource` is on `Arc<dyn Transport>` (not on
+        // `dyn Transport`), and trait-objects of different traits
+        // don't share a vtable so direct coercion
+        // `Arc<dyn Transport>` → `Arc<dyn InlineChunkSource>`
+        // isn't legal. The outer `Arc::new` is the price of using a
+        // narrow trait so test mocks don't have to stub the full
+        // 20-method `Transport` surface; net cost is one extra
+        // pointer + one extra deref per RPC, negligible vs the SEA
+        // round-trip.
+        let source: Arc<dyn crate::reader::inline::InlineChunkSource> =
+            Arc::new(self.client.clone());
+        let provider = InlineStreamingProvider::new(
+            source,
+            statement_id.to_string(),
+            initial_attachment,
+            initial_chunk_index,
+            initial_row_offset,
+            initial_row_count,
+            next_chunk_index,
+            compression,
+            self.config.inline_max_chunks_in_memory,
+            manifest_schema,
+            self.runtime_handle.clone(),
+        )?;
+
+        Ok(Box::new(InlineStreamingReader::new(provider)))
+    }
 }
 
 /// Trait for result readers.
@@ -416,6 +586,38 @@ impl ResultReader for InlineArrowReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
+    }
+}
+
+/// Reader for multi-chunk inline-Arrow streaming.
+///
+/// Wraps [`InlineStreamingProvider`] to implement the [`ResultReader`]
+/// trait. The provider's prefetch task fills a bounded rolling
+/// window of decoded chunks; `next_batch` pulls one Arrow batch at
+/// a time from the head of that window.
+struct InlineStreamingReader {
+    provider: Arc<InlineStreamingProvider>,
+    /// Cached schema (extracted from the initial chunk).
+    schema: Option<SchemaRef>,
+}
+
+impl InlineStreamingReader {
+    fn new(provider: Arc<InlineStreamingProvider>) -> Self {
+        let schema = provider.schema().cloned();
+        Self { provider, schema }
+    }
+}
+
+#[async_trait]
+impl ResultReader for InlineStreamingReader {
+    async fn schema(&self) -> Result<SchemaRef> {
+        self.schema.clone().ok_or_else(|| {
+            Error::invalid_state().message("Schema not available for inline-Arrow streaming result")
+        })
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        self.provider.next_batch().await
     }
 }
 
@@ -1088,4 +1290,347 @@ mod tests {
     // ManifestAugmentingReader behaviour is now covered by
     // `post_processor::tests` — the wrapper itself was folded into
     // `ResultPostProcessor`.
+
+    // ──────────────────────────────────────────────────────────────
+    // ResultReaderFactory::create_inner_reader — rollout-guard and
+    // initial-response strictness tests (PR #71 round-2 feedback
+    // B-2, B-3).
+    //
+    // The rollout-guard fires before any Transport method is
+    // called, so the test only needs a `Transport` impl that
+    // compiles. We use a panicking stub.
+    // ──────────────────────────────────────────────────────────────
+
+    use crate::client::{
+        ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult,
+        ExecuteResultData, HttpClientConfig, InlineChunkFetchResult, SessionInfo, TransportConfig,
+    };
+    use crate::kernel_error::ErrorCode;
+    use crate::reader::post_processor::PostProcessOptions;
+    use crate::types::sea::{ExecuteParams, ServiceError, StatementStatus};
+    use std::collections::HashMap;
+
+    /// Transport stub that panics on every method. Adequate for
+    /// tests that exercise the *factory's* synchronous control
+    /// flow before any RPC fires (e.g. the rollout-skew guard).
+    #[derive(Debug)]
+    struct PanickingTransport;
+
+    #[async_trait]
+    impl Transport for PanickingTransport {
+        async fn create_session(
+            &self,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: HashMap<String, String>,
+        ) -> Result<SessionInfo> {
+            unreachable!("PanickingTransport: not used by these tests")
+        }
+        async fn delete_session(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn execute_statement(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecuteParams,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn submit_statement(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecuteParams,
+        ) -> Result<ExecuteResponse> {
+            unreachable!()
+        }
+        async fn fetch_completed_result(&self, _: &str) -> Result<Option<ExecuteResult>> {
+            unreachable!()
+        }
+        async fn statement_status(&self, _: &str) -> Result<ExecuteResponse> {
+            unreachable!()
+        }
+        async fn get_result_chunks(&self, _: &str, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+            unreachable!()
+        }
+        async fn get_inline_chunk(
+            &self,
+            _: &str,
+            _: i64,
+            _: i64,
+        ) -> Result<InlineChunkFetchResult> {
+            unreachable!()
+        }
+        fn poll_config(&self) -> TransportConfig {
+            TransportConfig::default()
+        }
+        async fn cancel_statement(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn close_statement(&self, _: &str) -> Result<()> {
+            unreachable!()
+        }
+        async fn list_catalogs(&self, _: &str) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_schemas(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_tables(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&[&str]>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_columns(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_procedures(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_functions(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_primary_keys(
+            &self,
+            _: &str,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        async fn list_foreign_keys(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: &str,
+            _: &str,
+            _: &str,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
+        fn list_table_types(&self) -> Vec<String> {
+            unreachable!()
+        }
+    }
+
+    /// Build a `ResultReaderFactory` against the panicking stub
+    /// transport. Used by control-flow tests that don't fire any
+    /// RPC.
+    fn factory_for_control_flow_test() -> ResultReaderFactory {
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap(),
+        );
+        let runtime = tokio::runtime::Handle::current();
+        ResultReaderFactory::new(
+            Arc::new(PanickingTransport),
+            http_client,
+            CloudFetchConfig::default(),
+            PostProcessOptions::default(),
+            runtime,
+        )
+    }
+
+    fn ok_status() -> StatementStatus {
+        StatementStatus {
+            state: StatementState::Succeeded,
+            error: None::<ServiceError>,
+            num_modified_rows: None,
+            display_message: None,
+            diagnostic_info: None,
+            error_details_json: None,
+        }
+    }
+
+    fn minimal_manifest(total_chunk_count: Option<i64>) -> ResultManifest {
+        ResultManifest {
+            format: "ARROW_STREAM".to_string(),
+            schema: ResultSchema {
+                column_count: 0,
+                columns: vec![],
+            },
+            total_chunk_count,
+            total_row_count: None,
+            total_byte_count: None,
+            truncated: false,
+            chunks: None,
+            result_compression: None,
+        }
+    }
+
+    /// B-2: the rollout-guard branch. Server emits multi-chunk
+    /// inline-Arrow (manifest says total_chunk_count = 2) but
+    /// without the per-chunk `next_chunk_index` field. The factory
+    /// MUST surface `data_loss` rather than silently truncate the
+    /// result after the first chunk.
+    #[tokio::test]
+    async fn rollout_guard_errors_when_total_chunks_disagrees_with_next_chunk_index() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(2))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                // Non-empty inline payload, but per-chunk
+                // continuation is missing.
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                inline_row_count: Some(0),
+                inline_next_chunk_index: None,
+            }),
+        };
+
+        let err = match factory.create_inner_reader("stmt-1", &response) {
+            Ok(_) => panic!("rollout-skew must surface as Err"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(
+            err.message.contains("total_chunk_count"),
+            "error must call out the total_chunk_count discrepancy: {}",
+            err.message,
+        );
+    }
+
+    /// B-2 negative: when total_chunk_count says 1 (genuinely
+    /// single-chunk), the rollout guard MUST NOT fire. The
+    /// single-chunk inline path is taken instead, which would only
+    /// error if the bytes don't parse as Arrow IPC — but the
+    /// rollout guard runs BEFORE the parse, so it suffices to
+    /// confirm the error (if any) is NOT a `data_loss` mentioning
+    /// `total_chunk_count`.
+    #[tokio::test]
+    async fn rollout_guard_does_not_fire_on_genuinely_single_chunk() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(1))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                // Garbage bytes — the rollout guard won't reach the
+                // IPC parse step, so this is fine for the guard
+                // test. If we ever hit `data_loss` mentioning
+                // `total_chunk_count`, the guard erroneously fired.
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                inline_row_count: Some(1),
+                inline_next_chunk_index: None,
+            }),
+        };
+
+        match factory.create_inner_reader("stmt-1", &response) {
+            // OK or any non-rollout-guard error is acceptable —
+            // we're proving the guard is *not* the failure mode.
+            Ok(_) => {}
+            Err(e) => assert!(
+                !e.message.contains("total_chunk_count"),
+                "rollout guard erroneously fired for single-chunk: {}",
+                e.message,
+            ),
+        }
+    }
+
+    /// B-3: initial execute response must be strict about
+    /// `row_count` when `next_chunk_index.is_some()`. Defaulting
+    /// to 0 would silently corrupt the next-fetch row_offset.
+    #[tokio::test]
+    async fn initial_response_requires_row_count_when_streaming() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(2))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                // Critical: row_count missing on an
+                // attachment-bearing response that opts into
+                // streaming (next_chunk_index is Some).
+                inline_row_count: None,
+                inline_next_chunk_index: Some(1),
+            }),
+        };
+
+        let err = match factory.create_inner_reader("stmt-1", &response) {
+            Ok(_) => panic!("missing row_count on streaming response must surface as Err"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(
+            err.message.to_lowercase().contains("row_count"),
+            "error must mention the missing field: {}",
+            err.message,
+        );
+    }
+
+    #[tokio::test]
+    async fn initial_response_requires_chunk_index_when_streaming() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(2))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: None,
+                inline_row_offset: Some(0),
+                inline_row_count: Some(1),
+                inline_next_chunk_index: Some(1),
+            }),
+        };
+
+        let err = match factory.create_inner_reader("stmt-1", &response) {
+            Ok(_) => panic!("missing chunk_index on streaming response must surface as Err"),
+            Err(e) => e,
+        };
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(
+            err.message.to_lowercase().contains("chunk_index"),
+            "error must mention the missing field: {}",
+            err.message,
+        );
+    }
 }

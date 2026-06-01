@@ -385,6 +385,12 @@ pub struct GetChunksResponse {
     pub next_chunk_index: Option<i64>,
     #[serde(default)]
     pub external_links: Option<Vec<ExternalLink>>,
+    /// Inline Arrow IPC bytes (base64-decoded by serde) for the
+    /// inline-Arrow streaming path. Populated when the server
+    /// returns chunks inline rather than via CloudFetch — i.e. when
+    /// the session was opened with `can_cloud_download=false`.
+    #[serde(default, deserialize_with = "deserialize_base64_attachment")]
+    pub attachment: Option<Vec<u8>>,
 }
 
 #[cfg(test)]

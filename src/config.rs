@@ -564,6 +564,21 @@ pub struct ResultConfig {
     /// Bounds parallelism and peak RSS.
     pub cloudfetch_max_chunks_in_memory: usize,
 
+    /// Maximum number of decompressed Arrow chunks the inline-Arrow
+    /// streaming reader holds in memory at once. Analogue of
+    /// [`Self::cloudfetch_max_chunks_in_memory`] for the inline path
+    /// (used when [`Self::cloudfetch_enabled`] is `false`).
+    ///
+    /// The inline path is sequential per the SEA contract — one
+    /// `GetResultData` call at a time — so this knob bounds the
+    /// **prefetch window** (chunks the kernel pulls ahead of the
+    /// consumer) rather than the download parallelism. Larger values
+    /// give the consumer a deeper buffer at the cost of memory.
+    ///
+    /// Default `4`. Range 1..=N; `1` disables prefetching and gives
+    /// strict lazy fetch-on-demand semantics.
+    pub inline_max_chunks_in_memory: usize,
+
     /// When `true`, every column of complex type (`List` /
     /// `LargeList` / `FixedSizeList` / `Map` / `Struct`, plus the
     /// precise types `VARIANT` / `GEOMETRY` / `GEOGRAPHY` carried in
@@ -605,6 +620,7 @@ impl Default for ResultConfig {
             cloudfetch_enabled: true,
             cloudfetch_link_prefetch_window: 10,
             cloudfetch_max_chunks_in_memory: 16,
+            inline_max_chunks_in_memory: 4,
             complex_types_as_json: false,
             intervals_as_string: false,
         }
