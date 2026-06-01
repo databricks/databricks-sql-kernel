@@ -222,7 +222,11 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.num_modified_rows())
+            // Metadata result streams carry no operation-status fields.
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.num_modified_rows()),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -254,7 +258,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.display_message().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.display_message().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -270,7 +277,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.diagnostic_info().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.diagnostic_info().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -295,7 +305,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.error_details_json().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.error_details_json().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
