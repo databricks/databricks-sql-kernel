@@ -22,7 +22,7 @@
 
 use crate::kernel_error::{Error, Result};
 use crate::metadata::type_mapping::{arrow_type_to_databricks, databricks_type_to_arrow};
-use crate::statement::spec::{geo_wire, TypedValue};
+use crate::statement::spec::TypedValue;
 use crate::types::sea::StatementParameter;
 use arrow_array::cast::AsArray;
 use arrow_array::types::*;
@@ -399,44 +399,40 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
         // input with its own error. The connector or caller is
         // expected to have produced valid JSON.
         TypedValue::Variant(s) => ok("VARIANT", Some(s.clone())),
-        // `GEOGRAPHY` and `GEOMETRY` — bind as EWKT today. The
-        // `param_type` carries the SRID decorator when present
-        // (e.g. `GEOGRAPHY(4326)`), matching the form the server
-        // emits in column metadata. The `value` is EWKT (`SRID=N;
-        // WKT`) when SRID is set; bare WKT when not.
+        // `GEOGRAPHY` and `GEOMETRY` — bind as `STRING` on the
+        // wire, carrying **bare WKT** (e.g. `POINT(1 2)`). SEA's
+        // `parameters` array does not accept `GEOGRAPHY` /
+        // `GEOMETRY` as parameter types:
+        //   - `param_type=GEOGRAPHY(SRID)` → server rejects
+        //     `INVALID_PARAMETER_MARKER_VALUE.INVALID_VALUE_FOR_DATA_TYPE`
+        //   - `param_type=GEOGRAPHY` (bare) → server rejects
+        //     `INVALID_PARAMETER_MARKER_VALUE.INVALID_DATA_TYPE`
         //
-        // Binding via WKB is not yet wired — when SEA grows the
-        // binary geo input path, this arm gets a branch on
-        // `wkb.is_some()` to send the binary form instead. The
-        // variant's optional `wkb` field is already in place to
-        // make that change additive.
-        TypedValue::Geography { wkt, srid, .. } => ok(
-            geo_param_type(geo_wire::GEOGRAPHY, *srid),
-            Some(geo_param_value(wkt, *srid)),
-        ),
-        TypedValue::Geometry { wkt, srid, .. } => ok(
-            geo_param_type(geo_wire::GEOMETRY, *srid),
-            Some(geo_param_value(wkt, *srid)),
-        ),
-    }
-}
-
-/// Format the SEA `param_type` for a geospatial value. Appends an
-/// `(SRID)` decorator when the SRID is set, matching the form the
-/// server emits in column metadata (e.g. `GEOGRAPHY(4326)`).
-fn geo_param_type(family: &str, srid: Option<i32>) -> String {
-    match srid {
-        Some(s) => format!("{family}({s})"),
-        None => family.to_owned(),
-    }
-}
-
-/// Format the SEA `value` field for a geospatial binding. EWKT
-/// (`SRID=N;WKT`) when an SRID is present; bare WKT otherwise.
-fn geo_param_value(wkt: &str, srid: Option<i32>) -> String {
-    match srid {
-        Some(s) => format!("{}{};{}", geo_wire::EWKT_SRID_PREFIX, s, wkt),
-        None => wkt.to_owned(),
+        // The wire format that DOES work is the same pattern JDBC
+        // production users follow: bind as `STRING`, send bare WKT
+        // in `value`, and let the caller's SQL parse it server-
+        // side with `ST_GeogFromText(?)` / `ST_GeomFromText(?)`.
+        // Those functions accept bare WKT only — they reject the
+        // EWKT `SRID=N;WKT` prefix with `WKT_PARSE_ERROR: Invalid
+        // or unsupported type 'SRID=...'`. So the kernel does NOT
+        // serialise the SRID into the value; callers needing an
+        // explicit SRID write
+        //   `SELECT ST_SetSRID(ST_GeogFromText(?), 4326) AS g`
+        // and the SRID lives in the SQL, not the bound value.
+        //
+        // The `srid` field on `TypedValue::Geography` /
+        // `TypedValue::Geometry` is therefore informational only
+        // on the bind path today — kept on the variant so a
+        // future SEA bind-path that natively accepts EWKT (or
+        // WKB) can pick it up without a breaking-variant change.
+        // The result-reader path is unchanged: it reads the SRID
+        // out of column metadata.
+        //
+        // Binding via WKB is not yet wired — when SEA grows a
+        // native geo input path, this arm gets a branch on
+        // `wkb.is_some()` to send the binary form.
+        TypedValue::Geography { wkt, .. } => ok("STRING", Some(wkt.clone())),
+        TypedValue::Geometry { wkt, .. } => ok("STRING", Some(wkt.clone())),
     }
 }
 
@@ -1044,62 +1040,57 @@ mod tests {
     }
 
     #[test]
-    fn typed_value_geography_with_srid_emits_ewkt_and_decorated_type() {
-        let p = typed_value_to_sea_parameter(
-            1,
-            &TypedValue::Geography {
-                wkt: "POINT(1 2)".into(),
-                srid: Some(4326),
-                wkb: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(p.param_type, "GEOGRAPHY(4326)");
-        assert_eq!(p.value.as_deref(), Some("SRID=4326;POINT(1 2)"));
+    fn typed_value_geography_emits_bare_wkt_as_string_type() {
+        // Geo binds always go on the wire as STRING + bare WKT.
+        // The `srid` field on the variant is informational only
+        // on the bind path (callers carry SRID semantics in their
+        // SQL via `ST_SetSRID(ST_GeogFromText(?), <srid>)`).
+        // SRID values present on the variant are dropped before
+        // serialisation. See the comment in
+        // `typed_value_to_sea_payload`.
+        for srid in [None, Some(0), Some(4326)] {
+            let p = typed_value_to_sea_parameter(
+                1,
+                &TypedValue::Geography {
+                    wkt: "POINT(1 2)".into(),
+                    srid,
+                    wkb: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                p.param_type, "STRING",
+                "geo binds always emit STRING param_type, srid={srid:?}"
+            );
+            assert_eq!(
+                p.value.as_deref(),
+                Some("POINT(1 2)"),
+                "value is bare WKT regardless of srid, srid={srid:?}"
+            );
+        }
     }
 
     #[test]
-    fn typed_value_geography_without_srid_emits_bare_wkt() {
-        let p = typed_value_to_sea_parameter(
-            1,
-            &TypedValue::Geography {
-                wkt: "POINT(1 2)".into(),
-                srid: None,
-                wkb: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(p.param_type, "GEOGRAPHY");
-        assert_eq!(p.value.as_deref(), Some("POINT(1 2)"));
-    }
-
-    #[test]
-    fn typed_value_geometry_with_srid_emits_ewkt() {
-        let p = typed_value_to_sea_parameter(
-            1,
-            &TypedValue::Geometry {
-                wkt: "LINESTRING(0 0,1 1)".into(),
-                srid: Some(0),
-                wkb: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(p.param_type, "GEOMETRY(0)");
-        assert_eq!(p.value.as_deref(), Some("SRID=0;LINESTRING(0 0,1 1)"));
-    }
-
-    #[test]
-    fn typed_value_geometry_without_srid_emits_bare_wkt() {
-        let p = typed_value_to_sea_parameter(
-            1,
-            &TypedValue::Geometry {
-                wkt: "LINESTRING(0 0,1 1)".into(),
-                srid: None,
-                wkb: None,
-            },
-        )
-        .unwrap();
-        assert_eq!(p.param_type, "GEOMETRY");
-        assert_eq!(p.value.as_deref(), Some("LINESTRING(0 0,1 1)"));
+    fn typed_value_geometry_emits_bare_wkt_as_string_type() {
+        for srid in [None, Some(0), Some(3857)] {
+            let p = typed_value_to_sea_parameter(
+                1,
+                &TypedValue::Geometry {
+                    wkt: "LINESTRING(0 0,1 1)".into(),
+                    srid,
+                    wkb: None,
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                p.param_type, "STRING",
+                "geo binds always emit STRING param_type, srid={srid:?}"
+            );
+            assert_eq!(
+                p.value.as_deref(),
+                Some("LINESTRING(0 0,1 1)"),
+                "value is bare WKT regardless of srid, srid={srid:?}"
+            );
+        }
     }
 }

@@ -355,7 +355,7 @@ async fn bind_all_typed_values_round_trip() {
                  CAST(? AS TIMESTAMP) AS c_ts, \
                  CAST(? AS TIMESTAMP_NTZ) AS c_ts_ntz, \
                  CAST(? AS TIMESTAMP_LTZ) AS c_ts_ltz, \
-                 PARSE_JSON(?) AS c_variant, \
+                 ? AS c_variant, \
                  ? AS c_null",
         )
         .param(1, TypedValue::Bool(true))
@@ -396,13 +396,18 @@ async fn bind_all_typed_values_round_trip() {
         // metadata, not in the accessor).
         .param(10, TypedValue::TimestampLtz(ts_ltz))
         .unwrap()
-        // VARIANT round-trip: bind the JSON text, wrap with
-        // `PARSE_JSON(?)` server-side so the resulting column is a
-        // proper VARIANT (not a STRING). The kernel reads VARIANT
-        // back as Arrow Utf8 with `databricks.type_name="VARIANT"`
-        // metadata on the schema field; `get_str` reads the JSON
-        // text. Server JSON canonicalisation removes whitespace, so
-        // we compare against a canonical form.
+        // VARIANT round-trip: bind the JSON text. The kernel sends
+        // `param_type=VARIANT`, and SEA wraps the marker server-side
+        // as `PARSE_JSON(<value>)` so the column comes back as a
+        // proper VARIANT (not a STRING). Don't wrap the `?` with
+        // `PARSE_JSON(?)` in the SQL — that double-parses and the
+        // server raises `DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE`
+        // (the outer PARSE_JSON expects STRING but receives VARIANT).
+        // The kernel reads VARIANT back as Arrow Utf8 with
+        // `databricks.type_name="VARIANT"` metadata on the schema
+        // field; `get_str` reads the JSON text. Server JSON
+        // canonicalisation removes whitespace, so we compare
+        // against a canonical form.
         .param(11, TypedValue::Variant(variant_json.into()))
         .unwrap()
         .param(12, TypedValue::Null)
@@ -529,11 +534,12 @@ async fn bind_geography_and_geometry_round_trip() {
     );
     assert_eq!(row.get_i32(1).unwrap(), Some(4326), "Geography SRID");
 
-    // Geometry column: same shape.
+    // Geometry column: same shape. Server preserves the comma
+    // formatting from the bound WKT (no extra spaces inserted).
     assert_eq!(
         row.get_str(2).unwrap(),
-        Some("LINESTRING(0 0, 1 1, 2 2)"),
-        "Geometry WKT round-trip (note: server reformats with spaces after commas)",
+        Some("LINESTRING(0 0,1 1,2 2)"),
+        "Geometry WKT round-trip",
     );
     assert_eq!(row.get_i32(3).unwrap(), Some(0), "Geometry SRID");
 
