@@ -396,13 +396,22 @@ async fn bind_all_typed_values_round_trip() {
         // metadata, not in the accessor).
         .param(10, TypedValue::TimestampLtz(ts_ltz))
         .unwrap()
-        // VARIANT round-trip: bind the JSON text, wrap with
-        // `PARSE_JSON(?)` server-side so the resulting column is a
-        // proper VARIANT (not a STRING). The kernel reads VARIANT
-        // back as Arrow Utf8 with `databricks.type_name="VARIANT"`
-        // metadata on the schema field; `get_str` reads the JSON
-        // text. Server JSON canonicalisation removes whitespace, so
-        // we compare against a canonical form.
+        // VARIANT round-trip: bind the JSON text. The kernel binds
+        // `TypedValue::Variant` as SEA `param_type=STRING` (same
+        // pattern as geo — see `typed_value_to_sea_payload`), so
+        // the SQL must wrap the marker with `PARSE_JSON(?)` to get
+        // a proper Object/Array-typed VARIANT column. Without the
+        // wrapper, the server stores the value as a String-typed
+        // VARIANT (the JSON text gets JSON-encoded as a quoted
+        // string) and round-trip readback doesn't yield the
+        // structural shape the assertion expects.
+        //
+        // The kernel reads VARIANT back as Arrow Utf8 with
+        // `databricks.type_name="VARIANT"` metadata on the schema
+        // field; `get_str` reads the JSON text. Server JSON
+        // canonicalisation removes whitespace, so we compare
+        // structurally against a parsed `serde_json::Value`
+        // rather than byte-equality against the input string.
         .param(11, TypedValue::Variant(variant_json.into()))
         .unwrap()
         .param(12, TypedValue::Null)
@@ -529,11 +538,12 @@ async fn bind_geography_and_geometry_round_trip() {
     );
     assert_eq!(row.get_i32(1).unwrap(), Some(4326), "Geography SRID");
 
-    // Geometry column: same shape.
+    // Geometry column: same shape. Server preserves the comma
+    // formatting from the bound WKT (no extra spaces inserted).
     assert_eq!(
         row.get_str(2).unwrap(),
-        Some("LINESTRING(0 0, 1 1, 2 2)"),
-        "Geometry WKT round-trip (note: server reformats with spaces after commas)",
+        Some("LINESTRING(0 0,1 1,2 2)"),
+        "Geometry WKT round-trip",
     );
     assert_eq!(row.get_i32(3).unwrap(), Some(0), "Geometry SRID");
 
