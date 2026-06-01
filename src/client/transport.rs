@@ -122,6 +122,16 @@ pub(crate) struct ExecuteResultData {
     /// Inline Arrow IPC data (decoded from base64).
     /// Present when server returns inline results instead of CloudFetch.
     pub(crate) inline_arrow_data: Option<Vec<u8>>,
+    /// Per-chunk metadata for the inline-Arrow streaming path. Only
+    /// meaningful when `inline_arrow_data` is `Some(_)`. The
+    /// `inline_next_chunk_index` field is the signal: `Some(N)` →
+    /// the kernel should construct an [`InlineStreamingProvider`]
+    /// (multi-chunk inline); `None` → the result fits in a single
+    /// chunk and the legacy [`InlineArrowProvider`] is enough.
+    pub(crate) inline_chunk_index: Option<i64>,
+    pub(crate) inline_row_offset: Option<i64>,
+    pub(crate) inline_row_count: Option<i64>,
+    pub(crate) inline_next_chunk_index: Option<i64>,
 }
 
 /// Result of fetching chunk links.
@@ -153,6 +163,30 @@ pub(crate) struct ChunkLinkFetchResult {
         reason = "Thrift consumer wiring TBD; SEA path tracks row offset internally"
     )]
     pub next_row_offset: Option<i64>,
+}
+
+/// One inline-Arrow chunk fetched via `GetResultData`.
+///
+/// Returned by [`Transport::get_inline_chunk`] for the SEA inline-
+/// Arrow streaming path. Carries the chunk's Arrow IPC bytes
+/// inline (no separate cloud download) plus the metadata the kernel
+/// needs to walk the chunk chain: `chunk_index`, `row_offset`,
+/// `row_count`, and the server-emitted `next_chunk_index`.
+#[derive(Debug, Clone)]
+pub(crate) struct InlineChunkFetchResult {
+    /// Arrow IPC bytes (already base64-decoded by the SEA client).
+    pub bytes: Vec<u8>,
+    /// Index of this chunk in the result set.
+    pub chunk_index: i64,
+    /// Row position (0-based) of the first row in this chunk.
+    pub row_offset: i64,
+    /// Number of rows in this chunk.
+    pub row_count: i64,
+    /// `chunk_index` to ask for in the next `GetResultData` call.
+    /// `None` marks end-of-stream for inline-Arrow link discovery
+    /// (per the bounded SEA API contract — same end-of-stream
+    /// signal as CloudFetch's per-link `next_chunk_index`).
+    pub next_chunk_index: Option<i64>,
 }
 
 impl ChunkLinkFetchResult {
@@ -270,6 +304,27 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         chunk_index: i64,
         row_offset: i64,
     ) -> Result<ChunkLinkFetchResult>;
+
+    /// Fetch one inline-Arrow chunk by `chunk_index` (+ server-side
+    /// `row_offset`).
+    ///
+    /// Used by the inline-Arrow streaming path that lights up when
+    /// `ResultConfig.cloudfetch_enabled == false` (i.e. SEA's
+    /// `can_cloud_download=false` session conf). The server-side
+    /// response for this path carries Arrow IPC bytes inline in
+    /// `attachment` rather than emitting `external_links`.
+    ///
+    /// Per the bounded SEA API contract for OSS drivers:
+    /// - `chunk_index` is derived from the *previous* chunk's
+    ///   `next_chunk_index`. Never synthesised as `prev + 1`.
+    /// - `row_offset` is derived from the previous chunk's
+    ///   `row_offset + row_count`. Sent on every fetch.
+    async fn get_inline_chunk(
+        &self,
+        statement_id: &str,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<InlineChunkFetchResult>;
 
     /// Polling cadence + ceiling the kernel should use when driving
     /// `await_result` / `wait_for_completion`. v0 returns the

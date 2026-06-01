@@ -54,6 +54,12 @@ pub struct CloudFetchConfig {
     /// When > 0, consecutive small batches are concatenated into larger batches
     /// of approximately this many rows before being served to consumers.
     pub batch_merge_target_rows: usize,
+    /// Rolling-window bound for the multi-chunk inline-Arrow path
+    /// (used when CloudFetch is disabled at the session level via
+    /// `can_cloud_download=false`). Analogue of
+    /// [`Self::max_chunks_in_memory`] but for sequential inline
+    /// prefetches rather than parallel cloud downloads.
+    pub inline_max_chunks_in_memory: usize,
 }
 
 impl Default for CloudFetchConfig {
@@ -69,6 +75,7 @@ impl Default for CloudFetchConfig {
             speed_threshold_mbps: 0.1,
             enabled: true,
             batch_merge_target_rows: 0,
+            inline_max_chunks_in_memory: 4,
         }
     }
 }
