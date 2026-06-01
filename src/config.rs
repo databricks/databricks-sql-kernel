@@ -356,21 +356,20 @@ pub struct ProxyConfig {}
 /// The kernel exposes only fields that the internal rustls plumbing
 /// already supports — cert pinning and FIPS mode are *not* in scope.
 ///
+/// `TlsConfig` is `#[non_exhaustive]`, so construct it from
+/// [`TlsConfig::default`] and assign the public fields you need:
+///
 /// ```no_run
 /// # use databricks_sql_kernel::TlsConfig;
 /// // From a file path:
-/// let from_file = TlsConfig {
-///     custom_ca_cert: Some(std::fs::read("/etc/ssl/corp-ca.pem").unwrap()),
-///     ..TlsConfig::default()
-/// };
+/// let mut from_file = TlsConfig::default();
+/// from_file.custom_ca_cert = Some(std::fs::read("/etc/ssl/corp-ca.pem").unwrap());
 ///
 /// // From an in-memory buffer (the napi-rs `Buffer` / pyo3 `bytes`
 /// // path — no tempfile shim needed):
 /// let pem_bytes: Vec<u8> = b"-----BEGIN CERTIFICATE-----\n...".to_vec();
-/// let from_bytes = TlsConfig {
-///     custom_ca_cert: Some(pem_bytes),
-///     ..TlsConfig::default()
-/// };
+/// let mut from_bytes = TlsConfig::default();
+/// from_bytes.custom_ca_cert = Some(pem_bytes);
 /// # let _ = (from_file, from_bytes);
 /// ```
 //
