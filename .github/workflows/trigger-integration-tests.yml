@@ -77,7 +77,13 @@ name: Trigger Integration Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    # `ready_for_review` is included so a PR that was opened as a
+    # draft (which doesn't fire `auto-label-internal-prs` since
+    # `draft` is excluded below) still picks up the label the
+    # moment it transitions to ready-for-review. Without that
+    # type, a draft → ready-for-review transition is silent and
+    # the maintainer would need to manually label.
+    types: [opened, synchronize, reopened, labeled, ready_for_review]
   merge_group:
 
 # Concurrency model:
@@ -175,6 +181,77 @@ jobs:
               issue_number: context.issue.number,
               body: body
             });
+
+  # =============================================================================
+  # Auto-label internal PRs with `integration-test` so the
+  # `trigger-tests-pr` path below fires automatically. Removes
+  # the manual-labeling toil for the common case (every internal
+  # PR ought to run integration tests anyway), while preserving
+  # the trust gate for external contributors.
+  #
+  # Why this is safe:
+  #   - Gates on `pull_request.head.repo.owner.login == 'databricks'`.
+  #     Fork PRs (from outside the org) take the no-label path and
+  #     still require an explicit maintainer label, matching the
+  #     original security model. We have zero fork PRs in the kernel
+  #     repo today, but the guard preserves the contract for if/when
+  #     external contributions land.
+  #   - Excludes `action == 'synchronize'`. Adding the label on
+  #     every push would defeat `remove-label-on-new-commit` above —
+  #     we'd add it back faster than the security job could remove
+  #     it. Instead the auto-label fires once on `opened` /
+  #     `reopened` / `ready_for_review`, and after a push the
+  #     existing remove-on-synchronize job strips the label until a
+  #     maintainer re-adds it (or this job fires again because the
+  #     PR was reopened, which is rare).
+  #   - Excludes draft PRs. Drafts are typically work-in-progress;
+  #     running integration tests on every WIP commit burns Dogfood
+  #     resources without producing actionable signal. Once the PR
+  #     leaves draft, the `ready_for_review` event triggers the
+  #     auto-label.
+  #   - Idempotent: if the label is already present (e.g. a
+  #     maintainer added it manually before the workflow fired, or
+  #     this job re-fired after a `reopened` event on an already-
+  #     labeled PR), `addLabels` is a no-op and we silently skip.
+  # =============================================================================
+  auto-label-internal-prs:
+    if: |
+      github.event_name == 'pull_request' &&
+      (github.event.action == 'opened' || github.event.action == 'reopened' || github.event.action == 'ready_for_review') &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.owner.login == 'databricks' &&
+      !contains(github.event.pull_request.labels.*.name, 'integration-test') &&
+      vars.INTEGRATION_TESTS_ENABLED == 'true'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Add integration-test label
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            try {
+              await github.rest.issues.addLabels({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                labels: ['integration-test']
+              });
+              console.log('Added integration-test label');
+            } catch (error) {
+              // Label race: a maintainer / sibling automation may have
+              // added the same label between our `if` check and the
+              // API call. Treat 422 (already exists) as a no-op so we
+              // don't fail the workflow run on a benign race.
+              if (error.status === 422) {
+                console.log('Label already present (race with manual add); no-op');
+              } else {
+                throw error;
+              }
+            }
 
   # =============================================================================
   # On non-label PR events, auto-pass the "Kernel Integration Tests" check
