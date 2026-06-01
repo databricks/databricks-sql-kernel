@@ -210,9 +210,10 @@ fn build_statement(
     // than letting both loops run and surfacing an opaque server error —
     // mirrors the dual-`query_tags` rejection discipline.
     if !positional_params.is_empty() && !named_params.is_empty() {
-        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
-            "positional and named parameters are mutually exclusive; pass only one",
-        )));
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument()
+                .message("positional and named parameters are mutually exclusive; pass only one"),
+        ));
     }
 
     let mut stmt = session.statement();
