@@ -184,6 +184,70 @@ pub(crate) fn connection_closed_err() -> napi::Error {
     )
 }
 
+/// Build a kernel `Statement` from a decoded option set, under the caller's
+/// session lock. Shared verbatim by `execute_statement` and `submit_statement`
+/// so the option → spec mapping lives in exactly one place (any new option is
+/// edited once). `Session::statement()` clones the session's internal `Arc`,
+/// so the returned `Statement` is independent of the borrow and the caller can
+/// release the lock before `execute()` / `submit()`.
+///
+/// `query_timeout_secs` is honoured on the sync `execute` path; the submit path
+/// passes `None` because submit pins `wait_timeout=0s` and `resolve_wait_timeout`
+/// never consults the spec timeout there (see `statement/mutable.rs`).
+#[allow(clippy::too_many_arguments)]
+fn build_statement(
+    session: &Session,
+    sql: String,
+    statement_conf: Option<HashMap<String, String>>,
+    query_tags: Option<HashMap<String, String>>,
+    row_limit: Option<i64>,
+    query_timeout_secs: Option<u32>,
+    positional_params: Vec<TypedValue>,
+    named_params: Vec<(String, TypedValue)>,
+) -> napi::Result<databricks_sql_kernel::Statement> {
+    // Positional and named params are mutually exclusive (the public docs
+    // promise it). Reject at bind time with a clear InvalidArgument rather
+    // than letting both loops run and surfacing an opaque server error —
+    // mirrors the dual-`query_tags` rejection discipline.
+    if !positional_params.is_empty() && !named_params.is_empty() {
+        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
+            "positional and named parameters are mutually exclusive; pass only one",
+        )));
+    }
+
+    let mut stmt = session.statement();
+    stmt.spec().sql(sql);
+    // Set the explicit per-statement conf overlay first (only when non-empty)
+    // so the kernel's `query_tags` merge can detect a dual definition against it.
+    if let Some(conf) = statement_conf {
+        if !conf.is_empty() {
+            stmt.spec().statement_conf(conf);
+        }
+    }
+    // Fold the `queryTags` convenience map into the conf overlay. Empty map is
+    // a no-op; a dual definition with `statementConf["query_tags"]` rejects.
+    if let Some(tags) = query_tags {
+        stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
+    }
+    // `None` leaves the kernel's omit-the-field default in place.
+    stmt.spec()
+        .row_limit(row_limit)
+        .query_timeout_secs(query_timeout_secs);
+    // Bind positional params 1-based on the wire.
+    for (i, value) in positional_params.into_iter().enumerate() {
+        stmt.spec()
+            .param(i + 1, value)
+            .map_err(napi_err_from_kernel)?;
+    }
+    // Bind named params (`:name`).
+    for (name, value) in named_params {
+        stmt.spec()
+            .param_named(name, value)
+            .map_err(napi_err_from_kernel)?;
+    }
+    Ok(stmt)
+}
+
 /// Opaque connection handle wrapping a kernel `Session`.
 ///
 /// `inner` is `Arc<Mutex<Option<Session>>>` so:
@@ -284,42 +348,16 @@ impl Connection {
             let mut stmt = {
                 let guard = inner.lock().await;
                 let session = guard.as_ref().ok_or_else(connection_closed_err)?;
-
-                let mut stmt = session.statement();
-                stmt.spec().sql(sql);
-                // Set the explicit per-statement conf overlay first (only
-                // when non-empty) so the kernel's `query_tags` merge can
-                // detect a dual `query_tags` definition against it.
-                if let Some(conf) = statement_conf {
-                    if !conf.is_empty() {
-                        stmt.spec().statement_conf(conf);
-                    }
-                }
-                // Fold the `queryTags` convenience map into the conf
-                // overlay. Empty map is a no-op; a dual definition with
-                // `statementConf["query_tags"]` rejects as InvalidArgument.
-                if let Some(tags) = query_tags {
-                    stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
-                }
-                // `None` leaves the kernel's omit-the-field default in place,
-                // so threading unconditionally is safe and keeps the spec the
-                // single source of truth.
-                stmt.spec()
-                    .row_limit(row_limit)
-                    .query_timeout_secs(query_timeout_secs);
-                // Bind positional params 1-based on the wire.
-                for (i, value) in positional_params.into_iter().enumerate() {
-                    stmt.spec()
-                        .param(i + 1, value)
-                        .map_err(napi_err_from_kernel)?;
-                }
-                // Bind named params (`:name`).
-                for (name, value) in named_params {
-                    stmt.spec()
-                        .param_named(name, value)
-                        .map_err(napi_err_from_kernel)?;
-                }
-                stmt
+                build_statement(
+                    session,
+                    sql,
+                    statement_conf,
+                    query_tags,
+                    row_limit,
+                    query_timeout_secs,
+                    positional_params,
+                    named_params,
+                )?
                 // session lock released here
             };
 
@@ -362,8 +400,10 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         // Same option decoding as `execute_statement` — malformed
         // params surface as InvalidArgument before any wire round-trip.
+        // `queryTimeoutSecs` is intentionally NOT read here: submit pins
+        // `wait_timeout=0s`, so `resolve_wait_timeout` never consults the
+        // spec timeout on this path (see statement/mutable.rs).
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
-        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -394,31 +434,17 @@ impl Connection {
             let mut stmt = {
                 let guard = inner.lock().await;
                 let session = guard.as_ref().ok_or_else(connection_closed_err)?;
-
-                let mut stmt = session.statement();
-                stmt.spec().sql(sql);
-                if let Some(conf) = statement_conf {
-                    if !conf.is_empty() {
-                        stmt.spec().statement_conf(conf);
-                    }
-                }
-                if let Some(tags) = query_tags {
-                    stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
-                }
-                stmt.spec()
-                    .row_limit(row_limit)
-                    .query_timeout_secs(query_timeout_secs);
-                for (i, value) in positional_params.into_iter().enumerate() {
-                    stmt.spec()
-                        .param(i + 1, value)
-                        .map_err(napi_err_from_kernel)?;
-                }
-                for (name, value) in named_params {
-                    stmt.spec()
-                        .param_named(name, value)
-                        .map_err(napi_err_from_kernel)?;
-                }
-                stmt
+                // `None` for query_timeout_secs — ignored on the submit path.
+                build_statement(
+                    session,
+                    sql,
+                    statement_conf,
+                    query_tags,
+                    row_limit,
+                    None,
+                    positional_params,
+                    named_params,
+                )?
                 // session lock released here
             };
 

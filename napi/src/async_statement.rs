@@ -185,7 +185,10 @@ impl AsyncStatement {
     /// One-shot status check. Returns a string enum matching the
     /// kernel `StatementStatus` shape:
     /// `'Pending' | 'Running' | 'Succeeded' | 'Failed' |
-    /// 'Cancelled' | 'Closed'`. Returns
+    /// 'Cancelled' | 'Closed' | 'Unknown'`. (`'Unknown'` is the
+    /// `#[non_exhaustive]` forward-compat catch-all that
+    /// `StatementStatus::as_str` can return — consumers switching on
+    /// the state must handle it.) Returns
     /// `KernelError(InvalidStatementHandle)` if the statement has
     /// been explicitly `close()`d.
     ///

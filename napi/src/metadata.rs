@@ -85,6 +85,13 @@ where
     // must be called from inside an async context (it snapshots
     // Handle::current() on first call).
     let handle = get_handle().clone();
+    // Each metadata RPC parks one blocking-pool thread for the whole wire
+    // round-trip (the kernel futures are `!Send`; see the doc above). Bracket
+    // it with debug breadcrumbs so a "metadata hangs under load" incident — a
+    // fan-out exhausting the blocking pool — is localizable from logs without
+    // a profiler. (Long-term fix tracked separately: make the metadata futures
+    // `Send` via `.instrument(span)` so they can await on a worker thread.)
+    tracing::debug!("metadata RPC: entering blocking pool");
     let stream = tokio::task::spawn_blocking(move || handle.block_on(f()))
         .await
         .map_err(|e| {
@@ -93,6 +100,7 @@ where
             )
         })?
         .map_err(napi_err_from_kernel)?;
+    tracing::debug!("metadata RPC: blocking-pool thread released");
     Ok(stream)
 }
 

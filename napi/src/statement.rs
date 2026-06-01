@@ -435,8 +435,15 @@ impl Statement {
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
             match inner_state {
                 AnyInner::Executed(s) => s.executed.cancel().await.map_err(napi_err_from_kernel),
-                // Metadata streams have no server-side cancel handle.
-                AnyInner::Metadata(_) => Ok(()),
+                // Metadata streams have no server-side cancel handle, so the
+                // query keeps running server-side. Emit a breadcrumb so a
+                // "cancel() didn't cancel" report is diagnosable from logs.
+                AnyInner::Metadata(_) => {
+                    tracing::debug!(
+                        "cancel() on a metadata statement is a no-op (no server-side cancel handle); the query continues server-side"
+                    );
+                    Ok(())
+                }
             }
         })
         .await

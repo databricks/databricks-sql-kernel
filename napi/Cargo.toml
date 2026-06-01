@@ -70,6 +70,11 @@ napi-derive = "2"
 # kernel's default feature.
 databricks-sql-kernel = { path = "..", default-features = false, features = ["tls-rustls"] }
 
+# Tracing — transitive via the kernel; declared explicitly so the napi layer
+# can emit its own `tracing::debug!` breadcrumbs (metadata blocking-pool
+# entry/exit, metadata-cancel no-op) through the same subscriber the kernel uses.
+tracing = "0.1"
+
 # Tokio is a transitive dep via the kernel and via napi's `async` feature;
 # declared explicitly so we can name `tokio::runtime::Handle` and
 # `tokio::sync::Mutex` directly.

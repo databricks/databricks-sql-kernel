@@ -92,6 +92,48 @@ fn resolve_wait_timeout(
     }
 }
 
+/// Build the `(sql, ExecuteParams)` dispatch pair from a statement spec.
+///
+/// Pure — borrows `spec`, touches no `Session` — so the spec → wire-params
+/// mapping (row_limit, the resolved wait/on-wait pair, and **1-based**
+/// positional + named parameter binding) is unit-testable without a live
+/// session. Shared by both the sync and async dispatch paths via
+/// [`Statement::prepare_for_dispatch`].
+fn build_execute_params(
+    spec: &StatementSpec,
+    wait_timeout_secs: Option<&str>,
+) -> Result<(String, ExecuteParams)> {
+    let sql = spec
+        .sql
+        .as_deref()
+        .ok_or_else(|| {
+            Error::invalid_argument().message("StatementSpec.sql must be set before execute()")
+        })?
+        .to_owned();
+    if spec.result_format != ResultFormat::Arrow {
+        return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
+    }
+    let (wait_timeout, on_wait_timeout) =
+        resolve_wait_timeout(wait_timeout_secs, spec.query_timeout_secs);
+    let mut exec_params = ExecuteParams {
+        wait_timeout,
+        on_wait_timeout,
+        row_limit: spec.row_limit,
+        ..ExecuteParams::default()
+    };
+    for (i, value) in spec.positional_params.iter().enumerate() {
+        exec_params
+            .parameters
+            .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
+    }
+    for (name, value) in spec.named_params.iter() {
+        exec_params
+            .parameters
+            .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
+    }
+    Ok((sql, exec_params))
+}
+
 /// Lifecycle owner for a single statement spec.
 ///
 /// Mutable, reusable. Mutate the spec in place via [`Statement::spec`],
@@ -326,36 +368,7 @@ impl Statement {
         &self,
         wait_timeout_secs: Option<&str>,
     ) -> Result<(String, ExecuteParams)> {
-        let sql = self
-            .spec
-            .sql
-            .as_deref()
-            .ok_or_else(|| {
-                Error::invalid_argument().message("StatementSpec.sql must be set before execute()")
-            })?
-            .to_owned();
-        if self.spec.result_format != ResultFormat::Arrow {
-            return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
-        }
-        let (wait_timeout, on_wait_timeout) =
-            resolve_wait_timeout(wait_timeout_secs, self.spec.query_timeout_secs);
-        let mut exec_params = ExecuteParams {
-            wait_timeout,
-            on_wait_timeout,
-            row_limit: self.spec.row_limit,
-            ..ExecuteParams::default()
-        };
-        for (i, value) in self.spec.positional_params.iter().enumerate() {
-            exec_params
-                .parameters
-                .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
-        }
-        for (name, value) in self.spec.named_params.iter() {
-            exec_params
-                .parameters
-                .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
-        }
-        Ok((sql, exec_params))
+        build_execute_params(&self.spec, wait_timeout_secs)
     }
 
     /// Auto-close any prior executed handle this `Statement` produced.
@@ -507,7 +520,8 @@ impl Drop for Statement {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_wait_timeout;
+    use super::{build_execute_params, resolve_wait_timeout};
+    use crate::statement::spec::{StatementSpec, TypedValue};
 
     #[test]
     fn async_submit_caller_value_is_respected_verbatim() {
@@ -534,5 +548,49 @@ mod tests {
         let (wait, on_wait) = resolve_wait_timeout(None, None);
         assert_eq!(wait, None);
         assert_eq!(on_wait, None);
+    }
+
+    #[test]
+    fn build_execute_params_threads_row_limit_to_wire() {
+        // Headline parity feature: spec.row_limit must reach
+        // ExecuteParams.row_limit. A regression dropping it would otherwise
+        // pass every other test (the seam this pins).
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT 1").row_limit(Some(100));
+        let (sql, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(sql, "SELECT 1");
+        assert_eq!(params.row_limit, Some(100));
+    }
+
+    #[test]
+    fn build_execute_params_binds_positional_params_one_based() {
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ?, ?");
+        spec.param(1, TypedValue::Bool(true)).unwrap();
+        spec.param(2, TypedValue::Bool(false)).unwrap();
+        let (_, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(params.parameters.len(), 2);
+        // Positional binding is 1-based on the wire and carries no name.
+        assert_eq!(params.parameters[0].ordinal, Some(1));
+        assert_eq!(params.parameters[1].ordinal, Some(2));
+        assert!(params.parameters[0].name.is_none());
+    }
+
+    #[test]
+    fn build_execute_params_binds_named_params() {
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT :flag");
+        spec.param_named("flag", TypedValue::Bool(true)).unwrap();
+        let (_, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(params.parameters.len(), 1);
+        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.parameters[0].ordinal.is_none());
+    }
+
+    #[test]
+    fn build_execute_params_requires_sql() {
+        // Malformed/incomplete spec fails before any wire dispatch.
+        let spec = StatementSpec::new();
+        assert!(build_execute_params(&spec, None).is_err());
     }
 }
