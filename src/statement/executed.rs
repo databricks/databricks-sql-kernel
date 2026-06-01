@@ -113,28 +113,54 @@ impl ExecutedStatement {
     /// Rows modified by the statement (UPDATE / INSERT / DELETE /
     /// MERGE). Absent for SELECT and on warehouses that don't surface
     /// the counter.
+    ///
+    /// Reachable only on the `Succeeded` / `Closed-with-inline-data`
+    /// paths — the kernel returns `Err` (no `ExecutedStatement`) on
+    /// `Failed` / `Cancelled` / `Closed-no-data`.
     pub fn num_modified_rows(&self) -> Option<i64> {
         self.status.num_modified_rows
     }
 
-    /// Fractional completion in `[0.0, 1.0]`. Populated on analytics
-    /// warehouses; absent elsewhere. On a terminal `ExecutedStatement`
-    /// this is typically `Some(1.0)` when populated at all.
-    pub fn progress(&self) -> Option<f64> {
-        self.status.progress
-    }
+    // TODO(pr23-followup): add `progress()` once the SEA server emits
+    // a progress field. Verified empirically on 2026-05-27 that a 37s
+    // TPC-H query against a SQL warehouse returns no
+    // `progressUpdateResponse` even on the Thrift path that explicitly
+    // requests it (`getProgressUpdate=true`). The SDK Java
+    // `StatementStatus` model also has no progress field. Adding an
+    // accessor that always returns None would mislead callers; revisit
+    // when the SEA server grows progress support, ideally surfacing
+    // the same struct shape Thrift uses
+    // (`TProgressUpdateResp { headerNames, rows, footerSummary,
+    // progressedPercentage, status, startTime }`) rather than a bare
+    // `Option<f64>`.
 
     /// Server-supplied user-facing message. Distinct from the
-    /// `error.message` carried inside `Failed` — populated on
-    /// non-error states too (e.g. cancellation reasons, progress
-    /// hints).
+    /// `error.message` that the kernel folds into `Error::sql_error()`
+    /// on the `Failed` path.
+    ///
+    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
+    /// only. Failed / Cancelled / Closed-no-data return `Err` before
+    /// the `ExecutedStatement` is constructed, so cancellation-reason
+    /// messages from those paths are NOT reachable here — they flow
+    /// through the `Error` instead.
+    ///
+    /// **PII / sensitive-data note:** server-supplied free-form text
+    /// may include SQL fragments or parameter values. Redact before
+    /// centralised logging.
     pub fn display_message(&self) -> Option<&str> {
         self.status.display_message.as_deref()
     }
 
-    /// Server-supplied diagnostic detail — multi-line text with
-    /// stack frames or operator context. Intended for log / support
+    /// Server-supplied diagnostic detail — multi-line text with stack
+    /// frames or operator context. Intended for log / support
     /// surfaces; not user-facing.
+    ///
+    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
+    /// only — same caveat as [`Self::display_message`].
+    ///
+    /// **PII / sensitive-data note:** like `display_message`, this is
+    /// server-supplied free-form text and may include SQL fragments
+    /// or values. Redact before centralised logging.
     pub fn diagnostic_info(&self) -> Option<&str> {
         self.status.diagnostic_info.as_deref()
     }
@@ -142,6 +168,23 @@ impl ExecutedStatement {
     /// Server-supplied JSON blob with extended error details.
     /// Pass-through string — wrappers parse if they need structured
     /// access.
+    ///
+    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
+    /// only. The corresponding details for Failed statements flow
+    /// through the returned `Error`, not this accessor.
+    ///
+    /// **Server-side gating:** populated only when the workspace has
+    /// `spark.databricks.sql.errorDetailsJson.enabled = true` set on
+    /// the underlying SQL cluster. The flag is `internal()` and
+    /// false-by-default in `DatabricksSQLConf.scala`, so it is NOT
+    /// settable from a client session-configuration request. Most
+    /// workspaces will return `None` here; admin-enabled workspaces
+    /// return content shaped like
+    /// `{"errorClass": "...", "messageTemplate": "..."}`.
+    ///
+    /// **Unbounded:** when populated, the server can return a
+    /// multi-MB blob. Wrappers surfacing this should bound size
+    /// before logging.
     pub fn error_details_json(&self) -> Option<&str> {
         self.status.error_details_json.as_deref()
     }

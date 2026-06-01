@@ -1,0 +1,622 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Cross-repo integration-test trigger.
+#
+# This workflow does not run the tests. Tests live in
+# databricks/databricks-driver-test (the internal repo) and run against
+# the workspace credentials + mitmproxy infrastructure that lives there.
+# This workflow only fires a repository_dispatch event into that repo
+# and reports the result back as the "Kernel Integration Tests" check
+# on the kernel PR.
+#
+# Modeled on adbc-drivers/databricks's `trigger-integration-tests.yml`
+# (the C# ADBC equivalent). Differences:
+#   - Single language (Rust) — no per-language path-filter fan-out.
+#   - Source paths are kernel-relative: src/**, napi/**, pyo3/**,
+#     Cargo.{toml,lock}, .github/workflows/**.
+#   - Dispatched event-type is `kernel-pr-test`.
+#   - Check-run name is "Kernel Integration Tests" — must match the
+#     name created by databricks-sql-kernel-integration-tests.yml in
+#     the internal repo, and must match what branch-protection lists
+#     as the required status check.
+#
+# Security model is identical to the C# version: only maintainers can
+# add the `integration-test` label; the label is auto-removed on new
+# commits so each push gets re-reviewed before tests run against the
+# internal workspace.
+#
+# ------------------------------------------------------------------
+# GitHub App permissions — TWO-SIDED requirement
+# ------------------------------------------------------------------
+# The integration-test GitHub App (whose ID + private key live in
+# `INTEGRATION_TEST_APP_ID` / `INTEGRATION_TEST_PRIVATE_KEY` repo
+# secrets) MUST be installed on BOTH repositories with the
+# permissions enumerated below. Misconfiguration on either side
+# produces silent failure modes that are hard to spot in CI.
+#
+#   1. databricks/databricks-driver-test (the receiver)
+#      - Contents: write  → required for `repository_dispatch`
+#        (this workflow narrows the minted token to
+#        `permission-contents: write` defence-in-depth).
+#      A missing or read-only install here makes
+#      `peter-evans/repository-dispatch` fail with 403. The
+#      label-trigger path's `if: failure()` posts a failing check;
+#      the merge-queue path's `if: failure()` does the same.
+#
+#   2. databricks/databricks-sql-kernel (this repo, the reporter)
+#      - Checks: write  → required so the RECEIVER (running inside
+#        `databricks-driver-test`) can `POST /repos/databricks/
+#        databricks-sql-kernel/check-runs` to report back the
+#        Kernel Integration Tests result.
+#      A missing install here means the dispatch succeeds, the
+#      receiver runs the tests, then 403s when posting the check
+#      back — leaving the `in_progress` check posted by THIS
+#      workflow stuck forever (correctly: branch protection
+#      blocks merge, but operators have to know to investigate
+#      the App install, not the test result).
+#
+# The receiver-side timeout must be ≥ the longest realistic test
+# run + reasonable slack, and the merge-queue branch-protection
+# "Require status checks to pass" timeout must be ≥ that.
+# Otherwise the merge queue cancels the merge while tests are
+# still legitimately running.
+
+name: Trigger Integration Tests
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  merge_group:
+
+# Concurrency model:
+# - Dispatch-side jobs (`skip-integration-tests-pr`,
+#   `trigger-tests-pr`, `merge-queue-kernel`) coalesce per PR / merge
+#   group / branch so push-spam and label cycles don't burn through
+#   the GitHub App rate limit. `cancel-in-progress: true` lets a
+#   newer push supersede a stale dispatch.
+# - The label-cleanup job (`remove-label-on-new-commit`) runs in its
+#   own group with `cancel-in-progress: false` — cancelling
+#   mid-flight could leave the label attached after a push, which
+#   would defeat the "re-review on each push" security contract.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================================================
+  # Security: auto-remove `integration-test` label on new commits so each
+  # push to a PR gets re-reviewed before tests run against the internal
+  # workspace.
+  # =============================================================================
+  remove-label-on-new-commit:
+    if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
+    # Own concurrency group with `cancel-in-progress: false` — see the
+    # workflow-level comment above. The label-cleanup is a
+    # security-critical action; it MUST run to completion on every
+    # push regardless of how quickly subsequent pushes arrive.
+    concurrency:
+      group: ${{ github.workflow }}-label-cleanup-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    # Use the protected runner group — App private-key material is
+    # the crown jewel of this workflow surface; per the
+    # hardened-GHA convention every sibling workflow already uses it.
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Check if integration-test label exists
+        id: check-label
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const labels = context.payload.pull_request.labels.map(l => l.name);
+            const hasLabel = labels.includes('integration-test');
+            console.log(`integration-test label exists: ${hasLabel}`);
+            return hasLabel;
+
+      - name: Remove integration-test label
+        if: steps.check-label.outputs.result == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            try {
+              await github.rest.issues.removeLabel({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                name: 'integration-test'
+              });
+              console.log('Removed integration-test label');
+            } catch (error) {
+              if (error.status === 404) {
+                console.log('Label already removed or does not exist');
+              } else {
+                throw error;
+              }
+            }
+
+      - name: Comment on PR about label removal
+        if: steps.check-label.outputs.result == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            const isFromFork = pr.head.repo.full_name !== pr.base.repo.full_name;
+            const repoType = isFromFork ? '**fork PR**' : 'PR';
+
+            const body = [
+              'Integration test approval reset',
+              '',
+              `New commits were pushed to this ${repoType}. The \`integration-test\` label has been automatically removed for security.`,
+              '',
+              '**A maintainer must re-review the changes and re-add the label to trigger tests again.**',
+              '',
+              `**Latest commit**: ${pr.head.sha.substring(0, 7)}`
+            ].join('\n');
+
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              body: body
+            });
+
+  # =============================================================================
+  # On non-label PR events, auto-pass the "Kernel Integration Tests" check
+  # so it doesn't block merging. The real run happens in the merge queue
+  # (or earlier, when a maintainer adds the label).
+  # =============================================================================
+  skip-integration-tests-pr:
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Skip Kernel Integration Tests
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped on PR - runs in merge queue',
+                summary: 'Integration tests are skipped on PRs and run as a required gate in the merge queue. A maintainer can run them earlier by adding the `integration-test` label.'
+              }
+            });
+
+  # =============================================================================
+  # Label-triggered dispatch: maintainer added `integration-test` -> fire
+  # tests in the internal repo for this PR's head SHA.
+  # =============================================================================
+  # =============================================================================
+  # Rollout-window visibility: if a maintainer adds the
+  # `integration-test` label while `INTEGRATION_TESTS_ENABLED` is
+  # still off, `trigger-tests-pr` is gated off — without this
+  # mini-job the labeling would silently produce zero workflow
+  # jobs and the maintainer would assume the gate ran. Post a
+  # sticky comment to make the no-op visible.
+  # =============================================================================
+  label-noop-during-rollout:
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      contains(github.event.pull_request.labels.*.name, 'integration-test') &&
+      vars.INTEGRATION_TESTS_ENABLED != 'true'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Sticky comment about rollout gate
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043  # v4.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          # Distinct marker from the dispatch-side comment so the
+          # two stickies coexist without colliding.
+          body-includes: '<!-- kernel-integration-tests-rollout-noop -->'
+          edit-mode: replace
+          body: |
+            <!-- kernel-integration-tests-rollout-noop -->
+            **Integration-test label is a no-op right now.**
+
+            The `INTEGRATION_TESTS_ENABLED` repo variable is not set, which is the pre-rollout state: the receiving workflow in `databricks-driver-test` (PR #375) has not yet shipped. Labelling does not dispatch tests until that variable is flipped on.
+
+            Once the variable is set, re-add the label (or push) to trigger a real run.
+
+  trigger-tests-pr:
+    # Companion-PR ordering gate: only fire dispatches once the
+    # internal repo's receiving workflow (databricks-driver-test#375
+    # — see the PR description) has landed. Until then,
+    # `vars.INTEGRATION_TESTS_ENABLED` is unset / not `"true"` and
+    # the dispatch becomes a no-op. This way labeling a PR before
+    # the companion ships doesn't fire into the void / produce a
+    # broken workflow-run link, and branch protection — if enabled
+    # prematurely — won't strand merges. Flip the variable on after
+    # the companion merges. The `label-noop-during-rollout` job
+    # above surfaces the gate-off state as a sticky PR comment so
+    # maintainers don't think the label silently dispatched.
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action == 'labeled' &&
+      contains(github.event.pull_request.labels.*.name, 'integration-test') &&
+      vars.INTEGRATION_TESTS_ENABLED == 'true'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      checks: write
+      issues: write
+      pull-requests: write
+    steps:
+      - name: Generate GitHub App Token (internal repo)
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+          # Defense-in-depth: scope the minted installation token to
+          # exactly the permission `repository_dispatch` needs. By
+          # default the action mints with the App's full installed
+          # permission set (Contents: Read + Pull requests: Read +
+          # Checks: Write); narrowing to `contents: write` here
+          # ensures a leaked token can only fire dispatches.
+          permission-contents: write
+
+      # Post an `in_progress` Kernel Integration Tests check at the
+      # PR head SHA BEFORE the dispatch. Critical for two reasons:
+      #
+      # (1) **Overwrite the stale-green race.**
+      #     `skip-integration-tests-pr` posts `conclusion: success`
+      #     for the same check name on every
+      #     opened/synchronize/reopened. Without this in_progress
+      #     overwrite, a maintainer who labels-and-merges promptly
+      #     would ship a PR whose latest "Kernel Integration Tests"
+      #     check is still the auto-pass from the synchronize event
+      #     — branch protection sees green, allows merge, no real
+      #     signal ever runs against the receiver. The in_progress
+      #     check is now the latest until the receiver overwrites
+      #     it on completion.
+      #
+      # (2) **Silent-drop fail-closed if the receiver's handler is
+      #     broken / renamed.** `POST .../dispatches` returns 204
+      #     even when no workflow on the receiving side is listening
+      #     for `kernel-pr-test`. If `databricks-driver-test#375`
+      #     reverts, gets renamed (e.g. `kernel-pr-tests` plural),
+      #     or its handler is removed: dispatch succeeds, no
+      #     `if: failure()` fires, and without this in_progress
+      #     check the PR would merge on stale green with zero
+      #     signal. With this step, the `in_progress` sits forever
+      #     until something explicitly overwrites it — branch
+      #     protection blocks merge. The kernel-side
+      #     `INTEGRATION_TESTS_ENABLED` var protects rollout order;
+      #     this protects steady-state drift.
+      - name: Post in_progress check (overwrite stale-green / fail-closed on silent drop)
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'in_progress',
+              started_at: new Date().toISOString(),
+              output: {
+                title: 'Dispatching to databricks-driver-test',
+                summary: 'Maintainer added `integration-test` label. Dispatching to the receiver repo; it will overwrite this check with the run result. If this check stays `in_progress` for an unusually long time, the receiver-side workflow may be broken or renamed — manual investigation needed.'
+              }
+            });
+
+      - name: Build payload (PR-title-safe via JSON.stringify)
+        id: payload
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          PR_REPO: ${{ github.repository }}
+        with:
+          # `JSON.stringify` on every interpolated string eliminates
+          # the PR-title-injection class entirely — no regex
+          # filtering against U+0000-001F control codes (U+000B,
+          # U+000C, U+0008, etc.) needed, and no risk that a
+          # crafted title closes the outer JSON literal.
+          script: |
+            const pr = context.payload.pull_request;
+            const title = (pr.title || '').substring(0, 200);
+            const payload = {
+              pr_number: String(pr.number),
+              commit_sha: pr.head.sha,
+              pr_repo: process.env.PR_REPO,
+              pr_url: pr.html_url,
+              pr_title: title,
+              pr_author: pr.user.login,
+            };
+            core.setOutput('json', JSON.stringify(payload));
+
+      - name: Dispatch kernel tests to internal repo
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: kernel-pr-test
+          client-payload: ${{ steps.payload.outputs.json }}
+
+      - name: Comment on PR (sticky)
+        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043  # v4.0.0
+        with:
+          issue-number: ${{ github.event.pull_request.number }}
+          # Body is a single sticky comment edited in place — avoids
+          # the comment-spam that fires every label-toggle / push
+          # cycle when each event creates a fresh comment.
+          #
+          # The "View status" link points at the Kernel Integration
+          # Tests check on this PR's head SHA. The check itself
+          # carries the receiver-supplied `details_url` (the
+          # actual workflow run on `databricks-driver-test`) once
+          # the receiver overwrites the `in_progress` placeholder
+          # we posted before dispatch. Linking to the check
+          # directly — rather than the receiver workflow's run-list
+          # — means the comment doesn't go stale across re-runs.
+          body: |
+            <!-- kernel-integration-tests-comment -->
+            **Kernel integration tests triggered** for `${{ github.event.pull_request.head.sha }}`.
+
+            [View status](https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}/checks?check_name=Kernel+Integration+Tests) — the check entry carries the receiver-supplied link to the actual workflow run.
+          # `edit-mode: replace` so each new dispatch overwrites the
+          # previous status rather than appending — the comment
+          # tracks the latest run only.
+          edit-mode: replace
+          # Match by the HTML comment marker above so the sticky
+          # comment survives across pushes / label re-adds.
+          body-includes: '<!-- kernel-integration-tests-comment -->'
+
+      # Parity with the merge-queue path's "Fail check on dispatch
+      # error" step. Without this, a dispatch failure on the
+      # label-trigger path would leave the PR with no Kernel
+      # Integration Tests check at all (since this is the path that
+      # creates it for the labeled-PR scenario).
+      - name: Fail check on dispatch error
+        if: failure()
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: context.payload.pull_request.head.sha,
+              status: 'completed',
+              conclusion: 'failure',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Failed - error dispatching tests',
+                summary: 'An error occurred while dispatching kernel integration tests from the label-trigger path. Check the workflow run logs.'
+              }
+            });
+
+  # =============================================================================
+  # Merge-queue gate: tests are a required status check before merge. If
+  # nothing under the kernel-source path filter changed, auto-pass.
+  # Otherwise dispatch and let the internal repo report the result.
+  # =============================================================================
+  merge-queue-kernel:
+    if: github.event_name == 'merge_group'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      checks: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Check if kernel source files changed
+        id: changed
+        run: |
+          CHANGED=$(git diff --name-only \
+            "${{ github.event.merge_group.base_sha }}" \
+            "${{ github.event.merge_group.head_sha }}")
+          # Edge case: a merge-group event where `base_sha ==
+          # head_sha` (or the diff is genuinely empty) yields a
+          # blank `$CHANGED`. The `grep -qE` below would then
+          # return non-zero ("no match"), which we'd interpret as
+          # auto-pass — semantically correct, but worth being
+          # explicit so a future reader doesn't have to reason
+          # about empty-string grep semantics.
+          if [[ -z "$CHANGED" ]]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no files changed in merge group (base_sha == head_sha?)"
+            exit 0
+          fi
+          # Path set mirrors the in-repo rust-e2e.yml's source filter
+          # (src/**, tests/**, Cargo.toml, Cargo.lock, workflow files)
+          # plus napi/ and pyo3/ wrappers. `tests/` is included because a
+          # test-only change can still break kernel-protocol invariants
+          # that integration tests catch.
+          if echo "$CHANGED" | grep -qE "^(src/|tests/|napi/|pyo3/|Cargo\.toml|Cargo\.lock|\.github/workflows/)"; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "kernel source files changed"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "no kernel source files changed"
+          fi
+
+      - name: Auto-pass (no kernel source changes)
+        if: steps.changed.outputs.changed != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped - no kernel source changes',
+                summary: 'No kernel source files changed in this merge group.'
+              }
+            });
+
+      # Companion-PR ordering gate (mirror of the label-trigger
+      # path). Until `vars.INTEGRATION_TESTS_ENABLED` is `"true"`
+      # — flipped on after databricks-driver-test#375 lands —
+      # auto-pass the required check so branch protection doesn't
+      # strand merges. The variable is unset by default, so this
+      # PR can land before the companion without breaking the
+      # merge queue.
+      - name: Auto-pass (companion workflow not yet enabled)
+        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED != 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped - integration-test workflow not yet enabled',
+                summary: 'The `INTEGRATION_TESTS_ENABLED` repo variable is not set. This is the pre-rollout state: the companion workflow in databricks-driver-test has not yet shipped. Auto-passing so branch protection does not strand merges.'
+              }
+            });
+
+      - name: Extract PR number
+        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
+        id: extract-pr
+        run: |
+          REF="${{ github.event.merge_group.head_ref }}"
+          # Fully anchor to GitHub's documented merge-queue head_ref
+          # shape: `refs/heads/gh-readonly-queue/<base>/pr-<N>-<sha>`.
+          # `<base>` can contain slashes (`release/v1`, `feature/foo`,
+          # etc.); a stricter `[^/]+` would reject slashed bases and
+          # the step would `exit 1`, taking the `if: failure()` path
+          # — bricking the merge queue for those PRs once it's
+          # enabled. Greedy `.+` plus the strict `/pr-N-hex$` tail
+          # is unambiguous: the final `/pr-N-<sha>$` anchor pins
+          # the PR-number capture to the right segment regardless of
+          # how many slashes the base contains. Today the kernel
+          # only merges into `main` so this is latent, but cheap to
+          # fix now.
+          # The trailing `[0-9a-f]+` matches GitHub's hex commit SHA
+          # suffix; tolerating any length covers both short and
+          # full-length forms.
+          if [[ $REF =~ ^refs/heads/gh-readonly-queue/(.+)/pr-([0-9]+)-[0-9a-f]+$ ]]; then
+            echo "pr_number=${BASH_REMATCH[2]}" >> "$GITHUB_OUTPUT"
+          else
+            echo "Error: merge-group ref does not match the documented gh-readonly-queue shape: '$REF'" >&2
+            exit 1
+          fi
+
+      - name: Generate GitHub App Token (internal repo)
+        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+          # Defense-in-depth: scope the minted installation token to
+          # exactly the permission `repository_dispatch` needs (see
+          # the matching note on the label-trigger path).
+          permission-contents: write
+
+      # See the matching block on the label-trigger path for the
+      # full rationale: this `in_progress` check (a) overwrites
+      # any stale-green from earlier auto-pass paths and (b)
+      # turns a silent-drop (broken / renamed receiver-side
+      # handler) into a fail-closed timeout. Branch protection
+      # blocks merge until the receiver overwrites this check.
+      - name: Post in_progress check (overwrite stale-green / fail-closed on silent drop)
+        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'in_progress',
+              started_at: new Date().toISOString(),
+              output: {
+                title: 'Dispatching to databricks-driver-test (merge queue)',
+                summary: 'Merge group is validating; dispatching to the receiver repo. If this check stays `in_progress` past the merge-queue timeout, the receiver-side workflow may be broken or renamed — manual investigation needed.'
+              }
+            });
+
+      - name: Dispatch kernel tests
+        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: kernel-pr-test
+          client-payload: |
+            {
+              "pr_number": "${{ steps.extract-pr.outputs.pr_number }}",
+              "commit_sha": "${{ github.event.merge_group.head_sha }}",
+              "pr_repo": "${{ github.repository }}",
+              "pr_url": "https://github.com/${{ github.repository }}/pull/${{ steps.extract-pr.outputs.pr_number }}",
+              "pr_title": "Merge queue validation",
+              "pr_author": "merge-queue"
+            }
+
+      - name: Fail check on dispatch error
+        if: failure() && steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        with:
+          github-token: ${{ github.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: '${{ github.event.merge_group.head_sha }}',
+              status: 'completed',
+              conclusion: 'failure',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Failed - error dispatching tests',
+                summary: 'An error occurred while dispatching kernel integration tests. Check the workflow run logs.'
+              }
+            });

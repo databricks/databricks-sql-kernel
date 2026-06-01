@@ -162,6 +162,33 @@ fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
     .to_string()
 }
 
+/// `FAILED` body with the three SEA extended status fields populated.
+/// Pins the kernel's `Error.display_message` / `diagnostic_info` /
+/// `error_details_json` carry on the sync polling path.
+fn failed_body_with_extended_fields(
+    statement_id: &str,
+    message: &str,
+    sql_state: &str,
+    display_message: &str,
+    diagnostic_info: &str,
+    error_details_json: &str,
+) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": {
+            "state": "FAILED",
+            "error": {
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": format!("{message}. SQLSTATE: {sql_state}"),
+            },
+            "display_message": display_message,
+            "diagnostic_info": diagnostic_info,
+            "error_details_json": error_details_json,
+        },
+    })
+    .to_string()
+}
+
 async fn mount_execute(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
@@ -592,4 +619,401 @@ async fn kernel_invariant_parent_drop_invalidates_executed_cancel() {
         .await
         .expect_err("cancel after parent Statement drop must short-circuit");
     assert_eq!(err.code, ErrorCode::InvalidStatementHandle);
+}
+
+// ─── ExecutedStatement extended status accessors (PR #23) ─────────
+
+/// Build a SEA `SUCCEEDED` body with the 5 extended status fields
+/// populated. Mirrors `succeeded_inline_body` but injects status
+/// fields the kernel surfaces via `ExecutedStatement::*` getters.
+fn succeeded_inline_body_with_status(
+    statement_id: &str,
+    batch: &RecordBatch,
+    num_modified_rows: Option<i64>,
+    display_message: Option<&str>,
+    diagnostic_info: Option<&str>,
+    error_details_json: Option<&str>,
+) -> String {
+    let ipc = arrow_ipc_bytes(batch);
+    let attachment = STANDARD.encode(&ipc);
+    let columns: Vec<_> = batch
+        .schema()
+        .fields()
+        .iter()
+        .enumerate()
+        .map(|(i, f)| {
+            json!({
+                "name": f.name(),
+                "type_name": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    DataType::Utf8 => "STRING",
+                    _ => "STRING",
+                },
+                "type_text": match f.data_type() {
+                    DataType::Int64 => "BIGINT",
+                    DataType::Utf8 => "STRING",
+                    _ => "STRING",
+                },
+                "position": i as i32,
+            })
+        })
+        .collect();
+
+    let mut status = json!({ "state": "SUCCEEDED" });
+    let status_obj = status.as_object_mut().unwrap();
+    if let Some(n) = num_modified_rows {
+        status_obj.insert("num_modified_rows".to_string(), json!(n));
+    }
+    if let Some(m) = display_message {
+        status_obj.insert("display_message".to_string(), json!(m));
+    }
+    if let Some(d) = diagnostic_info {
+        status_obj.insert("diagnostic_info".to_string(), json!(d));
+    }
+    if let Some(e) = error_details_json {
+        status_obj.insert("error_details_json".to_string(), json!(e));
+    }
+
+    json!({
+        "statement_id": statement_id,
+        "status": status,
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": batch.num_columns() as i32,
+                "columns": columns,
+            },
+            "total_chunk_count": 1,
+            "total_row_count": batch.num_rows() as i64,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": batch.num_rows() as i64,
+            "byte_count": ipc.len() as i64,
+            "attachment": attachment,
+        },
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn executed_statement_surfaces_extended_status_fields() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(
+        &server,
+        succeeded_inline_body_with_status(
+            "stmt-status",
+            &batch,
+            Some(7),
+            Some("All good"),
+            Some("operator=Scan"),
+            Some(r#"{"k":"v"}"#),
+        ),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let exec = stmt.execute().await.expect("execute");
+
+    assert_eq!(exec.num_modified_rows(), Some(7));
+    assert_eq!(exec.display_message(), Some("All good"));
+    assert_eq!(exec.diagnostic_info(), Some("operator=Scan"));
+    assert_eq!(exec.error_details_json(), Some(r#"{"k":"v"}"#));
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn executed_statement_status_fields_default_to_none() {
+    // When the server omits the extended fields (the common case for
+    // SELECT on classic warehouses), all five accessors return None.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-empty-status", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let exec = stmt.execute().await.expect("execute");
+
+    assert_eq!(exec.num_modified_rows(), None);
+    assert_eq!(exec.display_message(), None);
+    assert_eq!(exec.diagnostic_info(), None);
+    assert_eq!(exec.error_details_json(), None);
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn polling_path_carries_terminal_status_not_initial() {
+    // Regression guard against the kernel surfacing the FIRST status
+    // response instead of the TERMINAL one.
+    //
+    // Setup: the POST /statements returns RUNNING with no extended
+    // fields. The polling GET /statements/{id} then returns SUCCEEDED
+    // with all 5 extended fields populated. The kernel's
+    // `wait_for_completion` loop must hand the **terminal** status
+    // (the final GET) to `ExecutedStatement::new`, not the initial
+    // POST response. If the kernel ever regresses to carrying forward
+    // the first response, this test fails because the accessors will
+    // see `None` instead of the populated terminal values.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // Initial execute returns RUNNING — no extended fields. The
+    // kernel must NOT latch this onto the ExecutedStatement.
+    mount_execute(&server, running_body("stmt-poll-status")).await;
+
+    // Polled GET returns SUCCEEDED with the extended fields
+    // populated. This is the status the kernel must carry forward.
+    let batch = int64_batch("n", vec![42]);
+    mount_status(
+        &server,
+        "stmt-poll-status",
+        succeeded_inline_body_with_status(
+            "stmt-poll-status",
+            &batch,
+            Some(11),
+            Some("Done after retry"),
+            Some("operator=Project; stage=Execute"),
+            Some(r#"{"errorClass":"NONE"}"#),
+        ),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = 1");
+    let exec = stmt
+        .execute()
+        .await
+        .expect("execute should poll to terminal SUCCEEDED");
+
+    // All accessors must reflect the TERMINAL poll, not the initial
+    // RUNNING response (which had no extended fields).
+    assert_eq!(exec.num_modified_rows(), Some(11));
+    assert_eq!(exec.display_message(), Some("Done after retry"));
+    assert_eq!(
+        exec.diagnostic_info(),
+        Some("operator=Project; stage=Execute")
+    );
+    assert_eq!(exec.error_details_json(), Some(r#"{"errorClass":"NONE"}"#));
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_failed_carries_extended_status_fields_onto_error() {
+    // Pins the sync polling path's terminal-error contract: when the
+    // SEA wire response on a FAILED statement includes
+    // `display_message` / `diagnostic_info` / `error_details_json`,
+    // the kernel `Error` returned from `Statement::execute()` carries
+    // all three. Mirrors the Thrift `TGetOperationStatusResp` field
+    // set so a Thrift-migrating wrapper (e.g. the napi binding's JS
+    // Error envelope) sees identical content regardless of which
+    // path surfaced the failure. Regression guard for the
+    // `terminal_outcome::Failed → carry_extended_status` wiring at
+    // `src/client/sea.rs`.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let body = failed_body_with_extended_fields(
+        "stmt-fail-ext",
+        "table not found",
+        "42P01",
+        "User-facing reason from server",
+        "operator=Scan; stage=Analyze; full stack ...",
+        r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#,
+    );
+    mount_execute(&server, body).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT * FROM does_not_exist");
+    let err = match stmt.execute().await {
+        Ok(_) => panic!("execute should fail on FAILED state"),
+        Err(e) => e,
+    };
+
+    assert_eq!(err.code, ErrorCode::SqlError);
+    assert_eq!(err.sql_state.as_deref(), Some("42P01"));
+    assert_eq!(
+        err.display_message.as_deref(),
+        Some("User-facing reason from server"),
+        "display_message must carry through from FAILED wire envelope"
+    );
+    assert_eq!(
+        err.diagnostic_info.as_deref(),
+        Some("operator=Scan; stage=Analyze; full stack ...")
+    );
+    assert_eq!(
+        err.error_details_json.as_deref(),
+        Some(r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#)
+    );
+}
+
+/// Reproducer for the orphaned-statement bug observed against the
+/// proxy-test suite's CLOUDFETCH-016 (databricks-driver-test PR #410).
+///
+/// `Statement::execute()` is supposed to be all-or-nothing: either it
+/// hands back an `ExecutedStatement` whose `close()` cleans up
+/// server-side state, OR it returns an error and the kernel cleans
+/// up internally. Today the latter half is missing for the CloudFetch
+/// path: when the server returns a `SUCCEEDED` response carrying
+/// `external_links` and the kernel's reader-construction reads chunk
+/// 0 (in `ResultPostProcessor::new` -> `StreamingCloudFetchProvider::
+/// get_schema` -> eager download) and that download fails, the
+/// SUCCEEDED statement on the server is leaked until the SQL
+/// Gateway's `CommandInactivityTimeout` (~1h) reclaims it. The
+/// kernel never issues `DELETE /api/2.0/sql/statements/{id}`.
+///
+/// This test mounts:
+///   1. `POST /api/2.0/sql/statements` returning a SUCCEEDED body
+///      with `external_links` pointing back at the mock server.
+///   2. `GET` on that link returning HTTP 500 (simulating an Azure
+///      Blob / S3 transient failure that doesn't trigger urllib3's
+///      retry policy in our case).
+///
+/// Expectation after the fix: `Statement::execute()` returns Err,
+/// AND the mock records a `DELETE /api/2.0/sql/statements/stmt-cf-leak`
+/// before the test ends.
+#[tokio::test]
+async fn execute_cloudfetch_chunk0_failure_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let statement_id = "stmt-cf-leak";
+    let chunk_path = format!("/cloud-fetch/{statement_id}/chunk-0.arrow");
+    let chunk_url = format!("{}{}", server.uri(), chunk_path);
+
+    // POST /statements: SUCCEEDED + external_links pointing at the
+    // mock-served chunk URL. The kernel will read chunk 0 eagerly in
+    // ResultPostProcessor::new to extract the result schema, so chunk
+    // 0's GET fires before execute() returns.
+    let exec_body = json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 1,
+                "columns": [{
+                    "name": "id",
+                    "type_name": "BIGINT",
+                    "type_text": "BIGINT",
+                    "position": 0,
+                }],
+            },
+            "total_chunk_count": 1,
+            "total_row_count": 1,
+            "total_byte_count": 1024,
+            "truncated": false,
+        },
+        "result": {
+            "external_links": [{
+                "external_link": chunk_url,
+                "expiration": "2099-01-01T00:00:00.000Z",
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": 1024,
+            }],
+        },
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(exec_body))
+        .mount(&server)
+        .await;
+
+    // Chunk-0 download fails with HTTP 404 — a non-retryable client
+    // error. The kernel's CloudFetch downloader treats 5xx as
+    // transient and retries up to ~30 times, which would make this
+    // test run for minutes; 404 hits the same propagation path
+    // (downloader -> ResultPostProcessor::new -> execute_and_read)
+    // on the first attempt. The bug we're reproducing is independent
+    // of which 4xx/5xx code surfaces the failure — what matters is
+    // that download fails after the SUCCEEDED execute response.
+    Mock::given(method("GET"))
+        .and(path(chunk_path.as_str()))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    // DELETE /statements/{id}: success. We do NOT mount it with
+    // `expect()` so that absence of the call shows up as a missing
+    // entry in `received_requests`, not as a wiremock failure
+    // message ("expected mock not called").
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT id FROM range(2000000)");
+
+    let err = stmt
+        .execute()
+        .await
+        .err()
+        .expect("execute must fail when chunk-0 returns HTTP 500");
+
+    // The error variant isn't load-bearing here; the close path is.
+    // Log so a regression that changes the surfaced error shape is
+    // visible at test-output time without burying the close-assert.
+    eprintln!("[reproducer] execute() returned: {err:?}");
+
+    // Defensive close — closes any state the failing execute()
+    // tracked locally. Mirrors what the Python connector does (and
+    // the C# canonical's `DatabricksCompositeReader.Dispose`).
+    let _ = stmt.close().await;
+
+    // Drop the session too so any lingering shutdown paths run.
+    let _ = session.close().await;
+
+    // The fix: after the eager-chunk-0 failure, the kernel must
+    // issue DELETE /api/2.0/sql/statements/{id} so the SUCCEEDED
+    // server-side statement doesn't linger until
+    // CommandInactivityTimeout (~1h).
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available");
+    let delete_path = format!("/api/2.0/sql/statements/{statement_id}");
+    let deletes: Vec<_> = recorded
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::DELETE && r.url.path() == delete_path)
+        .collect();
+    assert!(
+        !deletes.is_empty(),
+        "expected at least one DELETE {delete_path} after chunk-0 download \
+         failure; observed requests: {observed:?}",
+        delete_path = delete_path,
+        observed = recorded
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>(),
+    );
 }

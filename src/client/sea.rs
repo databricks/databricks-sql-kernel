@@ -35,7 +35,7 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Internal terminal-outcome for a single SEA statement response.
 ///
@@ -295,10 +295,22 @@ impl SeaRestTransport {
                     }
                 }
 
-                StatementOutcome::Err(error)
+                // Carry the extended status fields onto the Error so
+                // wrappers see what Thrift's `TGetOperationStatusResp`
+                // surfaces on terminal-error states.
+                StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                    error,
+                    &response.status,
+                ))
             }
             StatementState::Canceled => {
-                StatementOutcome::Err(Error::invalid_state().message("Statement was canceled"))
+                let error = Error::invalid_state()
+                    .message("Statement was canceled")
+                    .with_query_id(&response.statement_id);
+                StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                    error,
+                    &response.status,
+                ))
             }
             StatementState::Closed => {
                 // Closed with result data is valid for inline results
@@ -308,7 +320,13 @@ impl SeaRestTransport {
                 if response.result.is_some() {
                     StatementOutcome::Done(response)
                 } else {
-                    StatementOutcome::Err(Error::invalid_state().message("Statement was closed"))
+                    let error = Error::invalid_state()
+                        .message("Statement was closed")
+                        .with_query_id(&response.statement_id);
+                    StatementOutcome::Err(crate::kernel_error::carry_extended_status(
+                        error,
+                        &response.status,
+                    ))
                 }
             }
             StatementState::Pending | StatementState::Running => {
@@ -332,7 +350,11 @@ impl SeaRestTransport {
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
-                    debug!("Polling statement status: {}", r.statement_id);
+                    debug!(
+                        statement_id = %r.statement_id,
+                        state = ?r.status.state,
+                        "Polling statement status"
+                    );
                     current_response = self.get_statement_status(&r.statement_id).await?;
                 }
             }
@@ -429,10 +451,40 @@ impl SeaRestTransport {
         params: &ExecuteParams,
         request_type: RequestType,
     ) -> Result<ExecuteResult> {
+        // After call_execute_api succeeds, the SEA statement is open
+        // on the server. Any subsequent failure before we hand back
+        // an ExecuteResult (which wraps it in an ExecutedStatement
+        // whose Drop / explicit close() cleans up) would orphan the
+        // server-side statement until SQL Gateway's
+        // CommandInactivityTimeout (~1h) reclaims it. Two known
+        // paths into that gap:
+        //
+        //   - wait_for_completion times out (`Error::timeout`) while
+        //     the server still considers the statement live in
+        //     PENDING / RUNNING. (Terminal FAILED / CANCELED is the
+        //     server's own cleanup signal — no CloseStatement
+        //     needed.)
+        //   - create_reader fails. The most likely sub-failure today
+        //     is `ResultPostProcessor::new ->
+        //     StreamingCloudFetchProvider::get_schema` eagerly
+        //     downloading chunk 0 to extract the result schema; a
+        //     non-retriable 4xx / 5xx on that GET propagates up.
+        //
+        // Capture the statement_id from the initial response so we
+        // can issue a best-effort close on either path.
         let response = self
             .call_execute_api(session_id, sql, params, request_type)
             .await?;
-        let response = self.wait_for_completion(response).await?;
+        let statement_id = response.statement_id.clone();
+
+        let response = match self.wait_for_completion(response).await {
+            Ok(r) => r,
+            Err(e) => {
+                self.close_orphaned_statement(&statement_id, "wait_for_completion")
+                    .await;
+                return Err(e);
+            }
+        };
         let reader_factory = self.reader_factory()?;
         // `create_reader` wraps in a `ResultPostProcessor`
         // internally, so the reader returned here already carries
@@ -443,14 +495,22 @@ impl SeaRestTransport {
         // Arrow shape collapses (VARIANT → Utf8, intervals → Interval,
         // GEOMETRY/GEOGRAPHY → Utf8). The post-processor also handles
         // the optional complex-types-as-JSON rewrite in the same pass.
-        let reader = reader_factory
+        let reader = match reader_factory
             .create_reader(&response.statement_id, &response)
-            .await?;
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                self.close_orphaned_statement(&statement_id, "create_reader")
+                    .await;
+                return Err(e);
+            }
+        };
 
         // The full `status` is carried forward so the executed handle
         // can skip a redundant CloseStatement when the server already
         // cleaned up (status.state=Closed) AND expose
-        // num_modified_rows / progress / etc. without a second
+        // num_modified_rows / display_message / etc. without a second
         // GetStatementStatus round-trip.
         Ok(ExecuteResult {
             statement_id: response.statement_id,
@@ -458,6 +518,35 @@ impl SeaRestTransport {
             manifest: response.manifest,
             status: response.status,
         })
+    }
+
+    /// Best-effort close for a server-side statement we opened but
+    /// can't hand off to an `ExecutedStatement` because of a failure
+    /// in `wait_for_completion` or `create_reader`. The trait method
+    /// `close_statement` already swallows its own errors (line 797);
+    /// the wrapper here is just a logging seam so a future failure
+    /// to clean up shows up in traces with the failing-phase
+    /// attribution (`wait_for_completion` vs `create_reader`).
+    async fn close_orphaned_statement(&self, statement_id: &str, phase: &str) {
+        debug!(
+            statement_id = %statement_id,
+            phase = %phase,
+            "execute_and_read: closing orphaned statement after failure"
+        );
+        if let Err(e) = <Self as Transport>::close_statement(self, statement_id).await {
+            // `close_statement` is documented as best-effort and
+            // returns Ok even on inner failure (see body), but the
+            // signature is fallible so future implementations can
+            // surface real errors. Demote to warn — the caller is
+            // already returning the originating error.
+            warn!(
+                statement_id = %statement_id,
+                phase = %phase,
+                error = %e,
+                "execute_and_read: orphan-close failed; statement may linger \
+                 until SQL Gateway CommandInactivityTimeout"
+            );
+        }
     }
 }
 

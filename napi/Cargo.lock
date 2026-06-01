@@ -374,24 +374,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "databricks-sea-native"
-version = "0.1.0"
-dependencies = [
- "arrow-array",
- "arrow-ipc",
- "arrow-schema",
- "chrono",
- "databricks-sql-kernel",
- "futures",
- "napi",
- "napi-build",
- "napi-derive",
- "once_cell",
- "serde_json",
- "tokio",
-]
-
-[[package]]
 name = "databricks-sql-kernel"
 version = "0.1.0"
 dependencies = [
@@ -421,6 +403,23 @@ dependencies = [
  "tokio-util",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "databricks-sql-kernel-napi"
+version = "0.1.0"
+dependencies = [
+ "arrow-array",
+ "arrow-ipc",
+ "arrow-schema",
+ "databricks-sql-kernel",
+ "futures",
+ "napi",
+ "napi-build",
+ "napi-derive",
+ "once_cell",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
