@@ -356,6 +356,9 @@ pub struct ProxyConfig {}
 /// The kernel exposes only fields that the internal rustls plumbing
 /// already supports — cert pinning and FIPS mode are *not* in scope.
 ///
+/// `TlsConfig` is `#[non_exhaustive]`, so construct it from
+/// [`TlsConfig::default`] and assign the public fields you need:
+///
 /// ```no_run
 /// # use databricks_sql_kernel::TlsConfig;
 /// // From a file path:

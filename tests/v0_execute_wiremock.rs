@@ -869,3 +869,151 @@ async fn execute_failed_carries_extended_status_fields_onto_error() {
         Some(r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#)
     );
 }
+
+/// Reproducer for the orphaned-statement bug observed against the
+/// proxy-test suite's CLOUDFETCH-016 (databricks-driver-test PR #410).
+///
+/// `Statement::execute()` is supposed to be all-or-nothing: either it
+/// hands back an `ExecutedStatement` whose `close()` cleans up
+/// server-side state, OR it returns an error and the kernel cleans
+/// up internally. Today the latter half is missing for the CloudFetch
+/// path: when the server returns a `SUCCEEDED` response carrying
+/// `external_links` and the kernel's reader-construction reads chunk
+/// 0 (in `ResultPostProcessor::new` -> `StreamingCloudFetchProvider::
+/// get_schema` -> eager download) and that download fails, the
+/// SUCCEEDED statement on the server is leaked until the SQL
+/// Gateway's `CommandInactivityTimeout` (~1h) reclaims it. The
+/// kernel never issues `DELETE /api/2.0/sql/statements/{id}`.
+///
+/// This test mounts:
+///   1. `POST /api/2.0/sql/statements` returning a SUCCEEDED body
+///      with `external_links` pointing back at the mock server.
+///   2. `GET` on that link returning HTTP 500 (simulating an Azure
+///      Blob / S3 transient failure that doesn't trigger urllib3's
+///      retry policy in our case).
+///
+/// Expectation after the fix: `Statement::execute()` returns Err,
+/// AND the mock records a `DELETE /api/2.0/sql/statements/stmt-cf-leak`
+/// before the test ends.
+#[tokio::test]
+async fn execute_cloudfetch_chunk0_failure_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let statement_id = "stmt-cf-leak";
+    let chunk_path = format!("/cloud-fetch/{statement_id}/chunk-0.arrow");
+    let chunk_url = format!("{}{}", server.uri(), chunk_path);
+
+    // POST /statements: SUCCEEDED + external_links pointing at the
+    // mock-served chunk URL. The kernel will read chunk 0 eagerly in
+    // ResultPostProcessor::new to extract the result schema, so chunk
+    // 0's GET fires before execute() returns.
+    let exec_body = json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 1,
+                "columns": [{
+                    "name": "id",
+                    "type_name": "BIGINT",
+                    "type_text": "BIGINT",
+                    "position": 0,
+                }],
+            },
+            "total_chunk_count": 1,
+            "total_row_count": 1,
+            "total_byte_count": 1024,
+            "truncated": false,
+        },
+        "result": {
+            "external_links": [{
+                "external_link": chunk_url,
+                "expiration": "2099-01-01T00:00:00.000Z",
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": 1024,
+            }],
+        },
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(exec_body))
+        .mount(&server)
+        .await;
+
+    // Chunk-0 download fails with HTTP 404 — a non-retryable client
+    // error. The kernel's CloudFetch downloader treats 5xx as
+    // transient and retries up to ~30 times, which would make this
+    // test run for minutes; 404 hits the same propagation path
+    // (downloader -> ResultPostProcessor::new -> execute_and_read)
+    // on the first attempt. The bug we're reproducing is independent
+    // of which 4xx/5xx code surfaces the failure — what matters is
+    // that download fails after the SUCCEEDED execute response.
+    Mock::given(method("GET"))
+        .and(path(chunk_path.as_str()))
+        .respond_with(ResponseTemplate::new(404).set_body_string("Not Found"))
+        .mount(&server)
+        .await;
+
+    // DELETE /statements/{id}: success. We do NOT mount it with
+    // `expect()` so that absence of the call shows up as a missing
+    // entry in `received_requests`, not as a wiremock failure
+    // message ("expected mock not called").
+    Mock::given(method("DELETE"))
+        .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT id FROM range(2000000)");
+
+    let err = stmt
+        .execute()
+        .await
+        .err()
+        .expect("execute must fail when chunk-0 returns HTTP 500");
+
+    // The error variant isn't load-bearing here; the close path is.
+    // Log so a regression that changes the surfaced error shape is
+    // visible at test-output time without burying the close-assert.
+    eprintln!("[reproducer] execute() returned: {err:?}");
+
+    // Defensive close — closes any state the failing execute()
+    // tracked locally. Mirrors what the Python connector does (and
+    // the C# canonical's `DatabricksCompositeReader.Dispose`).
+    let _ = stmt.close().await;
+
+    // Drop the session too so any lingering shutdown paths run.
+    let _ = session.close().await;
+
+    // The fix: after the eager-chunk-0 failure, the kernel must
+    // issue DELETE /api/2.0/sql/statements/{id} so the SUCCEEDED
+    // server-side statement doesn't linger until
+    // CommandInactivityTimeout (~1h).
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available");
+    let delete_path = format!("/api/2.0/sql/statements/{statement_id}");
+    let deletes: Vec<_> = recorded
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::DELETE && r.url.path() == delete_path)
+        .collect();
+    assert!(
+        !deletes.is_empty(),
+        "expected at least one DELETE {delete_path} after chunk-0 download \
+         failure; observed requests: {observed:?}",
+        delete_path = delete_path,
+        observed = recorded
+            .iter()
+            .map(|r| format!("{} {}", r.method, r.url.path()))
+            .collect::<Vec<_>>(),
+    );
+}
