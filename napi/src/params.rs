@@ -15,12 +15,20 @@
 //! JS↔napi parameter codec — parses a connector-style
 //! `{ type, value }` pair into a kernel `TypedValue`.
 //!
-//! Mirrors `pyo3/src/params.rs` line-for-line so the two bindings share
-//! a single contract for what the kernel sees on the wire. The JS-side
-//! `DBSQLParameter` already stringifies values before crossing the FFI
-//! (see `lib/DBSQLParameter.ts::toSparkParameter` in the Node driver):
-//! the napi binding takes the `(sql_type, value_str)` form directly to
-//! avoid a per-call JS-value → Rust-value reflection trip.
+//! Mirrors `pyo3/src/params.rs`'s contract for the supported SQL types
+//! so the two bindings agree on what the kernel sees on the wire. The
+//! JS-side `DBSQLParameter` already stringifies values before crossing
+//! the FFI (see `lib/DBSQLParameter.ts::toSparkParameter` in the Node
+//! driver): the napi binding takes the `(sql_type, value_str)` form
+//! directly to avoid a per-call JS-value → Rust-value reflection trip.
+//!
+//! Known divergence from pyo3: `GEOGRAPHY` / `GEOMETRY` are dispatched
+//! to parsers in `pyo3/src/params.rs` (via `is_geo_type_name` →
+//! `parse_geography` / `parse_geometry`) but have no arms here yet, so
+//! they fall through to the generic `unsupported parameter SQL type`
+//! error. Adding the geo arms to napi is tracked as a follow-up; the
+//! `geo_falls_through_to_unsupported` test pins the current behaviour so
+//! a future GEO-add is a deliberate change.
 //!
 //! Compound types (`ARRAY` / `MAP` / `STRUCT`) and BINARY are
 //! explicitly rejected — the SEA wire does not accept either as a bound
@@ -620,6 +628,26 @@ mod tests {
             assert!(
                 e.message.contains("unsupported"),
                 "{ty} should fall through, got {}",
+                e.message
+            );
+        }
+    }
+
+    #[test]
+    fn geo_falls_through_to_unsupported() {
+        // Known divergence from pyo3: GEOGRAPHY / GEOMETRY (bare and
+        // SRID-decorated) have no arms in the napi codec, so they fall
+        // through to the generic "unsupported parameter SQL type"
+        // error. pyo3 dispatches these to parse_geography /
+        // parse_geometry. Pinning the fall-through here makes a future
+        // GEO-add a deliberate change rather than a silent contract
+        // drift between the two bindings.
+        for ty in ["GEOGRAPHY", "GEOGRAPHY(4326)", "GEOMETRY", "GEOMETRY(4326)"] {
+            let e = parse_typed_value(ty, Some("POINT(0 0)")).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidArgument, "{ty}");
+            assert!(
+                e.message.contains("unsupported"),
+                "{ty} should fall through to unsupported, got {}",
                 e.message
             );
         }

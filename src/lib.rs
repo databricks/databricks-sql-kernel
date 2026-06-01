@@ -120,7 +120,9 @@ pub use metadata_v0::{Identifier, LikePattern, Metadata};
 pub use result_stream::{OwnedBatchIter, ResultBatch, ResultStream, Row, SchemaRef};
 pub use session::{Session, SessionBuilder};
 pub use statement::executed::ExecutedStatement;
-pub use statement::executed_async::{ExecutedAsyncStatement, StatementStatus};
+pub use statement::executed_async::{
+    AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus,
+};
 pub use statement::handle::ExecutedStatementHandle;
 pub use statement::mutable::Statement;
 pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};

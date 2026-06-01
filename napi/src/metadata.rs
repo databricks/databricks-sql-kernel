@@ -50,9 +50,11 @@
 
 use std::sync::Arc;
 
-use databricks_sql_kernel::{Identifier, LikePattern, Metadata, Result as KResult, ResultStream};
+use databricks_sql_kernel::{
+    Error as KernelError, Identifier, LikePattern, Metadata, Result as KResult, ResultStream,
+};
 
-use crate::connection::Connection;
+use crate::connection::{connection_closed_err, Connection};
 use crate::error::napi_err_from_kernel;
 use crate::runtime::get_handle;
 use crate::statement::Statement;
@@ -87,7 +89,11 @@ where
     let handle = get_handle().clone();
     let stream = tokio::task::spawn_blocking(move || handle.block_on(f()))
         .await
-        .map_err(|e| napi::Error::new(napi::Status::GenericFailure, e.to_string()))?
+        .map_err(|e| {
+            napi_err_from_kernel(
+                KernelError::internal().message(format!("metadata task join failed: {e}")),
+            )
+        })?
         .map_err(napi_err_from_kernel)?;
     Ok(stream)
 }
@@ -97,9 +103,7 @@ async fn take_metadata(
     inner: &Arc<tokio::sync::Mutex<Option<databricks_sql_kernel::Session>>>,
 ) -> napi::Result<Metadata> {
     let guard = inner.lock().await;
-    let session = guard
-        .as_ref()
-        .ok_or_else(|| napi::Error::new(napi::Status::InvalidArg, "connection already closed"))?;
+    let session = guard.as_ref().ok_or_else(connection_closed_err)?;
     Ok(session.metadata())
 }
 
@@ -325,5 +329,58 @@ impl Connection {
             Ok(Statement::from_result_stream(stream))
         })
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use databricks_sql_kernel::ErrorCode;
+
+    // The `opt_identifier` / `opt_pattern` adapters are the only
+    // synchronous, kernel-runtime-free surface in this module — the
+    // `#[napi]` methods all link against the native napi runtime and
+    // can't be exercised under `cargo test`. Pinning the adapters here
+    // guards the JS-string → kernel-newtype contract: whitespace-only
+    // input must reject as `InvalidArgument` (matching
+    // `Identifier::new` / `LikePattern::new`), `None` must pass through
+    // as `Ok(None)`, and a real name must construct.
+
+    #[test]
+    fn opt_identifier_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = opt_identifier(&input).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn opt_identifier_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(opt_identifier(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn opt_identifier_real_name_is_ok_some() {
+        let input = Some("main".to_owned());
+        assert!(opt_identifier(&input).unwrap().is_some());
+    }
+
+    #[test]
+    fn opt_pattern_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = opt_pattern(&input).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn opt_pattern_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(opt_pattern(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn opt_pattern_real_name_is_ok_some() {
+        let input = Some("main".to_owned());
+        assert!(opt_pattern(&input).unwrap().is_some());
     }
 }

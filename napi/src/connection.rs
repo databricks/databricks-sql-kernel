@@ -102,6 +102,16 @@ pub struct ExecuteOptions {
     /// server statement timeout (JDBC `setQueryTimeout`). Maps to
     /// `StatementSpec.query_timeout_secs`. Distinct from the
     /// connection-level transport timeout. The SEA wire caps it at 50s.
+    ///
+    /// **Applies to `executeStatement` only.** The async `submitStatement`
+    /// path always sends `wait_timeout=0s` (so the server returns a
+    /// `statement_id` immediately and never blocks), which means this
+    /// field is *not* consulted on the submit path — the caller drives
+    /// completion via `AsyncStatement.status()` / `awaitResult()` and is
+    /// responsible for its own timeout (e.g. `Promise.race`). Passing
+    /// `queryTimeoutSecs` to `submitStatement` is silently ignored. This
+    /// matches the Python `use_sea` async-submit contract, where the
+    /// wait-timeout and any statement timeout are orthogonal.
     pub query_timeout_secs: Option<u32>,
     /// Positional parameters, in 1-based wire order. Index `i` in this
     /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
@@ -166,8 +176,9 @@ fn decode_named_params(
 /// Closed-state error builder. Mirrors `statement::statement_closed_err`
 /// — route through the kernel envelope so the TS reviver mints a typed
 /// `KernelError(code='InvalidStatementHandle')`. Single source of truth
-/// for `executeStatement` on a closed Connection.
-fn connection_closed_err() -> napi::Error {
+/// for `executeStatement` on a closed Connection. Also reused by
+/// `metadata::take_metadata` so closed-state errors share one envelope.
+pub(crate) fn connection_closed_err() -> napi::Error {
     napi_err_from_kernel(
         KernelError::invalid_statement_handle().message("connection already closed"),
     )
@@ -249,15 +260,16 @@ fn serialize_query_tags(tags: &HashMap<String, String>) -> String {
 /// - `close()` can `.take()` the session to consume it for the kernel's
 ///   move-by-value `Session::close(self)` signature.
 ///
-/// **Current concurrency shape** — `executeStatement` holds
-/// `inner.lock()` across `stmt.execute().await`, so two concurrent
-/// `Promise.all([executeStatement(q1), executeStatement(q2)])` calls
-/// on the same Connection serialise even though the kernel transport
-/// supports concurrent statements per session, and `close()` blocks
-/// behind any in-flight execute. The kernel's `Session::statement()`
-/// is `&self`-callable, so the right shape is `Arc<Session>` with
-/// concurrent execute paths; that lands in the follow-up lock-shape
-/// refactor — see
+/// **Concurrency shape** — both `executeStatement` and
+/// `submitStatement` build the kernel `Statement` under `inner.lock()`
+/// and then RELEASE the guard before the wire call
+/// (`stmt.execute().await` / `stmt.submit().await`). `Session::statement()`
+/// is `&self`-callable and only clones the session's internal `Arc`, so
+/// the built statement is independent of the guard. Concurrent
+/// `Promise.all([executeStatement(q1), submitStatement(q2)])` therefore
+/// serialise only for the microsecond statement-build, not the network
+/// round-trip, and `close()` never blocks behind an in-flight execute or
+/// submit. See
 /// `sea-workflow/jira-candidates/2026-05-24-napi-cancel-during-fetch.md`.
 #[napi]
 pub struct Connection {
@@ -387,9 +399,14 @@ impl Connection {
     /// uses (`runAsync: true`): the SEA backend submits, returns a
     /// pending operation handle, and polls to terminal during
     /// fetch. Option semantics (statementConf / queryTags /
-    /// rowLimit / queryTimeoutSecs / positional + named params) are
-    /// identical to `executeStatement`; only the blocking-vs-pending
-    /// return contract differs.
+    /// rowLimit / positional + named params) match `executeStatement`,
+    /// with one carve-out: `queryTimeoutSecs` is **ignored** here.
+    /// Submit always sends `wait_timeout=0s` so the call returns
+    /// immediately, leaving no server wait to bound; the caller drives
+    /// completion and its own timeout via `status()` / `awaitResult()`
+    /// (e.g. `Promise.race`). Only the blocking-vs-pending return
+    /// contract — and that timeout carve-out — differ from
+    /// `executeStatement`.
     #[napi]
     pub async fn submit_statement(
         &self,
@@ -415,27 +432,41 @@ impl Connection {
             .unwrap_or_default();
         let merged_conf = build_merged_statement_conf(options)?;
         guarded(async move {
-            let guard = inner.lock().await;
-            let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+            // Build the kernel `Statement` while holding the session lock,
+            // then RELEASE the lock before `submit().await` — same shape as
+            // `execute_statement`. `Session::statement()` clones the session's
+            // internal `Arc`, so the built statement is independent of the
+            // guard and we never need the mutex across the wire round-trip.
+            // This keeps concurrent `submitStatement` calls from serialising
+            // on the session mutex and stops `close()` blocking behind an
+            // in-flight submit (matters on transport retries — submit itself
+            // sends `wait_timeout=0s`). See jira-candidate
+            // 2026-05-24-napi-cancel-during-fetch (connection-side half).
+            let mut stmt = {
+                let guard = inner.lock().await;
+                let session = guard.as_ref().ok_or_else(connection_closed_err)?;
 
-            let mut stmt = session.statement();
-            stmt.spec().sql(sql);
-            if let Some(conf) = merged_conf {
-                stmt.spec().statement_conf(conf);
-            }
-            stmt.spec()
-                .row_limit(row_limit)
-                .query_timeout_secs(query_timeout_secs);
-            for (i, value) in positional_params.into_iter().enumerate() {
+                let mut stmt = session.statement();
+                stmt.spec().sql(sql);
+                if let Some(conf) = merged_conf {
+                    stmt.spec().statement_conf(conf);
+                }
                 stmt.spec()
-                    .param(i + 1, value)
-                    .map_err(napi_err_from_kernel)?;
-            }
-            for (name, value) in named_params {
-                stmt.spec()
-                    .param_named(name, value)
-                    .map_err(napi_err_from_kernel)?;
-            }
+                    .row_limit(row_limit)
+                    .query_timeout_secs(query_timeout_secs);
+                for (i, value) in positional_params.into_iter().enumerate() {
+                    stmt.spec()
+                        .param(i + 1, value)
+                        .map_err(napi_err_from_kernel)?;
+                }
+                for (name, value) in named_params {
+                    stmt.spec()
+                        .param_named(name, value)
+                        .map_err(napi_err_from_kernel)?;
+                }
+                stmt
+                // session lock released here
+            };
 
             let executed_async = stmt.submit().await.map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper so

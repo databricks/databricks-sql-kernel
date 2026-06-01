@@ -30,33 +30,42 @@
 //!
 //! - `AsyncStatement.awaitResult()` blocks until the server reaches
 //!   a terminal state, then returns an `AsyncResultHandle` over the
-//!   materialised `ResultStream`. The kernel's own
-//!   `AwaitResultCancelGuard` already covers drop-cancel safety: if
-//!   the JS Promise's underlying tokio future is dropped mid-poll
-//!   (e.g. a timeout wrapper, a tokio::select! loser), the kernel
-//!   fires a fire-and-forget `cancel_statement` so the server stops
-//!   charging DBUs on the orphaned query. The `util::guarded`
-//!   `catch_unwind` wrapper that we apply to every entry here covers
-//!   the V8-panic-across-boundary case on top of that.
+//!   materialised `ResultStream`. It holds `inner.lock()` across the
+//!   whole poll. Two independent cancellation paths cover it:
+//!   (1) the kernel's own `AwaitResultCancelGuard` handles drop-cancel
+//!   — if the JS Promise's underlying tokio future is dropped mid-poll
+//!   (a timeout wrapper, a `tokio::select!` loser, a `Promise.race`
+//!   loser), the kernel fires a fire-and-forget `cancel_statement` so
+//!   the server stops charging DBUs on the orphaned query; and
+//!   (2) an explicit `AsyncStatement.cancel()` (see below) fires a
+//!   server-side cancel *without* taking the lock, flipping the
+//!   statement terminal so the parked `awaitResult()` poll observes
+//!   `Cancelled` and returns. The `util::guarded` `catch_unwind`
+//!   wrapper applied to every entry here covers the
+//!   V8-panic-across-boundary case on top of both.
 //!
-//! Cancel-vs-close vs the sync path is identical: `cancel()` /
-//! `close()` route through the `ExecutedStatementHandle` trait the
+//! `close()` routes through the `ExecutedStatementHandle` trait the
 //! kernel implements for both `ExecutedStatement` and
-//! `ExecutedAsyncStatement`. The `Arc<Mutex<Option<…>>>` shape is
-//! the same as `Connection`/`Statement` so Drop's fire-and-forget
-//! cleanup behaves consistently.
+//! `ExecutedAsyncStatement`, holding `inner.lock()` like the sync path.
+//! `cancel()` is the one method that does *not* take the lock — it
+//! fires through a detached `AsyncStatementCanceller` (session +
+//! statement_id) so it can interrupt an in-flight `awaitResult()`
+//! rather than queue behind it. The `Arc<Mutex<Option<…>>>` shape is
+//! otherwise the same as `Connection`/`Statement` so Drop's
+//! fire-and-forget cleanup behaves consistently.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
-    Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle, ResultBatch,
-    ResultStream, Statement as KernelStatement, StatementStatus,
+    AsyncStatementCanceller, Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle,
+    ResultBatch, ResultStream, Statement as KernelStatement, StatementStatus,
 };
 
 use crate::error::napi_err_from_kernel;
-use crate::result::{ArrowBatch, ArrowSchema};
+use crate::result::{encode_ipc_stream, ArrowBatch, ArrowSchema};
 use crate::runtime;
 use crate::util::guarded;
 
@@ -73,44 +82,10 @@ fn closed_err(what: &str) -> napi::Error {
     )
 }
 
-/// Encode a `RecordBatch` (or schema-only payload) as a complete
-/// Arrow IPC stream. Duplicates the sync-path encoder in
-/// `statement.rs::encode_ipc_stream`; the helper is private there
-/// and the two paths produce byte-identical output, so we re-emit
-/// it here rather than expanding the surface of `statement` for one
-/// re-use site. If a third caller appears, this becomes the lifting
-/// trigger to extract into `bindings_common`.
-fn encode_ipc_stream(
-    schema: &SchemaRef,
-    batch: Option<&arrow_array::RecordBatch>,
-) -> napi::Result<Vec<u8>> {
-    // Conservative initial capacity — schema header alone is ~hundreds
-    // of bytes; a single batch can be hundreds of KB. Sized to avoid
-    // multiple small grows on schema-only payloads while not
-    // over-allocating for them.
-    let mut buf = Vec::with_capacity(1024);
-    {
-        let mut writer =
-            arrow_ipc::writer::StreamWriter::try_new(&mut buf, schema).map_err(|e| {
-                napi_err_from_kernel(
-                    KernelError::internal().message(format!("Arrow IPC writer init failed: {e}")),
-                )
-            })?;
-        if let Some(rb) = batch {
-            writer.write(rb).map_err(|e| {
-                napi_err_from_kernel(
-                    KernelError::internal().message(format!("Arrow IPC writer write failed: {e}")),
-                )
-            })?;
-        }
-        writer.finish().map_err(|e| {
-            napi_err_from_kernel(
-                KernelError::internal().message(format!("Arrow IPC writer finish failed: {e}")),
-            )
-        })?;
-    }
-    Ok(buf)
-}
+// Arrow IPC encoding is shared with the sync `Statement` path via
+// `crate::result::encode_ipc_stream` (its single home — see the
+// encoder-lift refactor). Both paths emit byte-identical envelopes and
+// route encode failures through the same kernel error envelope.
 
 // ───────────────────────── AsyncStatement ─────────────────────────
 
@@ -136,15 +111,33 @@ struct AsyncStatementInner {
 /// `Pending`/`Running`). JS drives polling via `status()` /
 /// `awaitResult()`.
 ///
-/// Concurrency shape matches the sync `Statement`: every method
-/// takes `inner.lock()` and holds the guard across the kernel
-/// `.await`. tokio `Mutex` is FIFO. `cancel()` / `close()` queue
-/// behind any in-flight `awaitResult()` until it returns naturally.
-/// The kernel's `AwaitResultCancelGuard` covers the drop-cancel
-/// case independently — see module docs.
+/// Concurrency shape: `status()`, `awaitResult()`, and `close()` take
+/// `inner.lock()` and hold the guard across the kernel `.await` (tokio
+/// `Mutex` is FIFO), so `status()` / `close()` queue behind any
+/// in-flight `awaitResult()` until it returns naturally. `cancel()` is
+/// the deliberate exception: it does **not** touch `inner` — it fires
+/// through the detached `AsyncStatementCanceller` (session +
+/// statement_id, captured at construction), so an explicit
+/// `stmt.cancel()` interrupts an in-flight `awaitResult()` instead of
+/// queueing behind it. The server-side cancel flips the statement
+/// terminal, which the parked `awaitResult()` poll loop observes
+/// (`Cancelled`) and returns on. The kernel's `AwaitResultCancelGuard`
+/// still covers the drop-cancel case (Promise.race / timeout)
+/// independently — see module docs.
 #[napi]
 pub struct AsyncStatement {
     inner: Arc<Mutex<Option<AsyncStatementInner>>>,
+    /// Detached canceller (session handle + statement_id), captured at
+    /// construction and held **outside** `inner` so `cancel()` can fire
+    /// a server-side cancel without contending for the mutex an
+    /// in-flight `awaitResult()` holds. See the struct-level
+    /// concurrency note.
+    canceller: AsyncStatementCanceller,
+    /// Lock-free mirror of "has `close()` taken `inner`". Set by
+    /// `close()`; read by the lock-free `cancel()` so a cancel after an
+    /// explicit close still surfaces `InvalidStatementHandle` without
+    /// taking the mutex.
+    closed: Arc<AtomicBool>,
     /// Server-issued statement id. Cached at construction; readable
     /// even after `close()` for log correlation against kernel /
     /// server logs which key on the same id.
@@ -164,11 +157,16 @@ impl AsyncStatement {
         executed_async: ExecutedAsyncStatement,
     ) -> Self {
         let statement_id = executed_async.statement_id().to_owned();
+        // Capture the detached canceller before `executed_async` moves
+        // into the mutex, so `cancel()` never needs `inner.lock()`.
+        let canceller = executed_async.canceller();
         Self {
             inner: Arc::new(Mutex::new(Some(AsyncStatementInner {
                 _parent: parent,
                 executed_async,
             }))),
+            canceller,
+            closed: Arc::new(AtomicBool::new(false)),
             statement_id,
         }
     }
@@ -232,11 +230,13 @@ impl AsyncStatement {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             // Acquire and HOLD the lock across the kernel await:
-            // dropping the lock guard while the long-running
-            // `await_result()` is in-flight would allow `cancel()` /
-            // `close()` to race for the inner state. The kernel-side
-            // `AwaitResultCancelGuard` covers the drop-the-future
-            // case; we cover the concurrent-method case here.
+            // dropping the guard while the long-running
+            // `await_result()` is in-flight would let `close()` /
+            // `status()` race for the inner state. `cancel()` is
+            // intentionally lock-free (it fires the detached
+            // `AsyncStatementCanceller`, not the mutex-guarded handle),
+            // so it can still interrupt this await; the kernel-side
+            // `AwaitResultCancelGuard` covers the drop-the-future case.
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
             let stream = inner_state
@@ -260,19 +260,24 @@ impl AsyncStatement {
     /// been explicitly `close()`d. Idempotent against a server
     /// that already reached a terminal state — the kernel's
     /// `cancel_statement` is a no-op there.
+    ///
+    /// **Lock-free by design.** Unlike `status()` / `awaitResult()` /
+    /// `close()`, this does not take `inner.lock()` — it fires through
+    /// the detached `AsyncStatementCanceller` captured at construction.
+    /// That lets `stmt.cancel()` interrupt an in-flight `awaitResult()`
+    /// (which holds the mutex for the whole poll) instead of queueing
+    /// behind it: the server-side cancel flips the statement terminal,
+    /// the parked `awaitResult()` poll loop observes `Cancelled` and
+    /// returns. The closed-state check reads a lock-free flag so a
+    /// cancel after an explicit `close()` still surfaces
+    /// `InvalidStatementHandle`.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
-        let inner = Arc::clone(&self.inner);
-        guarded(async move {
-            let guard = inner.lock().await;
-            let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
-            inner_state
-                .executed_async
-                .cancel()
-                .await
-                .map_err(napi_err_from_kernel)
-        })
-        .await
+        if self.closed.load(Ordering::Acquire) {
+            return Err(closed_err("AsyncStatement"));
+        }
+        let canceller = self.canceller.clone();
+        guarded(async move { canceller.cancel().await.map_err(napi_err_from_kernel) }).await
     }
 
     /// Explicit close. Idempotent — a second call on an
@@ -284,6 +289,7 @@ impl AsyncStatement {
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
+        let closed = Arc::clone(&self.closed);
         guarded(async move {
             let taken = {
                 let mut guard = inner.lock().await;
@@ -292,6 +298,10 @@ impl AsyncStatement {
             let Some(inner_state) = taken else {
                 return Ok(());
             };
+            // Flip the lock-free flag once we own the close so a racing
+            // lock-free `cancel()` short-circuits to InvalidStatementHandle
+            // rather than firing a wire cancel on a closing statement.
+            closed.store(true, Ordering::Release);
             inner_state
                 .executed_async
                 .close()

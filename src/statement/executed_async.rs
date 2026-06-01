@@ -577,6 +577,73 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
     }
 }
 
+impl ExecutedAsyncStatement {
+    /// Produce a detached [`AsyncStatementCanceller`] that can fire a
+    /// server-side cancel for this statement *without borrowing the
+    /// handle*.
+    ///
+    /// Use when the handle is parked inside a long-running
+    /// [`await_result`](Self::await_result) — behind a binding-side
+    /// lock, say — and an out-of-band `cancel()` must still reach the
+    /// server. The canceller flips the statement to a terminal state,
+    /// which the parked `await_result` poll loop observes (`Cancelled`)
+    /// and returns on, so an explicit cancel interrupts the await
+    /// instead of queueing behind it.
+    pub fn canceller(&self) -> AsyncStatementCanceller {
+        AsyncStatementCanceller {
+            session: Arc::clone(&self.session),
+            statement_id: self.statement_id.clone(),
+            valid: self.valid.clone(),
+        }
+    }
+}
+
+/// Detached canceller for an in-flight async statement.
+///
+/// Holds only the shared session handle, the statement id, and the
+/// shared [`ValidityFlag`] — **not** the [`ExecutedAsyncStatement`]
+/// itself — so a binding can fire a server-side cancel while the handle
+/// is borrowed elsewhere (e.g. parked inside a long-running
+/// [`ExecutedAsyncStatement::await_result`] that a binding-side lock is
+/// held across). Produced by [`ExecutedAsyncStatement::canceller`].
+///
+/// Cheap to [`Clone`] (one `Arc` bump plus a `String` / flag clone).
+#[derive(Clone)]
+pub struct AsyncStatementCanceller {
+    session: Arc<SessionInner>,
+    statement_id: String,
+    valid: ValidityFlag,
+}
+
+impl AsyncStatementCanceller {
+    /// Server-side cancel via `cancel_statement(statement_id)`.
+    ///
+    /// Short-circuits to `InvalidStatementHandle` (no wire round-trip)
+    /// if the parent handle was invalidated (re-execute / parent
+    /// `Statement` drop). Idempotent against a server already in a
+    /// terminal state — the kernel's `cancel_statement` is a no-op
+    /// there. Byte-for-byte the same operation as
+    /// [`ExecutedAsyncStatement::cancel`]; the two share no mutable
+    /// state, so this can run concurrently with an in-flight
+    /// `await_result` on the same statement.
+    pub async fn cancel(&self) -> Result<()> {
+        async {
+            self.valid.check()?;
+            self.session
+                .transport()
+                .cancel_statement(&self.statement_id)
+                .await
+        }
+        .instrument(self.session.log_span().clone())
+        .await
+    }
+
+    /// The server-issued statement id this canceller targets.
+    pub fn statement_id(&self) -> &str {
+        &self.statement_id
+    }
+}
+
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
         // `swap` (not `load`) so the shared `closed` flag — held by the

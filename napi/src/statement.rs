@@ -33,7 +33,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch, ResultStream,
@@ -371,7 +370,7 @@ impl Statement {
                     ));
                 }
             };
-            let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
+            let bytes = crate::result::encode_ipc_stream(&schema, Some(record_batch))?;
             Ok(Some(ArrowBatch {
                 ipc_bytes: bytes.into(),
             }))
@@ -394,7 +393,7 @@ impl Statement {
     /// entry points use is not required for this method.
     #[napi]
     pub fn schema(&self) -> napi::Result<ArrowSchema> {
-        let bytes = encode_ipc_stream(&self.schema, None)?;
+        let bytes = crate::result::encode_ipc_stream(&self.schema, None)?;
         Ok(ArrowSchema {
             ipc_bytes: bytes.into(),
         })
@@ -537,80 +536,19 @@ fn statement_closed_err() -> napi::Error {
     )
 }
 
-/// Encode an Arrow schema (and optional one record batch) as an IPC
-/// stream payload. Used for both `schema()` (schema only) and
-/// `fetchNextBatch()` (schema + one batch). Returning a self-contained
-/// IPC stream per call is wasteful header-wise but lets the JS adapter
-/// stay stateless — it decodes each `ipcBytes` independently via the
-/// same `apache-arrow` `RecordBatchReader` path.
-fn encode_ipc_stream(
-    schema: &arrow_schema::SchemaRef,
-    batch: Option<&arrow_array::RecordBatch>,
-) -> napi::Result<Vec<u8>> {
-    fn arrow_err(e: impl std::fmt::Display) -> napi::Error {
-        napi::Error::new(napi::Status::GenericFailure, e.to_string())
-    }
-    // Pre-size the buffer so a typical 500KB batch doesn't reallocate
-    // ~17 times growing from `Vec::new()`'s default capacity of 0.
-    // `get_array_memory_size` is the kernel-side memory footprint (close
-    // enough to the IPC-encoded size for capacity-hint purposes — IPC
-    // adds ~hundreds of bytes of framing per batch, not orders of
-    // magnitude). 4 KiB slack covers the schema-header on the
-    // schema-only path (`batch = None`) and the framing overhead on
-    // the schema+batch path.
-    let estimated = batch.map(|rb| rb.get_array_memory_size()).unwrap_or(0) + 4096;
-    let mut buf: Vec<u8> = Vec::with_capacity(estimated);
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, schema).map_err(arrow_err)?;
-        if let Some(rb) = batch {
-            writer.write(rb).map_err(arrow_err)?;
-        }
-        writer.finish().map_err(arrow_err)?;
-    }
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch};
-    use arrow_ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
 
     fn make_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
     }
 
-    #[test]
-    fn encode_ipc_stream_schema_only_yields_zero_batches() {
-        let schema = make_schema();
-        let bytes = encode_ipc_stream(&schema, None).expect("encode succeeds");
-        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
-        let decoded_schema = reader.schema();
-        let batches: Vec<_> = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode succeeds");
-        assert_eq!(decoded_schema.fields(), schema.fields());
-        assert_eq!(batches.len(), 0, "schema-only payload yields 0 batches");
-    }
-
-    #[test]
-    fn encode_ipc_stream_schema_plus_batch_round_trips() {
-        let schema = make_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .expect("batch builds");
-        let bytes = encode_ipc_stream(&schema, Some(&batch)).expect("encode succeeds");
-        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
-        let decoded: Vec<_> = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode succeeds");
-        assert_eq!(decoded.len(), 1, "exactly one batch decoded");
-        assert_eq!(decoded[0].num_rows(), 3);
-        assert_eq!(decoded[0].schema().fields(), schema.fields());
-    }
+    // Arrow IPC encoding is exercised by `encode_ipc_stream`'s own
+    // round-trip tests in `result.rs` (its new home — see the
+    // encoder-lift refactor). `schema()` / `fetchNextBatch()` just
+    // delegate to it, so the load-bearing assertions live there.
 
     // ─── Closed-state behaviour ─────────────────────────────────────
     //

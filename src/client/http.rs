@@ -341,18 +341,6 @@ impl DatabricksHttpClient {
             );
         }
 
-        if let Some(ref pem) = config.tls.trusted_certificate_pem {
-            let cert = reqwest::Certificate::from_pem(pem).map_err(|e| {
-                Error::invalid_argument()
-                    .message(format!("Invalid in-memory PEM certificate: {}", e))
-            })?;
-            builder = builder.add_root_certificate(cert);
-            debug!(
-                "Added custom CA certificate from in-memory bytes ({} bytes)",
-                pem.len()
-            );
-        }
-
         // Apply proxy configuration
         if let Some(ref proxy_url) = config.proxy.url {
             // Validate proxy URL scheme
