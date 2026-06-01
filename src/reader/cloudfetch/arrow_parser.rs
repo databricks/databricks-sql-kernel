@@ -63,9 +63,9 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
             while !remaining.is_empty() {
                 let mut decoder = FrameDecoder::new(Cursor::new(remaining));
                 let before = buf.len();
-                decoder.read_to_end(&mut buf).map_err(|e| {
-                    Error::io().message(format!("LZ4 decompression failed: {}", e))
-                })?;
+                decoder
+                    .read_to_end(&mut buf)
+                    .map_err(|e| Error::io().message(format!("LZ4 decompression failed: {}", e)))?;
                 let consumed = decoder.into_inner().position() as usize;
                 if consumed == 0 {
                     // Defensive: avoid infinite loop if decoder makes no progress.
@@ -225,8 +225,7 @@ mod tests {
         // truncated). We treat any non-success outcome as the
         // sanity-check passing — the exact error/empty shape from
         // arrow_ipc on a truncated stream isn't part of our contract.
-        let only_first =
-            parse_arrow_ipc(&encode(&ipc_data[..mid]), CompressionCodec::Lz4Frame);
+        let only_first = parse_arrow_ipc(&encode(&ipc_data[..mid]), CompressionCodec::Lz4Frame);
         let truncated_yields_batch = matches!(&only_first, Ok(batches) if !batches.is_empty());
         assert!(
             !truncated_yields_batch,
