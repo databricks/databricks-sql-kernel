@@ -394,11 +394,28 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
             Some(ts.format("%Y-%m-%dT%H:%M:%S%.fZ").to_string()),
         ),
         TypedValue::Interval(s) => ok("INTERVAL", Some(s.clone())),
-        // `VARIANT` — pass-through. The kernel doesn't validate the
-        // JSON; the server parses on receipt and rejects malformed
-        // input with its own error. The connector or caller is
-        // expected to have produced valid JSON.
-        TypedValue::Variant(s) => ok("VARIANT", Some(s.clone())),
+        // `VARIANT` — bind as `STRING` on the wire, carrying the
+        // JSON text as the value. Same pattern as geo: SEA's
+        // `parameters` array accepts `VARIANT` as a parameter type
+        // but treats the value as the **textual content of a JSON
+        // string** (i.e. the server stores a `String`-typed
+        // VARIANT, not a parsed `Object`/`Array`-typed VARIANT).
+        // Empirically `? AS c_variant` with `param_type=VARIANT`
+        // round-trips `{"k":1}` back as the JSON-encoded string
+        // `"\"{\\\"k\\\":1}\""` — not what callers want.
+        //
+        // Callers therefore write SQL like
+        //   `SELECT PARSE_JSON(?) AS v`
+        // and bind `TypedValue::Variant(<json text>)`. The kernel
+        // sends the JSON text as a STRING; `PARSE_JSON` produces
+        // a proper Object/Array-typed VARIANT column. Matches the
+        // geo + JDBC pattern (typed-value bind desugars to the
+        // STRING wire form; SQL function handles parsing).
+        //
+        // The kernel does NOT validate the JSON before sending;
+        // the server parses on receipt and rejects malformed
+        // input with its own SQL error.
+        TypedValue::Variant(s) => ok("STRING", Some(s.clone())),
         // `GEOGRAPHY` and `GEOMETRY` — bind as `STRING` on the
         // wire, carrying **bare WKT** (e.g. `POINT(1 2)`). SEA's
         // `parameters` array does not accept `GEOGRAPHY` /
@@ -1024,17 +1041,24 @@ mod tests {
     }
 
     #[test]
-    fn typed_value_variant_emits_json_pass_through() {
-        // Object form.
+    fn typed_value_variant_emits_json_text_as_string_type() {
+        // VARIANT binds go on the wire as STRING + raw JSON text;
+        // the caller's SQL wraps the marker with `PARSE_JSON(?)`.
+        // See the comment in `typed_value_to_sea_payload` for why
+        // — SEA's parameter type `VARIANT` stores the value as
+        // a String-typed VARIANT rather than parsing the JSON
+        // into an Object/Array-typed VARIANT, so the kernel
+        // desugars VARIANT binds to the STRING wire form
+        // (mirrors the geo + JDBC pattern).
         let json = r#"{"k":1,"nested":{"a":[true,null,"x"]}}"#;
         let p = typed_value_to_sea_parameter(1, &TypedValue::Variant(json.into())).unwrap();
-        assert_eq!(p.param_type, "VARIANT");
+        assert_eq!(p.param_type, "STRING");
         assert_eq!(p.value.as_deref(), Some(json));
 
         // Scalar JSON values are also valid VARIANT contents.
         for raw in [r#""hello""#, "42", "true", "null"] {
             let p = typed_value_to_sea_parameter(1, &TypedValue::Variant(raw.into())).unwrap();
-            assert_eq!(p.param_type, "VARIANT");
+            assert_eq!(p.param_type, "STRING");
             assert_eq!(p.value.as_deref(), Some(raw));
         }
     }

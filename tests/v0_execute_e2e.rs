@@ -355,7 +355,7 @@ async fn bind_all_typed_values_round_trip() {
                  CAST(? AS TIMESTAMP) AS c_ts, \
                  CAST(? AS TIMESTAMP_NTZ) AS c_ts_ntz, \
                  CAST(? AS TIMESTAMP_LTZ) AS c_ts_ltz, \
-                 ? AS c_variant, \
+                 PARSE_JSON(?) AS c_variant, \
                  ? AS c_null",
         )
         .param(1, TypedValue::Bool(true))
@@ -396,18 +396,22 @@ async fn bind_all_typed_values_round_trip() {
         // metadata, not in the accessor).
         .param(10, TypedValue::TimestampLtz(ts_ltz))
         .unwrap()
-        // VARIANT round-trip: bind the JSON text. The kernel sends
-        // `param_type=VARIANT`, and SEA wraps the marker server-side
-        // as `PARSE_JSON(<value>)` so the column comes back as a
-        // proper VARIANT (not a STRING). Don't wrap the `?` with
-        // `PARSE_JSON(?)` in the SQL — that double-parses and the
-        // server raises `DATATYPE_MISMATCH.UNEXPECTED_INPUT_TYPE`
-        // (the outer PARSE_JSON expects STRING but receives VARIANT).
+        // VARIANT round-trip: bind the JSON text. The kernel binds
+        // `TypedValue::Variant` as SEA `param_type=STRING` (same
+        // pattern as geo — see `typed_value_to_sea_payload`), so
+        // the SQL must wrap the marker with `PARSE_JSON(?)` to get
+        // a proper Object/Array-typed VARIANT column. Without the
+        // wrapper, the server stores the value as a String-typed
+        // VARIANT (the JSON text gets JSON-encoded as a quoted
+        // string) and round-trip readback doesn't yield the
+        // structural shape the assertion expects.
+        //
         // The kernel reads VARIANT back as Arrow Utf8 with
         // `databricks.type_name="VARIANT"` metadata on the schema
         // field; `get_str` reads the JSON text. Server JSON
         // canonicalisation removes whitespace, so we compare
-        // against a canonical form.
+        // structurally against a parsed `serde_json::Value`
+        // rather than byte-equality against the input string.
         .param(11, TypedValue::Variant(variant_json.into()))
         .unwrap()
         .param(12, TypedValue::Null)
