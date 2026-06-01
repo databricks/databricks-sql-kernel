@@ -168,16 +168,17 @@ pub struct ConnectionOptions {
     pub complex_types_as_json: Option<bool>,
     /// Whether to verify the server's TLS certificate.
     ///
-    /// Omitted / `false` ⇒ the driver matches the legacy NodeJS Thrift
-    /// driver's permissive behaviour (`rejectUnauthorized: false`): it
-    /// accepts self-signed / untrusted / expired certs AND skips the
-    /// hostname-vs-SNI check. This is **insecure** (no protection
-    /// against active MITM) but is the historical NodeJS-driver default
-    /// since 2020, so the SEA backend matches it for drop-in parity.
+    /// Omitted / `true` ⇒ strict validation against the system / Mozilla
+    /// trust store (full chain + expiry + hostname), matching JDBC / ODBC
+    /// and every modern HTTPS client. This is the **default** for the SEA
+    /// backend — secure by default.
     ///
-    /// `true` ⇒ strict validation against the system / Mozilla trust
-    /// store (full chain + expiry + hostname), matching JDBC / ODBC and
-    /// every modern HTTPS client. Recommended.
+    /// `false` ⇒ permissive: accept self-signed / untrusted / expired
+    /// certs AND skip the hostname-vs-SNI check. This is **insecure** (no
+    /// protection against active MITM); it exists only as an opt-out for
+    /// parity with the legacy NodeJS Thrift driver, which hard-codes
+    /// `rejectUnauthorized: false`. Prefer pairing strict checking with
+    /// `custom_ca_cert` over disabling verification entirely.
     ///
     /// Maps onto the kernel [`TlsConfig::accept_self_signed`] +
     /// [`TlsConfig::skip_hostname_verification`] (both = `!check`).
@@ -221,23 +222,21 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
 
 /// Map the JS TLS fields onto the kernel [`TlsConfig`].
 ///
-/// The default (no `check_server_certificate`) is **permissive** to
-/// match the legacy NodeJS Thrift driver (`rejectUnauthorized: false`):
-/// `accept_self_signed` + `skip_hostname_verification` are both set,
-/// disabling chain and hostname validation. Opting into
-/// `check_server_certificate: true` restores the kernel's strict
-/// defaults. A `custom_ca_cert` is always added to the trust store
-/// regardless of the strictness toggle.
+/// The default (no `check_server_certificate`) is **secure** — it keeps
+/// the kernel's strict [`TlsConfig::default()`] (full chain + expiry +
+/// hostname validation). Setting `check_server_certificate: false` is an
+/// explicit opt-out that relaxes both knobs, matching the legacy NodeJS
+/// Thrift driver's permissive `rejectUnauthorized: false` behaviour for
+/// callers that need it. A `custom_ca_cert` is always added to the trust
+/// store regardless of the strictness toggle.
 ///
 /// `TlsConfig` is `#[non_exhaustive]` — construct via `default()` then
 /// mutate (same pattern as `ResultConfig` / `HttpConfig` above). Pure
 /// (borrows `options`) so it is unit-testable without opening a session.
 fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
-    let strict = options.check_server_certificate.unwrap_or(false);
+    // Secure-by-default: only an explicit `false` relaxes verification.
+    let strict = options.check_server_certificate.unwrap_or(true);
     let mut tls = TlsConfig::default();
-    // Permissive-by-default: when the caller hasn't opted into strict
-    // checking, relax both knobs so behaviour matches Thrift's
-    // always-on `rejectUnauthorized: false`.
     tls.accept_self_signed = !strict;
     tls.skip_hostname_verification = !strict;
     if let Some(ca) = &options.custom_ca_cert {
@@ -466,14 +465,18 @@ mod tests {
     }
 
     #[test]
-    fn tls_defaults_to_permissive_matching_thrift() {
-        // No `check_server_certificate` ⇒ relax both knobs so behaviour
-        // matches the legacy Thrift driver's `rejectUnauthorized: false`.
+    fn tls_defaults_to_secure() {
+        // No `check_server_certificate` ⇒ secure by default: strict chain +
+        // hostname validation (the kernel's TlsConfig::default()). A caller
+        // must opt out explicitly with `check_server_certificate: false`.
         let tls = build_tls_config(&base());
-        assert!(tls.accept_self_signed, "self-signed should be accepted");
         assert!(
-            tls.skip_hostname_verification,
-            "hostname check should be skipped"
+            !tls.accept_self_signed,
+            "self-signed must be rejected by default"
+        );
+        assert!(
+            !tls.skip_hostname_verification,
+            "hostname check must run by default"
         );
         assert!(tls.custom_ca_cert.is_none());
     }
