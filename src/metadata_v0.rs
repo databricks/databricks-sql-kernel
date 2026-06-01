@@ -169,6 +169,18 @@ impl<'a> Identifier<'a> {
         Ok(Self(s))
     }
 
+    /// Construct from an optional borrowed string.
+    ///
+    /// Maps `None` to `Ok(None)` ("not supplied" — e.g. ODBC-style
+    /// "match all" for an exact catalog/schema), and `Some(s)` through
+    /// [`Identifier::new`] (so whitespace-only / empty / NUL / backtick /
+    /// oversize inputs reject as `InvalidArgument`). Single home for the
+    /// `Option<String>` → `Option<Identifier>` conversion the wrappers
+    /// (napi / pyo3) all need at their metadata call sites.
+    pub fn from_opt(s: &'a Option<String>) -> Result<Option<Identifier<'a>>> {
+        s.as_deref().map(Identifier::new).transpose()
+    }
+
     /// Borrow the underlying string.
     pub fn as_str(&self) -> &'a str {
         self.0
@@ -229,6 +241,17 @@ impl<'a> LikePattern<'a> {
             );
         }
         Ok(Self(s))
+    }
+
+    /// Construct from an optional borrowed pattern.
+    ///
+    /// Maps `None` to `Ok(None)` (the canonical "match all" intent), and
+    /// `Some(s)` through [`LikePattern::new`] (so whitespace-only / empty
+    /// / NUL / oversize inputs reject as `InvalidArgument`). Single home
+    /// for the `Option<String>` → `Option<LikePattern>` conversion the
+    /// wrappers (napi / pyo3) all need at their metadata call sites.
+    pub fn from_opt(s: &'a Option<String>) -> Result<Option<LikePattern<'a>>> {
+        s.as_deref().map(LikePattern::new).transpose()
     }
 
     /// Borrow the underlying pattern.
@@ -705,5 +728,47 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    // ─── from_opt — the wrapper-facing Option<String> adapters ──────────
+
+    #[test]
+    fn identifier_from_opt_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(Identifier::from_opt(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn identifier_from_opt_real_name_is_ok_some() {
+        let input = Some("main".to_owned());
+        let id = Identifier::from_opt(&input).unwrap().expect("some");
+        assert_eq!(id.as_str(), "main");
+    }
+
+    #[test]
+    fn identifier_from_opt_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = Identifier::from_opt(&input).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn like_pattern_from_opt_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(LikePattern::from_opt(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn like_pattern_from_opt_real_pattern_is_ok_some() {
+        let input = Some("info%".to_owned());
+        let pat = LikePattern::from_opt(&input).unwrap().expect("some");
+        assert_eq!(pat.as_str(), "info%");
+    }
+
+    #[test]
+    fn like_pattern_from_opt_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = LikePattern::from_opt(&input).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 }

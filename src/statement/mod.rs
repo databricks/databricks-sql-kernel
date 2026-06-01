@@ -29,6 +29,7 @@ pub mod executed_async;
 pub mod handle;
 pub mod mutable;
 pub mod params;
+pub mod params_codec;
 pub mod spec;
 
 pub(crate) mod validity;

@@ -94,6 +94,32 @@ pub enum StatementStatus {
 }
 
 impl StatementStatus {
+    /// Stable string slug for this status, matching the connector's
+    /// `CommandState` taxonomy one-for-one:
+    /// `"Pending" | "Running" | "Succeeded" | "Failed" | "Cancelled" |
+    /// "Closed"`. The `Failed` variant collapses to `"Failed"` (the
+    /// carried `Error` is surfaced separately by callers that need the
+    /// structured failure). `StatementStatus` is `#[non_exhaustive]`, so
+    /// a future variant a stale caller doesn't recognise maps to
+    /// `"Unknown"` — bindings get something deterministic instead of a
+    /// panic.
+    pub fn as_str(&self) -> &'static str {
+        // The `_` arm is unreachable *within* this crate (the enum is
+        // fully covered here), but `StatementStatus` is
+        // `#[non_exhaustive]`, so a future variant must map to something
+        // deterministic for downstream callers rather than panic.
+        #[allow(unreachable_patterns)]
+        match self {
+            StatementStatus::Pending => "Pending",
+            StatementStatus::Running => "Running",
+            StatementStatus::Succeeded => "Succeeded",
+            StatementStatus::Failed(_) => "Failed",
+            StatementStatus::Cancelled => "Cancelled",
+            StatementStatus::Closed => "Closed",
+            _ => "Unknown",
+        }
+    }
+
     /// Map a SEA `ExecuteResponse` to its public kernel status. The
     /// `Failed` arm preserves the same structured error
     /// `Transport::execute_statement`'s sync polling produces, so
@@ -670,5 +696,21 @@ impl Drop for ExecutedAsyncStatement {
                 );
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn status_as_str_covers_all_variants() {
+        assert_eq!(StatementStatus::Pending.as_str(), "Pending");
+        assert_eq!(StatementStatus::Running.as_str(), "Running");
+        assert_eq!(StatementStatus::Succeeded.as_str(), "Succeeded");
+        assert_eq!(StatementStatus::Cancelled.as_str(), "Cancelled");
+        assert_eq!(StatementStatus::Closed.as_str(), "Closed");
+        let failed = StatementStatus::Failed(Error::sql_error().message("boom"));
+        assert_eq!(failed.as_str(), "Failed");
     }
 }

@@ -60,15 +60,13 @@ use crate::runtime::get_handle;
 use crate::statement::Statement;
 use crate::util::guarded;
 
-// ─── Conversion helpers ─────────────────────────────────────────────────────
-
-fn opt_identifier(s: &Option<String>) -> KResult<Option<Identifier<'_>>> {
-    s.as_deref().map(Identifier::new).transpose()
-}
-
-fn opt_pattern(s: &Option<String>) -> KResult<Option<LikePattern<'_>>> {
-    s.as_deref().map(LikePattern::new).transpose()
-}
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+//
+// The `Option<String>` → `Option<Identifier>` / `Option<LikePattern>`
+// conversion lives on the kernel newtypes as `Identifier::from_opt` /
+// `LikePattern::from_opt` (one home shared by all bindings); call sites
+// below use those directly and keep the napi error mapping
+// (`napi_err_from_kernel`) on the run-on-blocking boundary.
 
 /// Run a `!Send` async kernel metadata operation on a blocking thread.
 ///
@@ -136,8 +134,8 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = opt_identifier(&catalog)?;
-                let pat = opt_pattern(&schema_pattern)?;
+                let cat = Identifier::from_opt(&catalog)?;
+                let pat = LikePattern::from_opt(&schema_pattern)?;
                 meta.list_schemas(cat, pat).await
             })
             .await?;
@@ -166,9 +164,9 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let tbl = opt_pattern(&table_pattern)?;
+                let cat = Identifier::from_opt(&catalog)?;
+                let sch = LikePattern::from_opt(&schema_pattern)?;
+                let tbl = LikePattern::from_opt(&table_pattern)?;
                 let types_owned: Option<Vec<&str>> = table_types
                     .as_ref()
                     .map(|v| v.iter().map(String::as_str).collect());
@@ -195,10 +193,10 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let tbl = opt_pattern(&table_pattern)?;
-                let col = opt_pattern(&column_pattern)?;
+                let cat = Identifier::from_opt(&catalog)?;
+                let sch = LikePattern::from_opt(&schema_pattern)?;
+                let tbl = LikePattern::from_opt(&table_pattern)?;
+                let col = LikePattern::from_opt(&column_pattern)?;
                 meta.list_columns(cat, sch, tbl, col).await
             })
             .await?;
@@ -219,9 +217,9 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let nam = opt_pattern(&function_pattern)?;
+                let cat = Identifier::from_opt(&catalog)?;
+                let sch = LikePattern::from_opt(&schema_pattern)?;
+                let nam = LikePattern::from_opt(&function_pattern)?;
                 meta.functions(cat, sch, nam).await
             })
             .await?;
@@ -242,9 +240,9 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = opt_identifier(&catalog)?;
-                let sch = opt_pattern(&schema_pattern)?;
-                let nam = opt_pattern(&procedure_pattern)?;
+                let cat = Identifier::from_opt(&catalog)?;
+                let sch = LikePattern::from_opt(&schema_pattern)?;
+                let nam = LikePattern::from_opt(&procedure_pattern)?;
                 meta.procedures(cat, sch, nam).await
             })
             .await?;
@@ -317,9 +315,9 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let pc = opt_identifier(&parent_catalog)?;
-                let ps = opt_identifier(&parent_schema)?;
-                let pt = opt_identifier(&parent_table)?;
+                let pc = Identifier::from_opt(&parent_catalog)?;
+                let ps = Identifier::from_opt(&parent_schema)?;
+                let pt = Identifier::from_opt(&parent_table)?;
                 let fc = Some(Identifier::new(&foreign_catalog)?);
                 let fs = Some(Identifier::new(&foreign_schema)?);
                 let ft = Some(Identifier::new(&foreign_table)?);
@@ -337,50 +335,35 @@ mod tests {
     use super::*;
     use databricks_sql_kernel::ErrorCode;
 
-    // The `opt_identifier` / `opt_pattern` adapters are the only
-    // synchronous, kernel-runtime-free surface in this module — the
-    // `#[napi]` methods all link against the native napi runtime and
-    // can't be exercised under `cargo test`. Pinning the adapters here
-    // guards the JS-string → kernel-newtype contract: whitespace-only
-    // input must reject as `InvalidArgument` (matching
-    // `Identifier::new` / `LikePattern::new`), `None` must pass through
-    // as `Ok(None)`, and a real name must construct.
+    // The `Option<String>` → kernel-newtype conversion now lives on the
+    // kernel as `Identifier::from_opt` / `LikePattern::from_opt` (tested
+    // exhaustively there). These thin smoke tests pin that the binding
+    // calls through to the same contract — whitespace-only rejects as
+    // `InvalidArgument`, `None` passes through as `Ok(None)`.
 
     #[test]
-    fn opt_identifier_rejects_whitespace_only() {
+    fn identifier_from_opt_rejects_whitespace_only() {
         let input = Some("  ".to_owned());
-        let err = opt_identifier(&input).unwrap_err();
+        let err = Identifier::from_opt(&input).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
-    fn opt_identifier_none_is_ok_none() {
+    fn identifier_from_opt_none_is_ok_none() {
         let input: Option<String> = None;
-        assert!(opt_identifier(&input).unwrap().is_none());
+        assert!(Identifier::from_opt(&input).unwrap().is_none());
     }
 
     #[test]
-    fn opt_identifier_real_name_is_ok_some() {
-        let input = Some("main".to_owned());
-        assert!(opt_identifier(&input).unwrap().is_some());
-    }
-
-    #[test]
-    fn opt_pattern_rejects_whitespace_only() {
+    fn like_pattern_from_opt_rejects_whitespace_only() {
         let input = Some("  ".to_owned());
-        let err = opt_pattern(&input).unwrap_err();
+        let err = LikePattern::from_opt(&input).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 
     #[test]
-    fn opt_pattern_none_is_ok_none() {
+    fn like_pattern_from_opt_none_is_ok_none() {
         let input: Option<String> = None;
-        assert!(opt_pattern(&input).unwrap().is_none());
-    }
-
-    #[test]
-    fn opt_pattern_real_name_is_ok_some() {
-        let input = Some("main".to_owned());
-        assert!(opt_pattern(&input).unwrap().is_some());
+        assert!(LikePattern::from_opt(&input).unwrap().is_none());
     }
 }

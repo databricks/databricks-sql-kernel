@@ -39,14 +39,12 @@ pub(crate) fn build_auth_config(
     access_token: Option<String>,
 ) -> PyResult<AuthConfig> {
     match auth_type {
-        "pat" => {
-            let token = access_token
-                .ok_or_else(|| PyValueError::new_err("auth_type='pat' requires access_token"))?;
-            if token.is_empty() {
-                return Err(PyValueError::new_err("access_token must not be empty"));
-            }
-            Ok(AuthConfig::Pat { token })
-        }
+        // Token presence/empty validation lives in the kernel's
+        // `AuthConfig::pat` ctor so every binding rejects it
+        // identically; map the kernel `InvalidArgument` message onto a
+        // `PyValueError` to preserve this function's existing PyResult
+        // contract.
+        "pat" => AuthConfig::pat(access_token).map_err(|e| PyValueError::new_err(e.message)),
         other => Err(PyValueError::new_err(format!(
             "unsupported auth_type {other:?}; only 'pat' is supported today"
         ))),

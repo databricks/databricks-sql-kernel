@@ -61,7 +61,7 @@ use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     AsyncStatementCanceller, Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle,
-    ResultBatch, ResultStream, Statement as KernelStatement, StatementStatus,
+    ResultBatch, ResultStream, Statement as KernelStatement,
 };
 
 use crate::error::napi_err_from_kernel;
@@ -206,7 +206,10 @@ impl AsyncStatement {
                 .status()
                 .await
                 .map_err(napi_err_from_kernel)?;
-            Ok(status_to_string(&status))
+            // String mapping lives on the kernel `StatementStatus::as_str`
+            // so all bindings share one taxonomy (incl. the
+            // `#[non_exhaustive]` `"Unknown"` catch-all).
+            Ok(status.as_str().to_owned())
         })
         .await
     }
@@ -421,46 +424,14 @@ impl AsyncResultHandle {
     }
 }
 
-// ───────────────────────── status mapping ─────────────────────────
-
-/// Map `StatementStatus` to the JS-visible string. The `Failed`
-/// variant collapses to `"Failed"`; the underlying error envelope
-/// is surfaced only via `awaitResult()`'s rejection, which is where
-/// callers actually need the typed error. `status()` is for
-/// progress UIs.
-fn status_to_string(s: &StatementStatus) -> String {
-    match s {
-        StatementStatus::Pending => "Pending",
-        StatementStatus::Running => "Running",
-        StatementStatus::Succeeded => "Succeeded",
-        StatementStatus::Failed(_) => "Failed",
-        StatementStatus::Cancelled => "Cancelled",
-        StatementStatus::Closed => "Closed",
-        // `StatementStatus` is `#[non_exhaustive]`. A future kernel
-        // variant the binding doesn't recognise surfaces as
-        // `"Unknown"` so JS callers see something deterministic
-        // instead of a panic; upgrading the binding maps the variant
-        // to its real string. If you see this in production logs,
-        // the binding is older than the kernel it's linked against.
-        _ => "Unknown",
-    }
-    .to_owned()
-}
+// The `StatementStatus` → JS-string mapping now lives on the kernel as
+// `StatementStatus::as_str` (one taxonomy for all bindings, including
+// the `#[non_exhaustive]` `"Unknown"` catch-all). `status()` calls it at
+// the call site above.
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn status_to_string_covers_all_variants() {
-        assert_eq!(status_to_string(&StatementStatus::Pending), "Pending");
-        assert_eq!(status_to_string(&StatementStatus::Running), "Running");
-        assert_eq!(status_to_string(&StatementStatus::Succeeded), "Succeeded");
-        assert_eq!(status_to_string(&StatementStatus::Cancelled), "Cancelled");
-        assert_eq!(status_to_string(&StatementStatus::Closed), "Closed");
-        let failed = StatementStatus::Failed(KernelError::sql_error().message("boom"));
-        assert_eq!(status_to_string(&failed), "Failed");
-    }
 
     #[test]
     fn closed_err_carries_invalid_statement_handle_envelope() {

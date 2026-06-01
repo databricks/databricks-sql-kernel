@@ -184,73 +184,6 @@ pub(crate) fn connection_closed_err() -> napi::Error {
     )
 }
 
-/// Merge `statement_conf` and `query_tags` from JS-supplied
-/// `ExecuteOptions` into the single `HashMap<String, String>` the
-/// kernel's `StatementSpec::statement_conf` accepts.
-///
-/// Returns `Ok(None)` when no per-statement conf is set (caller skips
-/// the `.statement_conf(...)` builder call so the kernel sees the
-/// session-level conf untouched). Returns `Ok(Some(conf))` when at
-/// least one knob was set. Returns `Err(InvalidArgument)` when both
-/// `queryTags` and `statementConf["query_tags"]` are present — the
-/// caller's intent is ambiguous.
-fn build_merged_statement_conf(
-    options: Option<ExecuteOptions>,
-) -> napi::Result<Option<HashMap<String, String>>> {
-    let Some(options) = options else {
-        return Ok(None);
-    };
-
-    let mut conf = options.statement_conf.unwrap_or_default();
-    if let Some(tags) = options.query_tags {
-        if !tags.is_empty() && conf.contains_key("query_tags") {
-            return Err(napi_err_from_kernel(
-                KernelError::invalid_argument().message(
-                    "ExecuteOptions: cannot supply both `queryTags` and \
-                     `statementConf[\"query_tags\"]` — pick one",
-                ),
-            ));
-        }
-        if !tags.is_empty() {
-            conf.insert("query_tags".to_string(), serialize_query_tags(&tags));
-        }
-    }
-
-    if conf.is_empty() {
-        Ok(None)
-    } else {
-        Ok(Some(conf))
-    }
-}
-
-/// Serialise a tag map to the same wire shape NodeJS Thrift's
-/// `serializeQueryTags` produces: comma-separated `key:value` pairs.
-/// Backslashes in keys are doubled; backslash, colon, and comma in
-/// values are backslash-escaped. Null/empty values would produce a
-/// bare key with no colon — but the napi `HashMap<String, String>`
-/// shape can't carry nulls today, so every tag here is `key:value`.
-///
-/// Match the Thrift wire shape exactly: the SEA server merges
-/// `confOverlay.query_tags` the same way regardless of which backend
-/// produced it, and JS callers porting from Thrift expect identical
-/// behaviour.
-fn serialize_query_tags(tags: &HashMap<String, String>) -> String {
-    tags.iter()
-        .map(|(k, v)| {
-            let esc_key = k.replace('\\', "\\\\");
-            let esc_val = v
-                .chars()
-                .flat_map(|c| match c {
-                    '\\' | ':' | ',' => vec!['\\', c],
-                    other => vec![other],
-                })
-                .collect::<String>();
-            format!("{esc_key}:{esc_val}")
-        })
-        .collect::<Vec<_>>()
-        .join(",")
-}
-
 /// Opaque connection handle wrapping a kernel `Session`.
 ///
 /// `inner` is `Arc<Mutex<Option<Session>>>` so:
@@ -310,8 +243,8 @@ impl Connection {
         mut options: Option<ExecuteOptions>,
     ) -> napi::Result<Statement> {
         let inner = Arc::clone(&self.inner);
-        // Pull the scalar knobs out before `build_merged_statement_conf`
-        // consumes `options` (both `i64`/`u32` are `Copy`).
+        // Pull the scalar knobs out (both `i64`/`u32` are `Copy`) before
+        // the `.take()`s below consume the map fields out of `options`.
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
         let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
         // Decode positional params before `options` is consumed below; a
@@ -329,12 +262,14 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
-        // Merge `query_tags` into `statement_conf` at the napi boundary
-        // so the kernel sees a single conf map. Serialise the tag
-        // map to the comma-separated `key:value` wire shape NodeJS
-        // Thrift produces in `serializeQueryTags`
-        // (`lib/utils/queryTags.ts`).
-        let merged_conf = build_merged_statement_conf(options)?;
+        // Pull the explicit `statement_conf` map and the `query_tags`
+        // convenience map out of `options`. The kernel `StatementSpec`
+        // owns the merge + serialisation: set the explicit conf first,
+        // then fold `query_tags` in via `spec.query_tags(...)`, which
+        // serialises to the Thrift wire shape and rejects the dual
+        // `queryTags` + `statementConf["query_tags"]` definition.
+        let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
+        let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
         guarded(async move {
             // Build the kernel `Statement` while holding the session lock,
             // then RELEASE the lock before `execute().await`. `Session::statement()`
@@ -352,8 +287,19 @@ impl Connection {
 
                 let mut stmt = session.statement();
                 stmt.spec().sql(sql);
-                if let Some(conf) = merged_conf {
-                    stmt.spec().statement_conf(conf);
+                // Set the explicit per-statement conf overlay first (only
+                // when non-empty) so the kernel's `query_tags` merge can
+                // detect a dual `query_tags` definition against it.
+                if let Some(conf) = statement_conf {
+                    if !conf.is_empty() {
+                        stmt.spec().statement_conf(conf);
+                    }
+                }
+                // Fold the `queryTags` convenience map into the conf
+                // overlay. Empty map is a no-op; a dual definition with
+                // `statementConf["query_tags"]` rejects as InvalidArgument.
+                if let Some(tags) = query_tags {
+                    stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
                 }
                 // `None` leaves the kernel's omit-the-field default in place,
                 // so threading unconditionally is safe and keeps the spec the
@@ -430,7 +376,10 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
-        let merged_conf = build_merged_statement_conf(options)?;
+        // Same conf + query_tags plumbing as `execute_statement`: the
+        // kernel `StatementSpec` owns the merge + serialisation.
+        let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
+        let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
         guarded(async move {
             // Build the kernel `Statement` while holding the session lock,
             // then RELEASE the lock before `submit().await` — same shape as
@@ -448,8 +397,13 @@ impl Connection {
 
                 let mut stmt = session.statement();
                 stmt.spec().sql(sql);
-                if let Some(conf) = merged_conf {
-                    stmt.spec().statement_conf(conf);
+                if let Some(conf) = statement_conf {
+                    if !conf.is_empty() {
+                        stmt.spec().statement_conf(conf);
+                    }
+                }
+                if let Some(tags) = query_tags {
+                    stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
                 }
                 stmt.spec()
                     .row_limit(row_limit)
@@ -584,228 +538,5 @@ mod tests {
             session_id: "session-survives-close".to_owned(),
         };
         assert_eq!(conn.session_id(), "session-survives-close");
-    }
-
-    // ─── ExecuteOptions / build_merged_statement_conf ───────────────────
-
-    #[test]
-    fn merged_conf_none_when_options_is_none() {
-        let result = build_merged_statement_conf(None).unwrap();
-        assert!(result.is_none(), "no options → no statement_conf");
-    }
-
-    #[test]
-    fn merged_conf_none_when_both_maps_empty() {
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: Some(HashMap::new()),
-            query_tags: Some(HashMap::new()),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap();
-        assert!(result.is_none(), "empty maps → no statement_conf");
-    }
-
-    #[test]
-    fn merged_conf_passes_through_statement_conf() {
-        let mut conf = HashMap::new();
-        conf.insert("ANSI_MODE".to_string(), "true".to_string());
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: Some(conf),
-            query_tags: None,
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap()
-        .unwrap();
-        assert_eq!(result.get("ANSI_MODE").map(String::as_str), Some("true"));
-    }
-
-    #[test]
-    fn merged_conf_query_tags_serialised_into_query_tags_key() {
-        let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: None,
-            query_tags: Some(tags),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap()
-        .unwrap();
-        // Single-tag case is deterministic regardless of HashMap order.
-        assert_eq!(
-            result.get("query_tags").map(String::as_str),
-            Some("team:platform"),
-        );
-    }
-
-    #[test]
-    fn merged_conf_query_tags_escape_special_chars_in_values() {
-        let mut tags = HashMap::new();
-        tags.insert("k".to_string(), "v:1,v\\2".to_string());
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: None,
-            query_tags: Some(tags),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap()
-        .unwrap();
-        let encoded = result.get("query_tags").unwrap();
-        // `:` → `\:`, `,` → `\,`, `\` → `\\`. Order in the input is
-        // `v:1,v\2` so the encoded form is `v\:1\,v\\2`.
-        assert_eq!(encoded, "k:v\\:1\\,v\\\\2");
-    }
-
-    #[test]
-    fn merged_conf_query_tags_escape_backslash_in_keys() {
-        let mut tags = HashMap::new();
-        tags.insert("k\\1".to_string(), "v".to_string());
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: None,
-            query_tags: Some(tags),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.get("query_tags").map(String::as_str),
-            Some("k\\\\1:v")
-        );
-    }
-
-    #[test]
-    fn merged_conf_rejects_dual_query_tags_definition() {
-        let mut conf = HashMap::new();
-        conf.insert("query_tags".to_string(), "explicit:value".to_string());
-        let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
-        let err = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: Some(conf),
-            query_tags: Some(tags),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .expect_err("must reject when both are set");
-        assert!(
-            err.reason.contains("cannot supply both"),
-            "error must explain the conflict: {}",
-            err.reason,
-        );
-    }
-
-    #[test]
-    fn merged_conf_empty_query_tags_does_not_collide_with_existing_key() {
-        // An empty `queryTags: {}` map should be ignored, so the
-        // caller can still pass an explicit
-        // `statementConf["query_tags"]` alongside `queryTags: {}`
-        // without tripping the ambiguity guard. Convention: empty
-        // input maps mean "not supplied".
-        let mut conf = HashMap::new();
-        conf.insert("query_tags".to_string(), "explicit:value".to_string());
-        let result = build_merged_statement_conf(Some(ExecuteOptions {
-            statement_conf: Some(conf),
-            query_tags: Some(HashMap::new()),
-            row_limit: None,
-            query_timeout_secs: None,
-            positional_params: None,
-            named_params: None,
-        }))
-        .unwrap()
-        .unwrap();
-        assert_eq!(
-            result.get("query_tags").map(String::as_str),
-            Some("explicit:value"),
-        );
-    }
-
-    // ─── DA round-2 M4 parity — byte-shape vs Thrift's serializeQueryTags ─
-
-    /// `serializeQueryTags` (NodeJS Thrift, `lib/utils/queryTags.ts`)
-    /// is the canonical wire shape for `query_tags`. Pin the
-    /// per-tag byte shape produced by the kernel-side serializer
-    /// against the algorithm Thrift uses, so a regression on either
-    /// side fails this test.
-    ///
-    /// Algorithm (per Thrift):
-    /// - Keys: backslash doubled (`\` → `\\`); no other escaping
-    /// - Values: backslash, colon, and comma each backslash-escaped
-    /// - Tags: joined with `,`
-    /// - Single-tag case is order-deterministic; multi-tag case
-    ///   asserts each pair appears regardless of HashMap iteration
-    ///   order (the documented order caveat).
-    #[test]
-    fn serialize_query_tags_matches_thrift_byte_shape_single_tag() {
-        let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
-        assert_eq!(serialize_query_tags(&tags), "team:platform");
-    }
-
-    #[test]
-    fn serialize_query_tags_matches_thrift_byte_shape_escapes() {
-        // Per Thrift's `escapedValue.replace(/[\\:,]/g, c => '\\' + c)`:
-        // input  `v:1,v\2`
-        // output `v\:1\,v\\2`
-        let mut tags = HashMap::new();
-        tags.insert("k".to_string(), "v:1,v\\2".to_string());
-        assert_eq!(serialize_query_tags(&tags), "k:v\\:1\\,v\\\\2");
-    }
-
-    #[test]
-    fn serialize_query_tags_matches_thrift_byte_shape_key_backslash_only() {
-        // Per Thrift's `escapedKey = key.replace(/\\/g, '\\\\')`:
-        // input  `k\1`
-        // output `k\\1`
-        // Colons/commas in keys are NOT escaped on Thrift's path —
-        // they're only escaped in values. Test pins this asymmetry
-        // so a future "uniformity" refactor that escapes them in
-        // keys too gets caught.
-        let mut tags = HashMap::new();
-        tags.insert("k\\1".to_string(), "v".to_string());
-        assert_eq!(serialize_query_tags(&tags), "k\\\\1:v");
-    }
-
-    #[test]
-    fn serialize_query_tags_empty_map_yields_empty_string() {
-        // Thrift returns `undefined` for empty input, but Thrift's
-        // caller only invokes the serializer when input is non-empty
-        // (see `lib/DBSQLSession.ts:231` `if (serializedQueryTags
-        // !== undefined)`). Our serializer is called only by
-        // `build_merged_statement_conf` which already filters empty
-        // input out, so this test pins the never-called case for
-        // defense.
-        assert_eq!(serialize_query_tags(&HashMap::new()), "");
-    }
-
-    #[test]
-    fn serialize_query_tags_multi_tag_contains_each_pair_regardless_of_order() {
-        // Multi-tag case: HashMap iteration is non-deterministic, so
-        // we can't assert a single byte string. Assert each pair is
-        // present and the join uses `,`. SEA server treats conf
-        // values as order-insensitive, so this is functionally
-        // equivalent to the Thrift output regardless of order.
-        let mut tags = HashMap::new();
-        tags.insert("a".to_string(), "1".to_string());
-        tags.insert("b".to_string(), "2".to_string());
-        let s = serialize_query_tags(&tags);
-        let pairs: std::collections::HashSet<&str> = s.split(',').collect();
-        assert!(
-            pairs == ["a:1", "b:2"].iter().copied().collect(),
-            "got: {s}",
-        );
     }
 }

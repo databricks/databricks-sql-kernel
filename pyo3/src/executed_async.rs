@@ -29,23 +29,6 @@ use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
-/// Map a kernel `StatementStatus` to a stable string slug. Matches
-/// the connector's `CommandState` taxonomy one-for-one so the Python
-/// side can branch on the result without holding a reference to a
-/// `StatementStatus` enum.
-fn status_str(status: &StatementStatus) -> &'static str {
-    match status {
-        StatementStatus::Pending => "Pending",
-        StatementStatus::Running => "Running",
-        StatementStatus::Succeeded => "Succeeded",
-        StatementStatus::Failed(_) => "Failed",
-        StatementStatus::Cancelled => "Cancelled",
-        StatementStatus::Closed => "Closed",
-        // `StatementStatus` is `#[non_exhaustive]`.
-        _ => "Unknown",
-    }
-}
-
 #[pyclass(name = "ExecutedAsyncStatement")]
 pub(crate) struct ExecutedAsyncStatement {
     inner: Option<ExecutedAsyncInner>,
@@ -95,7 +78,9 @@ impl ExecutedAsyncStatement {
         let inner = alive!(self, "ExecutedAsyncStatement");
         let runtime = inner.runtime.clone();
         let status = run_kernel!(py, runtime, inner.exec.status())?;
-        let state = status_str(&status);
+        // String mapping lives on the kernel `StatementStatus::as_str`
+        // so all bindings share one taxonomy.
+        let state = status.as_str();
         let failure: Bound<'py, PyAny> = match &status {
             StatementStatus::Failed(err) => {
                 // Build the KernelError instance the same way every

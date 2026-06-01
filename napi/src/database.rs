@@ -34,7 +34,7 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ResultConfig, Session, TlsConfig,
+    AuthConfig, DefaultOpts, HttpConfig, ResultConfig, Session, TlsConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -190,46 +190,32 @@ pub struct ConnectionOptions {
     pub custom_ca_cert: Option<Buffer>,
 }
 
-/// Require a non-empty `Option<String>` field for a given auth mode,
-/// returning a typed `InvalidArgument` naming the JS field otherwise.
-fn require_field(value: &Option<String>, js_name: &str, mode: &str) -> napi::Result<String> {
-    value.clone().filter(|s| !s.is_empty()).ok_or_else(|| {
-        napi_err_from_kernel(
-            KernelError::invalid_argument()
-                .message(format!("authMode {mode} requires a non-empty `{js_name}`")),
-        )
-    })
-}
-
 /// Map the JS `ConnectionOptions` auth fields onto the kernel
-/// [`AuthConfig`]. Per-mode required-field validation lives here at the
-/// binding boundary so the kernel always receives a fully-formed variant.
+/// [`AuthConfig`]. Per-mode required-field validation lives in the
+/// kernel's validating constructors ([`AuthConfig::pat`] /
+/// [`AuthConfig::oauth_m2m`]); this binding just forwards the JS
+/// optionals and maps any kernel `InvalidArgument` onto a napi error.
 /// Pure (borrows `options`) so it is unit-testable without opening a
 /// session.
 fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
     match options.auth_mode.unwrap_or_default() {
-        AuthMode::Pat => Ok(AuthConfig::Pat {
-            token: require_field(&options.token, "token", "Pat")?,
-        }),
-        AuthMode::OAuthM2m => Ok(AuthConfig::OAuthM2M {
-            client_id: require_field(&options.oauth_client_id, "oauthClientId", "OAuthM2m")?,
-            client_secret: require_field(
-                &options.oauth_client_secret,
-                "oauthClientSecret",
-                "OAuthM2m",
-            )?,
-            scopes: options.oauth_scopes.clone(),
-            token_url_override: None,
-        }),
-        AuthMode::OAuthU2m => Ok(AuthConfig::OAuthU2M {
-            // All U2M fields are optional — the kernel fills `databricks-cli`
-            // / port 8020 / default scopes when omitted.
-            client_id: options.oauth_client_id.clone(),
-            redirect_port: options.oauth_redirect_port,
-            scopes: options.oauth_scopes.clone(),
-            token_url_override: None,
-            callback_timeout: None,
-        }),
+        AuthMode::Pat => AuthConfig::pat(options.token.clone()).map_err(napi_err_from_kernel),
+        AuthMode::OAuthM2m => AuthConfig::oauth_m2m(
+            options.oauth_client_id.clone(),
+            options.oauth_client_secret.clone(),
+            options.oauth_scopes.clone(),
+            None,
+        )
+        .map_err(napi_err_from_kernel),
+        // All U2M fields are optional — the kernel fills `databricks-cli`
+        // / port 8020 / default scopes when omitted.
+        AuthMode::OAuthU2m => Ok(AuthConfig::oauth_u2m(
+            options.oauth_client_id.clone(),
+            options.oauth_redirect_port,
+            options.oauth_scopes.clone(),
+            None,
+            None,
+        )),
     }
 }
 
@@ -377,11 +363,34 @@ mod tests {
         }
     }
 
+    /// Assert a `build_auth_config` failure surfaces as a kernel
+    /// `InvalidArgument` (napi `Status::InvalidArg` + `"code":
+    /// "InvalidArgument"` in the error envelope) and that the kernel
+    /// constructor's message text contains `substr`. The required-field
+    /// validation now lives in the kernel ctors, so the binding tests
+    /// assert the kernel error flows through `napi_err_from_kernel`.
+    fn assert_invalid_arg(err: napi::Error, substr: &str) {
+        assert_eq!(err.status, napi::Status::InvalidArg);
+        let reason = err.reason.to_string();
+        assert!(
+            reason.contains("\"code\":\"InvalidArgument\""),
+            "expected InvalidArgument envelope, got: {reason}"
+        );
+        assert!(
+            reason.contains(substr),
+            "expected message to contain {substr:?}, got: {reason}"
+        );
+    }
+
     #[test]
     fn default_mode_is_pat_and_requires_token() {
         let mut o = base();
-        // No authMode + no token → fail-fast InvalidArgument.
-        assert!(build_auth_config(&o).is_err());
+        // No authMode + no token → fail-fast InvalidArgument from the
+        // kernel `AuthConfig::pat` ctor.
+        assert_invalid_arg(
+            build_auth_config(&o).unwrap_err(),
+            "requires a non-empty access token",
+        );
         o.token = Some("dapi-xxx".to_owned());
         assert!(matches!(
             build_auth_config(&o).unwrap(),
@@ -394,16 +403,19 @@ mod tests {
         let mut o = base();
         o.auth_mode = Some(AuthMode::Pat);
         o.token = Some(String::new());
-        assert!(build_auth_config(&o).is_err());
+        assert_invalid_arg(
+            build_auth_config(&o).unwrap_err(),
+            "requires a non-empty access token",
+        );
     }
 
     #[test]
     fn m2m_requires_client_id_and_secret() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthM2m);
-        assert!(build_auth_config(&o).is_err(), "missing both");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_id");
         o.oauth_client_id = Some("cid".to_owned());
-        assert!(build_auth_config(&o).is_err(), "missing secret");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_secret");
         o.oauth_client_secret = Some("sec".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
         match build_auth_config(&o).unwrap() {

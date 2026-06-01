@@ -278,6 +278,38 @@ impl StatementSpec {
         self
     }
 
+    /// Merge a `query_tags` map into the per-statement conf overlay.
+    ///
+    /// Serialises `tags` to the comma-separated `key:value` wire shape
+    /// the SEA server expects under the `query_tags` conf key (the same
+    /// shape NodeJS Thrift's `serializeQueryTags` produces: backslashes
+    /// in keys are doubled; backslash / colon / comma in values are
+    /// backslash-escaped) and inserts it into `statement_conf` under
+    /// `"query_tags"`.
+    ///
+    /// - An **empty** `tags` map is a no-op (returns `Ok(self)`),
+    ///   matching the "empty map means not-supplied" convention.
+    /// - If `statement_conf` already carries an explicit `"query_tags"`
+    ///   key, returns `Err(InvalidArgument)` — supplying both a
+    ///   `queryTags` map and `statementConf["query_tags"]` is an
+    ///   ambiguous intent the kernel refuses to silently resolve. Set
+    ///   the explicit `statement_conf` map (via [`Self::statement_conf`])
+    ///   before calling this so the conflict is detected.
+    pub fn query_tags(&mut self, tags: HashMap<String, String>) -> Result<&mut Self> {
+        if tags.is_empty() {
+            return Ok(self);
+        }
+        if self.statement_conf.contains_key("query_tags") {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "cannot supply both `queryTags` and `statementConf[\"query_tags\"]` — pick one",
+            ));
+        }
+        self.statement_conf
+            .insert("query_tags".to_string(), serialize_query_tags(&tags));
+        Ok(self)
+    }
+
     /// Set the server-side row cap (SEA `row_limit`). `None` clears it.
     pub fn row_limit(&mut self, row_limit: Option<i64>) -> &mut Self {
         self.row_limit = row_limit;
@@ -297,6 +329,35 @@ impl StatementSpec {
         self.result_format = fmt;
         self
     }
+}
+
+/// Serialise a tag map to the comma-separated `key:value` wire shape the
+/// SEA server expects under the `query_tags` conf key — identical to the
+/// shape NodeJS Thrift's `serializeQueryTags` (`lib/utils/queryTags.ts`)
+/// produces. Backslashes in keys are doubled; backslash, colon, and comma
+/// in values are each backslash-escaped. The SEA server merges
+/// `confOverlay.query_tags` the same way regardless of which backend
+/// produced it, so callers porting from Thrift see identical behaviour.
+///
+/// Tag ordering follows `HashMap` iteration order, which is
+/// non-deterministic; the SEA server treats conf values as
+/// order-insensitive, so the result is functionally equivalent to the
+/// Thrift output regardless of key order.
+fn serialize_query_tags(tags: &HashMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| {
+            let esc_key = k.replace('\\', "\\\\");
+            let esc_val = v
+                .chars()
+                .flat_map(|c| match c {
+                    '\\' | ':' | ',' => vec!['\\', c],
+                    other => vec![other],
+                })
+                .collect::<String>();
+            format!("{esc_key}:{esc_val}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -374,5 +435,124 @@ mod tests {
         let err = s.param_named("", TypedValue::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(s.named_params.is_empty());
+    }
+
+    // ─── query_tags merge behaviour ─────────────────────────────────────
+
+    #[test]
+    fn query_tags_empty_map_is_noop() {
+        let mut s = StatementSpec::new();
+        s.query_tags(HashMap::new()).unwrap();
+        assert!(s.statement_conf.is_empty());
+    }
+
+    #[test]
+    fn query_tags_serialised_into_query_tags_key() {
+        let mut s = StatementSpec::new();
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        s.query_tags(tags).unwrap();
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("team:platform"),
+        );
+    }
+
+    #[test]
+    fn query_tags_rejects_dual_definition() {
+        let mut s = StatementSpec::new();
+        let mut conf = HashMap::new();
+        conf.insert("query_tags".to_string(), "explicit:value".to_string());
+        s.statement_conf(conf);
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        let err = s.query_tags(tags).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("cannot supply both"),
+            "error must explain the conflict: {}",
+            err.message,
+        );
+        // The explicit key is left untouched.
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("explicit:value"),
+        );
+    }
+
+    #[test]
+    fn query_tags_empty_map_does_not_collide_with_existing_key() {
+        // An empty `queryTags: {}` map is ignored, so a caller can pass
+        // an explicit `statementConf["query_tags"]` alongside an empty
+        // tag map without tripping the ambiguity guard.
+        let mut s = StatementSpec::new();
+        let mut conf = HashMap::new();
+        conf.insert("query_tags".to_string(), "explicit:value".to_string());
+        s.statement_conf(conf);
+        s.query_tags(HashMap::new()).unwrap();
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("explicit:value"),
+        );
+    }
+
+    // ─── serialize_query_tags byte-shape parity with Thrift ─────────────
+
+    /// `serializeQueryTags` (NodeJS Thrift, `lib/utils/queryTags.ts`)
+    /// is the canonical wire shape for `query_tags`. Pin the per-tag
+    /// byte shape produced by the kernel-side serializer against the
+    /// algorithm Thrift uses, so a regression on either side fails this
+    /// test.
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_single_tag() {
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        assert_eq!(serialize_query_tags(&tags), "team:platform");
+    }
+
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_escapes() {
+        // Per Thrift's `escapedValue.replace(/[\\:,]/g, c => '\\' + c)`:
+        // input  `v:1,v\2`
+        // output `v\:1\,v\\2`
+        let mut tags = HashMap::new();
+        tags.insert("k".to_string(), "v:1,v\\2".to_string());
+        assert_eq!(serialize_query_tags(&tags), "k:v\\:1\\,v\\\\2");
+    }
+
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_key_backslash_only() {
+        // Per Thrift's `escapedKey = key.replace(/\\/g, '\\\\')`:
+        // input  `k\1`
+        // output `k\\1`
+        // Colons/commas in keys are NOT escaped on Thrift's path — only
+        // in values. Pins this asymmetry so a future "uniformity"
+        // refactor that escapes them in keys too gets caught.
+        let mut tags = HashMap::new();
+        tags.insert("k\\1".to_string(), "v".to_string());
+        assert_eq!(serialize_query_tags(&tags), "k\\\\1:v");
+    }
+
+    #[test]
+    fn serialize_query_tags_empty_map_yields_empty_string() {
+        assert_eq!(serialize_query_tags(&HashMap::new()), "");
+    }
+
+    #[test]
+    fn serialize_query_tags_multi_tag_contains_each_pair_regardless_of_order() {
+        // Multi-tag case: HashMap iteration is non-deterministic, so we
+        // can't assert a single byte string. Assert each pair is present
+        // and the join uses `,`. SEA treats conf values as
+        // order-insensitive, so this is functionally equivalent to the
+        // Thrift output regardless of order.
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "1".to_string());
+        tags.insert("b".to_string(), "2".to_string());
+        let s = serialize_query_tags(&tags);
+        let pairs: std::collections::HashSet<&str> = s.split(',').collect();
+        assert!(
+            pairs == ["a:1", "b:2"].iter().copied().collect(),
+            "got: {s}",
+        );
     }
 }
