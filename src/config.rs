@@ -322,7 +322,13 @@ pub struct HttpConfig {
     /// Maximum total time across retries for a single logical RPC.
     pub overall_timeout: Duration,
 
-    /// Connection pool size.
+    /// Connection pool size (max idle warm sockets per remote host).
+    ///
+    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
+    /// default. Raise this for workloads that burst many concurrent
+    /// `executeStatement` calls or CloudFetch chunk downloads against a
+    /// single host; too low a value forces fresh TLS handshakes when the
+    /// pool fills.
     pub pool_max_idle_per_host: usize,
 }
 
@@ -331,7 +337,7 @@ impl Default for HttpConfig {
         Self {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
-            pool_max_idle_per_host: 10,
+            pool_max_idle_per_host: 100,
         }
     }
 }

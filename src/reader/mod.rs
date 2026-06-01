@@ -183,7 +183,12 @@ impl ResultReaderFactory {
                         inline_data.len()
                     );
 
-                    return self.create_inline_reader(inline_data, compression);
+                    // Pass the manifest's authoritative row count so the
+                    // inline provider clamps off any look-ahead row the SEA
+                    // server appends when a row_limit truncates the result.
+                    let total_row_count =
+                        response.manifest.as_ref().and_then(|m| m.total_row_count);
+                    return self.create_inline_reader(inline_data, compression, total_row_count);
                 }
             }
 
@@ -316,14 +321,17 @@ impl ResultReaderFactory {
         &self,
         inline_data: &[u8],
         compression: CompressionCodec,
+        total_row_count: Option<i64>,
     ) -> Result<Box<dyn ResultReader + Send>> {
         tracing::debug!(
-            "Creating inline Arrow reader: {} bytes, compression={:?}",
+            "Creating inline Arrow reader: {} bytes, compression={:?}, total_row_count={:?}",
             inline_data.len(),
-            compression
+            compression,
+            total_row_count
         );
 
-        let provider = InlineArrowProvider::new(inline_data.to_vec(), compression)?;
+        let provider =
+            InlineArrowProvider::new(inline_data.to_vec(), compression, total_row_count)?;
 
         Ok(Box::new(InlineArrowReader::new(provider)))
     }

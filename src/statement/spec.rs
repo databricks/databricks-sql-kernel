@@ -192,6 +192,25 @@ pub struct StatementSpec {
     /// `session_conf` at execute time; this map wins on key collisions.
     pub statement_conf: HashMap<String, String>,
 
+    /// Server-side cap on the number of rows returned by this statement,
+    /// independent of SQL `LIMIT`. Maps directly to the SEA
+    /// `ExecuteStatement.row_limit` wire field (Python `use_sea`'s
+    /// `row_limit=` kwarg is the canonical cross-driver surface). `None`
+    /// omits the field, so the server applies no driver-imposed cap.
+    pub row_limit: Option<i64>,
+
+    /// Server-side statement wait timeout, in whole seconds. Bounds how
+    /// long the server waits for the statement to reach a terminal state
+    /// before the wait elapses; on elapse the statement is cancelled
+    /// (`on_wait_timeout = CANCEL`), surfacing as a timeout to the caller.
+    /// This is the per-statement server timeout (JDBC `setQueryTimeout` /
+    /// Python `use_sea`'s `wait_timeout=`), distinct from the transport
+    /// `overall_timeout`. `None` lets the kernel pick its sync/async
+    /// default (see `Statement::execute` / `submit`). The SEA wire caps
+    /// the value at 50s; the kernel forwards the requested value verbatim
+    /// and lets the server clamp.
+    pub query_timeout_secs: Option<u32>,
+
     /// Result wire format.
     pub result_format: ResultFormat,
 }
@@ -259,6 +278,20 @@ impl StatementSpec {
         self
     }
 
+    /// Set the server-side row cap (SEA `row_limit`). `None` clears it.
+    pub fn row_limit(&mut self, row_limit: Option<i64>) -> &mut Self {
+        self.row_limit = row_limit;
+        self
+    }
+
+    /// Set the per-statement server wait timeout in whole seconds. `None`
+    /// clears it (kernel default applies). See the field docs for the
+    /// `CANCEL`-on-elapse semantics and the 50s server cap.
+    pub fn query_timeout_secs(&mut self, secs: Option<u32>) -> &mut Self {
+        self.query_timeout_secs = secs;
+        self
+    }
+
     /// Set the result wire format.
     pub fn result_format(&mut self, fmt: ResultFormat) -> &mut Self {
         self.result_format = fmt;
@@ -277,7 +310,23 @@ mod tests {
         assert!(s.positional_params.is_empty());
         assert!(s.named_params.is_empty());
         assert!(s.statement_conf.is_empty());
+        // row_limit / query_timeout default to "omit the field" so the
+        // server applies no driver-imposed cap and its own wait default.
+        assert!(s.row_limit.is_none());
+        assert!(s.query_timeout_secs.is_none());
         assert_eq!(s.result_format, ResultFormat::Arrow);
+    }
+
+    #[test]
+    fn row_limit_and_query_timeout_setters() {
+        let mut s = StatementSpec::new();
+        s.row_limit(Some(100)).query_timeout_secs(Some(30));
+        assert_eq!(s.row_limit, Some(100));
+        assert_eq!(s.query_timeout_secs, Some(30));
+        // `None` clears back to the omit-the-field default.
+        s.row_limit(None).query_timeout_secs(None);
+        assert!(s.row_limit.is_none());
+        assert!(s.query_timeout_secs.is_none());
     }
 
     #[test]

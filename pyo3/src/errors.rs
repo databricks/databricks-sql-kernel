@@ -42,22 +42,9 @@ create_exception!(databricks_sql_kernel, KernelError, PyException);
 /// `ErrorCode` is `#[non_exhaustive]`; new kernel variants surface
 /// as `"Unknown"` on the Python side until this match is updated.
 fn code_str(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "InvalidArgument",
-        ErrorCode::Unauthenticated => "Unauthenticated",
-        ErrorCode::PermissionDenied => "PermissionDenied",
-        ErrorCode::NotFound => "NotFound",
-        ErrorCode::ResourceExhausted => "ResourceExhausted",
-        ErrorCode::Unavailable => "Unavailable",
-        ErrorCode::Timeout => "Timeout",
-        ErrorCode::Cancelled => "Cancelled",
-        ErrorCode::DataLoss => "DataLoss",
-        ErrorCode::Internal => "Internal",
-        ErrorCode::InvalidStatementHandle => "InvalidStatementHandle",
-        ErrorCode::NetworkError => "NetworkError",
-        ErrorCode::SqlError => "SqlError",
-        _ => "Unknown",
-    }
+    // Delegate to the kernel's single-source-of-truth slug map (shared with
+    // the napi binding) so the wire slugs can never drift across bindings.
+    code.slug()
 }
 
 /// Common attribute-set used by both `to_py_err` (kernel error
