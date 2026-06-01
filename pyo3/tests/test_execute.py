@@ -267,6 +267,29 @@ def test_bind_param_duplicate_ordinal_last_wins(session):
 
 
 @live
+def test_mixed_positional_and_named_params_rejected_at_execute(session):
+    """Positional and named bindings are mutually exclusive. The kernel
+    rejects them at execute time (bind just records them) with
+    ``KernelError(InvalidArgument)`` — before the wire — so the Python
+    binding gets the same fast, typed failure that napi and direct-Rust
+    callers do, instead of an opaque server BAD_REQUEST round-trip."""
+    stmt = session.statement()
+    stmt.set_sql("SELECT ? AS pos, :n AS named")
+    stmt.bind_param(1, "7", "INT")
+    stmt.bind_named_param("n", "99", "INT")
+    try:
+        try:
+            stmt.execute()
+        except k.KernelError as e:
+            assert e.code == "InvalidArgument", e.code
+            assert "mutually exclusive" in e.message.lower(), e.message
+        else:
+            raise AssertionError("expected KernelError for mixed positional + named params")
+    finally:
+        stmt.close()
+
+
+@live
 def test_bad_sql_surfaces_structured_kernel_error(session):
     stmt = session.statement()
     stmt.set_sql("SELECT * FROM definitely_not_a_table_xyz_kernel_test")
