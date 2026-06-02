@@ -21,8 +21,25 @@ name: Coverage
 on:
   push:
     branches: [main]
+    # Path-filtered: a full instrumented rebuild (`cargo llvm-cov`) is
+    # expensive, so only run it when something that can move the
+    # coverage number changes. Docs / workflow-only PRs skip it.
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyo3/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/coverage.yml"
   pull_request:
     branches: [main]
+    paths:
+      - "src/**"
+      - "tests/**"
+      - "pyo3/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/coverage.yml"
   workflow_dispatch:
 
 concurrency:

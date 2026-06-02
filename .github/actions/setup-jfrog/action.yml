@@ -110,9 +110,19 @@ runs:
         EOF
         chmod 600 ~/.cargo/credentials.toml
 
-        # Exported for tools like cargo-deny / cargo-llvm-cov that
-        # may read the env directly rather than the credentials file.
-        echo "CARGO_REGISTRIES_JFROG_TOKEN=Bearer ${JFROG_ACCESS_TOKEN}" >> "$GITHUB_ENV"
+        # NOTE: we deliberately do NOT export CARGO_REGISTRIES_JFROG_TOKEN
+        # into $GITHUB_ENV. cargo (and tools that shell out to it —
+        # cargo-deny, cargo-llvm-cov) read the token from the
+        # ~/.cargo/credentials.toml written above via the
+        # `credential-provider = ["cargo:token"]` line in config.toml,
+        # so the env var was redundant. Critically, the token is
+        # regenerated on every run, and Swatinem/rust-cache (run by
+        # actions-rust-lang/setup-rust-toolchain) hashes every
+        # `CARGO*`-prefixed env var into its cache key — so exporting a
+        # fresh token here gave every run a unique key and a guaranteed
+        # cache miss (full cold rebuild of the ~57-crate tree in every
+        # job). Keeping the token in the credentials file only restores
+        # stable cache keys and warm builds.
 
         echo "Cargo configured to use JFrog registry"
 

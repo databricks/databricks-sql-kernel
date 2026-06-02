@@ -28,6 +28,8 @@
 
 version: 2
 updates:
+  # Root workspace (kernel + the pyo3 member, which share the root
+  # Cargo.lock).
   - package-ecosystem: "cargo"
     directory: "/"
     schedule:
@@ -37,6 +39,21 @@ updates:
       # Batch patch + minor updates to reduce PR churn; security
       # advisories still come through as individual PRs.
       cargo-minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # napi/ is a standalone Cargo workspace with its own committed
+  # Cargo.lock (napi CI builds with `--locked`). The root entry above
+  # does not see it, so without this entry napi's transitive deps
+  # never get security / version bumps.
+  - package-ecosystem: "cargo"
+    directory: "/napi"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    groups:
+      napi-cargo-minor-and-patch:
         update-types:
           - "minor"
           - "patch"
