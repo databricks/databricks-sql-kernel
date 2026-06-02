@@ -31,8 +31,13 @@ allow = [
     "BSD-3-Clause",
     # CC0-1.0 is a public-domain dedication (no attribution or
     # copyleft obligation). Pulled in transitively by `tiny-keccak`
-    # via the napi dependency graph, which the license check now
-    # scans alongside the root workspace.
+    # (v2.0.2) — present in BOTH the root graph (ahash -> const-random
+    # -> const-random-macro -> tiny-keccak) and the napi graph. The
+    # root `cargo deny` run was previously passing without this entry
+    # only because the license text was classified as "unknown" under
+    # confidence-threshold = 0.93 rather than matched to the explicit
+    # CC0-1.0 string; allow-listing it makes the policy explicit so a
+    # future classifier change can't silently flip it to a hard reject.
     "CC0-1.0",
     "CDLA-Permissive-2.0",
     "ISC",

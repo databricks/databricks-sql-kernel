@@ -36,10 +36,15 @@ on:
   merge_group:
 
 concurrency:
-  # `github.head_ref` is set on pull_request but empty on merge_group;
-  # fall back to the ref so distinct merge-group entries don't collapse
-  # into one another.
-  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  # pull_request: coalesce per head_ref (PR branch).
+  # merge_group: head_ref is empty, so fall back to github.ref (the
+  #   unique gh-readonly-queue ref) — distinct queue entries stay
+  #   separate.
+  # push to main: head_ref is also empty, but falling back to
+  #   github.ref ("refs/heads/main") would make cancel-in-progress
+  #   cancel the previous main push's in-flight CI. Pin to github.sha
+  #   on push so each landed commit keeps its own isolated run.
+  group: ${{ github.workflow }}-${{ github.event_name == 'push' && github.sha || github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:

@@ -25,8 +25,10 @@ authors = [{ name = "Databricks" }]
 # (Python 3.14) wheels from 23.x onward, so the previous `<19` ceiling
 # forced a from-source build that fails on 3.14. Keeping the floor
 # aligned with the connector also keeps the two surfaces installable
-# side by side.
-dependencies = ["pyarrow>=23.0.1"]
+# side by side. The `<24` ceiling preserves the major-version upper
+# bound the go/pinning-python-deps policy requires (a future pyarrow
+# major then surfaces as a deliberate bump, not a silent auto-resolve).
+dependencies = ["pyarrow>=23.0.1,<24"]
 
 # Dev / CI dependencies. PEP 735 standard; uv reads this directly.
 # CI runs `uv sync --group dev` (no `--frozen`, no committed

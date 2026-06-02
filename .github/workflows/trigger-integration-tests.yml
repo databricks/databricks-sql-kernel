@@ -433,6 +433,13 @@ jobs:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
     permissions:
+      # `contents: read` is REQUIRED: this job checks out the repo to
+      # diff the merge group. Declaring any `permissions:` block sets
+      # every unlisted scope to `none`, so without this line
+      # actions/checkout gets a token that can't read the repo and
+      # fails with "Repository not found" (exit 128) — which only
+      # surfaces in the merge queue, the one path that checks out code.
+      contents: read
       checks: write
     steps:
       - name: Checkout code

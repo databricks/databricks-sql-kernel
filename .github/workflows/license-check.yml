@@ -92,7 +92,9 @@ jobs:
         # points back at the root deny.toml so both workspaces share
         # one allowlist rather than drifting. `--manifest-path` is a
         # global cargo-deny flag (before the subcommand); `--config`
-        # is a `check` flag (after it). A relative `--config` resolves
-        # against the manifest's directory (it would look for
-        # napi/deny.toml), so point at the root copy by absolute path.
-        run: cargo deny --manifest-path napi/Cargo.toml check --config "$GITHUB_WORKSPACE/deny.toml"
+        # is a `check` flag (after it). Both paths are absolute via
+        # $GITHUB_WORKSPACE so the step is immune to any
+        # `defaults.run.working-directory` a future edit might add
+        # (a relative `--config` would otherwise resolve against the
+        # manifest dir and look for napi/deny.toml).
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" check --config "$GITHUB_WORKSPACE/deny.toml"
