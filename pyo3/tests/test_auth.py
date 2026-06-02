@@ -32,7 +32,11 @@ def test_missing_auth_raises_value_error():
 
 
 def test_pat_with_empty_token_raises_value_error():
-    with pytest.raises(ValueError, match="access_token"):
+    # Empty-token validation is centralised in the kernel's
+    # `AuthConfig::pat` ctor (so every binding rejects it identically),
+    # which surfaces "PAT auth requires a non-empty access token" — match
+    # that message rather than the `access_token` kwarg spelling.
+    with pytest.raises(ValueError, match="non-empty access token"):
         k.Session(
             host="x.databricks.com",
             http_path="/sql/1.0/warehouses/abc",
