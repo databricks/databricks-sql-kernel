@@ -40,8 +40,12 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 databricks-sql-kernel = { path = ".." }
 
-# pyo3 — abi3-py39 lets one wheel cover Python 3.9+.
-pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
+# pyo3 — abi3-py310 builds a single stable-ABI wheel (tagged
+# cp310-abi3) that loads on CPython 3.10+. The ABI floor is kept in
+# step with `requires-python = ">=3.10"` in pyproject.toml; bumping
+# both together avoids shipping a wheel whose ABI tag advertises an
+# interpreter the package no longer claims to support.
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py310"] }
 
 # Multi-thread runtime — one per Session, owned on the Rust side.
 tokio = { version = "1", features = ["rt-multi-thread"] }

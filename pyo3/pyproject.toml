@@ -6,7 +6,10 @@ build-backend = "maturin"
 name = "databricks-sql-kernel"
 version = "0.1.0"
 description = "Python bindings for the Databricks SQL Kernel (PyO3)"
-requires-python = ">=3.9"
+# Floor matches the tested CI matrix in
+# .github/workflows/pyo3-checks.yml (3.10 .. 3.14). 3.9 is no longer
+# exercised in CI, so it is not claimed as supported here.
+requires-python = ">=3.10"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Databricks" }]
 # Runtime dependency for downstream consumers. Major-version bound
@@ -16,7 +19,16 @@ authors = [{ name = "Databricks" }]
 # uses these bounds (no committed lockfile) — see the
 # `[dependency-groups].dev` block below + the workflow comment in
 # `.github/workflows/pyo3-checks.yml` for the policy rationale.
-dependencies = ["pyarrow>=14,<19"]
+#
+# Floor is `>=23.0.1` to match databricks-sql-connector 5.0.0
+# (databricks/databricks-sql-python#818): pyarrow only ships cp314
+# (Python 3.14) wheels from 23.x onward, so the previous `<19` ceiling
+# forced a from-source build that fails on 3.14. Keeping the floor
+# aligned with the connector also keeps the two surfaces installable
+# side by side. The `<24` ceiling preserves the major-version upper
+# bound the go/pinning-python-deps policy requires (a future pyarrow
+# major then surfaces as a deliberate bump, not a silent auto-resolve).
+dependencies = ["pyarrow>=23.0.1,<24"]
 
 # Dev / CI dependencies. PEP 735 standard; uv reads this directly.
 # CI runs `uv sync --group dev` (no `--frozen`, no committed

@@ -58,7 +58,7 @@ jobs:
   # kernel-only PRs that trigger this workflow via root Cargo.toml
   # / Cargo.lock changes.
   precondition:
-    name: "Check pyo3/ sub-crate exists"
+    name: "Check pyo3 sub-crate exists"
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -99,7 +99,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ["3.9", "3.12"]
+        # Cover the supported floor through the newest release. 3.13
+        # and 3.14 exercise the GIL / free-threading changes where
+        # PyO3 extensions most often break. Floor is 3.10 — matches
+        # `requires-python` in pyo3/pyproject.toml.
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
@@ -132,7 +136,14 @@ jobs:
         # age filter on `db-pypi` are the baseline protection. uv
         # re-resolves each run within those bounds.
         working-directory: pyo3
-        run: uv sync --group dev
+        # `--no-install-project` installs only the dependency groups,
+        # NOT the kernel cdylib itself. Without it, `uv sync` runs a
+        # full maturin/cargo RELEASE build of the extension here — and
+        # then the `maturin develop` step below rebuilds it again in
+        # debug, so the kernel compiled twice per matrix Python version
+        # (~5 min each, x5 versions). The Rust extension is built
+        # exactly once, by `maturin develop`.
+        run: uv sync --group dev --no-install-project
 
       - name: Cargo unit tests (pyo3 crate)
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff
@@ -145,7 +156,12 @@ jobs:
         # `develop` builds the extension and installs it into the
         # uv-managed venv from the previous step. Debug build is
         # fine for tests and ~2x faster than --release.
-        run: uv run maturin develop --interpreter python${{ matrix.python-version }}
+        #
+        # maturin's `develop` always targets the active virtualenv's
+        # interpreter and (unlike `build`) has no --interpreter flag;
+        # `uv run` already activates the venv `uv sync` created for the
+        # matrix Python version, so the interpreter is selected for us.
+        run: uv run maturin develop
 
       - name: pytest (no-network + live tiers)
         working-directory: pyo3

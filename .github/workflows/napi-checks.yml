@@ -65,14 +65,14 @@ jobs:
   # this workflow via root Cargo.toml changes before the napi crate
   # has merged.
   precondition:
-    name: "Check napi/ sub-crate exists"
+    name: "Check napi sub-crate exists"
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
     outputs:
       ready: ${{ steps.check.outputs.ready }}
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       - name: "Check for napi/Cargo.toml"
         id: check
@@ -102,13 +102,18 @@ jobs:
         # All cargo commands run from the napi/ standalone workspace.
         working-directory: napi
     steps:
-      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5  # v4
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
+      # Route cargo through the JFrog crates proxy. The protected
+      # runner group blocks direct crates.io, so without this every
+      # cargo command below fails to update the registry index. The
+      # composite writes ~/.cargo/config.toml (a source replacement),
+      # which preserves resolved versions, so `--locked` stays valid.
       - uses: ./.github/actions/setup-jfrog
         with:
           cargo: "true"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@1780873c7b576612439a134613cc4cc74ce5538c  # v1.15.2
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
         with:
           components: rustfmt, clippy
 
@@ -130,8 +135,15 @@ jobs:
 
       # Release-profile build verifies the cdylib actually links with
       # the production profile knobs (lto=true, codegen-units=1,
-      # strip="debuginfo"). Slower (~1m) but cheap insurance against
-      # release-only regressions that the debug-profile `cargo test`
-      # above wouldn't catch.
+      # strip="debuginfo"). The lto=true link is the slow part (~4 min
+      # here), and `cargo check --release` would NOT exercise it
+      # (check doesn't link the cdylib), so we keep the real build but
+      # run it only on push to main — a post-merge canary — rather
+      # than on every PR push. napi is not a required check, so this
+      # keeps PR feedback fast (fmt + clippy + test, ~2.5 min) while
+      # still catching release-only link regressions before they
+      # accumulate on main. The merge group does not run napi (no
+      # merge_group trigger), so main is the gate.
       - name: cargo build --release --locked
+        if: github.event_name == 'push'
         run: cargo build --release --locked

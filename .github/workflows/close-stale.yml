@@ -29,6 +29,7 @@ permissions:
 
 jobs:
   stale:
+    name: Close stale issues and PRs
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
