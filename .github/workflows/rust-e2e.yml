@@ -14,16 +14,17 @@
 
 # End-to-end tests against a live Databricks workspace.
 #
-# Single `e2e` job covers the v0 surface (Session::open, execute,
+# The `e2e` job covers the v0 surface (Session::open, execute,
 # submit, await_result, metadata) via PAT + OAuth M2M. OAuth U2M is
 # intentionally absent: it requires a browser flow that can't run in
 # CI; `tests/oauth_u2m_integration.rs` covers it on developer
 # machines.
 #
-# Proxy + TLS coverage will land alongside the v0.1 work that fleshes
-# out `ProxyConfig` / `TlsConfig` in `src/config.rs` and plumbs them
-# through `src/client/http.rs`. Tracked in `docs/migration-plan.md`
-# §7.
+# The `tls` job covers `TlsConfig` (custom CA + accept-self-signed)
+# end-to-end through an intercepting mitmproxy. Full HTTP proxy
+# coverage (driving `SessionBuilder::proxy` directly) lands with the
+# v0.1 work that fleshes out the reserved `ProxyConfig` in
+# `src/config.rs`. Tracked in `docs/migration-plan.md` §7.
 
 name: Rust E2E Tests
 
@@ -91,3 +92,97 @@ jobs:
             cargo test --test "${suite}" -- --ignored --nocapture
             echo "::endgroup::"
           done
+
+  # TLS end-to-end coverage: drive the v0 `Session` surface through an
+  # intercepting HTTPS proxy (mitmproxy) so the kernel's `TlsConfig`
+  # plumbing is exercised against a REAL TLS handshake to a live
+  # workspace, not just unit-level reqwest-builder construction.
+  #
+  # mitmproxy re-signs every connection with its own CA. A default
+  # (strict) client sees an untrusted cert and fails; supplying the
+  # CA via `TlsConfig::custom_ca_cert` — or disabling validation via
+  # `accept_self_signed` — makes the round-trip succeed. The three
+  # `#[ignore]`d tests in `tests/v0_tls_e2e.rs` cover exactly those
+  # outcomes. Ported from `adbc-drivers/databricks`'s `tls_e2e.rs`.
+  #
+  # The v0 public `ProxyConfig` is still reserved, so we route traffic
+  # by setting `HTTPS_PROXY` (which reqwest honours by default) rather
+  # than through `SessionBuilder::proxy`. When the v0 proxy surface
+  # lands, drive the proxy explicitly and add a fourth test.
+  tls:
+    name: "v0 TLS (mitmproxy)"
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    environment: azure-prod
+    env:
+      DATABRICKS_HOST: ${{ secrets.DATABRICKS_HOST }}
+      DATABRICKS_HTTP_PATH: ${{ secrets.DATABRICKS_HTTP_PATH }}
+      DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+      DATABRICKS_TEST_CLIENT_ID: ${{ secrets.DATABRICKS_TEST_CLIENT_ID }}
+      DATABRICKS_TEST_CLIENT_SECRET: ${{ secrets.DATABRICKS_TEST_CLIENT_SECRET }}
+      RUST_LOG: databricks_sql_kernel=debug
+      RUST_BACKTRACE: 1
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+
+      - name: Start mitmproxy
+        run: |
+          docker run -d --name mitmproxy \
+            -p 8080:8080 \
+            mitmproxy/mitmproxy:12.2.1@sha256:743b6cdc817211d64bc269f5defacca8d14e76e647fc474e5c7244dbcb645141 \
+            mitmdump --set stream_large_bodies=0
+          for i in $(seq 1 15); do
+            if docker exec mitmproxy test -f /home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem 2>/dev/null; then
+              echo "mitmproxy CA cert is ready"
+              break
+            fi
+            echo "Waiting for mitmproxy CA cert... ($i/15)"
+            sleep 1
+          done
+
+      - name: Extract mitmproxy CA certificate
+        run: |
+          docker cp mitmproxy:/home/mitmproxy/.mitmproxy/mitmproxy-ca-cert.pem /tmp/mitmproxy-ca-cert.pem
+          echo "MITMPROXY_CA_CERT=/tmp/mitmproxy-ca-cert.pem" >> "$GITHUB_ENV"
+          echo "Extracted mitmproxy CA cert:"
+          openssl x509 -in /tmp/mitmproxy-ca-cert.pem -noout -subject -issuer
+
+      # Compile the test binary BEFORE the proxy is in scope. The
+      # protected runner reaches crates via the JFrog proxy, so cargo's
+      # registry fetch must NOT be routed through mitmproxy (which can't
+      # reach the internal registry and would intercept it with an
+      # untrusted cert). We set HTTPS_PROXY only on the run step below.
+      - name: Build v0 TLS E2E test binary
+        run: cargo test --test v0_tls_e2e --no-run
+
+      - name: Run v0 TLS E2E tests
+        # HTTPS_PROXY is scoped to THIS step so only the test's own HTTP
+        # traffic flows through mitmproxy. `--no-run` already fetched +
+        # compiled everything, so cargo needs no registry access here.
+        env:
+          HTTPS_PROXY: http://localhost:8080
+        run: cargo test --test v0_tls_e2e -- --ignored --nocapture
+
+      - name: Verify traffic flowed through mitmproxy
+        if: always()
+        run: |
+          echo "=== mitmproxy logs (tail) ==="
+          docker logs mitmproxy 2>&1 | tail -50
+          echo "=== checking for proxied-connection entries ==="
+          docker logs mitmproxy 2>&1 \
+            | grep -i "CONNECT\|clientconnect\|<<" \
+            || (echo "FAIL: no traffic in mitmproxy logs — proxy was not used" && exit 1)
+
+      - name: Cleanup mitmproxy
+        if: always()
+        run: docker rm -f mitmproxy 2>/dev/null || true

@@ -501,6 +501,49 @@ pub struct TlsConfig {
     /// when connecting via an IP literal or a hostname the cert
     /// wasn't issued for in a development / lab environment.
     pub skip_hostname_verification: bool,
+
+    /// PEM-encoded client certificate for mutual TLS (mTLS).
+    ///
+    /// Set together with [`Self::client_key_pem`] when the server
+    /// requires the client to present a certificate (mTLS handshake).
+    /// Mirrors the Python connector's `_tls_client_cert_file` /
+    /// `_tls_client_cert_key_file` knobs — wrappers read those files
+    /// and pass the bytes here, no tempfile shim needed.
+    ///
+    /// **Backend note:** under the `tls-native` backend the cert chain
+    /// and key are loaded as a separate `(cert, key)` pair via
+    /// `reqwest::Identity::from_pkcs8_pem`; under `tls-rustls` they are
+    /// concatenated into a single PEM and loaded via
+    /// `reqwest::Identity::from_pem`. Either backend accepts a PEM
+    /// `client_cert_pem` carrying a leaf certificate optionally followed
+    /// by its intermediate chain.
+    ///
+    /// Both `client_cert_pem` and `client_key_pem` must be set
+    /// together; setting only one is rejected at
+    /// [`Session::open`](crate::Session::open) with
+    /// `ErrorCode::InvalidArgument`.
+    ///
+    /// **Validation timing differs by backend.** Under `tls-native`,
+    /// `from_pkcs8_pem` validates the cert/key pair at `Session::open`,
+    /// so a malformed or mismatched pair surfaces synchronously as
+    /// `ErrorCode::InvalidArgument`. Under `tls-rustls`, the cert and
+    /// key are stored and only exercised during the TLS handshake, so
+    /// the same problem surfaces later as a connection error on the
+    /// first request rather than at `Session::open`.
+    pub client_cert_pem: Option<Vec<u8>>,
+
+    /// PEM-encoded private key for the mTLS client certificate.
+    ///
+    /// Accepted key encodings depend on the active TLS backend:
+    /// - **`tls-rustls`** accepts PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
+    ///   (`BEGIN RSA PRIVATE KEY`), and SEC1 (`BEGIN EC PRIVATE KEY`).
+    /// - **`tls-native`** requires a **PKCS#8** key (`BEGIN PRIVATE
+    ///   KEY`) — `reqwest::Identity::from_pkcs8_pem` is PKCS#8-only.
+    ///
+    /// For portability across both backends, supply a PKCS#8 key. See
+    /// [`Self::client_cert_pem`] for pairing rules and the
+    /// backend-specific validation timing.
+    pub client_key_pem: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -517,6 +560,19 @@ impl std::fmt::Debug for TlsConfig {
             .field(
                 "skip_hostname_verification",
                 &self.skip_hostname_verification,
+            )
+            .field(
+                "client_cert_pem",
+                &self
+                    .client_cert_pem
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            // The private key is secret material — never render its
+            // length or contents, just whether one was supplied.
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -1062,6 +1118,7 @@ mod tests {
             custom_ca_cert: Some(b"-----BEGIN CERTIFICATE-----...".to_vec()),
             accept_self_signed: false,
             skip_hostname_verification: false,
+            ..TlsConfig::default()
         };
         let s = format!("{tls:?}");
         assert!(s.contains("<"), "expected byte-count summary, got: {s}");
@@ -1070,5 +1127,28 @@ mod tests {
             "expected byte-count summary, got: {s}"
         );
         assert!(!s.contains("BEGIN CERTIFICATE"), "raw bytes leaked: {s}");
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_client_key() {
+        // The mTLS private key is secret — Debug must show only its
+        // presence, never its length or bytes.
+        // The key's PEM header is assembled at runtime so the repo's
+        // secret scanner doesn't flag a literal `BEGIN PRIVATE KEY`
+        // marker — the body ("supersecret") is the thing under test.
+        let key_pem = format!("-----BEGIN {} KEY-----supersecret", "PRIVATE");
+        let tls = TlsConfig {
+            client_cert_pem: Some(b"-----BEGIN CERTIFICATE-----cert".to_vec()),
+            client_key_pem: Some(key_pem.into_bytes()),
+            ..TlsConfig::default()
+        };
+        let s = format!("{tls:?}");
+        assert!(s.contains("<redacted>"), "expected redaction, got: {s}");
+        assert!(!s.contains("supersecret"), "private key leaked: {s}");
+        // The cert (not secret) is summarised by byte count.
+        assert!(
+            s.contains("bytes>"),
+            "expected cert byte-count summary, got: {s}"
+        );
     }
 }

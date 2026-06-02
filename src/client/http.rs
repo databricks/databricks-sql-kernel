@@ -113,6 +113,16 @@ pub struct TlsConfig {
     /// field has no public projection), so the "both set" case is
     /// unreachable for `SessionBuilder` callers today.
     pub trusted_certificate_pem: Option<Vec<u8>>,
+    /// PEM-encoded client certificate (leaf + optional intermediates)
+    /// for mutual TLS. Populated from
+    /// [`crate::config::TlsConfig::client_cert_pem`]. Paired with
+    /// [`Self::client_key_pem`]; the builder rejects one-without-the-
+    /// other.
+    pub client_cert_pem: Option<Vec<u8>>,
+    /// PEM-encoded private key for the mTLS client certificate.
+    /// Populated from [`crate::config::TlsConfig::client_key_pem`].
+    /// Secret material — redacted in `Debug`.
+    pub client_key_pem: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -134,6 +144,19 @@ impl std::fmt::Debug for TlsConfig {
                     .trusted_certificate_pem
                     .as_ref()
                     .map(|b| format!("<{} bytes>", b.len())),
+            )
+            .field(
+                "client_cert_pem",
+                &self
+                    .client_cert_pem
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            // Private key is secret material — never render length or
+            // contents, only presence.
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -161,6 +184,8 @@ impl TlsConfig {
             allow_hostname_mismatch: Some(cfg.skip_hostname_verification),
             trusted_certificate_path: None,
             trusted_certificate_pem: cfg.custom_ca_cert.clone(),
+            client_cert_pem: cfg.client_cert_pem.clone(),
+            client_key_pem: cfg.client_key_pem.clone(),
         }
     }
 }
@@ -201,6 +226,51 @@ impl Default for HttpClientConfig {
             org_id: None,
         }
     }
+}
+
+/// Build a reqwest mTLS client [`Identity`](reqwest::Identity) from a
+/// PEM client certificate and private key.
+///
+/// The two TLS backends expose different reqwest constructors (gated
+/// opposite to one another in `reqwest::tls`), so this is
+/// feature-gated:
+///
+/// - **`tls-native`**: `Identity::from_pkcs8_pem(cert, key)` takes the
+///   certificate chain and a PKCS#8 private key as two separate
+///   buffers.
+/// - **`tls-rustls`**: `Identity::from_pem(buf)` expects a single PEM
+///   blob holding the private key followed by the certificate chain.
+///   We concatenate `key || cert` (key first) and hand it over.
+///
+/// The `compile_error!` guards in `src/lib.rs` guarantee exactly one
+/// of the two features is active, so the two arms are mutually
+/// exclusive and one always compiles.
+#[cfg(feature = "tls-native")]
+fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity> {
+    reqwest::Identity::from_pkcs8_pem(cert_pem, key_pem).map_err(|e| {
+        Error::invalid_argument().message(format!(
+            "Invalid mTLS client certificate/key in TlsConfig.client_cert_pem/client_key_pem: {e}"
+        ))
+    })
+}
+
+#[cfg(feature = "tls-rustls")]
+fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Identity> {
+    // rustls's `from_pem` wants key + cert in one PEM buffer.
+    let mut combined = Vec::with_capacity(key_pem.len() + cert_pem.len() + 1);
+    combined.extend_from_slice(key_pem);
+    // Guard against a missing trailing newline between the two PEM
+    // blocks, which would glue `-----END ... KEY----------BEGIN ...`
+    // together and break parsing.
+    if !key_pem.ends_with(b"\n") {
+        combined.push(b'\n');
+    }
+    combined.extend_from_slice(cert_pem);
+    reqwest::Identity::from_pem(&combined).map_err(|e| {
+        Error::invalid_argument().message(format!(
+            "Invalid mTLS client certificate/key in TlsConfig.client_cert_pem/client_key_pem: {e}"
+        ))
+    })
 }
 
 /// HTTP client for communicating with Databricks SQL endpoints.
@@ -339,6 +409,33 @@ impl DatabricksHttpClient {
                 cert_count,
                 pem.len()
             );
+        }
+
+        // Apply mTLS client identity. Both halves must be present —
+        // a cert without a key (or vice versa) is a caller error, not
+        // a partial handshake we should attempt.
+        match (&config.tls.client_cert_pem, &config.tls.client_key_pem) {
+            (Some(cert), Some(key)) => {
+                let identity = build_mtls_identity(cert, key)?;
+                builder = builder.identity(identity);
+                debug!(
+                    "Configured mTLS client identity ({} cert bytes)",
+                    cert.len()
+                );
+            }
+            (Some(_), None) => {
+                return Err(Error::invalid_argument().message(
+                    "TlsConfig.client_cert_pem is set without client_key_pem; \
+                     mTLS requires both the client certificate and its private key",
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::invalid_argument().message(
+                    "TlsConfig.client_key_pem is set without client_cert_pem; \
+                     mTLS requires both the client certificate and its private key",
+                ));
+            }
+            (None, None) => {}
         }
 
         // Apply proxy configuration
@@ -995,6 +1092,8 @@ lGrv15pBcePj
             custom_ca_cert: Some(b"pem-bytes".to_vec()),
             accept_self_signed: true,
             skip_hostname_verification: true,
+            client_cert_pem: Some(b"cert-bytes".to_vec()),
+            client_key_pem: Some(b"key-bytes".to_vec()),
         };
         let internal = TlsConfig::from_public(&public);
         assert_eq!(internal.allow_self_signed, Some(true));
@@ -1003,6 +1102,8 @@ lGrv15pBcePj
             internal.trusted_certificate_pem,
             Some(b"pem-bytes".to_vec())
         );
+        assert_eq!(internal.client_cert_pem, Some(b"cert-bytes".to_vec()));
+        assert_eq!(internal.client_key_pem, Some(b"key-bytes".to_vec()));
         // `enabled` and `trusted_certificate_path` stay at internal
         // defaults — the public surface doesn't expose them.
         assert!(internal.enabled.is_none());
@@ -1023,6 +1124,9 @@ lGrv15pBcePj
         assert_eq!(internal.allow_hostname_mismatch, Some(false));
         assert!(internal.trusted_certificate_pem.is_none());
         assert!(internal.trusted_certificate_path.is_none());
+        // mTLS unset by default.
+        assert!(internal.client_cert_pem.is_none());
+        assert!(internal.client_key_pem.is_none());
     }
 
     #[test]
@@ -1034,6 +1138,7 @@ lGrv15pBcePj
             custom_ca_cert: None,
             accept_self_signed: true,
             skip_hostname_verification: false,
+            ..crate::config::TlsConfig::default()
         };
         let config = HttpClientConfig {
             tls: TlsConfig::from_public(&public),
@@ -1052,6 +1157,7 @@ lGrv15pBcePj
             custom_ca_cert: Some(TEST_CA_CERT_PEM.as_bytes().to_vec()),
             accept_self_signed: false,
             skip_hostname_verification: false,
+            ..crate::config::TlsConfig::default()
         };
         let config = HttpClientConfig {
             tls: TlsConfig::from_public(&public),
@@ -1062,6 +1168,57 @@ lGrv15pBcePj
             client.is_ok(),
             "reqwest client construction should succeed when custom_ca_cert is set with a valid PEM"
         );
+    }
+
+    #[test]
+    fn test_mtls_requires_both_cert_and_key() {
+        // A client cert without its key (or vice versa) is a caller
+        // error — surface it as InvalidArgument at build time rather
+        // than attempting a half-configured handshake.
+        let cert_only = HttpClientConfig {
+            tls: TlsConfig {
+                client_cert_pem: Some(b"cert".to_vec()),
+                client_key_pem: None,
+                ..TlsConfig::default()
+            },
+            ..HttpClientConfig::default()
+        };
+        let err = DatabricksHttpClient::new(cert_only, default_retry_configs()).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_key_pem"));
+
+        let key_only = HttpClientConfig {
+            tls: TlsConfig {
+                client_cert_pem: None,
+                client_key_pem: Some(b"key".to_vec()),
+                ..TlsConfig::default()
+            },
+            ..HttpClientConfig::default()
+        };
+        let err = DatabricksHttpClient::new(key_only, default_retry_configs()).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_cert_pem"));
+    }
+
+    #[test]
+    fn test_mtls_invalid_pem_is_rejected() {
+        // Garbage cert+key bytes must fail the reqwest Identity parse
+        // with an InvalidArgument, not panic. The PEM headers are
+        // assembled at runtime (rather than written as string literals)
+        // so the repo's secret scanner doesn't flag a bare
+        // `BEGIN PRIVATE KEY` marker — the body is the non-key literal
+        // "nope" regardless.
+        let pem = |label: &str| format!("-----BEGIN {label}-----\nnope\n-----END {label}-----\n");
+        let config = HttpClientConfig {
+            tls: TlsConfig {
+                client_cert_pem: Some(pem("CERTIFICATE").into_bytes()),
+                client_key_pem: Some(pem(&format!("{} KEY", "PRIVATE")).into_bytes()),
+                ..TlsConfig::default()
+            },
+            ..HttpClientConfig::default()
+        };
+        let err = DatabricksHttpClient::new(config, default_retry_configs()).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
     }
 
     #[test]

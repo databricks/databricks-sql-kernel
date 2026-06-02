@@ -68,11 +68,11 @@ async fn open_with_pat_against_live_warehouse() {
         .expect("explicit close() should succeed");
 }
 
-// Multi-thread runtime required: M2M `get_auth_header` does a blocking
-// token refresh via `block_on_in_runtime` → `block_in_place`, which
-// panics on a current-thread runtime ("can call blocking only when
-// running on the multi-threaded runtime"). Matches the flavor used by
-// every other OAuth test (src/auth/oauth/m2m.rs, oauth_u2m_integration).
+// multi_thread: the OAuth M2M provider's sync `get_auth_header`
+// acquires its token via `block_in_place` (`src/util/runtime.rs`),
+// which panics on a current-thread runtime. Real consumers (pyo3 /
+// napi) always use a multi-thread runtime; the PAT tests above don't
+// make a token call so they're flavor-agnostic.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn open_with_oauth_m2m_against_live_warehouse() {
@@ -103,9 +103,9 @@ async fn open_with_oauth_m2m_against_live_warehouse() {
     session.close().await.expect("close()");
 }
 
-// Multi-thread runtime required for the same reason as the M2M test:
-// U2M token acquisition blocks via `block_in_place`, which panics on a
-// current-thread runtime.
+// multi_thread for the same reason as the M2M test above: the OAuth
+// provider's sync token acquisition uses `block_in_place`, which
+// panics on a current-thread runtime.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore]
 async fn open_with_oauth_u2m_against_live_warehouse() {
