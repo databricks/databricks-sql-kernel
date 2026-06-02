@@ -337,7 +337,7 @@ jobs:
             core.setOutput('json', JSON.stringify(payload));
 
       - name: Dispatch kernel tests to internal repo
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697  # v4.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: databricks/databricks-driver-test
@@ -554,7 +554,7 @@ jobs:
       # dispatch error.
       - name: Dispatch kernel tests
         if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0  # v3.0.0
+        uses: peter-evans/repository-dispatch@28959ce8df70de7be546dd1250a005dd32156697  # v4.0.1
         with:
           token: ${{ steps.app-token.outputs.token }}
           repository: databricks/databricks-driver-test
