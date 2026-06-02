@@ -385,6 +385,7 @@ pub struct HttpConfig {
     pub request_timeout: Duration,
 
     /// Maximum total time across retries for a single logical RPC.
+    /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
     /// Connection pool size (max idle warm sockets per remote host).
@@ -395,6 +396,26 @@ pub struct HttpConfig {
     /// single host; too low a value forces fresh TLS handshakes when the
     /// pool fills.
     pub pool_max_idle_per_host: usize,
+
+    /// Minimum backoff wait between retry attempts. Also the floor for
+    /// a server-supplied `Retry-After` and the base of the exponential
+    /// backoff (`min_wait * 2^attempt`) used when no `Retry-After` is
+    /// present. Default 1s.
+    pub retry_min_wait: Duration,
+
+    /// Maximum backoff wait between retry attempts. Caps both the
+    /// exponential backoff and a server-supplied `Retry-After`.
+    /// Default 60s.
+    pub retry_max_wait: Duration,
+
+    /// Maximum number of retries **after** the initial attempt — a
+    /// request is attempted at most `retry_max_retries + 1` times.
+    /// Default 5 (→ 6 total attempts).
+    ///
+    /// Wrappers exposing a "total attempts" knob (the connector's
+    /// `_retry_stop_after_attempts_count`, the JDBC driver, …) should
+    /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
+    pub retry_max_retries: u32,
 }
 
 impl Default for HttpConfig {
@@ -403,6 +424,12 @@ impl Default for HttpConfig {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
+            // Mirror `RetryConfig::default()` so a stock `HttpConfig`
+            // produces the same retry behaviour the kernel shipped
+            // before these knobs were configurable.
+            retry_min_wait: Duration::from_secs(1),
+            retry_max_wait: Duration::from_secs(60),
+            retry_max_retries: 5,
         }
     }
 }
