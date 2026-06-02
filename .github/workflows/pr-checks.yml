@@ -25,9 +25,21 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
     branches: [main]
+  # The `protect-main` ruleset enables a merge queue and lists this
+  # workflow's "Unit + doc tests" job as a required status check.
+  # GitHub re-evaluates required checks against the merge-group ref,
+  # so without this trigger the queue entry hangs until
+  # `check_response_timeout_minutes` expires. The sibling jobs
+  # (Formatting / Clippy / Build (tls-rustls feature)) also run on the
+  # merge group — they are advisory, not required, so the extra runs
+  # are harmless and keep the workflow trigger simple.
+  merge_group:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.head_ref || github.sha }}
+  # `github.head_ref` is set on pull_request but empty on merge_group;
+  # fall back to the ref so distinct merge-group entries don't collapse
+  # into one another.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
   cancel-in-progress: true
 
 permissions:

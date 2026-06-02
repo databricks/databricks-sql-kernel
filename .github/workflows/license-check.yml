@@ -31,6 +31,11 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      # napi/ is a standalone workspace with its own lockfile; its
+      # dependency graph is invisible to a root `cargo deny` run, so
+      # changes there must re-trigger this workflow to scan it.
+      - "napi/Cargo.toml"
+      - "napi/Cargo.lock"
       - ".github/workflows/license-check.yml"
   pull_request:
     branches: [main]
@@ -38,6 +43,8 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - "deny.toml"
+      - "napi/Cargo.toml"
+      - "napi/Cargo.lock"
       - ".github/workflows/license-check.yml"
 
 permissions:
@@ -70,9 +77,22 @@ jobs:
         with:
           tool: cargo-deny
 
-      - name: Check licenses, advisories, bans, sources
+      - name: Check licenses, advisories, bans, sources (root workspace)
         # `licenses` is the load-bearing check; `advisories` flags
         # RustSec security advisories; `bans` and `sources` are
         # empty-permissive in our deny.toml today but the slots are
-        # there for future hardening.
+        # there for future hardening. The root workspace covers the
+        # kernel + pyo3 (pyo3 is a root workspace member).
         run: cargo deny check
+
+      - name: Check licenses, advisories, bans, sources (napi workspace)
+        # napi/ is a separate Cargo workspace (its own Cargo.lock) so
+        # its transitive graph is NOT seen by the root run above. Scan
+        # it explicitly against the same deny.toml policy. `--config`
+        # points back at the root deny.toml so both workspaces share
+        # one allowlist rather than drifting. `--manifest-path` is a
+        # global cargo-deny flag (before the subcommand); `--config`
+        # is a `check` flag (after it). A relative `--config` resolves
+        # against the manifest's directory (it would look for
+        # napi/deny.toml), so point at the root copy by absolute path.
+        run: cargo deny --manifest-path napi/Cargo.toml check --config "$GITHUB_WORKSPACE/deny.toml"
