@@ -49,6 +49,12 @@ concurrency:
 
 permissions:
   contents: read
+  # Required for the OIDC token exchange that the
+  # `.github/actions/setup-jfrog` composite uses to authenticate
+  # against the JFrog cargo proxy. The protected runner group blocks
+  # direct crates.io access, so cargo must route through the proxy.
+  # See go/hardened-gha.
+  id-token: write
 
 defaults:
   run:
@@ -94,6 +100,15 @@ jobs:
         working-directory: napi
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # Route cargo through the JFrog crates proxy. The protected
+      # runner group blocks direct crates.io, so without this every
+      # cargo command below fails to update the registry index. The
+      # composite writes ~/.cargo/config.toml (a source replacement),
+      # which preserves resolved versions, so `--locked` stays valid.
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
         with:

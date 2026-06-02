@@ -19,7 +19,14 @@ authors = [{ name = "Databricks" }]
 # uses these bounds (no committed lockfile) — see the
 # `[dependency-groups].dev` block below + the workflow comment in
 # `.github/workflows/pyo3-checks.yml` for the policy rationale.
-dependencies = ["pyarrow>=14,<19"]
+#
+# Floor is `>=23.0.1` to match databricks-sql-connector 5.0.0
+# (databricks/databricks-sql-python#818): pyarrow only ships cp314
+# (Python 3.14) wheels from 23.x onward, so the previous `<19` ceiling
+# forced a from-source build that fails on 3.14. Keeping the floor
+# aligned with the connector also keeps the two surfaces installable
+# side by side.
+dependencies = ["pyarrow>=23.0.1"]
 
 # Dev / CI dependencies. PEP 735 standard; uv reads this directly.
 # CI runs `uv sync --group dev` (no `--frozen`, no committed
