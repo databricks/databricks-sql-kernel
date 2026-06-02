@@ -412,6 +412,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "chrono",
  "databricks-sql-kernel",
  "futures",
  "napi",
@@ -420,6 +421,7 @@ dependencies = [
  "once_cell",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]

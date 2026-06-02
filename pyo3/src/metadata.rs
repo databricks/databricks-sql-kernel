@@ -42,7 +42,7 @@
 //! conversions stay explicit and grep-able.
 
 use crate::result_stream::ResultStream;
-use databricks_sql_kernel::{Identifier, LikePattern, Metadata as KMetadata, Result as KResult};
+use databricks_sql_kernel::{Identifier, LikePattern, Metadata as KMetadata};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -64,16 +64,11 @@ impl Metadata {
     }
 }
 
-/// Build a kernel `Identifier` from an optional Python string, or
-/// `None` if the input was `None`. Empty / NUL / backtick rejection
-/// happens kernel-side and surfaces as `InvalidArgument`.
-fn opt_identifier(s: &Option<String>) -> KResult<Option<Identifier<'_>>> {
-    s.as_deref().map(Identifier::new).transpose()
-}
-
-fn opt_pattern(s: &Option<String>) -> KResult<Option<LikePattern<'_>>> {
-    s.as_deref().map(LikePattern::new).transpose()
-}
+// The `Option<String>` → `Option<Identifier>` / `Option<LikePattern>`
+// conversion lives on the kernel newtypes as `Identifier::from_opt` /
+// `LikePattern::from_opt` (one home shared by all bindings, with empty /
+// NUL / backtick / whitespace rejection kernel-side surfacing as
+// `InvalidArgument`). Call sites below use those directly.
 
 #[pymethods]
 impl Metadata {
@@ -92,8 +87,8 @@ impl Metadata {
         schema_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = opt_identifier(&catalog)?;
-            let pat = opt_pattern(&schema_pattern)?;
+            let cat = Identifier::from_opt(&catalog)?;
+            let pat = LikePattern::from_opt(&schema_pattern)?;
             self.inner.list_schemas(cat, pat).await
         })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
@@ -113,9 +108,9 @@ impl Metadata {
         table_types: Option<Vec<String>>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = opt_identifier(&catalog)?;
-            let sch = opt_pattern(&schema_pattern)?;
-            let tbl = opt_pattern(&table_pattern)?;
+            let cat = Identifier::from_opt(&catalog)?;
+            let sch = LikePattern::from_opt(&schema_pattern)?;
+            let tbl = LikePattern::from_opt(&table_pattern)?;
             let types_owned: Option<Vec<&str>> = table_types
                 .as_ref()
                 .map(|v| v.iter().map(String::as_str).collect());
@@ -142,9 +137,9 @@ impl Metadata {
                 Some(s) => Some(Identifier::new(s)?),
                 None => None,
             };
-            let sch = opt_pattern(&schema_pattern)?;
-            let tbl = opt_pattern(&table_pattern)?;
-            let col = opt_pattern(&column_pattern)?;
+            let sch = LikePattern::from_opt(&schema_pattern)?;
+            let tbl = LikePattern::from_opt(&table_pattern)?;
+            let col = LikePattern::from_opt(&column_pattern)?;
             self.inner.list_columns(cat, sch, tbl, col).await
         })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
@@ -186,9 +181,9 @@ impl Metadata {
         foreign_table: String,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let pc = opt_identifier(&parent_catalog)?;
-            let ps = opt_identifier(&parent_schema)?;
-            let pt = opt_identifier(&parent_table)?;
+            let pc = Identifier::from_opt(&parent_catalog)?;
+            let ps = Identifier::from_opt(&parent_schema)?;
+            let pt = Identifier::from_opt(&parent_table)?;
             let fc = Some(Identifier::new(&foreign_catalog)?);
             let fs = Some(Identifier::new(&foreign_schema)?);
             let ft = Some(Identifier::new(&foreign_table)?);
@@ -207,9 +202,9 @@ impl Metadata {
         name_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = opt_identifier(&catalog)?;
-            let sch = opt_pattern(&schema_pattern)?;
-            let nam = opt_pattern(&name_pattern)?;
+            let cat = Identifier::from_opt(&catalog)?;
+            let sch = LikePattern::from_opt(&schema_pattern)?;
+            let nam = LikePattern::from_opt(&name_pattern)?;
             self.inner.functions(cat, sch, nam).await
         })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
@@ -225,9 +220,9 @@ impl Metadata {
         name_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = opt_identifier(&catalog)?;
-            let sch = opt_pattern(&schema_pattern)?;
-            let nam = opt_pattern(&name_pattern)?;
+            let cat = Identifier::from_opt(&catalog)?;
+            let sch = LikePattern::from_opt(&schema_pattern)?;
+            let nam = LikePattern::from_opt(&name_pattern)?;
             self.inner.procedures(cat, sch, nam).await
         })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))

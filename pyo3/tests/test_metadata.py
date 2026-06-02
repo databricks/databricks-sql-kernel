@@ -55,10 +55,11 @@ def test_list_tables_in_information_schema(session):
     try:
         table = rs.fetch_all_arrow()
         assert table.num_rows > 0
-        # Server-shape sanity: the columns should match the kernel's
-        # documented `SHOW TABLES` server-shape.
+        # Shape sanity: the kernel returns JDBC-shaped metadata columns
+        # (TABLE_CAT / TABLE_SCHEM / TABLE_NAME / TABLE_TYPE …), matching
+        # Thrift's getTables — not the raw `SHOW TABLES` shape.
         col_names = [f.name for f in table.schema]
-        for required in ("tableName", "tableType"):
+        for required in ("TABLE_NAME", "TABLE_TYPE"):
             assert required in col_names, f"missing column {required!r}: {col_names}"
     finally:
         rs.close()
@@ -110,10 +111,19 @@ def test_empty_identifier_rejected(session):
 
 
 @live
-def test_list_columns_requires_catalog_kwarg(session):
-    # `catalog` is a kwarg-only required parameter (no default).
-    with pytest.raises(TypeError):
-        session.metadata().list_columns(schema_pattern="x")  # type: ignore[call-arg]
+def test_list_columns_catalog_is_optional(session):
+    # `catalog` is optional (defaults to None = "across all catalogs"),
+    # so omitting it must NOT raise. Narrow the scan with schema + table
+    # patterns to keep the cross-catalog query bounded.
+    rs = session.metadata().list_columns(
+        schema_pattern="information_schema", table_pattern="tables"
+    )
+    try:
+        # Executing without `catalog` succeeds; the column rows
+        # themselves are covered by test_list_columns_in_tables.
+        rs.fetch_all_arrow()
+    finally:
+        rs.close()
 
 
 @live

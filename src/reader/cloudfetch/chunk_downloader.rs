@@ -130,7 +130,66 @@ impl ChunkDownloader {
             batches.iter().map(|b| b.num_rows()).sum::<usize>()
         );
 
+        // Trim the decoded chunk down to the link's declared row_count.
+        //
+        // Under a `row_limit=N` query the SEA server can hand back a
+        // chunk that decodes to more rows than the external link's
+        // declared `row_count` (a +1 server look-ahead row, or more).
+        // Mirror the Python SEA driver's
+        // `CloudFetchQueue._create_table_at_offset` (utils.py), which
+        // slices each downloaded chunk to its own external-link
+        // `row_count`. The inline-Arrow path clamps via the manifest's
+        // `total_row_count`; this is the CloudFetch-side equivalent so
+        // both transports return exactly N rows.
+        let batches = Self::trim_to_row_count(batches, link.row_count);
+
         Ok(batches)
+    }
+
+    /// Trim a decoded chunk's batches so their total row count does not
+    /// exceed `row_count` (the external link's declared row count).
+    ///
+    /// Mirrors Python's per-chunk `arrow_table.slice(0, row_count)`:
+    /// only ever shrinks, never expands. A negative `row_count` (server
+    /// never sends this for a real link) is treated as "no trim". When
+    /// the decoded data already fits within `row_count` the batches are
+    /// returned untouched. Otherwise batches are kept whole until the
+    /// budget is reached and the boundary batch is sliced; any trailing
+    /// batches beyond the budget are dropped.
+    fn trim_to_row_count(batches: Vec<RecordBatch>, row_count: i64) -> Vec<RecordBatch> {
+        if row_count < 0 {
+            return batches;
+        }
+        let limit = row_count as usize;
+
+        let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+        if total <= limit {
+            return batches;
+        }
+
+        let mut trimmed = Vec::with_capacity(batches.len());
+        let mut remaining = limit;
+        for batch in batches {
+            if remaining == 0 {
+                break;
+            }
+            let rows = batch.num_rows();
+            if rows <= remaining {
+                remaining -= rows;
+                trimmed.push(batch);
+            } else {
+                // Slice the boundary batch down to the remaining budget.
+                trimmed.push(batch.slice(0, remaining));
+                remaining = 0;
+            }
+        }
+
+        debug!(
+            "Trimmed CloudFetch chunk from {} to {} rows (link row_count={})",
+            total, limit, row_count
+        );
+
+        trimmed
     }
 }
 
@@ -169,4 +228,62 @@ mod tests {
 
     // Note: Full download tests require mocking the HTTP layer
     // Integration tests should be added in a separate test module
+
+    use arrow_array::Int32Array;
+    use arrow_schema::{DataType, Field, Schema};
+
+    /// Build a single-column Int32 RecordBatch with `num_rows` rows.
+    fn make_batch(start: i32, num_rows: usize) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let ids: Vec<i32> = (start..start + num_rows as i32).collect();
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(ids))]).unwrap()
+    }
+
+    fn total_rows(batches: &[RecordBatch]) -> usize {
+        batches.iter().map(|b| b.num_rows()).sum()
+    }
+
+    #[test]
+    fn test_trim_to_row_count_single_batch_overrun() {
+        // A chunk that decoded to N+1 rows but the link only declares N.
+        // Mirrors the SEA `row_limit` look-ahead overrun.
+        let batch = make_batch(0, 101);
+        let trimmed = ChunkDownloader::trim_to_row_count(vec![batch], 100);
+        assert_eq!(total_rows(&trimmed), 100);
+        assert_eq!(trimmed.len(), 1);
+        assert_eq!(trimmed[0].num_rows(), 100);
+    }
+
+    #[test]
+    fn test_trim_to_row_count_multiple_batches_trims_across_chunk() {
+        // Three batches (40 + 40 + 40 = 120 rows) but link declares 100.
+        // Expect the first two batches whole and the third sliced to 20.
+        let batches = vec![make_batch(0, 40), make_batch(40, 40), make_batch(80, 40)];
+        let trimmed = ChunkDownloader::trim_to_row_count(batches, 100);
+        assert_eq!(total_rows(&trimmed), 100);
+        assert_eq!(trimmed.len(), 3);
+        assert_eq!(trimmed[0].num_rows(), 40);
+        assert_eq!(trimmed[1].num_rows(), 40);
+        assert_eq!(trimmed[2].num_rows(), 20);
+    }
+
+    #[test]
+    fn test_trim_to_row_count_drops_trailing_batches() {
+        // Budget is exhausted within the first batch; the trailing batch
+        // must be dropped entirely, not expanded.
+        let batches = vec![make_batch(0, 100), make_batch(100, 50)];
+        let trimmed = ChunkDownloader::trim_to_row_count(batches, 100);
+        assert_eq!(total_rows(&trimmed), 100);
+        assert_eq!(trimmed.len(), 1);
+    }
+
+    #[test]
+    fn test_trim_to_row_count_no_overrun_passthrough() {
+        // Decoded rows fit within the declared row_count → never expand,
+        // batches returned untouched.
+        let batches = vec![make_batch(0, 30), make_batch(30, 20)];
+        let trimmed = ChunkDownloader::trim_to_row_count(batches, 100);
+        assert_eq!(total_rows(&trimmed), 50);
+        assert_eq!(trimmed.len(), 2);
+    }
 }

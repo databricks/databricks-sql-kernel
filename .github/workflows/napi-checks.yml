@@ -49,12 +49,9 @@ concurrency:
 
 permissions:
   contents: read
-  # Required for the OIDC token exchange that the
-  # `.github/actions/setup-jfrog` composite uses to authenticate
-  # against the JFrog cargo proxy. The protected runner group blocks
-  # direct crates.io access, so cargo must route through the proxy.
-  # See go/hardened-gha.
-  id-token: write
+# `id-token: write` is NOT granted workflow-wide: the `precondition`
+# job only checks out and inspects the tree, so least-privilege keeps
+# it on the single job that needs it (`check-and-test`, below).
 
 defaults:
   run:
@@ -91,6 +88,12 @@ jobs:
     name: "napi fmt + clippy + test"
     needs: precondition
     if: needs.precondition.outputs.ready == 'true'
+    # Scoped here (not workflow-wide): `id-token: write` is only needed
+    # for the OIDC token exchange in `.github/actions/setup-jfrog` that
+    # authenticates against the JFrog cargo proxy. See go/hardened-gha.
+    permissions:
+      contents: read
+      id-token: write
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

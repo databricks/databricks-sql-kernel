@@ -255,6 +255,71 @@ pub enum AuthConfig {
     External(Box<dyn TokenProvider>),
 }
 
+impl AuthConfig {
+    /// Construct a [`AuthConfig::Pat`] from an optional token, validating
+    /// that it is present and non-empty.
+    ///
+    /// Bindings forward the raw optional from their host language; the
+    /// required-field check lives here so every wrapper rejects a
+    /// missing/empty token identically (`ErrorCode::InvalidArgument`)
+    /// instead of each re-implementing it at the binding boundary.
+    pub fn pat(token: Option<String>) -> crate::Result<Self> {
+        match token {
+            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat { token }),
+            _ => Err(crate::kernel_error::Error::invalid_argument()
+                .message("PAT auth requires a non-empty access token")),
+        }
+    }
+
+    /// Construct a [`AuthConfig::OAuthM2M`] from optional fields,
+    /// validating that the required `client_id` / `client_secret` are
+    /// present and non-empty. `scopes` / `token_url_override` are
+    /// optional and forwarded as-is (the kernel fills defaults).
+    pub fn oauth_m2m(
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        scopes: Option<Vec<String>>,
+        token_url_override: Option<String>,
+    ) -> crate::Result<Self> {
+        let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M auth requires a non-empty client_id")
+        })?;
+        let client_secret = client_secret.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M auth requires a non-empty client_secret")
+        })?;
+        Ok(AuthConfig::OAuthM2M {
+            client_id,
+            client_secret,
+            scopes,
+            token_url_override,
+        })
+    }
+
+    /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
+    /// U2M fields are optional — the kernel fills `databricks-cli` /
+    /// port 8020 / default scopes when omitted — so this performs no
+    /// validation and exists for symmetry with [`AuthConfig::pat`] /
+    /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
+    /// uniformly.
+    pub fn oauth_u2m(
+        client_id: Option<String>,
+        redirect_port: Option<u16>,
+        scopes: Option<Vec<String>>,
+        token_url_override: Option<String>,
+        callback_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        AuthConfig::OAuthU2M {
+            client_id,
+            redirect_port,
+            scopes,
+            token_url_override,
+            callback_timeout,
+        }
+    }
+}
+
 /// Caller-supplied token provider trait.
 ///
 /// Used by [`AuthConfig::External`] to plug a host-side auth
@@ -322,7 +387,13 @@ pub struct HttpConfig {
     /// Maximum total time across retries for a single logical RPC.
     pub overall_timeout: Duration,
 
-    /// Connection pool size.
+    /// Connection pool size (max idle warm sockets per remote host).
+    ///
+    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
+    /// default. Raise this for workloads that burst many concurrent
+    /// `executeStatement` calls or CloudFetch chunk downloads against a
+    /// single host; too low a value forces fresh TLS handshakes when the
+    /// pool fills.
     pub pool_max_idle_per_host: usize,
 }
 
@@ -331,7 +402,7 @@ impl Default for HttpConfig {
         Self {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
-            pool_max_idle_per_host: 10,
+            pool_max_idle_per_host: 100,
         }
     }
 }
@@ -810,6 +881,75 @@ mod tests {
                 SESSION_CONF_ALLOWLIST.contains(&jdbc_key),
                 "missing JDBC-compatible key: {jdbc_key}"
             );
+        }
+    }
+
+    // ─── AuthConfig validating constructors ───────────────────────
+
+    #[test]
+    fn pat_rejects_missing_or_empty_token() {
+        let err = AuthConfig::pat(None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("non-empty access token"));
+
+        let err = AuthConfig::pat(Some(String::new())).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn pat_accepts_non_empty_token() {
+        match AuthConfig::pat(Some("dapi-x".to_string())).unwrap() {
+            AuthConfig::Pat { token } => assert_eq!(token, "dapi-x"),
+            other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_m2m_rejects_missing_or_empty_client_id() {
+        let err = AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_id"));
+
+        let err = AuthConfig::oauth_m2m(Some(String::new()), Some("sec".to_string()), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_id"));
+    }
+
+    #[test]
+    fn oauth_m2m_rejects_missing_or_empty_client_secret() {
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_secret"));
+
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), Some(String::new()), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_secret"));
+    }
+
+    #[test]
+    fn oauth_m2m_accepts_full_credentials() {
+        match AuthConfig::oauth_m2m(
+            Some("cid".to_string()),
+            Some("sec".to_string()),
+            Some(vec!["all-apis".to_string()]),
+            None,
+        )
+        .unwrap()
+        {
+            AuthConfig::OAuthM2M {
+                client_id,
+                client_secret,
+                scopes,
+                token_url_override,
+            } => {
+                assert_eq!(client_id, "cid");
+                assert_eq!(client_secret, "sec");
+                assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
+                assert!(token_url_override.is_none());
+            }
+            other => panic!("expected OAuthM2M, got {other:?}"),
         }
     }
 
