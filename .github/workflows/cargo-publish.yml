@@ -1,0 +1,125 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Publishes the kernel crate to Databricks's internal Cargo registry
+# (db-cargo-remote, fronted by JFrog Artifactory). Triggered by:
+#
+#   1. Pushing a `v*` git tag (e.g. `v0.1.0`) — the canonical release path.
+#   2. Manual `workflow_dispatch` from the Actions tab — for ad-hoc test
+#      publishes or re-running after a transient failure.
+#
+# Downstream consumer: `databricks-eng/universe` pulls the kernel via
+# `third_party/rust/BUILD.bazel`'s `crates_vendor` packages dict,
+# referencing it like any other crates.io dep (mirrors how
+# `databricks-zerobus-ingest-sdk` is consumed). See universe PR
+# https://github.com/databricks-eng/universe/pull/2006687 for the
+# initial consumer wiring.
+#
+# Why this workflow exists: the same JFrog proxy this repo already
+# uses to FETCH dependencies (via `.github/actions/setup-jfrog`) can
+# also receive `cargo publish` uploads — they route to the local
+# backing repo in the virtual `db-cargo-remote`. The OIDC token
+# exchange grants both read and write scopes by default for the
+# `jfrog-github` audience.
+
+name: Cargo Publish
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Run `cargo publish --dry-run` instead of an actual publish"
+        required: false
+        default: "false"
+
+concurrency:
+  # Serialize publishes — Artifactory rejects concurrent uploads of
+  # the same crate-version pair, and a concurrent dry-run + real run
+  # could leave the registry in a confusing state.
+  group: ${{ github.repository }}-cargo-publish
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  # Required for the OIDC token exchange that the
+  # `.github/actions/setup-jfrog` composite uses. See go/hardened-gha.
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  publish:
+    name: cargo publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+        with:
+          # Tag-triggered runs need full history-of-the-tag's commit only;
+          # depth=1 keeps the checkout small.
+          fetch-depth: 1
+
+      - name: Configure JFrog Artifactory access
+        uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.13.0
+
+      # Sanity-check the tag-vs-Cargo.toml-version alignment so a typo
+      # in the tag (`v0.1.0` vs Cargo.toml `0.1.1`) fails loudly here
+      # rather than producing a mismatched-name release. Only runs on
+      # tag-triggered builds; manual workflow_dispatch skips the check.
+      - name: Verify tag matches Cargo.toml version
+        if: github.event_name == 'push'
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          CARGO_VERSION=$(grep '^version' Cargo.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')
+          if [ "$TAG_VERSION" != "$CARGO_VERSION" ]; then
+            echo "FAIL: tag $GITHUB_REF_NAME (=> $TAG_VERSION) does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+          echo "Tag and Cargo.toml version both at $CARGO_VERSION"
+
+      - name: cargo publish
+        env:
+          # The `setup-jfrog` action exports CARGO_REGISTRIES_JFROG_TOKEN
+          # into GITHUB_ENV for tools that read env directly; cargo
+          # publish picks it up automatically via the credential-provider
+          # config the action writes to ~/.cargo/credentials.toml.
+          CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+        run: |
+          set -euo pipefail
+          DRY_RUN_FLAG=""
+          if [ "${{ github.event.inputs.dry_run || 'false' }}" = "true" ]; then
+            DRY_RUN_FLAG="--dry-run"
+            echo "DRY RUN — no actual publish will happen"
+          fi
+          # `--registry jfrog` matches the `[registries.jfrog]` block
+          # that setup-jfrog writes into ~/.cargo/config.toml. The
+          # workspace's other members (pyo3/) have their own publish
+          # workflows / are not part of this release; --no-verify
+          # skips re-compiling the crate during the package step
+          # since CI has already done that elsewhere.
+          cargo publish \
+            --registry jfrog \
+            --package databricks-sql-kernel \
+            $DRY_RUN_FLAG
