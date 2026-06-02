@@ -145,7 +145,12 @@ jobs:
         # `develop` builds the extension and installs it into the
         # uv-managed venv from the previous step. Debug build is
         # fine for tests and ~2x faster than --release.
-        run: uv run maturin develop --interpreter python${{ matrix.python-version }}
+        #
+        # maturin's `develop` always targets the active virtualenv's
+        # interpreter and (unlike `build`) has no --interpreter flag;
+        # `uv run` already activates the venv `uv sync` created for the
+        # matrix Python version, so the interpreter is selected for us.
+        run: uv run maturin develop
 
       - name: pytest (no-network + live tiers)
         working-directory: pyo3
