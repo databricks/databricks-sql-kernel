@@ -136,7 +136,14 @@ jobs:
         # age filter on `db-pypi` are the baseline protection. uv
         # re-resolves each run within those bounds.
         working-directory: pyo3
-        run: uv sync --group dev
+        # `--no-install-project` installs only the dependency groups,
+        # NOT the kernel cdylib itself. Without it, `uv sync` runs a
+        # full maturin/cargo RELEASE build of the extension here — and
+        # then the `maturin develop` step below rebuilds it again in
+        # debug, so the kernel compiled twice per matrix Python version
+        # (~5 min each, x5 versions). The Rust extension is built
+        # exactly once, by `maturin develop`.
+        run: uv sync --group dev --no-install-project
 
       - name: Cargo unit tests (pyo3 crate)
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff

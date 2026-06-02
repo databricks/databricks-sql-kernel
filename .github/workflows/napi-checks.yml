@@ -132,8 +132,15 @@ jobs:
 
       # Release-profile build verifies the cdylib actually links with
       # the production profile knobs (lto=true, codegen-units=1,
-      # strip="debuginfo"). Slower (~1m) but cheap insurance against
-      # release-only regressions that the debug-profile `cargo test`
-      # above wouldn't catch.
+      # strip="debuginfo"). The lto=true link is the slow part (~4 min
+      # here), and `cargo check --release` would NOT exercise it
+      # (check doesn't link the cdylib), so we keep the real build but
+      # run it only on push to main — a post-merge canary — rather
+      # than on every PR push. napi is not a required check, so this
+      # keeps PR feedback fast (fmt + clippy + test, ~2.5 min) while
+      # still catching release-only link regressions before they
+      # accumulate on main. The merge group does not run napi (no
+      # merge_group trigger), so main is the gate.
       - name: cargo build --release --locked
+        if: github.event_name == 'push'
         run: cargo build --release --locked
