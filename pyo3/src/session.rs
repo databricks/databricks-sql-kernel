@@ -80,6 +80,17 @@ impl Session {
     /// `tls_client_cert` + `tls_client_key` (both PEM bytes) configure
     /// mutual TLS. The two mTLS fields must be set together.
     ///
+    /// Retry/backoff: all optional, default to the kernel's built-in
+    /// policy (1s/60s backoff, 6 total attempts, 900s budget) when
+    /// unset. `retry_min_wait_secs` / `retry_max_wait_secs` bound the
+    /// exponential backoff (and clamp a server `Retry-After`);
+    /// `retry_max_attempts` is the **total** number of attempts
+    /// (converted to the kernel's retries-after-first internally, so
+    /// `0`/`1` both mean a single attempt); `retry_overall_timeout_secs`
+    /// caps cumulative time across retries. These apply to SQL +
+    /// CloudFetch requests; token-endpoint (auth) calls keep a fixed
+    /// fast-fail policy.
+    ///
     /// `session_conf` is the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
     /// `ANSI_MODE`, `TIMEZONE`, `STATEMENT_TIMEOUT`, query-tag
@@ -104,6 +115,10 @@ impl Session {
         tls_skip_hostname_verify=false,
         tls_client_cert=None,
         tls_client_key=None,
+        retry_min_wait_secs=None,
+        retry_max_wait_secs=None,
+        retry_max_attempts=None,
+        retry_overall_timeout_secs=None,
         catalog=None,
         schema=None,
         session_conf=None,
@@ -128,6 +143,10 @@ impl Session {
         tls_skip_hostname_verify: bool,
         tls_client_cert: Option<Vec<u8>>,
         tls_client_key: Option<Vec<u8>>,
+        retry_min_wait_secs: Option<u64>,
+        retry_max_wait_secs: Option<u64>,
+        retry_max_attempts: Option<u32>,
+        retry_overall_timeout_secs: Option<u64>,
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
@@ -180,6 +199,39 @@ impl Session {
             None
         };
 
+        // Build an HttpConfig only when the caller tuned retry/backoff;
+        // otherwise leave the builder on its defaults (1s/60s/5-retries).
+        //
+        // `retry_max_attempts` is the **total** number of attempts
+        // (matching the connector's `_retry_stop_after_attempts_count`
+        // and JDBC's count semantics). The kernel's `retry_max_retries`
+        // counts retries *after* the first attempt, so we convert with
+        // `max(0, attempts - 1)` here — centralising the off-by-one so
+        // wrappers can pass an intuitive total. `retry_max_attempts = 0`
+        // or `1` both mean "one attempt, no retries".
+        let http_config = if retry_min_wait_secs.is_some()
+            || retry_max_wait_secs.is_some()
+            || retry_max_attempts.is_some()
+            || retry_overall_timeout_secs.is_some()
+        {
+            let mut http = databricks_sql_kernel::HttpConfig::default();
+            if let Some(s) = retry_min_wait_secs {
+                http.retry_min_wait = std::time::Duration::from_secs(s);
+            }
+            if let Some(s) = retry_max_wait_secs {
+                http.retry_max_wait = std::time::Duration::from_secs(s);
+            }
+            if let Some(attempts) = retry_max_attempts {
+                http.retry_max_retries = attempts.saturating_sub(1);
+            }
+            if let Some(s) = retry_overall_timeout_secs {
+                http.overall_timeout = std::time::Duration::from_secs(s);
+            }
+            Some(http)
+        } else {
+            None
+        };
+
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker
         // count left to tokio's default (logical CPU count).
@@ -205,6 +257,9 @@ impl Session {
                 .auth(auth_config);
             if let Some(tls) = tls_config {
                 builder = builder.tls(tls);
+            }
+            if let Some(http) = http_config {
+                builder = builder.http(http);
             }
             if catalog.is_some() || schema.is_some() {
                 let mut defaults = databricks_sql_kernel::DefaultOpts::default();

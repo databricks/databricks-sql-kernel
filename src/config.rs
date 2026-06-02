@@ -385,6 +385,7 @@ pub struct HttpConfig {
     pub request_timeout: Duration,
 
     /// Maximum total time across retries for a single logical RPC.
+    /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
     /// Connection pool size (max idle warm sockets per remote host).
@@ -395,6 +396,26 @@ pub struct HttpConfig {
     /// single host; too low a value forces fresh TLS handshakes when the
     /// pool fills.
     pub pool_max_idle_per_host: usize,
+
+    /// Minimum backoff wait between retry attempts. Also the floor for
+    /// a server-supplied `Retry-After` and the base of the exponential
+    /// backoff (`min_wait * 2^attempt`) used when no `Retry-After` is
+    /// present. Default 1s.
+    pub retry_min_wait: Duration,
+
+    /// Maximum backoff wait between retry attempts. Caps both the
+    /// exponential backoff and a server-supplied `Retry-After`.
+    /// Default 60s.
+    pub retry_max_wait: Duration,
+
+    /// Maximum number of retries **after** the initial attempt — a
+    /// request is attempted at most `retry_max_retries + 1` times.
+    /// Default 5 (→ 6 total attempts).
+    ///
+    /// Wrappers exposing a "total attempts" knob (the connector's
+    /// `_retry_stop_after_attempts_count`, the JDBC driver, …) should
+    /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
+    pub retry_max_retries: u32,
 }
 
 impl Default for HttpConfig {
@@ -403,6 +424,12 @@ impl Default for HttpConfig {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
+            // Mirror `RetryConfig::default()` so a stock `HttpConfig`
+            // produces the same retry behaviour the kernel shipped
+            // before these knobs were configurable.
+            retry_min_wait: Duration::from_secs(1),
+            retry_max_wait: Duration::from_secs(60),
+            retry_max_retries: 5,
         }
     }
 }
@@ -806,10 +833,40 @@ pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
     "USE_CACHED_RESULT",
 ];
 
-/// Filter a caller-supplied `session_conf` map against
-/// [`SESSION_CONF_ALLOWLIST`]. Unknown keys are dropped with a
-/// `tracing::warn!`; known keys are normalized to uppercase (the
-/// server echoes uppercase, so SET-readback matches).
+/// Case-sensitive session-conf keys that must be sent **verbatim**
+/// rather than uppercased. These are dotted `spark.*` Spark confs (as
+/// opposed to the short SET-style SQL parameters in
+/// [`SESSION_CONF_ALLOWLIST`], which Databricks echoes uppercase).
+/// Spark stores `SQLConf` entries under their exact registered
+/// lowercase-dotted key, so uppercasing would address the wrong entry.
+///
+/// Each tuple is `(uppercased_lookup_key, canonical_verbatim_key)`:
+/// callers are matched case-insensitively (via the uppercased lookup)
+/// but the canonical form is what we send on the wire.
+///
+/// `spark.sql.thriftserver.metadata.metricview.enabled` enables UC
+/// Metric View metadata — when set to `"true"`, `SHOW TABLES`
+/// (`Metadata::tables`) returns `METRIC_VIEW` rows and `getColumns`
+/// surfaces `measure` columns. Opt-in: the connector sets it from its
+/// `enable_metric_view_metadata` kwarg (default off), matching the
+/// JDBC driver's `EnableMetricViewMetadata` (default `0`). The kernel
+/// already lists `METRIC_VIEW` among its table types; this lets the
+/// enabling conf through so the server actually emits the rows.
+pub(crate) const SESSION_CONF_CASE_SENSITIVE_ALLOWLIST: &[(&str, &str)] = &[(
+    "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED",
+    "spark.sql.thriftserver.metadata.metricview.enabled",
+)];
+
+/// Filter a caller-supplied `session_conf` map against the allowlists.
+/// Unknown keys are dropped with a `tracing::warn!`.
+///
+/// - Keys in [`SESSION_CONF_ALLOWLIST`] are normalized to **uppercase**
+///   (the server echoes uppercase for these SET-style params, so
+///   SET-readback matches).
+/// - Keys in [`SESSION_CONF_CASE_SENSITIVE_ALLOWLIST`] (dotted
+///   `spark.*` confs) are matched case-insensitively but emitted in
+///   their **canonical verbatim** form — Spark conf keys are
+///   case-sensitive and must not be uppercased.
 pub(crate) fn filter_session_conf(
     raw: std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -819,6 +876,13 @@ pub(crate) fn filter_session_conf(
         let upper = k.to_ascii_uppercase();
         if SESSION_CONF_ALLOWLIST.contains(&upper.as_str()) {
             out.insert(upper, v);
+        } else if let Some((_, canonical)) = SESSION_CONF_CASE_SENSITIVE_ALLOWLIST
+            .iter()
+            .find(|(lookup, _)| *lookup == upper.as_str())
+        {
+            // Send the canonical lowercase-dotted form verbatim, not
+            // the caller's casing and not uppercased.
+            out.insert((*canonical).to_string(), v);
         } else {
             tracing::warn!(
                 key = %k,
@@ -859,6 +923,46 @@ mod tests {
         let out = filter_session_conf(raw);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("TIMEZONE").map(String::as_str), Some("UTC"));
+    }
+
+    #[test]
+    fn session_conf_filter_passes_metricview_conf_verbatim() {
+        // The metric-view conf is a dotted spark.* key: it must survive
+        // the allowlist AND be emitted lowercase-verbatim (NOT
+        // uppercased like the SET-style params), because Spark conf
+        // keys are case-sensitive.
+        let mut raw = std::collections::HashMap::new();
+        raw.insert(
+            "spark.sql.thriftserver.metadata.metricview.enabled".to_string(),
+            "true".to_string(),
+        );
+        let out = filter_session_conf(raw);
+        assert_eq!(
+            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
+                .map(String::as_str),
+            Some("true"),
+        );
+        // It must NOT have been uppercased.
+        assert!(!out.contains_key("SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn session_conf_filter_metricview_match_is_case_insensitive() {
+        // A caller passing the key in any casing is recognised, but the
+        // canonical lowercase form is always what we send.
+        let mut raw = std::collections::HashMap::new();
+        raw.insert(
+            "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED".to_string(),
+            "true".to_string(),
+        );
+        let out = filter_session_conf(raw);
+        assert_eq!(
+            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
+                .map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

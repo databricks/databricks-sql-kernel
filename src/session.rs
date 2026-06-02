@@ -600,14 +600,24 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
     hcc
 }
 
-/// Build the per-category retry config for the HTTP client. v0
-/// matches the legacy ADBC defaults: global 900s/5-retries with an
-/// auth-specific 30s/3-retries override so token endpoint calls
-/// fail fast.
+/// Build the per-category retry config for the HTTP client.
+///
+/// The global config is driven by the public [`HttpConfig`] retry
+/// knobs (`retry_min_wait` / `retry_max_wait` / `retry_max_retries` /
+/// `overall_timeout`), so callers can tune backoff and attempt counts.
+///
+/// The `Auth` category keeps a **fixed** fast-fail override (30s /
+/// 3 retries) regardless of the user's global settings: token-endpoint
+/// calls must not inherit a generous `overall_timeout` (e.g. 900s) or
+/// they'd hang for many minutes on an unreachable IdP. This matches the
+/// legacy ADBC behaviour and is intentionally not user-overridable.
 fn build_retry_configs_for_session(
     config: &SessionConfig,
 ) -> std::collections::HashMap<RequestCategory, RetryConfig> {
     let global = RetryConfig {
+        min_wait: config.http.retry_min_wait,
+        max_wait: config.http.retry_max_wait,
+        max_retries: config.http.retry_max_retries,
         overall_timeout: config.http.overall_timeout,
         ..RetryConfig::default()
     };
@@ -720,5 +730,83 @@ async fn build_auth_provider(
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
             .message("AuthConfig::External is reserved; v0 wires PAT + OAuthM2M + OAuthU2M only")),
+    }
+}
+
+#[cfg(test)]
+mod retry_config_tests {
+    use super::*;
+    use crate::client::retry::RequestCategory;
+    use std::time::Duration;
+
+    /// Build a minimal `SessionConfig` with the given `HttpConfig` for
+    /// exercising `build_retry_configs_for_session` in isolation.
+    fn config_with_http(http: HttpConfig) -> SessionConfig {
+        SessionConfig {
+            connection: ConnectionConfig::new("https://example.databricks.com", "wh123"),
+            defaults: None,
+            auth: AuthConfig::Pat {
+                token: "dapi-test".to_string(),
+            },
+            session_conf: Default::default(),
+            http,
+            proxy: None,
+            tls: Default::default(),
+            result: Default::default(),
+            logging: Default::default(),
+            telemetry: Default::default(),
+            transport: None,
+        }
+    }
+
+    #[test]
+    fn http_retry_knobs_flow_into_global_config() {
+        let http = HttpConfig {
+            retry_min_wait: Duration::from_secs(3),
+            retry_max_wait: Duration::from_secs(90),
+            retry_max_retries: 7,
+            overall_timeout: Duration::from_secs(600),
+            ..HttpConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_http(http));
+
+        // SEA + CloudFetch inherit the user-tuned global config.
+        for cat in [RequestCategory::Sea, RequestCategory::CloudFetch] {
+            let c = &configs[&cat];
+            assert_eq!(c.min_wait, Duration::from_secs(3), "{cat:?} min_wait");
+            assert_eq!(c.max_wait, Duration::from_secs(90), "{cat:?} max_wait");
+            assert_eq!(c.max_retries, 7, "{cat:?} max_retries");
+            assert_eq!(
+                c.overall_timeout,
+                Duration::from_secs(600),
+                "{cat:?} overall_timeout"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_override_stays_fixed_regardless_of_user_knobs() {
+        // Even with a very generous user overall_timeout, the Auth
+        // category keeps its fast-fail 30s / 3-retry override so token
+        // endpoint calls can't hang for the full global budget.
+        let http = HttpConfig {
+            retry_max_retries: 99,
+            overall_timeout: Duration::from_secs(3600),
+            ..HttpConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_http(http));
+        let auth = &configs[&RequestCategory::Auth];
+        assert_eq!(auth.overall_timeout, Duration::from_secs(30));
+        assert_eq!(auth.max_retries, 3);
+    }
+
+    #[test]
+    fn defaults_preserve_legacy_behaviour() {
+        let configs = build_retry_configs_for_session(&config_with_http(HttpConfig::default()));
+        let sea = &configs[&RequestCategory::Sea];
+        assert_eq!(sea.min_wait, Duration::from_secs(1));
+        assert_eq!(sea.max_wait, Duration::from_secs(60));
+        assert_eq!(sea.max_retries, 5);
+        assert_eq!(sea.overall_timeout, Duration::from_secs(900));
     }
 }
