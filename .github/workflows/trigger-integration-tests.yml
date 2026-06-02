@@ -124,7 +124,7 @@ jobs:
     steps:
       - name: Check if integration-test label exists
         id: check-label
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const labels = context.payload.pull_request.labels.map(l => l.name);
@@ -134,7 +134,7 @@ jobs:
 
       - name: Remove integration-test label
         if: steps.check-label.outputs.result == 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             try {
@@ -155,7 +155,7 @@ jobs:
 
       - name: Comment on PR about label removal
         if: steps.check-label.outputs.result == 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           script: |
             const pr = context.payload.pull_request;
@@ -194,7 +194,7 @@ jobs:
       checks: write
     steps:
       - name: Skip Kernel Integration Tests
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ github.token }}
           script: |
@@ -314,7 +314,7 @@ jobs:
       # the receiver's result satisfy the gate.
       - name: Build payload (PR-title-safe via JSON.stringify)
         id: payload
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         env:
           PR_REPO: ${{ github.repository }}
         with:
@@ -380,7 +380,7 @@ jobs:
       # creates it for the labeled-PR scenario).
       - name: Fail check on dispatch error
         if: failure()
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ github.token }}
           script: |
@@ -457,7 +457,7 @@ jobs:
 
       - name: Auto-pass (no kernel source changes)
         if: steps.changed.outputs.changed != 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ github.token }}
           script: |
@@ -484,7 +484,7 @@ jobs:
       # merge queue.
       - name: Auto-pass (companion workflow not yet enabled)
         if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED != 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ github.token }}
           script: |
@@ -571,7 +571,7 @@ jobs:
 
       - name: Fail check on dispatch error
         if: failure() && steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3  # v9.0.0
         with:
           github-token: ${{ github.token }}
           script: |
