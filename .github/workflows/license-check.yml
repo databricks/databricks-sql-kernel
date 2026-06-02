@@ -59,7 +59,7 @@ defaults:
 
 jobs:
   cargo-deny:
-    name: cargo-deny
+    name: License & advisory check
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

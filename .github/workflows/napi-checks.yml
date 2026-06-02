@@ -68,7 +68,7 @@ jobs:
   # this workflow via root Cargo.toml changes before the napi crate
   # has merged.
   precondition:
-    name: "Check napi/ sub-crate exists"
+    name: "Check napi sub-crate exists"
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

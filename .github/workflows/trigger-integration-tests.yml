@@ -103,6 +103,7 @@ jobs:
   # workspace.
   # =============================================================================
   remove-label-on-new-commit:
+    name: Reset integration-test label on push
     if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
     # Own concurrency group with `cancel-in-progress: false` — see the
     # workflow-level comment above. The label-cleanup is a
@@ -184,6 +185,7 @@ jobs:
   # (or earlier, when a maintainer adds the label).
   # =============================================================================
   skip-integration-tests-pr:
+    name: Integration tests (auto-pass on PR)
     if: github.event_name == 'pull_request' && github.event.action != 'labeled'
     runs-on:
       group: databricks-protected-runner-group
@@ -223,6 +225,7 @@ jobs:
   # sticky comment to make the no-op visible.
   # =============================================================================
   label-noop-during-rollout:
+    name: Integration-test label (rollout no-op notice)
     if: |
       github.event_name == 'pull_request' &&
       github.event.action == 'labeled' &&
@@ -252,6 +255,7 @@ jobs:
             Once the variable is set, re-add the label (or push) to trigger a real run.
 
   trigger-tests-pr:
+    name: Dispatch integration tests (labeled PR)
     # Companion-PR ordering gate: only fire dispatches once the
     # internal repo's receiving workflow (databricks-driver-test#375
     # — see the PR description) has landed. Until then,
@@ -400,6 +404,7 @@ jobs:
   # Otherwise dispatch and let the internal repo report the result.
   # =============================================================================
   merge-queue-kernel:
+    name: Dispatch integration tests (merge queue)
     if: github.event_name == 'merge_group'
     runs-on:
       group: databricks-protected-runner-group

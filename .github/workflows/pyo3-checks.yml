@@ -58,7 +58,7 @@ jobs:
   # kernel-only PRs that trigger this workflow via root Cargo.toml
   # / Cargo.lock changes.
   precondition:
-    name: "Check pyo3/ sub-crate exists"
+    name: "Check pyo3 sub-crate exists"
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
