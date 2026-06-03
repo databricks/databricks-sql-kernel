@@ -305,28 +305,31 @@ jobs:
             echo "</body></html>"
           } > security-scan-report.html
 
-      # action-send-mail: SHA 4226df7d... resolves to v3.11.0 (the
-      # floating `v3` tag also points here today). Verify with
-      # `gh api repos/dawidd6/action-send-mail/git/refs/tags` before
-      # bumping.
-      - name: Send Email
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
-        uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3.11.0
-        with:
-          server_address: smtp.gmail.com
-          server_port: 465
-          username: ${{ secrets.SMTP_USERNAME }}
-          password: ${{ secrets.SMTP_PASSWORD }}
-          subject: Databricks SQL Kernel Security Scan - Vulnerabilities Found
-          html_body: file://security-scan-report.html
-          to: ${{ secrets.EMAIL_RECIPIENTS }}
-          from: Kernel Security Scanner
-          content_type: text/html
+      # Email notification deferred — the SMTP credentials path
+      # (SMTP_USERNAME / SMTP_PASSWORD / EMAIL_RECIPIENTS) hasn't
+      # been provisioned. The HTML report is still produced and
+      # uploaded as a run artifact (see `Upload reports` below), so
+      # triagers can pull it after a scheduled-run failure without
+      # needing the email. Re-enable when SMTP creds are wired up.
+      #
+      # - name: Send Email
+      #   if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
+      #   uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3.11.0
+      #   with:
+      #     server_address: smtp.gmail.com
+      #     server_port: 465
+      #     username: ${{ secrets.SMTP_USERNAME }}
+      #     password: ${{ secrets.SMTP_PASSWORD }}
+      #     subject: Databricks SQL Kernel Security Scan - Vulnerabilities Found
+      #     html_body: file://security-scan-report.html
+      #     to: ${{ secrets.EMAIL_RECIPIENTS }}
+      #     from: Kernel Security Scanner
+      #     content_type: text/html
 
       - name: Fail on findings (scheduled/manual)
         if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
         run: |
-          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s) on main. Email sent."
+          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s) on main. Download the security-scan-reports artifact for the HTML report."
           exit 1
 
       - name: Upload reports
