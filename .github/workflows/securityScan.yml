@@ -1,0 +1,236 @@
+name: Security Scan
+
+# Source-repo CVE gate. Lives in `databricks/databricks-sql-kernel`'s
+# `.github/workflows/`. Ported from databricks-jdbc/securityScan.yml.
+#
+# Three modes with different thresholds:
+#
+#   - pull_request to main: fail the job on any unsuppressed CVSS >= 7
+#     finding. MEDIUM/LOW findings show in the step summary but don't
+#     block merges.
+#
+#   - cron (weekly): report ALL findings regardless of severity. Sends
+#     an email with the full sorted list and fails the job on any
+#     finding. The weekly is read by humans, not enforced by code.
+#
+#   - workflow_dispatch: behaves like the cron run.
+#
+# Scanner: OSV-Scanner v2.3.8 (purl-based via OSV.dev; federates GHSA,
+# NVD, RustSec, PyPA, Go vuln DB). Reads CycloneDX SBOMs produced by
+# `cargo cyclonedx` over the three workspaces (root + napi + pyo3) so
+# it sees the actually-resolved dep tree.
+#
+# Why OSV in addition to cargo-deny (which we already run in
+# license-check.yml): OSV's GHSA-Rust source includes advisories that
+# aren't yet mirrored to RustSec (the source cargo-deny uses).
+#
+# Suppressions live in `osv-scanner.toml` at repo root as
+# [[IgnoredVulns]] entries. Each entry needs a justification comment.
+
+on:
+  pull_request:
+    branches: [main]
+  schedule:
+    - cron: '0 0 * * 0'  # Every Sunday at midnight UTC
+  workflow_dispatch:
+
+permissions:
+  id-token: write
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  security-scan:
+    name: Security Scan
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      # JFrog OIDC + cargo proxy: skipped on fork PRs (no OIDC token).
+      # Fork PRs still work because cargo can reach crates.io directly;
+      # JFrog is just a faster mirror.
+      - name: Set up JFrog
+        if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+        uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+
+      # cargo-cyclonedx produces a CycloneDX SBOM from Cargo.lock for
+      # each workspace. The kernel has three: the root (publishes the
+      # crate), pyo3/ (PyPI wheel), and napi/ (npm package).
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --version 0.5.7 --locked
+
+      - name: Generate SBOMs (root + napi + pyo3)
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/sboms
+
+          cargo cyclonedx --format json --override-filename root-bom
+          mv root-bom.cdx.json /tmp/sboms/root.json
+
+          ( cd napi && cargo cyclonedx --format json --override-filename napi-bom )
+          mv napi/napi-bom.cdx.json /tmp/sboms/napi.json
+
+          ( cd pyo3 && cargo cyclonedx --format json --override-filename pyo3-bom )
+          mv pyo3/pyo3-bom.cdx.json /tmp/sboms/pyo3.json
+
+          ls -lh /tmp/sboms/
+
+      - name: Install osv-scanner
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/osv-scanner \
+            https://github.com/google/osv-scanner/releases/download/v2.3.8/osv-scanner_linux_amd64
+          chmod +x /tmp/osv-scanner
+          /tmp/osv-scanner --version
+
+      - name: Run OSV-Scanner
+        # Drop -e: osv-scanner exits 1 on ANY finding regardless of
+        # severity. The severity gate below is what actually blocks PRs;
+        # we tolerate osv-scanner's non-zero exit via `|| true`.
+        run: |
+          set -uo pipefail
+          /tmp/osv-scanner scan source \
+            --recursive=false \
+            --config=osv-scanner.toml \
+            --format=json \
+            --output-file=/tmp/osv-out.json \
+            /tmp/sboms/root.json /tmp/sboms/napi.json /tmp/sboms/pyo3.json || true
+
+          if [ ! -s /tmp/osv-out.json ]; then
+            echo "::error::OSV-Scanner did not produce an output file."
+            exit 1
+          fi
+
+      - name: Collect findings
+        id: findings
+        run: |
+          set -uo pipefail
+
+          # All findings sorted by severity desc. Anything missing a
+          # CVSS score sorts to 0 -- still visible.
+          ALL_FINDINGS=$(jq -c '[
+            .results[].packages[]? |
+            .package as $pkg |
+            .groups[]? |
+            {pkg: ($pkg.name + "@" + $pkg.version), ids: .ids, severity: (.max_severity // "0")}
+          ] | sort_by(- (.severity | tonumber? // 0))' /tmp/osv-out.json)
+          TOTAL_FINDINGS=$(echo "$ALL_FINDINGS" | jq 'length')
+
+          HIGH_FINDINGS=$(echo "$ALL_FINDINGS" | jq -c '[.[] | select((.severity | tonumber? // 0) >= 7)]')
+          HIGH_COUNT=$(echo "$HIGH_FINDINGS" | jq 'length')
+
+          # Persist findings to a file -- GitHub Actions outputs are
+          # capped at 1 MB and the email body can exceed that.
+          echo "$ALL_FINDINGS" > /tmp/all-findings.json
+
+          echo "total_findings=$TOTAL_FINDINGS" >> "$GITHUB_OUTPUT"
+          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## OSV-Scanner Findings"
+            echo ""
+            echo "- Total findings (any severity): \`$TOTAL_FINDINGS\`"
+            echo "- High findings (CVSS >= 7, PR-blocking): \`$HIGH_COUNT\`"
+            if [ "$TOTAL_FINDINGS" -gt 0 ]; then
+              echo ""
+              echo "All findings (sorted by severity desc):"
+              echo ""
+              echo "| Severity | Package | IDs |"
+              echo "|---|---|---|"
+              echo "$ALL_FINDINGS" | jq -r '.[] | "| \(.severity) | \(.pkg) | \(.ids | join(",")) |"'
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          echo "OSV: $TOTAL_FINDINGS total findings, $HIGH_COUNT at CVSS>=7"
+          if [ "$TOTAL_FINDINGS" -gt 0 ]; then
+            echo ""
+            echo "All findings (sorted by severity desc):"
+            echo "$ALL_FINDINGS" | jq -r '.[] | "  [\(.severity)] \(.pkg)  \(.ids | join(\", \"))"'
+          fi
+
+      - name: Fail on findings (PR)
+        if: github.event_name == 'pull_request' && steps.findings.outputs.high_count != '0'
+        run: |
+          set -uo pipefail
+          HIGH_FINDINGS=$(jq -c '[.[] | select((.severity | tonumber? // 0) >= 7)]' /tmp/all-findings.json)
+          echo "::error::${{ steps.findings.outputs.high_count }} unsuppressed CVSS>=7 finding(s):"
+          echo ""
+          echo "$HIGH_FINDINGS" | jq -r '.[] | "  [\(.severity)] \(.pkg)  \(.ids | join(\", \"))"'
+          echo ""
+          echo "Fix by either:"
+          echo "  1. Bumping the affected dependency to a patched version, or"
+          echo "  2. Adding a documented [[IgnoredVulns]] entry to osv-scanner.toml"
+          echo "     with a clear justification for why the CVE doesn't apply."
+          echo ""
+          echo "Full step summary: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+          exit 1
+
+      - name: Compose email body
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
+        run: |
+          set -uo pipefail
+          {
+            echo "<!DOCTYPE html><html><head><title>Kernel Security Scan Results</title>"
+            echo "<style>"
+            echo "  body { font-family: -apple-system, sans-serif; }"
+            echo "  table { border-collapse: collapse; margin-top: 1em; }"
+            echo "  th, td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; }"
+            echo "  th { background: #f5f5f5; }"
+            echo "  tr.high { background: #ffe5e5; }"
+            echo "  tr.medium { background: #fff5e5; }"
+            echo "</style></head><body>"
+            echo "<h1>Security Vulnerabilities Found</h1>"
+            echo "<p><b>${{ steps.findings.outputs.total_findings }}</b> total finding(s) on main; <b>${{ steps.findings.outputs.high_count }}</b> at CVSS &gt;= 7 (PR-blocking).</p>"
+            echo "<p>Full reports: <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>View Artifacts</a></p>"
+            echo "<table><tr><th>Severity</th><th>Package</th><th>IDs</th></tr>"
+            jq -r '.[] |
+              (if (.severity | tonumber? // 0) >= 7 then "high"
+               elif (.severity | tonumber? // 0) >= 4 then "medium"
+               else "" end) as $cls |
+              "<tr class=\"\($cls)\"><td>\(.severity)</td><td>\(.pkg)</td><td>\(.ids | join(", "))</td></tr>"
+            ' /tmp/all-findings.json
+            echo "</table>"
+            echo "</body></html>"
+          } > security-scan-report.html
+
+      - name: Send Email
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
+        uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3
+        with:
+          server_address: smtp.gmail.com
+          server_port: 465
+          username: ${{ secrets.SMTP_USERNAME }}
+          password: ${{ secrets.SMTP_PASSWORD }}
+          subject: Databricks SQL Kernel Security Scan - Vulnerabilities Found
+          html_body: file://security-scan-report.html
+          to: ${{ secrets.EMAIL_RECIPIENTS }}
+          from: Kernel Security Scanner
+          content_type: text/html
+
+      - name: Fail on findings (scheduled/manual)
+        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
+        run: |
+          echo "::error::${{ steps.findings.outputs.total_findings }} OSV finding(s) on main (${{ steps.findings.outputs.high_count }} at CVSS>=7). Email sent."
+          exit 1
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f  # v7.0.0
+        with:
+          name: security-scan-reports
+          path: |
+            /tmp/osv-out.json
+            /tmp/sboms/
+            security-scan-report.html
+          if-no-files-found: ignore
