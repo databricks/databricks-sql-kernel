@@ -33,10 +33,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use arrow_ipc::writer::StreamWriter;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
-    Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch,
+    Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch, ResultStream,
     Statement as KernelStatement,
 };
 
@@ -70,6 +69,30 @@ struct StatementInner {
     executed: ExecutedStatement,
 }
 
+/// Discriminated inner state for `Statement`.
+enum AnyInner {
+    /// Produced by `Connection::execute_statement`. Boxed to keep the
+    /// enum size close to the `Metadata` variant (StatementInner is
+    /// large; ResultStream is much smaller).
+    Executed(Box<StatementInner>),
+    /// Produced by metadata methods — wraps a bare `ResultStream`.
+    Metadata(ResultStream),
+}
+
+impl AnyInner {
+    /// Borrow the underlying result stream regardless of variant. The
+    /// executed-statement variant delegates to its
+    /// `ExecutedStatement::result_stream_mut`; the metadata variant
+    /// returns the bare `ResultStream` directly. Used by
+    /// `fetch_next_batch` to share one streaming path across both.
+    fn result_stream_mut(&mut self) -> &mut ResultStream {
+        match self {
+            AnyInner::Executed(s) => s.executed.result_stream_mut(),
+            AnyInner::Metadata(rs) => rs,
+        }
+    }
+}
+
 /// Opaque executed-statement handle.
 ///
 /// **Current concurrency shape** — every method takes `inner.lock()`
@@ -88,21 +111,31 @@ struct StatementInner {
 /// disposed statement can still read them.
 #[napi]
 pub struct Statement {
-    /// Wraps the kernel `Statement` + `ExecutedStatement` pair so the
-    /// parent's `Drop` doesn't fire (and invalidate the executed
-    /// handle via the shared `ValidityFlag`) while JS still holds
-    /// this wrapper. See `StatementInner` docs above.
-    inner: Arc<Mutex<Option<StatementInner>>>,
+    /// Discriminated inner state: the `Executed` variant wraps the
+    /// kernel `Statement` + `ExecutedStatement` pair (the parent kept
+    /// alive to prevent its `Drop` from invalidating the executed
+    /// handle via the shared `ValidityFlag`); the `Metadata` variant
+    /// wraps a bare `ResultStream` produced by `Metadata::list_*` /
+    /// `primary_keys` / `foreign_keys` / `type_info` / `table_types`.
+    inner: Arc<Mutex<Option<AnyInner>>>,
     /// Schema captured at construction. Available even after `close()`.
+    /// For the `Executed` variant this is the executed handle's
+    /// schema; for the `Metadata` variant it's the result-stream's
+    /// schema. Either way, cached so JS callers can build error
+    /// reports against a disposed statement.
     schema: SchemaRef,
-    /// Server-issued id. Available even after `close()` for log
-    /// correlation.
+    /// Server-issued statement id. Populated for the `Executed`
+    /// variant; empty string for the `Metadata` variant (the kernel
+    /// does not emit a statement id for SHOW/information_schema
+    /// queries driven through `Metadata`).
     statement_id: String,
     /// Set to `true` when `fetchNextBatch` observes the natural end of
     /// the stream (`None`). `cancel()` short-circuits to `Ok(())` when
     /// this is set, matching the JDBC `Statement.cancel()` no-op-after-
     /// completion contract — without it, a defensive cancel after the
     /// stream is drained surfaces an opaque server-side error.
+    /// (Irrelevant for the `Metadata` variant where cancel is already
+    /// a no-op kernel-side; harmless to carry the field regardless.)
     finished: Arc<AtomicBool>,
 }
 
@@ -119,12 +152,34 @@ impl Statement {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
         Self {
-            inner: Arc::new(Mutex::new(Some(StatementInner {
-                _parent: parent,
-                executed,
-            }))),
+            inner: Arc::new(Mutex::new(Some(AnyInner::Executed(Box::new(
+                StatementInner {
+                    _parent: parent,
+                    executed,
+                },
+            ))))),
             schema,
             statement_id,
+            finished: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    /// Crate-internal constructor for metadata calls. Wraps a bare
+    /// `ResultStream` returned by `Metadata::list_*` / `primary_keys` /
+    /// `foreign_keys` / `type_info` / `table_types`. Cancel is a no-op
+    /// for metadata streams (the kernel has no in-flight cancellation
+    /// surface for them); close just drops the stream.
+    ///
+    /// `schema` is captured from the stream so the `schema()` getter
+    /// works after close. `statement_id` is empty (kernel does not
+    /// emit one for metadata queries). `finished` defaults false and
+    /// is unread on this path (cancel is already a no-op).
+    pub(crate) fn from_result_stream(stream: ResultStream) -> Self {
+        let schema = stream.schema();
+        Self {
+            inner: Arc::new(Mutex::new(Some(AnyInner::Metadata(stream)))),
+            schema,
+            statement_id: String::new(),
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -166,7 +221,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.num_modified_rows())
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.num_modified_rows()),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -198,7 +256,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.display_message().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.display_message().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -214,7 +275,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.diagnostic_info().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.diagnostic_info().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -239,7 +303,10 @@ impl Statement {
         guarded(async move {
             let guard = inner.lock().await;
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            Ok(inner_state.executed.error_details_json().map(str::to_owned))
+            match inner_state {
+                AnyInner::Executed(s) => Ok(s.executed.error_details_json().map(str::to_owned)),
+                AnyInner::Metadata(_) => Ok(None),
+            }
         })
         .await
     }
@@ -261,9 +328,14 @@ impl Statement {
         guarded(async move {
             let mut guard = inner.lock().await;
             let inner_state = guard.as_mut().ok_or_else(statement_closed_err)?;
-            let executed = &mut inner_state.executed;
-
-            let stream = executed.result_stream_mut();
+            // `result_stream_mut` returns `&mut ResultStream` for both
+            // variants — the executed-path borrows from its
+            // `ExecutedStatement`, the metadata-path borrows from its
+            // bare `ResultStream`. The IPC schema header serialised
+            // into every batch payload comes from the cached
+            // `self.schema` captured outside the lock (see method
+            // start), so no need to re-fetch from the stream.
+            let stream = inner_state.result_stream_mut();
             let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
             let Some(batch) = maybe_batch else {
                 // End of stream — record so a defensive cancel after
@@ -298,7 +370,7 @@ impl Statement {
                     ));
                 }
             };
-            let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
+            let bytes = crate::result::encode_ipc_stream(&schema, Some(record_batch))?;
             Ok(Some(ArrowBatch {
                 ipc_bytes: bytes.into(),
             }))
@@ -321,7 +393,7 @@ impl Statement {
     /// entry points use is not required for this method.
     #[napi]
     pub fn schema(&self) -> napi::Result<ArrowSchema> {
-        let bytes = encode_ipc_stream(&self.schema, None)?;
+        let bytes = crate::result::encode_ipc_stream(&self.schema, None)?;
         Ok(ArrowSchema {
             ipc_bytes: bytes.into(),
         })
@@ -329,11 +401,15 @@ impl Statement {
 
     /// Server-side cancel.
     ///
-    /// Short-circuits to `Ok(())` if `fetchNextBatch` has already
-    /// returned `null` (stream naturally exhausted) — matches the
-    /// JDBC `Statement.cancel()` no-op-after-completion contract, so
-    /// JS callers can fire cancel defensively without distinguishing
-    /// "real cancel" from "raced with natural completion."
+    /// For executed statements: short-circuits to `Ok(())` if
+    /// `fetchNextBatch` has already returned `null` (stream
+    /// naturally exhausted) — matches the JDBC `Statement.cancel()`
+    /// no-op-after-completion contract, so JS callers can fire cancel
+    /// defensively without distinguishing "real cancel" from "raced
+    /// with natural completion."
+    ///
+    /// For metadata streams: no-op (the kernel has no in-flight
+    /// cancellation surface for metadata calls today).
     ///
     /// Returns `KernelError(InvalidStatementHandle)` if the statement
     /// has been explicitly `close()`d.
@@ -344,20 +420,39 @@ impl Statement {
             return Ok(());
         }
         let inner = Arc::clone(&self.inner);
+        let finished = Arc::clone(&self.finished);
         guarded(async move {
             let guard = inner.lock().await;
+            // Re-check `finished` after acquiring the lock to close the
+            // fetch-vs-cancel TOCTOU: a concurrent `fetch_next_batch` may have
+            // drained to completion and set `finished` while this cancel was
+            // queued on the mutex. Without the re-check we'd dispatch a
+            // `CancelStatement` against an already-terminal statement (a
+            // redundant, wire-benign-but-wasteful RPC).
+            if finished.load(Ordering::Acquire) {
+                return Ok(());
+            }
             let inner_state = guard.as_ref().ok_or_else(statement_closed_err)?;
-            inner_state
-                .executed
-                .cancel()
-                .await
-                .map_err(napi_err_from_kernel)
+            match inner_state {
+                AnyInner::Executed(s) => s.executed.cancel().await.map_err(napi_err_from_kernel),
+                // Metadata streams have no server-side cancel handle, so the
+                // query keeps running server-side. Emit a breadcrumb so a
+                // "cancel() didn't cancel" report is diagnosable from logs.
+                AnyInner::Metadata(_) => {
+                    tracing::debug!(
+                        "cancel() on a metadata statement is a no-op (no server-side cancel handle); the query continues server-side"
+                    );
+                    Ok(())
+                }
+            }
         })
         .await
     }
 
-    /// Explicit close. Awaits the server-side `CloseStatement` so the
-    /// JS caller can observe failures (auth revoked mid-session,
+    /// Explicit close.
+    ///
+    /// For executed statements: awaits the server-side `CloseStatement`
+    /// so the JS caller can observe failures (auth revoked mid-session,
     /// network error, server-side error). Idempotent — a second call
     /// on an already-closed statement returns `Ok`.
     ///
@@ -373,26 +468,27 @@ impl Statement {
     /// runtime. The JS caller can log the error but cannot drive a
     /// further retry. If you need retry-on-failure semantics for
     /// `CloseStatement`, layer them above this method.
+    ///
+    /// For metadata streams: drops the stream (no server round-trip
+    /// needed — metadata results have no in-flight server-side
+    /// resource to release).
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             // Take the inner state out so `Drop` knows there's nothing
-            // left to clean up. The parent kernel `Statement`'s Drop
-            // runs here too — but only AFTER the executed handle's
-            // close has finished, so we still observe a clean
-            // server-side close result before the validity flag flips.
+            // left to clean up.
             let inner_state = {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            if let Some(inner_state) = inner_state {
-                inner_state
-                    .executed
-                    .close()
-                    .await
-                    .map_err(napi_err_from_kernel)?;
-                // _parent drops here, after close has resolved.
+            match inner_state {
+                Some(AnyInner::Executed(s)) => {
+                    s.executed.close().await.map_err(napi_err_from_kernel)?;
+                    // _parent drops here, after close has resolved.
+                }
+                // Metadata stream: just drop it.
+                Some(AnyInner::Metadata(_)) | None => {}
             }
             Ok(())
         })
@@ -447,80 +543,19 @@ fn statement_closed_err() -> napi::Error {
     )
 }
 
-/// Encode an Arrow schema (and optional one record batch) as an IPC
-/// stream payload. Used for both `schema()` (schema only) and
-/// `fetchNextBatch()` (schema + one batch). Returning a self-contained
-/// IPC stream per call is wasteful header-wise but lets the JS adapter
-/// stay stateless — it decodes each `ipcBytes` independently via the
-/// same `apache-arrow` `RecordBatchReader` path.
-fn encode_ipc_stream(
-    schema: &arrow_schema::SchemaRef,
-    batch: Option<&arrow_array::RecordBatch>,
-) -> napi::Result<Vec<u8>> {
-    fn arrow_err(e: impl std::fmt::Display) -> napi::Error {
-        napi::Error::new(napi::Status::GenericFailure, e.to_string())
-    }
-    // Pre-size the buffer so a typical 500KB batch doesn't reallocate
-    // ~17 times growing from `Vec::new()`'s default capacity of 0.
-    // `get_array_memory_size` is the kernel-side memory footprint (close
-    // enough to the IPC-encoded size for capacity-hint purposes — IPC
-    // adds ~hundreds of bytes of framing per batch, not orders of
-    // magnitude). 4 KiB slack covers the schema-header on the
-    // schema-only path (`batch = None`) and the framing overhead on
-    // the schema+batch path.
-    let estimated = batch.map(|rb| rb.get_array_memory_size()).unwrap_or(0) + 4096;
-    let mut buf: Vec<u8> = Vec::with_capacity(estimated);
-    {
-        let mut writer = StreamWriter::try_new(&mut buf, schema).map_err(arrow_err)?;
-        if let Some(rb) = batch {
-            writer.write(rb).map_err(arrow_err)?;
-        }
-        writer.finish().map_err(arrow_err)?;
-    }
-    Ok(buf)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::{Int32Array, RecordBatch};
-    use arrow_ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
 
     fn make_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
     }
 
-    #[test]
-    fn encode_ipc_stream_schema_only_yields_zero_batches() {
-        let schema = make_schema();
-        let bytes = encode_ipc_stream(&schema, None).expect("encode succeeds");
-        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
-        let decoded_schema = reader.schema();
-        let batches: Vec<_> = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode succeeds");
-        assert_eq!(decoded_schema.fields(), schema.fields());
-        assert_eq!(batches.len(), 0, "schema-only payload yields 0 batches");
-    }
-
-    #[test]
-    fn encode_ipc_stream_schema_plus_batch_round_trips() {
-        let schema = make_schema();
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
-        )
-        .expect("batch builds");
-        let bytes = encode_ipc_stream(&schema, Some(&batch)).expect("encode succeeds");
-        let reader = StreamReader::try_new(bytes.as_slice(), None).expect("reader opens");
-        let decoded: Vec<_> = reader
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .expect("decode succeeds");
-        assert_eq!(decoded.len(), 1, "exactly one batch decoded");
-        assert_eq!(decoded[0].num_rows(), 3);
-        assert_eq!(decoded[0].schema().fields(), schema.fields());
-    }
+    // Arrow IPC encoding is exercised by `encode_ipc_stream`'s own
+    // round-trip tests in `result.rs` (its new home — see the
+    // encoder-lift refactor). `schema()` / `fetchNextBatch()` just
+    // delegate to it, so the load-bearing assertions live there.
 
     // ─── Closed-state behaviour ─────────────────────────────────────
     //
@@ -623,5 +658,19 @@ mod tests {
         assert!(!stmt.finished.load(Ordering::Acquire));
         stmt.finished.store(true, Ordering::Release);
         assert!(stmt.finished.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn cancel_short_circuits_when_finished_even_on_closed_inner() {
+        // `finished = true` must short-circuit cancel to Ok(()) BEFORE the
+        // closed-state check — so a cancel racing a just-completed fetch is a
+        // no-op, not a CancelStatement RPC (and not a closed-handle error).
+        let stmt = Statement {
+            inner: Arc::new(Mutex::new(None)), // closed
+            schema: make_schema(),
+            statement_id: "x".to_owned(),
+            finished: Arc::new(AtomicBool::new(true)),
+        };
+        assert!(stmt.cancel().await.is_ok());
     }
 }

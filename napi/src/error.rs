@@ -185,26 +185,11 @@ fn status_from_kernel_code(code: ErrorCode) -> Status {
 /// versions because v0's `ErrorCode` is `#[non_exhaustive]` and we
 /// pattern-match exhaustively against the known set.
 fn error_code_str(code: ErrorCode) -> &'static str {
-    match code {
-        ErrorCode::InvalidArgument => "InvalidArgument",
-        ErrorCode::Unauthenticated => "Unauthenticated",
-        ErrorCode::PermissionDenied => "PermissionDenied",
-        ErrorCode::NotFound => "NotFound",
-        ErrorCode::ResourceExhausted => "ResourceExhausted",
-        ErrorCode::Unavailable => "Unavailable",
-        ErrorCode::Timeout => "Timeout",
-        ErrorCode::Cancelled => "Cancelled",
-        ErrorCode::DataLoss => "DataLoss",
-        ErrorCode::Internal => "Internal",
-        ErrorCode::InvalidStatementHandle => "InvalidStatementHandle",
-        ErrorCode::NetworkError => "NetworkError",
-        ErrorCode::SqlError => "SqlError",
-        // Forward-compat: ErrorCode is `#[non_exhaustive]`. Any new
-        // variant the kernel adds in v0.x lands here until we mirror
-        // it in this match. The TS layer treats Unknown as a generic
-        // failure.
-        _ => "Unknown",
-    }
+    // Delegate to the kernel's single-source-of-truth slug map so the napi and
+    // pyo3 wire slugs can never drift. `ErrorCode` is `#[non_exhaustive]`, but
+    // `slug()` is defined in the kernel crate (exhaustive there), so any future
+    // variant is covered automatically without a wildcard here.
+    code.slug()
 }
 
 #[cfg(test)]

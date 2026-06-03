@@ -255,6 +255,71 @@ pub enum AuthConfig {
     External(Box<dyn TokenProvider>),
 }
 
+impl AuthConfig {
+    /// Construct a [`AuthConfig::Pat`] from an optional token, validating
+    /// that it is present and non-empty.
+    ///
+    /// Bindings forward the raw optional from their host language; the
+    /// required-field check lives here so every wrapper rejects a
+    /// missing/empty token identically (`ErrorCode::InvalidArgument`)
+    /// instead of each re-implementing it at the binding boundary.
+    pub fn pat(token: Option<String>) -> crate::Result<Self> {
+        match token {
+            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat { token }),
+            _ => Err(crate::kernel_error::Error::invalid_argument()
+                .message("PAT auth requires a non-empty access token")),
+        }
+    }
+
+    /// Construct a [`AuthConfig::OAuthM2M`] from optional fields,
+    /// validating that the required `client_id` / `client_secret` are
+    /// present and non-empty. `scopes` / `token_url_override` are
+    /// optional and forwarded as-is (the kernel fills defaults).
+    pub fn oauth_m2m(
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        scopes: Option<Vec<String>>,
+        token_url_override: Option<String>,
+    ) -> crate::Result<Self> {
+        let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M auth requires a non-empty client_id")
+        })?;
+        let client_secret = client_secret.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M auth requires a non-empty client_secret")
+        })?;
+        Ok(AuthConfig::OAuthM2M {
+            client_id,
+            client_secret,
+            scopes,
+            token_url_override,
+        })
+    }
+
+    /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
+    /// U2M fields are optional — the kernel fills `databricks-cli` /
+    /// port 8020 / default scopes when omitted — so this performs no
+    /// validation and exists for symmetry with [`AuthConfig::pat`] /
+    /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
+    /// uniformly.
+    pub fn oauth_u2m(
+        client_id: Option<String>,
+        redirect_port: Option<u16>,
+        scopes: Option<Vec<String>>,
+        token_url_override: Option<String>,
+        callback_timeout: Option<std::time::Duration>,
+    ) -> Self {
+        AuthConfig::OAuthU2M {
+            client_id,
+            redirect_port,
+            scopes,
+            token_url_override,
+            callback_timeout,
+        }
+    }
+}
+
 /// Caller-supplied token provider trait.
 ///
 /// Used by [`AuthConfig::External`] to plug a host-side auth
@@ -320,10 +385,37 @@ pub struct HttpConfig {
     pub request_timeout: Duration,
 
     /// Maximum total time across retries for a single logical RPC.
+    /// Retrying stops once cumulative elapsed time exceeds this.
     pub overall_timeout: Duration,
 
-    /// Connection pool size.
+    /// Connection pool size (max idle warm sockets per remote host).
+    ///
+    /// Defaults to `100`, matching the JDBC driver's `HttpConnectionPoolSize`
+    /// default. Raise this for workloads that burst many concurrent
+    /// `executeStatement` calls or CloudFetch chunk downloads against a
+    /// single host; too low a value forces fresh TLS handshakes when the
+    /// pool fills.
     pub pool_max_idle_per_host: usize,
+
+    /// Minimum backoff wait between retry attempts. Also the floor for
+    /// a server-supplied `Retry-After` and the base of the exponential
+    /// backoff (`min_wait * 2^attempt`) used when no `Retry-After` is
+    /// present. Default 1s.
+    pub retry_min_wait: Duration,
+
+    /// Maximum backoff wait between retry attempts. Caps both the
+    /// exponential backoff and a server-supplied `Retry-After`.
+    /// Default 60s.
+    pub retry_max_wait: Duration,
+
+    /// Maximum number of retries **after** the initial attempt — a
+    /// request is attempted at most `retry_max_retries + 1` times.
+    /// Default 5 (→ 6 total attempts).
+    ///
+    /// Wrappers exposing a "total attempts" knob (the connector's
+    /// `_retry_stop_after_attempts_count`, the JDBC driver, …) should
+    /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
+    pub retry_max_retries: u32,
 }
 
 impl Default for HttpConfig {
@@ -331,7 +423,13 @@ impl Default for HttpConfig {
         Self {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
-            pool_max_idle_per_host: 10,
+            pool_max_idle_per_host: 100,
+            // Mirror `RetryConfig::default()` so a stock `HttpConfig`
+            // produces the same retry behaviour the kernel shipped
+            // before these knobs were configurable.
+            retry_min_wait: Duration::from_secs(1),
+            retry_max_wait: Duration::from_secs(60),
+            retry_max_retries: 5,
         }
     }
 }
@@ -430,6 +528,49 @@ pub struct TlsConfig {
     /// when connecting via an IP literal or a hostname the cert
     /// wasn't issued for in a development / lab environment.
     pub skip_hostname_verification: bool,
+
+    /// PEM-encoded client certificate for mutual TLS (mTLS).
+    ///
+    /// Set together with [`Self::client_key_pem`] when the server
+    /// requires the client to present a certificate (mTLS handshake).
+    /// Mirrors the Python connector's `_tls_client_cert_file` /
+    /// `_tls_client_cert_key_file` knobs — wrappers read those files
+    /// and pass the bytes here, no tempfile shim needed.
+    ///
+    /// **Backend note:** under the `tls-native` backend the cert chain
+    /// and key are loaded as a separate `(cert, key)` pair via
+    /// `reqwest::Identity::from_pkcs8_pem`; under `tls-rustls` they are
+    /// concatenated into a single PEM and loaded via
+    /// `reqwest::Identity::from_pem`. Either backend accepts a PEM
+    /// `client_cert_pem` carrying a leaf certificate optionally followed
+    /// by its intermediate chain.
+    ///
+    /// Both `client_cert_pem` and `client_key_pem` must be set
+    /// together; setting only one is rejected at
+    /// [`Session::open`](crate::Session::open) with
+    /// `ErrorCode::InvalidArgument`.
+    ///
+    /// **Validation timing differs by backend.** Under `tls-native`,
+    /// `from_pkcs8_pem` validates the cert/key pair at `Session::open`,
+    /// so a malformed or mismatched pair surfaces synchronously as
+    /// `ErrorCode::InvalidArgument`. Under `tls-rustls`, the cert and
+    /// key are stored and only exercised during the TLS handshake, so
+    /// the same problem surfaces later as a connection error on the
+    /// first request rather than at `Session::open`.
+    pub client_cert_pem: Option<Vec<u8>>,
+
+    /// PEM-encoded private key for the mTLS client certificate.
+    ///
+    /// Accepted key encodings depend on the active TLS backend:
+    /// - **`tls-rustls`** accepts PKCS#8 (`BEGIN PRIVATE KEY`), PKCS#1
+    ///   (`BEGIN RSA PRIVATE KEY`), and SEC1 (`BEGIN EC PRIVATE KEY`).
+    /// - **`tls-native`** requires a **PKCS#8** key (`BEGIN PRIVATE
+    ///   KEY`) — `reqwest::Identity::from_pkcs8_pem` is PKCS#8-only.
+    ///
+    /// For portability across both backends, supply a PKCS#8 key. See
+    /// [`Self::client_cert_pem`] for pairing rules and the
+    /// backend-specific validation timing.
+    pub client_key_pem: Option<Vec<u8>>,
 }
 
 impl std::fmt::Debug for TlsConfig {
@@ -446,6 +587,19 @@ impl std::fmt::Debug for TlsConfig {
             .field(
                 "skip_hostname_verification",
                 &self.skip_hostname_verification,
+            )
+            .field(
+                "client_cert_pem",
+                &self
+                    .client_cert_pem
+                    .as_ref()
+                    .map(|b| format!("<{} bytes>", b.len())),
+            )
+            // The private key is secret material — never render its
+            // length or contents, just whether one was supplied.
+            .field(
+                "client_key_pem",
+                &self.client_key_pem.as_ref().map(|_| "<redacted>"),
             )
             .finish()
     }
@@ -679,10 +833,40 @@ pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
     "USE_CACHED_RESULT",
 ];
 
-/// Filter a caller-supplied `session_conf` map against
-/// [`SESSION_CONF_ALLOWLIST`]. Unknown keys are dropped with a
-/// `tracing::warn!`; known keys are normalized to uppercase (the
-/// server echoes uppercase, so SET-readback matches).
+/// Case-sensitive session-conf keys that must be sent **verbatim**
+/// rather than uppercased. These are dotted `spark.*` Spark confs (as
+/// opposed to the short SET-style SQL parameters in
+/// [`SESSION_CONF_ALLOWLIST`], which Databricks echoes uppercase).
+/// Spark stores `SQLConf` entries under their exact registered
+/// lowercase-dotted key, so uppercasing would address the wrong entry.
+///
+/// Each tuple is `(uppercased_lookup_key, canonical_verbatim_key)`:
+/// callers are matched case-insensitively (via the uppercased lookup)
+/// but the canonical form is what we send on the wire.
+///
+/// `spark.sql.thriftserver.metadata.metricview.enabled` enables UC
+/// Metric View metadata — when set to `"true"`, `SHOW TABLES`
+/// (`Metadata::tables`) returns `METRIC_VIEW` rows and `getColumns`
+/// surfaces `measure` columns. Opt-in: the connector sets it from its
+/// `enable_metric_view_metadata` kwarg (default off), matching the
+/// JDBC driver's `EnableMetricViewMetadata` (default `0`). The kernel
+/// already lists `METRIC_VIEW` among its table types; this lets the
+/// enabling conf through so the server actually emits the rows.
+pub(crate) const SESSION_CONF_CASE_SENSITIVE_ALLOWLIST: &[(&str, &str)] = &[(
+    "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED",
+    "spark.sql.thriftserver.metadata.metricview.enabled",
+)];
+
+/// Filter a caller-supplied `session_conf` map against the allowlists.
+/// Unknown keys are dropped with a `tracing::warn!`.
+///
+/// - Keys in [`SESSION_CONF_ALLOWLIST`] are normalized to **uppercase**
+///   (the server echoes uppercase for these SET-style params, so
+///   SET-readback matches).
+/// - Keys in [`SESSION_CONF_CASE_SENSITIVE_ALLOWLIST`] (dotted
+///   `spark.*` confs) are matched case-insensitively but emitted in
+///   their **canonical verbatim** form — Spark conf keys are
+///   case-sensitive and must not be uppercased.
 pub(crate) fn filter_session_conf(
     raw: std::collections::HashMap<String, String>,
 ) -> std::collections::HashMap<String, String> {
@@ -692,6 +876,13 @@ pub(crate) fn filter_session_conf(
         let upper = k.to_ascii_uppercase();
         if SESSION_CONF_ALLOWLIST.contains(&upper.as_str()) {
             out.insert(upper, v);
+        } else if let Some((_, canonical)) = SESSION_CONF_CASE_SENSITIVE_ALLOWLIST
+            .iter()
+            .find(|(lookup, _)| *lookup == upper.as_str())
+        {
+            // Send the canonical lowercase-dotted form verbatim, not
+            // the caller's casing and not uppercased.
+            out.insert((*canonical).to_string(), v);
         } else {
             tracing::warn!(
                 key = %k,
@@ -735,6 +926,46 @@ mod tests {
     }
 
     #[test]
+    fn session_conf_filter_passes_metricview_conf_verbatim() {
+        // The metric-view conf is a dotted spark.* key: it must survive
+        // the allowlist AND be emitted lowercase-verbatim (NOT
+        // uppercased like the SET-style params), because Spark conf
+        // keys are case-sensitive.
+        let mut raw = std::collections::HashMap::new();
+        raw.insert(
+            "spark.sql.thriftserver.metadata.metricview.enabled".to_string(),
+            "true".to_string(),
+        );
+        let out = filter_session_conf(raw);
+        assert_eq!(
+            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
+                .map(String::as_str),
+            Some("true"),
+        );
+        // It must NOT have been uppercased.
+        assert!(!out.contains_key("SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED"));
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
+    fn session_conf_filter_metricview_match_is_case_insensitive() {
+        // A caller passing the key in any casing is recognised, but the
+        // canonical lowercase form is always what we send.
+        let mut raw = std::collections::HashMap::new();
+        raw.insert(
+            "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED".to_string(),
+            "true".to_string(),
+        );
+        let out = filter_session_conf(raw);
+        assert_eq!(
+            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
+                .map(String::as_str),
+            Some("true"),
+        );
+        assert_eq!(out.len(), 1);
+    }
+
+    #[test]
     fn session_conf_allowlist_covers_jdbc_set() {
         // Parity check: every key the Java driver accepts must be
         // accepted here too (we add COLLATION which JDBC currently
@@ -754,6 +985,75 @@ mod tests {
                 SESSION_CONF_ALLOWLIST.contains(&jdbc_key),
                 "missing JDBC-compatible key: {jdbc_key}"
             );
+        }
+    }
+
+    // ─── AuthConfig validating constructors ───────────────────────
+
+    #[test]
+    fn pat_rejects_missing_or_empty_token() {
+        let err = AuthConfig::pat(None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("non-empty access token"));
+
+        let err = AuthConfig::pat(Some(String::new())).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn pat_accepts_non_empty_token() {
+        match AuthConfig::pat(Some("dapi-x".to_string())).unwrap() {
+            AuthConfig::Pat { token } => assert_eq!(token, "dapi-x"),
+            other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_m2m_rejects_missing_or_empty_client_id() {
+        let err = AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_id"));
+
+        let err = AuthConfig::oauth_m2m(Some(String::new()), Some("sec".to_string()), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_id"));
+    }
+
+    #[test]
+    fn oauth_m2m_rejects_missing_or_empty_client_secret() {
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_secret"));
+
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), Some(String::new()), None, None)
+            .unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("client_secret"));
+    }
+
+    #[test]
+    fn oauth_m2m_accepts_full_credentials() {
+        match AuthConfig::oauth_m2m(
+            Some("cid".to_string()),
+            Some("sec".to_string()),
+            Some(vec!["all-apis".to_string()]),
+            None,
+        )
+        .unwrap()
+        {
+            AuthConfig::OAuthM2M {
+                client_id,
+                client_secret,
+                scopes,
+                token_url_override,
+            } => {
+                assert_eq!(client_id, "cid");
+                assert_eq!(client_secret, "sec");
+                assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
+                assert!(token_url_override.is_none());
+            }
+            other => panic!("expected OAuthM2M, got {other:?}"),
         }
     }
 
@@ -922,6 +1222,7 @@ mod tests {
             custom_ca_cert: Some(b"-----BEGIN CERTIFICATE-----...".to_vec()),
             accept_self_signed: false,
             skip_hostname_verification: false,
+            ..TlsConfig::default()
         };
         let s = format!("{tls:?}");
         assert!(s.contains("<"), "expected byte-count summary, got: {s}");
@@ -930,5 +1231,28 @@ mod tests {
             "expected byte-count summary, got: {s}"
         );
         assert!(!s.contains("BEGIN CERTIFICATE"), "raw bytes leaked: {s}");
+    }
+
+    #[test]
+    fn tls_config_debug_redacts_client_key() {
+        // The mTLS private key is secret — Debug must show only its
+        // presence, never its length or bytes.
+        // The key's PEM header is assembled at runtime so the repo's
+        // secret scanner doesn't flag a literal `BEGIN PRIVATE KEY`
+        // marker — the body ("supersecret") is the thing under test.
+        let key_pem = format!("-----BEGIN {} KEY-----supersecret", "PRIVATE");
+        let tls = TlsConfig {
+            client_cert_pem: Some(b"-----BEGIN CERTIFICATE-----cert".to_vec()),
+            client_key_pem: Some(key_pem.into_bytes()),
+            ..TlsConfig::default()
+        };
+        let s = format!("{tls:?}");
+        assert!(s.contains("<redacted>"), "expected redaction, got: {s}");
+        assert!(!s.contains("supersecret"), "private key leaked: {s}");
+        // The cert (not secret) is summarised by byte count.
+        assert!(
+            s.contains("bytes>"),
+            "expected cert byte-count summary, got: {s}"
+        );
     }
 }

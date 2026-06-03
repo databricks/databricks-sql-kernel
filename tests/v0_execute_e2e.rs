@@ -131,13 +131,14 @@ async fn select_with_named_params() {
 
 #[tokio::test]
 #[ignore]
-async fn mixed_positional_and_named_params_is_server_side_error() {
-    // The kernel can serialise mixed positional + named bindings in
-    // the same `parameters` array — but the server rejects with
-    // `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME` when any
-    // parameter has a `name` set and another doesn't. This test
-    // documents the server contract: bindings must be uniformly
-    // positional or uniformly named.
+async fn mixed_positional_and_named_params_rejected_before_dispatch() {
+    // Positional + named bindings in the same statement are mutually
+    // exclusive. The kernel rejects them at bind time (in
+    // `build_execute_params`) with `InvalidArgument` — before the wire —
+    // so every binding gets a consistent, fast failure instead of an
+    // opaque server `BAD_REQUEST` / `MISSING_NAME` round-trip. The
+    // pure-unit coverage lives in `statement::mutable`'s test module;
+    // this e2e asserts the guard fires in the real `execute()` path.
     let session = live_session().await;
     let mut stmt = session.statement();
     stmt.spec()
@@ -150,17 +151,18 @@ async fn mixed_positional_and_named_params_is_server_side_error() {
         .execute()
         .await
         .err()
-        .expect("server should reject mixed bindings");
-    // Surfaced as DataLoss because the FAILED response is parsed via
-    // the generic execute-response path and the kernel's error
-    // classifier hasn't decoded BAD_REQUEST → InvalidArgument here.
-    // The important assertion is the BAD_REQUEST / MISSING_NAME
-    // text — the kernel correctly forwarded the mixed payload and
-    // surfaced the server-side rejection without losing context.
-    let msg = err.message;
+        .expect("kernel should reject mixed bindings at bind time");
+    assert_eq!(
+        err.code,
+        ErrorCode::InvalidArgument,
+        "mixed positional + named params must be InvalidArgument, got {:?}: {}",
+        err.code,
+        err.message
+    );
     assert!(
-        msg.contains("MISSING_NAME") || msg.contains("BAD_REQUEST"),
-        "expected MISSING_NAME / BAD_REQUEST in error, got: {msg}"
+        err.message.contains("mutually exclusive"),
+        "expected 'mutually exclusive' in error, got: {}",
+        err.message
     );
     session.close().await.expect("session close");
 }

@@ -29,6 +29,7 @@ pub mod executed_async;
 pub mod handle;
 pub mod mutable;
 pub mod params;
+pub mod params_codec;
 pub mod spec;
 
 pub(crate) mod validity;
@@ -37,7 +38,7 @@ pub(crate) mod validity;
 // of the deeper submodule paths. The crate-root re-exports in `lib.rs`
 // also resolve here, so both paths work.
 pub use executed::ExecutedStatement;
-pub use executed_async::{ExecutedAsyncStatement, StatementStatus};
+pub use executed_async::{AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus};
 pub use handle::ExecutedStatementHandle;
 pub use mutable::Statement;
 pub use spec::{ResultFormat, StatementSpec, TypedValue};

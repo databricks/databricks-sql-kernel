@@ -180,17 +180,40 @@ pub struct StatementSpec {
     pub sql: Option<String>,
 
     /// Positional parameters, 1-based on the wire. Index `i` in this Vec
-    /// corresponds to ordinal `i + 1`.
+    /// corresponds to ordinal `i + 1`. Mutually exclusive with
+    /// `named_params` (see below).
     pub positional_params: Vec<TypedValue>,
 
-    /// Named parameters. Mutually compatible with `positional_params`; the
-    /// kernel forwards both to the SEA `parameters` field.
+    /// Named parameters. Mutually exclusive with `positional_params`:
+    /// `execute()` / `submit()` return `ErrorCode::InvalidArgument` if
+    /// both are non-empty. The SEA server rejects a mixed `parameters`
+    /// array with `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME`, so the
+    /// kernel rejects at bind time before the wire.
     pub named_params: HashMap<String, TypedValue>,
 
     /// Per-statement conf overlay. Maps to SEA `parameters` /
     /// Thrift `confOverlay`. Merged on top of the session-level
     /// `session_conf` at execute time; this map wins on key collisions.
     pub statement_conf: HashMap<String, String>,
+
+    /// Server-side cap on the number of rows returned by this statement,
+    /// independent of SQL `LIMIT`. Maps directly to the SEA
+    /// `ExecuteStatement.row_limit` wire field (Python `use_sea`'s
+    /// `row_limit=` kwarg is the canonical cross-driver surface). `None`
+    /// omits the field, so the server applies no driver-imposed cap.
+    pub row_limit: Option<i64>,
+
+    /// Server-side statement wait timeout, in whole seconds. Bounds how
+    /// long the server waits for the statement to reach a terminal state
+    /// before the wait elapses; on elapse the statement is cancelled
+    /// (`on_wait_timeout = CANCEL`), surfacing as a timeout to the caller.
+    /// This is the per-statement server timeout (JDBC `setQueryTimeout` /
+    /// Python `use_sea`'s `wait_timeout=`), distinct from the transport
+    /// `overall_timeout`. `None` lets the kernel pick its sync/async
+    /// default (see `Statement::execute` / `submit`). The SEA wire caps
+    /// the value at 50s; the kernel forwards the requested value verbatim
+    /// and lets the server clamp.
+    pub query_timeout_secs: Option<u32>,
 
     /// Result wire format.
     pub result_format: ResultFormat,
@@ -259,11 +282,86 @@ impl StatementSpec {
         self
     }
 
+    /// Merge a `query_tags` map into the per-statement conf overlay.
+    ///
+    /// Serialises `tags` to the comma-separated `key:value` wire shape
+    /// the SEA server expects under the `query_tags` conf key (the same
+    /// shape NodeJS Thrift's `serializeQueryTags` produces: backslashes
+    /// in keys are doubled; backslash / colon / comma in values are
+    /// backslash-escaped) and inserts it into `statement_conf` under
+    /// `"query_tags"`.
+    ///
+    /// - An **empty** `tags` map is a no-op (returns `Ok(self)`),
+    ///   matching the "empty map means not-supplied" convention.
+    /// - If `statement_conf` already carries an explicit `"query_tags"`
+    ///   key, returns `Err(InvalidArgument)` — supplying both a
+    ///   `queryTags` map and `statementConf["query_tags"]` is an
+    ///   ambiguous intent the kernel refuses to silently resolve. Set
+    ///   the explicit `statement_conf` map (via [`Self::statement_conf`])
+    ///   before calling this so the conflict is detected.
+    pub fn query_tags(&mut self, tags: HashMap<String, String>) -> Result<&mut Self> {
+        if tags.is_empty() {
+            return Ok(self);
+        }
+        if self.statement_conf.contains_key("query_tags") {
+            return Err(Error::new(
+                ErrorCode::InvalidArgument,
+                "cannot supply both `queryTags` and `statementConf[\"query_tags\"]` — pick one",
+            ));
+        }
+        self.statement_conf
+            .insert("query_tags".to_string(), serialize_query_tags(&tags));
+        Ok(self)
+    }
+
+    /// Set the server-side row cap (SEA `row_limit`). `None` clears it.
+    pub fn row_limit(&mut self, row_limit: Option<i64>) -> &mut Self {
+        self.row_limit = row_limit;
+        self
+    }
+
+    /// Set the per-statement server wait timeout in whole seconds. `None`
+    /// clears it (kernel default applies). See the field docs for the
+    /// `CANCEL`-on-elapse semantics and the 50s server cap.
+    pub fn query_timeout_secs(&mut self, secs: Option<u32>) -> &mut Self {
+        self.query_timeout_secs = secs;
+        self
+    }
+
     /// Set the result wire format.
     pub fn result_format(&mut self, fmt: ResultFormat) -> &mut Self {
         self.result_format = fmt;
         self
     }
+}
+
+/// Serialise a tag map to the comma-separated `key:value` wire shape the
+/// SEA server expects under the `query_tags` conf key — identical to the
+/// shape NodeJS Thrift's `serializeQueryTags` (`lib/utils/queryTags.ts`)
+/// produces. Backslashes in keys are doubled; backslash, colon, and comma
+/// in values are each backslash-escaped. The SEA server merges
+/// `confOverlay.query_tags` the same way regardless of which backend
+/// produced it, so callers porting from Thrift see identical behaviour.
+///
+/// Tag ordering follows `HashMap` iteration order, which is
+/// non-deterministic; the SEA server treats conf values as
+/// order-insensitive, so the result is functionally equivalent to the
+/// Thrift output regardless of key order.
+fn serialize_query_tags(tags: &HashMap<String, String>) -> String {
+    tags.iter()
+        .map(|(k, v)| {
+            let esc_key = k.replace('\\', "\\\\");
+            let esc_val = v
+                .chars()
+                .flat_map(|c| match c {
+                    '\\' | ':' | ',' => vec!['\\', c],
+                    other => vec![other],
+                })
+                .collect::<String>();
+            format!("{esc_key}:{esc_val}")
+        })
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 #[cfg(test)]
@@ -277,7 +375,23 @@ mod tests {
         assert!(s.positional_params.is_empty());
         assert!(s.named_params.is_empty());
         assert!(s.statement_conf.is_empty());
+        // row_limit / query_timeout default to "omit the field" so the
+        // server applies no driver-imposed cap and its own wait default.
+        assert!(s.row_limit.is_none());
+        assert!(s.query_timeout_secs.is_none());
         assert_eq!(s.result_format, ResultFormat::Arrow);
+    }
+
+    #[test]
+    fn row_limit_and_query_timeout_setters() {
+        let mut s = StatementSpec::new();
+        s.row_limit(Some(100)).query_timeout_secs(Some(30));
+        assert_eq!(s.row_limit, Some(100));
+        assert_eq!(s.query_timeout_secs, Some(30));
+        // `None` clears back to the omit-the-field default.
+        s.row_limit(None).query_timeout_secs(None);
+        assert!(s.row_limit.is_none());
+        assert!(s.query_timeout_secs.is_none());
     }
 
     #[test]
@@ -325,5 +439,124 @@ mod tests {
         let err = s.param_named("", TypedValue::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(s.named_params.is_empty());
+    }
+
+    // ─── query_tags merge behaviour ─────────────────────────────────────
+
+    #[test]
+    fn query_tags_empty_map_is_noop() {
+        let mut s = StatementSpec::new();
+        s.query_tags(HashMap::new()).unwrap();
+        assert!(s.statement_conf.is_empty());
+    }
+
+    #[test]
+    fn query_tags_serialised_into_query_tags_key() {
+        let mut s = StatementSpec::new();
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        s.query_tags(tags).unwrap();
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("team:platform"),
+        );
+    }
+
+    #[test]
+    fn query_tags_rejects_dual_definition() {
+        let mut s = StatementSpec::new();
+        let mut conf = HashMap::new();
+        conf.insert("query_tags".to_string(), "explicit:value".to_string());
+        s.statement_conf(conf);
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        let err = s.query_tags(tags).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+        assert!(
+            err.message.contains("cannot supply both"),
+            "error must explain the conflict: {}",
+            err.message,
+        );
+        // The explicit key is left untouched.
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("explicit:value"),
+        );
+    }
+
+    #[test]
+    fn query_tags_empty_map_does_not_collide_with_existing_key() {
+        // An empty `queryTags: {}` map is ignored, so a caller can pass
+        // an explicit `statementConf["query_tags"]` alongside an empty
+        // tag map without tripping the ambiguity guard.
+        let mut s = StatementSpec::new();
+        let mut conf = HashMap::new();
+        conf.insert("query_tags".to_string(), "explicit:value".to_string());
+        s.statement_conf(conf);
+        s.query_tags(HashMap::new()).unwrap();
+        assert_eq!(
+            s.statement_conf.get("query_tags").map(String::as_str),
+            Some("explicit:value"),
+        );
+    }
+
+    // ─── serialize_query_tags byte-shape parity with Thrift ─────────────
+
+    /// `serializeQueryTags` (NodeJS Thrift, `lib/utils/queryTags.ts`)
+    /// is the canonical wire shape for `query_tags`. Pin the per-tag
+    /// byte shape produced by the kernel-side serializer against the
+    /// algorithm Thrift uses, so a regression on either side fails this
+    /// test.
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_single_tag() {
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), "platform".to_string());
+        assert_eq!(serialize_query_tags(&tags), "team:platform");
+    }
+
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_escapes() {
+        // Per Thrift's `escapedValue.replace(/[\\:,]/g, c => '\\' + c)`:
+        // input  `v:1,v\2`
+        // output `v\:1\,v\\2`
+        let mut tags = HashMap::new();
+        tags.insert("k".to_string(), "v:1,v\\2".to_string());
+        assert_eq!(serialize_query_tags(&tags), "k:v\\:1\\,v\\\\2");
+    }
+
+    #[test]
+    fn serialize_query_tags_matches_thrift_byte_shape_key_backslash_only() {
+        // Per Thrift's `escapedKey = key.replace(/\\/g, '\\\\')`:
+        // input  `k\1`
+        // output `k\\1`
+        // Colons/commas in keys are NOT escaped on Thrift's path — only
+        // in values. Pins this asymmetry so a future "uniformity"
+        // refactor that escapes them in keys too gets caught.
+        let mut tags = HashMap::new();
+        tags.insert("k\\1".to_string(), "v".to_string());
+        assert_eq!(serialize_query_tags(&tags), "k\\\\1:v");
+    }
+
+    #[test]
+    fn serialize_query_tags_empty_map_yields_empty_string() {
+        assert_eq!(serialize_query_tags(&HashMap::new()), "");
+    }
+
+    #[test]
+    fn serialize_query_tags_multi_tag_contains_each_pair_regardless_of_order() {
+        // Multi-tag case: HashMap iteration is non-deterministic, so we
+        // can't assert a single byte string. Assert each pair is present
+        // and the join uses `,`. SEA treats conf values as
+        // order-insensitive, so this is functionally equivalent to the
+        // Thrift output regardless of order.
+        let mut tags = HashMap::new();
+        tags.insert("a".to_string(), "1".to_string());
+        tags.insert("b".to_string(), "2".to_string());
+        let s = serialize_query_tags(&tags);
+        let pairs: std::collections::HashSet<&str> = s.split(',').collect();
+        assert!(
+            pairs == ["a:1", "b:2"].iter().copied().collect(),
+            "got: {s}",
+        );
     }
 }

@@ -134,6 +134,8 @@ impl<'a> Identifier<'a> {
     /// Rejects:
     /// - Empty string — meaningless as an identifier; almost always a
     ///   bug at the wrapper layer.
+    /// - Strings consisting only of whitespace — would backtick-escape
+    ///   to a blank token and produce a server-side parse error.
     /// - Embedded NUL bytes (`\0`) — would terminate the string at the
     ///   first FFI / C ABI boundary and silently truncate the
     ///   identifier in transit.
@@ -147,6 +149,9 @@ impl<'a> Identifier<'a> {
     pub fn new(s: &'a str) -> Result<Self> {
         if s.is_empty() {
             return Err(Error::invalid_argument().message("identifier must not be empty"));
+        }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument().message("identifier must not be all whitespace"));
         }
         if s.len() > MAX_IDENTIFIER_BYTES {
             return Err(Error::invalid_argument().message(format!(
@@ -162,6 +167,18 @@ impl<'a> Identifier<'a> {
                 .message("identifier must not contain a backtick character"));
         }
         Ok(Self(s))
+    }
+
+    /// Construct from an optional borrowed string.
+    ///
+    /// Maps `None` to `Ok(None)` ("not supplied" — e.g. ODBC-style
+    /// "match all" for an exact catalog/schema), and `Some(s)` through
+    /// [`Identifier::new`] (so whitespace-only / empty / NUL / backtick /
+    /// oversize inputs reject as `InvalidArgument`). Single home for the
+    /// `Option<String>` → `Option<Identifier>` conversion the wrappers
+    /// (napi / pyo3) all need at their metadata call sites.
+    pub fn from_opt(s: &'a Option<String>) -> Result<Option<Identifier<'a>>> {
+        s.as_deref().map(Identifier::new).transpose()
     }
 
     /// Borrow the underlying string.
@@ -194,6 +211,8 @@ impl<'a> LikePattern<'a> {
     ///
     /// Rejects:
     /// - Empty string — callers should pass `None` for "match all".
+    /// - Strings consisting only of whitespace — callers should pass
+    ///   `None` for "match all".
     /// - Embedded NUL bytes — same FFI-truncation hazard as
     ///   [`Identifier::new`].
     /// - Strings exceeding 255 bytes.
@@ -205,6 +224,10 @@ impl<'a> LikePattern<'a> {
         if s.is_empty() {
             return Err(Error::invalid_argument()
                 .message("LIKE pattern must not be empty (pass None for \"match all\")"));
+        }
+        if s.trim().is_empty() {
+            return Err(Error::invalid_argument()
+                .message("LIKE pattern must not be all whitespace (pass None for \"match all\")"));
         }
         if s.len() > MAX_LIKE_PATTERN_BYTES {
             return Err(Error::invalid_argument().message(format!(
@@ -218,6 +241,17 @@ impl<'a> LikePattern<'a> {
             );
         }
         Ok(Self(s))
+    }
+
+    /// Construct from an optional borrowed pattern.
+    ///
+    /// Maps `None` to `Ok(None)` (the canonical "match all" intent), and
+    /// `Some(s)` through [`LikePattern::new`] (so whitespace-only / empty
+    /// / NUL / oversize inputs reject as `InvalidArgument`). Single home
+    /// for the `Option<String>` → `Option<LikePattern>` conversion the
+    /// wrappers (napi / pyo3) all need at their metadata call sites.
+    pub fn from_opt(s: &'a Option<String>) -> Result<Option<LikePattern<'a>>> {
+        s.as_deref().map(LikePattern::new).transpose()
     }
 
     /// Borrow the underlying pattern.
@@ -667,6 +701,74 @@ mod tests {
     fn like_pattern_rejects_too_long() {
         let s = "a".repeat(MAX_LIKE_PATTERN_BYTES + 1);
         let err = LikePattern::new(&s).expect_err("oversize pattern rejected");
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn identifier_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = Identifier::new(s).expect_err("whitespace-only identifier rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn like_pattern_rejects_whitespace_only() {
+        for s in &["   ", "\t", "\n", " \t "] {
+            let err = LikePattern::new(s).expect_err("whitespace-only pattern rejected");
+            assert_eq!(err.code, ErrorCode::InvalidArgument);
+            assert!(
+                err.message.contains("whitespace"),
+                "expected 'whitespace' in: {}",
+                err.message
+            );
+        }
+    }
+
+    // ─── from_opt — the wrapper-facing Option<String> adapters ──────────
+
+    #[test]
+    fn identifier_from_opt_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(Identifier::from_opt(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn identifier_from_opt_real_name_is_ok_some() {
+        let input = Some("main".to_owned());
+        let id = Identifier::from_opt(&input).unwrap().expect("some");
+        assert_eq!(id.as_str(), "main");
+    }
+
+    #[test]
+    fn identifier_from_opt_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = Identifier::from_opt(&input).unwrap_err();
+        assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn like_pattern_from_opt_none_is_ok_none() {
+        let input: Option<String> = None;
+        assert!(LikePattern::from_opt(&input).unwrap().is_none());
+    }
+
+    #[test]
+    fn like_pattern_from_opt_real_pattern_is_ok_some() {
+        let input = Some("info%".to_owned());
+        let pat = LikePattern::from_opt(&input).unwrap().expect("some");
+        assert_eq!(pat.as_str(), "info%");
+    }
+
+    #[test]
+    fn like_pattern_from_opt_rejects_whitespace_only() {
+        let input = Some("  ".to_owned());
+        let err = LikePattern::from_opt(&input).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
     }
 }

@@ -20,7 +20,7 @@
 //! they `block_on` the same pool without keeping the `Session`
 //! pyclass alive longer than the user keeps a reference.
 
-use crate::auth::build_auth_config;
+use crate::auth::{build_auth_config, OAuthParams};
 use crate::metadata::Metadata;
 use crate::statement::Statement;
 use databricks_sql_kernel::Session as KSession;
@@ -58,11 +58,38 @@ impl Session {
     /// fully-qualified (`https://...`). `http_path` is the SQL
     /// endpoint path.
     ///
-    /// Auth: PAT only in this phase. Pass `access_token=<dapi...>`
-    /// (or the explicit form `auth_type='pat', access_token=...`).
-    /// OAuth and other auth types are reserved and will be wired
-    /// in once the credential-ownership question (kernel-owned vs
-    /// connector-owned OAuth) is settled.
+    /// Auth: pass `auth_type` plus the matching credentials.
+    ///
+    /// - `"pat"` (or omit `auth_type` and pass `access_token`):
+    ///   personal access token.
+    /// - `"oauth-m2m"`: service-principal client credentials —
+    ///   `client_id` + `client_secret` (optional `oauth_scopes`,
+    ///   `token_url`).
+    /// - `"oauth-u2m"`: browser authorization-code + PKCE flow
+    ///   (optional `client_id`, `redirect_port`, `oauth_scopes`,
+    ///   `token_url`, `oauth_callback_timeout_secs`).
+    ///
+    /// OAuth is kernel-owned: the kernel acquires and transparently
+    /// refreshes tokens itself.
+    ///
+    /// TLS: all knobs are optional relaxations / additions on top of
+    /// the secure default (validate system trust store, verify chain
+    /// + hostname). `tls_ca_cert` adds a PEM CA bundle (bytes);
+    /// `tls_skip_verify` disables all chain validation;
+    /// `tls_skip_hostname_verify` disables the hostname check;
+    /// `tls_client_cert` + `tls_client_key` (both PEM bytes) configure
+    /// mutual TLS. The two mTLS fields must be set together.
+    ///
+    /// Retry/backoff: all optional, default to the kernel's built-in
+    /// policy (1s/60s backoff, 6 total attempts, 900s budget) when
+    /// unset. `retry_min_wait_secs` / `retry_max_wait_secs` bound the
+    /// exponential backoff (and clamp a server `Retry-After`);
+    /// `retry_max_attempts` is the **total** number of attempts
+    /// (converted to the kernel's retries-after-first internally, so
+    /// `0`/`1` both mean a single attempt); `retry_overall_timeout_secs`
+    /// caps cumulative time across retries. These apply to SQL +
+    /// CloudFetch requests; token-endpoint (auth) calls keep a fixed
+    /// fast-fail policy.
     ///
     /// `session_conf` is the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
@@ -77,6 +104,21 @@ impl Session {
         *,
         auth_type=None,
         access_token=None,
+        client_id=None,
+        client_secret=None,
+        oauth_scopes=None,
+        token_url=None,
+        redirect_port=None,
+        oauth_callback_timeout_secs=None,
+        tls_ca_cert=None,
+        tls_skip_verify=false,
+        tls_skip_hostname_verify=false,
+        tls_client_cert=None,
+        tls_client_key=None,
+        retry_min_wait_secs=None,
+        retry_max_wait_secs=None,
+        retry_max_attempts=None,
+        retry_overall_timeout_secs=None,
         catalog=None,
         schema=None,
         session_conf=None,
@@ -90,27 +132,105 @@ impl Session {
         http_path: String,
         auth_type: Option<String>,
         access_token: Option<String>,
+        client_id: Option<String>,
+        client_secret: Option<String>,
+        oauth_scopes: Option<Vec<String>>,
+        token_url: Option<String>,
+        redirect_port: Option<u16>,
+        oauth_callback_timeout_secs: Option<u64>,
+        tls_ca_cert: Option<Vec<u8>>,
+        tls_skip_verify: bool,
+        tls_skip_hostname_verify: bool,
+        tls_client_cert: Option<Vec<u8>>,
+        tls_client_key: Option<Vec<u8>>,
+        retry_min_wait_secs: Option<u64>,
+        retry_max_wait_secs: Option<u64>,
+        retry_max_attempts: Option<u32>,
+        retry_overall_timeout_secs: Option<u64>,
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
         complex_types_as_json: bool,
         intervals_as_string: bool,
     ) -> PyResult<Self> {
-        // Resolve auth_type: default to "pat" only when the caller
-        // also passed access_token. This keeps existing PAT callers
-        // working without changes while still rejecting ambiguous
-        // calls like `Session(host, http_path)` with no auth.
+        // Resolve auth_type. Explicit `auth_type` always wins. When
+        // omitted, default to "pat" if `access_token` was passed
+        // (back-compat for existing PAT callers). A bare
+        // `Session(host, http_path)` with no auth is still rejected.
         let resolved_auth_type = match auth_type.as_deref() {
             Some(t) => t.to_owned(),
             None if access_token.is_some() => "pat".to_owned(),
             None => {
                 return Err(pyo3::exceptions::PyValueError::new_err(
-                    "Session requires auth: pass access_token (PAT) — \
-                     other auth types are not yet supported by this binding",
+                    "Session requires auth: pass access_token (PAT) or set \
+                     auth_type to 'oauth-m2m' / 'oauth-u2m' with the matching \
+                     credentials",
                 ));
             }
         };
-        let auth_config = build_auth_config(&resolved_auth_type, access_token)?;
+        let oauth = OAuthParams {
+            client_id,
+            client_secret,
+            scopes: oauth_scopes,
+            token_url,
+            redirect_port,
+            callback_timeout_secs: oauth_callback_timeout_secs,
+        };
+        let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;
+
+        // Build a TLS config only when the caller relaxed or extended
+        // the secure default — otherwise leave the builder on its
+        // default (full validation) so we don't allocate a config that
+        // changes nothing.
+        let tls_config = if tls_ca_cert.is_some()
+            || tls_skip_verify
+            || tls_skip_hostname_verify
+            || tls_client_cert.is_some()
+            || tls_client_key.is_some()
+        {
+            let mut tls = databricks_sql_kernel::TlsConfig::default();
+            tls.custom_ca_cert = tls_ca_cert;
+            tls.accept_self_signed = tls_skip_verify;
+            tls.skip_hostname_verification = tls_skip_hostname_verify;
+            tls.client_cert_pem = tls_client_cert;
+            tls.client_key_pem = tls_client_key;
+            Some(tls)
+        } else {
+            None
+        };
+
+        // Build an HttpConfig only when the caller tuned retry/backoff;
+        // otherwise leave the builder on its defaults (1s/60s/5-retries).
+        //
+        // `retry_max_attempts` is the **total** number of attempts
+        // (matching the connector's `_retry_stop_after_attempts_count`
+        // and JDBC's count semantics). The kernel's `retry_max_retries`
+        // counts retries *after* the first attempt, so we convert with
+        // `max(0, attempts - 1)` here — centralising the off-by-one so
+        // wrappers can pass an intuitive total. `retry_max_attempts = 0`
+        // or `1` both mean "one attempt, no retries".
+        let http_config = if retry_min_wait_secs.is_some()
+            || retry_max_wait_secs.is_some()
+            || retry_max_attempts.is_some()
+            || retry_overall_timeout_secs.is_some()
+        {
+            let mut http = databricks_sql_kernel::HttpConfig::default();
+            if let Some(s) = retry_min_wait_secs {
+                http.retry_min_wait = std::time::Duration::from_secs(s);
+            }
+            if let Some(s) = retry_max_wait_secs {
+                http.retry_max_wait = std::time::Duration::from_secs(s);
+            }
+            if let Some(attempts) = retry_max_attempts {
+                http.retry_max_retries = attempts.saturating_sub(1);
+            }
+            if let Some(s) = retry_overall_timeout_secs {
+                http.overall_timeout = std::time::Duration::from_secs(s);
+            }
+            Some(http)
+        } else {
+            None
+        };
 
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker
@@ -135,6 +255,12 @@ impl Session {
             let mut builder = KSession::builder()
                 .http_path(host, http_path)
                 .auth(auth_config);
+            if let Some(tls) = tls_config {
+                builder = builder.tls(tls);
+            }
+            if let Some(http) = http_config {
+                builder = builder.http(http);
+            }
             if catalog.is_some() || schema.is_some() {
                 let mut defaults = databricks_sql_kernel::DefaultOpts::default();
                 defaults.catalog = catalog;
