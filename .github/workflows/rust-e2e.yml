@@ -87,7 +87,7 @@ jobs:
 
       - name: Run v0 E2E tests
         run: |
-          for suite in v0_session_e2e v0_execute_e2e v0_async_execute_e2e v0_metadata_e2e; do
+          for suite in v0_session_e2e v0_execute_e2e v0_async_execute_e2e v0_metadata_e2e v0_query_tags_headers_e2e; do
             echo "::group::cargo test --test ${suite}"
             cargo test --test "${suite}" -- --ignored --nocapture
             echo "::endgroup::"

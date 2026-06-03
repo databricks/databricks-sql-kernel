@@ -91,6 +91,13 @@ impl Session {
     /// CloudFetch requests; token-endpoint (auth) calls keep a fixed
     /// fast-fail policy.
     ///
+    /// `http_headers` is a list of `(name, value)` pairs sent on every
+    /// request — used to forward the connector's caller headers (which
+    /// also carry the composed `User-Agent`). The kernel applies them
+    /// before its own `Authorization` / `x-databricks-org-id` headers,
+    /// which always take precedence; a caller header for either of those
+    /// names is ignored.
+    ///
     /// `session_conf` is the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
     /// `ANSI_MODE`, `TIMEZONE`, `STATEMENT_TIMEOUT`, query-tag
@@ -119,6 +126,7 @@ impl Session {
         retry_max_wait_secs=None,
         retry_max_attempts=None,
         retry_overall_timeout_secs=None,
+        http_headers=None,
         catalog=None,
         schema=None,
         session_conf=None,
@@ -147,6 +155,7 @@ impl Session {
         retry_max_wait_secs: Option<u64>,
         retry_max_attempts: Option<u32>,
         retry_overall_timeout_secs: Option<u64>,
+        http_headers: Option<Vec<(String, String)>>,
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
@@ -199,8 +208,9 @@ impl Session {
             None
         };
 
-        // Build an HttpConfig only when the caller tuned retry/backoff;
-        // otherwise leave the builder on its defaults (1s/60s/5-retries).
+        // Build an HttpConfig only when the caller tuned retry/backoff
+        // or supplied custom headers; otherwise leave the builder on its
+        // defaults (1s/60s/5-retries, no extra headers).
         //
         // `retry_max_attempts` is the **total** number of attempts
         // (matching the connector's `_retry_stop_after_attempts_count`
@@ -209,10 +219,17 @@ impl Session {
         // `max(0, attempts - 1)` here — centralising the off-by-one so
         // wrappers can pass an intuitive total. `retry_max_attempts = 0`
         // or `1` both mean "one attempt, no retries".
+        //
+        // `http_headers` are extra headers sent on every request (the
+        // connector forwards its `http_headers`, which also carries the
+        // composed `User-Agent`). The kernel applies them before its own
+        // `Authorization` / `x-databricks-org-id`, which always win.
+        let has_http_headers = http_headers.as_ref().is_some_and(|h| !h.is_empty());
         let http_config = if retry_min_wait_secs.is_some()
             || retry_max_wait_secs.is_some()
             || retry_max_attempts.is_some()
             || retry_overall_timeout_secs.is_some()
+            || has_http_headers
         {
             let mut http = databricks_sql_kernel::HttpConfig::default();
             if let Some(s) = retry_min_wait_secs {
@@ -226,6 +243,9 @@ impl Session {
             }
             if let Some(s) = retry_overall_timeout_secs {
                 http.overall_timeout = std::time::Duration::from_secs(s);
+            }
+            if let Some(headers) = http_headers {
+                http.custom_headers = headers;
             }
             Some(http)
         } else {

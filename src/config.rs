@@ -416,6 +416,38 @@ pub struct HttpConfig {
     /// `_retry_stop_after_attempts_count`, the JDBC driver, …) should
     /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
     pub retry_max_retries: u32,
+
+    /// Extra HTTP headers to send on every request. Lets wrappers
+    /// forward caller-supplied headers (the connector's `http_headers`,
+    /// which also carries the composed `User-Agent`) onto the kernel's
+    /// HTTP stack.
+    ///
+    /// **`Authorization` / `x-databricks-org-id` are reserved:** a
+    /// caller entry for either name is **silently dropped (with a
+    /// `warn!`)** — it never reaches the wire. The kernel always adds
+    /// its own `Authorization` (from the auth provider) and, when set,
+    /// `x-databricks-org-id`, so auth and multi-tenant routing can't be
+    /// hijacked by a caller header. (This mirrors the Thrift connector,
+    /// where `auth_provider.add_headers` runs after the custom-header
+    /// dict and overwrites those names.)
+    ///
+    /// **`User-Agent` is special-cased:** rather than replacing the
+    /// kernel's base UA, a caller `User-Agent` here is **appended** to
+    /// it (`"<kernel-base-UA> <caller-UA>"`) — it is folded into the
+    /// effective UA at client construction and removed from this list.
+    /// The base UA carries the `DatabricksJDBCDriverOSS/...` token the
+    /// SEA server keys on to enable the `INLINE_OR_EXTERNAL_LINKS`
+    /// result disposition; replacing it would break result fetching.
+    /// Appending preserves that gating and still surfaces the caller's
+    /// identity (e.g. the connector's `PyDatabricksSqlConnector/x (entry)`).
+    ///
+    /// **All other headers are sent as supplied.** A `Vec` (not a map)
+    /// so order is preserved. No de-duplication is performed: duplicate
+    /// names are applied via `reqwest`'s `HeaderMap::append`, so each
+    /// entry is emitted on the wire in insertion order (the receiver
+    /// sees every value, not just the last) — pass a name once unless
+    /// you specifically intend multiple header lines.
+    pub custom_headers: Vec<(String, String)>,
 }
 
 impl Default for HttpConfig {
@@ -430,6 +462,7 @@ impl Default for HttpConfig {
             retry_min_wait: Duration::from_secs(1),
             retry_max_wait: Duration::from_secs(60),
             retry_max_retries: 5,
+            custom_headers: Vec::new(),
         }
     }
 }
