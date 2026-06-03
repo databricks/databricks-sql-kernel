@@ -1,0 +1,26 @@
+# OSV-Scanner suppression config for databricks-sql-kernel.
+#
+# Each [[IgnoredVulns]] entry suppresses a CVE/GHSA ID GLOBALLY across
+# all packages (osv-scanner v2.3.8 doesn't support per-package CVE
+# scoping). Every entry MUST carry a justification comment explaining
+# why the vulnerability doesn't apply to our usage, and a TODO or
+# expiry note if the suppression is provisional.
+#
+# Example:
+#
+# [[IgnoredVulns]]
+# id = "CVE-2024-XXXXX"
+# # Justification: <how the vuln does not apply to kernel use, e.g.,
+# # "kernel does not parse untrusted YAML" or "kernel does not expose
+# # the affected entrypoint">
+# # Expiry: 2026-12-31 (if provisional)
+#
+# TODO(securityScan): the `# Expiry:` convention above is documentation
+# only — no workflow step rejects expired suppressions today. Add an
+# expiry-lint step to securityScan.yml (PR + cron) that parses these
+# comments, fails the run if any `Expiry: <date>` is in the past, and
+# emits a step-summary table of upcoming-expiry entries. Tracked
+# separately so this file stays empty on the initial landing; once we
+# have real suppressions to enforce against, wire it up.
+
+# (intentionally empty — add entries here as needed)
