@@ -108,11 +108,15 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/sboms
 
+          # Root workspace has members [".", "pyo3"]; cargo-cyclonedx
+          # writes one SBOM per member alongside its Cargo.toml. Pull
+          # them in by EXPLICIT path (./*.cdx.json and pyo3/*.cdx.json)
+          # rather than a **/*.cdx.json globstar walk — the walk would
+          # silently pick up a stray .cdx.json under target/ or a test
+          # fixture if one ever lands.
           cargo cyclonedx --format json
-          # Root workspace places per-member SBOMs alongside each
-          # member's Cargo.toml. Glob them all in.
-          shopt -s globstar nullglob
-          for f in **/*.cdx.json; do
+          shopt -s nullglob
+          for f in ./*.cdx.json pyo3/*.cdx.json; do
             cp "$f" "/tmp/sboms/$(basename "$f")"
           done
 
@@ -170,9 +174,26 @@ jobs:
           fi
 
       - name: Collect findings
+        # Intentionally NOT `set -e`: each step here ends with an
+        # unconditional `exit 1` (or the next step's `if:` gate on
+        # total_findings), and `set -e` would cause a jq-rendering
+        # failure here to silently abort the step *before* writing
+        # `total_findings=...` to GITHUB_OUTPUT — which would skip
+        # the downstream fail-on-findings gate and weaken the
+        # security posture. Do not "tighten" this to set -euo pipefail.
         id: findings
         run: |
           set -uo pipefail
+
+          # Schema sanity check. OSV-Scanner's JSON shape is `{"results":
+          # [...]}`. If a future version ever changes that (or the file
+          # is truncated), fail loudly here rather than letting the
+          # classifier silently see zero findings.
+          if ! jq -e '.results | type == "array"' /tmp/osv-out.json >/dev/null; then
+            echo "::error::OSV output missing .results array — schema drift?"
+            head -c 4096 /tmp/osv-out.json
+            exit 1
+          fi
 
           # Normalise severity into a single jq pipeline. OSV's
           # max_severity is one of:
@@ -180,9 +201,10 @@ jobs:
           #   - empty string "" (textual-only advisory)
           #   - missing entirely
           # We classify any non-numeric / missing / 0 as
-          # "unscored" — these go to UNSCORED_FINDINGS and STILL
-          # block PRs under the fail-on-any policy. The numeric
-          # value (or "unscored") is what we display.
+          # "unscored" — these STILL block PRs under the fail-on-any
+          # policy (they may well be HIGH/CRITICAL with only textual
+          # severity). The numeric value (or "unscored") is what we
+          # display.
           ALL_FINDINGS=$(jq -c '[
             .results[].packages[]? |
             .package as $pkg |
@@ -219,16 +241,23 @@ jobs:
 
           echo "OSV: $TOTAL_FINDINGS unsuppressed finding(s)"
           if [ "$TOTAL_FINDINGS" -gt 0 ]; then
-            echo "$ALL_FINDINGS" | jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(\", \"))"'
+            # NOTE: jq escapes inside a single-quoted bash string are
+            # LITERAL — `\", \"` reaches jq verbatim and jq rejects it
+            # as a syntax error. Use plain `", "`, same as line 216.
+            echo "$ALL_FINDINGS" | jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(", "))"'
           fi
 
       - name: Fail on findings (PR)
+        # See "Collect findings" above for why this step intentionally
+        # omits `-e`. The unconditional `exit 1` below is the gate.
         if: github.event_name == 'pull_request' && steps.findings.outputs.total_findings != '0'
         run: |
           set -uo pipefail
           echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s):"
           echo ""
-          jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(\", \"))"' /tmp/all-findings.json
+          # See Collect findings note: plain `", "` is correct; the
+          # prior `\", \"` form was jq syntax error.
+          jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(", "))"' /tmp/all-findings.json
           echo ""
           echo "Fix by either:"
           echo "  1. Bumping the affected dependency to a patched version, or"
@@ -239,6 +268,8 @@ jobs:
           exit 1
 
       - name: Compose email body
+        # See "Collect findings" above for why this step intentionally
+        # omits `-e`.
         if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
         run: |
           set -uo pipefail
@@ -251,6 +282,12 @@ jobs:
             echo "  th { background: #f5f5f5; }"
             echo "  tr.high { background: #ffe5e5; }"
             echo "  tr.medium { background: #fff5e5; }"
+            # Unscored findings are also gate-blocking under the
+            # fail-on-any policy (textual-severity advisories often
+            # describe HIGH-impact issues with no numeric CVSS).
+            # Style them the same as high so recipients don't misread
+            # the lack of a number as "low risk".
+            echo "  tr.unscored { background: #ffe5e5; }"
             echo "</style></head><body>"
             echo "<h1>Security Vulnerabilities Found</h1>"
             echo "<p><b>${{ steps.findings.outputs.total_findings }}</b> unsuppressed finding(s) on main.</p>"
@@ -258,7 +295,8 @@ jobs:
             echo "<p>Full reports: <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>View Artifacts</a></p>"
             echo "<table><tr><th>Severity</th><th>Package</th><th>IDs</th></tr>"
             jq -r '.[] |
-              (if .severity >= 7 then "high"
+              (if .display == "unscored" then "unscored"
+               elif .severity >= 7 then "high"
                elif .severity >= 4 then "medium"
                else "" end) as $cls |
               "<tr class=\"\($cls)\"><td>\(.display)</td><td>\(.pkg)</td><td>\(.ids | join(", "))</td></tr>"
