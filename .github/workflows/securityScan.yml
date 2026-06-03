@@ -1,31 +1,49 @@
 name: Security Scan
 
 # Source-repo CVE gate. Lives in `databricks/databricks-sql-kernel`'s
-# `.github/workflows/`. Ported from databricks-jdbc/securityScan.yml.
+# `.github/workflows/`. Ported from databricks-jdbc/securityScan.yml,
+# then hardened in response to PR #118 review.
 #
-# Three modes with different thresholds:
+# Two modes — fail-closed on ANY unsuppressed finding on both paths.
+# Triage by adding an [[IgnoredVulns]] entry to osv-scanner.toml with
+# a justification, NOT by tweaking severity thresholds here:
 #
-#   - pull_request to main: fail the job on any unsuppressed CVSS >= 7
-#     finding. MEDIUM/LOW findings show in the step summary but don't
-#     block merges.
+#   - pull_request to main: fail the job on any unsuppressed finding.
+#     Justification: textual-severity findings (max_severity == ""
+#     or non-numeric strings — common for GHSA-Rust advisories not yet
+#     scored against CVSS) silently bypassed a CVSS-numeric gate and
+#     defeated the exact class of CVE this workflow is meant to catch.
 #
-#   - cron (weekly): report ALL findings regardless of severity. Sends
-#     an email with the full sorted list and fails the job on any
-#     finding. The weekly is read by humans, not enforced by code.
+#   - cron (weekly): same fail-on-any policy, plus an HTML email so
+#     emerging findings are visible to humans, not just buried in CI.
 #
 #   - workflow_dispatch: behaves like the cron run.
 #
-# Scanner: OSV-Scanner v2.3.8 (purl-based via OSV.dev; federates GHSA,
-# NVD, RustSec, PyPA, Go vuln DB). Reads CycloneDX SBOMs produced by
-# `cargo cyclonedx` over the three workspaces (root + napi + pyo3) so
-# it sees the actually-resolved dep tree.
+# Scanner: OSV-Scanner v2.3.8 (purl-based via OSV.dev; federates
+# GHSA, NVD, RustSec, PyPA, Go vuln DB). Reads CycloneDX SBOMs
+# produced by `cargo cyclonedx` over the kernel's two workspaces:
 #
-# Why OSV in addition to cargo-deny (which we already run in
-# license-check.yml): OSV's GHSA-Rust source includes advisories that
-# aren't yet mirrored to RustSec (the source cargo-deny uses).
+#   1. Root workspace `[".", "pyo3"]` — emits two SBOMs (one per
+#      member: databricks-sql-kernel + databricks-sql-kernel-pyo3).
+#   2. napi/ standalone workspace — emits its own SBOM.
 #
-# Suppressions live in `osv-scanner.toml` at repo root as
-# [[IgnoredVulns]] entries. Each entry needs a justification comment.
+# We deliberately do NOT pass --override-filename, because that
+# causes a same-name collision when a workspace has multiple members
+# (one SBOM per member is written to the same path, last-writer
+# wins). Letting cyclonedx pick per-package names + globbing keeps
+# every workspace member in scope.
+#
+# Coverage caveat: the pyo3 SBOM is Rust-only — it does NOT include
+# Python-side runtime deps (pyarrow, etc.) that maturin resolves at
+# wheel-install time on the consumer. Layer 1 (gh-action-scan at
+# release time) covers the assembled wheel.
+#
+# Fork-PR coverage gap: this job runs on the protected runner group,
+# which (per org policy) does not pick up fork PRs. Fork PRs DO get
+# a check-run entry — it stays pending and the required-status-check
+# rule blocks merge until a maintainer pushes the same SHA to a
+# branch in this repo. Documented; revisit if external contributors
+# become common.
 
 on:
   pull_request:
@@ -45,6 +63,10 @@ defaults:
 jobs:
   security-scan:
     name: Security Scan
+    # Mitigation for the "fork deletes securityScan.yml" attack:
+    # protect-main must include `Security Scan` as a required status
+    # check (follow-up). GitHub treats a missing check as `pending`,
+    # not `failure`, which would silently fail-open without this gate.
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -54,8 +76,8 @@ jobs:
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
 
       # JFrog OIDC + cargo proxy: skipped on fork PRs (no OIDC token).
-      # Fork PRs still work because cargo can reach crates.io directly;
-      # JFrog is just a faster mirror.
+      # Fork PRs still resolve crates.io directly; JFrog is a faster
+      # mirror, not a source of any otherwise-unavailable artifact.
       - name: Set up JFrog
         if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
         uses: ./.github/actions/setup-jfrog
@@ -64,27 +86,48 @@ jobs:
 
       - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
 
-      # cargo-cyclonedx produces a CycloneDX SBOM from Cargo.lock for
-      # each workspace. The kernel has three: the root (publishes the
-      # crate), pyo3/ (PyPI wheel), and napi/ (npm package).
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --version 0.5.7 --locked
 
-      - name: Generate SBOMs (root + napi + pyo3)
+      # Two cyclonedx invocations cover all three published artifacts:
+      #
+      #   - From repo root: writes one SBOM per root-workspace member.
+      #     Members are [".", "pyo3"], so we get
+      #     databricks-sql-kernel.cdx.json AND
+      #     databricks-sql-kernel-pyo3.cdx.json.
+      #
+      #   - From napi/: standalone workspace, writes one SBOM
+      #     (databricks-sql-kernel-napi.cdx.json).
+      #
+      # We let cyclonedx pick per-package names by NOT passing
+      # --override-filename — the original PR's --override-filename
+      # caused same-name collisions (last-writer wins) that silently
+      # dropped one workspace-member SBOM from scope.
+      - name: Generate SBOMs
         run: |
           set -euo pipefail
           mkdir -p /tmp/sboms
 
-          cargo cyclonedx --format json --override-filename root-bom
-          mv root-bom.cdx.json /tmp/sboms/root.json
+          cargo cyclonedx --format json
+          # Root workspace places per-member SBOMs alongside each
+          # member's Cargo.toml. Glob them all in.
+          shopt -s globstar nullglob
+          for f in **/*.cdx.json; do
+            cp "$f" "/tmp/sboms/$(basename "$f")"
+          done
 
-          ( cd napi && cargo cyclonedx --format json --override-filename napi-bom )
-          mv napi/napi-bom.cdx.json /tmp/sboms/napi.json
+          ( cd napi && cargo cyclonedx --format json )
+          for f in napi/*.cdx.json; do
+            cp "$f" "/tmp/sboms/$(basename "$f")"
+          done
 
-          ( cd pyo3 && cargo cyclonedx --format json --override-filename pyo3-bom )
-          mv pyo3/pyo3-bom.cdx.json /tmp/sboms/pyo3.json
-
+          echo "SBOMs:"
           ls -lh /tmp/sboms/
+          # Hard-stop if we lost coverage by accident.
+          test "$(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)" -ge 3 || {
+            echo "::error::expected >=3 SBOMs (root crate + pyo3 + napi), got $(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)"
+            exit 1
+          }
 
       - name: Install osv-scanner
         run: |
@@ -94,19 +137,33 @@ jobs:
           chmod +x /tmp/osv-scanner
           /tmp/osv-scanner --version
 
+      # OSV-Scanner exit codes (per its docs):
+      #   0 = no vulns found
+      #   1 = vulns found
+      #   2+ = real errors (no extractor matched / corrupt input / etc.)
+      #
+      # The original `|| true` swallowed everything, including the
+      # "no extractor matched" class that writes `{"results": []}` and
+      # exits non-zero. We capture RC and tolerate only 0 and 1; any
+      # other exit fails the step. The findings-collection step below
+      # is the gate on what's in the JSON.
       - name: Run OSV-Scanner
-        # Drop -e: osv-scanner exits 1 on ANY finding regardless of
-        # severity. The severity gate below is what actually blocks PRs;
-        # we tolerate osv-scanner's non-zero exit via `|| true`.
         run: |
+          # GHA's default shell is `bash --noprofile --norc -eo pipefail
+          # {0}`; add `-u`.
           set -uo pipefail
+          RC=0
           /tmp/osv-scanner scan source \
-            --recursive=false \
             --config=osv-scanner.toml \
             --format=json \
             --output-file=/tmp/osv-out.json \
-            /tmp/sboms/root.json /tmp/sboms/napi.json /tmp/sboms/pyo3.json || true
-
+            --sbom=/tmp/sboms/databricks-sql-kernel.cdx.json \
+            --sbom=/tmp/sboms/databricks-sql-kernel-pyo3.cdx.json \
+            --sbom=/tmp/sboms/databricks-sql-kernel-napi.cdx.json || RC=$?
+          if [[ "$RC" -gt 1 ]]; then
+            echo "::error::osv-scanner exited with $RC (real error, not 'vulns found')."
+            exit "$RC"
+          fi
           if [ ! -s /tmp/osv-out.json ]; then
             echo "::error::OSV-Scanner did not produce an output file."
             exit 1
@@ -117,56 +174,61 @@ jobs:
         run: |
           set -uo pipefail
 
-          # All findings sorted by severity desc. Anything missing a
-          # CVSS score sorts to 0 -- still visible.
+          # Normalise severity into a single jq pipeline. OSV's
+          # max_severity is one of:
+          #   - a numeric string ("7.5")
+          #   - empty string "" (textual-only advisory)
+          #   - missing entirely
+          # We classify any non-numeric / missing / 0 as
+          # "unscored" — these go to UNSCORED_FINDINGS and STILL
+          # block PRs under the fail-on-any policy. The numeric
+          # value (or "unscored") is what we display.
           ALL_FINDINGS=$(jq -c '[
             .results[].packages[]? |
             .package as $pkg |
             .groups[]? |
-            {pkg: ($pkg.name + "@" + $pkg.version), ids: .ids, severity: (.max_severity // "0")}
-          ] | sort_by(- (.severity | tonumber? // 0))' /tmp/osv-out.json)
+            ( .max_severity as $raw
+              | ($raw | tostring | tonumber? // null) as $num
+              | {
+                  pkg: ($pkg.name + "@" + $pkg.version),
+                  ids: .ids,
+                  severity: ($num // 0),
+                  display: (if $num != null then ($num | tostring) else "unscored" end)
+                }
+            )
+          ] | sort_by(- .severity)' /tmp/osv-out.json)
           TOTAL_FINDINGS=$(echo "$ALL_FINDINGS" | jq 'length')
 
-          HIGH_FINDINGS=$(echo "$ALL_FINDINGS" | jq -c '[.[] | select((.severity | tonumber? // 0) >= 7)]')
-          HIGH_COUNT=$(echo "$HIGH_FINDINGS" | jq 'length')
-
-          # Persist findings to a file -- GitHub Actions outputs are
-          # capped at 1 MB and the email body can exceed that.
           echo "$ALL_FINDINGS" > /tmp/all-findings.json
-
           echo "total_findings=$TOTAL_FINDINGS" >> "$GITHUB_OUTPUT"
-          echo "high_count=$HIGH_COUNT" >> "$GITHUB_OUTPUT"
 
           {
             echo "## OSV-Scanner Findings"
             echo ""
-            echo "- Total findings (any severity): \`$TOTAL_FINDINGS\`"
-            echo "- High findings (CVSS >= 7, PR-blocking): \`$HIGH_COUNT\`"
+            echo "- Total unsuppressed findings: \`$TOTAL_FINDINGS\`"
+            echo ""
+            echo "Triage policy: any unsuppressed finding fails the run."
+            echo "Document accepted risks via \`[[IgnoredVulns]]\` entries in \`osv-scanner.toml\`."
             if [ "$TOTAL_FINDINGS" -gt 0 ]; then
-              echo ""
-              echo "All findings (sorted by severity desc):"
               echo ""
               echo "| Severity | Package | IDs |"
               echo "|---|---|---|"
-              echo "$ALL_FINDINGS" | jq -r '.[] | "| \(.severity) | \(.pkg) | \(.ids | join(",")) |"'
+              echo "$ALL_FINDINGS" | jq -r '.[] | "| \(.display) | \(.pkg) | \(.ids | join(",")) |"'
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "OSV: $TOTAL_FINDINGS total findings, $HIGH_COUNT at CVSS>=7"
+          echo "OSV: $TOTAL_FINDINGS unsuppressed finding(s)"
           if [ "$TOTAL_FINDINGS" -gt 0 ]; then
-            echo ""
-            echo "All findings (sorted by severity desc):"
-            echo "$ALL_FINDINGS" | jq -r '.[] | "  [\(.severity)] \(.pkg)  \(.ids | join(\", \"))"'
+            echo "$ALL_FINDINGS" | jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(\", \"))"'
           fi
 
       - name: Fail on findings (PR)
-        if: github.event_name == 'pull_request' && steps.findings.outputs.high_count != '0'
+        if: github.event_name == 'pull_request' && steps.findings.outputs.total_findings != '0'
         run: |
           set -uo pipefail
-          HIGH_FINDINGS=$(jq -c '[.[] | select((.severity | tonumber? // 0) >= 7)]' /tmp/all-findings.json)
-          echo "::error::${{ steps.findings.outputs.high_count }} unsuppressed CVSS>=7 finding(s):"
+          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s):"
           echo ""
-          echo "$HIGH_FINDINGS" | jq -r '.[] | "  [\(.severity)] \(.pkg)  \(.ids | join(\", \"))"'
+          jq -r '.[] | "  [\(.display)] \(.pkg)  \(.ids | join(\", \"))"' /tmp/all-findings.json
           echo ""
           echo "Fix by either:"
           echo "  1. Bumping the affected dependency to a patched version, or"
@@ -191,22 +253,27 @@ jobs:
             echo "  tr.medium { background: #fff5e5; }"
             echo "</style></head><body>"
             echo "<h1>Security Vulnerabilities Found</h1>"
-            echo "<p><b>${{ steps.findings.outputs.total_findings }}</b> total finding(s) on main; <b>${{ steps.findings.outputs.high_count }}</b> at CVSS &gt;= 7 (PR-blocking).</p>"
+            echo "<p><b>${{ steps.findings.outputs.total_findings }}</b> unsuppressed finding(s) on main.</p>"
+            echo "<p>All findings fail the run; document accepted risk via osv-scanner.toml.</p>"
             echo "<p>Full reports: <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>View Artifacts</a></p>"
             echo "<table><tr><th>Severity</th><th>Package</th><th>IDs</th></tr>"
             jq -r '.[] |
-              (if (.severity | tonumber? // 0) >= 7 then "high"
-               elif (.severity | tonumber? // 0) >= 4 then "medium"
+              (if .severity >= 7 then "high"
+               elif .severity >= 4 then "medium"
                else "" end) as $cls |
-              "<tr class=\"\($cls)\"><td>\(.severity)</td><td>\(.pkg)</td><td>\(.ids | join(", "))</td></tr>"
+              "<tr class=\"\($cls)\"><td>\(.display)</td><td>\(.pkg)</td><td>\(.ids | join(", "))</td></tr>"
             ' /tmp/all-findings.json
             echo "</table>"
             echo "</body></html>"
           } > security-scan-report.html
 
+      # action-send-mail: SHA 4226df7d... resolves to v3.11.0 (the
+      # floating `v3` tag also points here today). Verify with
+      # `gh api repos/dawidd6/action-send-mail/git/refs/tags` before
+      # bumping.
       - name: Send Email
         if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
-        uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3
+        uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3.11.0
         with:
           server_address: smtp.gmail.com
           server_port: 465
@@ -221,7 +288,7 @@ jobs:
       - name: Fail on findings (scheduled/manual)
         if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
         run: |
-          echo "::error::${{ steps.findings.outputs.total_findings }} OSV finding(s) on main (${{ steps.findings.outputs.high_count }} at CVSS>=7). Email sent."
+          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s) on main. Email sent."
           exit 1
 
       - name: Upload reports
@@ -234,3 +301,6 @@ jobs:
             /tmp/sboms/
             security-scan-report.html
           if-no-files-found: ignore
+          # SBOMs/reports stick around long enough to triage a finding
+          # without being part of the 90-day default retention.
+          retention-days: 30
