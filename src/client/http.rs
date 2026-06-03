@@ -208,6 +208,14 @@ pub struct HttpClientConfig {
     /// Databricks organization ID for multi-tenant workspace routing.
     /// When set, sent as the `x-databricks-org-id` header on all authenticated requests.
     pub org_id: Option<String>,
+    /// Extra headers applied to every request, before the kernel's own
+    /// `Authorization` / `x-databricks-org-id` (which are added last and
+    /// therefore win). A caller `User-Agent` here is folded into the
+    /// effective UA at construction (appended to the base UA, then
+    /// removed from this list). Populated from
+    /// [`crate::config::HttpConfig::custom_headers`]; see its docs for
+    /// the full precedence / reserved-name rules.
+    pub custom_headers: Vec<(String, String)>,
 }
 
 impl Default for HttpClientConfig {
@@ -224,6 +232,7 @@ impl Default for HttpClientConfig {
             proxy: ProxyConfig::default(),
             tls: TlsConfig::default(),
             org_id: None,
+            custom_headers: Vec::new(),
         }
     }
 }
@@ -309,9 +318,66 @@ impl DatabricksHttpClient {
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
     pub fn new(
-        config: HttpClientConfig,
+        mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
     ) -> Result<Self> {
+        // Fold any caller-supplied `User-Agent` custom header into the
+        // effective UA, and remove it from `custom_headers` so it isn't
+        // re-applied per-request. **`User-Agent` is never replaced** —
+        // the kernel's base UA carries the `DatabricksJDBCDriverOSS/...`
+        // token the SEA server keys on to enable the
+        // `INLINE_OR_EXTERNAL_LINKS` result disposition; a caller UA that
+        // replaced it would break result fetching (HTTP 400
+        // "not a supported disposition"). Instead we APPEND the caller's
+        // UA as a suffix: `"<base> <caller>"`. This preserves the
+        // disposition gating and honors partner attribution (the
+        // connector's composed `PyDatabricksSqlConnector/x (entry)` UA
+        // rides along after the base token).
+        // Last UA wins if a caller somehow set several.
+        if let Some(caller_ua) = config
+            .custom_headers
+            .iter()
+            .rfind(|(n, _)| n.eq_ignore_ascii_case("user-agent"))
+            .map(|(_, v)| v.clone())
+        {
+            config
+                .custom_headers
+                .retain(|(n, _)| !n.eq_ignore_ascii_case("user-agent"));
+            let caller_ua = caller_ua.trim();
+            // Guard against a pathologically large UA on every request.
+            // 1 KiB is far above any legitimate `product/version (entry)`
+            // string; truncate (don't reject) so an over-long entry
+            // degrades gracefully rather than failing the session.
+            const MAX_UA_SUFFIX: usize = 1024;
+            if caller_ua.len() > MAX_UA_SUFFIX {
+                warn!(
+                    len = caller_ua.len(),
+                    "caller User-Agent suffix exceeds {MAX_UA_SUFFIX} bytes; truncating"
+                );
+            }
+            let caller_ua = &caller_ua[..caller_ua.len().min(MAX_UA_SUFFIX)];
+            if !caller_ua.is_empty() {
+                config.user_agent = format!("{} {}", config.user_agent, caller_ua);
+            }
+        }
+
+        // Validate the remaining custom headers up front so a malformed
+        // name/value fails at session-open rather than on every request
+        // build (where it would surface as a confusing per-request
+        // error). Reserved names are still dropped at request time; we
+        // only reject structurally-invalid headers here.
+        for (name, value) in &config.custom_headers {
+            reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| {
+                Error::invalid_argument()
+                    .message(format!("invalid custom HTTP header name {name:?}: {e}"))
+            })?;
+            reqwest::header::HeaderValue::try_from(value.as_str()).map_err(|e| {
+                Error::invalid_argument().message(format!(
+                    "invalid custom HTTP header value for {name:?}: {e}"
+                ))
+            })?;
+        }
+
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             .timeout(config.read_timeout)
@@ -616,6 +682,38 @@ impl DatabricksHttpClient {
             // Build a fresh request for this attempt
             let mut req_builder = self.client.request(method.clone(), url.clone());
 
+            // Caller-supplied custom headers go on FIRST, so the
+            // kernel's own auth / routing headers (set last, below) take
+            // precedence — matching the Thrift connector, where
+            // `auth_provider.add_headers` runs after the custom-header
+            // dict. We SKIP any custom header named `Authorization` or
+            // `x-databricks-org-id` (case-insensitive) so a stray caller
+            // header can't sit alongside the kernel's (reqwest appends
+            // same-named headers rather than replacing, which for those
+            // two would send a duplicate and could confuse the server).
+            // `User-Agent` is NOT in this map — it was folded into the
+            // client's base UA in `new()` (appended, never replacing,
+            // to preserve the disposition-gating JDBC token).
+            //
+            // Note: this loop runs for BOTH `execute` and
+            // `execute_without_auth`, so custom headers (and the merged
+            // User-Agent) also ride OAuth token-endpoint requests. This
+            // is intentional and matches the Thrift connector, where
+            // `setCustomHeaders` applies to every request on the
+            // transport, IdP calls included.
+            for (name, value) in &self.config.custom_headers {
+                let lname = name.to_ascii_lowercase();
+                if lname == "authorization" || lname == "x-databricks-org-id" {
+                    warn!(
+                        header = %name,
+                        "ignoring caller-supplied custom header; this name is \
+                         managed by the kernel and cannot be overridden"
+                    );
+                    continue;
+                }
+                req_builder = req_builder.header(name, value);
+            }
+
             for (name, value) in headers.iter() {
                 req_builder = req_builder.header(name, value);
             }
@@ -828,6 +926,89 @@ mod tests {
 
         let header = client.auth_header().unwrap();
         assert_eq!(header, "Bearer test-token");
+    }
+
+    #[tokio::test]
+    async fn test_custom_headers_applied_with_auth_winning() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+
+        // Expect: our benign custom header present; the caller's
+        // User-Agent is APPENDED to the kernel's base UA (never
+        // replacing it — the base token gates the SEA result
+        // disposition); Authorization is the kernel's real token (NOT
+        // the caller's bogus one).
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .and(header("x-custom-header", "custom-value"))
+            .and(header(
+                "user-agent",
+                "KernelBase/9.9 MyConnector/1.0 (entry)",
+            ))
+            .and(header("authorization", "Bearer real-token"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = HttpClientConfig {
+            // Fixed base UA so the merged-UA assertion is deterministic
+            // (the real default embeds the crate version).
+            user_agent: "KernelBase/9.9".to_string(),
+            custom_headers: vec![
+                ("x-custom-header".to_string(), "custom-value".to_string()),
+                (
+                    "User-Agent".to_string(),
+                    "MyConnector/1.0 (entry)".to_string(),
+                ),
+                // Caller attempt to override auth — must be ignored; the
+                // kernel's real token wins.
+                (
+                    "Authorization".to_string(),
+                    "Bearer caller-bogus".to_string(),
+                ),
+            ],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        client.set_auth_provider(Arc::new(PersonalAccessToken::new("real-token".to_string())));
+
+        let req = client
+            .inner()
+            .request(reqwest::Method::GET, format!("{}/probe", server.uri()))
+            .build()
+            .unwrap();
+        let resp = client
+            .execute(req, RequestType::GetStatementStatus)
+            .await
+            .expect("request should succeed against the mock");
+        assert_eq!(resp.status().as_u16(), 200);
+        // If the matchers above didn't all match, wiremock returns the
+        // default 404 and the status assert fails — so a 200 confirms
+        // custom header + caller UA present AND auth = real-token.
+    }
+
+    #[test]
+    fn test_malformed_custom_header_rejected_at_construction() {
+        // A structurally-invalid header name must fail at `new()`
+        // (session-open) rather than on the first request build.
+        let bad_name = HttpClientConfig {
+            custom_headers: vec![("Bad Header Name".to_string(), "v".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let err = DatabricksHttpClient::new(bad_name, default_retry_configs()).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("header name"), "{}", err.message);
+
+        // An invalid header value (control char) is likewise rejected.
+        let bad_value = HttpClientConfig {
+            custom_headers: vec![("X-Custom".to_string(), "bad\nvalue".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let err = DatabricksHttpClient::new(bad_value, default_retry_configs()).unwrap_err();
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("header value"), "{}", err.message);
     }
 
     #[tokio::test]

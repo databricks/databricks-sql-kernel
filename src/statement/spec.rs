@@ -284,12 +284,21 @@ impl StatementSpec {
 
     /// Merge a `query_tags` map into the per-statement conf overlay.
     ///
-    /// Serialises `tags` to the comma-separated `key:value` wire shape
-    /// the SEA server expects under the `query_tags` conf key (the same
-    /// shape NodeJS Thrift's `serializeQueryTags` produces: backslashes
-    /// in keys are doubled; backslash / colon / comma in values are
-    /// backslash-escaped) and inserts it into `statement_conf` under
-    /// `"query_tags"`.
+    /// Serialises `tags` to the comma-separated wire shape the SEA
+    /// server expects under the `query_tags` conf key, matching the
+    /// connectors' serialisers (NodeJS Thrift's `serializeQueryTags`
+    /// and the Python connector's `serialize_query_tags`):
+    /// - backslashes in keys are doubled (colon/comma in keys are NOT
+    ///   escaped);
+    /// - backslash / colon / comma in values are backslash-escaped;
+    /// - a **`None`** value emits a **bare key** with no colon (e.g.
+    ///   `{"production": None}` → `"production"`), matching the Python
+    ///   connector's `Dict[str, Optional[str]]` contract. This is
+    ///   distinct from `Some("")`, which emits `key:` (a present but
+    ///   empty value) — `None` means "no value", `Some("")` means
+    ///   "empty value".
+    ///
+    /// Then inserts the result into `statement_conf` under `"query_tags"`.
     ///
     /// - An **empty** `tags` map is a no-op (returns `Ok(self)`),
     ///   matching the "empty map means not-supplied" convention.
@@ -299,7 +308,7 @@ impl StatementSpec {
     ///   ambiguous intent the kernel refuses to silently resolve. Set
     ///   the explicit `statement_conf` map (via [`Self::statement_conf`])
     ///   before calling this so the conflict is detected.
-    pub fn query_tags(&mut self, tags: HashMap<String, String>) -> Result<&mut Self> {
+    pub fn query_tags(&mut self, tags: HashMap<String, Option<String>>) -> Result<&mut Self> {
         if tags.is_empty() {
             return Ok(self);
         }
@@ -347,18 +356,25 @@ impl StatementSpec {
 /// non-deterministic; the SEA server treats conf values as
 /// order-insensitive, so the result is functionally equivalent to the
 /// Thrift output regardless of key order.
-fn serialize_query_tags(tags: &HashMap<String, String>) -> String {
+fn serialize_query_tags(tags: &HashMap<String, Option<String>>) -> String {
     tags.iter()
         .map(|(k, v)| {
             let esc_key = k.replace('\\', "\\\\");
-            let esc_val = v
-                .chars()
-                .flat_map(|c| match c {
-                    '\\' | ':' | ',' => vec!['\\', c],
-                    other => vec![other],
-                })
-                .collect::<String>();
-            format!("{esc_key}:{esc_val}")
+            match v {
+                // `None` → bare key, no colon. Matches the Python
+                // connector's serializer for a `None`-valued tag.
+                None => esc_key,
+                Some(v) => {
+                    let esc_val = v
+                        .chars()
+                        .flat_map(|c| match c {
+                            '\\' | ':' | ',' => vec!['\\', c],
+                            other => vec![other],
+                        })
+                        .collect::<String>();
+                    format!("{esc_key}:{esc_val}")
+                }
+            }
         })
         .collect::<Vec<_>>()
         .join(",")
@@ -454,7 +470,7 @@ mod tests {
     fn query_tags_serialised_into_query_tags_key() {
         let mut s = StatementSpec::new();
         let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
+        tags.insert("team".to_string(), Some("platform".to_string()));
         s.query_tags(tags).unwrap();
         assert_eq!(
             s.statement_conf.get("query_tags").map(String::as_str),
@@ -469,7 +485,7 @@ mod tests {
         conf.insert("query_tags".to_string(), "explicit:value".to_string());
         s.statement_conf(conf);
         let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
+        tags.insert("team".to_string(), Some("platform".to_string()));
         let err = s.query_tags(tags).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(
@@ -507,11 +523,19 @@ mod tests {
     /// byte shape produced by the kernel-side serializer against the
     /// algorithm Thrift uses, so a regression on either side fails this
     /// test.
+    /// One tag with a present value.
+    fn tag(k: &str, v: &str) -> HashMap<String, Option<String>> {
+        let mut m = HashMap::new();
+        m.insert(k.to_string(), Some(v.to_string()));
+        m
+    }
+
     #[test]
     fn serialize_query_tags_matches_thrift_byte_shape_single_tag() {
-        let mut tags = HashMap::new();
-        tags.insert("team".to_string(), "platform".to_string());
-        assert_eq!(serialize_query_tags(&tags), "team:platform");
+        assert_eq!(
+            serialize_query_tags(&tag("team", "platform")),
+            "team:platform"
+        );
     }
 
     #[test]
@@ -519,9 +543,10 @@ mod tests {
         // Per Thrift's `escapedValue.replace(/[\\:,]/g, c => '\\' + c)`:
         // input  `v:1,v\2`
         // output `v\:1\,v\\2`
-        let mut tags = HashMap::new();
-        tags.insert("k".to_string(), "v:1,v\\2".to_string());
-        assert_eq!(serialize_query_tags(&tags), "k:v\\:1\\,v\\\\2");
+        assert_eq!(
+            serialize_query_tags(&tag("k", "v:1,v\\2")),
+            "k:v\\:1\\,v\\\\2"
+        );
     }
 
     #[test]
@@ -532,9 +557,22 @@ mod tests {
         // Colons/commas in keys are NOT escaped on Thrift's path — only
         // in values. Pins this asymmetry so a future "uniformity"
         // refactor that escapes them in keys too gets caught.
+        assert_eq!(serialize_query_tags(&tag("k\\1", "v")), "k\\\\1:v");
+    }
+
+    #[test]
+    fn serialize_query_tags_none_value_emits_bare_key() {
+        // `None` value → bare key, no colon. Matches the Python
+        // connector's serializer for a `None`-valued tag
+        // (`Dict[str, Optional[str]]`).
         let mut tags = HashMap::new();
-        tags.insert("k\\1".to_string(), "v".to_string());
-        assert_eq!(serialize_query_tags(&tags), "k\\\\1:v");
+        tags.insert("production".to_string(), None);
+        assert_eq!(serialize_query_tags(&tags), "production");
+
+        // A `None`-keyed backslash is still escaped in the bare key.
+        let mut tags = HashMap::new();
+        tags.insert("k\\1".to_string(), None);
+        assert_eq!(serialize_query_tags(&tags), "k\\\\1");
     }
 
     #[test]
@@ -548,15 +586,13 @@ mod tests {
         // can't assert a single byte string. Assert each pair is present
         // and the join uses `,`. SEA treats conf values as
         // order-insensitive, so this is functionally equivalent to the
-        // Thrift output regardless of order.
+        // Thrift output regardless of order. Mixes a valued tag with a
+        // bare-key (None) tag.
         let mut tags = HashMap::new();
-        tags.insert("a".to_string(), "1".to_string());
-        tags.insert("b".to_string(), "2".to_string());
+        tags.insert("a".to_string(), Some("1".to_string()));
+        tags.insert("b".to_string(), None);
         let s = serialize_query_tags(&tags);
         let pairs: std::collections::HashSet<&str> = s.split(',').collect();
-        assert!(
-            pairs == ["a:1", "b:2"].iter().copied().collect(),
-            "got: {s}",
-        );
+        assert!(pairs == ["a:1", "b"].iter().copied().collect(), "got: {s}",);
     }
 }

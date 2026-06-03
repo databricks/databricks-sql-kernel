@@ -588,6 +588,7 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
         proxy: HttpProxyConfig::default(),
         tls: HttpTlsConfig::from_public(&config.tls),
         org_id,
+        custom_headers: config.http.custom_headers.clone(),
         ..HttpClientConfig::default()
     };
     // Touch the still-reserved proxy config so a future field addition

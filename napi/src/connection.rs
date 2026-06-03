@@ -88,10 +88,14 @@ pub struct ExecuteOptions {
     /// raises `InvalidArgument` — the caller's intent is ambiguous
     /// so we refuse to silently pick one over the other.
     ///
+    /// A **`null`** value emits a **bare key** (no colon) — e.g.
+    /// `{ production: null }` → `"production"` — matching the
+    /// connectors' `key`-only tag form.
+    ///
     /// See the struct-level "Tag-order caveat" for the
     /// HashMap-iteration-order vs `Object.keys`-iteration-order
     /// divergence and the byte-identical-Thrift-parity workaround.
-    pub query_tags: Option<HashMap<String, String>>,
+    pub query_tags: Option<HashMap<String, Option<String>>>,
     /// Server-side cap on the number of rows this statement returns
     /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
     /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
@@ -199,7 +203,7 @@ fn build_statement(
     session: &Session,
     sql: String,
     statement_conf: Option<HashMap<String, String>>,
-    query_tags: Option<HashMap<String, String>>,
+    query_tags: Option<HashMap<String, Option<String>>>,
     row_limit: Option<i64>,
     query_timeout_secs: Option<u32>,
     positional_params: Vec<TypedValue>,
@@ -220,6 +224,7 @@ fn build_statement(
     }
     // Fold the `queryTags` convenience map into the conf overlay. Empty map is
     // a no-op; a dual definition with `statementConf["query_tags"]` rejects.
+    // A `null` JS value maps to `None` → a bare key on the wire.
     if let Some(tags) = query_tags {
         stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
     }

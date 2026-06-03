@@ -30,6 +30,7 @@ use databricks_sql_kernel::{
     Statement as KStatement,
 };
 use pyo3::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -62,6 +63,32 @@ impl Statement {
     fn set_sql(&mut self, sql: String) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
         inner.stmt.spec().sql(sql);
+        Ok(())
+    }
+
+    /// Set per-statement query tags.
+    ///
+    /// ``tags`` is a ``dict[str, str | None]`` — a ``None`` value emits
+    /// a bare key (no colon) on the wire, matching the connector's
+    /// ``Dict[str, Optional[str]]`` contract. The kernel serialises to
+    /// the SEA ``query_tags`` conf shape and merges it into the
+    /// per-statement conf overlay.
+    ///
+    /// Raises ``KernelError(code='InvalidArgument')`` if a ``query_tags``
+    /// entry was already set explicitly via the statement conf (the
+    /// kernel refuses an ambiguous double-definition). An empty ``tags``
+    /// dict is a no-op.
+    fn set_query_tags(
+        &mut self,
+        py: Python<'_>,
+        tags: HashMap<String, Option<String>>,
+    ) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        inner
+            .stmt
+            .spec()
+            .query_tags(tags)
+            .map_err(|e| to_py_err(py, e))?;
         Ok(())
     }
 
