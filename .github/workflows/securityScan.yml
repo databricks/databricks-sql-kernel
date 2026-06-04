@@ -21,17 +21,29 @@ name: Security Scan
 #
 # Scanner: OSV-Scanner v2.3.8 (purl-based via OSV.dev; federates
 # GHSA, NVD, RustSec, PyPA, Go vuln DB). Reads CycloneDX SBOMs
-# produced by `cargo cyclonedx` over the kernel's two workspaces:
+# produced by `cargo cyclonedx` over the kernel's three standalone
+# workspaces:
 #
-#   1. Root workspace `[".", "pyo3"]` — emits two SBOMs (one per
-#      member: databricks-sql-kernel + databricks-sql-kernel-pyo3).
-#   2. napi/ standalone workspace — emits its own SBOM.
+#   1. Kernel root `Cargo.toml` (members = ["."]) — emits one SBOM
+#      for `databricks-sql-kernel`.
+#   2. pyo3/ standalone workspace — emits one SBOM for
+#      `databricks-sql-kernel-pyo3` (built with `tls-rustls`).
+#   3. napi/ standalone workspace — emits one SBOM for
+#      `databricks-sql-kernel-napi` (also `tls-rustls`).
+#
+# The bindings are deliberately NOT members of the kernel's root
+# workspace because their kernel-dep features (`tls-rustls`) conflict
+# with the kernel's default (`tls-native`); Cargo would unify the
+# feature set across workspace members and trip the mutual-exclusion
+# `compile_error!` in `src/lib.rs`. See the workspace comment in
+# each Cargo.toml.
 #
 # We deliberately do NOT pass --override-filename, because that
-# causes a same-name collision when a workspace has multiple members
-# (one SBOM per member is written to the same path, last-writer
-# wins). Letting cyclonedx pick per-package names + globbing keeps
-# every workspace member in scope.
+# caused a same-name collision back when the root workspace had
+# multiple members (one SBOM per member written to the same path,
+# last-writer wins). Letting cyclonedx pick per-package names +
+# globbing keeps every workspace in scope as the workspace shape
+# evolves.
 #
 # Coverage caveat: the pyo3 SBOM is Rust-only — it does NOT include
 # Python-side runtime deps (pyarrow, etc.) that maturin resolves at
@@ -91,10 +103,11 @@ jobs:
 
       # Two cyclonedx invocations cover all three published artifacts:
       #
-      #   - From repo root: writes one SBOM per root-workspace member.
-      #     Members are [".", "pyo3"], so we get
-      #     databricks-sql-kernel.cdx.json AND
-      #     databricks-sql-kernel-pyo3.cdx.json.
+      #   - From repo root: writes one SBOM (kernel root is now a
+      #     single-member workspace) — databricks-sql-kernel.cdx.json.
+      #
+      #   - From pyo3/: standalone workspace, writes one SBOM
+      #     (databricks-sql-kernel-pyo3.cdx.json).
       #
       #   - From napi/: standalone workspace, writes one SBOM
       #     (databricks-sql-kernel-napi.cdx.json).
@@ -108,15 +121,28 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/sboms
 
-          # Root workspace has members [".", "pyo3"]; cargo-cyclonedx
-          # writes one SBOM per member alongside its Cargo.toml. Pull
-          # them in by EXPLICIT path (./*.cdx.json and pyo3/*.cdx.json)
-          # rather than a **/*.cdx.json globstar walk — the walk would
-          # silently pick up a stray .cdx.json under target/ or a test
+          # The kernel root, pyo3, and napi are each their own
+          # standalone single-member workspaces (see the workspace
+          # comment in each Cargo.toml — pyo3 and napi need
+          # `tls-rustls` while the kernel default is `tls-native`,
+          # and Cargo feature unification across a shared workspace
+          # would trip the mutual-exclusion `compile_error!` in
+          # `src/lib.rs`). So `cargo cyclonedx` has to be invoked
+          # once per workspace.
+          #
+          # Pull SBOMs in by EXPLICIT path rather than a
+          # `**/*.cdx.json` globstar walk — the walk would silently
+          # pick up a stray .cdx.json under target/ or a test
           # fixture if one ever lands.
-          cargo cyclonedx --format json
           shopt -s nullglob
-          for f in ./*.cdx.json pyo3/*.cdx.json; do
+
+          cargo cyclonedx --format json
+          for f in ./*.cdx.json; do
+            cp "$f" "/tmp/sboms/$(basename "$f")"
+          done
+
+          ( cd pyo3 && cargo cyclonedx --format json )
+          for f in pyo3/*.cdx.json; do
             cp "$f" "/tmp/sboms/$(basename "$f")"
           done
 

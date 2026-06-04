@@ -149,7 +149,14 @@ jobs:
         # The pyo3 crate's Rust-side unit tests cover the GIL handoff
         # in isolation. Runs before any maturin build so a pure-Rust
         # break is caught fast.
-        run: cargo test -p databricks-sql-kernel-pyo3
+        #
+        # pyo3 is a standalone workspace (see `pyo3/Cargo.toml`), so
+        # `cargo test` runs from inside `pyo3/` rather than via
+        # `-p` from the kernel root. Same reason as napi: per-binding
+        # TLS feature choice cannot share a workspace with the kernel
+        # default.
+        working-directory: pyo3
+        run: cargo test
 
       - name: "Build + install pyo3 wheel (maturin develop)"
         working-directory: pyo3
