@@ -380,7 +380,7 @@ dependencies = [
 
 [[package]]
 name = "databricks-sql-kernel"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-buffer",
@@ -412,7 +412,7 @@ dependencies = [
 
 [[package]]
 name = "databricks-sql-kernel-pyo3"
-version = "0.1.0"
+version = "0.1.2"
 dependencies = [
  "arrow-array",
  "arrow-pyarrow",
