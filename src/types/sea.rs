@@ -338,6 +338,16 @@ pub struct ExecuteParams {
     pub row_limit: Option<i64>,
     /// Parameters for parameterized query execution.
     pub parameters: Vec<StatementParameter>,
+    /// Optional sink for the server statement id, published as soon as
+    /// the initial `POST /statements` returns it — *before* the
+    /// sync-execute poll loop. Lets a detached canceller
+    /// (`StatementCanceller`) target a still-running sync query (the
+    /// id is otherwise only known once `execute_statement` returns,
+    /// which for a long query is after it has already finished).
+    /// `None` on the async / metadata / submit paths, which don't poll
+    /// inside the transport. Never serialized (this is the internal
+    /// params struct; the wire struct is separate).
+    pub inflight_id_observer: Option<std::sync::Arc<std::sync::Mutex<Option<String>>>>,
 }
 
 /// Compression codec for result data.

@@ -62,6 +62,14 @@ fn attach_attrs(
     http_status: Option<u16>,
     retryable: bool,
     query_id: Option<&str>,
+    // Extended server-supplied status. These mirror the Thrift path's
+    // `displayMessage` / `diagnosticInfo` so the connector can populate
+    // `ServerOperationError.context["diagnostic-info"]` (the Spark stack
+    // trace) at parity. The kernel `Error` carries them but they were
+    // previously dropped here.
+    display_message: Option<&str>,
+    diagnostic_info: Option<&str>,
+    error_details_json: Option<&str>,
 ) -> PyResult<()> {
     bound.setattr("code", code)?;
     bound.setattr("message", message)?;
@@ -71,6 +79,9 @@ fn attach_attrs(
     bound.setattr("http_status", http_status)?;
     bound.setattr("retryable", retryable)?;
     bound.setattr("query_id", query_id)?;
+    bound.setattr("display_message", display_message)?;
+    bound.setattr("diagnostic_info", diagnostic_info)?;
+    bound.setattr("error_details_json", error_details_json)?;
     let _ = py; // silence unused-var warning if pyo3 ever drops the Python<'_> arg
     Ok(())
 }
@@ -94,6 +105,9 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.http_status,
         err.retryable,
         err.query_id.as_deref(),
+        err.display_message.as_deref(),
+        err.diagnostic_info.as_deref(),
+        err.error_details_json.as_deref(),
     ) {
         // Attribute attachment is best-effort. If something goes
         // wrong (extremely unlikely for plain string/int setattrs),
@@ -127,6 +141,9 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
             None,
             None,
             false,
+            None,
+            None,
+            None,
             None,
         ) {
             return setattr_err;

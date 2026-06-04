@@ -27,7 +27,7 @@ use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
     Error as KError, ExecutedStatement as KExecutedStatement, ExecutedStatementHandle,
-    Statement as KStatement,
+    Statement as KStatement, StatementCanceller as KStatementCanceller,
 };
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -186,13 +186,35 @@ impl Statement {
         Ok(())
     }
 
+    /// Produce a detached [`StatementCanceller`] for the statement
+    /// about to run (or running) on this `Statement`.
+    ///
+    /// The sync `execute()` blocks and consumes the statement, so a
+    /// second thread can't reach an `ExecutedStatement` to cancel a
+    /// *running* query (the default PEP-249 `cursor.cancel()` shape).
+    /// Obtain a canceller **before** calling `execute()`; once the
+    /// server issues the statement id mid-execute, `canceller.cancel()`
+    /// reaches it. Cheap; safe to call from another thread.
+    fn canceller(&self) -> PyResult<StatementCanceller> {
+        let inner = alive!(self, "Statement");
+        Ok(StatementCanceller {
+            inner: inner.stmt.canceller(),
+            runtime: inner.runtime.clone(),
+        })
+    }
+
     /// Wait-for-result execution. Blocks until the kernel finishes
     /// polling and returns an `ExecutedStatement` with the result
     /// stream ready to drain.
+    ///
+    /// The blocking drive is interruptible: a `KeyboardInterrupt`
+    /// (Ctrl-C) raised while this is running aborts the query — the
+    /// in-flight future is dropped, firing the kernel's mid-execute
+    /// cancel guard so the server-side statement is cancelled too.
     fn execute(&mut self, py: Python<'_>) -> PyResult<ExecutedStatement> {
         let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();
-        let exec = run_kernel!(py, runtime, inner.stmt.execute())?;
+        let exec = run_kernel_interruptible!(py, &runtime, inner.stmt.execute())?;
         Ok(ExecutedStatement::new(exec, runtime))
     }
 
@@ -351,5 +373,39 @@ impl ExecutedStatement {
             "ExecutedStatement(statement_id={:?}, state={state})",
             self.statement_id
         )
+    }
+}
+
+/// Detached canceller for the statement in flight on a [`Statement`].
+///
+/// Obtained from [`Statement::canceller`] *before* the blocking
+/// `execute()` so a second Python thread can cancel a running sync
+/// query — the PEP-249 `cursor.cancel()`-from-another-thread shape.
+/// Holds no borrow on the `Statement`; safe to call concurrently with
+/// the `execute()` it targets.
+#[pyclass(name = "StatementCanceller")]
+pub(crate) struct StatementCanceller {
+    inner: KStatementCanceller,
+    runtime: Arc<Runtime>,
+}
+
+#[pymethods]
+impl StatementCanceller {
+    /// Server-side cancel of the in-flight statement.
+    ///
+    /// No-op if nothing has executed yet, or the query is still in its
+    /// initial submit round-trip (no statement id observed). Idempotent
+    /// against a server already in a terminal state. Releases the GIL
+    /// while the cancel RPC is in flight.
+    fn cancel(&self, py: Python<'_>) -> PyResult<()> {
+        let runtime = self.runtime.clone();
+        run_kernel!(py, runtime, self.inner.cancel())?;
+        Ok(())
+    }
+
+    /// The server-issued statement id this canceller targets, if one
+    /// has been observed yet (`None` before the server issues it).
+    fn statement_id(&self) -> Option<String> {
+        self.inner.statement_id()
     }
 }
