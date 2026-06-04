@@ -43,12 +43,23 @@
 //! `Statement.execute()` split from PR #121 — the canceller is obtained
 //! before the blocking drive so a concurrent task can cancel a running
 //! query.
+//!
+//! **API-shape note (vs pyo3):** the two bindings expose the same capability
+//! with different shapes. pyo3 splits it across the statement builder —
+//! `stmt.canceller()` returns a detached canceller and `stmt.execute()` drives
+//! the blocking call separately. napi instead returns a single combined
+//! `CancellableExecution` from `Connection.executeStatementCancellable(...)`
+//! that owns both halves (`cancel()` + `result()`), because the napi surface
+//! has no exposed builder-shape `Statement` to hang a `canceller()` off. Same
+//! semantics, fewer moving parts for the JS caller.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
-use databricks_sql_kernel::{Statement as KernelStatement, StatementCanceller};
+use databricks_sql_kernel::{
+    Error as KernelError, ErrorCode, Statement as KernelStatement, StatementCanceller,
+};
 
 use crate::error::napi_err_from_kernel;
 use crate::statement::{statement_closed_err, Statement};
@@ -79,6 +90,15 @@ pub struct CancellableExecution {
     /// second `result()` so the double-drive surfaces
     /// `InvalidStatementHandle` without taking the mutex.
     consumed: Arc<AtomicBool>,
+    /// Set by `cancel()`. Read in `result()`'s error arm to normalise the
+    /// kernel's sync-cancel quirk (`execute()` surfaces a server-side cancel
+    /// as `InvalidArgument`, not `Cancelled`) into `Cancelled`, so every napi
+    /// consumer sees a consistent cancelled status — matching the async path.
+    cancel_fired: Arc<AtomicBool>,
+    /// Set by `result()` once it resolves successfully. Read by `cancel()` to
+    /// skip a redundant server-side cancel RPC on an already-finished
+    /// statement (parity with `AsyncStatement`/`Statement` cancel gating).
+    finished: Arc<AtomicBool>,
 }
 
 impl CancellableExecution {
@@ -93,6 +113,8 @@ impl CancellableExecution {
             pending: Arc::new(Mutex::new(Some(stmt))),
             canceller,
             consumed: Arc::new(AtomicBool::new(false)),
+            cancel_fired: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -118,6 +140,12 @@ impl CancellableExecution {
     /// guard fires a fire-and-forget `cancel_statement` if this future is
     /// dropped mid-flight (`Promise.race` / timeout loser), independently
     /// of an explicit `cancel()`.
+    ///
+    /// On a server-side cancel the kernel's blocking `execute()` currently
+    /// surfaces `InvalidArgument` (a known kernel quirk — the async path
+    /// returns `Cancelled`). When this handle's `cancel()` fired, we normalise
+    /// that into `Cancelled` here so JS callers can rely on a single
+    /// cancelled-status code regardless of execution path.
     #[napi]
     pub async fn result(&self) -> napi::Result<Statement> {
         // Mark consumed before taking, so a racing second `result()`
@@ -127,17 +155,39 @@ impl CancellableExecution {
             return Err(statement_closed_err());
         }
         let pending = Arc::clone(&self.pending);
+        let cancel_fired = Arc::clone(&self.cancel_fired);
+        let finished = Arc::clone(&self.finished);
         guarded(async move {
             let mut stmt = {
                 let mut guard = pending.lock().await;
                 guard.take().ok_or_else(statement_closed_err)?
             };
-            let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
-            // Pass the parent kernel `Statement` into the JS wrapper so
-            // its `Drop` doesn't invalidate the executed handle via the
-            // shared `ValidityFlag` — same rationale as
-            // `Connection::execute_statement`.
-            Ok(Statement::from_executed(stmt, executed))
+            match stmt.execute().await {
+                Ok(executed) => {
+                    // Mark finished so a later `cancel()` skips a redundant RPC.
+                    finished.store(true, Ordering::Release);
+                    // Pass the parent kernel `Statement` into the JS wrapper so
+                    // its `Drop` doesn't invalidate the executed handle via the
+                    // shared `ValidityFlag` — same rationale as
+                    // `Connection::execute_statement`.
+                    Ok(Statement::from_executed(stmt, executed))
+                }
+                Err(kernel_err) => {
+                    // Normalise the sync-cancel `InvalidArgument` quirk into
+                    // `Cancelled` when the caller fired `cancel()`. Any other
+                    // failure (or a non-cancel `InvalidArgument`) passes through
+                    // verbatim.
+                    if cancel_fired.load(Ordering::Acquire)
+                        && kernel_err.code == ErrorCode::InvalidArgument
+                    {
+                        Err(napi_err_from_kernel(
+                            KernelError::cancelled().message("statement cancelled by client"),
+                        ))
+                    } else {
+                        Err(napi_err_from_kernel(kernel_err))
+                    }
+                }
+            }
         })
         .await
     }
@@ -147,11 +197,20 @@ impl CancellableExecution {
     /// Lock-free: fires the detached `StatementCanceller` captured at
     /// construction rather than taking the mutex `result()` holds, so it
     /// interrupts a still-running blocking `result()` instead of queueing
-    /// behind it. No-op (returns `Ok`) if no statement id has been
-    /// observed yet (query still in its initial submit round-trip), and
-    /// idempotent against a server already in a terminal state.
+    /// behind it. No-op (returns `Ok`) if `result()` already finished
+    /// successfully, or if no statement id has been observed yet (query still
+    /// in its initial submit round-trip), and idempotent against a server
+    /// already in a terminal state.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
+        // Skip the server-side cancel RPC if the statement already finished —
+        // it would be a redundant no-op-at-server call and a confusing log line.
+        if self.finished.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        // Record intent so `result()` can normalise the kernel's sync-cancel
+        // `InvalidArgument` into `Cancelled`.
+        self.cancel_fired.store(true, Ordering::Release);
         let canceller = self.canceller.clone();
         guarded(async move { canceller.cancel().await.map_err(napi_err_from_kernel) }).await
     }

@@ -962,12 +962,12 @@ async fn sync_canceller_cancels_a_running_execute_mid_compute() {
         .expect("execute() must reject after a server-side cancel, not run to completion");
     // The invariant that matters: the cancel interrupted the running execute
     // (it errored ~13s in, not after running the 1e12-row cross join to term).
-    // KERNEL QUIRK (follow-up): the sync execute() path currently surfaces a
-    // server-side cancel as `InvalidArgument`, whereas the async path returns
-    // `Cancelled`. The napi/pyo3 wrappers map it to a cancelled status via their
-    // client-side cancel flag, so callers still observe "cancelled". Accept both
-    // so this test stays green today and after the code is normalised to
-    // `Cancelled`.
+    // KERNEL QUIRK: this CORE `Statement::execute()` path surfaces a server-side
+    // cancel as `InvalidArgument`, whereas the async path returns `Cancelled`.
+    // The napi `CancellableExecution` normalises it to `Cancelled` at the
+    // binding layer (see napi/src/cancellable.rs — done in this PR); pyo3 does
+    // not yet. This core test asserts the raw kernel behaviour, so it accepts
+    // both — and stays green if/when the core itself is normalised to `Cancelled`.
     assert!(
         matches!(err.code, ErrorCode::Cancelled | ErrorCode::InvalidArgument),
         "cancelled execute should error (Cancelled, or today's InvalidArgument), got {:?}",
