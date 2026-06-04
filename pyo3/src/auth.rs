@@ -54,6 +54,17 @@ pub(crate) struct OAuthParams {
     pub callback_timeout_secs: Option<u64>,
 }
 
+/// Default U2M OAuth client id for the **Python** binding.
+///
+/// Matches the standalone Thrift connector's `PYSQL_OAUTH_CLIENT_ID`
+/// (`databricks-sql-python`), so the `use_kernel=True` path presents
+/// the same OAuth app identity — and shares the same SSO token-cache
+/// entry — as the Thrift backend. The kernel's own bare-Rust fallback
+/// is `databricks-cli`; we override it here so pyo3 (Python) and napi
+/// (Node, `databricks-sql-connector`) don't collide on a shared cache
+/// key and each aligns with its standalone-driver sibling.
+const PYSQL_OAUTH_CLIENT_ID: &str = "databricks-sql-python";
+
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
 /// constructor accepts.
 ///
@@ -117,7 +128,7 @@ fn build_auth_config_inner(
             if matches!(oauth.client_id.as_deref(), Some("")) {
                 return Err(
                     "auth_type='oauth-u2m' client_id must be non-empty when set; \
-                     omit it to use the default 'databricks-cli'"
+                     omit it to use the default 'databricks-sql-python'"
                         .to_owned(),
                 );
             }
@@ -136,7 +147,20 @@ fn build_auth_config_inner(
                 );
             }
             Ok(AuthConfig::OAuthU2M {
-                client_id: oauth.client_id,
+                // Default the U2M OAuth client to the Python connector's
+                // own registered client (`databricks-sql-python`), NOT
+                // the kernel's bare-Rust fallback (`databricks-cli`).
+                // This matches the standalone Thrift connector
+                // (`PYSQL_OAUTH_CLIENT_ID` in databricks-sql-python's
+                // auth.py) so a user gets the same OAuth app identity —
+                // and the same SSO token cache entry — whether they use
+                // the Thrift backend or `use_kernel=True`. It also keeps
+                // the kernel's per-{host,client_id,scopes} token cache
+                // distinct from the napi (Node) binding's, which defaults
+                // to its own client.
+                client_id: oauth
+                    .client_id
+                    .or_else(|| Some(PYSQL_OAUTH_CLIENT_ID.to_owned())),
                 redirect_port: oauth.redirect_port,
                 scopes: oauth.scopes,
                 token_url_override: oauth.token_url,
@@ -250,8 +274,11 @@ mod tests {
     }
 
     #[test]
-    fn u2m_builds_with_all_defaults_none() {
-        // U2M takes no mandatory fields; the kernel fills defaults.
+    fn u2m_defaults_client_id_to_python_connector() {
+        // U2M takes no mandatory fields. The Python binding defaults the
+        // OAuth client_id to `databricks-sql-python` (NOT the kernel's
+        // bare `databricks-cli`) so it matches the standalone Thrift
+        // connector and the napi binding gets a distinct cache key.
         let cfg = build_auth_config_inner("oauth-u2m", None, OAuthParams::default()).unwrap();
         match cfg {
             AuthConfig::OAuthU2M {
@@ -261,11 +288,30 @@ mod tests {
                 token_url_override,
                 callback_timeout,
             } => {
-                assert!(client_id.is_none());
+                assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 assert!(redirect_port.is_none());
                 assert!(scopes.is_none());
                 assert!(token_url_override.is_none());
                 assert!(callback_timeout.is_none());
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_explicit_client_id_overrides_default() {
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                client_id: Some("my-custom-app".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M { client_id, .. } => {
+                assert_eq!(client_id.as_deref(), Some("my-custom-app"));
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

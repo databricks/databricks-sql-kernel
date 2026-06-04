@@ -80,15 +80,17 @@ enum AnyInner {
 }
 
 impl AnyInner {
-    /// Borrow the underlying result stream regardless of variant. The
-    /// executed-statement variant delegates to its
-    /// `ExecutedStatement::result_stream_mut`; the metadata variant
-    /// returns the bare `ResultStream` directly. Used by
-    /// `fetch_next_batch` to share one streaming path across both.
-    fn result_stream_mut(&mut self) -> &mut ResultStream {
+    /// Pull the next batch, variant-aware so the executed path gets the
+    /// kernel's **auto-close-on-drain** (fire-and-forget CloseStatement
+    /// once the stream is exhausted, after all lazy CloudFetch link
+    /// fetches). The metadata variant uses the bare stream's
+    /// `next_batch` — it carries its own close-on-drop guard
+    /// (`ResultStream::from_reader_with_close`), so it must NOT route
+    /// through the executed auto-close.
+    async fn next_batch(&mut self) -> databricks_sql_kernel::Result<Option<&ResultBatch>> {
         match self {
-            AnyInner::Executed(s) => s.executed.result_stream_mut(),
-            AnyInner::Metadata(rs) => rs,
+            AnyInner::Executed(s) => s.executed.next_batch().await,
+            AnyInner::Metadata(rs) => rs.next_batch().await,
         }
     }
 }
@@ -328,15 +330,17 @@ impl Statement {
         guarded(async move {
             let mut guard = inner.lock().await;
             let inner_state = guard.as_mut().ok_or_else(statement_closed_err)?;
-            // `result_stream_mut` returns `&mut ResultStream` for both
-            // variants — the executed-path borrows from its
-            // `ExecutedStatement`, the metadata-path borrows from its
-            // bare `ResultStream`. The IPC schema header serialised
-            // into every batch payload comes from the cached
-            // `self.schema` captured outside the lock (see method
-            // start), so no need to re-fetch from the stream.
-            let stream = inner_state.result_stream_mut();
-            let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
+            // The IPC schema header serialised into every batch payload
+            // comes from the cached `self.schema` captured outside the
+            // lock (see method start), so no need to re-fetch from the
+            // stream.
+            // Variant-aware: the executed path auto-closes the server
+            // statement on drain; the metadata path uses its own
+            // close-on-drop guard. (See `AnyInner::next_batch`.)
+            let maybe_batch = inner_state
+                .next_batch()
+                .await
+                .map_err(napi_err_from_kernel)?;
             let Some(batch) = maybe_batch else {
                 // End of stream — record so a defensive cancel after
                 // natural completion can short-circuit to Ok(()).

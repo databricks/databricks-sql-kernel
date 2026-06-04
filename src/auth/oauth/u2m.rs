@@ -376,11 +376,26 @@ impl AuthProvider for AuthorizationCodeProvider {
                                     return Ok(token);
                                 }
                                 Err(e) => {
-                                    crate::klog::warn!(
-                                        "Token refresh failed, falling back to browser flow: {}",
-                                        e
-                                    );
-                                    // Fall through to browser flow
+                                    // We HAD a refresh token and it failed
+                                    // (expired / revoked / invalid_grant).
+                                    // Do NOT fall through to the interactive
+                                    // browser flow: in a headless / long-lived
+                                    // server context (no browser, no human)
+                                    // that would block this query thread for
+                                    // the full callback timeout (~120s) and
+                                    // then fail opaquely. Fail fast with an
+                                    // auth error instead — matching the Thrift
+                                    // connector, whose mid-session refresh path
+                                    // (oauth.py check_and_refresh_access_token)
+                                    // raises and never launches a browser. The
+                                    // browser flow remains reachable only for a
+                                    // genuine first connect (no cached token),
+                                    // below.
+                                    crate::klog::warn!("OAuth token refresh failed: {}", e);
+                                    return Err(Error::unauthenticated().message(format!(
+                                        "OAuth token refresh failed (refresh token expired or \
+                                         revoked); re-authentication required: {e}"
+                                    )));
                                 }
                             }
                         }

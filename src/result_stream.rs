@@ -47,6 +47,7 @@
 
 use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
+use crate::session::SessionInner;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, DecimalType, Float32Type, Float64Type,
@@ -463,6 +464,46 @@ pub struct ResultStream {
     /// call on readers whose `next_batch` is non-trivial (CloudFetch
     /// in particular checks state and may take a runtime tick).
     exhausted: bool,
+
+    /// Optional fire-and-forget `CloseStatement` on Drop.
+    ///
+    /// `Some` only for the **metadata** path (`Metadata::list_*`),
+    /// which produces a bare `ResultStream` with no owning
+    /// `ExecutedStatement` to reap the server-side statement. Without
+    /// this, every metadata call leaked a server statement until the
+    /// session closed. The data path leaves this `None` — there the
+    /// owning `ExecutedStatement` (or its `Drop`) issues the close, so
+    /// a second guard here would double-fire.
+    close_guard: Option<StatementCloseGuard>,
+}
+
+/// Fire-and-forget `CloseStatement`-on-Drop for a server statement that
+/// no other handle owns (the metadata path). Mirrors the
+/// `ExecutedStatement` Drop cleanup, scoped to the bare-stream case.
+struct StatementCloseGuard {
+    session: Arc<SessionInner>,
+    statement_id: String,
+}
+
+impl Drop for StatementCloseGuard {
+    fn drop(&mut self) {
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = std::mem::take(&mut self.statement_id);
+        if stmt_id.is_empty() {
+            return;
+        }
+        runtime.spawn(async move {
+            if let Err(e) = transport.close_statement(&stmt_id).await {
+                crate::klog::warn!(
+                    "fire-and-forget close_statement for metadata stream {} failed: {} \
+                     (server reclaims on session close)",
+                    stmt_id,
+                    e
+                );
+            }
+        });
+    }
 }
 
 impl ResultStream {
@@ -487,7 +528,35 @@ impl ResultStream {
             current: None,
             current_row_idx: 0,
             exhausted: false,
+            close_guard: None,
         })
+    }
+
+    /// Like [`from_reader`](Self::from_reader), but the stream owns a
+    /// fire-and-forget `CloseStatement` for `statement_id`, fired when
+    /// the stream is dropped.
+    ///
+    /// For the **metadata** path only: `Metadata::list_*` returns a
+    /// bare `ResultStream` with no owning `ExecutedStatement`, so
+    /// nothing else reaps the server statement. The data path uses
+    /// `from_reader` (no guard) because `ExecutedStatement` owns the
+    /// close there.
+    pub(crate) async fn from_reader_with_close(
+        reader: Box<dyn ResultReader>,
+        session: Arc<SessionInner>,
+        statement_id: String,
+    ) -> Result<Self> {
+        let mut stream = Self::from_reader(reader).await?;
+        // Skip the guard for an empty id (inline fast-path results the
+        // server already auto-closed) — nothing to reap, and an empty
+        // CloseStatement would be a wasted/invalid RPC.
+        if !statement_id.is_empty() {
+            stream.close_guard = Some(StatementCloseGuard {
+                session,
+                statement_id,
+            });
+        }
+        Ok(stream)
     }
 
     /// Result schema. Available before any batches have been pulled.
@@ -534,6 +603,18 @@ impl ResultStream {
                 Ok(None)
             }
         }
+    }
+
+    /// The batch most recently buffered by
+    /// [`next_batch`](Self::next_batch), without advancing the stream
+    /// or doing any I/O. `None` before the first `next_batch` or after
+    /// end-of-stream.
+    ///
+    /// Used by [`ExecutedStatement::next_batch`](crate::statement::executed::ExecutedStatement::next_batch)
+    /// to re-borrow the just-fetched batch after a borrow-scoped
+    /// exhaustion check, so it can fire the auto-close on `None`.
+    pub fn current(&self) -> Option<&ResultBatch> {
+        self.current.as_ref()
     }
 
     /// Pull the next row from the currently-buffered batch.

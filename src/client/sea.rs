@@ -313,7 +313,14 @@ impl SeaRestTransport {
                 ))
             }
             StatementState::Canceled => {
-                let error = Error::invalid_state()
+                // `cancelled()` (ErrorCode::Cancelled), not invalid_state:
+                // a server-side cancel (admin cancel, warehouse eviction,
+                // another client's cancel) is an operational/cancelled
+                // condition, not a caller-argument error. The connector
+                // maps "Cancelled" -> OperationalError (the DatabaseError
+                // family Thrift uses), whereas invalid_state collapses to
+                // InvalidArgument -> ProgrammingError (misleading "bad SQL").
+                let error = Error::cancelled()
                     .message("Statement was canceled")
                     .with_query_id(&response.statement_id);
                 StatementOutcome::Err(crate::kernel_error::carry_extended_status(

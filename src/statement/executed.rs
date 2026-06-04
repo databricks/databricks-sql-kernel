@@ -30,7 +30,7 @@
 
 use crate::kernel_error::Result;
 use crate::klog::warn;
-use crate::result_stream::{ResultStream, SchemaRef};
+use crate::result_stream::{ResultBatch, ResultStream, SchemaRef};
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::validity::ValidityFlag;
@@ -109,6 +109,69 @@ impl ExecutedStatement {
     /// otherwise the borrow checker rejects the call.
     pub fn result_stream_mut(&mut self) -> &mut ResultStream {
         &mut self.result_stream
+    }
+
+    /// Pull the next result batch, **auto-closing the server statement
+    /// when the stream is exhausted**.
+    ///
+    /// Identical to `result_stream_mut().next_batch()` except that the
+    /// first time it observes end-of-stream (`Ok(None)`), it spawns a
+    /// fire-and-forget `CloseStatement` (guarded by the shared `closed`
+    /// flag, so `Drop` / explicit `close()` never double-fire).
+    ///
+    /// Why this matters: for a large CloudFetch result whose chunk
+    /// *links* are paginated (`all_fetched=false`), the reader fetches
+    /// later links lazily via `get_result_chunks` against the live
+    /// server statement *during consumption*. Closing the statement
+    /// before the stream is drained (as a premature connector
+    /// `Statement::close()` did) breaks those lazy fetches. Closing
+    /// *here*, only once `next_batch` has returned `None`, guarantees
+    /// every lazy link fetch has already completed — so the close is
+    /// always safe, and the connector no longer needs to close the
+    /// statement on the sync path at all.
+    ///
+    /// Bindings should call this instead of
+    /// `result_stream_mut().next_batch()` so the auto-close fires.
+    pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
+        // NLL: when `next_batch` yields `Some`, the returned reference
+        // keeps `self.result_stream` borrowed, so we return it directly.
+        // When it yields `None`, that borrow has ended — so we can read
+        // the other `self` fields to fire the auto-close. We branch on a
+        // cheap `is_some()` check (not the reference itself) to let the
+        // borrow end before the `None` arm touches `self`.
+        if self.result_stream.next_batch().await?.is_some() {
+            // Re-borrow and return the batch the stream just buffered.
+            // `current()` returns the same already-fetched batch without
+            // advancing the stream.
+            return Ok(self.result_stream.current());
+        }
+        // End-of-stream: every lazy link fetch has completed, so the
+        // server statement is safe to close.
+        self.spawn_close_if_open();
+        Ok(None)
+    }
+
+    /// Spawn a fire-and-forget `CloseStatement` unless the statement is
+    /// already closed (`closed` flag). Shared by [`Self::next_batch`]'s
+    /// auto-close-on-drain and `Drop`. The `swap` makes whichever fires
+    /// first win; the other observes `closed=true` and skips.
+    fn spawn_close_if_open(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let transport = Arc::clone(self.session.transport());
+        let runtime = self.session.runtime_handle().clone();
+        let stmt_id = self.statement_id.clone();
+        runtime.spawn(async move {
+            if let Err(e) = transport.close_statement(&stmt_id).await {
+                warn!(
+                    statement_id = %stmt_id,
+                    error = %e,
+                    "fire-and-forget close_statement failed; \
+                     server-side resource reclaimed when the session closes"
+                );
+            }
+        });
     }
 
     /// Rows modified by the statement (UPDATE / INSERT / DELETE /
@@ -246,31 +309,12 @@ impl ExecutedStatementHandle for ExecutedStatement {
 
 impl Drop for ExecutedStatement {
     fn drop(&mut self) {
-        // `swap` (not `load`) so the shared `closed` flag — held by the
-        // parent `Statement::last_closed` — reflects that Drop is now
-        // handling cleanup. Without this, a `drop(executed) → execute()
-        // again` sequence would have `invalidate_prior` fire a redundant
-        // `CloseStatement` racing the one we're about to spawn. The
-        // server is idempotent so it's harmless, but a wasted RPC.
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        // Fire-and-forget CloseStatement. Drop must not panic and
-        // we can't surface a failure here; the runtime keeps the
-        // background task alive until completion. Swallows errors
-        // by design.
-        let transport = Arc::clone(self.session.transport());
-        let runtime = self.session.runtime_handle().clone();
-        let stmt_id = self.statement_id.clone();
-        runtime.spawn(async move {
-            if let Err(e) = transport.close_statement(&stmt_id).await {
-                warn!(
-                    statement_id = %stmt_id,
-                    error = %e,
-                    "fire-and-forget close_statement on Drop failed; \
-                     server-side resource reclaimed when the session closes"
-                );
-            }
-        });
+        // Backstop for the not-fully-drained case (partial fetch /
+        // abandoned result / early error): if the stream was drained,
+        // `next_batch`'s auto-close already fired and flipped `closed`,
+        // so this is a no-op (the `swap` inside sees `closed=true`).
+        // Drop must not panic and can't surface failure — fire-and-
+        // forget; the runtime keeps the task alive until completion.
+        self.spawn_close_if_open();
     }
 }

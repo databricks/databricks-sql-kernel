@@ -324,10 +324,10 @@ impl ExecutedStatement {
             return Ok(None);
         }
         let runtime = inner.runtime.clone();
-        let batch = run_sync_kernel!(
-            py,
-            fetch::next_batch(&runtime, inner.exec.result_stream_mut())
-        )?;
+        // `next_batch_exec` drives the ExecutedStatement so the kernel's
+        // auto-close-on-drain fires the server CloseStatement once the
+        // stream is exhausted (after all lazy CloudFetch link fetches).
+        let batch = run_sync_kernel!(py, fetch::next_batch_exec(&runtime, &mut inner.exec))?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
@@ -341,7 +341,7 @@ impl ExecutedStatement {
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = alive_mut!(self, "ExecutedStatement");
         let runtime = inner.runtime.clone();
-        let batches = run_sync_kernel!(py, fetch::drain(&runtime, inner.exec.result_stream_mut()))?;
+        let batches = run_sync_kernel!(py, fetch::drain_exec(&runtime, &mut inner.exec))?;
         inner.exhausted = true;
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
