@@ -77,10 +77,35 @@ use databricks_sql_kernel::KERNEL_LOG_TARGET as KERNEL_TARGET;
 /// customer can isolate boundary logs from core kernel logs by name.
 pub(crate) const PYO3_LOG_TARGET: &str = "databricks::sql::kernel::pyo3";
 
-/// Holds the `ResetHandle` from the one-time install so [`reset_logging`]
-/// can clear `pyo3_log`'s caches after a Python-side level change. `None`
-/// until [`init_logging`] succeeds.
-static RESET_HANDLE: OnceLock<Mutex<Option<ResetHandle>>> = OnceLock::new();
+/// One-time install state. Tristate (rather than `Option<ResetHandle>`)
+/// so a *failed* install is sticky: we don't retry `Logger::install()`
+/// — which re-walks construction + the global-logger set — on every
+/// subsequent `init_logging` call.
+enum LogState {
+    /// No install attempted yet.
+    NotInstalled,
+    /// Installed; handle retained for [`reset_logging`].
+    Installed(ResetHandle),
+    /// Install was attempted and failed (or `Logger` construction
+    /// failed). Sticky — we won't try again this process.
+    Failed,
+}
+
+/// Holds the install state so [`reset_logging`] can reach the
+/// `ResetHandle` and repeated `init_logging` calls stay cheap. `Mutex`
+/// poisoning is handled (`into_inner`) rather than `unwrap`-panicked —
+/// a logging helper must never take down the process.
+static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
+
+/// Lock the state, recovering the guard if a previous holder panicked
+/// while holding it (poisoned). Logging must never panic the caller, so
+/// we never `unwrap` the lock.
+fn lock_state() -> std::sync::MutexGuard<'static, LogState> {
+    LOG_STATE
+        .get_or_init(|| Mutex::new(LogState::NotInstalled))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 /// Install the `tracing`/`log` -> Python `logging` bridge.
 ///
@@ -103,12 +128,16 @@ static RESET_HANDLE: OnceLock<Mutex<Option<ResetHandle>>> = OnceLock::new();
 /// customer can silence them with the standard
 /// `logging.getLogger("hyper_util").setLevel(WARNING)`.
 ///
-/// Returns `true` if this call performed the install, `false` if logging
-/// was already initialized.
+/// Returns `true` if this call performed the install, `false` otherwise
+/// (already installed, a prior attempt failed, `Logger` construction
+/// failed, or another global `log` logger is already set). Never panics:
+/// a logging helper must not be able to tear down the host process.
 pub(crate) fn init_logging(py: Python<'_>) -> bool {
-    let slot = RESET_HANDLE.get_or_init(|| Mutex::new(None));
-    let mut guard = slot.lock().unwrap();
-    if guard.is_some() {
+    let mut state = lock_state();
+    // Already installed, or a prior attempt failed — don't retry. Retry
+    // would re-run `Logger::install()`'s global-logger set, which is not
+    // free, on every Session construction.
+    if !matches!(*state, LogState::NotInstalled) {
         return false;
     }
 
@@ -119,22 +148,37 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
     // gating. The explicit kernel `filter_target` is redundant under a
     // `Trace` default but documents the contract target and guards
     // against a future default change silently dropping kernel records.
-    let handle = Logger::new(py, Caching::LoggersAndLevels)
-        .expect("failed to construct pyo3_log Logger")
+    //
+    // `Logger::new` returns a `PyResult` — it can fail if the Python
+    // `logging` module can't be imported or the interpreter is mid
+    // shutdown. We must NOT `expect()` it: an unwinding panic across the
+    // pyo3/FFI boundary is undefined behavior and would tear down the
+    // process over a non-essential feature. Treat it as a sticky failure.
+    let logger = match Logger::new(py, Caching::LoggersAndLevels) {
+        Ok(l) => l,
+        Err(_) => {
+            *state = LogState::Failed;
+            return false;
+        }
+    };
+    let handle = logger
         .filter(log::LevelFilter::Trace)
         .filter_target(KERNEL_TARGET.to_owned(), log::LevelFilter::Trace)
         .install();
 
     match handle {
         Ok(h) => {
-            *guard = Some(h);
+            *state = LogState::Installed(h);
             true
         }
         Err(_) => {
-            // Another `log` logger is already installed (e.g. the host
-            // application set one up). We leave it in place — the host's
-            // logger wins and kernel records flow through it. Not an
-            // error worth surfacing to Python.
+            // A global `log` logger is already installed (e.g. the host
+            // application or another library set one up). We leave it in
+            // place; kernel records then flow to *that* logger (whatever
+            // sink it points at — e.g. env_logger to stderr), NOT to
+            // Python `logging`. Sticky so we don't retry the failing
+            // install on every call.
+            *state = LogState::Failed;
             false
         }
     }
@@ -142,12 +186,10 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
 
 /// Clear `pyo3_log`'s logger/level caches so a Python-side logging
 /// reconfiguration (e.g. a `setLevel` call after the first kernel log)
-/// takes effect. No-op if logging was never initialized.
+/// takes effect. No-op if logging was never installed. Never panics.
 pub(crate) fn reset_logging() {
-    if let Some(slot) = RESET_HANDLE.get() {
-        if let Some(handle) = slot.lock().unwrap().as_ref() {
-            handle.reset();
-        }
+    if let LogState::Installed(handle) = &*lock_state() {
+        handle.reset();
     }
 }
 

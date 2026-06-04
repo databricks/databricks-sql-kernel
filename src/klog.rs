@@ -127,10 +127,21 @@ mod tests {
     /// string — this is the value `pyo3_log` turns into the
     /// `databricks.sql.kernel` Python logger. If a future change routes
     /// kernel logs through a different target, this fails loudly.
+    ///
+    /// CONSTRAINT: this test installs a process-global `log` logger via
+    /// `set_boxed_logger`. There must be at most ONE such test per test
+    /// binary — `log` allows only one global logger, and a second
+    /// `set_boxed_logger` from a sibling test would no-op (its `Err` is
+    /// ignored), so whichever test runs first wins and the other would
+    /// silently capture into the wrong sink. If another global-logger
+    /// test is ever added to this crate's unit-test binary, move one of
+    /// them to an integration test (separate binary) or gate behind a
+    /// shared `Once`. Today this is the only one.
     #[test]
     fn klog_emits_contract_target() {
         CAPTURED.get_or_init(|| Mutex::new(Vec::new()));
-        // Ignore error: another test in the binary may have set a logger.
+        // Ignore error: tolerate a logger already set in this binary
+        // (see the CONSTRAINT note above — only one such test exists).
         let _ = log::set_boxed_logger(Box::new(Capture));
         log::set_max_level(log::LevelFilter::Trace);
 

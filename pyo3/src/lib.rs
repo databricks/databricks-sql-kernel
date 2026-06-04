@@ -86,5 +86,14 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<result_stream::ResultStream>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
+
+    // Install the log bridge at module import so *any* consumer of the
+    // bare wheel (the connector, integration tests, custom embedders)
+    // gets kernel logs in Python `logging` without an explicit
+    // `init_logging()` call. It's idempotent and never panics, so the
+    // connector's own call at kernel-backend load is a harmless no-op.
+    // Records still only surface once a customer raises the relevant
+    // logger's level, so this default-on install is silent until asked.
+    logging::init_logging(m.py());
     Ok(())
 }
