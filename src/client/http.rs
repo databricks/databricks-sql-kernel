@@ -27,12 +27,12 @@ use crate::client::retry::{
     calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
 };
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, warn};
 use reqwest::{Client, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
-use tracing::{debug, warn};
 
 /// Configuration for HTTP proxy.
 ///

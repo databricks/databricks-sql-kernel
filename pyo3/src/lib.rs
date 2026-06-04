@@ -36,6 +36,7 @@ mod auth;
 mod errors;
 mod executed_async;
 mod fetch;
+mod logging;
 mod metadata;
 mod params;
 mod result_stream;
@@ -43,6 +44,35 @@ mod session;
 mod statement;
 
 use pyo3::prelude::*;
+
+/// Route kernel logs into Python's `logging`. Idempotent — safe to call
+/// more than once (later calls are no-ops). Returns `True` if this call
+/// performed the install, `False` if logging was already initialized (by
+/// an earlier call or because the host process owns the `log` logger).
+///
+/// The connector calls this automatically when the kernel backend loads,
+/// so `use_kernel=True` users need not call it themselves.
+///
+/// Records are forwarded under per-crate logger names: the kernel's own
+/// events under `databricks.sql.kernel` (and the pyo3 boundary under
+/// `databricks.sql.kernel.pyo3`), plus the underlying HTTP stack
+/// (`hyper_util.client…`, `reqwest.connect`, `rustls`, …). Each is gated
+/// by its Python logger's level, so deps stay quiet until a customer
+/// raises them — e.g. `logging.getLogger("databricks.sql").setLevel(DEBUG)`
+/// for everything, or silence the wire chatter with
+/// `logging.getLogger("hyper_util").setLevel(WARNING)`.
+#[pyfunction]
+fn init_logging(py: Python<'_>) -> bool {
+    logging::init_logging(py)
+}
+
+/// Clear cached logger levels so a Python-side logging reconfiguration
+/// applied *after* the first kernel log (e.g. raising
+/// `databricks.sql.kernel` to DEBUG mid-session) takes effect.
+#[pyfunction]
+fn reset_logging() {
+    logging::reset_logging();
+}
 
 #[pymodule]
 fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
@@ -55,5 +85,16 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<executed_async::ExecutedAsyncStatement>()?;
     m.add_class::<metadata::Metadata>()?;
     m.add_class::<result_stream::ResultStream>()?;
+    m.add_function(wrap_pyfunction!(init_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
+
+    // Install the log bridge at module import so *any* consumer of the
+    // bare wheel (the connector, integration tests, custom embedders)
+    // gets kernel logs in Python `logging` without an explicit
+    // `init_logging()` call. It's idempotent and never panics, so the
+    // connector's own call at kernel-backend load is a harmless no-op.
+    // Records still only surface once a customer raises the relevant
+    // logger's level, so this default-on install is silent until asked.
+    logging::init_logging(m.py());
     Ok(())
 }

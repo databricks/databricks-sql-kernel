@@ -55,6 +55,7 @@
 //! `crate::statement::validity` for the flag implementation.
 
 use crate::kernel_error::{Error, Result};
+use crate::klog::warn;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
@@ -65,7 +66,7 @@ use crate::statement::validity::ValidityFlag;
 use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use tracing::{warn, Instrument};
+use tracing::Instrument;
 
 /// Shared slot holding the server statement id of the statement
 /// currently in flight on a [`Statement`] (or its most recent

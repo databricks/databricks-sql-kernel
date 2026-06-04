@@ -21,6 +21,7 @@
 use crate::client::retry::RequestType;
 use crate::client::DatabricksHttpClient;
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, warn};
 use crate::reader::cloudfetch::arrow_parser::parse_arrow_ipc;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::CompressionCodec;
@@ -28,7 +29,6 @@ use arrow_array::RecordBatch;
 use reqwest::Method;
 use std::sync::Arc;
 use std::time::Instant;
-use tracing::{debug, warn};
 
 /// Downloads Arrow data from cloud storage presigned URLs.
 ///

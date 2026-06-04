@@ -60,13 +60,14 @@ use crate::config::{
     ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
 };
 use crate::kernel_error::{Error, Result};
+use crate::klog::debug;
 use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
 use crate::statement::mutable::Statement;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
-use tracing::{debug, info_span, Instrument, Span};
+use tracing::{info_span, Instrument, Span};
 
 /// Crate-internal session state. Wrapped in `Arc` and shared with
 /// every child handle (`Statement`, `ExecutedStatement`, …) so the
@@ -283,7 +284,7 @@ impl Session {
             let has_nonempty_user_value = session_conf
                 .iter()
                 .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
-            tracing::debug!(
+            crate::klog::debug!(
                 cloudfetch_enabled = false,
                 user_value_present = has_nonempty_user_value,
                 "evaluating can_cloud_download injection",
@@ -305,8 +306,15 @@ impl Session {
             .await?;
 
         // 5. Tag the per-session tracing span. Future log lines
-        //    inherit `session_id` automatically.
-        let log_span = info_span!("kernel.session", session_id = %session_info.session_id);
+        //    inherit `session_id` automatically. Target is pinned to the
+        //    kernel log target so the span (and any `log` record derived
+        //    from it) maps to the `databricks.sql.kernel` Python logger,
+        //    consistent with `klog` events — see `crate::klog`.
+        let log_span = info_span!(
+            target: crate::klog::KERNEL_LOG_TARGET,
+            "kernel.session",
+            session_id = %session_info.session_id
+        );
 
         Ok(Session {
             inner: Arc::new(SessionInner {

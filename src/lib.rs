@@ -92,6 +92,7 @@ compile_error!(
 
 pub mod auth;
 pub mod client;
+pub(crate) mod klog;
 pub(crate) mod logging;
 pub mod metadata;
 pub mod reader;
@@ -116,6 +117,11 @@ pub use config::{
     ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
 };
 pub use kernel_error::{Error, ErrorCode, Result};
+/// The `tracing` target string stamped on every kernel log event.
+/// Binding crates (pyo3, napi) reference this constant directly so the
+/// logger name they expose to users can never drift from what the
+/// kernel actually emits. See [`klog::KERNEL_LOG_TARGET`].
+pub use klog::KERNEL_LOG_TARGET;
 pub use metadata_v0::{Identifier, LikePattern, Metadata};
 pub use result_stream::{OwnedBatchIter, ResultBatch, ResultStream, Row, SchemaRef};
 pub use session::{Session, SessionBuilder};

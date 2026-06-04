@@ -81,7 +81,26 @@ fn attach_attrs(
     bound.setattr("query_id", query_id)?;
     bound.setattr("display_message", display_message)?;
     bound.setattr("diagnostic_info", diagnostic_info)?;
-    bound.setattr("error_details_json", error_details_json)?;
+    // ``error_details_json`` is documented (types/sea.rs) as a
+    // potentially multi-MB server blob, and the type-level doc requires
+    // wrappers to bound its size. Cap what we expose as a Python
+    // exception attribute so ``repr(e)`` / log lines can't pump
+    // multi-MB strings into a customer's centralized logging. The full
+    // blob remains server-side; this is the boundary's exposure cap.
+    const MAX_ERROR_DETAILS_JSON: usize = 64 * 1024;
+    let bounded_details = error_details_json.map(|s| {
+        if s.len() > MAX_ERROR_DETAILS_JSON {
+            // Truncate on a char boundary, with a marker.
+            let mut end = MAX_ERROR_DETAILS_JSON;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
+        } else {
+            s.to_owned()
+        }
+    });
+    bound.setattr("error_details_json", bounded_details)?;
     let _ = py; // silence unused-var warning if pyo3 ever drops the Python<'_> arg
     Ok(())
 }
@@ -91,6 +110,17 @@ fn attach_attrs(
 /// `err.code`, `err.message`, `err.sql_state`, etc.; `str(err)` is
 /// the kernel's message text.
 pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
+    // Boundary-only breadcrumb: the kernel logged *what* failed; this
+    // records the kernel `Error` -> Python `KernelError` translation
+    // (and which code slug drove it), which is knowledge unique to the
+    // pyo3 layer. Helps explain "why did I get this exception type".
+    tracing::debug!(
+        target: crate::logging::PYO3_LOG_TARGET,
+        code = code_str(err.code),
+        retryable = err.retryable,
+        "mapping kernel error to KernelError: {}",
+        err.message
+    );
     let py_err = KernelError::new_err(err.message.clone());
     // Materialise the exception value so we can attach attributes.
     let bound = py_err.value(py);
@@ -109,13 +139,20 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.diagnostic_info.as_deref(),
         err.error_details_json.as_deref(),
     ) {
-        // Attribute attachment is best-effort. If something goes
-        // wrong (extremely unlikely for plain string/int setattrs),
-        // surface that error so the caller sees it rather than a
-        // partially-populated exception. Fold the original kernel
-        // message into the new error so debugging context isn't
-        // lost.
-        return setattr_err;
+        // Attribute attachment is best-effort. If something goes wrong
+        // (extremely unlikely for plain string/int setattrs — but
+        // marginally less so now that `error_details_json` can be a
+        // large blob), don't let the partially-populated exception
+        // swallow the original kernel context: chain the kernel message
+        // into the setattr error's cause so debugging context survives.
+        // ``str(setattr_err)`` would otherwise be a generic Python
+        // internal error with no hint of the underlying SQL failure.
+        let chained = KernelError::new_err(format!(
+            "failed to attach kernel error attributes (original kernel error: {}): {}",
+            err.message, setattr_err
+        ));
+        chained.set_cause(py, Some(setattr_err));
+        return chained;
     }
     py_err
 }

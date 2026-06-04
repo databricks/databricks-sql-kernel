@@ -214,6 +214,10 @@ impl Statement {
     fn execute(&mut self, py: Python<'_>) -> PyResult<ExecutedStatement> {
         let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Statement.execute: running statement synchronously (GIL released, interruptible)"
+        );
         let exec = run_kernel_interruptible!(py, &runtime, inner.stmt.execute())?;
         Ok(ExecutedStatement::new(exec, runtime))
     }
@@ -229,6 +233,10 @@ impl Statement {
     fn submit(&mut self, py: Python<'_>) -> PyResult<ExecutedAsyncStatement> {
         let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Statement.submit: submitting statement async (GIL released)"
+        );
         let exec = run_kernel!(py, runtime, inner.stmt.submit())?;
         Ok(ExecutedAsyncStatement::new(exec, runtime))
     }

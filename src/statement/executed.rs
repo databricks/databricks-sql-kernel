@@ -29,6 +29,7 @@
 //! separately.
 
 use crate::kernel_error::Result;
+use crate::klog::warn;
 use crate::result_stream::{ResultStream, SchemaRef};
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
@@ -37,7 +38,7 @@ use crate::types::sea::StatementStatus as SeaStatementStatus;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tracing::{warn, Instrument};
+use tracing::Instrument;
 
 /// Sync-consumption executed handle.
 pub struct ExecutedStatement {
