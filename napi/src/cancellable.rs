@@ -228,16 +228,19 @@ impl CancellableExecution {
             return Ok(());
         }
         // Only flag `cancel_fired` when a server-side cancel is actually
-        // dispatched — i.e. a statement id has been observed. A first-window
-        // `cancel()` (before the id is published) is a no-op, so it must NOT
-        // arm the `InvalidArgument`→`Cancelled` normalisation: otherwise a later
-        // genuine `InvalidArgument` (a real SQL/parse error) would be mislabelled
-        // "cancelled" with its diagnostic discarded.
-        let dispatched = self.canceller.statement_id().is_some();
+        // dispatched. `canceller.cancel()` reports whether it dispatched (an id
+        // had been observed) from the SAME id read that makes the decision, so
+        // there is no time-of-check/time-of-use gap. A first-window `cancel()`
+        // (before the id is published) returns `false` and must NOT arm the
+        // `InvalidArgument`→`Cancelled` normalisation — otherwise a later genuine
+        // `InvalidArgument` (a real SQL/parse error) would be mislabelled
+        // "cancelled" with its diagnostic discarded. A pre-check on
+        // `statement_id()` here would be racy (the id can publish between the
+        // check and the canceller's own read); using the return value closes it.
         let canceller = self.canceller.clone();
         let cancel_fired = Arc::clone(&self.cancel_fired);
         guarded(async move {
-            canceller.cancel().await.map_err(napi_err_from_kernel)?;
+            let dispatched = canceller.cancel().await.map_err(napi_err_from_kernel)?;
             if dispatched {
                 cancel_fired.store(true, Ordering::Release);
             }
