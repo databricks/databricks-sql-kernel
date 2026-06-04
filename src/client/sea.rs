@@ -486,6 +486,17 @@ impl SeaRestTransport {
             .await?;
         let statement_id = response.statement_id.clone();
 
+        // Publish the server statement id to the caller's canceller
+        // slot NOW — before polling — so a concurrent
+        // `StatementCanceller::cancel()` can target a still-running
+        // sync query. (The initial POST returns within the server
+        // wait_timeout, ~10s, even for a long query.)
+        if let Some(observer) = params.inflight_id_observer.as_ref() {
+            if let Ok(mut slot) = observer.lock() {
+                *slot = Some(statement_id.clone());
+            }
+        }
+
         let response = match self.wait_for_completion(response).await {
             Ok(r) => r,
             Err(e) => {

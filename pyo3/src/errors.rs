@@ -62,6 +62,14 @@ fn attach_attrs(
     http_status: Option<u16>,
     retryable: bool,
     query_id: Option<&str>,
+    // Extended server-supplied status. These mirror the Thrift path's
+    // `displayMessage` / `diagnosticInfo` so the connector can populate
+    // `ServerOperationError.context["diagnostic-info"]` (the Spark stack
+    // trace) at parity. The kernel `Error` carries them but they were
+    // previously dropped here.
+    display_message: Option<&str>,
+    diagnostic_info: Option<&str>,
+    error_details_json: Option<&str>,
 ) -> PyResult<()> {
     bound.setattr("code", code)?;
     bound.setattr("message", message)?;
@@ -71,6 +79,28 @@ fn attach_attrs(
     bound.setattr("http_status", http_status)?;
     bound.setattr("retryable", retryable)?;
     bound.setattr("query_id", query_id)?;
+    bound.setattr("display_message", display_message)?;
+    bound.setattr("diagnostic_info", diagnostic_info)?;
+    // ``error_details_json`` is documented (types/sea.rs) as a
+    // potentially multi-MB server blob, and the type-level doc requires
+    // wrappers to bound its size. Cap what we expose as a Python
+    // exception attribute so ``repr(e)`` / log lines can't pump
+    // multi-MB strings into a customer's centralized logging. The full
+    // blob remains server-side; this is the boundary's exposure cap.
+    const MAX_ERROR_DETAILS_JSON: usize = 64 * 1024;
+    let bounded_details = error_details_json.map(|s| {
+        if s.len() > MAX_ERROR_DETAILS_JSON {
+            // Truncate on a char boundary, with a marker.
+            let mut end = MAX_ERROR_DETAILS_JSON;
+            while !s.is_char_boundary(end) {
+                end -= 1;
+            }
+            format!("{}…[truncated {} bytes]", &s[..end], s.len() - end)
+        } else {
+            s.to_owned()
+        }
+    });
+    bound.setattr("error_details_json", bounded_details)?;
     let _ = py; // silence unused-var warning if pyo3 ever drops the Python<'_> arg
     Ok(())
 }
@@ -105,14 +135,24 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.http_status,
         err.retryable,
         err.query_id.as_deref(),
+        err.display_message.as_deref(),
+        err.diagnostic_info.as_deref(),
+        err.error_details_json.as_deref(),
     ) {
-        // Attribute attachment is best-effort. If something goes
-        // wrong (extremely unlikely for plain string/int setattrs),
-        // surface that error so the caller sees it rather than a
-        // partially-populated exception. Fold the original kernel
-        // message into the new error so debugging context isn't
-        // lost.
-        return setattr_err;
+        // Attribute attachment is best-effort. If something goes wrong
+        // (extremely unlikely for plain string/int setattrs — but
+        // marginally less so now that `error_details_json` can be a
+        // large blob), don't let the partially-populated exception
+        // swallow the original kernel context: chain the kernel message
+        // into the setattr error's cause so debugging context survives.
+        // ``str(setattr_err)`` would otherwise be a generic Python
+        // internal error with no hint of the underlying SQL failure.
+        let chained = KernelError::new_err(format!(
+            "failed to attach kernel error attributes (original kernel error: {}): {}",
+            err.message, setattr_err
+        ));
+        chained.set_cause(py, Some(setattr_err));
+        return chained;
     }
     py_err
 }
@@ -138,6 +178,9 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
             None,
             None,
             false,
+            None,
+            None,
+            None,
             None,
         ) {
             return setattr_err;

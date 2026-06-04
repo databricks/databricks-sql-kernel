@@ -130,7 +130,7 @@ pub use statement::executed_async::{
     AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus,
 };
 pub use statement::handle::ExecutedStatementHandle;
-pub use statement::mutable::Statement;
+pub use statement::mutable::{Statement, StatementCanceller};
 pub use statement::params_codec::parse_typed_value;
 pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};
 

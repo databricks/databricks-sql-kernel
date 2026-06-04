@@ -46,6 +46,59 @@ macro_rules! run_kernel {
     }};
 }
 
+/// Like [`run_kernel!`], but periodically re-acquires the GIL to poll
+/// Python signal handlers so a long-running blocking call (e.g. a sync
+/// `execute()`) can be interrupted by `KeyboardInterrupt` (Ctrl-C).
+///
+/// The bare `py.detach(|| block_on(fut))` form runs the future to
+/// completion with the GIL released; the main thread is parked in the
+/// FFI call, so a SIGINT-set Python signal flag isn't observed until
+/// the call returns. This variant instead drives the future in ~100ms
+/// slices: each slice runs with the GIL released, and on each timeout
+/// the GIL is re-acquired to call [`Python::check_signals`], which
+/// raises (e.g. `KeyboardInterrupt`) if a handler is pending. On
+/// interrupt the future is dropped — which fires the kernel's
+/// mid-execute cancel guard, so the server-side statement is cancelled
+/// too, not just abandoned.
+///
+/// `$runtime` must be a `&tokio::runtime::Runtime` (so the future can
+/// be driven across slices). Expands to a `PyResult<T>` (the future's
+/// `Ok` value), mapping kernel `Error`s via `to_py_err` and surfacing
+/// any signal `PyErr` directly.
+#[macro_export]
+macro_rules! run_kernel_interruptible {
+    ($py:expr, $runtime:expr, $future:expr) => {{
+        let py = $py;
+        let runtime = $runtime;
+        // 100ms balances interrupt latency against per-tick overhead.
+        const TICK: ::std::time::Duration = ::std::time::Duration::from_millis(100);
+        let mut fut = ::std::boxed::Box::pin($future);
+        loop {
+            let step = py.detach(|| {
+                runtime.block_on(async {
+                    match ::tokio::time::timeout(TICK, &mut fut).await {
+                        Ok(done) => Some(done),
+                        Err(_elapsed) => None,
+                    }
+                })
+            });
+            match step {
+                // Future completed within this slice.
+                Some(result) => break result.map_err(|e| $crate::errors::to_py_err(py, e)),
+                // Slice timed out: poll Python signals. A pending
+                // handler (e.g. KeyboardInterrupt) returns Err, which
+                // we propagate — dropping `fut` fires the kernel's
+                // mid-execute cancel guard.
+                None => {
+                    if let Err(signal_err) = py.check_signals() {
+                        break Err(signal_err);
+                    }
+                }
+            }
+        }
+    }};
+}
+
 /// Variant that accepts a block expression — useful when the future
 /// is constructed inline from borrowed state that can't escape the
 /// `detach` closure cleanly with the simpler form. Same shape, same

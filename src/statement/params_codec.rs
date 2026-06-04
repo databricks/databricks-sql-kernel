@@ -228,15 +228,32 @@ fn parse_date(s: &str) -> Result<TypedValue> {
 }
 
 fn parse_timestamp(s: &str) -> Result<TypedValue> {
+    use chrono::{DateTime, FixedOffset, Utc};
+
     // The connector's TimestampParameter stringifies via str(),
     // which on a Python datetime produces ``YYYY-MM-DD HH:MM:SS``
     // optionally with ``.microseconds``. Accept both with and
     // without sub-second precision.
     //
-    // Also accept the trailing-``Z`` UTC marker that JavaScript's
-    // ``Date.prototype.toISOString()`` always emits — strip it
-    // before parsing since ``TypedValue::Timestamp`` is a naive
-    // ``NaiveDateTime`` (the SEA wire encodes timestamps in UTC).
+    // A tz-AWARE Python datetime (``datetime.now(timezone.utc)``,
+    // ``.astimezone(tz)``, or ORM/db-sourced values) stringifies with
+    // an explicit ``+HH:MM`` / ``-HH:MM`` offset. The Thrift path
+    // forwards such literals verbatim and the server resolves the
+    // instant; to keep parity, accept the offset forms here too and
+    // normalise to the equivalent UTC wall-clock, since
+    // ``TypedValue::Timestamp`` is a naive ``NaiveDateTime`` and the
+    // SEA wire encodes timestamps in UTC. (Mirrors the offset handling
+    // in ``parse_timestamp_ltz``.)
+    if let Ok(dt) = DateTime::<FixedOffset>::parse_from_rfc3339(s) {
+        return Ok(TypedValue::Timestamp(dt.with_timezone(&Utc).naive_utc()));
+    }
+    if let Ok(dt) = DateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S%.f%:z") {
+        return Ok(TypedValue::Timestamp(dt.with_timezone(&Utc).naive_utc()));
+    }
+
+    // Naive forms. Also accept the trailing-``Z`` UTC marker that
+    // JavaScript's ``Date.prototype.toISOString()`` always emits —
+    // strip it before parsing (the value is already UTC on the wire).
     let body = s.strip_suffix('Z').unwrap_or(s);
     let formats = [
         "%Y-%m-%d %H:%M:%S%.f",
@@ -447,8 +464,15 @@ fn parse_decimal(sql_type: &str, value: &str) -> Result<TypedValue> {
 /// execute, defeating the headline "bad literal fails at bind"
 /// contract.
 ///
-/// Scientific notation (``1e5``) is disallowed because it changes
-/// the implicit precision/scale and the connector never emits it.
+/// Scientific notation (``1E+2``, ``1E-7``) IS accepted: Python's
+/// ``str(Decimal(...))`` emits an exponent for large- or
+/// small-magnitude values (``Decimal("1E+2")`` -> ``"1E+2"``,
+/// ``Decimal("1E-7")`` -> ``"1E-7"``), and the Databricks server
+/// accepts scientific-notation DECIMAL literals — the Thrift path
+/// forwards them verbatim. Rejecting them here would make common
+/// Decimal bindings fail at bind on the kernel path but work on
+/// Thrift. An optional trailing ``[eE][+-]?digits`` exponent is
+/// allowed after the (otherwise required) mantissa.
 fn validate_decimal_literal(value: &str) -> Result<()> {
     let bytes = value.as_bytes();
     if bytes.is_empty() {
@@ -474,7 +498,23 @@ fn validate_decimal_literal(value: &str) -> Result<()> {
         }
         frac_digits = i - frac_start;
     }
-    let well_formed = i == bytes.len() && int_digits >= 1 && (!has_dot || frac_digits >= 1);
+    let mantissa_ok = int_digits >= 1 && (!has_dot || frac_digits >= 1);
+
+    // Optional exponent: ``[eE][+-]?<one-or-more-digits>``.
+    let mut exp_ok = true;
+    if i < bytes.len() && matches!(bytes[i], b'e' | b'E') {
+        i += 1;
+        if i < bytes.len() && matches!(bytes[i], b'+' | b'-') {
+            i += 1;
+        }
+        let exp_start = i;
+        while i < bytes.len() && bytes[i].is_ascii_digit() {
+            i += 1;
+        }
+        exp_ok = i - exp_start >= 1;
+    }
+
+    let well_formed = i == bytes.len() && mantissa_ok && exp_ok;
     if !well_formed {
         return Err(invalid_msg(format!("invalid DECIMAL literal {value:?}")));
     }
@@ -698,6 +738,37 @@ mod tests {
         // ISO-8601 T-separator variant (some Python datetime formatters use it).
         let c = parse_typed_value("TIMESTAMP", Some("2026-05-15T12:30:45")).unwrap();
         assert!(matches!(c, TypedValue::Timestamp(_)));
+    }
+
+    #[test]
+    fn timestamp_accepts_tz_aware_offset_normalised_to_utc() {
+        // A tz-aware Python datetime (datetime.now(timezone.utc),
+        // .astimezone(tz), ORM/db-sourced) stringifies with an explicit
+        // offset. Thrift forwards such literals; the kernel must accept
+        // them too and normalise to the equivalent UTC wall-clock,
+        // since TypedValue::Timestamp is naive UTC on the SEA wire.
+        //
+        // 18:00 at +05:30 == 12:30 UTC — confirms real conversion, not
+        // just offset-stripping.
+        let v = parse_typed_value("TIMESTAMP", Some("2026-05-15T18:00:00+05:30")).unwrap();
+        let TypedValue::Timestamp(dt) = v else {
+            panic!("expected Timestamp");
+        };
+        assert_eq!(
+            dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
+            "2026-05-15T12:30:00"
+        );
+
+        // Space-separated offset form (datetime.astimezone().isoformat(sep=' ')).
+        let v = parse_typed_value("TIMESTAMP", Some("2026-05-15 18:00:00.500000+05:30")).unwrap();
+        let TypedValue::Timestamp(dt) = v else {
+            panic!("expected Timestamp");
+        };
+        assert_eq!(dt.format("%H:%M:%S%.3f").to_string(), "12:30:00.500");
+
+        // UTC offset (+00:00) — same wall-clock.
+        let v = parse_typed_value("TIMESTAMP", Some("2026-05-15T12:30:45+00:00")).unwrap();
+        assert!(matches!(v, TypedValue::Timestamp(_)));
     }
 
     #[test]
@@ -994,6 +1065,23 @@ mod tests {
         for v in ["0", "-0", "-123.45", "0.0001", "+1.5", "123"] {
             let r = parse_typed_value("DECIMAL(10,4)", Some(v));
             assert!(r.is_ok(), "expected {v:?} to parse: {:?}", r.err());
+        }
+    }
+
+    #[test]
+    fn decimal_accepts_scientific_notation() {
+        // Python's str(Decimal(...)) emits an exponent for large/small
+        // magnitudes (Decimal("1E+2") -> "1E+2", Decimal("1E-7") ->
+        // "1E-7"). The server accepts these; Thrift forwards them; the
+        // kernel must too (the value string is carried verbatim).
+        for v in ["1E+2", "1E-7", "1e5", "-2.5E10", "+3.14e-2", "0E0"] {
+            let r = parse_typed_value("DECIMAL(38,10)", Some(v));
+            assert!(r.is_ok(), "expected {v:?} to parse: {:?}", r.err());
+        }
+        // A malformed exponent (no digits) is still rejected.
+        for v in ["1E", "1E+", "1e-", "1EE2"] {
+            let e = parse_typed_value("DECIMAL(38,10)", Some(v)).unwrap_err();
+            assert_eq!(e.code, ErrorCode::InvalidArgument, "{v:?}");
         }
     }
 

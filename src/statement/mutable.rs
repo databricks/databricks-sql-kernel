@@ -65,8 +65,17 @@ use crate::statement::spec::{ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
 use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tracing::Instrument;
+
+/// Shared slot holding the server statement id of the statement
+/// currently in flight on a [`Statement`] (or its most recent
+/// execution). Written by `execute()` / `submit()` as soon as the
+/// transport surfaces the id; read by [`StatementCanceller`] so an
+/// out-of-band `cancel()` from another thread can reach a *running*
+/// sync query — the case the per-call drop guard can't cover because
+/// the binding's `block_on` runs the execute future to completion.
+type InflightId = Arc<Mutex<Option<String>>>;
 
 /// Resolve the SEA `(wait_timeout, on_wait_timeout)` pair for an execute /
 /// submit dispatch. Pure so the precedence rules are unit-testable without
@@ -172,6 +181,13 @@ pub struct Statement {
     /// skip the `CloseStatement` round-trip entirely when the server
     /// side is already gone.
     last_closed: Option<Arc<AtomicBool>>,
+    /// Server statement id of the in-flight (or most recent) execution,
+    /// shared with any [`StatementCanceller`] handed out via
+    /// [`Statement::canceller`]. Populated mid-execute as soon as the
+    /// transport returns the id; reset to `None` at the start of each
+    /// new `execute()` / `submit()` so a canceller never targets a
+    /// stale prior statement.
+    inflight_id: InflightId,
 }
 
 impl Statement {
@@ -184,6 +200,31 @@ impl Statement {
             last_statement_id: None,
             last_valid: None,
             last_closed: None,
+            inflight_id: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Produce a detached [`StatementCanceller`] that can cancel the
+    /// statement currently in flight on this `Statement` *without
+    /// borrowing it*.
+    ///
+    /// This is the sync-execute counterpart to
+    /// [`ExecutedAsyncStatement::canceller`](crate::statement::executed_async::ExecutedAsyncStatement::canceller).
+    /// The blocking `execute()` consumes `&mut self` and runs to
+    /// completion inside the binding's `block_on`, so a second thread
+    /// can't reach an `ExecutedStatement` to cancel a *running* query.
+    /// Obtain a `StatementCanceller` **before** calling `execute()`;
+    /// once the server issues the statement id mid-execute, the
+    /// canceller's [`cancel`](StatementCanceller::cancel) reaches it.
+    ///
+    /// Cheap to clone (two `Arc` bumps). If `cancel()` fires before the
+    /// id is observed (query still in the initial submit round-trip) it
+    /// is a no-op; the per-call drop guard still covers the
+    /// future-dropped case.
+    pub fn canceller(&self) -> StatementCanceller {
+        StatementCanceller {
+            session: Arc::clone(&self.session),
+            inflight_id: Arc::clone(&self.inflight_id),
         }
     }
 
@@ -227,10 +268,21 @@ impl Statement {
         let span = self.session.log_span().clone();
         async {
             self.invalidate_prior().await;
-            let (sql, exec_params) = self.prepare_for_dispatch(None)?;
+            let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
-            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let cancel_state = MidExecuteCancelState::new(
+                Arc::clone(&self.session),
+                Arc::clone(&self.inflight_id),
+            );
             let guard = cancel_state.guard();
+
+            // Publish the server statement id to the shared in-flight
+            // slot as soon as the initial POST returns (the transport
+            // fills this before its poll loop) so a concurrent
+            // `StatementCanceller` can cancel a still-running query.
+            // `MidExecuteCancelState::new` already cleared the slot, so
+            // set the observer after it.
+            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             // SeaRestTransport::execute_statement polls to completion
             // (10s server-side wait_timeout, then GetStatementStatus
@@ -286,7 +338,10 @@ impl Statement {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
-            let cancel_state = MidExecuteCancelState::new(Arc::clone(&self.session));
+            let cancel_state = MidExecuteCancelState::new(
+                Arc::clone(&self.session),
+                Arc::clone(&self.inflight_id),
+            );
             let guard = cancel_state.guard();
 
             let response = self
@@ -446,15 +501,24 @@ impl Statement {
 /// statement_id (if any).
 struct MidExecuteCancelState {
     session: Arc<SessionInner>,
-    observed_id: std::sync::Mutex<Option<String>>,
+    /// Shared with the owning [`Statement::inflight_id`] so an
+    /// out-of-band [`StatementCanceller`] reads the same id this guard
+    /// observes. Reset to `None` on construction (new execution).
+    observed_id: InflightId,
     defused: std::sync::atomic::AtomicBool,
 }
 
 impl MidExecuteCancelState {
-    fn new(session: Arc<SessionInner>) -> Arc<Self> {
+    /// `inflight_id` is the owning `Statement`'s shared slot. We clear
+    /// it here so a canceller can't fire against a prior statement
+    /// while this execution is still establishing its own id.
+    fn new(session: Arc<SessionInner>, inflight_id: InflightId) -> Arc<Self> {
+        if let Ok(mut slot) = inflight_id.lock() {
+            *slot = None;
+        }
         Arc::new(Self {
             session,
-            observed_id: std::sync::Mutex::new(None),
+            observed_id: inflight_id,
             defused: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -504,6 +568,53 @@ impl Drop for MidExecuteCancelGuard {
         self.state.session.runtime_handle().spawn(async move {
             let _ = transport.cancel_statement(&id).await;
         });
+    }
+}
+
+/// Detached canceller for the statement currently in flight on a
+/// [`Statement`]. Produced by [`Statement::canceller`].
+///
+/// Holds only the shared session handle and the `Statement`'s shared
+/// in-flight-id slot — **not** the `Statement` itself — so a binding
+/// can fire a server-side cancel from another thread while `execute()`
+/// is blocked. The sync-execute analogue of
+/// [`AsyncStatementCanceller`](crate::statement::executed_async::AsyncStatementCanceller).
+///
+/// Cheap to [`Clone`] (two `Arc` bumps).
+#[derive(Clone)]
+pub struct StatementCanceller {
+    session: Arc<SessionInner>,
+    inflight_id: InflightId,
+}
+
+impl StatementCanceller {
+    /// Server-side cancel of the in-flight statement via
+    /// `cancel_statement(statement_id)`.
+    ///
+    /// No-op (returns `Ok`) if no statement id has been observed yet —
+    /// either nothing has executed, or the query is still in its
+    /// initial submit round-trip and the server hasn't issued an id.
+    /// Idempotent against a server already in a terminal state (the
+    /// kernel's `cancel_statement` is a no-op there). Safe to call
+    /// concurrently with the `execute()` it targets — the two share
+    /// only the id slot (behind a `Mutex`), no mutable statement state.
+    pub async fn cancel(&self) -> Result<()> {
+        let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
+        let Some(id) = id else {
+            return Ok(());
+        };
+        async {
+            self.session.transport().cancel_statement(&id).await?;
+            Ok(())
+        }
+        .instrument(self.session.log_span().clone())
+        .await
+    }
+
+    /// The server-issued statement id this canceller currently targets,
+    /// if one has been observed yet.
+    pub fn statement_id(&self) -> Option<String> {
+        self.inflight_id.lock().ok().and_then(|g| g.clone())
     }
 }
 
