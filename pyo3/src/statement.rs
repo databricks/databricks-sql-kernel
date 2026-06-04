@@ -351,6 +351,15 @@ impl ExecutedStatement {
     /// or dropped.
     fn cancel(&mut self, py: Python<'_>) -> PyResult<()> {
         let inner = alive_mut!(self, "ExecutedStatement");
+        // Short-circuit if the stream was fully drained: the kernel's
+        // auto-close-on-drain already closed the server statement, so a
+        // cancel RPC here would hit an already-terminal/closed statement
+        // (a wasted round-trip, benign error at worst). Matches the
+        // napi binding's `finished`-flag short-circuit and the JDBC
+        // cancel-after-completion no-op contract.
+        if inner.exhausted {
+            return Ok(());
+        }
         let runtime = inner.runtime.clone();
         run_kernel!(py, runtime, inner.exec.cancel())?;
         Ok(())

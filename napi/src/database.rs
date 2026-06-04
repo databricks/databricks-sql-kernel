@@ -34,7 +34,7 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, HttpConfig, ResultConfig, Session, TlsConfig,
+    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ResultConfig, Session, TlsConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -59,12 +59,22 @@ use crate::util::guarded;
 /// Default U2M OAuth client id for the **Node** binding.
 ///
 /// Matches the standalone Node driver's
-/// `DatabricksOAuthManager.defaultClientId` (`databricks-sql-connector`),
-/// so the napi path presents the same OAuth app identity — and shares
-/// the same SSO token-cache entry — as databricks-sql-nodejs. The
-/// kernel's bare-Rust fallback is `databricks-cli`; overriding it here
-/// keeps the napi cache key distinct from the pyo3 (Python,
-/// `databricks-sql-python`) binding's.
+/// `DatabricksOAuthManager.defaultClientId` (`databricks-sql-connector`)
+/// rather than the kernel's bare-Rust fallback (`databricks-cli`), for
+/// two reasons:
+///
+/// 1. **OAuth app identity** — the napi path registers as the same
+///    OAuth app the standalone Node driver does, so admin-side consent
+///    screens / SSO policies attribute it consistently.
+/// 2. **Per-binding cache-key isolation** — the kernel's U2M token
+///    cache is keyed on `{host, client_id, scopes}`; a distinct client
+///    id keeps the napi cache from colliding with the pyo3 (Python,
+///    `databricks-sql-python`) binding's.
+///
+/// This does NOT share a token-cache *entry* with databricks-sql-nodejs
+/// — the kernel writes to its own `~/.config/databricks-sql-kernel/
+/// oauth/` directory. The alignment is of the OAuth app identity, not
+/// the on-disk cache.
 const NODE_OAUTH_CLIENT_ID: &str = "databricks-sql-connector";
 
 /// Authentication mode selector crossing the napi boundary. The string
@@ -223,22 +233,35 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
         // the Node driver's own registered client
         // (`databricks-sql-connector`, matching the standalone
         // databricks-sql-nodejs `DatabricksOAuthManager.defaultClientId`)
-        // rather than the kernel's bare-Rust `databricks-cli` fallback —
-        // so the napi path presents the same OAuth app identity (and
-        // shares the same SSO token-cache entry) as the standalone Node
-        // driver, and stays distinct from the pyo3 (Python) binding's
-        // `databricks-sql-python` cache key. Port 8020 / default scopes
-        // are still filled by the kernel when omitted.
-        AuthMode::OAuthU2m => Ok(AuthConfig::oauth_u2m(
-            options
-                .oauth_client_id
-                .clone()
-                .or_else(|| Some(NODE_OAUTH_CLIENT_ID.to_owned())),
-            options.oauth_redirect_port,
-            options.oauth_scopes.clone(),
-            None,
-            None,
-        )),
+        // rather than the kernel's bare-Rust `databricks-cli` fallback,
+        // so the napi path presents the same OAuth app identity as the
+        // standalone Node driver and keeps a cache key distinct from the
+        // pyo3 (Python) binding. Port 8020 / default scopes are still
+        // filled by the kernel when omitted.
+        AuthMode::OAuthU2m => {
+            // Reject an explicit empty client_id (parity with pyo3):
+            // an empty string would bypass the default and bind an empty
+            // OAuth client, surfacing as an opaque server error. Omit
+            // the field to get the `databricks-sql-connector` default.
+            if matches!(options.oauth_client_id.as_deref(), Some("")) {
+                return Err(napi_err_from_kernel(
+                    KernelError::invalid_argument().message(
+                        "oauthClientId must be non-empty when set; omit it to use the \
+                         default 'databricks-sql-connector'",
+                    ),
+                ));
+            }
+            Ok(AuthConfig::oauth_u2m(
+                options
+                    .oauth_client_id
+                    .clone()
+                    .or_else(|| Some(NODE_OAUTH_CLIENT_ID.to_owned())),
+                options.oauth_redirect_port,
+                options.oauth_scopes.clone(),
+                None,
+                None,
+            ))
+        }
     }
 }
 
@@ -487,6 +510,17 @@ mod tests {
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn u2m_rejects_explicit_empty_client_id() {
+        // Parity with pyo3: an explicit empty oauthClientId is rejected
+        // (it would bind an empty client and surface an opaque server
+        // error), rather than silently falling back to the default.
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthU2m);
+        o.oauth_client_id = Some(String::new());
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "oauthClientId");
     }
 
     #[test]

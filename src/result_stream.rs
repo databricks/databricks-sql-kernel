@@ -648,15 +648,23 @@ impl ResultStream {
 
     /// Free client-side resources held by the stream — buffered
     /// chunks, the link prefetcher, in-flight downloaders.
-    /// Local-only; does not issue any server-side RPC. To cancel the
-    /// underlying statement, call `cancel()` on the executed handle.
+    ///
+    /// Usually local-only, **except for the metadata path**: a stream
+    /// built via [`from_reader_with_close`](Self::from_reader_with_close)
+    /// (`Metadata::list_*`) carries a close-on-drop guard that fires a
+    /// fire-and-forget `CloseStatement` for its server statement when
+    /// the stream drops. The data path (`from_reader`) issues no RPC
+    /// here — the owning `ExecutedStatement` reaps the statement
+    /// (auto-close-on-drain / its own `Drop`); to cancel a still-running
+    /// statement, call `cancel()` on the executed handle.
     ///
     /// Consuming `self` makes use-after-close a compile error.
-    /// `Drop` performs the same cleanup if `close` was never called
-    /// explicitly.
+    /// `Drop` performs the same cleanup (including the metadata guard's
+    /// close) if `close` was never called explicitly.
     pub fn close(self) {
-        // Drops `self` (and the wrapped reader / current batch).
-        // Background tasks owned by the reader stop on `Drop`.
+        // Drops `self` (and the wrapped reader / current batch / any
+        // metadata close-guard). Background tasks owned by the reader
+        // stop on `Drop`.
     }
 
     /// Consume the stream and yield **owned** `RecordBatch`es as a

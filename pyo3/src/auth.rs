@@ -57,12 +57,23 @@ pub(crate) struct OAuthParams {
 /// Default U2M OAuth client id for the **Python** binding.
 ///
 /// Matches the standalone Thrift connector's `PYSQL_OAUTH_CLIENT_ID`
-/// (`databricks-sql-python`), so the `use_kernel=True` path presents
-/// the same OAuth app identity — and shares the same SSO token-cache
-/// entry — as the Thrift backend. The kernel's own bare-Rust fallback
-/// is `databricks-cli`; we override it here so pyo3 (Python) and napi
-/// (Node, `databricks-sql-connector`) don't collide on a shared cache
-/// key and each aligns with its standalone-driver sibling.
+/// (`databricks-sql-python`) rather than the kernel's bare-Rust
+/// fallback (`databricks-cli`). Two reasons:
+///
+/// 1. **OAuth app identity** — the `use_kernel=True` path registers as
+///    the same OAuth app the standalone Python connector does, so
+///    admin-side consent screens / SSO policies attribute it
+///    consistently (not as the generic CLI client).
+/// 2. **Per-binding cache-key isolation** — the kernel's U2M token
+///    cache is keyed on `{host, client_id, scopes}`. Distinct client
+///    ids keep the pyo3 (Python) and napi (Node,
+///    `databricks-sql-connector`) caches from colliding.
+///
+/// Note: this does NOT share a token-cache *entry* with the standalone
+/// Thrift connector — the kernel writes to its own
+/// `~/.config/databricks-sql-kernel/oauth/` directory, and the Thrift
+/// connector caches U2M tokens in-memory only. The alignment is of the
+/// OAuth app identity, not the on-disk cache.
 const PYSQL_OAUTH_CLIENT_ID: &str = "databricks-sql-python";
 
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
