@@ -104,7 +104,11 @@ pub(crate) use {
 mod tests {
     use std::sync::{Mutex, OnceLock};
 
-    static CAPTURED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    /// Captured `(target, rendered_message)` pairs. The message is what
+    /// `tracing`'s `log` feature renders — including any structured
+    /// fields appended as `key="value"` — so we can assert field
+    /// propagation, not just the target.
+    static CAPTURED: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
 
     struct Capture;
     impl log::Log for Capture {
@@ -116,7 +120,7 @@ mod tests {
                 .get_or_init(|| Mutex::new(Vec::new()))
                 .lock()
                 .unwrap()
-                .push(record.target().to_owned());
+                .push((record.target().to_owned(), record.args().to_string()));
         }
         fn flush(&self) {}
     }
@@ -150,11 +154,49 @@ mod tests {
 
         let got = CAPTURED.get().unwrap().lock().unwrap().clone();
         assert!(
-            got.iter().any(|t| t == super::KERNEL_LOG_TARGET),
+            got.iter().any(|(t, _)| t == super::KERNEL_LOG_TARGET),
             "expected a record with target {:?}, got {:?}",
             super::KERNEL_LOG_TARGET,
             got
         );
         assert_eq!(super::KERNEL_LOG_TARGET, "databricks::sql::kernel");
+    }
+
+    /// Guards correlation-field propagation: a `klog::*` call with a
+    /// structured field (e.g. `statement_id = …`) must carry that field
+    /// through `tracing`'s `log` feature into the `log::Record` — this is
+    /// what lets a customer correlate interleaved kernel logs to a
+    /// statement/session in a multi-session deployment.
+    ///
+    /// The `tracing`→`log` bridge does NOT propagate enclosing *span*
+    /// fields, only the event's own fields, so reader/factory call sites
+    /// pass `statement_id` as an explicit event field rather than relying
+    /// on the session span. This test pins that mechanism: if the bridge
+    /// behaviour changed (fields stop rendering) or a refactor dropped
+    /// the field, the rendered message would no longer contain it.
+    ///
+    /// Shares the single global logger with `klog_emits_contract_target`
+    /// (see the CONSTRAINT note above) — both read from `CAPTURED`, which
+    /// accumulates across tests in this binary, so this asserts on the
+    /// presence of *its own* distinctive record rather than on counts.
+    #[test]
+    fn klog_propagates_correlation_field() {
+        CAPTURED.get_or_init(|| Mutex::new(Vec::new()));
+        let _ = log::set_boxed_logger(Box::new(Capture));
+        log::set_max_level(log::LevelFilter::Trace);
+
+        let stmt = "stmt-correlation-probe-7f3a";
+        crate::klog::debug!(statement_id = stmt, "creating reader: {} bytes", 42);
+
+        let got = CAPTURED.get().unwrap().lock().unwrap().clone();
+        // The field renders into the message as `statement_id="…"`.
+        assert!(
+            got.iter()
+                .any(|(target, msg)| target == super::KERNEL_LOG_TARGET
+                    && msg.contains(stmt)
+                    && msg.contains("statement_id")),
+            "expected a kernel-target record whose rendered message carries \
+             the `statement_id` field {stmt:?}; got {got:?}"
+        );
     }
 }

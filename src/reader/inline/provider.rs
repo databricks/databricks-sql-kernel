@@ -75,6 +75,11 @@ impl InlineArrowProvider {
     /// Decompresses (if needed) and parses the Arrow IPC stream into RecordBatches.
     ///
     /// # Arguments
+    /// * `statement_id` - SEA statement id, attached to this provider's
+    ///   decode logs so they correlate to a statement in interleaved
+    ///   multi-session logs (matches the CloudFetch streaming provider,
+    ///   which stores `statement_id` for the same reason). Used for
+    ///   logging only — not retained.
     /// * `attachment` - Raw Arrow IPC bytes (decoded from base64)
     /// * `compression` - Compression codec used (from manifest.result_compression)
     /// * `total_row_count` - Authoritative logical row count from
@@ -93,12 +98,17 @@ impl InlineArrowProvider {
     /// - If decompression fails
     /// - If Arrow IPC parsing fails
     pub fn new(
+        statement_id: &str,
         attachment: Vec<u8>,
         compression: CompressionCodec,
         total_row_count: Option<i64>,
     ) -> Result<Self> {
+        // Correlate decode logs to the statement (see `statement_id` doc
+        // above) — matches `create_inline_reader` and the CloudFetch
+        // streaming provider so a customer filtering by `statement_id`
+        // sees the whole result lifecycle, decode internals included.
         if attachment.is_empty() {
-            crate::klog::debug!("Empty attachment, creating empty provider");
+            crate::klog::debug!(statement_id, "Empty attachment, creating empty provider");
             return Ok(Self {
                 batches: VecDeque::new(),
                 schema: None,
@@ -106,6 +116,7 @@ impl InlineArrowProvider {
         }
 
         crate::klog::debug!(
+            statement_id,
             "Parsing inline Arrow data: {} bytes, compression={:?}",
             attachment.len(),
             compression
@@ -121,6 +132,7 @@ impl InlineArrowProvider {
         let schema = batches.first().map(|b| b.schema());
 
         crate::klog::debug!(
+            statement_id,
             "Parsed inline Arrow data: {} batches, {} total rows",
             batches.len(),
             batches.iter().map(|b| b.num_rows()).sum::<usize>()
@@ -202,7 +214,7 @@ mod tests {
         let ipc_data = create_test_arrow_ipc(&[batch]);
 
         let mut provider =
-            InlineArrowProvider::new(ipc_data, CompressionCodec::None, None).unwrap();
+            InlineArrowProvider::new("test-stmt", ipc_data, CompressionCodec::None, None).unwrap();
 
         // Check schema
         assert!(provider.schema().is_some());
@@ -235,7 +247,8 @@ mod tests {
         }
 
         let mut provider =
-            InlineArrowProvider::new(compressed, CompressionCodec::Lz4Frame, None).unwrap();
+            InlineArrowProvider::new("test-stmt", compressed, CompressionCodec::Lz4Frame, None)
+                .unwrap();
 
         let batch = provider.next_batch().unwrap().unwrap();
         assert_eq!(batch.num_rows(), 100);
@@ -248,7 +261,7 @@ mod tests {
         let ipc_data = create_test_arrow_ipc(&[batch1, batch2]);
 
         let mut provider =
-            InlineArrowProvider::new(ipc_data, CompressionCodec::None, None).unwrap();
+            InlineArrowProvider::new("test-stmt", ipc_data, CompressionCodec::None, None).unwrap();
 
         // First batch
         let batch = provider.next_batch().unwrap().unwrap();
@@ -264,7 +277,8 @@ mod tests {
 
     #[test]
     fn test_inline_provider_with_empty_data() {
-        let provider = InlineArrowProvider::new(vec![], CompressionCodec::None, None).unwrap();
+        let provider =
+            InlineArrowProvider::new("test-stmt", vec![], CompressionCodec::None, None).unwrap();
 
         assert!(provider.schema().is_none());
         assert!(!provider.has_more());
@@ -274,7 +288,8 @@ mod tests {
     fn test_inline_provider_with_invalid_data() {
         let invalid_data = b"this is not valid arrow ipc data".to_vec();
 
-        let result = InlineArrowProvider::new(invalid_data, CompressionCodec::None, None);
+        let result =
+            InlineArrowProvider::new("test-stmt", invalid_data, CompressionCodec::None, None);
         assert!(result.is_err());
     }
 
@@ -313,7 +328,8 @@ mod tests {
         // exactly 10 rows (parity with Python use_sea and Thrift).
         let batch = create_test_batch(11);
         let ipc = create_test_arrow_ipc(&[batch]);
-        let mut provider = InlineArrowProvider::new(ipc, CompressionCodec::None, Some(10)).unwrap();
+        let mut provider =
+            InlineArrowProvider::new("test-stmt", ipc, CompressionCodec::None, Some(10)).unwrap();
         let mut total = 0;
         while let Some(b) = provider.next_batch().unwrap() {
             total += b.num_rows();

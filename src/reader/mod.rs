@@ -122,6 +122,7 @@ impl ResultReaderFactory {
         // Log manifest info for debugging
         if let Some(ref manifest) = response.manifest {
             crate::klog::debug!(
+                statement_id,
                 "Result manifest: total_chunks={:?}, total_rows={:?}, total_bytes={:?}, truncated={}",
                 manifest.total_chunk_count,
                 manifest.total_row_count,
@@ -142,6 +143,7 @@ impl ResultReaderFactory {
         if let Some(ref result) = response.result {
             // Log what result data we have for debugging the decision path
             crate::klog::debug!(
+                statement_id,
                 "Result data present: external_links={}, inline_arrow_data={} bytes, next_chunk_internal_link={}",
                 result.external_links.as_ref().map(|l| l.len()).unwrap_or(0),
                 result.inline_arrow_data.as_ref().map(|d| d.len()).unwrap_or(0),
@@ -161,6 +163,7 @@ impl ResultReaderFactory {
                     let total_chunk_count =
                         response.manifest.as_ref().and_then(|m| m.total_chunk_count);
                     crate::klog::info!(
+                        statement_id,
                         "Using CloudFetch reader: {} initial external links, total_chunks={:?}",
                         external_links.len(),
                         total_chunk_count,
@@ -250,6 +253,7 @@ impl ResultReaderFactory {
                             )
                         })?;
                         crate::klog::info!(
+                            statement_id,
                             "Using inline-Arrow streaming reader: {} bytes initial chunk, \
                              next_chunk_index={}",
                             inline_data.len(),
@@ -267,6 +271,7 @@ impl ResultReaderFactory {
                                 Ok(s) => Some(s),
                                 Err(e) => {
                                     crate::klog::warn!(
+                                        statement_id,
                                         "Failed to extract manifest schema for inline-Arrow \
                                              streaming fallback; proceeding without it: {e}"
                                     );
@@ -289,6 +294,7 @@ impl ResultReaderFactory {
                     // Single-chunk inline: legacy fast path, parses
                     // the whole result up front.
                     crate::klog::info!(
+                        statement_id,
                         "Using inline Arrow reader: {} bytes of Arrow IPC data",
                         inline_data.len()
                     );
@@ -298,7 +304,12 @@ impl ResultReaderFactory {
                     // server appends when a row_limit truncates the result.
                     let total_row_count =
                         response.manifest.as_ref().and_then(|m| m.total_row_count);
-                    return self.create_inline_reader(inline_data, compression, total_row_count);
+                    return self.create_inline_reader(
+                        statement_id,
+                        inline_data,
+                        compression,
+                        total_row_count,
+                    );
                 }
             }
 
@@ -316,6 +327,7 @@ impl ResultReaderFactory {
                 // Note: Closed state is valid for inline results where the server delivers
                 // the data (or empty result) and immediately closes the statement.
                 crate::klog::info!(
+                    statement_id,
                     "Using empty reader: no result data present for {:?} statement",
                     response.status.state
                 );
@@ -387,6 +399,7 @@ impl ResultReaderFactory {
         compression: CompressionCodec,
     ) -> Result<Box<dyn ResultReader + Send>> {
         crate::klog::debug!(
+            statement_id,
             "Creating CloudFetch reader: {} initial links, prefetch_window={}, total_chunks={:?}",
             external_links.len(),
             self.config.link_prefetch_window,
@@ -429,19 +442,25 @@ impl ResultReaderFactory {
 
     fn create_inline_reader(
         &self,
+        statement_id: &str,
         inline_data: &[u8],
         compression: CompressionCodec,
         total_row_count: Option<i64>,
     ) -> Result<Box<dyn ResultReader + Send>> {
         crate::klog::debug!(
+            statement_id,
             "Creating inline Arrow reader: {} bytes, compression={:?}, total_row_count={:?}",
             inline_data.len(),
             compression,
             total_row_count
         );
 
-        let provider =
-            InlineArrowProvider::new(inline_data.to_vec(), compression, total_row_count)?;
+        let provider = InlineArrowProvider::new(
+            statement_id,
+            inline_data.to_vec(),
+            compression,
+            total_row_count,
+        )?;
 
         Ok(Box::new(InlineArrowReader::new(provider)))
     }
