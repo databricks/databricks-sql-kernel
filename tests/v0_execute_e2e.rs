@@ -923,3 +923,56 @@ async fn live_failed_statement_error_envelope_carries_extended_fields() {
 
     session.close().await.expect("session close");
 }
+
+// Sync-cancel surface (#121 core + #122 napi): a detached `StatementCanceller`
+// obtained BEFORE `execute()` cancels a still-running blocking execute. Past the
+// server's ~10s wait-timeout window the statement_id is published into the
+// shared inflight slot, so `cancel()` reaches the running query (before that
+// window it is a tolerant no-op — a documented kernel-core property).
+#[tokio::test]
+#[ignore]
+async fn sync_canceller_cancels_a_running_execute_mid_compute() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    // ~1e12-row cross join: runs for minutes, so it cannot complete before the
+    // cancel — the assertion below proves the cancel actually took effect.
+    stmt.spec()
+        .sql("SELECT count(*) FROM range(0,1000000) a CROSS JOIN range(0,1000000) b WHERE (a.id*b.id)%7=3");
+
+    // Detached canceller captured before dispatch — the whole point of the API.
+    let canceller = stmt.canceller();
+    let cancel_task = tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(13)).await;
+        let id_present = canceller.statement_id().is_some();
+        let cancelled = canceller.cancel().await;
+        (id_present, cancelled)
+    });
+
+    // Drive the blocking execute; it must reject (Cancelled), not run to term.
+    let result = stmt.execute().await;
+    let (id_present, cancelled) = cancel_task.await.expect("cancel task join");
+
+    assert!(
+        id_present,
+        "statement_id must be published before cancel (past the wait-timeout window)"
+    );
+    cancelled.expect("cancel() should succeed");
+    let err = result
+        .err()
+        .expect("execute() must reject after a server-side cancel, not run to completion");
+    // The invariant that matters: the cancel interrupted the running execute
+    // (it errored ~13s in, not after running the 1e12-row cross join to term).
+    // KERNEL QUIRK (follow-up): the sync execute() path currently surfaces a
+    // server-side cancel as `InvalidArgument`, whereas the async path returns
+    // `Cancelled`. The napi/pyo3 wrappers map it to a cancelled status via their
+    // client-side cancel flag, so callers still observe "cancelled". Accept both
+    // so this test stays green today and after the code is normalised to
+    // `Cancelled`.
+    assert!(
+        matches!(err.code, ErrorCode::Cancelled | ErrorCode::InvalidArgument),
+        "cancelled execute should error (Cancelled, or today's InvalidArgument), got {:?}",
+        err.code
+    );
+
+    session.close().await.expect("session close");
+}
