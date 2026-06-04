@@ -38,7 +38,16 @@ name = "databricks_sql_kernel_pyo3"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-databricks-sql-kernel = { path = ".." }
+# Disable the kernel's `default` feature (which selects `tls-native`)
+# and opt into `tls-rustls` instead — same as the napi crate. The
+# wheel is built inside a manylinux container that ships no OpenSSL,
+# so `native-tls` (system OpenSSL via `openssl-sys`) fails to compile;
+# the pure-Rust rustls backend needs no system library and keeps the
+# published wheel self-contained / portable.
+#
+# Direct-Rust users + the C-ABI (future ODBC) keep `tls-native` via the
+# kernel's default feature.
+databricks-sql-kernel = { path = "..", default-features = false, features = ["tls-rustls"] }
 
 # pyo3 — abi3-py310 builds a single stable-ABI wheel (tagged
 # cp310-abi3) that loads on CPython 3.10+. The ABI floor is kept in
