@@ -423,6 +423,62 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manifest_overlays_real_names_onto_positional_columns_and_batches() {
+        // Real names must appear on both the advertised schema and the
+        // yielded batch (rebuilt onto the renamed schema), not the col_N
+        // names from the Arrow payload.
+        let positional = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int32, true),
+            Field::new("col_1", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            positional.clone(),
+            vec![
+                Arc::new(Int32Array::from(vec![1])) as _,
+                Arc::new(StringArray::from(vec!["abc"])) as _,
+            ],
+        )
+        .unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![
+            column_info("id", "INT", "INT", 0),
+            column_info("varchar_column", "STRING", "STRING", 1),
+        ]);
+
+        let mut pp =
+            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
+                .await
+                .unwrap();
+
+        // Advertised schema carries the manifest names.
+        let advertised = pp.schema().await.unwrap();
+        assert_eq!(advertised.field(0).name(), "id");
+        assert_eq!(advertised.field(1).name(), "varchar_column");
+
+        // The actual yielded batch carries them too (not the col_N names),
+        // and the data is untouched.
+        let out = pp.next_batch().await.unwrap().unwrap();
+        assert_eq!(out.schema().field(0).name(), "id");
+        assert_eq!(out.schema().field(1).name(), "varchar_column");
+        assert_eq!(
+            out.column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            1
+        );
+        assert_eq!(
+            out.column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "abc"
+        );
+    }
+
+    #[tokio::test]
     async fn json_path_rewrites_list_column_to_utf8() {
         // Build a one-row batch with a list<int32> column.
         let mut list_b = ListBuilder::new(arrow_array::builder::Int32Builder::new());
