@@ -75,6 +75,12 @@ databricks-sql-kernel = { path = "..", default-features = false, features = ["tl
 # entry/exit, metadata-cancel no-op) through the same subscriber the kernel uses.
 tracing = "0.1"
 
+# `tracing-subscriber` — the napi layer installs a process-global Subscriber
+# (see `logger.rs`) that captures kernel `tracing` events and forwards them to
+# the JS `DBSQLLogger` via a `ThreadsafeFunction`. Only `registry` + `std` are
+# needed; level filtering is done by our own atomic rather than `EnvFilter`.
+tracing-subscriber = { version = "0.3", default-features = false, features = ["registry", "std"] }
+
 # Tokio is a transitive dep via the kernel and via napi's `async` feature;
 # declared explicitly so we can name `tokio::runtime::Handle` and
 # `tokio::sync::Mutex` directly.
