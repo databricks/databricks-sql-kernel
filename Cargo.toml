@@ -24,7 +24,14 @@ keywords = ["databricks", "arrow", "database", "sql"]
 categories = ["database"]
 
 [dependencies]
-tracing = "0.1"
+# The `log` feature makes `tracing::*` macros also emit `log::Record`s
+# *when no tracing Subscriber is installed*. The pyo3 binding relies on
+# this: it installs no Subscriber and instead routes those `log` records
+# into Python's `logging` via `pyo3-log` (see `pyo3/src/logging.rs`).
+# Direct-Rust / C-ABI consumers install the `fmt` Subscriber in
+# `src/logging.rs` instead, which suppresses the `log` records — the two
+# paths are mutually exclusive by construction.
+tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
 arrow-array = "57"
@@ -93,6 +100,7 @@ dirs = "5"           # Cross-platform config directory (~/.config/)
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 tempfile = "3"
+log = "0.4"
 
 # TLS backend selection.
 #

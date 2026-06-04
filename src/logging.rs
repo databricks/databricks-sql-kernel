@@ -15,6 +15,7 @@
 //! Logging configuration for the Databricks SQL Kernel.
 //!
 //! Initializes a `tracing-subscriber` with file or stderr output.
+//! This path is for **direct-Rust and C-ABI (ODBC / Go) consumers**.
 //!
 //! ## Configuration priority
 //!
@@ -28,6 +29,23 @@
 //! # Via environment variable
 //! RUST_LOG=databricks_sql_kernel=debug ./my_app
 //! ```
+//!
+//! ## Relationship to the pyo3 / Python path
+//!
+//! The Python binding does **not** install this subscriber. The
+//! `tracing` crate is built with its `log` feature (see `Cargo.toml`),
+//! so when no `tracing` `Subscriber` is installed, every `tracing::*`
+//! event also emits a `log::Record`. The pyo3 crate installs
+//! [`pyo3_log`] as the `log` consumer and forwards records into
+//! Python's `logging` module under the `databricks.sql.kernel` logger
+//! (see `pyo3/src/logging.rs`).
+//!
+//! These two paths are **mutually exclusive**: installing the
+//! subscriber below *suppresses* the `log` records pyo3 relies on
+//! (that is the documented behaviour of the `tracing/log` feature, as
+//! opposed to `log-always`). A single process therefore uses exactly
+//! one — `init_logging` here for embedded Rust, or `pyo3_log` for
+//! Python. Do not call `init_logging` from the pyo3 crate.
 
 #![allow(dead_code)]
 

@@ -42,13 +42,13 @@
 
 use crate::client::{ChunkLinkFetchResult, Transport};
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, error};
 use crate::types::cloudfetch::CloudFetchLink;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::Arc;
 use tokio::sync::Mutex as TokioMutex;
-use tracing::{debug, error};
 
 /// Statement-scoped abstraction for fetching chunk links.
 ///
@@ -479,7 +479,7 @@ impl SeaChunkLinkFetcher {
     /// remove the fallback path.
     fn warn_total_chunk_count_fallback(&self, site: &str) {
         if !self.fallback_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %self.statement_id,
                 total_chunk_count = ?self.total_chunk_count_hint,
                 "Server did not populate `external_links[].next_chunk_index` ({site}); \
@@ -498,7 +498,7 @@ impl SeaChunkLinkFetcher {
     /// truncates multi-batch results.
     fn warn_silent_eos(&self, site: &str) {
         if !self.silent_eos_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %self.statement_id,
                 "Server emitted neither `next_chunk_index` nor `total_chunk_count` ({site}); \
                  assuming end-of-stream. If this query has more than one batch of links, \
@@ -521,7 +521,7 @@ impl SeaChunkLinkFetcher {
         last_chunk_index: i64,
     ) {
         if !self.non_monotonic_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %self.statement_id,
                 server_next_chunk_index = server_emitted,
                 last_chunk_index,
@@ -541,7 +541,7 @@ impl SeaChunkLinkFetcher {
     /// bounded by `max_chunks_in_memory`; metadata is not).
     fn warn_runaway_prefetch(&self, site: &str, current_index: i64, ceiling: i64) {
         if !self.runaway_prefetch_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %self.statement_id,
                 next_server_fetch_index = current_index,
                 ceiling,
@@ -559,7 +559,7 @@ impl SeaChunkLinkFetcher {
     /// server bug we want surfaced in production logs.
     fn warn_empty_with_has_more(&self, site: &str, advanced_from: i64, advanced_to: i64) {
         if !self.empty_with_has_more_warned.swap(true, Ordering::AcqRel) {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %self.statement_id,
                 advanced_from,
                 advanced_to,

@@ -116,7 +116,7 @@ impl TokenCache {
 
         // Check if cache file exists
         if !cache_path.exists() {
-            tracing::debug!("Token cache miss: file does not exist at {:?}", cache_path);
+            crate::klog::debug!("Token cache miss: file does not exist at {:?}", cache_path);
             return None;
         }
 
@@ -124,16 +124,20 @@ impl TokenCache {
         match fs::read_to_string(&cache_path) {
             Ok(contents) => match serde_json::from_str::<OAuthToken>(&contents) {
                 Ok(token) => {
-                    tracing::debug!("Token cache hit: loaded from {:?}", cache_path);
+                    crate::klog::debug!("Token cache hit: loaded from {:?}", cache_path);
                     Some(token)
                 }
                 Err(e) => {
-                    tracing::warn!("Token cache corrupted at {:?}, ignoring: {}", cache_path, e);
+                    crate::klog::warn!(
+                        "Token cache corrupted at {:?}, ignoring: {}",
+                        cache_path,
+                        e
+                    );
                     None
                 }
             },
             Err(e) => {
-                tracing::warn!("Failed to read token cache at {:?}: {}", cache_path, e);
+                crate::klog::warn!("Failed to read token cache at {:?}: {}", cache_path, e);
                 None
             }
         }
@@ -156,7 +160,7 @@ impl TokenCache {
         let cache_path = match Self::cache_file_path(host, client_id, scopes) {
             Some(path) => path,
             None => {
-                tracing::warn!("Cannot determine cache directory, token will not be cached");
+                crate::klog::warn!("Cannot determine cache directory, token will not be cached");
                 return;
             }
         };
@@ -164,7 +168,7 @@ impl TokenCache {
         // Create cache directory if it doesn't exist, with 700 permissions (owner only)
         if let Some(parent) = cache_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
-                tracing::warn!("Failed to create cache directory {:?}: {}", parent, e);
+                crate::klog::warn!("Failed to create cache directory {:?}: {}", parent, e);
                 return;
             }
             // Tighten directory permissions to 700 (owner read/write/execute only)
@@ -179,7 +183,7 @@ impl TokenCache {
         let json = match serde_json::to_string_pretty(token) {
             Ok(j) => j,
             Err(e) => {
-                tracing::warn!("Failed to serialize token for cache: {}", e);
+                crate::klog::warn!("Failed to serialize token for cache: {}", e);
                 return;
             }
         };
@@ -191,13 +195,13 @@ impl TokenCache {
         match File::create(&temp_path) {
             Ok(mut file) => {
                 if let Err(e) = file.write_all(json.as_bytes()) {
-                    tracing::warn!("Failed to write token cache to {:?}: {}", temp_path, e);
+                    crate::klog::warn!("Failed to write token cache to {:?}: {}", temp_path, e);
                     let _ = fs::remove_file(&temp_path); // Clean up temp file
                     return;
                 }
             }
             Err(e) => {
-                tracing::warn!("Failed to create temp cache file {:?}: {}", temp_path, e);
+                crate::klog::warn!("Failed to create temp cache file {:?}: {}", temp_path, e);
                 return;
             }
         }
@@ -207,7 +211,7 @@ impl TokenCache {
         {
             use std::os::unix::fs::PermissionsExt;
             if let Err(e) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(0o600)) {
-                tracing::warn!("Failed to set cache file permissions: {}", e);
+                crate::klog::warn!("Failed to set cache file permissions: {}", e);
                 let _ = fs::remove_file(&temp_path); // Clean up temp file
                 return;
             }
@@ -215,7 +219,7 @@ impl TokenCache {
 
         // Atomically rename temp file to final cache file
         if let Err(e) = fs::rename(&temp_path, &cache_path) {
-            tracing::warn!(
+            crate::klog::warn!(
                 "Failed to rename temp cache file {:?} to {:?}: {}",
                 temp_path,
                 cache_path,
@@ -225,7 +229,7 @@ impl TokenCache {
             return;
         }
 
-        tracing::debug!("Token cached successfully at {:?}", cache_path);
+        crate::klog::debug!("Token cached successfully at {:?}", cache_path);
     }
 }
 

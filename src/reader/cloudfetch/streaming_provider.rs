@@ -21,6 +21,7 @@
 //! - Consumer API via RecordBatchReader trait
 
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, error, info, warn};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
 use crate::types::cloudfetch::{
@@ -35,7 +36,6 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
 
 /// Merge a list of record batches into larger batches up to `target_rows` each.
 ///
