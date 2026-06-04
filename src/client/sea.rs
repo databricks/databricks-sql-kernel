@@ -23,6 +23,7 @@ use crate::client::{
     InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, warn};
 use crate::metadata::sql::SqlCommandBuilder;
 use crate::reader::ResultReaderFactory;
 use crate::types::cloudfetch::CloudFetchLink;
@@ -35,7 +36,6 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
-use tracing::{debug, warn};
 
 /// Internal terminal-outcome for a single SEA statement response.
 ///
@@ -725,7 +725,7 @@ impl Transport for SeaRestTransport {
             .execute(request, RequestType::CloseSession)
             .await
         {
-            tracing::warn!(
+            crate::klog::warn!(
                 session_id = %session_id,
                 error = %e,
                 "delete_session failed after HTTP retries; server-side session will be reclaimed by idle timeout"
@@ -1005,7 +1005,7 @@ impl Transport for SeaRestTransport {
             .execute(request, RequestType::CloseStatement)
             .await
         {
-            tracing::warn!(
+            crate::klog::warn!(
                 statement_id = %statement_id,
                 error = %e,
                 "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"

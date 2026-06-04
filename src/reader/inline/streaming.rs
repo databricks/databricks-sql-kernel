@@ -64,6 +64,7 @@
 
 use crate::client::{InlineChunkFetchResult, Transport};
 use crate::kernel_error::{Error, Result};
+use crate::klog::{debug, error};
 use crate::reader::cloudfetch::parse_arrow_ipc;
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
@@ -72,7 +73,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as TokioMutex};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, instrument};
+use tracing::instrument;
 
 /// Narrow source trait for inline-chunk fetches.
 ///

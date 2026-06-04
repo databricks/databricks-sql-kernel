@@ -917,7 +917,7 @@ pub(crate) fn filter_session_conf(
             // the caller's casing and not uppercased.
             out.insert((*canonical).to_string(), v);
         } else {
-            tracing::warn!(
+            crate::klog::warn!(
                 key = %k,
                 "dropping unknown session_conf key (not in kernel allowlist); \
                  see https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters"

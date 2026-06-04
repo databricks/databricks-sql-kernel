@@ -60,3 +60,6 @@ arrow-pyarrow = "57"
 # kernel uses for its `TypedValue::Date` / `TypedValue::Timestamp`
 # variants — the parsed values flow directly into those.
 chrono = "0.4"
+pyo3-log = "0.13"
+log = "0.4"
+tracing = "0.1"

@@ -170,6 +170,14 @@ impl Session {
             Some(t) => t.to_owned(),
             None if access_token.is_some() => "pat".to_owned(),
             None => {
+                // Boundary-only breadcrumb: this rejection happens in
+                // pyo3 *before* any kernel code runs, so the kernel emits
+                // nothing. Without this, a customer who turned on DEBUG to
+                // chase a connection failure would see an empty log.
+                tracing::debug!(
+                    target: crate::logging::PYO3_LOG_TARGET,
+                    "Session.__new__ rejected: no auth credentials provided"
+                );
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "Session requires auth: pass access_token (PAT) or set \
                      auth_type to 'oauth-m2m' / 'oauth-u2m' with the matching \
@@ -270,6 +278,10 @@ impl Session {
         // `Session::open` is async and grabs the current tokio handle.
         // Drive it on the runtime; the macro detaches the GIL for the
         // I/O and maps kernel errors into `KernelError`.
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Session.__new__: opening kernel session (GIL released)"
+        );
         let rt = runtime.clone();
         let session = run_kernel!(py, rt, async {
             let mut builder = KSession::builder()
@@ -337,6 +349,10 @@ impl Session {
         };
         let SessionInner { session, runtime } = inner;
         let rt = runtime;
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Session.close: closing kernel session (GIL released)"
+        );
         run_kernel!(py, rt, session.close())?;
         Ok(())
     }

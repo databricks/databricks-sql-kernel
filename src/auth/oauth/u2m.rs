@@ -226,16 +226,16 @@ impl AuthorizationCodeProvider {
         if let Some(cached_token) = TokenCache::load(host, client_id, &scopes) {
             // Check if the cached token has a refresh token
             if cached_token.refresh_token.is_some() {
-                tracing::debug!("Loaded cached token with refresh_token for U2M flow");
+                crate::klog::debug!("Loaded cached token with refresh_token for U2M flow");
                 // Store the cached token - TokenStore will handle refresh if needed
                 // We need to manually insert it since get_or_refresh expects to call the closure
                 // Let's trigger a get_or_refresh with a closure that returns the cached token
                 let _ = token_store.get_or_refresh(move || Ok(cached_token.clone()));
             } else {
-                tracing::debug!("Cached token has no refresh_token, will trigger browser flow");
+                crate::klog::debug!("Cached token has no refresh_token, will trigger browser flow");
             }
         } else {
-            tracing::debug!(
+            crate::klog::debug!(
                 "No cached token found for U2M flow, will trigger browser flow on first auth"
             );
         }
@@ -316,7 +316,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                     if let Some(cached_token) = TokenCache::load(&host, &client_id, &scopes) {
                         if let Some(ref refresh_token_str) = cached_token.refresh_token {
                             // Try refreshing the token
-                            tracing::debug!("Attempting to refresh token via refresh_token");
+                            crate::klog::debug!("Attempting to refresh token via refresh_token");
 
                             // Build OAuth client
                             let oauth_client = BasicClient::new(ClientId::new(client_id.clone()))
@@ -340,7 +340,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                                 .await
                             {
                                 Ok(token_response) => {
-                                    tracing::debug!("Token refresh successful");
+                                    crate::klog::debug!("Token refresh successful");
                                     // Convert to OAuthToken
                                     let access_token =
                                         token_response.access_token().secret().to_string();
@@ -376,7 +376,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                                     return Ok(token);
                                 }
                                 Err(e) => {
-                                    tracing::warn!(
+                                    crate::klog::warn!(
                                         "Token refresh failed, falling back to browser flow: {}",
                                         e
                                     );
@@ -387,7 +387,7 @@ impl AuthProvider for AuthorizationCodeProvider {
                     }
 
                     // No cached token or refresh failed - trigger browser flow
-                    tracing::debug!("Initiating browser-based authorization code flow");
+                    crate::klog::debug!("Initiating browser-based authorization code flow");
 
                     // Generate PKCE challenge
                     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
@@ -427,12 +427,12 @@ impl AuthProvider for AuthorizationCodeProvider {
 
                     // Launch browser (unless suppressed for testing)
                     if open_browser {
-                        tracing::info!("Opening browser for OAuth authorization: {}", auth_url);
+                        crate::klog::info!("Opening browser for OAuth authorization: {}", auth_url);
                         if let Err(e) = open::that(auth_url.as_str()) {
-                            tracing::warn!("Failed to automatically open browser: {}. Please manually navigate to: {}", e, auth_url);
+                            crate::klog::warn!("Failed to automatically open browser: {}. Please manually navigate to: {}", e, auth_url);
                         }
                     } else {
-                        tracing::debug!("Browser opening suppressed, authorization URL: {}", auth_url);
+                        crate::klog::debug!("Browser opening suppressed, authorization URL: {}", auth_url);
                     }
 
                     // Wait for callback

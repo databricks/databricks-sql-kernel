@@ -80,6 +80,17 @@ fn attach_attrs(
 /// `err.code`, `err.message`, `err.sql_state`, etc.; `str(err)` is
 /// the kernel's message text.
 pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
+    // Boundary-only breadcrumb: the kernel logged *what* failed; this
+    // records the kernel `Error` -> Python `KernelError` translation
+    // (and which code slug drove it), which is knowledge unique to the
+    // pyo3 layer. Helps explain "why did I get this exception type".
+    tracing::debug!(
+        target: crate::logging::PYO3_LOG_TARGET,
+        code = code_str(err.code),
+        retryable = err.retryable,
+        "mapping kernel error to KernelError: {}",
+        err.message
+    );
     let py_err = KernelError::new_err(err.message.clone());
     // Materialise the exception value so we can attach attributes.
     let bound = py_err.value(py);

@@ -98,14 +98,14 @@ impl InlineArrowProvider {
         total_row_count: Option<i64>,
     ) -> Result<Self> {
         if attachment.is_empty() {
-            tracing::debug!("Empty attachment, creating empty provider");
+            crate::klog::debug!("Empty attachment, creating empty provider");
             return Ok(Self {
                 batches: VecDeque::new(),
                 schema: None,
             });
         }
 
-        tracing::debug!(
+        crate::klog::debug!(
             "Parsing inline Arrow data: {} bytes, compression={:?}",
             attachment.len(),
             compression
@@ -120,7 +120,7 @@ impl InlineArrowProvider {
 
         let schema = batches.first().map(|b| b.schema());
 
-        tracing::debug!(
+        crate::klog::debug!(
             "Parsed inline Arrow data: {} batches, {} total rows",
             batches.len(),
             batches.iter().map(|b| b.num_rows()).sum::<usize>()

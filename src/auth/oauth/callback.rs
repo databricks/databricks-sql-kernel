@@ -256,13 +256,13 @@ impl CallbackServer {
                             break;
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to handle callback request: {}", e);
+                            crate::klog::warn!("Failed to handle callback request: {}", e);
                             // Continue listening for another request
                         }
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Failed to accept connection: {}", e);
+                    crate::klog::error!("Failed to accept connection: {}", e);
                     break;
                 }
             }
