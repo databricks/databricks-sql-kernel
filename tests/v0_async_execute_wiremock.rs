@@ -362,7 +362,7 @@ async fn await_result_propagates_failed_status() {
 }
 
 #[tokio::test]
-async fn await_result_surfaces_cancelled_as_invalid_state() {
+async fn await_result_surfaces_cancelled_as_cancelled_code() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -380,10 +380,11 @@ async fn await_result_surfaces_cancelled_as_invalid_state() {
         Ok(_) => panic!("await_result on CANCELED should error"),
         Err(e) => e,
     };
-    // `Error::invalid_state()` currently maps to InvalidArgument
-    // until the ErrorCode taxonomy expansion (spec A8) ships
-    // `FailedPrecondition` / `InvalidState`.
-    assert_eq!(err.code, ErrorCode::InvalidArgument);
+    // A server-side CANCELLED is an operational/cancelled condition,
+    // not a caller-argument error — `Error::cancelled()` (ErrorCode::
+    // Cancelled). The connector maps this to OperationalError, not the
+    // misleading ProgrammingError that InvalidArgument would yield.
+    assert_eq!(err.code, ErrorCode::Cancelled);
     assert!(err.message.contains("cancel"), "{}", err.message);
 }
 
@@ -963,10 +964,9 @@ async fn async_await_result_cancelled_carries_extended_status_fields_onto_error(
         Ok(_) => panic!("await_result on CANCELED should error"),
         Err(e) => e,
     };
-    // Cancelled maps to InvalidArgument per the kernel's invalid-state
-    // helper today; assert the message + extended fields rather than
-    // pinning the code (the categorisation may move under ErrorCode
-    // taxonomy expansion).
+    // A server-side CANCELLED surfaces as ErrorCode::Cancelled (the
+    // connector maps it to OperationalError, not ProgrammingError).
+    assert_eq!(err.code, ErrorCode::Cancelled);
     assert!(
         err.message.contains("cancelled"),
         "message should mention cancellation, got: {}",
