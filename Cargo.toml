@@ -67,7 +67,7 @@ base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 
 # LZ4 decompression for CloudFetch
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # Random number generation (retry jitter)
 rand = "0.9"
