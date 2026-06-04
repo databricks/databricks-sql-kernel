@@ -537,7 +537,7 @@ impl Drop for Statement {
 /// (fetch_next_batch / cancel and their Connection-side cousin) —
 /// keeps the wire-message shape stable for the TS reviver's contract
 /// test.
-fn statement_closed_err() -> napi::Error {
+pub(crate) fn statement_closed_err() -> napi::Error {
     napi_err_from_kernel(
         KernelError::invalid_statement_handle().message("statement already closed"),
     )
