@@ -742,12 +742,16 @@ impl ResultReaderAdapter {
         Ok(Self { inner, schema })
     }
 
-    /// Augment an Arrow schema with Databricks column metadata from the manifest.
+    /// Augment an Arrow schema with column info from the manifest.
     ///
-    /// For each field in the schema, if a matching ColumnInfo exists (by position),
-    /// attach `databricks.*` key-value metadata to the field. This preserves
-    /// server-provided type_name, type_text, precision, scale, etc. through the
-    /// Arrow C Data Interface FFI boundary.
+    /// For each field with a matching `ColumnInfo` (by position):
+    /// - overwrite the field name with `ColumnInfo.name` — SEA sends
+    ///   positional placeholders (`col_0`, …) in the Arrow payload; the
+    ///   authoritative names live in the manifest;
+    /// - attach `databricks.*` type metadata (type_name, type_text,
+    ///   precision, scale, interval_type) for the Arrow C Data FFI boundary.
+    ///
+    /// Fields with no matching `ColumnInfo` are left unchanged.
     pub(crate) fn augment_schema_with_manifest(
         schema: &SchemaRef,
         manifest: &ResultManifest,
@@ -791,7 +795,13 @@ impl ResultReaderAdapter {
                                 interval.clone(),
                             );
                         }
-                        field.as_ref().clone().with_metadata(metadata)
+                        // Overlay the real manifest name (Arrow payload has
+                        // positional `col_N`) and attach the type metadata.
+                        field
+                            .as_ref()
+                            .clone()
+                            .with_name(info.name.clone())
+                            .with_metadata(metadata)
                     }
                     None => field.as_ref().clone(),
                 }
@@ -1120,6 +1130,63 @@ mod tests {
             type_scale: scale,
             type_interval_type: interval_type.map(|s| s.to_string()),
         }
+    }
+
+    /// Overlay must replace the Arrow payload's positional names
+    /// (`col_0`, …) with the manifest's real names. The other augment
+    /// tests use fixtures where the names already match, so this is the
+    /// only one that catches a broken overlay.
+    #[test]
+    fn test_augment_schema_overlays_manifest_names_over_positional() {
+        // Arrow payload = positional placeholders; manifest = real names.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int32, true),
+            Field::new("col_1", DataType::Utf8, true),
+            Field::new("col_2", DataType::Boolean, true),
+        ]));
+        let manifest = make_manifest(vec![
+            make_column_info("id", "INT", "INT", 0, None, None, None),
+            make_column_info("varchar_column", "STRING", "STRING", 1, None, None, None),
+            make_column_info("boolean_column", "BOOLEAN", "BOOLEAN", 2, None, None, None),
+        ]);
+
+        let augmented = ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+
+        // Names come from the manifest, not the Arrow payload.
+        assert_eq!(augmented.field(0).name(), "id");
+        assert_eq!(augmented.field(1).name(), "varchar_column");
+        assert_eq!(augmented.field(2).name(), "boolean_column");
+        // Data types are preserved unchanged.
+        assert_eq!(augmented.field(0).data_type(), &DataType::Int32);
+        assert_eq!(augmented.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(augmented.field(2).data_type(), &DataType::Boolean);
+        // Type metadata still attached.
+        assert_eq!(
+            augmented.field(0).metadata().get(metadata_keys::TYPE_NAME),
+            Some(&"INT".to_string())
+        );
+    }
+
+    /// A field with no matching `ColumnInfo` keeps its original Arrow name.
+    #[test]
+    fn test_augment_schema_keeps_arrow_name_when_no_manifest_column() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int32, true),
+            Field::new("col_1", DataType::Utf8, true),
+        ]));
+        // Manifest only describes position 0.
+        let manifest = make_manifest(vec![make_column_info(
+            "id", "INT", "INT", 0, None, None, None,
+        )]);
+
+        let augmented = ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+
+        assert_eq!(augmented.field(0).name(), "id", "manifest name overlaid");
+        assert_eq!(
+            augmented.field(1).name(),
+            "col_1",
+            "no manifest column at position 1 → original Arrow name kept"
+        );
     }
 
     #[test]
