@@ -370,6 +370,80 @@ impl Connection {
         .await
     }
 
+    /// Execute a SQL statement on the blocking (sync) path, but return a
+    /// `CancellableExecution` handle so a concurrent JS task can cancel
+    /// the query *while it is still running server-side*.
+    ///
+    /// `executeStatement` builds the kernel `Statement`, awaits the
+    /// blocking `execute()`, and only then hands JS a `Statement` — so a
+    /// query that runs for several seconds is uncancellable from JS on
+    /// that path (there is no handle until the blocking call resolves).
+    /// This method instead builds the statement, captures a detached
+    /// `StatementCanceller` **before** dispatching `execute()`, and hands
+    /// JS a `CancellableExecution` immediately. The caller drives the
+    /// blocking execution via `result()` (resolves to the same
+    /// `Statement` `executeStatement` returns) and can fire `cancel()`
+    /// concurrently to interrupt a still-running query mid-COMPUTE.
+    ///
+    /// Option semantics are identical to `executeStatement` — including
+    /// `queryTimeoutSecs`, which IS honoured here (this is the sync
+    /// `execute` path; only the async `submitStatement` ignores it).
+    /// Mirrors the pyo3 `Statement.canceller()` / `Statement.execute()`
+    /// split (PR #121): obtain the canceller before the blocking drive.
+    #[napi]
+    pub async fn execute_statement_cancellable(
+        &self,
+        sql: String,
+        mut options: Option<ExecuteOptions>,
+    ) -> napi::Result<crate::cancellable::CancellableExecution> {
+        let inner = Arc::clone(&self.inner);
+        // Same option decoding as `execute_statement` — `queryTimeoutSecs`
+        // IS honoured here (sync execute path), so it is read and threaded
+        // through `build_statement` like the rest of the knobs.
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
+        let positional_params = options
+            .as_mut()
+            .and_then(|o| o.positional_params.take())
+            .map(decode_positional_params)
+            .transpose()?
+            .unwrap_or_default();
+        let named_params = options
+            .as_mut()
+            .and_then(|o| o.named_params.take())
+            .map(decode_named_params)
+            .transpose()?
+            .unwrap_or_default();
+        let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
+        let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        guarded(async move {
+            // Build the kernel `Statement` under the session lock, release
+            // the lock, then hand the built statement to the
+            // `CancellableExecution` WITHOUT dispatching `execute()` here —
+            // the blocking drive runs in `CancellableExecution::result()`,
+            // after JS has the cancellable handle in hand. The canceller is
+            // captured inside `CancellableExecution::new` off the built
+            // statement before any execute dispatch.
+            let stmt = {
+                let guard = inner.lock().await;
+                let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+                build_statement(
+                    session,
+                    sql,
+                    statement_conf,
+                    query_tags,
+                    row_limit,
+                    query_timeout_secs,
+                    positional_params,
+                    named_params,
+                )?
+                // session lock released here
+            };
+            Ok(crate::cancellable::CancellableExecution::new(stmt))
+        })
+        .await
+    }
+
     /// Submit a SQL statement and return immediately with an
     /// `AsyncStatement` handle, without blocking until the query
     /// finishes. The kernel's `Statement::submit()` sends

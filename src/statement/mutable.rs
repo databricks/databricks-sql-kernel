@@ -591,21 +591,27 @@ impl StatementCanceller {
     /// Server-side cancel of the in-flight statement via
     /// `cancel_statement(statement_id)`.
     ///
-    /// No-op (returns `Ok`) if no statement id has been observed yet —
-    /// either nothing has executed, or the query is still in its
-    /// initial submit round-trip and the server hasn't issued an id.
+    /// Returns `Ok(true)` if a cancel RPC was actually dispatched (a
+    /// statement id had been observed) and `Ok(false)` if it was a no-op
+    /// because no id has been observed yet — either nothing has executed,
+    /// or the query is still in its initial submit round-trip and the
+    /// server hasn't issued an id. The dispatched/no-op decision and the
+    /// returned flag come from the *same* id read, so a caller can attribute
+    /// a subsequent execute error to this cancel without a separate (racy)
+    /// `statement_id()` re-check.
+    ///
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
     /// concurrently with the `execute()` it targets — the two share
     /// only the id slot (behind a `Mutex`), no mutable statement state.
-    pub async fn cancel(&self) -> Result<()> {
+    pub async fn cancel(&self) -> Result<bool> {
         let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
         let Some(id) = id else {
-            return Ok(());
+            return Ok(false);
         };
         async {
             self.session.transport().cancel_statement(&id).await?;
-            Ok(())
+            Ok(true)
         }
         .instrument(self.session.log_span().clone())
         .await
