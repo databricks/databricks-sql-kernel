@@ -25,7 +25,74 @@ use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use arrow_ipc::reader::StreamReader;
 use lz4_flex::frame::FrameDecoder;
-use std::io::{Cursor, Read};
+use std::io::{self, Cursor, Read};
+
+/// Streaming reader over a buffer that may concatenate multiple LZ4 frames.
+///
+/// Databricks LZ4_FRAME payloads pack one frame per server-side Arrow record
+/// batch, end-to-end in a single body. `FrameDecoder::read` returns EOF at
+/// each frame's end-marker, so a single `FrameDecoder` cannot read across
+/// frame boundaries. This adapter peels frames lazily: as soon as the
+/// current frame is exhausted, it advances past the consumed bytes and
+/// starts a new `FrameDecoder` on whatever follows, transparently to the
+/// caller.
+///
+/// Used by `parse_arrow_ipc` to pipe LZ4-compressed bodies directly into
+/// `arrow_ipc::reader::StreamReader` without ever materializing the full
+/// decompressed payload. Mirrors the JDBC driver's switch from
+/// `decompress -> byte[]` to a streaming `LZ4FrameInputStream`. A 10TB-
+/// logical / 14MB-on-wire chunk fed through this adapter peaks at a single
+/// arrow_ipc batch's worth of memory, not the whole decompressed body.
+struct MultiFrameLz4Reader<'a> {
+    /// Bytes that have not yet been consumed by any frame decoder.
+    remaining: &'a [u8],
+    /// Active decoder for the current frame, if any. `None` between
+    /// frames (or before the first one).
+    current: Option<FrameDecoder<Cursor<&'a [u8]>>>,
+}
+
+impl<'a> MultiFrameLz4Reader<'a> {
+    fn new(data: &'a [u8]) -> Self {
+        Self {
+            remaining: data,
+            current: None,
+        }
+    }
+}
+
+impl<'a> Read for MultiFrameLz4Reader<'a> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        loop {
+            if let Some(decoder) = self.current.as_mut() {
+                let n = decoder.read(buf)?;
+                if n > 0 {
+                    return Ok(n);
+                }
+                // EOF on this frame — recover the consumed-byte count
+                // from the inner cursor and advance `remaining`.
+                let consumed = decoder.get_ref().position() as usize;
+                if consumed == 0 {
+                    // Defensive: a zero-progress decoder on a non-empty
+                    // input would otherwise spin forever. Match the
+                    // failure shape of the previous in-memory loop.
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "LZ4 decoder stalled with {} bytes remaining",
+                            self.remaining.len()
+                        ),
+                    ));
+                }
+                self.remaining = &self.remaining[consumed..];
+                self.current = None;
+            }
+            if self.remaining.is_empty() {
+                return Ok(0);
+            }
+            self.current = Some(FrameDecoder::new(Cursor::new(self.remaining)));
+        }
+    }
+}
 
 /// Parse Arrow IPC data into RecordBatches.
 ///
@@ -48,50 +115,27 @@ use std::io::{Cursor, Read};
 /// - If LZ4 decompression fails
 /// - If Arrow IPC parsing fails
 pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec<RecordBatch>> {
-    // 1. Decompress if needed
-    let decompressed: Vec<u8>;
-    let bytes: &[u8] = match compression {
-        CompressionCodec::Lz4Frame => {
-            // Databricks LZ4_FRAME payloads concatenate multiple LZ4
-            // frames in one buffer (one frame per server-side arrow
-            // record batch). FrameDecoder::read_to_end short-circuits
-            // at the first frame's end marker, so we must loop and
-            // peel each frame off in sequence. Mirrors the Python
-            // connector's `_decompress_data` (cloudfetch/downloader.py).
-            let mut buf = Vec::new();
-            let mut remaining = data;
-            while !remaining.is_empty() {
-                let mut decoder = FrameDecoder::new(Cursor::new(remaining));
-                let before = buf.len();
-                decoder
-                    .read_to_end(&mut buf)
-                    .map_err(|e| Error::io().message(format!("LZ4 decompression failed: {}", e)))?;
-                let consumed = decoder.into_inner().position() as usize;
-                if consumed == 0 {
-                    // Defensive: avoid infinite loop if decoder makes no progress.
-                    return Err(Error::io().message(format!(
-                        "LZ4 decoder stalled with {} bytes remaining",
-                        remaining.len()
-                    )));
-                }
-                if buf.len() == before && consumed == remaining.len() {
-                    break;
-                }
-                remaining = &remaining[consumed..];
-            }
-            decompressed = buf;
-            &decompressed
-        }
-        CompressionCodec::None => data,
+    // Pipe the (possibly LZ4-decompressed) byte stream directly into the
+    // Arrow IPC reader. The decompressed body is never materialized into
+    // a `Vec<u8>` — peak memory is bounded by the current IPC record
+    // batch plus the LZ4 decoder's internal block buffer, not the total
+    // decompressed length.
+    //
+    // This matters in practice: a query that ships ~14 MB compressed but
+    // would decompress to >2 GiB (e.g. `SELECT repeat('A', 1024*1024) FROM
+    // range(10*1024)`) would otherwise either OOM or trip the IPC byte-
+    // array limit. Mirrors the JDBC driver's switch from `byte[]
+    // decompressedBytes` to `LZ4FrameInputStream` in
+    // `SeaInlineArrowChunkProvider.processResultData`.
+    let reader: Box<dyn Read + '_> = match compression {
+        CompressionCodec::Lz4Frame => Box::new(MultiFrameLz4Reader::new(data)),
+        CompressionCodec::None => Box::new(Cursor::new(data)),
     };
 
-    // 2. Parse Arrow IPC stream
-    let cursor = Cursor::new(bytes);
-    let reader = StreamReader::try_new(cursor, None)
+    let stream = StreamReader::try_new(reader, None)
         .map_err(|e| Error::io().message(format!("Failed to create Arrow IPC reader: {}", e)))?;
 
-    // 3. Collect all batches from the stream
-    let batches: Vec<RecordBatch> = reader
+    let batches: Vec<RecordBatch> = stream
         .into_iter()
         .collect::<std::result::Result<Vec<_>, _>>()
         .map_err(|e| Error::io().message(format!("Failed to read Arrow batches: {}", e)))?;

@@ -139,6 +139,32 @@ impl ResultReaderFactory {
             .map(|s| CompressionCodec::from_manifest(Some(s)))
             .unwrap_or_default();
 
+        // Manifest-authoritative empty-result short-circuit.
+        //
+        // When the SEA manifest reports `total_chunk_count = 0`, the
+        // result set is empty regardless of whatever `result` payload
+        // the server may have attached (external_links, inline-Arrow
+        // attachment, or internal-link). Returning an `EmptyReader`
+        // built from the manifest schema avoids walking the chunk-
+        // fetch path for a result we know has no rows, and mirrors
+        // the JDBC driver's manifest-first empty-result handling.
+        //
+        // Only fires when the field is explicitly `Some(0)`. Absent
+        // or non-zero values fall through to the existing branch
+        // dispatch — the manifest field is deprecated on newer
+        // servers and we must not infer "empty" from its absence.
+        if matches!(
+            response.manifest.as_ref().and_then(|m| m.total_chunk_count),
+            Some(0)
+        ) {
+            crate::klog::info!(
+                statement_id,
+                "Manifest reports total_chunk_count=0; short-circuiting to empty reader",
+            );
+            let schema = Self::extract_schema_from_manifest(response.manifest.as_ref())?;
+            return Ok(Box::new(EmptyReader::new(schema)));
+        }
+
         // Check result data for CloudFetch or inline results
         if let Some(ref result) = response.result {
             // Log what result data we have for debugging the decision path
@@ -1716,6 +1742,111 @@ mod tests {
         assert!(
             err.message.to_lowercase().contains("chunk_index"),
             "error must mention the missing field: {}",
+            err.message,
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // total_chunk_count == 0 manifest short-circuit.
+    //
+    // The SEA manifest is authoritative when it explicitly reports
+    // zero chunks: the result has no rows, regardless of any stray
+    // `result` payload the server may have attached. Absent or
+    // non-zero values must fall through to the existing branch
+    // dispatch (the field is deprecated on newer servers).
+    // ──────────────────────────────────────────────────────────────
+
+    /// Zero-chunk manifest must produce an `EmptyReader` even when a
+    /// non-empty inline-Arrow attachment is also present. The factory
+    /// must trust the manifest and never reach the IPC parser. Bytes
+    /// that wouldn't parse as Arrow IPC are deliberately used so that
+    /// an accidental fall-through would surface as an `io` error
+    /// rather than a silent pass.
+    #[tokio::test]
+    async fn zero_chunk_count_short_circuits_to_empty_reader() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(0))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                inline_row_count: Some(0),
+                inline_next_chunk_index: None,
+            }),
+        };
+
+        let mut reader = factory
+            .create_inner_reader("stmt-1", &response)
+            .expect("zero-chunk manifest must succeed without parsing inline bytes");
+        assert!(
+            reader.next_batch().await.unwrap().is_none(),
+            "zero-chunk reader must yield no batches",
+        );
+    }
+
+    /// Absent `total_chunk_count` (older servers / non-SEA path) must
+    /// NOT trip the short-circuit. With a `Succeeded` state and no
+    /// result payload, the factory falls through to the existing
+    /// state-based empty branch — also an `EmptyReader`, but reached
+    /// via a different code path. The test guards that the absence
+    /// of the field is not mis-read as `Some(0)`.
+    #[tokio::test]
+    async fn absent_total_chunk_count_falls_through() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(None)),
+            result: None,
+        };
+
+        let mut reader = factory
+            .create_inner_reader("stmt-1", &response)
+            .expect("absent total_chunk_count + Succeeded state must yield empty reader");
+        assert!(reader.next_batch().await.unwrap().is_none());
+    }
+
+    /// Non-zero `total_chunk_count` must NOT trip the short-circuit
+    /// even when the result payload is empty in shape. With
+    /// `total_chunk_count = 1` and a non-empty inline attachment of
+    /// garbage bytes, the factory takes the single-chunk inline path
+    /// and fails parsing — proving the short-circuit didn't fire
+    /// (which would have returned `Ok` with no batches). The exact
+    /// error code isn't part of the contract; we only assert that
+    /// it's not the manifest-driven `EmptyReader` path.
+    #[tokio::test]
+    async fn non_zero_total_chunk_count_does_not_short_circuit() {
+        let factory = factory_for_control_flow_test();
+        let response = ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(1))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                inline_arrow_data: Some(vec![1u8, 2, 3]),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                inline_row_count: Some(1),
+                inline_next_chunk_index: None,
+            }),
+        };
+
+        // Single-chunk inline path on garbage bytes — must surface as
+        // a parse error. If the short-circuit had fired, this would
+        // return `Ok` and we'd never reach the IPC parser.
+        let err = factory
+            .create_inner_reader("stmt-1", &response)
+            .err()
+            .expect("non-zero total_chunk_count + garbage inline must surface parse error");
+        assert!(
+            !err.message.contains("total_chunk_count=0"),
+            "short-circuit must not have fired: {}",
             err.message,
         );
     }
