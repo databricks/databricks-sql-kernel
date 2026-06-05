@@ -23,7 +23,7 @@
 use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
-use databricks_sql_kernel::{Error, Result, ResultBatch, ResultStream};
+use databricks_sql_kernel::{Error, ExecutedStatement, Result, ResultBatch, ResultStream};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
@@ -53,6 +53,46 @@ pub(crate) fn drain(runtime: &Runtime, stream: &mut ResultStream) -> Result<Vec<
         let mut out = Vec::new();
         loop {
             match stream.next_batch().await? {
+                Some(ResultBatch::Arrow(rb)) => out.push(rb.clone()),
+                Some(_) => {
+                    return Err(Error::invalid_argument()
+                        .message("kernel returned a non-Arrow ResultBatch variant"));
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    })
+}
+
+/// Like [`next_batch`], but drives the `ExecutedStatement` (not a bare
+/// `ResultStream`) so the kernel's auto-close-on-drain fires when the
+/// stream is exhausted. Used by `ExecutedStatement.fetch_next_batch`.
+pub(crate) fn next_batch_exec(
+    runtime: &Runtime,
+    exec: &mut ExecutedStatement,
+) -> Result<Option<RecordBatch>> {
+    runtime.block_on(async {
+        match exec.next_batch().await? {
+            Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
+            Some(_) => Err(Error::invalid_argument()
+                .message("kernel returned a non-Arrow ResultBatch variant")),
+            None => Ok(None),
+        }
+    })
+}
+
+/// Like [`drain`], but drives the `ExecutedStatement` so auto-close-on-
+/// drain fires once the stream is exhausted. Used by
+/// `ExecutedStatement.fetch_all_arrow`.
+pub(crate) fn drain_exec(
+    runtime: &Runtime,
+    exec: &mut ExecutedStatement,
+) -> Result<Vec<RecordBatch>> {
+    runtime.block_on(async {
+        let mut out = Vec::new();
+        loop {
+            match exec.next_batch().await? {
                 Some(ResultBatch::Arrow(rb)) => out.push(rb.clone()),
                 Some(_) => {
                     return Err(Error::invalid_argument()

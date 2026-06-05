@@ -285,12 +285,18 @@ impl Metadata {
                 .transport()
                 .list_catalogs(self.session.session_id())
                 .await?;
+            let stmt_id = raw.statement_id.clone();
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_CATALOGS_SCHEMA.clone(),
                 Box::new(thrift_shape::reshape_catalogs),
             );
-            ResultStream::from_reader(Box::new(reshaped)).await
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -323,12 +329,18 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
             };
+            let stmt_id = raw.statement_id.clone();
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_SCHEMAS_SCHEMA.clone(),
                 Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
             );
-            ResultStream::from_reader(Box::new(reshaped)).await
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -375,6 +387,7 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
             };
+            let stmt_id = raw.statement_id.clone();
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_TABLES_SCHEMA.clone(),
@@ -385,7 +398,12 @@ impl Metadata {
                     thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
                 }),
             );
-            ResultStream::from_reader(Box::new(reshaped)).await
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -440,12 +458,18 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
             };
+            let stmt_id = raw.statement_id.clone();
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_COLUMNS_SCHEMA.clone(),
                 Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
             );
-            ResultStream::from_reader(Box::new(reshaped)).await
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -490,7 +514,9 @@ impl Metadata {
                     table.as_str(),
                 )
                 .await?;
-            ResultStream::from_reader(raw.reader).await
+            let stmt_id = raw.statement_id.clone();
+            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
+                .await
         }
         .instrument(span)
         .await
@@ -540,7 +566,9 @@ impl Metadata {
                     foreign_table.as_str(),
                 )
                 .await?;
-            ResultStream::from_reader(raw.reader).await
+            let stmt_id = raw.statement_id.clone();
+            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
+                .await
         }
         .instrument(span)
         .await
@@ -570,7 +598,9 @@ impl Metadata {
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
                 .await?;
-            ResultStream::from_reader(raw.reader).await
+            let stmt_id = raw.statement_id.clone();
+            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
+                .await
         }
         .instrument(span)
         .await
@@ -599,7 +629,9 @@ impl Metadata {
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
                 .await?;
-            ResultStream::from_reader(raw.reader).await
+            let stmt_id = raw.statement_id.clone();
+            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
+                .await
         }
         .instrument(span)
         .await

@@ -62,12 +62,18 @@
 //!     .param(1, TypedValue::Int64(42))?;
 //!
 //! let mut exec = stmt.execute().await?;
-//! while let Some(_batch) = exec.result_stream_mut().next_batch().await? {
-//!     while let Some(_row) = exec.result_stream_mut().next_row_in_batch() {
-//!         // process row
-//!     }
+//! // Drive the result through `exec.next_batch()` (not
+//! // `result_stream_mut().next_batch()`): it auto-closes the server
+//! // statement when the stream is fully drained, after every lazy
+//! // CloudFetch chunk-link fetch — so paginated-link results stay
+//! // valid through the last batch.
+//! while let Some(_batch) = exec.next_batch().await? {
+//!     // process the Arrow batch (`ResultBatch::Arrow(rb)`); per-row
+//!     // access is available via `exec.result_stream_mut()
+//!     // .next_row_in_batch()` between `next_batch` calls.
 //! }
-//! exec.close().await?;
+//! // Optional: `exec.close().await?` closes early if you stop before
+//! // the stream is drained; a fully-drained stream auto-closes.
 //! ```
 
 // === TLS feature wiring guard ===

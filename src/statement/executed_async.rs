@@ -410,8 +410,11 @@ impl ExecutedAsyncStatement {
                         // the returned Error — mirrors the sync
                         // `terminal_outcome::Canceled` arm so the
                         // Cancelled-state envelope contract is
-                        // identical across kernel handles.
-                        let error = Error::invalid_state()
+                        // identical across kernel handles. `cancelled()`
+                        // (not invalid_state) so the connector maps it to
+                        // OperationalError, not ProgrammingError — see the
+                        // sync arm in client/sea.rs for the rationale.
+                        let error = Error::cancelled()
                             .message(format!("Statement {} was cancelled", self.statement_id))
                             .with_query_id(&self.statement_id);
                         return Err(crate::kernel_error::carry_extended_status(
