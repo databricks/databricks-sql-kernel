@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "databricks-sql-kernel"
-version = "0.1.0"
+version = "0.1.2"
 description = "Python bindings for the Databricks SQL Kernel (PyO3)"
 # Floor matches the tested CI matrix in
 # .github/workflows/pyo3-checks.yml (3.10 .. 3.14). 3.9 is no longer
