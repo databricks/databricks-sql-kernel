@@ -475,13 +475,65 @@ impl Default for HttpConfig {
     }
 }
 
-// ─── HTTP proxy (reserved) ──────────────────────────────────────────────────
+// ─── HTTP proxy ───────────────────────────────────────────────────────────
 
-/// Reserved for v0.1. Fields land once the proxy story (auth, bypass,
-/// system-proxy interplay) is settled.
+/// Programmatic HTTP/HTTPS proxy configuration.
+///
+/// When [`url`](Self::url) is `None` (the default), the kernel does **not**
+/// configure a proxy explicitly and `reqwest`'s standard behaviour applies —
+/// the `HTTP_PROXY` / `HTTPS_PROXY` / `NO_PROXY` environment variables are
+/// honoured automatically. Setting [`url`](Self::url) **overrides** those env
+/// vars with the supplied proxy, routing all (`http://` and `https://`)
+/// traffic through it.
+///
+/// Basic-auth credentials may be embedded directly in the URL
+/// (`http://user:pass@host:port`), or supplied out-of-band via
+/// [`username`](Self::username) / [`password`](Self::password); the explicit
+/// fields take precedence over URL-embedded credentials when both are set.
+///
+/// `ProxyConfig` is `#[non_exhaustive]` — construct via
+/// [`ProxyConfig::default`] and assign the public fields you need:
+///
+/// ```no_run
+/// # use databricks_sql_kernel::ProxyConfig;
+/// let mut proxy = ProxyConfig::default();
+/// proxy.url = Some("http://proxy.corp.example.com:8080".to_string());
+/// ```
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub struct ProxyConfig {}
+#[derive(Clone, Default)]
+pub struct ProxyConfig {
+    /// Proxy URL, e.g. `http://proxy.corp.example.com:8080` or
+    /// `http://user:pass@proxy:8080`. Must use the `http://` or
+    /// `https://` scheme. `None` ⇒ env-var behaviour (no override).
+    pub url: Option<String>,
+
+    /// Username for proxy basic-auth. Overrides any credentials
+    /// embedded in [`url`](Self::url) when set.
+    pub username: Option<String>,
+
+    /// Password for proxy basic-auth. Secret material — redacted in
+    /// `Debug`. Ignored unless [`username`](Self::username) is also set.
+    pub password: Option<String>,
+
+    /// Comma-separated list of hosts/domains to bypass the proxy
+    /// (e.g. `"localhost,*.internal.corp,.example.com"`). Only applied
+    /// when [`url`](Self::url) is set.
+    pub bypass_hosts: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the explicit `password` field. The `url` may itself
+        // carry embedded `user:pass@` credentials, so render only its
+        // presence rather than the raw string.
+        f.debug_struct("ProxyConfig")
+            .field("url", &self.url.as_ref().map(|_| "<set>"))
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .field("bypass_hosts", &self.bypass_hosts)
+            .finish()
+    }
+}
 
 // ─── TLS ────────────────────────────────────────────────────────────────────
 
