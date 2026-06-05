@@ -66,6 +66,7 @@ use crate::statement::validity::ValidityFlag;
 use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tracing::Instrument;
 
 /// Shared slot holding the server statement id of the statement
@@ -591,23 +592,36 @@ impl StatementCanceller {
     /// Server-side cancel of the in-flight statement via
     /// `cancel_statement(statement_id)`.
     ///
-    /// Returns `Ok(true)` if a cancel RPC was actually dispatched (a
-    /// statement id had been observed) and `Ok(false)` if it was a no-op
-    /// because no id has been observed yet — either nothing has executed,
-    /// or the query is still in its initial submit round-trip and the
-    /// server hasn't issued an id. The dispatched/no-op decision and the
-    /// returned flag come from the *same* id read, so a caller can attribute
-    /// a subsequent execute error to this cancel without a separate (racy)
-    /// `statement_id()` re-check.
+    /// Holds the cancel intent until the target statement id is published
+    /// (see the INTENT-HOLD note in the body), then dispatches the real
+    /// `CancelStatement`. Returns `Ok(true)` once that RPC has been
+    /// dispatched. Returns `Ok(false)` only if no id is ever published
+    /// within the bounded wait — i.e. the execute failed before its POST
+    /// returned an id, so there is nothing to cancel.
     ///
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
     /// concurrently with the `execute()` it targets — the two share
     /// only the id slot (behind a `Mutex`), no mutable statement state.
     pub async fn cancel(&self) -> Result<bool> {
-        let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
-        let Some(id) = id else {
-            return Ok(false);
+        // INTENT-HOLD: if the statement id hasn't been published yet (the execute
+        // POST is still in its initial submit / inline-wait round-trip), HOLD the
+        // cancel until the id appears, then dispatch the real `CancelStatement` —
+        // instead of silently no-opping and leaving the server-side query running
+        // (orphaned). Bounded so an id that never publishes (execute failed before
+        // the POST returned) eventually gives up rather than hanging forever.
+        // Blocking form; a non-blocking "record intent, fire on publish" variant
+        // is the optimisation on top.
+        let poll = Duration::from_millis(25);
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let id = loop {
+            if let Some(id) = self.inflight_id.lock().ok().and_then(|g| g.clone()) {
+                break id;
+            }
+            if Instant::now() >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(poll).await;
         };
         async {
             self.session.transport().cancel_statement(&id).await?;
