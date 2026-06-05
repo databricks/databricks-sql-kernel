@@ -209,10 +209,15 @@ pub struct LikePattern<'a>(&'a str);
 impl<'a> LikePattern<'a> {
     /// Construct from a borrowed pattern.
     ///
+    /// Accepts the **empty string**: it compiles to `LIKE ''`, which matches
+    /// only the empty name — i.e. "match nothing", mirroring the Thrift/JDBC
+    /// convention where an empty `tableNamePattern` (etc.) returns zero rows.
+    /// `None` remains the canonical "match all" intent; empty `""` is the
+    /// distinct "match nothing", so both are kept.
+    ///
     /// Rejects:
-    /// - Empty string — callers should pass `None` for "match all".
-    /// - Strings consisting only of whitespace — callers should pass
-    ///   `None` for "match all".
+    /// - Non-empty **whitespace-only** strings — almost always a caller
+    ///   mistake; pass `None` for "match all".
     /// - Embedded NUL bytes — same FFI-truncation hazard as
     ///   [`Identifier::new`].
     /// - Strings exceeding 255 bytes.

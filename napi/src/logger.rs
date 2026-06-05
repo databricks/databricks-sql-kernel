@@ -52,7 +52,7 @@
 // test cfg so genuine dead code is still caught in the production build.
 #![cfg_attr(test, allow(dead_code))]
 
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Mutex, Once};
 
@@ -61,7 +61,9 @@ use napi::Env;
 use napi_derive::napi;
 use once_cell::sync::OnceCell;
 use tracing::field::{Field, Visit};
-use tracing::{Event, Level, Subscriber};
+use tracing::level_filters::LevelFilter;
+use tracing::subscriber::Interest;
+use tracing::{Event, Level, Metadata, Subscriber};
 use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
@@ -95,7 +97,25 @@ const LEVEL_TRACE: u8 = 5;
 /// The layer emits an event when `severity(event) <= LEVEL` (and `LEVEL > 0`).
 static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_WARN);
 
-/// Producer end, populated once on first `initKernelLogging`.
+/// Number of records dropped because the bounded channel was full (or the
+/// drain never started). Surfaced via [`kernel_logging_stats`] so a caller
+/// can detect log loss during a burst — logs are advisory and never block,
+/// but the loss must be *observable*.
+static DROPPED: AtomicU64 = AtomicU64::new(0);
+
+const INSTALL_PENDING: u8 = 0;
+const INSTALL_OK: u8 = 1;
+const INSTALL_FAILED: u8 = 2;
+
+/// Outcome of the one-time subscriber install (see [`init_kernel_logging`]).
+/// `INSTALL_FAILED` means another global `tracing` subscriber was already
+/// set, or the drain thread could not be spawned — in either case kernel
+/// logs will not reach the JS sink, and [`kernel_logging_stats`] reports it.
+static INSTALL_STATUS: AtomicU8 = AtomicU8::new(INSTALL_PENDING);
+
+/// Producer end, populated once on first `initKernelLogging` — and only
+/// after the drain thread is confirmed running, so a live producer never
+/// outlives its consumer.
 static SENDER: OnceCell<SyncSender<LogRecord>> = OnceCell::new();
 
 /// Current JS sink. Last-writer-wins; read by the drain thread per batch.
@@ -141,6 +161,29 @@ fn level_label(level: &Level) -> &'static str {
 fn should_emit(level: &Level) -> bool {
     let configured = LEVEL.load(Ordering::Relaxed);
     configured != LEVEL_OFF && severity(level) <= configured
+}
+
+/// Targets the bridge forwards: the `klog!` shim's `databricks::sql::kernel`,
+/// kernel module paths (`databricks_sql_kernel::*`), and the napi crate's own
+/// `databricks_sql_kernel_napi` breadcrumbs. A raw `starts_with` (not a
+/// `::`-segmented `Targets` filter) so the underscore module-path variants
+/// match too.
+fn is_kernel_target(target: &str) -> bool {
+    target.starts_with("databricks")
+}
+
+/// The configured kernel level as a `tracing` [`LevelFilter`], used for
+/// `max_level_hint` so the process-global level gate tracks the kernel's
+/// level instead of being pinned wide-open at `TRACE`.
+fn current_level_filter() -> LevelFilter {
+    match LEVEL.load(Ordering::Relaxed) {
+        LEVEL_OFF => LevelFilter::OFF,
+        LEVEL_ERROR => LevelFilter::ERROR,
+        LEVEL_WARN => LevelFilter::WARN,
+        LEVEL_INFO => LevelFilter::INFO,
+        LEVEL_DEBUG => LevelFilter::DEBUG,
+        _ => LevelFilter::TRACE,
+    }
 }
 
 /// Collects a `tracing` event's primary `message` plus any structured fields
@@ -196,23 +239,53 @@ impl Visit for MessageVisitor {
 /// configured level, formats each event, and enqueues it (drop-on-full).
 struct KernelLogLayer;
 
+/// Per-layer [`Filter`] that gates the bridge — the fix for the HIGH perf
+/// finding. As a *per-layer* filter (not `Layer::enabled`/`register_callsite`,
+/// which a `Registry` overrides back to "always interested"), its
+/// `callsite_enabled` contributes to the **global** interest cache:
+///
+/// - foreign callsites (`hyper`, `rustls`, `quinn`, …) cache as
+///   [`Interest::never`] → zero-cost no-ops, never dispatched;
+/// - kernel callsites return [`Interest::sometimes`] so the runtime level
+///   (an atomic flipped by `setKernelLogLevel`) is re-checked in `enabled`;
+/// - `max_level_hint` tracks the configured level so the process-global gate
+///   isn't pinned wide-open at `TRACE` (paired with `rebuild_interest_cache`).
+struct KernelFilter;
+
+/// Per-callsite interest for a target: kernel callsites re-evaluate per
+/// event (`sometimes`, for the dynamic level); foreign callsites cache off
+/// forever (`never`). Extracted from [`KernelFilter::callsite_enabled`] so
+/// it's unit-testable without fabricating a `&'static Metadata`.
+fn callsite_interest_for(target: &str) -> Interest {
+    if is_kernel_target(target) {
+        Interest::sometimes()
+    } else {
+        Interest::never()
+    }
+}
+
+impl<S> tracing_subscriber::layer::Filter<S> for KernelFilter {
+    fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
+        callsite_interest_for(meta.target())
+    }
+
+    fn enabled(&self, meta: &Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
+        is_kernel_target(meta.target()) && should_emit(meta.level())
+    }
+
+    fn max_level_hint(&self) -> Option<LevelFilter> {
+        Some(current_level_filter())
+    }
+}
+
 impl<S> Layer<S> for KernelLogLayer
 where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // The per-layer `KernelFilter` already excludes foreign targets and
+        // below-level events, so `on_event` only sees kernel events to forward.
         let meta = event.metadata();
-
-        // Only kernel / napi diagnostics — never another crate that happens to
-        // share the global subscriber. `databricks::sql::kernel` (klog shim),
-        // `databricks_sql_kernel::*` (module paths), and the napi crate's own
-        // `databricks_sql_kernel_napi` breadcrumbs all share the prefix.
-        if !meta.target().starts_with("databricks") {
-            return;
-        }
-        if !should_emit(meta.level()) {
-            return;
-        }
 
         let Some(tx) = SENDER.get() else {
             return;
@@ -228,15 +301,18 @@ where
         };
 
         // Drop-on-full / disconnected: logs are advisory, never block a kernel
-        // task waiting on JS-side back-pressure.
-        let _ = tx.try_send(record);
+        // task waiting on JS-side back-pressure. Count the loss so it's
+        // observable via `kernelLoggingStats()` (the channel is drop-newest).
+        if tx.try_send(record).is_err() {
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+        }
     }
 }
 
 /// Drain loop (own OS thread): block for one record, opportunistically gather
 /// the rest of the burst, then forward the whole batch to JS in one call.
 fn drain_loop(rx: Receiver<LogRecord>) {
-    let mut buf: Vec<LogRecord> = Vec::with_capacity(64);
+    let mut buf: Vec<LogRecord> = Vec::with_capacity(MAX_BATCH);
     // `recv()` errors only once the (process-global) sender is dropped, which
     // never happens in practice; if the channel is ever torn down, exit the
     // thread cleanly rather than spin.
@@ -248,7 +324,9 @@ fn drain_loop(rx: Receiver<LogRecord>) {
                 break;
             }
         }
-        let batch = std::mem::take(&mut buf);
+        // `replace` (not `take`) so the reused buffer keeps its capacity
+        // across batches instead of reallocating from zero each drain.
+        let batch = std::mem::replace(&mut buf, Vec::with_capacity(MAX_BATCH));
         if let Some(sink) = SINK.get() {
             if let Ok(guard) = sink.lock() {
                 if let Some(tsfn) = guard.as_ref() {
@@ -291,20 +369,70 @@ pub fn init_kernel_logging(
 
     INSTALL.call_once(|| {
         let (tx, rx) = sync_channel::<LogRecord>(CHANNEL_CAPACITY);
-        // `set` only fails if already set, which `Once` precludes.
-        let _ = SENDER.set(tx);
 
-        let _ = std::thread::Builder::new()
+        // Spawn the drain thread FIRST and publish `SENDER` only once it is
+        // confirmed running — so a live producer never outlives its consumer
+        // (F4). If the OS refuses the thread (EAGAIN/ENOMEM), `rx` is dropped
+        // with the failed closure, `SENDER` stays unset (so `on_event`
+        // early-returns and produces nothing), and we record the failure.
+        match std::thread::Builder::new()
             .name("kernel-log-drain".to_owned())
-            .spawn(move || drain_loop(rx));
-
-        // Install our layer as the process-global subscriber. Ignore the error
-        // if something already set one (e.g. a host that installed its own).
-        let subscriber = tracing_subscriber::registry().with(KernelLogLayer);
-        let _ = tracing::subscriber::set_global_default(subscriber);
+            .spawn(move || drain_loop(rx))
+        {
+            Ok(_) => {
+                // `set` only fails if already set, which `Once` precludes.
+                let _ = SENDER.set(tx);
+                // Install our layer as the process-global subscriber. Capture
+                // the result: if a subscriber was already installed (e.g. an
+                // embedding host set its own), our layer never runs and kernel
+                // logs won't reach JS — surface that via the status (F3).
+                let subscriber =
+                    tracing_subscriber::registry().with(KernelLogLayer.with_filter(KernelFilter));
+                let status = match tracing::subscriber::set_global_default(subscriber) {
+                    Ok(()) => INSTALL_OK,
+                    Err(_) => INSTALL_FAILED,
+                };
+                INSTALL_STATUS.store(status, Ordering::Release);
+            }
+            Err(_) => {
+                INSTALL_STATUS.store(INSTALL_FAILED, Ordering::Release);
+            }
+        }
     });
 
+    // Apply the (possibly updated) level to the global max-level gate by
+    // re-querying `max_level_hint` / `register_callsite` for every callsite.
+    // Cheap and safe to call even before any subscriber is installed.
+    tracing::callsite::rebuild_interest_cache();
+
     Ok(())
+}
+
+/// Snapshot of the bridge's runtime state for observability.
+///
+/// `installed` is `true` only when the process-global subscriber was
+/// successfully installed by *this* bridge (and the drain thread started);
+/// `false` means another global subscriber was already set or the drain
+/// thread could not be spawned, so kernel logs are NOT reaching the JS sink.
+/// `dropped` is the cumulative count of records discarded because the
+/// bounded channel was full during a burst (drop-newest) — a nonzero,
+/// growing value signals the sink can't keep up.
+#[napi(object)]
+pub struct KernelLoggingStats {
+    pub installed: bool,
+    pub dropped: i64,
+}
+
+/// Return the bridge's [`KernelLoggingStats`]. Safe to call before
+/// `initKernelLogging` (reports `installed: false`, `dropped: 0`).
+#[napi(js_name = "kernelLoggingStats")]
+pub fn kernel_logging_stats() -> KernelLoggingStats {
+    KernelLoggingStats {
+        installed: INSTALL_STATUS.load(Ordering::Acquire) == INSTALL_OK,
+        // Saturating into the JS-safe `i64`; a real drop count never
+        // approaches `i64::MAX`.
+        dropped: DROPPED.load(Ordering::Relaxed).min(i64::MAX as u64) as i64,
+    }
 }
 
 /// Live-retarget the bridge's level (one of
@@ -312,6 +440,11 @@ pub fn init_kernel_logging(
 #[napi(js_name = "setKernelLogLevel")]
 pub fn set_kernel_log_level(level: String) {
     LEVEL.store(parse_level(&level), Ordering::Relaxed);
+    // The level feeds `max_level_hint`, which `tracing` caches; rebuild so
+    // the new level takes effect on the global gate (and re-confirms kernel
+    // callsites' interest) rather than lagging until the next callsite
+    // registers.
+    tracing::callsite::rebuild_interest_cache();
 }
 
 #[cfg(test)]
@@ -371,5 +504,118 @@ mod tests {
         let mut v = MessageVisitor::default();
         v.push_field("k", "v".to_owned());
         assert_eq!(v.finish(), "k=v");
+    }
+
+    // ── F1: callsite-filtering regression guards (the HIGH finding) ──
+    //
+    // The fix is the per-layer `KernelFilter`. These assert its decision
+    // logic *directly* (rather than through `with_default` + the
+    // process-global callsite-interest cache / `LevelFilter::current()`
+    // atomic, which is shared across the parallel test binary and so makes
+    // macro-based assertions order-dependent). The "before" state — the
+    // unfiltered layer forcing a global TRACE gate and dispatching every
+    // foreign callsite — was confirmed empirically while developing the fix.
+
+    #[test]
+    fn foreign_callsites_cache_off_kernel_callsites_reevaluate() {
+        // The crux of the perf fix: foreign crate callsites (`hyper`,
+        // `rustls`, …) are `never` — cached off so they never dispatch —
+        // while kernel callsites are `sometimes` so the dynamic level is
+        // re-checked per event.
+        assert!(callsite_interest_for("hyper::client::pool").is_never());
+        assert!(callsite_interest_for("rustls::conn").is_never());
+        assert!(callsite_interest_for("quinn::connection").is_never());
+        assert!(callsite_interest_for("databricks::sql::kernel").is_sometimes());
+        assert!(callsite_interest_for("databricks_sql_kernel::session").is_sometimes());
+        assert!(callsite_interest_for("databricks_sql_kernel_napi").is_sometimes());
+    }
+
+    #[test]
+    fn max_level_hint_tracks_level_and_is_not_pinned_to_trace() {
+        // The other half of the fix: the global max-level gate tracks the
+        // configured kernel level instead of the default `None` (which
+        // `tracing` treats as TRACE, re-enabling every crate's dispatch).
+        let saved = LEVEL.load(Ordering::Relaxed);
+        LEVEL.store(LEVEL_WARN, Ordering::Relaxed);
+        assert_eq!(current_level_filter(), LevelFilter::WARN);
+        LEVEL.store(LEVEL_OFF, Ordering::Relaxed);
+        assert_eq!(current_level_filter(), LevelFilter::OFF);
+        LEVEL.store(LEVEL_DEBUG, Ordering::Relaxed);
+        assert_eq!(current_level_filter(), LevelFilter::DEBUG);
+        LEVEL.store(LEVEL_TRACE, Ordering::Relaxed);
+        assert_eq!(current_level_filter(), LevelFilter::TRACE);
+        LEVEL.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn enabled_decision_requires_kernel_target_and_level() {
+        // The `Filter::enabled` decision (target prefix AND level), tested
+        // as the pure predicate it delegates to.
+        let saved = LEVEL.load(Ordering::Relaxed);
+        LEVEL.store(LEVEL_INFO, Ordering::Relaxed);
+        let enabled = |target: &str, level: &Level| is_kernel_target(target) && should_emit(level);
+        assert!(enabled("databricks::sql::kernel", &Level::INFO));
+        assert!(enabled("databricks::sql::kernel", &Level::ERROR));
+        assert!(!enabled("databricks::sql::kernel", &Level::DEBUG)); // below level
+        assert!(!enabled("hyper::client", &Level::ERROR)); // foreign target
+        LEVEL.store(saved, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn stats_default_before_install() {
+        // Safe to query before `initKernelLogging`: not installed, no drops.
+        let stats = kernel_logging_stats();
+        assert!(!stats.installed);
+        assert_eq!(stats.dropped, 0);
+    }
+
+    // F10: drift guard. The bridge routes on the `databricks` prefix; the
+    // kernel stamps every `klog!` with `KERNEL_LOG_TARGET`. If that constant
+    // ever changed to a non-`databricks` prefix, kernel logs would silently
+    // stop reaching the sink — this pins the two together (the kernel side
+    // has its own `klog::tests` guard on the exact string).
+    #[test]
+    fn filter_prefix_still_matches_kernel_emit_target() {
+        assert!(
+            is_kernel_target(databricks_sql_kernel::KERNEL_LOG_TARGET),
+            "napi log filter prefix must still match the kernel's emit target ({})",
+            databricks_sql_kernel::KERNEL_LOG_TARGET
+        );
+    }
+
+    // F7: exercise the `Visit` dispatch (`record_debug` / `record_str` and
+    // the `message`-field special-casing) through a *real* `tracing` event,
+    // which the direct `push_field`/`finish` tests bypass. Uses a local
+    // capture layer (no global install, no channel) so it's deterministic.
+    #[test]
+    fn visitor_renders_message_str_and_debug_fields_from_real_event() {
+        use std::sync::Mutex;
+        static CAP: Mutex<Option<String>> = Mutex::new(None);
+
+        struct CaptureLayer;
+        impl<S> Layer<S> for CaptureLayer
+        where
+            S: Subscriber + for<'a> LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                let mut v = MessageVisitor::default();
+                event.record(&mut v);
+                *CAP.lock().unwrap() = Some(v.finish());
+            }
+        }
+
+        tracing::subscriber::with_default(
+            tracing_subscriber::registry().with(CaptureLayer),
+            || {
+                // `msg` → `message` field via record_debug (rendered, unquoted);
+                // `name` (&str) → record_str; `attempt` (i64) → record_debug.
+                tracing::error!(target: "databricks::sql::kernel", name = "abc", attempt = 2, "boom");
+            },
+        );
+
+        let got = CAP.lock().unwrap().take().expect("event captured");
+        assert!(got.starts_with("boom"), "message first, got: {got}");
+        assert!(got.contains("name=abc"), "record_str field, got: {got}");
+        assert!(got.contains("attempt=2"), "record_debug field, got: {got}");
     }
 }
