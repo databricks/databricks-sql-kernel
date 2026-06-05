@@ -105,6 +105,23 @@ impl std::fmt::Debug for ExecuteResult {
     }
 }
 
+/// Outcome of a directResults-style execute (`Transport::execute_statement_direct`):
+/// the server is given a bounded inline wait (`wait_timeout` + `on_wait_timeout=CONTINUE`)
+/// and we return WITHOUT the internal poll loop.
+///
+/// - `Completed` — the statement reached a terminal-and-succeeded state within
+///   the inline wait; the reader is materialised from the inline result (no
+///   extra `GetStatementResult` round-trip), exactly like `execute_statement`.
+/// - `Running` — the statement is still `Pending`/`Running`; the caller gets the
+///   `statement_id` + status and drives polling itself (and can cancel by id).
+///
+/// Mirrors the Thrift/JDBC directResults shape: fast queries come back inline,
+/// slow ones come back as a running handle.
+pub(crate) enum DirectOutcome {
+    Completed(ExecuteResult),
+    Running(ExecuteResponse),
+}
+
 /// Unified response from statement execution (internal to client implementations).
 #[derive(Debug, Clone)]
 pub(crate) struct ExecuteResponse {
@@ -243,6 +260,21 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         sql: &str,
         params: &ExecuteParams,
     ) -> Result<ExecuteResult>;
+
+    /// Execute a SQL statement with a bounded server-side inline wait
+    /// (`wait_timeout` + `on_wait_timeout=CONTINUE`), returning WITHOUT the
+    /// internal poll loop — the Thrift/JDBC directResults model.
+    ///
+    /// Returns [`DirectOutcome::Completed`] (terminal + reader materialised
+    /// inline) for queries that finish within the wait, or
+    /// [`DirectOutcome::Running`] (statement id + status, no reader) for ones
+    /// that don't. The caller drives any further polling and owns cancellation.
+    async fn execute_statement_direct(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+    ) -> Result<DirectOutcome>;
 
     /// Submit a SQL statement without polling for completion.
     ///

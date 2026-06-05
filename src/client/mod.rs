@@ -45,6 +45,6 @@ pub use retry::{
 // Crate-internal surface — `Transport` trait + its value types.
 pub(crate) use sea::SeaRestTransport;
 pub(crate) use transport::{
-    ChunkLinkFetchResult, ExecuteResponse, ExecuteResult, ExecuteResultData,
+    ChunkLinkFetchResult, DirectOutcome, ExecuteResponse, ExecuteResult, ExecuteResultData,
     InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
 };

@@ -370,6 +370,70 @@ impl Connection {
         .await
     }
 
+    /// directResults execute — the Thrift/JDBC model. Sends ExecuteStatement
+    /// with a bounded server-side inline wait (`wait_timeout=10s`,
+    /// `on_wait_timeout=CONTINUE`) and returns WITHOUT polling past it:
+    ///
+    /// - a **`Statement`** (left arm) when the query finished within the inline
+    ///   wait — terminal, result ready inline, `close()` is a clean release;
+    /// - an **`AsyncStatement`** (right arm) when it did not — a poll/cancel
+    ///   handle the caller drives (`status()` / `awaitResult()` / `cancel()`).
+    ///
+    /// JS distinguishes the arms by feature-detecting `awaitResult` (present
+    /// only on `AsyncStatement`). This is the path that gives mid-run cancel for
+    /// long queries WITHOUT the eager-handle / close-drives workaround: the
+    /// returned handle always corresponds to a server-owned statement.
+    #[napi]
+    pub async fn execute_statement_direct(
+        &self,
+        sql: String,
+        mut options: Option<ExecuteOptions>,
+    ) -> napi::Result<napi::Either<Statement, AsyncStatement>> {
+        let inner = Arc::clone(&self.inner);
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
+        let positional_params = options
+            .as_mut()
+            .and_then(|o| o.positional_params.take())
+            .map(decode_positional_params)
+            .transpose()?
+            .unwrap_or_default();
+        let named_params = options
+            .as_mut()
+            .and_then(|o| o.named_params.take())
+            .map(decode_named_params)
+            .transpose()?
+            .unwrap_or_default();
+        let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
+        let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        guarded(async move {
+            let mut stmt = {
+                let guard = inner.lock().await;
+                let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+                build_statement(
+                    session,
+                    sql,
+                    statement_conf,
+                    query_tags,
+                    row_limit,
+                    query_timeout_secs,
+                    positional_params,
+                    named_params,
+                )?
+            };
+
+            match stmt.execute_direct().await.map_err(napi_err_from_kernel)? {
+                databricks_sql_kernel::DirectStatement::Completed(executed) => {
+                    Ok(napi::Either::A(Statement::from_executed(stmt, executed)))
+                }
+                databricks_sql_kernel::DirectStatement::Running(executed_async) => Ok(
+                    napi::Either::B(AsyncStatement::from_executed_async(stmt, executed_async)),
+                ),
+            }
+        })
+        .await
+    }
+
     /// Execute a SQL statement on the blocking (sync) path, but return a
     /// `CancellableExecution` handle so a concurrent JS task can cancel
     /// the query *while it is still running server-side*.

@@ -26,8 +26,8 @@ use crate::params::parse_typed_value;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
-    Error as KError, ExecutedStatement as KExecutedStatement, ExecutedStatementHandle,
-    Statement as KStatement, StatementCanceller as KStatementCanceller,
+    DirectStatement as KDirectStatement, Error as KError, ExecutedStatement as KExecutedStatement,
+    ExecutedStatementHandle, Statement as KStatement, StatementCanceller as KStatementCanceller,
 };
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -239,6 +239,36 @@ impl Statement {
         );
         let exec = run_kernel!(py, runtime, inner.stmt.submit())?;
         Ok(ExecutedAsyncStatement::new(exec, runtime))
+    }
+
+    /// directResults execute — the Thrift/JDBC model. Sends ExecuteStatement
+    /// with a bounded server-side inline wait (omits `wait_timeout` so the
+    /// server applies its ~10s default AND auto-closes on success) and returns
+    /// WITHOUT polling past it:
+    ///   - an **`ExecutedStatement`** when the query finished within the inline
+    ///     wait (terminal, result ready inline) — identical to `execute()`;
+    ///   - an **`ExecutedAsyncStatement`** when it did not — a poll/cancel
+    ///     handle (identical to `submit()`).
+    ///
+    /// Python distinguishes the arms by feature-detecting `await_result`
+    /// (present only on `ExecutedAsyncStatement`). Like `execute()`, the
+    /// blocking inline wait is `KeyboardInterrupt`-interruptible.
+    fn execute_direct<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let inner = alive_mut!(self, "Statement");
+        let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Statement.execute_direct: directResults execute (GIL released, interruptible)"
+        );
+        let outcome = run_kernel_interruptible!(py, &runtime, inner.stmt.execute_direct())?;
+        match outcome {
+            KDirectStatement::Completed(exec) => {
+                Ok(Bound::new(py, ExecutedStatement::new(exec, runtime))?.into_any())
+            }
+            KDirectStatement::Running(exec) => {
+                Ok(Bound::new(py, ExecutedAsyncStatement::new(exec, runtime))?.into_any())
+            }
+        }
     }
 
     /// Explicit close — cancels and closes any executed handle this
