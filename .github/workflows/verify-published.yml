@@ -107,10 +107,24 @@ jobs:
           PKG_VERSION: ${{ env.VERSION }}
         run: |
           echo "Verifying databricks-sql-kernel==${PKG_VERSION} on ${{ matrix.label }}"
-          # Isolated venv; install ONLY the published wheel from PyPI
-          # (no source, no build) so we exercise the real artifact.
+          # Isolated venv; install ONLY the published wheel (no source,
+          # no build) so we exercise the real artifact.
           uv venv /tmp/verify
-          uv pip install --python /tmp/verify "databricks-sql-kernel==${PKG_VERSION}"
+          # Retry with backoff: a just-published version is not visible
+          # immediately — the registry CDN lags and, more so, the JFrog
+          # remote-repo proxy caches upstream metadata for its TTL, so
+          # the new version can 404 through the proxy for a while. Poll
+          # the install until it resolves (up to ~15 min).
+          attempt=0; max=30
+          until uv pip install --python /tmp/verify "databricks-sql-kernel==${PKG_VERSION}"; do
+            attempt=$((attempt+1))
+            if [[ $attempt -ge $max ]]; then
+              echo "::error::databricks-sql-kernel==${PKG_VERSION} not installable after ${max} attempts (~15m) — registry/proxy propagation or a missing wheel for this arch."
+              exit 1
+            fi
+            echo "Not available yet (attempt ${attempt}/${max}); retrying in 30s..."
+            sleep 30
+          done
           uv run --python /tmp/verify python - <<'PY'
           import os, importlib.metadata as md
           import databricks_sql_kernel  # native import — fails if the wheel's binary can't load
@@ -158,7 +172,20 @@ jobs:
           work="$(mktemp -d)"
           cd "$work"
           npm init -y >/dev/null
-          npm install "@databricks/databricks-sql-kernel@${PKG_VERSION}"
+          # Retry with backoff: the just-published version isn't visible
+          # immediately through the JFrog npm proxy (remote-repo metadata
+          # cache TTL) or the registry CDN. Poll until it resolves
+          # (up to ~15 min).
+          attempt=0; max=30
+          until npm install "@databricks/databricks-sql-kernel@${PKG_VERSION}"; do
+            attempt=$((attempt+1))
+            if [[ $attempt -ge $max ]]; then
+              echo "::error::@databricks/databricks-sql-kernel@${PKG_VERSION} not installable after ${max} attempts (~15m) — registry/proxy propagation or a missing platform package for this arch."
+              exit 1
+            fi
+            echo "Not available yet (attempt ${attempt}/${max}); retrying in 30s..."
+            sleep 30
+          done
           node - <<'JS'
           const k = require('@databricks/databricks-sql-kernel'); // native load — fails if platform pkg missing/wrong arch
           const got = require('@databricks/databricks-sql-kernel/package.json').version;
