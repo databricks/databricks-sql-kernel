@@ -94,7 +94,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # we use on the encode side. Versions kept in lock-step with the
 # kernel's `arrow-*` deps to avoid two arrow versions in the dep graph.
 arrow-array = "57"
-arrow-schema = "57"
+arrow-schema = "58"
 arrow-ipc = "57"
 
 # Error envelope serialization. Already a kernel transitive dep; the
