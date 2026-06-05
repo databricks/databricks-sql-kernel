@@ -1,5 +1,5 @@
 {
-  "name": "@databricks/sql-kernel",
+  "name": "@databricks/databricks-sql-kernel",
   "version": "0.1.2",
   "description": "Databricks SQL Kernel — Node.js native binding.",
   "main": "index.js",
