@@ -131,6 +131,17 @@ pub struct ExecuteOptions {
     /// positional is the documented-undocumented variant. The two are
     /// mutually exclusive at the SQL level (`?` vs `:name`).
     pub named_params: Option<Vec<NamedTypedValueInput>>,
+    /// **`submitStatement` only.** Bounded inline ("direct results") wait, in
+    /// whole seconds (SEA wire caps at 50). When set, the async submit asks the
+    /// server to attempt an inline result for ~`n`s before returning: a FAST
+    /// statement comes back already `Succeeded` (so the first
+    /// `AsyncStatement.status()` is terminal and `awaitResult()` skips straight
+    /// to the fetch), while a SLOW statement still comes back `Running` as a
+    /// cancellable handle. This is the directResults / JDBC-`wait_timeout` model
+    /// — it lets the driver get a near-Thrift "fast completes inline, slow
+    /// returns a cancellable handle" shape. Omitted ⇒ `wait_timeout=0s` (the
+    /// classic immediate async submit). Ignored by `executeStatement`.
+    pub direct_results_wait_secs: Option<u32>,
 }
 
 /// A named bound parameter — a [`TypedValueInput`] plus its `:name`. Kept a
@@ -493,6 +504,11 @@ impl Connection {
         // kernel `StatementSpec` owns the merge + serialisation.
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        // Optional bounded inline ("direct results") wait. `None` ⇒ the classic
+        // `wait_timeout=0s` immediate async submit; `Some(n)` ⇒ the server
+        // attempts an inline result for ~n s, returning a terminal-or-running
+        // handle (directResults / JDBC model). See `Statement::submit_with_wait`.
+        let direct_results_wait_secs = options.as_ref().and_then(|o| o.direct_results_wait_secs);
         guarded(async move {
             // Build the kernel `Statement` while holding the session lock,
             // then RELEASE the lock before `submit().await` — same shape as
@@ -521,7 +537,10 @@ impl Connection {
                 // session lock released here
             };
 
-            let executed_async = stmt.submit().await.map_err(napi_err_from_kernel)?;
+            let executed_async = stmt
+                .submit_with_wait(direct_results_wait_secs)
+                .await
+                .map_err(napi_err_from_kernel)?;
             // Pass the parent kernel `Statement` into the JS wrapper so
             // its `Drop` doesn't invalidate the executed-async handle
             // via the shared ValidityFlag while JS still holds it.

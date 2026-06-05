@@ -333,10 +333,41 @@ impl Statement {
     /// `fetch_result`. Long-running queries that would blow past
     /// `execute()`'s sync polling budget belong on this path.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
+        // `None` preserves the historical `wait_timeout=0s` immediate-return.
+        self.submit_with_wait(None).await
+    }
+
+    /// Submit-and-return with a caller-chosen inline ("direct results") wait.
+    ///
+    /// - `wait_timeout_secs = None` — `wait_timeout=0s`: the server returns a
+    ///   `Pending`/`Running` handle immediately (the classic async submit).
+    /// - `wait_timeout_secs = Some(n)` — `wait_timeout=Ns` (server caps at 50):
+    ///   the server attempts to finish the statement inline within ~`n`s. A
+    ///   FAST statement comes back already `Succeeded` in this first response, so
+    ///   the caller's first `await_result()` finds it terminal on the first poll
+    ///   and skips straight to the fetch; a SLOW statement still comes back
+    ///   `Running` as a cancellable handle. This is the directResults /
+    ///   JDBC-`wait_timeout` model — it lets a binding get a near-Thrift "fast
+    ///   completes inline, slow returns a cancellable handle" shape without the
+    ///   sync `execute()` path's poll-to-terminal block.
+    ///
+    /// Unlike sync `execute()` (which omits `wait_timeout` and lets the server
+    /// auto-`Closed` on success), `Some(n)` leaves a fast statement `Succeeded`
+    /// (server-side alive), so the handle is still fetchable via the normal
+    /// `await_result()` path and the caller must `close()` it as usual. (Serving
+    /// the inline result of an auto-`Closed` statement without a re-fetch is a
+    /// consuming-side optimisation — materialise the initial response — tracked
+    /// separately.)
+    pub async fn submit_with_wait(
+        &mut self,
+        wait_timeout_secs: Option<u32>,
+    ) -> Result<ExecutedAsyncStatement> {
         let span = self.session.log_span().clone();
         async {
             self.invalidate_prior().await;
-            let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
+            let wait = wait_timeout_secs.map(|s| format!("{s}s"));
+            let (sql, exec_params) =
+                self.prepare_for_dispatch(Some(wait.as_deref().unwrap_or("0s")))?;
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -354,10 +385,12 @@ impl Statement {
             guard.defuse();
 
             let valid = ValidityFlag::new();
-            // submit path always uses wait_timeout=0s, so the server can't
-            // return CLOSED yet; start the flag false and let later close()
-            // calls flip it.
-            let closed = Arc::new(AtomicBool::new(false));
+            // With `wait_timeout=0s` the server can't return CLOSED, so this is
+            // `false`. With a `Some(n)` direct wait it normally returns
+            // `Succeeded` (still alive ⇒ `false`); derive the flag from the
+            // actual response state so a server that DID auto-close is reflected.
+            let already_closed = response.status.state == StatementState::Closed;
+            let closed = Arc::new(AtomicBool::new(already_closed));
             self.last_statement_id = Some(response.statement_id.clone());
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
@@ -676,6 +709,23 @@ mod tests {
         let (wait, on_wait) = resolve_wait_timeout(None, None);
         assert_eq!(wait, None);
         assert_eq!(on_wait, None);
+    }
+
+    #[test]
+    fn direct_submit_wait_maps_to_bounded_inline_wait() {
+        // submit_with_wait(Some(n)) pins "Ns" with CONTINUE — the directResults
+        // model: the server attempts an inline result for ~n s, then returns a
+        // (terminal-or-running) handle without cancelling. `build_execute_params`
+        // is what `submit_with_wait` feeds the resolved wait string into.
+        let (wait, on_wait) = resolve_wait_timeout(Some("10s"), None);
+        assert_eq!(wait.as_deref(), Some("10s"));
+        assert_eq!(on_wait.as_deref(), Some("CONTINUE"));
+
+        let mut spec = StatementSpec::default();
+        spec.sql = Some("SELECT 1".to_string());
+        let (_, params) = build_execute_params(&spec, Some("10s")).unwrap();
+        assert_eq!(params.wait_timeout.as_deref(), Some("10s"));
+        assert_eq!(params.on_wait_timeout.as_deref(), Some("CONTINUE"));
     }
 
     #[test]
