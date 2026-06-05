@@ -240,7 +240,7 @@ async fn execute_succeeded_inline_returns_one_row() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let mut exec = stmt.execute().await.expect("execute");
+    let mut exec = stmt.execute_to_completion().await.expect("execute");
 
     let batches = drain(exec.result_stream_mut()).await;
     assert_eq!(batches.len(), 1);
@@ -275,7 +275,7 @@ async fn execute_running_then_succeeded_polls_status() {
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 42 AS n");
     let mut exec = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .expect("execute should poll to success");
 
@@ -303,7 +303,7 @@ async fn execute_failed_propagates_sql_state() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELEKT 1");
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("execute should fail on FAILED state"),
         Err(e) => e,
     };
@@ -320,7 +320,7 @@ async fn execute_validates_missing_sql() {
 
     let session = open_session(&server).await;
     let mut stmt = session.statement();
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("execute without sql must fail"),
         Err(e) => e,
     };
@@ -348,7 +348,10 @@ async fn execute_sends_named_params_in_wire_form() {
         .sql("SELECT :x")
         .param_named("x", TypedValue::Int64(1))
         .expect("param_named");
-    let mut exec = stmt.execute().await.expect("execute with named params");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with named params");
     let batches = drain(exec.result_stream_mut()).await;
     assert_eq!(batches[0].num_rows(), 1);
     exec.close().await.expect("close");
@@ -369,7 +372,7 @@ async fn execute_rejects_binary_typed_value_before_wire() {
         .sql("SELECT ?")
         .param(1, TypedValue::Binary(vec![0xCA, 0xFE]))
         .unwrap();
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("Binary must be rejected before any wire call"),
         Err(e) => e,
     };
@@ -398,7 +401,10 @@ async fn execute_sends_positional_params_in_wire_form() {
         .unwrap()
         .param(2, TypedValue::String("bound".into()))
         .unwrap();
-    let mut exec = stmt.execute().await.expect("execute with params");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with params");
     let batches = drain(exec.result_stream_mut()).await;
     assert_eq!(batches[0].num_rows(), 1);
     exec.close().await.expect("close");
@@ -446,11 +452,11 @@ async fn re_execute_invalidates_prior_handle() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1");
-    let exec_a = stmt.execute().await.expect("execute A");
+    let exec_a = stmt.execute_to_completion().await.expect("execute A");
     assert_eq!(exec_a.statement_id(), "stmt-A");
 
     // Re-execute on the same Statement invalidates exec_a.
-    let _exec_b = stmt.execute().await.expect("execute B");
+    let _exec_b = stmt.execute_to_completion().await.expect("execute B");
     let err = exec_a
         .cancel()
         .await
@@ -470,7 +476,7 @@ async fn executed_close_is_idempotent() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1");
-    let exec = stmt.execute().await.unwrap();
+    let exec = stmt.execute_to_completion().await.unwrap();
     exec.close().await.expect("first close");
     // Second close short-circuits without hitting the wire.
     exec.close().await.expect("second close — idempotent");
@@ -499,7 +505,7 @@ async fn statement_close_cancels_and_closes_outstanding_executed_handle() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1");
-    let exec = stmt.execute().await.expect("execute");
+    let exec = stmt.execute_to_completion().await.expect("execute");
     assert_eq!(exec.statement_id(), "stmt-Z");
 
     // Close the parent Statement (not the executed handle). The
@@ -538,7 +544,7 @@ async fn row_accessors_walk_succeeded_result() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT id, name FROM t");
-    let mut exec = stmt.execute().await.unwrap();
+    let mut exec = stmt.execute_to_completion().await.unwrap();
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -604,7 +610,7 @@ async fn kernel_invariant_parent_drop_invalidates_executed_cancel() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let exec = stmt.execute().await.expect("execute");
+    let exec = stmt.execute_to_completion().await.expect("execute");
 
     // This is the exact shape the napi binding's
     // `Connection::execute_statement` produces today (PR #25): the
@@ -723,7 +729,7 @@ async fn executed_statement_surfaces_extended_status_fields() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("UPDATE t SET x = 1");
-    let exec = stmt.execute().await.expect("execute");
+    let exec = stmt.execute_to_completion().await.expect("execute");
 
     assert_eq!(exec.num_modified_rows(), Some(7));
     assert_eq!(exec.display_message(), Some("All good"));
@@ -748,7 +754,7 @@ async fn executed_statement_status_fields_default_to_none() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let exec = stmt.execute().await.expect("execute");
+    let exec = stmt.execute_to_completion().await.expect("execute");
 
     assert_eq!(exec.num_modified_rows(), None);
     assert_eq!(exec.display_message(), None);
@@ -801,7 +807,7 @@ async fn polling_path_carries_terminal_status_not_initial() {
     let mut stmt = session.statement();
     stmt.spec().sql("UPDATE t SET x = 1");
     let exec = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .expect("execute should poll to terminal SUCCEEDED");
 
@@ -848,7 +854,7 @@ async fn execute_failed_carries_extended_status_fields_onto_error() {
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT * FROM does_not_exist");
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("execute should fail on FAILED state"),
         Err(e) => e,
     };
@@ -975,7 +981,7 @@ async fn execute_cloudfetch_chunk0_failure_closes_statement() {
     stmt.spec().sql("SELECT id FROM range(2000000)");
 
     let err = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .err()
         .expect("execute must fail when chunk-0 returns HTTP 500");

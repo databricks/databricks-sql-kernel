@@ -193,7 +193,7 @@ impl CancellableExecution {
                 let mut guard = pending.lock().await;
                 guard.take().ok_or_else(statement_closed_err)?
             };
-            let outcome = stmt.execute().await;
+            let outcome = stmt.execute_to_completion().await;
             // The statement is terminal either way now — let a racing/later
             // `cancel()` short-circuit rather than fire a redundant RPC.
             terminal.store(true, Ordering::Release);

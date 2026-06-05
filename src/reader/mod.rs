@@ -1431,6 +1431,14 @@ mod tests {
         ) -> Result<ExecuteResponse> {
             unreachable!()
         }
+        async fn execute_statement_direct(
+            &self,
+            _: &str,
+            _: &str,
+            _: &ExecuteParams,
+        ) -> Result<crate::client::DirectOutcome> {
+            unreachable!()
+        }
         async fn fetch_completed_result(&self, _: &str) -> Result<Option<ExecuteResult>> {
             unreachable!()
         }

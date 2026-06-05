@@ -131,7 +131,7 @@ async fn assert_select_one(session: &Session) {
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
     let mut exec = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .expect("execute SELECT 1 through proxy");
     let stream: &mut ResultStream = exec.result_stream_mut();
@@ -160,7 +160,7 @@ async fn tls_fails_without_config_behind_intercepting_proxy() {
     // also exercise a query before concluding the connection "worked".
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1");
-    let exec = stmt.execute().await;
+    let exec = stmt.execute_to_completion().await;
     assert!(
         exec.is_err(),
         "expected an untrusted-certificate failure behind mitmproxy with default TLS, \

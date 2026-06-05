@@ -109,7 +109,10 @@ async fn query_tags_round_trip_succeeds() {
     stmt.spec().sql("SELECT 1 AS n");
     stmt.spec().query_tags(tags).expect("query_tags accepted");
 
-    let mut exec = stmt.execute().await.expect("execute with query tags");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with query tags");
     assert_select_one(exec.result_stream_mut()).await;
     exec.close().await.expect("close");
     session.close().await.expect("session close");
@@ -130,7 +133,10 @@ async fn query_tags_with_none_value_succeeds() {
         .query_tags(tags)
         .expect("query_tags (with None value) accepted");
 
-    let mut exec = stmt.execute().await.expect("execute with bare-key tag");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with bare-key tag");
     assert_select_one(exec.result_stream_mut()).await;
     exec.close().await.expect("close");
     session.close().await.expect("session close");
@@ -160,7 +166,10 @@ async fn custom_http_headers_round_trip_succeeds() {
     .await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let mut exec = stmt.execute().await.expect("execute with custom headers");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with custom headers");
     assert_select_one(exec.result_stream_mut()).await;
     exec.close().await.expect("close");
     session.close().await.expect("session close");
@@ -183,7 +192,7 @@ async fn custom_authorization_header_is_dropped_and_real_auth_wins() {
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
     let mut exec = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .expect("execute must succeed — the real PAT wins, the bogus Authorization is dropped");
     assert_select_one(exec.result_stream_mut()).await;

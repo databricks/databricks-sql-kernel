@@ -19,8 +19,8 @@
 
 use crate::client::retry::RequestType;
 use crate::client::{
-    ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult, ExecuteResultData,
-    InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
+    ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
+    ExecuteResultData, InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -785,6 +785,70 @@ impl Transport for SeaRestTransport {
         params.on_wait_timeout = Some("CONTINUE".to_string());
         self.call_execute_api(session_id, sql, &params, RequestType::ExecuteStatement)
             .await
+    }
+
+    async fn execute_statement_direct(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+    ) -> Result<DirectOutcome> {
+        // directResults model: OMIT `wait_timeout` (exactly like the sync
+        // `execute` path) so the server applies its default ~10s inline wait
+        // AND auto-closes on success (returns `state=CLOSED`). This is the fast
+        // path: a quick query / fire-and-forget DDL comes back terminal AND
+        // already server-closed, so the handle's `close()` is a true no-op (no
+        // cancel+close round-trip that would otherwise discard an unfetched
+        // result). Setting `wait_timeout=10s` explicitly instead yields
+        // `SUCCEEDED` (statement still alive → needs an explicit cancel+close),
+        // which is both slower and breaks fire-and-forget. We just DON'T run the
+        // `wait_for_completion` poll loop: a query that outlasts the inline wait
+        // comes back `Running` for the caller to poll/cancel.
+        let response = self
+            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement)
+            .await?;
+        let statement_id = response.statement_id.clone();
+
+        // Publish the server statement id to the caller's canceller slot now —
+        // a concurrent `StatementCanceller::cancel()` (the Running arm) can
+        // target the still-running query immediately, no mid-execute observer
+        // race (the id is known from this POST response).
+        if let Some(observer) = params.inflight_id_observer.as_ref() {
+            if let Ok(mut slot) = observer.lock() {
+                *slot = Some(statement_id.clone());
+            }
+        }
+
+        match Self::terminal_outcome(response) {
+            // Terminal + succeeded within the inline wait → materialise the
+            // reader from the inline result (no extra GetStatementResult).
+            StatementOutcome::Done(r) => {
+                let reader_factory = self.reader_factory()?;
+                let reader = match reader_factory.create_reader(&r.statement_id, &r).await {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        self.close_orphaned_statement(&statement_id, "create_reader (direct)")
+                            .await;
+                        return Err(e);
+                    }
+                };
+                Ok(DirectOutcome::Completed(ExecuteResult {
+                    statement_id: r.statement_id,
+                    reader,
+                    manifest: r.manifest,
+                    status: r.status,
+                }))
+            }
+            // Still running after the inline wait → hand back a running handle;
+            // the caller polls (and may cancel) via the statement id.
+            StatementOutcome::NotReady(r) => Ok(DirectOutcome::Running(r)),
+            // Inline terminal failure/cancel → surface it (close the orphan).
+            StatementOutcome::Err(e) => {
+                self.close_orphaned_statement(&statement_id, "execute_statement_direct")
+                    .await;
+                Err(e)
+            }
+        }
     }
 
     async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>> {

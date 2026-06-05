@@ -62,7 +62,10 @@ async fn select_one_round_trip() {
     let session = live_session().await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let mut exec = stmt.execute().await.expect("execute SELECT 1");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute SELECT 1");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -88,7 +91,10 @@ async fn select_with_positional_params() {
         .unwrap()
         .param(3, TypedValue::Bool(true))
         .unwrap();
-    let mut exec = stmt.execute().await.expect("execute with params");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with params");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -117,7 +123,10 @@ async fn select_with_named_params() {
         .unwrap()
         .param_named("b", TypedValue::Bool(true))
         .unwrap();
-    let mut exec = stmt.execute().await.expect("execute with named params");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute with named params");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -148,7 +157,7 @@ async fn mixed_positional_and_named_params_rejected_before_dispatch() {
         .param_named("n", TypedValue::Int64(99))
         .unwrap();
     let err = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .err()
         .expect("kernel should reject mixed bindings at bind time");
@@ -175,7 +184,7 @@ async fn multi_batch_range_succeeds() {
     // Large enough to typically span multiple batches via CloudFetch,
     // but constrained so a tiny warehouse can still complete it.
     stmt.spec().sql("SELECT * FROM range(100000)");
-    let mut exec = stmt.execute().await.expect("execute range");
+    let mut exec = stmt.execute_to_completion().await.expect("execute range");
 
     let rows = drain_rows(exec.result_stream_mut()).await;
     assert_eq!(rows, 100_000, "expected 100k rows from range(100000)");
@@ -190,7 +199,11 @@ async fn select_from_nonexistent_table_returns_sql_error() {
     let mut stmt = session.statement();
     stmt.spec()
         .sql("SELECT * FROM main.default.__no_such_table_for_v0_e2e");
-    let err = stmt.execute().await.err().expect("must fail with SqlError");
+    let err = stmt
+        .execute_to_completion()
+        .await
+        .err()
+        .expect("must fail with SqlError");
     assert_eq!(err.code, ErrorCode::SqlError, "{err:?}");
     assert!(
         err.sql_state.is_some(),
@@ -205,10 +218,10 @@ async fn re_execute_invalidates_prior_handle() {
     let session = live_session().await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1");
-    let exec_a = stmt.execute().await.expect("execute A");
+    let exec_a = stmt.execute_to_completion().await.expect("execute A");
     let id_a = exec_a.statement_id().to_owned();
 
-    let exec_b = stmt.execute().await.expect("execute B");
+    let exec_b = stmt.execute_to_completion().await.expect("execute B");
     assert_ne!(exec_b.statement_id(), id_a, "fresh statement_id expected");
 
     let err = exec_a
@@ -255,7 +268,10 @@ async fn select_returns_all_types_correctly() {
              CAST('2026-05-11 12:34:56' AS TIMESTAMP) AS c_ts, \
              CAST(NULL AS INT)                    AS c_null",
     );
-    let mut exec = stmt.execute().await.expect("execute SELECT all-types");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute SELECT all-types");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -418,7 +434,10 @@ async fn bind_all_typed_values_round_trip() {
         .unwrap()
         .param(12, TypedValue::Null)
         .unwrap();
-    let mut exec = stmt.execute().await.expect("execute bind-all-types");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute bind-all-types");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -525,7 +544,10 @@ async fn bind_geography_and_geometry_round_trip() {
             },
         )
         .unwrap();
-    let mut exec = stmt.execute().await.expect("execute geo bind");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute geo bind");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -572,7 +594,10 @@ async fn binary_sql_literals_and_casts_work() {
              X''                           AS empty_binary, \
              CAST('Spark' AS BINARY)       AS cast_string",
     );
-    let mut exec = stmt.execute().await.expect("execute binary SQL literals");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute binary SQL literals");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
@@ -612,7 +637,7 @@ async fn bind_binary_typed_value_is_rejected_at_execute_time() {
         .sql("SELECT ?")
         .param(1, TypedValue::Binary(vec![0xCA, 0xFE]))
         .unwrap();
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("Binary must be rejected before wire"),
         Err(e) => e,
     };
@@ -657,7 +682,10 @@ async fn cloudfetch_drain_does_not_nest_block_on() {
     // on the test warehouse. If a future server-side change moves
     // the inline/external threshold, bump this.
     stmt.spec().sql("SELECT * FROM range(1000000)");
-    let mut exec = stmt.execute().await.expect("execute range(1000000)");
+    let mut exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute range(1000000)");
 
     let rows = drain_rows(exec.result_stream_mut()).await;
     assert_eq!(
@@ -687,7 +715,7 @@ async fn cloudfetch_drain_works_on_current_thread_runtime() {
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT * FROM range(1000000)");
     let mut exec = stmt
-        .execute()
+        .execute_to_completion()
         .await
         .expect("execute range(1000000) on current_thread runtime");
 
@@ -752,7 +780,10 @@ async fn complex_types_as_json_flag_stringifies_complex_columns() {
         let session = live_session_with_complex_json(false).await;
         let mut stmt = session.statement();
         stmt.spec().sql(sql);
-        let mut exec = stmt.execute().await.expect("execute (default)");
+        let mut exec = stmt
+            .execute_to_completion()
+            .await
+            .expect("execute (default)");
         let stream = exec.result_stream_mut();
         let batch = stream.next_batch().await.unwrap().expect("batch (default)");
         let ResultBatch::Arrow(batch) = batch else {
@@ -790,7 +821,7 @@ async fn complex_types_as_json_flag_stringifies_complex_columns() {
         let session = live_session_with_complex_json(true).await;
         let mut stmt = session.statement();
         stmt.spec().sql(sql);
-        let mut exec = stmt.execute().await.expect("execute (json)");
+        let mut exec = stmt.execute_to_completion().await.expect("execute (json)");
         let stream = exec.result_stream_mut();
         let batch = stream.next_batch().await.unwrap().expect("batch (json)");
         let ResultBatch::Arrow(batch) = batch else {
@@ -863,7 +894,10 @@ async fn live_select_status_accessors_default_to_none() {
     let session = live_session().await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
-    let exec = stmt.execute().await.expect("execute SELECT 1");
+    let exec = stmt
+        .execute_to_completion()
+        .await
+        .expect("execute SELECT 1");
 
     // num_modified_rows is None for SELECT.
     assert_eq!(
@@ -901,7 +935,7 @@ async fn live_failed_statement_error_envelope_carries_extended_fields() {
     // Reference a definitely-nonexistent table to provoke a SqlError.
     stmt.spec()
         .sql("SELECT * FROM nonexistent_kernel_pr23_test_table_xyz_123");
-    let err = match stmt.execute().await {
+    let err = match stmt.execute_to_completion().await {
         Ok(_) => panic!("execute against nonexistent table must fail"),
         Err(e) => e,
     };
@@ -949,7 +983,7 @@ async fn sync_canceller_cancels_a_running_execute_mid_compute() {
     });
 
     // Drive the blocking execute; it must reject (Cancelled), not run to term.
-    let result = stmt.execute().await;
+    let result = stmt.execute_to_completion().await;
     let (id_present, cancelled) = cancel_task.await.expect("cancel task join");
 
     assert!(

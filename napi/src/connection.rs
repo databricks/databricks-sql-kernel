@@ -37,7 +37,6 @@ use crate::async_statement::AsyncStatement;
 use crate::error::napi_err_from_kernel;
 use crate::params::{parse_typed_value, TypedValueInput};
 use crate::runtime;
-use crate::statement::Statement;
 use crate::util::guarded;
 
 /// Per-statement options for `Connection.executeStatement`.
@@ -286,33 +285,32 @@ impl Connection {
         &self.session_id
     }
 
-    /// Execute a SQL statement and return a Statement handle that
-    /// streams batches via `fetchNextBatch()`.
+    /// Execute a SQL statement (directResults — the Thrift / JDBC / Python
+    /// `use_sea` model) and return a single `AsyncStatement` handle. Sends
+    /// ExecuteStatement with the server inline wait (`wait_timeout` default ~10s,
+    /// `on_wait_timeout=CONTINUE`) and returns WITHOUT polling past it.
     ///
-    /// Catalog / schema / sessionConf are session-level
-    /// (`openSession`). Per-statement options on `ExecuteOptions`:
-    /// - `statementConf` — per-statement Spark conf overlay
-    /// - `queryTags` — serialised to a comma-separated `key:value`
-    ///   string and placed in `statement_conf["query_tags"]`,
-    ///   matching NodeJS Thrift's `serializeQueryTags` wire shape
+    /// The handle is uniform regardless of whether the query finished within the
+    /// inline wait:
+    /// - **fast query** — the handle is seeded with the inline result, so
+    ///   `awaitResult()` returns it with zero extra round-trips and `status()`
+    ///   reports the terminal state without a poll (the latency fast path; also
+    ///   404-proof — a terminal handle never polls a released statement);
+    /// - **slow query** — the handle is a poll/cancel handle the caller drives
+    ///   (`status()` / `awaitResult()` / `cancel()`).
     ///
-    /// `options` is omitted/`None` for the no-options path; passing
-    /// `{ statementConf: {} }` (an empty map) is treated the same as
-    /// omission to keep the wire shape stable for the common case.
+    /// This is the path that gives mid-run cancel for long queries WITHOUT the
+    /// eager-handle / close-drives workaround: the returned handle always
+    /// corresponds to a server-owned statement, and `close()` is a clean release.
     #[napi]
     pub async fn execute_statement(
         &self,
         sql: String,
         mut options: Option<ExecuteOptions>,
-    ) -> napi::Result<Statement> {
+    ) -> napi::Result<AsyncStatement> {
         let inner = Arc::clone(&self.inner);
-        // Pull the scalar knobs out (both `i64`/`u32` are `Copy`) before
-        // the `.take()`s below consume the map fields out of `options`.
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
         let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
-        // Decode positional params before `options` is consumed below; a
-        // malformed entry surfaces as InvalidArgument here, before any wire
-        // round-trip.
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -325,25 +323,9 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
-        // Pull the explicit `statement_conf` map and the `query_tags`
-        // convenience map out of `options`. The kernel `StatementSpec`
-        // owns the merge + serialisation: set the explicit conf first,
-        // then fold `query_tags` in via `spec.query_tags(...)`, which
-        // serialises to the Thrift wire shape and rejects the dual
-        // `queryTags` + `statementConf["query_tags"]` definition.
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
         guarded(async move {
-            // Build the kernel `Statement` while holding the session lock,
-            // then RELEASE the lock before `execute().await`. `Session::statement()`
-            // returns an owned `Statement` (it clones the session's internal
-            // `Arc`), so the built statement is independent of the guard — we
-            // do not need to hold the mutex across the network round-trip.
-            // This unblocks concurrent `Promise.all([executeStatement(...)])`
-            // (they serialise only for the microsecond statement-build, not the
-            // wire call) and stops `close()` from blocking behind an in-flight
-            // execute. See jira-candidate 2026-05-24-napi-cancel-during-fetch
-            // (connection-side half).
             let mut stmt = {
                 let guard = inner.lock().await;
                 let session = guard.as_ref().ok_or_else(connection_closed_err)?;
@@ -357,15 +339,10 @@ impl Connection {
                     positional_params,
                     named_params,
                 )?
-                // session lock released here
             };
 
-            let executed = stmt.execute().await.map_err(napi_err_from_kernel)?;
-            // Pass the parent kernel `Statement` into the JS wrapper.
-            // Dropping it here would invalidate the executed handle
-            // via the shared ValidityFlag — see `StatementInner` docs
-            // in `statement.rs` for the rationale.
-            Ok(Statement::from_executed(stmt, executed))
+            let executed_async = stmt.execute().await.map_err(napi_err_from_kernel)?;
+            Ok(AsyncStatement::from_executed_async(stmt, executed_async))
         })
         .await
     }

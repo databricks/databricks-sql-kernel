@@ -54,6 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
+use crate::client::DirectOutcome;
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -258,7 +259,7 @@ impl Statement {
     /// the prior handle's [`ValidityFlag`] is flipped so subsequent
     /// calls on it short-circuit to `InvalidStatementHandle` without
     /// hitting the wire.
-    pub async fn execute(&mut self) -> Result<ExecutedStatement> {
+    pub async fn execute_to_completion(&mut self) -> Result<ExecutedStatement> {
         // `instrument` (rather than `.entered()`) so the resulting
         // future stays `Send` — napi-rs's `execute_tokio_future` and
         // `tokio::spawn` both require `Send`, and `EnteredSpan` is
@@ -375,6 +376,97 @@ impl Statement {
                 // the first poll.
                 response.status,
             ))
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Execute and return one async-consumption handle — the directResults
+    /// model (Thrift / JDBC / Python `use_sea`), expressed as a **single**
+    /// [`ExecutedAsyncStatement`] (no enum, no caller branching).
+    ///
+    /// Sends `ExecuteStatement` with the server inline wait (`wait_timeout`
+    /// omitted ⇒ the server's ~10s default + `on_wait_timeout=CONTINUE`) and
+    /// returns WITHOUT polling past it. The returned handle is uniform either
+    /// way:
+    ///   - **fast query** — reached a terminal, succeeded state within the
+    ///     inline wait: the handle is seeded with the inline result
+    ///     ([`ExecutedAsyncStatement::new_with_inline`]), so `await_result()`
+    ///     returns it with **zero** extra round-trips and `status()` reports
+    ///     the terminal state without a poll. This is the latency fast path and
+    ///     is 404-proof (a terminal handle never polls a released statement).
+    ///   - **slow query** — still `Pending`/`Running` after the inline wait:
+    ///     an un-seeded handle the caller polls/cancels via `status()` /
+    ///     `await_result()` / `cancel()`.
+    ///
+    /// Why single-threaded callers (napi, the Node driver) need this shape
+    /// rather than a blocking drive-to-terminal: the handle must come back
+    /// *before* a long query is terminal so a concurrent `cancel()` can reach
+    /// it, while a fast query must still commit inline (fire-and-forget DDL/DML)
+    /// before `close()` can race it. The inline wait threads exactly that
+    /// needle. A genuinely blocking variant lives at [`execute_to_completion`].
+    ///
+    /// The server statement id is published to the shared in-flight slot from
+    /// the POST response (not mid-execute), so a `StatementCanceller` /
+    /// `AsyncStatementCanceller` targets it without an observer race.
+    pub async fn execute(&mut self) -> Result<ExecutedAsyncStatement> {
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
+
+            let cancel_state = MidExecuteCancelState::new(
+                Arc::clone(&self.session),
+                Arc::clone(&self.inflight_id),
+            );
+            let guard = cancel_state.guard();
+            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+
+            let outcome = self
+                .session
+                .transport()
+                .execute_statement_direct(self.session.session_id(), &sql, &exec_params)
+                .await?;
+
+            let valid = ValidityFlag::new();
+            match outcome {
+                DirectOutcome::Completed(result) => {
+                    cancel_state.observe(&result.statement_id);
+                    guard.defuse();
+                    let already_closed = result.status.state == StatementState::Closed;
+                    let closed = Arc::new(AtomicBool::new(already_closed));
+                    self.last_statement_id = Some(result.statement_id.clone());
+                    self.last_valid = Some(valid.clone());
+                    self.last_closed = Some(Arc::clone(&closed));
+                    let status = result.status.clone();
+                    Ok(ExecutedAsyncStatement::new_with_inline(
+                        Arc::clone(&self.session),
+                        result.statement_id.clone(),
+                        valid,
+                        closed,
+                        status,
+                        result,
+                    ))
+                }
+                DirectOutcome::Running(resp) => {
+                    cancel_state.observe(&resp.statement_id);
+                    guard.defuse();
+                    // Still running — start the closed flag false (the server
+                    // can't have auto-closed a non-terminal statement); later
+                    // close()/await drives it.
+                    let closed = Arc::new(AtomicBool::new(false));
+                    self.last_statement_id = Some(resp.statement_id.clone());
+                    self.last_valid = Some(valid.clone());
+                    self.last_closed = Some(Arc::clone(&closed));
+                    Ok(ExecutedAsyncStatement::new(
+                        Arc::clone(&self.session),
+                        resp.statement_id,
+                        valid,
+                        closed,
+                        resp.status,
+                    ))
+                }
+            }
         }
         .instrument(span)
         .await

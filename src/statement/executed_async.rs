@@ -44,7 +44,7 @@
 //! class) can route through whichever handle their language idiom
 //! prefers; field availability is identical.
 
-use crate::client::ExecuteResponse;
+use crate::client::{ExecuteResponse, ExecuteResult};
 use crate::kernel_error::Error;
 use crate::kernel_error::Result;
 use crate::klog::warn;
@@ -206,6 +206,25 @@ pub struct ExecutedAsyncStatement {
     /// don't `.await` and the poll loop releases the lock before
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
+    /// Inline result seeded by [`Statement::execute`]'s fast path — the
+    /// `ExecuteStatement` POST returned a terminal, succeeded result
+    /// within the server inline wait, so the reader is already in hand.
+    /// `Some` only on the `execute()` fast path; always `None` on the
+    /// `submit()` path (which sends `wait_timeout=0s` and can't be
+    /// terminal yet).
+    ///
+    /// When present, this handle is **fully terminal with the result
+    /// already materialisable** — `status()` and `await_result()`
+    /// short-circuit to it with **zero network round-trips**. That is
+    /// both the latency fast path (the POST already delivered
+    /// everything; no GetStatementStatus / GetStatementResult) and the
+    /// reason a fast query is 404-proof: a terminal handle never polls a
+    /// statement the server may have already auto-released.
+    ///
+    /// `await_result()` / `fetch_result()` `take()` it (the reader is
+    /// consumed once into a `ResultStream`); a second consumption falls
+    /// through to the normal fetch path.
+    inline: std::sync::Mutex<Option<ExecuteResult>>,
 }
 
 impl ExecutedAsyncStatement {
@@ -231,13 +250,59 @@ impl ExecutedAsyncStatement {
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
+        Self::new_inner(session, statement_id, valid, closed, initial_status, None)
+    }
+
+    /// Constructor for [`Statement::execute`]'s fast path: the
+    /// `ExecuteStatement` POST returned a terminal, succeeded result
+    /// within the server inline wait, so the reader is seeded inline.
+    ///
+    /// `initial_status` is the terminal SEA status from that POST
+    /// (`Succeeded` / `Closed`); `result` carries the inline reader. The
+    /// resulting handle is fully terminal — `status()` reports the seeded
+    /// status and `await_result()` materialises the seeded reader, both
+    /// without any network round-trip (see the `inline` field doc).
+    pub(crate) fn new_with_inline(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+        closed: Arc<AtomicBool>,
+        initial_status: crate::types::sea::StatementStatus,
+        result: ExecuteResult,
+    ) -> Self {
+        Self::new_inner(
+            session,
+            statement_id,
+            valid,
+            closed,
+            initial_status,
+            Some(result),
+        )
+    }
+
+    fn new_inner(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+        closed: Arc<AtomicBool>,
+        initial_status: crate::types::sea::StatementStatus,
+        inline: Option<ExecuteResult>,
+    ) -> Self {
         Self {
             session,
             statement_id,
             valid,
             closed,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            inline: std::sync::Mutex::new(inline),
         }
+    }
+
+    /// True while the seeded inline result is still present (not yet
+    /// consumed by `await_result` / `fetch_result`). Used to short-circuit
+    /// `status()` / `await_result()` to a zero-round-trip terminal path.
+    fn has_inline(&self) -> bool {
+        self.inline.lock().map(|g| g.is_some()).unwrap_or(false)
     }
 
     /// Number of rows modified by the statement (UPDATE / INSERT /
@@ -329,6 +394,28 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         async {
             self.valid.check()?;
+            // Seeded fast path (`execute()` inline result): the statement
+            // finished and the result is in hand, so report `Succeeded`
+            // WITHOUT a GetStatementStatus RPC. This is what makes a fast
+            // query 404-proof — a terminal handle never polls a statement the
+            // server may have already released — and removes a round-trip
+            // from the hot path.
+            //
+            // We report `Succeeded` even when the server's inline-wait
+            // response carried `state=CLOSED`: on warehouses that auto-close
+            // a statement once it has delivered its result inline, `CLOSED`
+            // is a *resource* state meaning "succeeded and already released",
+            // NOT a failure or a client-initiated close. A seeded handle is
+            // only ever produced for a succeeded terminal outcome (the
+            // transport surfaces an inline Failed/Canceled as `Err`, never as
+            // an inline result), and the result is materialisable from the
+            // seed — so the caller-visible outcome is unambiguously success.
+            // Collapsing `CLOSED → Succeeded` here keeps directResults parity
+            // across auto-closing and non-auto-closing warehouses and matches
+            // the Thrift `FINISHED_STATE` a completed directResults op reports.
+            if self.has_inline() {
+                return Ok(StatementStatus::Succeeded);
+            }
             let response = self
                 .session
                 .transport()
@@ -367,6 +454,15 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         async {
             self.valid.check()?;
+
+            // Seeded fast path (`execute()` inline result): the result is
+            // already in hand. Materialise it WITHOUT any poll/fetch
+            // round-trip (`materialise_result` takes the inline reader).
+            // Also makes a terminal handle 404-proof — it never
+            // GetStatementStatus-es a statement the server may have closed.
+            if self.has_inline() {
+                return self.materialise_result().await;
+            }
 
             // Poll cadence + ceiling come from the transport's config —
             // same source the sync `wait_for_completion` path uses, so
@@ -465,6 +561,12 @@ impl ExecutedAsyncStatement {
     /// status so callers don't have to re-query, and points at the
     /// actionable follow-up.
     async fn materialise_result(&self) -> Result<ResultStream> {
+        // Seeded inline result (execute() fast path): consume the reader
+        // already in hand — no GetStatementResult round-trip. `take()` so a
+        // second consumption falls through to the normal fetch path below.
+        if let Some(result) = self.inline.lock().ok().and_then(|mut g| g.take()) {
+            return ResultStream::from_reader(result.reader).await;
+        }
         match self
             .session
             .transport()

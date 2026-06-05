@@ -203,25 +203,6 @@ impl Statement {
         })
     }
 
-    /// Wait-for-result execution. Blocks until the kernel finishes
-    /// polling and returns an `ExecutedStatement` with the result
-    /// stream ready to drain.
-    ///
-    /// The blocking drive is interruptible: a `KeyboardInterrupt`
-    /// (Ctrl-C) raised while this is running aborts the query — the
-    /// in-flight future is dropped, firing the kernel's mid-execute
-    /// cancel guard so the server-side statement is cancelled too.
-    fn execute(&mut self, py: Python<'_>) -> PyResult<ExecutedStatement> {
-        let inner = alive_mut!(self, "Statement");
-        let runtime = inner.runtime.clone();
-        tracing::debug!(
-            target: crate::logging::PYO3_LOG_TARGET,
-            "Statement.execute: running statement synchronously (GIL released, interruptible)"
-        );
-        let exec = run_kernel_interruptible!(py, &runtime, inner.stmt.execute())?;
-        Ok(ExecutedStatement::new(exec, runtime))
-    }
-
     /// Submit-and-return. Sends `ExecuteStatement` with
     /// `wait_timeout=0s` so the server returns immediately with a
     /// `statement_id`; the kernel does not poll. Returns an
@@ -239,6 +220,48 @@ impl Statement {
         );
         let exec = run_kernel!(py, runtime, inner.stmt.submit())?;
         Ok(ExecutedAsyncStatement::new(exec, runtime))
+    }
+
+    /// directResults execution — the Thrift / JDBC / Python `use_sea` model,
+    /// expressed as a single `ExecutedAsyncStatement` handle. Sends
+    /// ExecuteStatement with the server inline wait (omits `wait_timeout` so the
+    /// server applies its ~10s default + `on_wait_timeout=CONTINUE`) and returns
+    /// WITHOUT polling past it. The handle is uniform either way:
+    ///   - a **fast query** comes back seeded with the inline result, so
+    ///     `await_result()` returns it with zero extra round-trips;
+    ///   - a **slow query** comes back as a poll/cancel handle (drive via
+    ///     `await_result()`, same as `submit()`).
+    ///
+    /// The inline wait (still-running case) is `KeyboardInterrupt`-interruptible.
+    /// A genuinely blocking drive-to-terminal lives at `execute_to_completion`.
+    fn execute(&mut self, py: Python<'_>) -> PyResult<ExecutedAsyncStatement> {
+        let inner = alive_mut!(self, "Statement");
+        let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Statement.execute: directResults execute (GIL released, interruptible)"
+        );
+        let exec = run_kernel_interruptible!(py, &runtime, inner.stmt.execute())?;
+        Ok(ExecutedAsyncStatement::new(exec, runtime))
+    }
+
+    /// Blocking drive-to-terminal execution (the JDBC `Statement.execute()`
+    /// shape). Sends `ExecuteStatement` and polls server-side to a terminal
+    /// state before returning a fully-materialised `ExecutedStatement` — no
+    /// caller-driven polling. Unlike [`execute`](Self::execute) (which returns
+    /// after the inline wait so a long query stays cancellable), this blocks for
+    /// the full query duration; reach for it only when the caller genuinely
+    /// wants one synchronous call. The drive is `KeyboardInterrupt`-interruptible
+    /// (the GIL is released for the duration).
+    fn execute_to_completion(&mut self, py: Python<'_>) -> PyResult<ExecutedStatement> {
+        let inner = alive_mut!(self, "Statement");
+        let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Statement.execute_to_completion: blocking drive-to-terminal (GIL released, interruptible)"
+        );
+        let exec = run_kernel_interruptible!(py, &runtime, inner.stmt.execute_to_completion())?;
+        Ok(ExecutedStatement::new(exec, runtime))
     }
 
     /// Explicit close — cancels and closes any executed handle this
