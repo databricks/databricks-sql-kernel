@@ -42,10 +42,11 @@ use tokio::runtime::Handle as RuntimeHandle;
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
 /// so the sync polling loop and the async one-shot
 /// [`Transport::fetch_completed_result`] path produce identical
-/// outcomes (and identical errors) for `FAILED` / `CANCELLED` /
-/// `CLOSED-no-data` responses.
+/// outcomes (and identical errors) for `FAILED` / `CANCELLED` responses.
 enum StatementOutcome {
-    /// `Succeeded` (or `Closed` with inline data).
+    /// Terminal success — `Succeeded` OR `Closed` (with or without inline
+    /// data; an empty `Closed` is a valid empty result set, materialised
+    /// downstream by `create_reader`'s `EmptyReader`).
     Done(ExecuteResponse),
     /// `Pending` / `Running` — caller polls again.
     NotReady(ExecuteResponse),
@@ -329,21 +330,17 @@ impl SeaRestTransport {
                 ))
             }
             StatementState::Closed => {
-                // Closed with result data is valid for inline results
-                // — the server delivers the data and immediately
-                // closes the statement since no further fetching is
-                // needed.
-                if response.result.is_some() {
-                    StatementOutcome::Done(response)
-                } else {
-                    let error = Error::invalid_state()
-                        .message("Statement was closed")
-                        .with_query_id(&response.statement_id);
-                    StatementOutcome::Err(crate::kernel_error::carry_extended_status(
-                        error,
-                        &response.status,
-                    ))
-                }
+                // CLOSED is a terminal SUCCESS state — parity with JDBC's
+                // `DatabricksSdkClient`, which treats SUCCEEDED and CLOSED
+                // identically as success (anything else → handleFailedExecution).
+                // It's the server's auto-close-on-completion signal. A CLOSED
+                // response with NO result payload is a valid EMPTY result set
+                // (common for DDL/DML and no-row queries that auto-close), NOT
+                // an error: `create_reader` builds an `EmptyReader` from the
+                // manifest schema for exactly this case (see its own CLOSED arm
+                // in reader/mod.rs). Gating on `result.is_some()` here was both
+                // stricter than JDBC and internally inconsistent with that.
+                StatementOutcome::Done(response)
             }
             StatementState::Pending | StatementState::Running => {
                 StatementOutcome::NotReady(response)
