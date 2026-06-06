@@ -226,6 +226,43 @@ fn cancelled_body(statement_id: &str) -> String {
     .to_string()
 }
 
+/// `CLOSED` status body — what the SEA server returns from
+/// `GetStatementStatus` after the statement has been closed (verified
+/// against a live warehouse: `GET` after `DELETE` → 200 `state: CLOSED`).
+fn closed_body(statement_id: &str) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": { "state": "CLOSED" },
+    })
+    .to_string()
+}
+
+/// Mount a single `GetStatementStatus` (GET) response for `attach`'s
+/// seeding call.
+async fn mount_status_once(server: &MockServer, statement_id: &str, body: String) {
+    Mock::given(method("GET"))
+        .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+/// Mount a `404 NOT_FOUND` for an unknown/expired statement id — the
+/// SEA shape verified against a live warehouse for a well-formed but
+/// unknown id.
+async fn mount_status_not_found(server: &MockServer, statement_id: &str) {
+    let body = json!({
+        "error_code": "NOT_FOUND",
+        "message": format!("The statement {statement_id} was not found."),
+    })
+    .to_string();
+    Mock::given(method("GET"))
+        .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+        .respond_with(ResponseTemplate::new(404).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
 async fn mount_submit(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
@@ -982,4 +1019,102 @@ async fn async_await_result_cancelled_carries_extended_status_fields_onto_error(
         Some("operator=Scan; cancelled-mid-execute")
     );
     let _ = ErrorCode::SqlError; // silence unused-import warning if the assert above changes
+}
+
+// ─── attach_async_statement (resume-by-id) ──────────────────────────
+
+#[tokio::test]
+async fn attach_seeds_status_and_reports_server_state() {
+    // attach issues one GetStatementStatus to seed the handle; the
+    // seeded state is whatever the server reports for the id.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_status_once(&server, "stmt-attach", running_body("stmt-attach")).await;
+
+    let session = open_session(&server).await;
+    let async_exec = session
+        .attach_async_statement("stmt-attach")
+        .await
+        .expect("attach should succeed for a known id");
+    assert_eq!(async_exec.statement_id(), "stmt-attach");
+
+    let status = async_exec.status().await.expect("status");
+    assert!(matches!(status, StatementStatus::Running), "{status:?}");
+}
+
+#[tokio::test]
+async fn attach_reports_closed_for_a_closed_statement() {
+    // The connector relies on this: a closed async command must report
+    // CLOSED from the *server*, not from connector-side bookkeeping.
+    // Verified against a live warehouse — GET after DELETE returns
+    // 200 state=CLOSED.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_status_once(&server, "stmt-closed", closed_body("stmt-closed")).await;
+
+    let session = open_session(&server).await;
+    let async_exec = session
+        .attach_async_statement("stmt-closed")
+        .await
+        .expect("attach should succeed for a closed (but still known) id");
+
+    let status = async_exec.status().await.expect("status");
+    assert!(matches!(status, StatementStatus::Closed), "{status:?}");
+}
+
+#[tokio::test]
+async fn attach_errors_not_found_for_unknown_id() {
+    // An unknown / TTL-expired id returns 404 NOT_FOUND, which the
+    // transport maps to ErrorCode::NotFound. The connector keys its
+    // "command is gone → CLOSED" decision on this specific code, so
+    // assert the mapping holds (and is not, e.g., a generic SqlError).
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_status_not_found(&server, "stmt-gone").await;
+
+    let session = open_session(&server).await;
+    let err = match session.attach_async_statement("stmt-gone").await {
+        Ok(_) => panic!("attach on an unknown id should error"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code, ErrorCode::NotFound, "got: {err:?}");
+}
+
+#[tokio::test]
+async fn attached_handle_drop_does_not_close_statement() {
+    // An attached handle is non-owning: dropping it must NOT fire a
+    // CloseStatement. This is load-bearing — get_query_state re-attaches
+    // on every poll, so a self-closing attached handle would close the
+    // statement the poll loop is watching. Assert zero DELETEs reach the
+    // server after the handle drops.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_status_once(&server, "stmt-noclose", running_body("stmt-noclose")).await;
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-noclose"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let async_exec = session
+            .attach_async_statement("stmt-noclose")
+            .await
+            .expect("attach");
+        let _ = async_exec.status().await.expect("status");
+        // async_exec drops here.
+    }
+    // Give any (erroneously) spawned fire-and-forget close a chance to
+    // hit the wire before the scoped mock verifies expect(0) on drop.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // `_no_close` verifies expect(0) when it drops at end of scope.
 }

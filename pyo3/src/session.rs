@@ -21,6 +21,7 @@
 //! pyclass alive longer than the user keeps a reference.
 
 use crate::auth::{build_auth_config, OAuthParams};
+use crate::executed_async::ExecutedAsyncStatement;
 use crate::metadata::Metadata;
 use crate::statement::Statement;
 use databricks_sql_kernel::Session as KSession;
@@ -339,6 +340,37 @@ impl Session {
         let inner = alive!(self, "Session");
         let kmeta = inner.session.metadata();
         Ok(Metadata::new(kmeta, inner.runtime.clone()))
+    }
+
+    /// Re-attach to an already-submitted server statement by its id,
+    /// returning an `ExecutedAsyncStatement` the caller can poll
+    /// (`status()`), await (`await_result()`), or cancel/close — without
+    /// having been the handle that submitted it.
+    ///
+    /// This is the resume path the connector uses for
+    /// `get_query_state` / `get_async_execution_result`: server
+    /// statement state is keyed solely by the id, so a caller holding
+    /// only the id can recover a working handle bound to this session.
+    ///
+    /// Issues one `GetStatementStatus` to seed the handle. Raises
+    /// `KernelError` with code `NotFound` if the server doesn't
+    /// recognise the id (never submitted, or its result TTL elapsed). A
+    /// *closed* statement is not an error — the server keeps reporting
+    /// `CLOSED` (and terminal `SUCCEEDED`/`FAILED`) until GC, so the
+    /// returned handle's `status()` surfaces the real server state.
+    fn attach_async_statement(
+        &self,
+        py: Python<'_>,
+        statement_id: String,
+    ) -> PyResult<ExecutedAsyncStatement> {
+        let inner = alive!(self, "Session");
+        let runtime = inner.runtime.clone();
+        tracing::debug!(
+            target: crate::logging::PYO3_LOG_TARGET,
+            "Session.attach_async_statement: re-attaching by id (GIL released)"
+        );
+        let exec = run_kernel!(py, runtime, inner.session.attach_async_statement(statement_id))?;
+        Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
     /// Explicitly close the session. Idempotent. Subsequent calls on
