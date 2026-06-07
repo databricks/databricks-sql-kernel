@@ -84,7 +84,7 @@ use crate::kernel_error::{Error, Result};
 use crate::metadata::static_data;
 use crate::metadata::thrift_shape::{
     self, is_object_not_found, ThriftReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
-    GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
+    GET_CROSS_REFERENCE_SCHEMA, GET_PRIMARY_KEYS_SCHEMA, GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
 };
 use crate::reader::EmptyReader;
 use crate::result_stream::ResultStream;
@@ -490,9 +490,11 @@ impl Metadata {
     /// namespace, tableName, col_name, keySeq, constraintName,
     /// constraintType, parentCatalogName, parentNamespace,
     /// parentTableName, parentColName, updateRule, deleteRule,
-    /// deferrability`. Wrappers filter `constraintType =
-    /// 'PRIMARY KEY'` to isolate the PK rows from the FK rows the
-    /// server returns alongside.
+    /// deferrability`. The result is reshaped kernel-side into the
+    /// JDBC `getPrimaryKeys` column set (`TABLE_CAT`, `TABLE_SCHEM`,
+    /// `TABLE_NAME`, `COLUMN_NAME`, `KEY_SEQ`, `PK_NAME`) by
+    /// [`thrift_shape::reshape_primary_keys`] so every binding sees the
+    /// canonical names without re-mapping.
     ///
     /// Catalog and schema are required at the kernel layer:
     /// Databricks `SHOW KEYS` needs `IN CATALOG / IN SCHEMA / IN
@@ -512,7 +514,7 @@ impl Metadata {
             let schema = schema.ok_or_else(|| {
                 Error::invalid_argument().message("primary_keys requires a schema identifier")
             })?;
-            let raw = self
+            let raw = match self
                 .session
                 .transport()
                 .list_primary_keys(
@@ -521,10 +523,23 @@ impl Metadata {
                     schema.as_str(),
                     table.as_str(),
                 )
-                .await?;
-            let stmt_id = raw.statement_id.clone();
-            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_PRIMARY_KEYS_SCHEMA.clone(), Err).await,
+            };
+            let stmt_id = raw.statement_id.clone();
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_PRIMARY_KEYS_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_primary_keys),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -541,6 +556,12 @@ impl Metadata {
     ///
     /// Server shape: same as [`primary_keys`](Self::primary_keys) —
     /// `SHOW FOREIGN KEYS` shares its result schema with `SHOW KEYS`.
+    /// The result is reshaped kernel-side into the JDBC
+    /// `getCrossReference` column set (`PKTABLE_*`, `FKTABLE_*`,
+    /// `KEY_SEQ`, `UPDATE_RULE`, `DELETE_RULE`, `FK_NAME`, `PK_NAME`,
+    /// `DEFERRABILITY`) by [`thrift_shape::reshape_foreign_keys`].
+    /// `UPDATE_RULE` / `DELETE_RULE` / `PK_NAME` have no source in the
+    /// server response and are emitted as typed nulls (not synthesized).
     pub async fn foreign_keys(
         &self,
         parent_catalog: Option<Identifier<'_>>,
@@ -561,7 +582,7 @@ impl Metadata {
             let foreign_table = foreign_table.ok_or_else(|| {
                 Error::invalid_argument().message("foreign_keys requires foreign_table")
             })?;
-            let raw = self
+            let raw = match self
                 .session
                 .transport()
                 .list_foreign_keys(
@@ -573,10 +594,23 @@ impl Metadata {
                     foreign_schema.as_str(),
                     foreign_table.as_str(),
                 )
-                .await?;
-            let stmt_id = raw.statement_id.clone();
-            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_CROSS_REFERENCE_SCHEMA.clone(), Err).await,
+            };
+            let stmt_id = raw.statement_id.clone();
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_CROSS_REFERENCE_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_foreign_keys),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
