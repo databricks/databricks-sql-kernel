@@ -104,21 +104,18 @@ type InflightId = Arc<Mutex<Option<String>>>;
 /// - `caller_wait_secs = Some(s)` — the caller pinned the wait shape
 ///   (e.g. `submit` passes `"0s"` for async). Respected verbatim with
 ///   `CONTINUE`; overriding it would make async submit block.
-/// - `caller_wait_secs = None` — the sync `execute` path. A per-statement
-///   `spec_query_timeout_secs` then bounds the server wait and `CANCEL`s
-///   the statement on elapse (JDBC `setQueryTimeout` / Python `use_sea`'s
-///   `wait_timeout` semantics). With no spec timeout, both are omitted so
-///   the server applies its default (~10s wait + auto-close on success).
-fn resolve_wait_timeout(
-    caller_wait_secs: Option<&str>,
-    spec_query_timeout_secs: Option<u32>,
-) -> (Option<String>, Option<String>) {
+/// - `caller_wait_secs = None` — the sync `execute` path. Both fields are
+///   omitted so the server applies its default (~10s wait + auto-close on
+///   success).
+///
+/// Note: there is intentionally NO statement-execution-timeout knob here.
+/// `wait_timeout` is the server's inline-HOLD window (capped 5–50s), not an
+/// execution deadline; a real per-statement timeout is the `STATEMENT_TIMEOUT`
+/// SQL conf, not this field. See the removal of `query_timeout_secs`.
+fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Option<String>) {
     match caller_wait_secs {
         Some(s) => (Some(s.to_string()), Some("CONTINUE".to_string())),
-        None => match spec_query_timeout_secs {
-            Some(secs) => (Some(format!("{secs}s")), Some("CANCEL".to_string())),
-            None => (None, None),
-        },
+        None => (None, None),
     }
 }
 
@@ -153,8 +150,7 @@ fn build_execute_params(
         return Err(Error::invalid_argument()
             .message("positional and named parameters are mutually exclusive; pass only one"));
     }
-    let (wait_timeout, on_wait_timeout) =
-        resolve_wait_timeout(wait_timeout_secs, spec.query_timeout_secs);
+    let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
     let mut exec_params = ExecuteParams {
         wait_timeout,
         on_wait_timeout,
@@ -415,17 +411,9 @@ impl Statement {
     /// Omitting `wait_timeout` (rather than sending an explicit `wait_timeout=10s`,
     /// which returns `SUCCEEDED` and leaves the statement alive needing a separate
     /// `CloseStatement`) is what makes the `Completed` arm's `close()` a no-op and
-    /// lets fire-and-forget DDL commit.
-    ///
-    /// **`query_timeout_secs` caveat.** If the spec sets `query_timeout_secs = N`,
-    /// `prepare_for_dispatch` sends `wait_timeout="{N}s"` + `on_wait_timeout=CANCEL`
-    /// instead of omitting it. The server then holds for `N`s and **CANCELs** the
-    /// statement on expiry — surfacing as an eager `Cancelled` error from this call,
-    /// NOT a `DirectStatement::Running` handle. So a `query_timeout_secs` shorter
-    /// than the query's runtime makes the `Running` arm unreachable (the statement
-    /// is cancelled rather than handed back). (The SEA wire also rejects
-    /// `wait_timeout` below 5s with HTTP 400, so `query_timeout_secs` in 1..=4 errors
-    /// at the server rather than cancelling.)
+    /// lets fire-and-forget DDL commit. There is no statement-execution-timeout
+    /// knob on this path — `wait_timeout` is the inline-hold window, not an
+    /// execution deadline.
     ///
     /// Unlike [`Statement::execute`], this never blocks past the inline wait and
     /// never swallows a still-running handle: a long query stays cancellable via
@@ -445,8 +433,7 @@ impl Statement {
             // auto-closes on success (`state=CLOSED`). Omitting (vs an explicit
             // `wait_timeout=10s`, which returns `SUCCEEDED` and leaves the statement
             // alive) is what makes the Completed arm's `close()` a no-op and lets
-            // fire-and-forget DDL commit. (`query_timeout_secs`, if set on the spec,
-            // is the exception — see the method doc: it sends `{secs}s` + CANCEL.)
+            // fire-and-forget DDL commit.
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
             let cancel_state = MidExecuteCancelState::new(
@@ -791,27 +778,18 @@ mod tests {
 
     #[test]
     fn async_submit_caller_value_is_respected_verbatim() {
-        // submit() pins "0s" for async; never overridden, even if a spec
-        // query_timeout is set (overriding would make submit block).
-        let (wait, on_wait) = resolve_wait_timeout(Some("0s"), Some(30));
+        // submit() pins "0s" for async; respected verbatim with CONTINUE.
+        let (wait, on_wait) = resolve_wait_timeout(Some("0s"));
         assert_eq!(wait.as_deref(), Some("0s"));
         assert_eq!(on_wait.as_deref(), Some("CONTINUE"));
     }
 
     #[test]
-    fn sync_with_query_timeout_cancels_on_elapse() {
-        // execute() passes None; a spec query_timeout bounds the wait and
-        // CANCELs the statement on elapse (server statement-timeout).
-        let (wait, on_wait) = resolve_wait_timeout(None, Some(30));
-        assert_eq!(wait.as_deref(), Some("30s"));
-        assert_eq!(on_wait.as_deref(), Some("CANCEL"));
-    }
-
-    #[test]
-    fn sync_without_query_timeout_omits_field() {
-        // No caller pin and no spec timeout: omit both so the server uses
-        // its default (~10s wait + auto-close on success).
-        let (wait, on_wait) = resolve_wait_timeout(None, None);
+    fn sync_omits_wait_timeout_field() {
+        // execute() passes None: omit both so the server uses its default
+        // (~10s wait + auto-close on success). There is no statement-timeout
+        // knob — `query_timeout_secs` was removed (it abused `wait_timeout`).
+        let (wait, on_wait) = resolve_wait_timeout(None);
         assert_eq!(wait, None);
         assert_eq!(on_wait, None);
     }

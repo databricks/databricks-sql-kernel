@@ -53,10 +53,11 @@ use crate::util::guarded;
 ///   produces (`lib/utils/queryTags.ts`). Backslashes in keys are
 ///   doubled; backslash/colon/comma in values are backslash-escaped.
 ///
-/// `rowLimit` (SEA `row_limit`) and `queryTimeoutSecs` (the per-statement
-/// server wait timeout) are exposed here and threaded onto the kernel
+/// `rowLimit` (SEA `row_limit`) is exposed here and threaded onto the kernel
 /// `StatementSpec`. `positionalParams` (`?`) and `namedParams` (`:name`)
 /// carry bound query parameters, decoded via `params::parse_typed_value`.
+/// (There is no `queryTimeoutSecs`: it abused the SEA `wait_timeout` inline-hold
+/// window and was removed — a real per-statement timeout is `STATEMENT_TIMEOUT`.)
 ///
 /// **Tag-order caveat (M4 parity note).** The napi `queryTags` field
 /// is a Rust `HashMap<String, String>` whose iteration order is
@@ -100,23 +101,6 @@ pub struct ExecuteOptions {
     /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
     /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
     pub row_limit: Option<i64>,
-    /// Per-statement server wait timeout in whole seconds. Bounds how
-    /// long the server waits before cancelling the statement
-    /// (`on_wait_timeout = CANCEL`), surfacing as a timeout — the
-    /// server statement timeout (JDBC `setQueryTimeout`). Maps to
-    /// `StatementSpec.query_timeout_secs`. Distinct from the
-    /// connection-level transport timeout. The SEA wire caps it at 50s.
-    ///
-    /// **Applies to `executeStatement` only.** The async `submitStatement`
-    /// path always sends `wait_timeout=0s` (so the server returns a
-    /// `statement_id` immediately and never blocks), which means this
-    /// field is *not* consulted on the submit path — the caller drives
-    /// completion via `AsyncStatement.status()` / `awaitResult()` and is
-    /// responsible for its own timeout (e.g. `Promise.race`). Passing
-    /// `queryTimeoutSecs` to `submitStatement` is silently ignored. This
-    /// matches the Python `use_sea` async-submit contract, where the
-    /// wait-timeout and any statement timeout are orthogonal.
-    pub query_timeout_secs: Option<u32>,
     /// Positional parameters, in 1-based wire order. Index `i` in this
     /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
     /// Each entry is a `{ sqlType, value }` pair — `value` is the
@@ -194,10 +178,6 @@ pub(crate) fn connection_closed_err() -> napi::Error {
 /// edited once). `Session::statement()` clones the session's internal `Arc`,
 /// so the returned `Statement` is independent of the borrow and the caller can
 /// release the lock before `execute()` / `submit()`.
-///
-/// `query_timeout_secs` is honoured on the sync `execute` path; the submit path
-/// passes `None` because submit pins `wait_timeout=0s` and `resolve_wait_timeout`
-/// never consults the spec timeout there (see `statement/mutable.rs`).
 #[allow(clippy::too_many_arguments)]
 fn build_statement(
     session: &Session,
@@ -205,7 +185,6 @@ fn build_statement(
     statement_conf: Option<HashMap<String, String>>,
     query_tags: Option<HashMap<String, Option<String>>>,
     row_limit: Option<i64>,
-    query_timeout_secs: Option<u32>,
     positional_params: Vec<TypedValue>,
     named_params: Vec<(String, TypedValue)>,
 ) -> napi::Result<databricks_sql_kernel::Statement> {
@@ -229,9 +208,7 @@ fn build_statement(
         stmt.spec().query_tags(tags).map_err(napi_err_from_kernel)?;
     }
     // `None` leaves the kernel's omit-the-field default in place.
-    stmt.spec()
-        .row_limit(row_limit)
-        .query_timeout_secs(query_timeout_secs);
+    stmt.spec().row_limit(row_limit);
     // Bind positional params 1-based on the wire.
     for (i, value) in positional_params.into_iter().enumerate() {
         stmt.spec()
@@ -308,9 +285,7 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         // Pull the scalar knobs out (both `i64`/`u32` are `Copy`) before
         // the `.take()`s below consume the map fields out of `options`.
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);
-        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
-        // Decode positional params before `options` is consumed below; a
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);        // Decode positional params before `options` is consumed below; a
         // malformed entry surfaces as InvalidArgument here, before any wire
         // round-trip.
         let positional_params = options
@@ -353,7 +328,6 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
-                    query_timeout_secs,
                     positional_params,
                     named_params,
                 )?
@@ -397,9 +371,7 @@ impl Connection {
         mut options: Option<ExecuteOptions>,
     ) -> napi::Result<napi::Either<Statement, AsyncStatement>> {
         let inner = Arc::clone(&self.inner);
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);
-        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
-        let positional_params = options
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);        let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
             .map(decode_positional_params)
@@ -423,7 +395,6 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
-                    query_timeout_secs,
                     positional_params,
                     named_params,
                 )?
@@ -456,9 +427,7 @@ impl Connection {
     /// `Statement` `executeStatement` returns) and can fire `cancel()`
     /// concurrently to interrupt a still-running query mid-COMPUTE.
     ///
-    /// Option semantics are identical to `executeStatement` — including
-    /// `queryTimeoutSecs`, which IS honoured here (this is the sync
-    /// `execute` path; only the async `submitStatement` ignores it).
+    /// Option semantics are identical to `executeStatement`.
     /// Mirrors the pyo3 `Statement.canceller()` / `Statement.execute()`
     /// split (PR #121): obtain the canceller before the blocking drive.
     #[napi]
@@ -468,12 +437,8 @@ impl Connection {
         mut options: Option<ExecuteOptions>,
     ) -> napi::Result<crate::cancellable::CancellableExecution> {
         let inner = Arc::clone(&self.inner);
-        // Same option decoding as `execute_statement` — `queryTimeoutSecs`
-        // IS honoured here (sync execute path), so it is read and threaded
-        // through `build_statement` like the rest of the knobs.
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);
-        let query_timeout_secs = options.as_ref().and_then(|o| o.query_timeout_secs);
-        let positional_params = options
+        // Same option decoding as `execute_statement`.
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);        let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
             .map(decode_positional_params)
@@ -504,7 +469,6 @@ impl Connection {
                     statement_conf,
                     query_tags,
                     row_limit,
-                    query_timeout_secs,
                     positional_params,
                     named_params,
                 )?
@@ -527,14 +491,11 @@ impl Connection {
     /// uses (`runAsync: true`): the SEA backend submits, returns a
     /// pending operation handle, and polls to terminal during
     /// fetch. Option semantics (statementConf / queryTags /
-    /// rowLimit / positional + named params) match `executeStatement`,
-    /// with one carve-out: `queryTimeoutSecs` is **ignored** here.
+    /// rowLimit / positional + named params) match `executeStatement`.
     /// Submit always sends `wait_timeout=0s` so the call returns
-    /// immediately, leaving no server wait to bound; the caller drives
-    /// completion and its own timeout via `status()` / `awaitResult()`
-    /// (e.g. `Promise.race`). Only the blocking-vs-pending return
-    /// contract — and that timeout carve-out — differ from
-    /// `executeStatement`.
+    /// immediately; the caller drives completion via `status()` /
+    /// `awaitResult()`. Only the blocking-vs-pending return contract
+    /// differs from `executeStatement`.
     #[napi]
     pub async fn submit_statement(
         &self,
@@ -544,9 +505,6 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         // Same option decoding as `execute_statement` — malformed
         // params surface as InvalidArgument before any wire round-trip.
-        // `queryTimeoutSecs` is intentionally NOT read here: submit pins
-        // `wait_timeout=0s`, so `resolve_wait_timeout` never consults the
-        // spec timeout on this path (see statement/mutable.rs).
         let row_limit = options.as_ref().and_then(|o| o.row_limit);
         let positional_params = options
             .as_mut()
@@ -578,14 +536,12 @@ impl Connection {
             let mut stmt = {
                 let guard = inner.lock().await;
                 let session = guard.as_ref().ok_or_else(connection_closed_err)?;
-                // `None` for query_timeout_secs — ignored on the submit path.
                 build_statement(
                     session,
                     sql,
                     statement_conf,
                     query_tags,
                     row_limit,
-                    None,
                     positional_params,
                     named_params,
                 )?
