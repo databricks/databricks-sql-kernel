@@ -261,8 +261,9 @@ impl SeaRestTransport {
     ///
     /// Shared by `wait_for_completion` (sync poll loop) and
     /// [`Transport::fetch_completed_result`] (async one-shot fetch)
-    /// so both paths produce identical errors for `FAILED` /
-    /// `CANCELLED` / `CLOSED-no-data`.
+    /// so both paths produce identical errors for `FAILED` / `CANCELLED`.
+    /// `CLOSED` (with or without result data) is a terminal success — JDBC
+    /// parity; an empty `CLOSED` materialises an empty result downstream.
     fn terminal_outcome(response: ExecuteResponse) -> StatementOutcome {
         match response.status.state {
             StatementState::Succeeded => StatementOutcome::Done(response),

@@ -402,15 +402,30 @@ impl Statement {
 
     /// directResults execute — the Thrift/JDBC model.
     ///
-    /// Sends ExecuteStatement with a bounded server-side inline wait
-    /// (`wait_timeout=10s`, `on_wait_timeout=CONTINUE`) and returns WITHOUT
-    /// polling past it:
+    /// Sends ExecuteStatement with **no `wait_timeout` field** (the server then
+    /// applies its ~10s default inline wait AND auto-closes on success,
+    /// `state=CLOSED`) and returns WITHOUT polling past it:
     ///   - [`DirectStatement::Completed`] when the query reached a terminal,
     ///     succeeded state within the inline wait — the result stream is ready
     ///     inline (no extra `GetStatementResult` round-trip), identical to
     ///     [`Statement::execute`]'s fast path;
     ///   - [`DirectStatement::Running`] when it did not — a poll/cancel handle
     ///     (identical to [`Statement::submit`]'s return) the caller drives.
+    ///
+    /// Omitting `wait_timeout` (rather than sending an explicit `wait_timeout=10s`,
+    /// which returns `SUCCEEDED` and leaves the statement alive needing a separate
+    /// `CloseStatement`) is what makes the `Completed` arm's `close()` a no-op and
+    /// lets fire-and-forget DDL commit.
+    ///
+    /// **`query_timeout_secs` caveat.** If the spec sets `query_timeout_secs = N`,
+    /// `prepare_for_dispatch` sends `wait_timeout="{N}s"` + `on_wait_timeout=CANCEL`
+    /// instead of omitting it. The server then holds for `N`s and **CANCELs** the
+    /// statement on expiry — surfacing as an eager `Cancelled` error from this call,
+    /// NOT a `DirectStatement::Running` handle. So a `query_timeout_secs` shorter
+    /// than the query's runtime makes the `Running` arm unreachable (the statement
+    /// is cancelled rather than handed back). (The SEA wire also rejects
+    /// `wait_timeout` below 5s with HTTP 400, so `query_timeout_secs` in 1..=4 errors
+    /// at the server rather than cancelling.)
     ///
     /// Unlike [`Statement::execute`], this never blocks past the inline wait and
     /// never swallows a still-running handle: a long query stays cancellable via
@@ -424,8 +439,14 @@ impl Statement {
         let span = self.session.log_span().clone();
         async {
             self.invalidate_prior().await;
-            // `prepare_for_dispatch(None)` here; `execute_statement_direct`
-            // forces `wait_timeout=10s` + `on_wait_timeout=CONTINUE` itself.
+            // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
+            // UNSET, so `execute_statement_direct` sends ExecuteStatement with no
+            // `wait_timeout` field — the server applies its ~10s default AND
+            // auto-closes on success (`state=CLOSED`). Omitting (vs an explicit
+            // `wait_timeout=10s`, which returns `SUCCEEDED` and leaves the statement
+            // alive) is what makes the Completed arm's `close()` a no-op and lets
+            // fire-and-forget DDL commit. (`query_timeout_secs`, if set on the spec,
+            // is the exception — see the method doc: it sends `{secs}s` + CANCEL.)
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
             let cancel_state = MidExecuteCancelState::new(
@@ -435,11 +456,23 @@ impl Statement {
             let guard = cancel_state.guard();
             exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
-            let outcome = self
+            let outcome = match self
                 .session
                 .transport()
                 .execute_statement_direct(self.session.session_id(), &sql, &exec_params)
-                .await?;
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // Inline terminal failure/cancel. The transport already published
+                    // the statement id to the shared slot and closed the orphaned
+                    // statement (`execute_statement_direct`'s `Err` arm). Defuse the
+                    // cancel guard so its `Drop` does NOT fire a second, redundant
+                    // `CancelStatement` against that now-closed statement.
+                    guard.defuse();
+                    return Err(e);
+                }
+            };
 
             let valid = ValidityFlag::new();
             match outcome {

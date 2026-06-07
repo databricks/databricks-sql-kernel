@@ -371,8 +371,8 @@ impl Connection {
     }
 
     /// directResults execute — the Thrift/JDBC model. Sends ExecuteStatement
-    /// with a bounded server-side inline wait (`wait_timeout=10s`,
-    /// `on_wait_timeout=CONTINUE`) and returns WITHOUT polling past it:
+    /// with no `wait_timeout` field (server applies its ~10s default inline wait
+    /// and auto-closes on success) and returns WITHOUT polling past it:
     ///
     /// - a **`Statement`** (left arm) when the query finished within the inline
     ///   wait — terminal, result ready inline, `close()` is a clean release;
@@ -383,6 +383,13 @@ impl Connection {
     /// only on `AsyncStatement`). This is the path that gives mid-run cancel for
     /// long queries WITHOUT the eager-handle / close-drives workaround: the
     /// returned handle always corresponds to a server-owned statement.
+    ///
+    /// **Load-bearing contract:** the kernel's `DirectStatement::{Completed,
+    /// Running}` discriminant cannot ride on these opaque `#[napi]` classes, so
+    /// consumers MUST feature-detect via `awaitResult` (the only member unique to
+    /// `AsyncStatement`). `Statement` (the Completed arm) MUST NOT gain an
+    /// `awaitResult` member, or every consumer silently misroutes. The pyo3
+    /// binding makes the same `await_result`-probe assumption.
     #[napi]
     pub async fn execute_statement_direct(
         &self,

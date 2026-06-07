@@ -247,11 +247,10 @@ impl Statement {
     /// data note:** may contain SQL fragments or parameter values —
     /// redact before centralised logging.
     ///
-    /// Populated on `Succeeded` / `Closed-with-inline-data` paths.
-    /// On terminal-error states (`Failed` / `Cancelled` /
-    /// `Closed-no-data`) the kernel returns an Error instead of a
-    /// `Statement`, and the same field rides on the JS Error envelope
-    /// under the same `displayMessage` key.
+    /// Populated on `Succeeded` / `Closed` paths (incl. an empty `Closed`).
+    /// On terminal-error states (`Failed` / `Cancelled`) the kernel returns
+    /// an Error instead of a `Statement`, and the same field rides on the JS
+    /// Error envelope under the same `displayMessage` key.
     #[napi]
     pub async fn display_message(&self) -> napi::Result<Option<String>> {
         let inner = Arc::clone(&self.inner);

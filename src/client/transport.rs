@@ -261,9 +261,10 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         params: &ExecuteParams,
     ) -> Result<ExecuteResult>;
 
-    /// Execute a SQL statement with a bounded server-side inline wait
-    /// (`wait_timeout` + `on_wait_timeout=CONTINUE`), returning WITHOUT the
-    /// internal poll loop — the Thrift/JDBC directResults model.
+    /// Execute a SQL statement relying on the server's default inline wait
+    /// (the caller's `ExecuteParams` omit `wait_timeout`/`on_wait_timeout` unless
+    /// a `query_timeout_secs` was set), returning WITHOUT the internal poll loop
+    /// — the Thrift/JDBC directResults model.
     ///
     /// Returns [`DirectOutcome::Completed`] (terminal + reader materialised
     /// inline) for queries that finish within the wait, or
