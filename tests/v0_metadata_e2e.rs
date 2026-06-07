@@ -311,7 +311,7 @@ async fn find_known_table(session: &Session) -> Option<(String, String, String)>
 
 #[tokio::test]
 #[ignore]
-async fn primary_keys_returns_server_show_keys_columns() {
+async fn primary_keys_returns_jdbc_columns() {
     let session = live_session().await;
     let Some((cat, schema, table)) = find_known_table(&session).await else {
         eprintln!("skipping primary_keys E2E — no known sample table reachable");
@@ -328,24 +328,20 @@ async fn primary_keys_returns_server_show_keys_columns() {
         .await
         .expect("primary_keys");
 
-    // Live SHOW KEYS shape on Dogfood: 14 columns including
-    // catalogName / namespace / tableName / col_name / keySeq /
-    // constraintName / constraintType / parent* / updateRule /
-    // deleteRule / deferrability. Required minimum:
+    // Reshaped kernel-side into the JDBC getPrimaryKeys column set
+    // (the raw SHOW KEYS columns are renamed by reshape_primary_keys).
     let names = col_names(&stream.schema());
-    for required in [
-        "catalogName",
-        "namespace",
-        "tableName",
-        "col_name",
-        "keySeq",
-        "constraintName",
-    ] {
-        assert!(
-            names.iter().any(|n| n == required),
-            "expected '{required}' in {names:?}"
-        );
-    }
+    assert_eq!(
+        names,
+        vec![
+            "TABLE_CAT",
+            "TABLE_SCHEM",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "KEY_SEQ",
+            "PK_NAME",
+        ]
+    );
     let _ = collect(stream).await;
 
     session.close().await.expect("close");
@@ -353,7 +349,7 @@ async fn primary_keys_returns_server_show_keys_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn foreign_keys_returns_server_show_foreign_keys_columns() {
+async fn foreign_keys_returns_jdbc_columns() {
     let session = live_session().await;
     let Some((cat, schema, table)) = find_known_table(&session).await else {
         eprintln!("skipping foreign_keys E2E — no known sample table reachable");
@@ -373,22 +369,29 @@ async fn foreign_keys_returns_server_show_foreign_keys_columns() {
         .await
         .expect("foreign_keys");
 
+    // Reshaped kernel-side into the JDBC getCrossReference column set
+    // (the raw SHOW FOREIGN KEYS columns are renamed by
+    // reshape_foreign_keys).
     let names = col_names(&stream.schema());
-    for required in [
-        "catalogName",
-        "namespace",
-        "tableName",
-        "col_name",
-        "parentCatalogName",
-        "parentNamespace",
-        "parentTableName",
-        "parentColName",
-    ] {
-        assert!(
-            names.iter().any(|n| n == required),
-            "expected '{required}' in {names:?}"
-        );
-    }
+    assert_eq!(
+        names,
+        vec![
+            "PKTABLE_CAT",
+            "PKTABLE_SCHEM",
+            "PKTABLE_NAME",
+            "PKCOLUMN_NAME",
+            "FKTABLE_CAT",
+            "FKTABLE_SCHEM",
+            "FKTABLE_NAME",
+            "FKCOLUMN_NAME",
+            "KEY_SEQ",
+            "UPDATE_RULE",
+            "DELETE_RULE",
+            "FK_NAME",
+            "PK_NAME",
+            "DEFERRABILITY",
+        ]
+    );
     let _ = collect(stream).await;
 
     session.close().await.expect("close");
