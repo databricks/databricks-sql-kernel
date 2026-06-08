@@ -45,10 +45,12 @@ use databricks_sql_kernel::{
 /// driver's `maxSockets: Infinity` pool for bursty workloads
 /// (concurrent `executeStatement`, parallel CloudFetch chunk downloads).
 ///
-/// The kernel core's [`HttpConfig::pool_max_idle_per_host`] default
-/// remains at the conservative kernel value (10) — each binding
-/// chooses its own user-facing default. The pyo3 binding inherits
-/// the kernel default; this constant is napi-specific.
+/// The kernel core's [`HttpConfig::pool_max_idle_per_host`] default is
+/// also 100 (matching the JDBC `HttpConnectionPoolSize` default), so this
+/// constant currently equals it. It is declared here to *pin* napi's
+/// user-facing default against future kernel drift — each binding owns its
+/// own default rather than silently inheriting the kernel's. The pyo3
+/// binding, by contrast, inherits whatever the kernel default is.
 pub const NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST: usize = 100;
 
 use crate::connection::Connection;
@@ -97,6 +99,21 @@ pub enum AuthMode {
     /// OAuth 2.0 user-to-machine (browser flow) — optional `oauthClientId`
     /// + `oauthRedirectPort`.
     OAuthU2m,
+}
+
+/// A single extra HTTP header as an explicit `{ name, value }` pair.
+///
+/// An ordered list of these (`ConnectionOptions.custom_headers`) mirrors
+/// the kernel core's `Vec<(String, String)>` and the pyo3 binding's
+/// `http_headers`: order is preserved and duplicate `name`s are allowed.
+/// A struct (rather than a raw `[name, value]` tuple) because napi-rs
+/// does not marshal Rust tuples through `#[napi(object)]` fields; the
+/// struct is the idiomatic, self-documenting equivalent and maps to a JS
+/// `{ name: string, value: string }`.
+#[napi(object)]
+pub struct HeaderEntry {
+    pub name: String,
+    pub value: String,
 }
 
 /// JS-visible options for opening a Databricks SQL session.
@@ -165,9 +182,9 @@ pub struct ConnectionOptions {
     /// the JDBC driver's `HttpConnectionPoolSize` default and to close
     /// the throughput gap vs the NodeJS Thrift driver's
     /// `maxSockets: Infinity` pool for bursty workloads. The kernel
-    /// core's [`HttpConfig::pool_max_idle_per_host`] default remains
-    /// at the conservative kernel value (10); each binding chooses
-    /// its own user-facing default. Mirrors the Python connector's
+    /// core's [`HttpConfig::pool_max_idle_per_host`] default is also 100
+    /// (matching the same JDBC default), so napi pins its own copy rather
+    /// than inheriting it. Mirrors the Python connector's
     /// `max_connections` kwarg on the SEA backend, which exposes the
     /// knob but keeps its own urllib3-aligned default of 10.
     ///
@@ -201,15 +218,68 @@ pub struct ConnectionOptions {
     /// `rejectUnauthorized: false`. Prefer pairing strict checking with
     /// `custom_ca_cert` over disabling verification entirely.
     ///
-    /// Maps onto the kernel [`TlsConfig::accept_self_signed`] +
-    /// [`TlsConfig::skip_hostname_verification`] (both = `!check`).
+    /// This is the master verify toggle: `false` disables chain validation
+    /// (`TlsConfig::accept_self_signed`) **and** subsumes the hostname
+    /// check (`skip_hostname_verification`), regardless of
+    /// `check_server_certificate_hostname`.
     pub check_server_certificate: Option<bool>,
+    /// Whether to verify that the server certificate matches the host
+    /// (hostname-vs-SNI check), **independently** of full chain validation.
+    ///
+    /// Omitted / `true` ⇒ the hostname check runs (the secure default).
+    /// `false` ⇒ skip only the hostname check while still validating the
+    /// chain + expiry against the trust store — for connecting via an IP
+    /// literal or a host the cert wasn't issued for, without dropping all
+    /// validation. Ignored (already implied) when
+    /// `check_server_certificate` is `false`, which disables everything.
+    ///
+    /// Mirrors the Python connector's `_tls_verify_hostname` knob and the
+    /// kernel's [`TlsConfig::skip_hostname_verification`] (= `!check`).
+    pub check_server_certificate_hostname: Option<bool>,
     /// PEM-encoded CA certificate bytes to add to the trust store on
     /// top of the system roots. Use for corporate TLS-inspecting
     /// proxies that re-sign TLS, or on-prem deployments with an
     /// internal CA. Honoured regardless of `check_server_certificate`.
     /// Maps onto the kernel [`TlsConfig::custom_ca_cert`].
     pub custom_ca_cert: Option<Buffer>,
+    /// PEM-encoded client certificate for mutual TLS (mTLS). Set this
+    /// together with `client_key_pem` when the server requires the
+    /// client to present a certificate. A PEM carrying a leaf cert
+    /// optionally followed by its intermediate chain is accepted.
+    /// Maps onto the kernel [`TlsConfig::client_cert_pem`].
+    ///
+    /// `client_cert_pem` and `client_key_pem` must be supplied together;
+    /// the kernel rejects setting only one at `open_session` with
+    /// `InvalidArgument`.
+    pub client_cert_pem: Option<Buffer>,
+    /// PEM-encoded private key for the mTLS client certificate. Set this
+    /// together with `client_cert_pem`. For portability across the
+    /// kernel's TLS backends supply a PKCS#8 key (`BEGIN PRIVATE KEY`).
+    /// Maps onto the kernel [`TlsConfig::client_key_pem`].
+    pub client_key_pem: Option<Buffer>,
+    /// Extra HTTP headers to send on every request — the route for
+    /// caller-supplied headers (the NodeJS driver's `customHeaders` and
+    /// the composed `User-Agent`). Maps onto the kernel
+    /// [`HttpConfig::custom_headers`].
+    ///
+    /// An **ordered list** of `(name, value)` pairs, mirroring the kernel
+    /// core's `Vec<(String, String)>` and the pyo3 binding's
+    /// `http_headers` — order is preserved and duplicate names are
+    /// allowed (the kernel emits each entry, and for `User-Agent` folds
+    /// the **last** one into its base UA).
+    ///
+    /// Three names are handled specially by the kernel:
+    /// - `Authorization` / `x-databricks-org-id` are **reserved** — a
+    ///   caller entry for either is silently dropped (skip-and-warn) so
+    ///   auth and multi-tenant routing can't be hijacked by a custom
+    ///   header. (The NodeJS driver also drops these before they cross
+    ///   the FFI, matching the Python connector's double-wall.)
+    /// - `User-Agent` is **appended** to the kernel base UA (rather than
+    ///   replacing it), preserving the `DatabricksJDBCDriverOSS/...`
+    ///   token the SEA server keys on while still surfacing the caller's
+    ///   identity. The NodeJS driver folds its `userAgentEntry` into a
+    ///   `User-Agent` entry here.
+    pub custom_headers: Option<Vec<HeaderEntry>>,
 }
 
 /// Map the JS `ConnectionOptions` auth fields onto the kernel
@@ -267,27 +337,76 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
 
 /// Map the JS TLS fields onto the kernel [`TlsConfig`].
 ///
-/// The default (no `check_server_certificate`) is **secure** — it keeps
-/// the kernel's strict [`TlsConfig::default()`] (full chain + expiry +
-/// hostname validation). Setting `check_server_certificate: false` is an
-/// explicit opt-out that relaxes both knobs, matching the legacy NodeJS
-/// Thrift driver's permissive `rejectUnauthorized: false` behaviour for
-/// callers that need it. A `custom_ca_cert` is always added to the trust
-/// store regardless of the strictness toggle.
+/// The default (no toggles) is **secure** — it keeps the kernel's strict
+/// [`TlsConfig::default()`] (full chain + expiry + hostname validation).
+///
+/// Two independent toggles, mirroring the Python connector's `tls_verify`
+/// / `tls_verify_hostname`:
+/// - `check_server_certificate: false` relaxes chain validation
+///   (`accept_self_signed`) **and** subsumes the hostname check — the
+///   legacy NodeJS Thrift driver's permissive `rejectUnauthorized: false`
+///   behaviour.
+/// - `check_server_certificate_hostname: false` skips **only** the
+///   hostname check while the chain is still validated. When the master
+///   `check_server_certificate` is `false`, the hostname check is already
+///   off, so this flag is a no-op in that case.
+///
+/// A `custom_ca_cert` is always added to the trust store regardless of the
+/// strictness toggles.
 ///
 /// `TlsConfig` is `#[non_exhaustive]` — construct via `default()` then
 /// mutate (same pattern as `ResultConfig` / `HttpConfig` above). Pure
 /// (borrows `options`) so it is unit-testable without opening a session.
 fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
     // Secure-by-default: only an explicit `false` relaxes verification.
-    let strict = options.check_server_certificate.unwrap_or(true);
+    let verify = options.check_server_certificate.unwrap_or(true);
+    let verify_hostname = options.check_server_certificate_hostname.unwrap_or(true);
     let mut tls = TlsConfig::default();
-    tls.accept_self_signed = !strict;
-    tls.skip_hostname_verification = !strict;
+    tls.accept_self_signed = !verify;
+    // Disabling chain validation subsumes the hostname check; otherwise the
+    // hostname check follows its own toggle. Matches the Python connector
+    // (`tls_verify=False` ⇒ both skips; `tls_verify_hostname=False` ⇒
+    // hostname skip only).
+    tls.skip_hostname_verification = !verify || !verify_hostname;
     if let Some(ca) = &options.custom_ca_cert {
         tls.custom_ca_cert = Some(ca.to_vec());
     }
+    // mTLS client identity. Threaded through verbatim; the kernel enforces
+    // the both-or-neither rule (and validates the PEM/key pairing) at
+    // `Session::open`, surfacing `InvalidArgument` if only one is set.
+    if let Some(cert) = &options.client_cert_pem {
+        tls.client_cert_pem = Some(cert.to_vec());
+    }
+    if let Some(key) = &options.client_key_pem {
+        tls.client_key_pem = Some(key.to_vec());
+    }
     tls
+}
+
+/// Map the JS HTTP fields onto the kernel [`HttpConfig`].
+///
+/// Always sets `pool_max_idle_per_host` — to the JS-supplied
+/// `max_connections` when present, otherwise the NodeJS-driver-appropriate
+/// [`NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST`] (100; pinned independently of
+/// the kernel default, which is also 100 today). `custom_headers` is
+/// forwarded when supplied; the kernel handles the reserved/`User-Agent`
+/// special cases. `HttpConfig` is `#[non_exhaustive]` — construct via
+/// `default()` then mutate. Consumes the `custom_headers` list out of
+/// `options` (pure otherwise) so it does not have to clone the header
+/// strings.
+fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
+    let mut http = HttpConfig::default();
+    http.pool_max_idle_per_host = options
+        .max_connections
+        .map(|max| max as usize)
+        .unwrap_or(NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST);
+    if let Some(headers) = options.custom_headers.take() {
+        // `Vec<HeaderEntry>` → the kernel core's `Vec<(String, String)>`,
+        // preserving order and duplicates (a `HashMap` would have collapsed
+        // duplicate names).
+        http.custom_headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
+    }
+    http
 }
 
 /// Open a Databricks SQL session and return an opaque `Connection`
@@ -302,7 +421,7 @@ fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
     reason = "exported via napi macro codegen; not called from Rust"
 )]
 #[napi]
-pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection> {
+pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connection> {
     guarded(async move {
         // Cache the napi-rs tokio Handle on the very first async call
         // so Drop impls (which run on the V8 GC thread, outside any
@@ -319,6 +438,11 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
         // omitting `.tls()` would fall back to the kernel's strict
         // defaults, which is the opposite of the Thrift-parity default.
         let tls_config = build_tls_config(&options);
+        // Build the HTTP config (pool sizing + custom headers) before the
+        // builder moves the transport fields out of `options`. Takes
+        // `&mut` because it moves the `custom_headers` list out of
+        // `options` to avoid cloning the header strings.
+        let http_config = build_http_config(&mut options);
 
         // SessionConfig is `#[non_exhaustive]` — go through the
         // builder, which is the only public path that constructs it.
@@ -356,19 +480,9 @@ pub async fn open_session(options: ConnectionOptions) -> napi::Result<Connection
             result.complex_types_as_json = complex_types_as_json;
             builder = builder.result(result);
         }
-        // `HttpConfig` is `#[non_exhaustive]` — must construct via
-        // `default()` then mutate. The napi binding ALWAYS sets
-        // `pool_max_idle_per_host` so the NodeJS-driver-appropriate
-        // default ([`NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST`] = 100)
-        // applies even when the JS caller doesn't pass `maxConnections`.
-        // The kernel core's `HttpConfig::default()` (10) is intentionally
-        // conservative; each binding chooses its own user-facing default.
-        let mut http = HttpConfig::default();
-        http.pool_max_idle_per_host = options
-            .max_connections
-            .map(|max| max as usize)
-            .unwrap_or(NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST);
-        builder = builder.http(http);
+        // HTTP config (pool sizing + custom headers) was built up-front
+        // by `build_http_config` before the transport fields moved.
+        builder = builder.http(http_config);
         builder = builder.tls(tls_config);
         let session = builder.open().await.map_err(napi_err_from_kernel)?;
         let session_id = session.session_id().to_owned();
@@ -403,7 +517,11 @@ mod tests {
             intervals_as_string: None,
             complex_types_as_json: None,
             check_server_certificate: None,
+            check_server_certificate_hostname: None,
             custom_ca_cert: None,
+            client_cert_pem: None,
+            client_key_pem: None,
+            custom_headers: None,
         }
     }
 
@@ -560,6 +678,68 @@ mod tests {
     }
 
     #[test]
+    fn tls_hostname_check_can_be_disabled_independently() {
+        // Chain validation stays ON; only the hostname check is skipped.
+        // Mirrors the Python connector's `tls_verify_hostname=False`.
+        let mut o = base();
+        o.check_server_certificate_hostname = Some(false);
+        let tls = build_tls_config(&o);
+        assert!(!tls.accept_self_signed, "chain validation must remain on");
+        assert!(
+            tls.skip_hostname_verification,
+            "hostname check must be skipped"
+        );
+    }
+
+    #[test]
+    fn tls_strict_master_explicit_with_hostname_off_and_custom_ca() {
+        // Headline security-matrix cell, both flags explicit: verify the
+        // chain (master = Some(true)) but skip the hostname check
+        // (hostname = Some(false)), pairing with a custom CA — the
+        // realistic "connect to an IP behind a corporate CA" case.
+        const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let mut o = base();
+        o.check_server_certificate = Some(true);
+        o.check_server_certificate_hostname = Some(false);
+        o.custom_ca_cert = Some(PEM.to_vec());
+        let tls = build_tls_config(&o);
+        assert!(
+            !tls.accept_self_signed,
+            "chain validation must remain on (master = true)"
+        );
+        assert!(
+            tls.skip_hostname_verification,
+            "hostname check must be skipped (hostname = false)"
+        );
+        assert_eq!(tls.custom_ca_cert.as_deref(), Some(PEM));
+    }
+
+    #[test]
+    fn tls_hostname_check_on_by_default_and_when_explicit_true() {
+        for hostname in [None, Some(true)] {
+            let mut o = base();
+            o.check_server_certificate_hostname = hostname;
+            let tls = build_tls_config(&o);
+            assert!(!tls.skip_hostname_verification);
+            assert!(!tls.accept_self_signed);
+        }
+    }
+
+    #[test]
+    fn tls_master_off_subsumes_hostname_toggle() {
+        // `check_server_certificate=false` disables everything regardless
+        // of the hostname flag (matches Python `tls_verify=False`).
+        for hostname in [None, Some(true), Some(false)] {
+            let mut o = base();
+            o.check_server_certificate = Some(false);
+            o.check_server_certificate_hostname = hostname;
+            let tls = build_tls_config(&o);
+            assert!(tls.accept_self_signed);
+            assert!(tls.skip_hostname_verification);
+        }
+    }
+
+    #[test]
     fn tls_custom_ca_threads_through_regardless_of_strictness() {
         const PEM: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
         // Custom CA is honoured in both strict and permissive modes.
@@ -570,5 +750,130 @@ mod tests {
             let tls = build_tls_config(&o);
             assert_eq!(tls.custom_ca_cert.as_deref(), Some(PEM));
         }
+    }
+
+    #[test]
+    fn tls_no_mtls_by_default() {
+        let tls = build_tls_config(&base());
+        assert!(tls.client_cert_pem.is_none());
+        assert!(tls.client_key_pem.is_none());
+    }
+
+    #[test]
+    fn tls_mtls_cert_and_key_thread_through() {
+        const CERT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        // Opaque placeholder bytes — `build_tls_config` only threads the key
+        // through, never parses it (the kernel validates the real PEM at
+        // `open`), so the fixture deliberately avoids a real key header.
+        const KEY: &[u8] = b"<client-key-pem-placeholder>";
+        // Honoured regardless of the cert-verification toggle: mTLS is the
+        // *client* identity, orthogonal to *server*-cert strictness.
+        for strict in [None, Some(true), Some(false)] {
+            let mut o = base();
+            o.check_server_certificate = strict;
+            o.client_cert_pem = Some(CERT.to_vec());
+            o.client_key_pem = Some(KEY.to_vec());
+            let tls = build_tls_config(&o);
+            assert_eq!(tls.client_cert_pem.as_deref(), Some(CERT));
+            assert_eq!(tls.client_key_pem.as_deref(), Some(KEY));
+        }
+    }
+
+    #[test]
+    fn tls_partial_mtls_threads_through_for_kernel_to_reject() {
+        // The binding does NOT enforce the both-or-neither rule — it
+        // forwards whatever is set so the kernel can raise the canonical
+        // `InvalidArgument` at `open`. Assert each half threads through
+        // independently (so a caller setting only one isn't silently
+        // dropped before the kernel can complain).
+        const CERT: &[u8] = b"-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----\n";
+        let mut cert_only = base();
+        cert_only.client_cert_pem = Some(CERT.to_vec());
+        let tls = build_tls_config(&cert_only);
+        assert_eq!(tls.client_cert_pem.as_deref(), Some(CERT));
+        assert!(tls.client_key_pem.is_none());
+
+        let mut key_only = base();
+        key_only.client_key_pem = Some(CERT.to_vec());
+        let tls = build_tls_config(&key_only);
+        assert!(tls.client_cert_pem.is_none());
+        assert_eq!(tls.client_key_pem.as_deref(), Some(CERT));
+    }
+
+    #[test]
+    fn http_defaults_pool_and_no_headers() {
+        // Pin the napi-owned default value itself, so a drift in the
+        // constant (or someone "simplifying" it to inherit the kernel's)
+        // fails here. NOTE: this assertion can't catch deletion of the
+        // override line in `build_http_config` on its own, because the
+        // kernel `HttpConfig::default()` is *also* 100 today — the
+        // discriminating test for the override is
+        // `http_max_connections_overrides_pool` (sets a value the kernel
+        // default is not). This test guards the no-`maxConnections` path
+        // and the constant's value.
+        assert_eq!(
+            NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST, 100,
+            "napi pins its own user-facing pool default"
+        );
+        let mut o = base();
+        let http = build_http_config(&mut o);
+        assert_eq!(
+            http.pool_max_idle_per_host,
+            NAPI_DEFAULT_POOL_MAX_IDLE_PER_HOST
+        );
+        assert!(http.custom_headers.is_empty());
+    }
+
+    #[test]
+    fn http_max_connections_overrides_pool() {
+        let mut o = base();
+        o.max_connections = Some(7);
+        let http = build_http_config(&mut o);
+        assert_eq!(http.pool_max_idle_per_host, 7);
+    }
+
+    fn header(name: &str, value: &str) -> HeaderEntry {
+        HeaderEntry {
+            name: name.to_owned(),
+            value: value.to_owned(),
+        }
+    }
+
+    #[test]
+    fn http_custom_headers_thread_through_in_order() {
+        let mut o = base();
+        // Ordered list (mirrors pyo3 / kernel core) — order and duplicates
+        // are preserved verbatim, so assert the exact sequence.
+        o.custom_headers = Some(vec![
+            header("X-Trace", "abc123"),
+            header("X-Env", "prod"),
+            header("User-Agent", "MyApp/1.0"),
+        ]);
+        let http = build_http_config(&mut o);
+        assert_eq!(
+            http.custom_headers,
+            vec![
+                ("X-Trace".to_owned(), "abc123".to_owned()),
+                ("X-Env".to_owned(), "prod".to_owned()),
+                ("User-Agent".to_owned(), "MyApp/1.0".to_owned()),
+            ]
+        );
+        // The list was moved out of `options` (taken), not cloned.
+        assert!(o.custom_headers.is_none());
+    }
+
+    #[test]
+    fn http_custom_headers_preserve_duplicate_names() {
+        // Duplicate header names survive (a `HashMap` would have collapsed
+        // them) — the kernel emits each and folds the last User-Agent.
+        let mut o = base();
+        o.custom_headers = Some(vec![
+            header("User-Agent", "Caller/1.0"),
+            header("User-Agent", "Connector/2.0"),
+        ]);
+        let http = build_http_config(&mut o);
+        assert_eq!(http.custom_headers.len(), 2);
+        assert_eq!(http.custom_headers[0].1, "Caller/1.0");
+        assert_eq!(http.custom_headers[1].1, "Connector/2.0");
     }
 }

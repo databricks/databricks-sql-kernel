@@ -209,10 +209,15 @@ pub struct LikePattern<'a>(&'a str);
 impl<'a> LikePattern<'a> {
     /// Construct from a borrowed pattern.
     ///
+    /// Accepts the **empty string**: it compiles to `LIKE ''`, which matches
+    /// only the empty name — i.e. "match nothing", mirroring the Thrift/JDBC
+    /// convention where an empty `tableNamePattern` (etc.) returns zero rows.
+    /// `None` remains the canonical "match all" intent; empty `""` is the
+    /// distinct "match nothing", so both are kept.
+    ///
     /// Rejects:
-    /// - Empty string — callers should pass `None` for "match all".
-    /// - Strings consisting only of whitespace — callers should pass
-    ///   `None` for "match all".
+    /// - Non-empty **whitespace-only** strings — almost always a caller
+    ///   mistake; pass `None` for "match all".
     /// - Embedded NUL bytes — same FFI-truncation hazard as
     ///   [`Identifier::new`].
     /// - Strings exceeding 255 bytes.
@@ -221,11 +226,14 @@ impl<'a> LikePattern<'a> {
     /// responsibility per ODBC convention; the kernel does not
     /// interpret the pattern beyond passing it to the SQL builder.
     pub fn new(s: &'a str) -> Result<Self> {
-        if s.is_empty() {
-            return Err(Error::invalid_argument()
-                .message("LIKE pattern must not be empty (pass None for \"match all\")"));
-        }
-        if s.trim().is_empty() {
+        // An empty string is a valid LIKE pattern: it compiles to `LIKE ''`,
+        // which matches only the empty name — i.e. "match nothing". This
+        // mirrors the Thrift/JDBC convention where an empty tableNamePattern
+        // (etc.) returns zero rows. `None` remains the canonical "match all"
+        // intent; empty `""` is distinct (match-nothing), so both are kept.
+        // Non-empty whitespace-only patterns are still rejected as a likely
+        // caller mistake (use `None` for match-all).
+        if !s.is_empty() && s.trim().is_empty() {
             return Err(Error::invalid_argument()
                 .message("LIKE pattern must not be all whitespace (pass None for \"match all\")"));
         }
@@ -717,10 +725,12 @@ mod tests {
     }
 
     #[test]
-    fn like_pattern_rejects_empty() {
-        let err = LikePattern::new("").expect_err("empty pattern rejected");
-        assert_eq!(err.code, ErrorCode::InvalidArgument);
-        assert!(err.message.contains("None"), "{}", err.message);
+    fn like_pattern_accepts_empty() {
+        // Empty pattern is valid → `LIKE ''` (match-nothing), matching the
+        // Thrift/JDBC empty-pattern convention. Non-empty whitespace-only is
+        // still rejected (see like_pattern_rejects_whitespace_only).
+        let p = LikePattern::new("").expect("empty pattern accepted");
+        assert_eq!(p.as_str(), "");
     }
 
     #[test]
