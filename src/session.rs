@@ -65,9 +65,7 @@ use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::mutable::Statement;
-use crate::statement::validity::ValidityFlag;
 use std::collections::HashMap;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info_span, Instrument, Span};
@@ -373,10 +371,12 @@ impl Session {
     /// [`status`] surfaces the real server state.
     ///
     /// The returned handle is standalone and **non-owning**: its
-    /// [`ValidityFlag`] is fresh (not shared with any parent
-    /// `Statement`, since there is none), and it does **not** close the
-    /// server statement on `Drop` or via [`close`] — attach is a
-    /// read-only adopt. The statement's lifecycle stays with whatever
+    /// validity flag is fresh (not shared with any parent `Statement`,
+    /// since there is none), and it does **not** close the server
+    /// statement on `Drop` or via [`close`], does **not** cancel it on a
+    /// dropped `await_result()` poll, and its [`cancel`] errors — attach
+    /// is a read-only adopt. The statement's lifecycle stays with
+    /// whatever
     /// submitted it (or an explicit `close_statement`); a transient
     /// handle a poller creates and drops must not tear it down. (This is
     /// what lets `get_query_state` re-attach on every poll without the
@@ -384,6 +384,7 @@ impl Session {
     ///
     /// [`status`]: ExecutedAsyncStatement::status
     /// [`close`]: ExecutedAsyncStatement::close
+    /// [`cancel`]: ExecutedAsyncStatement::cancel
     /// [`ErrorCode::NotFound`]: crate::kernel_error::ErrorCode::NotFound
     pub async fn attach_async_statement(
         &self,
@@ -395,32 +396,27 @@ impl Session {
             // Seed initial_status from the wire — the same RPC
             // `ExecutedAsyncStatement::status` makes. Surfaces NotFound
             // here (rather than on the caller's first poll) for an
-            // unknown/expired id.
+            // unknown/expired id. Stamp the statement id onto the error
+            // (mirrors `terminal_outcome`, which sets query_id on every
+            // error it builds) so callers can correlate which id was not
+            // found.
             let response = self
                 .inner
                 .transport()
                 .statement_status(&statement_id)
-                .await?;
-            Ok(ExecutedAsyncStatement::new(
+                .await
+                .map_err(|e| e.with_query_id(&statement_id))?;
+            // NON-OWNING read-only adopt: `new_attached` gives the handle
+            // a fresh standalone `ValidityFlag`, `closed=true` (so `Drop`
+            // / `close()` never fire `close_statement`), and
+            // `owning=false` (so `await_result` doesn't arm the
+            // drop-cancel guard and `cancel()` errors). The statement's
+            // lifecycle stays with whoever submitted it; a poller that
+            // re-attaches each tick can't tear down the statement it's
+            // watching.
+            Ok(ExecutedAsyncStatement::new_attached(
                 Arc::clone(&self.inner),
                 statement_id,
-                // Standalone handle: no parent Statement to share the
-                // flag with, so a re-execute elsewhere can't invalidate
-                // it. Starts valid.
-                ValidityFlag::new(),
-                // NON-OWNING: start `closed=true` so this handle never
-                // closes the server statement — neither on `Drop` (its
-                // `swap(true)` sees already-closed and skips the
-                // fire-and-forget `close_statement`) nor via an explicit
-                // `close()` (which short-circuits on the flag). Attach is
-                // a *read-only adopt*: the statement's lifecycle is owned
-                // by whatever submitted it (or by an explicit
-                // `close_statement`), NOT by a transient handle a poller
-                // creates and drops. Without this, every `status()` poll
-                // through a fresh attached handle would close the very
-                // statement it's polling on Drop — turning a poll loop
-                // into a self-close.
-                Arc::new(AtomicBool::new(true)),
                 response.status,
             ))
         }
