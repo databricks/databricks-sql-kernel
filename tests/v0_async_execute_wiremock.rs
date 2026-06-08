@@ -1118,3 +1118,94 @@ async fn attached_handle_drop_does_not_close_statement() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     // `_no_close` verifies expect(0) when it drops at end of scope.
 }
+
+#[tokio::test]
+async fn attached_handle_await_result_drop_does_not_cancel_statement() {
+    // P1: an attached (non-owning) handle must NOT fire cancel_statement
+    // when its await_result() future is dropped mid-poll. The owning
+    // submit path *does* (await_result_drop_fires_cancel_statement pins
+    // that); attach is a read-only adopt, so a passive observer wrapping
+    // await_result() in a timeout must never cancel the owner's query.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    // Server stays RUNNING forever so await_result() loops until dropped.
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-attach-noclancel"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(running_body("stmt-attach-noclancel")),
+        )
+        .mount(&server)
+        .await;
+    // Scoped expectation: ZERO cancels on this statement.
+    let _no_cancel = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-attach-noclancel/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let async_exec = session
+        .attach_async_statement("stmt-attach-noclancel")
+        .await
+        .expect("attach");
+
+    // Drop the await_result future via timeout.
+    let outcome = tokio::time::timeout(
+        std::time::Duration::from_millis(150),
+        async_exec.await_result(),
+    )
+    .await;
+    assert!(outcome.is_err(), "timeout should fire");
+
+    // Give any (erroneously) spawned cancel a chance to hit the wire
+    // before the scoped mock verifies expect(0) on drop.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // `_no_cancel` verifies expect(0) when it drops at end of scope.
+}
+
+#[tokio::test]
+async fn attached_handle_cancel_errors() {
+    // P1: cancel() on an attached (read-only) handle must refuse rather
+    // than terminate a statement it doesn't own. No cancel reaches the
+    // server.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_status_once(
+        &server,
+        "stmt-attach-cancel",
+        running_body("stmt-attach-cancel"),
+    )
+    .await;
+    let _no_cancel = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-attach-cancel/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let async_exec = session
+        .attach_async_statement("stmt-attach-cancel")
+        .await
+        .expect("attach");
+
+    let err = async_exec
+        .cancel()
+        .await
+        .expect_err("cancel() on an attached handle must error");
+    assert_eq!(err.code, ErrorCode::InvalidArgument, "got: {err:?}");
+
+    // Same for a canceller derived from the attached handle.
+    let canceller = async_exec.canceller();
+    let cerr = canceller
+        .cancel()
+        .await
+        .expect_err("canceller from an attached handle must error");
+    assert_eq!(cerr.code, ErrorCode::InvalidArgument, "got: {cerr:?}");
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}

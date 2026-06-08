@@ -53,32 +53,47 @@ fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error
     struct ErrorWrapper {
         error: ServiceError,
     }
-    // Try the bare envelope first, then the `{"error": ...}` wrapper.
-    let svc: Option<ServiceError> = serde_json::from_str::<ServiceError>(body)
+    // Parse the body once into a `Value`, then try both envelope shapes
+    // off it (bare `ServiceError`, then the `{"error": ...}` wrapper) —
+    // avoids re-walking the raw string twice.
+    let svc: Option<ServiceError> = serde_json::from_str::<serde_json::Value>(body)
         .ok()
-        .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
-        .or_else(|| {
-            serde_json::from_str::<ErrorWrapper>(body)
+        .and_then(|v| {
+            serde_json::from_value::<ServiceError>(v.clone())
                 .ok()
-                .map(|w| w.error)
+                .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
+                .or_else(|| {
+                    serde_json::from_value::<ErrorWrapper>(v)
+                        .ok()
+                        .map(|w| w.error)
+                })
         });
 
     let mut err = Error::from_http_status(status);
     match svc {
         Some(svc) => {
-            // Prefer the server's structured message; keep the caller
-            // context as a prefix for continuity with existing logs.
-            let msg = svc.message.as_deref().unwrap_or(body);
+            let error_code = svc.error_code.as_deref().filter(|s| !s.is_empty());
+            // Prefer the server's structured message. If it's absent but
+            // an error_code is present, synthesize a readable message
+            // rather than folding the raw JSON body in. Only fall back to
+            // the raw body when neither is available.
+            let msg = match (svc.message.as_deref(), error_code) {
+                (Some(m), _) => m.to_string(),
+                (None, Some(ec)) => format!("server returned error_code {ec}"),
+                (None, None) => body.to_string(),
+            };
             err = err.message(format!("{context}: {msg}"));
-            if let Some(ec) = svc.error_code.as_deref().filter(|s| !s.is_empty()) {
+            if let Some(ec) = error_code {
                 err = err.with_error_code(ec);
             }
-            // SQL state: explicit field, else the "SQLSTATE: XXXXX"
-            // pattern in the message — same precedence as terminal_outcome.
+            // SQL state: explicit field (must be the canonical 5-char
+            // shape — same predicate as terminal_outcome, so we don't
+            // surface junk like "X" or "garbage"), else the
+            // "SQLSTATE: XXXXX" pattern in the message.
             let sql_state = svc
                 .sql_state
-                .filter(|s| !s.is_empty())
-                .or_else(|| crate::kernel_error::extract_sqlstate_from_message(msg));
+                .filter(|s| s.len() == 5)
+                .or_else(|| crate::kernel_error::extract_sqlstate_from_message(&msg));
             if let Some(s) = sql_state {
                 err = err.with_sql_state(s);
             }

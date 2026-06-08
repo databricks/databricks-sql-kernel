@@ -187,6 +187,23 @@ pub struct ExecutedAsyncStatement {
     /// short-circuited) `close()`. Tells `Drop` to skip its
     /// fire-and-forget cleanup.
     closed: Arc<AtomicBool>,
+    /// Whether this handle *owns* the server statement's lifecycle.
+    ///
+    /// `true` for handles produced by [`Statement::submit`] (the
+    /// submitting handle): they may close the statement on `Drop` /
+    /// `close()`, cancel it on a dropped `await_result()` poll (the
+    /// drop-cancel DBU-safety guard), and `cancel()` actively
+    /// terminates it.
+    ///
+    /// `false` for handles produced by
+    /// [`Session::attach_async_statement`](crate::Session::attach_async_statement)
+    /// — a *read-only adopt* of a statement someone else owns. A
+    /// non-owning handle must never tear the statement down out from
+    /// under its owner: it does not arm the `await_result` drop-cancel
+    /// guard, and `cancel()` returns an error instead of firing a
+    /// server-side cancel. (`Drop` / `close()` are already inert on
+    /// attached handles via `closed=true`.)
+    owning: bool,
     /// Last SEA `StatementStatus` observed by this handle (initial
     /// `submit_statement` response or any subsequent `status()` /
     /// `await_result` poll). Read by the `num_modified_rows()` /
@@ -236,6 +253,40 @@ impl ExecutedAsyncStatement {
             statement_id,
             valid,
             closed,
+            // The submitting handle owns the statement lifecycle.
+            owning: true,
+            latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+        }
+    }
+
+    /// Crate-internal constructor for a **non-owning** (read-only
+    /// adopt) handle, built by
+    /// [`Session::attach_async_statement`](crate::Session::attach_async_statement).
+    ///
+    /// The handle observes a statement someone else owns, so it must
+    /// never tear it down:
+    /// - `valid` is a fresh standalone [`ValidityFlag`] — no parent
+    ///   `Statement` to share with, so a re-execute elsewhere can't
+    ///   invalidate it.
+    /// - `closed` starts `true` so `Drop` and `close()` are inert (they
+    ///   never fire `close_statement`).
+    /// - `owning` is `false` so `await_result()` does not arm the
+    ///   drop-cancel guard and `cancel()` errors instead of firing a
+    ///   server-side cancel.
+    ///
+    /// `initial_status` is seeded from the `GetStatementStatus` the
+    /// attach path already issued.
+    pub(crate) fn new_attached(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        initial_status: crate::types::sea::StatementStatus,
+    ) -> Self {
+        Self {
+            session,
+            statement_id,
+            valid: ValidityFlag::new(),
+            closed: Arc::new(AtomicBool::new(true)),
+            owning: false,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
         }
     }
@@ -379,8 +430,21 @@ impl ExecutedAsyncStatement {
             // best-effort `cancel_statement` so the server stops
             // charging DBUs on a now-orphaned query. Defused once we
             // reach a terminal state on the success or error path.
-            let cancel_guard =
-                AwaitResultCancelGuard::new(Arc::clone(&self.session), self.statement_id.clone());
+            //
+            // ONLY for owning handles. A non-owning (attached) handle is
+            // a read-only adopt of a statement someone else owns —
+            // dropping its `await_result()` mid-poll (e.g. a passive
+            // observer wrapping it in a `tokio::time::timeout`) must NOT
+            // cancel the owner's statement. Leaving the guard `None`
+            // makes the drop a true no-op.
+            let mut cancel_guard = if self.owning {
+                Some(AwaitResultCancelGuard::new(
+                    Arc::clone(&self.session),
+                    self.statement_id.clone(),
+                ))
+            } else {
+                None
+            };
 
             loop {
                 self.valid.check()?;
@@ -395,17 +459,23 @@ impl ExecutedAsyncStatement {
                 self.record_latest_status(response.status.clone());
                 match StatementStatus::from_sea_response(&response) {
                     StatementStatus::Succeeded | StatementStatus::Closed => {
-                        cancel_guard.defuse();
+                        if let Some(g) = cancel_guard.take() {
+                            g.defuse();
+                        }
                         return self.materialise_result().await;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
                         // need to fire a redundant cancel.
-                        cancel_guard.defuse();
+                        if let Some(g) = cancel_guard.take() {
+                            g.defuse();
+                        }
                         return Err(e);
                     }
                     StatementStatus::Cancelled => {
-                        cancel_guard.defuse();
+                        if let Some(g) = cancel_guard.take() {
+                            g.defuse();
+                        }
                         // Carry the SEA extended status fields onto
                         // the returned Error — mirrors the sync
                         // `terminal_outcome::Canceled` arm so the
@@ -579,6 +649,17 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
     async fn cancel(&self) -> Result<()> {
         async {
             self.valid.check()?;
+            // A non-owning (attached) handle must not cancel a statement
+            // it merely adopted to observe — that would terminate the
+            // owner's query. Refuse rather than silently firing the
+            // server-side cancel.
+            if !self.owning {
+                return Err(Error::invalid_state().message(
+                    "cancel() is not permitted on an attached (read-only) \
+                     ExecutedAsyncStatement; the statement is owned by whoever \
+                     submitted it",
+                ));
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -644,6 +725,11 @@ impl ExecutedAsyncStatement {
             session: Arc::clone(&self.session),
             statement_id: self.statement_id.clone(),
             valid: self.valid.clone(),
+            // Inherit ownership: a canceller derived from an attached
+            // (read-only) handle must not cancel the owner's statement
+            // either — otherwise the footgun just moves to the detached
+            // canceller.
+            owning: self.owning,
         }
     }
 }
@@ -663,6 +749,11 @@ pub struct AsyncStatementCanceller {
     session: Arc<SessionInner>,
     statement_id: String,
     valid: ValidityFlag,
+    /// Inherited from the producing handle — `false` for a canceller
+    /// derived from an attached (read-only) handle, which must not
+    /// cancel a statement it doesn't own. See
+    /// [`ExecutedAsyncStatement::owning`].
+    owning: bool,
 }
 
 impl AsyncStatementCanceller {
@@ -679,6 +770,13 @@ impl AsyncStatementCanceller {
     pub async fn cancel(&self) -> Result<()> {
         async {
             self.valid.check()?;
+            if !self.owning {
+                return Err(Error::invalid_state().message(
+                    "cancel() is not permitted on a canceller derived from an \
+                     attached (read-only) ExecutedAsyncStatement; the statement \
+                     is owned by whoever submitted it",
+                ));
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
