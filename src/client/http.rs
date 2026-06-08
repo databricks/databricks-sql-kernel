@@ -28,11 +28,69 @@ use crate::client::retry::{
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
+use crate::types::sea::ServiceError;
 use reqwest::{Client, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
+
+/// Build an `Error` for a transport-level non-2xx HTTP response, parsing
+/// the SEA error envelope out of the response body when present.
+///
+/// The SEA REST API returns a JSON error body — either a bare
+/// `{"error_code", "message", "sql_state"}` ([`ServiceError`]) or a
+/// `{"error": {...}}` wrapper. Mirrors the statement-level path
+/// (`sea.rs terminal_outcome`) so transport-level failures surface the
+/// structured `error_code` / `sql_state` instead of only the raw body
+/// stuffed into the message. Falls back to `context` (the raw body) as
+/// the message when the body isn't a recognised envelope.
+///
+/// `context` is a caller-supplied prefix (e.g. "HTTP 400" / retry-timeout
+/// detail) folded into the message so existing diagnostics are preserved.
+fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error {
+    #[derive(serde::Deserialize)]
+    struct ErrorWrapper {
+        error: ServiceError,
+    }
+    // Try the bare envelope first, then the `{"error": ...}` wrapper.
+    let svc: Option<ServiceError> = serde_json::from_str::<ServiceError>(body)
+        .ok()
+        .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
+        .or_else(|| {
+            serde_json::from_str::<ErrorWrapper>(body)
+                .ok()
+                .map(|w| w.error)
+        });
+
+    let mut err = Error::from_http_status(status);
+    match svc {
+        Some(svc) => {
+            // Prefer the server's structured message; keep the caller
+            // context as a prefix for continuity with existing logs.
+            let msg = svc.message.as_deref().unwrap_or(body);
+            err = err.message(format!("{context}: {msg}"));
+            if let Some(ec) = svc.error_code.as_deref().filter(|s| !s.is_empty()) {
+                err = err.with_error_code(ec);
+            }
+            // SQL state: explicit field, else the "SQLSTATE: XXXXX"
+            // pattern in the message — same precedence as terminal_outcome.
+            let sql_state = svc
+                .sql_state
+                .filter(|s| !s.is_empty())
+                .or_else(|| crate::kernel_error::extract_sqlstate_from_message(msg));
+            if let Some(s) = sql_state {
+                err = err.with_sql_state(s);
+            }
+        }
+        None => {
+            // Not a recognised envelope — preserve today's behavior
+            // (raw body folded into the message).
+            err = err.message(format!("{context}: {body}"));
+        }
+    }
+    err
+}
 
 /// Configuration for HTTP proxy.
 ///
@@ -781,13 +839,16 @@ impl DatabricksHttpClient {
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
-                            return Err(Error::from_http_status(status.as_u16()).message(format!(
-                                "HTTP {} — retry timeout exceeded after {} attempts ({:.1}s): {}",
+                            return Err(http_error(
                                 status.as_u16(),
-                                attempts,
-                                elapsed.as_secs_f64(),
-                                error_body
-                            )));
+                                &error_body,
+                                format_args!(
+                                    "HTTP {} — retry timeout exceeded after {} attempts ({:.1}s)",
+                                    status.as_u16(),
+                                    attempts,
+                                    elapsed.as_secs_f64()
+                                ),
+                            ));
                         }
 
                         last_error = Some(format!("HTTP {}", status.as_u16()));
@@ -812,11 +873,11 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         status.as_u16()
                     );
-                    return Err(Error::from_http_status(status.as_u16()).message(format!(
-                        "HTTP {} - {}",
+                    return Err(http_error(
                         status.as_u16(),
-                        error_body
-                    )));
+                        &error_body,
+                        format_args!("HTTP {}", status.as_u16()),
+                    ));
                 }
                 Err(e) => {
                     if strategy.is_retryable_error(&e) && attempts < max_attempts {
@@ -1595,6 +1656,68 @@ lGrv15pBcePj
             assert!(result.is_err());
             // 400 is non-retryable — only 1 attempt
             assert_eq!(attempt_count.load(Ordering::SeqCst), 1);
+        }
+
+        #[tokio::test]
+        async fn test_http_error_parses_sea_error_envelope() {
+            // A transport-level 4xx whose body is the SEA error envelope
+            // must surface the structured error_code / sql_state on the
+            // returned Error (not just the raw body in the message),
+            // mirroring the statement-level terminal_outcome path.
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/test"))
+                .respond_with(ResponseTemplate::new(400).set_body_string(
+                    r#"{"error_code":"BAD_REQUEST","message":"bad thing happened","sql_state":"42000"}"#,
+                ))
+                .mount(&mock_server)
+                .await;
+
+            let client = test_client(&mock_server, fast_retry_config(3));
+            let request = client
+                .inner()
+                .get(format!("{}/test", mock_server.uri()))
+                .build()
+                .unwrap();
+            let err = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect_err("400 must error");
+
+            assert_eq!(err.error_code.as_deref(), Some("BAD_REQUEST"));
+            assert_eq!(err.sql_state.as_deref(), Some("42000"));
+            // The structured server message is folded into the message.
+            assert!(
+                err.message.contains("bad thing happened"),
+                "message should carry the server text, got: {}",
+                err.message
+            );
+        }
+
+        #[tokio::test]
+        async fn test_http_error_non_envelope_body_falls_back_to_raw() {
+            // A non-JSON body keeps today's behavior: raw body in the
+            // message, no structured error_code/sql_state.
+            let mock_server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/test"))
+                .respond_with(ResponseTemplate::new(400).set_body_string("plain text error"))
+                .mount(&mock_server)
+                .await;
+
+            let client = test_client(&mock_server, fast_retry_config(3));
+            let request = client
+                .inner()
+                .get(format!("{}/test", mock_server.uri()))
+                .build()
+                .unwrap();
+            let err = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect_err("400 must error");
+
+            assert!(err.error_code.is_none());
+            assert!(err.message.contains("plain text error"));
         }
 
         #[tokio::test]

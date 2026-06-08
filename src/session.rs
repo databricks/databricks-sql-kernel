@@ -63,8 +63,11 @@ use crate::kernel_error::{Error, Result};
 use crate::klog::debug;
 use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
+use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::mutable::Statement;
+use crate::statement::validity::ValidityFlag;
 use std::collections::HashMap;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::{info_span, Instrument, Span};
@@ -339,6 +342,90 @@ impl Session {
     /// Metadata operations — flat, per-method (ODBC-shaped).
     pub fn metadata(&self) -> Metadata {
         Metadata::new(Arc::clone(&self.inner))
+    }
+
+    /// Adopt an already-submitted server statement by its id, producing
+    /// an [`ExecutedAsyncStatement`] that can poll [`status`] / await
+    /// results / cancel — without having been the handle that submitted
+    /// it.
+    ///
+    /// This is the resume path: a caller (or a different process) that
+    /// holds only the statement id can re-attach and drive it to
+    /// completion, fetch its result, or read its terminal state. Server
+    /// statement state is keyed solely by the id — every
+    /// `GetStatementStatus` / `GetStatementResult` / cancel / close RPC
+    /// takes just the id — so the only thing the originating handle
+    /// carried that a bare id does not is *this session's* transport
+    /// (auth, retry, poll cadence). Binding the id to this session is
+    /// exactly what `attach` does.
+    ///
+    /// Issues a single `GetStatementStatus` to seed the handle's initial
+    /// status (mirrors how `submit` seeds it from the submit response),
+    /// so the extended-status accessors return useful values before the
+    /// caller drives a poll. **Errors with [`ErrorCode::NotFound`] if
+    /// the server doesn't recognise the id** (never submitted, or its
+    /// result TTL elapsed and the server garbage-collected it) — the SEA
+    /// server returns `404 NOT_FOUND` for an unknown-but-well-formed id,
+    /// which the transport maps to `NotFound`. A *closed* statement is
+    /// **not** an error: the server keeps reporting `CLOSED` (and a
+    /// terminal `SUCCEEDED`/`FAILED` statement keeps reporting that
+    /// state, with its result) until GC, so `attach` succeeds and
+    /// [`status`] surfaces the real server state.
+    ///
+    /// The returned handle is standalone and **non-owning**: its
+    /// [`ValidityFlag`] is fresh (not shared with any parent
+    /// `Statement`, since there is none), and it does **not** close the
+    /// server statement on `Drop` or via [`close`] — attach is a
+    /// read-only adopt. The statement's lifecycle stays with whatever
+    /// submitted it (or an explicit `close_statement`); a transient
+    /// handle a poller creates and drops must not tear it down. (This is
+    /// what lets `get_query_state` re-attach on every poll without the
+    /// poll loop closing the statement it's watching.)
+    ///
+    /// [`status`]: ExecutedAsyncStatement::status
+    /// [`close`]: ExecutedAsyncStatement::close
+    /// [`ErrorCode::NotFound`]: crate::kernel_error::ErrorCode::NotFound
+    pub async fn attach_async_statement(
+        &self,
+        statement_id: impl Into<String>,
+    ) -> Result<ExecutedAsyncStatement> {
+        let statement_id = statement_id.into();
+        let span = self.inner.log_span().clone();
+        async {
+            // Seed initial_status from the wire — the same RPC
+            // `ExecutedAsyncStatement::status` makes. Surfaces NotFound
+            // here (rather than on the caller's first poll) for an
+            // unknown/expired id.
+            let response = self
+                .inner
+                .transport()
+                .statement_status(&statement_id)
+                .await?;
+            Ok(ExecutedAsyncStatement::new(
+                Arc::clone(&self.inner),
+                statement_id,
+                // Standalone handle: no parent Statement to share the
+                // flag with, so a re-execute elsewhere can't invalidate
+                // it. Starts valid.
+                ValidityFlag::new(),
+                // NON-OWNING: start `closed=true` so this handle never
+                // closes the server statement — neither on `Drop` (its
+                // `swap(true)` sees already-closed and skips the
+                // fire-and-forget `close_statement`) nor via an explicit
+                // `close()` (which short-circuits on the flag). Attach is
+                // a *read-only adopt*: the statement's lifecycle is owned
+                // by whatever submitted it (or by an explicit
+                // `close_statement`), NOT by a transient handle a poller
+                // creates and drops. Without this, every `status()` poll
+                // through a fresh attached handle would close the very
+                // statement it's polling on Drop — turning a poll loop
+                // into a self-close.
+                Arc::new(AtomicBool::new(true)),
+                response.status,
+            ))
+        }
+        .instrument(span)
+        .await
     }
 
     /// Server-issued session identifier. Stable for the life of the
