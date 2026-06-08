@@ -284,7 +284,10 @@ impl SeaRestTransport {
         // Decode the inline count via a throwaway reader; this is independent of
         // any later fetch the caller makes (a fresh GetStatement builds its own
         // reader), so result consumption is unaffected.
-        let reader = match factory.create_reader(&response.statement_id, response).await {
+        let reader = match factory
+            .create_reader(&response.statement_id, response)
+            .await
+        {
             Ok(r) => r,
             Err(_) => return,
         };
@@ -292,7 +295,8 @@ impl SeaRestTransport {
             Ok(s) => s,
             Err(_) => return,
         };
-        if let Ok(Some(n)) = crate::statement::dml_count::read_dml_affected_rows(&mut stream).await {
+        if let Ok(Some(n)) = crate::statement::dml_count::read_dml_affected_rows(&mut stream).await
+        {
             response.status.num_modified_rows = Some(n);
         }
     }
