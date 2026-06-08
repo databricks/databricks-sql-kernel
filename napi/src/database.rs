@@ -81,7 +81,7 @@ const NODE_OAUTH_CLIENT_ID: &str = "databricks-sql-connector";
 
 /// Authentication mode selector crossing the napi boundary. The string
 /// literals are what napi-rs emits from this `#[napi(string_enum)]` — the
-/// NodeJS SEA adapter (`SeaAuth`) matches them verbatim (`'Pat'`,
+/// NodeJS SEA adapter (`KernelAuth`) matches them verbatim (`'Pat'`,
 /// `'OAuthM2m'`, `'OAuthU2m'`).
 ///
 /// Mirrors the kernel [`AuthConfig`] variants this binding supports.

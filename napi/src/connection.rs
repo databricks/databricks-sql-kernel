@@ -69,7 +69,7 @@ use crate::util::guarded;
 /// byte-identical Thrift parity, the JS adapter pre-serialises via
 /// `serializeQueryTags` and writes the result into
 /// `statementConf["query_tags"]` directly — see
-/// `SeaSessionBackend.executeStatement` in the NodeJS driver. This
+/// `KernelSessionBackend.executeStatement` in the NodeJS driver. This
 /// path is the one the production code uses.
 #[allow(
     dead_code,
