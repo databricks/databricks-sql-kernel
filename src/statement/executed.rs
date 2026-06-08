@@ -178,9 +178,9 @@ impl ExecutedStatement {
     /// MERGE). Absent for SELECT and on warehouses that don't surface
     /// the counter.
     ///
-    /// Reachable only on the `Succeeded` / `Closed-with-inline-data`
-    /// paths — the kernel returns `Err` (no `ExecutedStatement`) on
-    /// `Failed` / `Cancelled` / `Closed-no-data`.
+    /// Reachable on the `Succeeded` / `Closed` paths — the kernel returns
+    /// `Err` (no `ExecutedStatement`) on `Failed` / `Cancelled`. (A `Closed`
+    /// response with no result data is a valid empty result, not an error.)
     pub fn num_modified_rows(&self) -> Option<i64> {
         self.status.num_modified_rows
     }
@@ -202,11 +202,10 @@ impl ExecutedStatement {
     /// `error.message` that the kernel folds into `Error::sql_error()`
     /// on the `Failed` path.
     ///
-    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
-    /// only. Failed / Cancelled / Closed-no-data return `Err` before
-    /// the `ExecutedStatement` is constructed, so cancellation-reason
-    /// messages from those paths are NOT reachable here — they flow
-    /// through the `Error` instead.
+    /// **Reachability:** populated on `Succeeded` / `Closed` (incl. an empty
+    /// `Closed`). Failed / Cancelled return `Err` before the `ExecutedStatement`
+    /// is constructed, so cancellation-reason messages from those paths are NOT
+    /// reachable here — they flow through the `Error` instead.
     ///
     /// **PII / sensitive-data note:** server-supplied free-form text
     /// may include SQL fragments or parameter values. Redact before
@@ -219,7 +218,7 @@ impl ExecutedStatement {
     /// frames or operator context. Intended for log / support
     /// surfaces; not user-facing.
     ///
-    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
+    /// **Reachability:** populated on `Succeeded` / `Closed`
     /// only — same caveat as [`Self::display_message`].
     ///
     /// **PII / sensitive-data note:** like `display_message`, this is
@@ -233,7 +232,7 @@ impl ExecutedStatement {
     /// Pass-through string — wrappers parse if they need structured
     /// access.
     ///
-    /// **Reachability:** populated on `Succeeded` / `Closed-with-inline-data`
+    /// **Reachability:** populated on `Succeeded` / `Closed`
     /// only. The corresponding details for Failed statements flow
     /// through the returned `Error`, not this accessor.
     ///

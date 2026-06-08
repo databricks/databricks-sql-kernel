@@ -1,0 +1,26 @@
+==============================================================================
+Databricks SQL Kernel — Node.js binding Release Notes
+==============================================================================
+
+These release notes summarize enhancements, new features, known issues,
+and version history for the Node.js binding published to npm as
+`@databricks/databricks-sql-kernel` (built from this directory via napi-rs).
+
+The Rust crate and Python (pyo3) bindings ship on independent cadences;
+their release notes live at `../release-notes.txt` and
+`../pyo3/release-notes.txt`.
+
+Version History ==============================================================
+
+0.1.2 ========================================================================
+Released 2026-06-06
+
+Initial public release of the Node.js binding.
+
+Enhancements & New Features
+
+ * Node.js (napi) bindings published to npm as
+   `@databricks/databricks-sql-kernel` — an umbrella loader package plus
+   per-platform native packages for Linux gnu/musl (x64/arm64), macOS
+   (x64/arm64), and Windows (x64/arm64).
+ * napi-rs based bridge over the Rust kernel's async public API.

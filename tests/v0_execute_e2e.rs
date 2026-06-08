@@ -23,8 +23,8 @@
 //! ```
 
 use databricks_sql_kernel::{
-    AuthConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig, ResultStream,
-    Session, TypedValue,
+    AuthConfig, DirectStatement, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig,
+    ResultStream, Session, TypedValue,
 };
 use std::env;
 
@@ -97,6 +97,141 @@ async fn select_with_positional_params() {
     assert_eq!(row.get_str(1).unwrap(), Some("hello"));
     assert_eq!(row.get_bool(2).unwrap(), Some(true));
     exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+// -------------------------------------------------------------------------
+// directResults (`execute_direct`) — the Thrift/JDBC model.
+//
+// `execute_direct()` POSTs with the server inline wait and returns WITHOUT an
+// internal poll loop: `DirectStatement::Completed` (terminal, result inline)
+// for a query that finishes within the wait, or `DirectStatement::Running`
+// (a live poll/cancel handle) for one that does not. These exercise each arm
+// against a live warehouse (the usage coverage requested on PR #140).
+// -------------------------------------------------------------------------
+
+/// Completed arm: a fast query finishes within the inline wait and comes back
+/// with its result materialised inline (no extra fetch round-trip), just like
+/// `execute()`'s fast path.
+#[tokio::test]
+#[ignore]
+async fn execute_direct_completed_returns_inline_result() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    match stmt
+        .execute_direct()
+        .await
+        .expect("execute_direct SELECT 1")
+    {
+        DirectStatement::Completed(mut exec) => {
+            assert_eq!(
+                drain_rows(exec.result_stream_mut()).await,
+                1,
+                "one row inline"
+            );
+            exec.close().await.expect("close");
+        }
+        DirectStatement::Running(_) => panic!("a trivial query must return Completed, not Running"),
+    }
+    session.close().await.expect("session close");
+}
+
+/// Empty / CLOSED-no-data: a 0-row query the server auto-closes is a valid
+/// EMPTY result set, not an error (JDBC parity — see the `terminal_outcome`
+/// CLOSED change).
+#[tokio::test]
+#[ignore]
+async fn execute_direct_empty_result_is_not_an_error() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n WHERE 1 = 0");
+    match stmt.execute_direct().await.expect("execute_direct empty") {
+        DirectStatement::Completed(mut exec) => {
+            assert_eq!(
+                drain_rows(exec.result_stream_mut()).await,
+                0,
+                "empty result, no error"
+            );
+            exec.close().await.expect("close");
+        }
+        DirectStatement::Running(_) => panic!("a trivial query must return Completed"),
+    }
+    session.close().await.expect("session close");
+}
+
+/// Inline failure surfaces EAGERLY as `Err` from `execute_direct` (not deferred
+/// to a later fetch), matching Python `use_kernel`.
+#[tokio::test]
+#[ignore]
+async fn execute_direct_inline_failure_surfaces_eagerly() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT * FROM definitely_no_such_table_xyz123");
+    match stmt.execute_direct().await {
+        Ok(_) => panic!("analysis error must surface eagerly from execute_direct, got Ok"),
+        Err(err) => assert_eq!(err.code, ErrorCode::SqlError, "{err:?}"),
+    }
+    session.close().await.expect("session close");
+}
+
+/// Running arm + cancel: a query that exceeds the inline wait comes back as a
+/// live `Running` handle; cancelling it makes `await_result` surface the
+/// cancellation — the mid-run-cancel path directResults exists for.
+#[tokio::test]
+#[ignore]
+async fn execute_direct_running_handle_is_cancellable() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    // A 40B-row scan reliably runs past the ~10s server inline wait.
+    stmt.spec()
+        .sql("SELECT count(*) FROM range(40000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
+    match stmt
+        .execute_direct()
+        .await
+        .expect("execute_direct slow query")
+    {
+        DirectStatement::Running(async_stmt) => {
+            async_stmt
+                .cancel()
+                .await
+                .expect("cancel the running statement");
+            match async_stmt.await_result().await {
+                Ok(_) => panic!("cancelled statement must not yield a result stream"),
+                Err(err) => assert_eq!(err.code, ErrorCode::Cancelled, "{err:?}"),
+            }
+        }
+        DirectStatement::Completed(_) => {
+            panic!("a 40B-row scan must not finish within the inline wait")
+        }
+    }
+    session.close().await.expect("session close");
+}
+
+/// Running arm driven to a SUCCESSFUL terminal result via `await_result` (no
+/// cancel) — proves the slow-query poll-to-terminal path returns rows.
+#[tokio::test]
+#[ignore]
+async fn execute_direct_running_await_result_completes() {
+    let session = live_session().await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT count(*) AS c FROM range(40000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
+    match stmt
+        .execute_direct()
+        .await
+        .expect("execute_direct slow query")
+    {
+        DirectStatement::Running(async_stmt) => {
+            let mut stream = async_stmt
+                .await_result()
+                .await
+                .expect("await_result to terminal");
+            assert_eq!(drain_rows(&mut stream).await, 1, "count(*) returns one row");
+        }
+        DirectStatement::Completed(_) => panic!("a 40B-row scan must be Running"),
+    }
     session.close().await.expect("session close");
 }
 

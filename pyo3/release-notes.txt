@@ -1,0 +1,26 @@
+==============================================================================
+Databricks SQL Kernel — Python binding Release Notes
+==============================================================================
+
+These release notes summarize enhancements, new features, known issues,
+and version history for the Python wheel published to PyPI as
+`databricks-sql-kernel` (built from this directory via pyo3 + maturin).
+
+The Rust crate and Node.js (napi) bindings ship on independent cadences;
+their release notes live at `../release-notes.txt` and
+`../napi/release-notes.txt`.
+
+Version History ==============================================================
+
+0.1.2 ========================================================================
+Released 2026-06-06
+
+Initial public release of the Python binding.
+
+Enhancements & New Features
+
+ * Python bindings published to PyPI as `databricks-sql-kernel`.
+ * abi3 wheels for Linux (manylinux_2_28 x86_64/aarch64), macOS
+   (x86_64/arm64), and Windows (x86_64), plus a source distribution.
+ * pyo3-based bridge over the Rust kernel's async public API with PyArrow
+   interop for result batches.

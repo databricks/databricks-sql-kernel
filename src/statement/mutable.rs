@@ -54,6 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
+use crate::client::DirectOutcome;
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -67,6 +68,25 @@ use crate::types::sea::{ExecuteParams, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::Instrument;
+
+/// Outcome of [`Statement::execute_direct`] — the Thrift/JDBC directResults
+/// model. A fast query comes back [`DirectStatement::Completed`] (terminal,
+/// result stream ready inline); a slow one comes back
+/// [`DirectStatement::Running`] (a poll/cancel handle), letting the caller stay
+/// cancellable and keep `close()` a clean release.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "ephemeral return value of execute_direct, matched and unwrapped \
+              immediately by the caller — never stored in a collection, so the \
+              inter-variant size gap costs nothing and boxing would only add an \
+              allocation on the hot result path"
+)]
+pub enum DirectStatement {
+    /// Finished within the server inline wait — result ready, no further poll.
+    Completed(ExecutedStatement),
+    /// Still running after the inline wait — poll / cancel via this handle.
+    Running(ExecutedAsyncStatement),
+}
 
 /// Shared slot holding the server statement id of the statement
 /// currently in flight on a [`Statement`] (or its most recent
@@ -84,21 +104,18 @@ type InflightId = Arc<Mutex<Option<String>>>;
 /// - `caller_wait_secs = Some(s)` — the caller pinned the wait shape
 ///   (e.g. `submit` passes `"0s"` for async). Respected verbatim with
 ///   `CONTINUE`; overriding it would make async submit block.
-/// - `caller_wait_secs = None` — the sync `execute` path. A per-statement
-///   `spec_query_timeout_secs` then bounds the server wait and `CANCEL`s
-///   the statement on elapse (JDBC `setQueryTimeout` / Python `use_sea`'s
-///   `wait_timeout` semantics). With no spec timeout, both are omitted so
-///   the server applies its default (~10s wait + auto-close on success).
-fn resolve_wait_timeout(
-    caller_wait_secs: Option<&str>,
-    spec_query_timeout_secs: Option<u32>,
-) -> (Option<String>, Option<String>) {
+/// - `caller_wait_secs = None` — the sync `execute` path. Both fields are
+///   omitted so the server applies its default (~10s wait + auto-close on
+///   success).
+///
+/// Note: there is intentionally NO statement-execution-timeout knob here.
+/// `wait_timeout` is the server's inline-HOLD window (capped 5–50s), not an
+/// execution deadline; a real per-statement timeout is the `STATEMENT_TIMEOUT`
+/// SQL conf, not this field. See the removal of `query_timeout_secs`.
+fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Option<String>) {
     match caller_wait_secs {
         Some(s) => (Some(s.to_string()), Some("CONTINUE".to_string())),
-        None => match spec_query_timeout_secs {
-            Some(secs) => (Some(format!("{secs}s")), Some("CANCEL".to_string())),
-            None => (None, None),
-        },
+        None => (None, None),
     }
 }
 
@@ -133,8 +150,7 @@ fn build_execute_params(
         return Err(Error::invalid_argument()
             .message("positional and named parameters are mutually exclusive; pass only one"));
     }
-    let (wait_timeout, on_wait_timeout) =
-        resolve_wait_timeout(wait_timeout_secs, spec.query_timeout_secs);
+    let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
     let mut exec_params = ExecuteParams {
         wait_timeout,
         on_wait_timeout,
@@ -385,6 +401,115 @@ impl Statement {
                 // the first poll.
                 response.status,
             ))
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// directResults execute — the Thrift/JDBC model.
+    ///
+    /// Sends ExecuteStatement with **no `wait_timeout` field** (the server then
+    /// applies its ~10s default inline wait AND auto-closes on success,
+    /// `state=CLOSED`) and returns WITHOUT polling past it:
+    ///   - [`DirectStatement::Completed`] when the query reached a terminal,
+    ///     succeeded state within the inline wait — the result stream is ready
+    ///     inline (no extra `GetStatementResult` round-trip), identical to
+    ///     [`Statement::execute`]'s fast path;
+    ///   - [`DirectStatement::Running`] when it did not — a poll/cancel handle
+    ///     (identical to [`Statement::submit`]'s return) the caller drives.
+    ///
+    /// Omitting `wait_timeout` (rather than sending an explicit `wait_timeout=10s`,
+    /// which returns `SUCCEEDED` and leaves the statement alive needing a separate
+    /// `CloseStatement`) is what makes the `Completed` arm's `close()` a no-op and
+    /// lets fire-and-forget DDL commit. There is no statement-execution-timeout
+    /// knob on this path — `wait_timeout` is the inline-hold window, not an
+    /// execution deadline.
+    ///
+    /// Unlike [`Statement::execute`], this never blocks past the inline wait and
+    /// never swallows a still-running handle: a long query stays cancellable via
+    /// the `Running` handle, and `close()` on either arm is a clean release (the
+    /// statement is server-owned, so there is no client-side drive-to-terminal).
+    ///
+    /// The server statement id is published to the shared in-flight slot from
+    /// the POST response (not mid-execute), so a `StatementCanceller` /
+    /// `AsyncStatementCanceller` targets it without an observer race.
+    pub async fn execute_direct(&mut self) -> Result<DirectStatement> {
+        let span = self.session.log_span().clone();
+        async {
+            self.invalidate_prior().await;
+            // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
+            // UNSET, so `execute_statement_direct` sends ExecuteStatement with no
+            // `wait_timeout` field — the server applies its ~10s default AND
+            // auto-closes on success (`state=CLOSED`). Omitting (vs an explicit
+            // `wait_timeout=10s`, which returns `SUCCEEDED` and leaves the statement
+            // alive) is what makes the Completed arm's `close()` a no-op and lets
+            // fire-and-forget DDL commit.
+            let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
+
+            let cancel_state = MidExecuteCancelState::new(
+                Arc::clone(&self.session),
+                Arc::clone(&self.inflight_id),
+            );
+            let guard = cancel_state.guard();
+            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+
+            let outcome = match self
+                .session
+                .transport()
+                .execute_statement_direct(self.session.session_id(), &sql, &exec_params)
+                .await
+            {
+                Ok(outcome) => outcome,
+                Err(e) => {
+                    // Inline terminal failure/cancel. The transport already published
+                    // the statement id to the shared slot and closed the orphaned
+                    // statement (`execute_statement_direct`'s `Err` arm). Defuse the
+                    // cancel guard so its `Drop` does NOT fire a second, redundant
+                    // `CancelStatement` against that now-closed statement.
+                    guard.defuse();
+                    return Err(e);
+                }
+            };
+
+            let valid = ValidityFlag::new();
+            match outcome {
+                DirectOutcome::Completed(result) => {
+                    cancel_state.observe(&result.statement_id);
+                    guard.defuse();
+                    let already_closed = result.status.state == StatementState::Closed;
+                    let closed = Arc::new(AtomicBool::new(already_closed));
+                    self.last_statement_id = Some(result.statement_id.clone());
+                    self.last_valid = Some(valid.clone());
+                    self.last_closed = Some(Arc::clone(&closed));
+                    let result_stream = ResultStream::from_reader(result.reader).await?;
+                    Ok(DirectStatement::Completed(ExecutedStatement::new(
+                        Arc::clone(&self.session),
+                        result.statement_id,
+                        valid,
+                        result_stream,
+                        closed,
+                        result.status,
+                    )))
+                }
+                DirectOutcome::Running(resp) => {
+                    cancel_state.observe(&resp.statement_id);
+                    guard.defuse();
+                    // Still running — start the closed flag false (the server
+                    // can't have auto-closed a non-terminal statement); later
+                    // close()/await drives it.
+                    let closed = Arc::new(AtomicBool::new(false));
+                    self.last_statement_id = Some(resp.statement_id.clone());
+                    self.last_valid = Some(valid.clone());
+                    self.last_closed = Some(Arc::clone(&closed));
+                    Ok(DirectStatement::Running(ExecutedAsyncStatement::new(
+                        Arc::clone(&self.session),
+                        resp.statement_id,
+                        valid,
+                        closed,
+                        resp.status,
+                    )))
+                }
+            }
         }
         .instrument(span)
         .await
@@ -663,27 +788,18 @@ mod tests {
 
     #[test]
     fn async_submit_caller_value_is_respected_verbatim() {
-        // submit() pins "0s" for async; never overridden, even if a spec
-        // query_timeout is set (overriding would make submit block).
-        let (wait, on_wait) = resolve_wait_timeout(Some("0s"), Some(30));
+        // submit() pins "0s" for async; respected verbatim with CONTINUE.
+        let (wait, on_wait) = resolve_wait_timeout(Some("0s"));
         assert_eq!(wait.as_deref(), Some("0s"));
         assert_eq!(on_wait.as_deref(), Some("CONTINUE"));
     }
 
     #[test]
-    fn sync_with_query_timeout_cancels_on_elapse() {
-        // execute() passes None; a spec query_timeout bounds the wait and
-        // CANCELs the statement on elapse (server statement-timeout).
-        let (wait, on_wait) = resolve_wait_timeout(None, Some(30));
-        assert_eq!(wait.as_deref(), Some("30s"));
-        assert_eq!(on_wait.as_deref(), Some("CANCEL"));
-    }
-
-    #[test]
-    fn sync_without_query_timeout_omits_field() {
-        // No caller pin and no spec timeout: omit both so the server uses
-        // its default (~10s wait + auto-close on success).
-        let (wait, on_wait) = resolve_wait_timeout(None, None);
+    fn sync_omits_wait_timeout_field() {
+        // execute() passes None: omit both so the server uses its default
+        // (~10s wait + auto-close on success). There is no statement-timeout
+        // knob — `query_timeout_secs` was removed (it abused `wait_timeout`).
+        let (wait, on_wait) = resolve_wait_timeout(None);
         assert_eq!(wait, None);
         assert_eq!(on_wait, None);
     }
