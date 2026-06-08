@@ -279,6 +279,12 @@ pub(crate) struct ExecutedStatement {
     /// Cached schema. Pulled from the kernel once on construction —
     /// available even after `close()` so descriptions stay stable.
     schema: Arc<Schema>,
+    /// Rows modified by the statement (DML: INSERT/UPDATE/DELETE/MERGE),
+    /// or `None` for SELECT / warehouses that don't report it. Cached at
+    /// construction (it's fixed once the statement completed) so it
+    /// survives `close()`, like `statement_id` / `schema`. The connector
+    /// surfaces this as `cursor.rowcount`.
+    num_modified_rows: Option<i64>,
 }
 
 struct ExecutedInner {
@@ -291,9 +297,11 @@ impl ExecutedStatement {
     fn new(exec: KExecutedStatement, runtime: Arc<Runtime>) -> Self {
         let statement_id = exec.statement_id().to_owned();
         let schema = exec.schema();
+        let num_modified_rows = exec.num_modified_rows();
         Self {
             statement_id,
             schema,
+            num_modified_rows,
             inner: Some(ExecutedInner {
                 exec,
                 runtime,
@@ -308,6 +316,15 @@ impl ExecutedStatement {
     #[getter]
     fn statement_id(&self) -> &str {
         &self.statement_id
+    }
+
+    /// Rows modified by the statement (DML), or `None` for SELECT /
+    /// warehouses that don't report it. The connector maps this to
+    /// `cursor.rowcount` (falling back to -1 when `None`). Available
+    /// after `close()` (cached at construction).
+    #[getter]
+    fn num_modified_rows(&self) -> Option<i64> {
+        self.num_modified_rows
     }
 
     /// Result schema as a `pyarrow.Schema`. Available even after
