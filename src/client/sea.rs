@@ -19,8 +19,8 @@
 
 use crate::client::retry::RequestType;
 use crate::client::{
-    ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult, ExecuteResultData,
-    InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
+    ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
+    ExecuteResultData, InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -42,10 +42,11 @@ use tokio::runtime::Handle as RuntimeHandle;
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
 /// so the sync polling loop and the async one-shot
 /// [`Transport::fetch_completed_result`] path produce identical
-/// outcomes (and identical errors) for `FAILED` / `CANCELLED` /
-/// `CLOSED-no-data` responses.
+/// outcomes (and identical errors) for `FAILED` / `CANCELLED` responses.
 enum StatementOutcome {
-    /// `Succeeded` (or `Closed` with inline data).
+    /// Terminal success — `Succeeded` OR `Closed` (with or without inline
+    /// data; an empty `Closed` is a valid empty result set, materialised
+    /// downstream by `create_reader`'s `EmptyReader`).
     Done(ExecuteResponse),
     /// `Pending` / `Running` — caller polls again.
     NotReady(ExecuteResponse),
@@ -260,8 +261,9 @@ impl SeaRestTransport {
     ///
     /// Shared by `wait_for_completion` (sync poll loop) and
     /// [`Transport::fetch_completed_result`] (async one-shot fetch)
-    /// so both paths produce identical errors for `FAILED` /
-    /// `CANCELLED` / `CLOSED-no-data`.
+    /// so both paths produce identical errors for `FAILED` / `CANCELLED`.
+    /// `CLOSED` (with or without result data) is a terminal success — JDBC
+    /// parity; an empty `CLOSED` materialises an empty result downstream.
     fn terminal_outcome(response: ExecuteResponse) -> StatementOutcome {
         match response.status.state {
             StatementState::Succeeded => StatementOutcome::Done(response),
@@ -329,21 +331,17 @@ impl SeaRestTransport {
                 ))
             }
             StatementState::Closed => {
-                // Closed with result data is valid for inline results
-                // — the server delivers the data and immediately
-                // closes the statement since no further fetching is
-                // needed.
-                if response.result.is_some() {
-                    StatementOutcome::Done(response)
-                } else {
-                    let error = Error::invalid_state()
-                        .message("Statement was closed")
-                        .with_query_id(&response.statement_id);
-                    StatementOutcome::Err(crate::kernel_error::carry_extended_status(
-                        error,
-                        &response.status,
-                    ))
-                }
+                // CLOSED is a terminal SUCCESS state — parity with JDBC's
+                // `DatabricksSdkClient`, which treats SUCCEEDED and CLOSED
+                // identically as success (anything else → handleFailedExecution).
+                // It's the server's auto-close-on-completion signal. A CLOSED
+                // response with NO result payload is a valid EMPTY result set
+                // (common for DDL/DML and no-row queries that auto-close), NOT
+                // an error: `create_reader` builds an `EmptyReader` from the
+                // manifest schema for exactly this case (see its own CLOSED arm
+                // in reader/mod.rs). Gating on `result.is_some()` here was both
+                // stricter than JDBC and internally inconsistent with that.
+                StatementOutcome::Done(response)
             }
             StatementState::Pending | StatementState::Running => {
                 StatementOutcome::NotReady(response)
@@ -785,6 +783,70 @@ impl Transport for SeaRestTransport {
         params.on_wait_timeout = Some("CONTINUE".to_string());
         self.call_execute_api(session_id, sql, &params, RequestType::ExecuteStatement)
             .await
+    }
+
+    async fn execute_statement_direct(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+    ) -> Result<DirectOutcome> {
+        // directResults model: OMIT `wait_timeout` (exactly like the sync
+        // `execute` path) so the server applies its default ~10s inline wait
+        // AND auto-closes on success (returns `state=CLOSED`). This is the fast
+        // path: a quick query / fire-and-forget DDL comes back terminal AND
+        // already server-closed, so the handle's `close()` is a true no-op (no
+        // cancel+close round-trip that would otherwise discard an unfetched
+        // result). Setting `wait_timeout=10s` explicitly instead yields
+        // `SUCCEEDED` (statement still alive → needs an explicit cancel+close),
+        // which is both slower and breaks fire-and-forget. We just DON'T run the
+        // `wait_for_completion` poll loop: a query that outlasts the inline wait
+        // comes back `Running` for the caller to poll/cancel.
+        let response = self
+            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement)
+            .await?;
+        let statement_id = response.statement_id.clone();
+
+        // Publish the server statement id to the caller's canceller slot now —
+        // a concurrent `StatementCanceller::cancel()` (the Running arm) can
+        // target the still-running query immediately, no mid-execute observer
+        // race (the id is known from this POST response).
+        if let Some(observer) = params.inflight_id_observer.as_ref() {
+            if let Ok(mut slot) = observer.lock() {
+                *slot = Some(statement_id.clone());
+            }
+        }
+
+        match Self::terminal_outcome(response) {
+            // Terminal + succeeded within the inline wait → materialise the
+            // reader from the inline result (no extra GetStatementResult).
+            StatementOutcome::Done(r) => {
+                let reader_factory = self.reader_factory()?;
+                let reader = match reader_factory.create_reader(&r.statement_id, &r).await {
+                    Ok(reader) => reader,
+                    Err(e) => {
+                        self.close_orphaned_statement(&statement_id, "create_reader (direct)")
+                            .await;
+                        return Err(e);
+                    }
+                };
+                Ok(DirectOutcome::Completed(ExecuteResult {
+                    statement_id: r.statement_id,
+                    reader,
+                    manifest: r.manifest,
+                    status: r.status,
+                }))
+            }
+            // Still running after the inline wait → hand back a running handle;
+            // the caller polls (and may cancel) via the statement id.
+            StatementOutcome::NotReady(r) => Ok(DirectOutcome::Running(r)),
+            // Inline terminal failure/cancel → surface it (close the orphan).
+            StatementOutcome::Err(e) => {
+                self.close_orphaned_statement(&statement_id, "execute_statement_direct")
+                    .await;
+                Err(e)
+            }
+        }
     }
 
     async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>> {

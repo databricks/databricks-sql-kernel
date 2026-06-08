@@ -1160,6 +1160,14 @@ mod tests {
         ) -> Result<crate::client::ExecuteResponse> {
             unimplemented!("submit_statement not used by the link-fetcher mock")
         }
+        async fn execute_statement_direct(
+            &self,
+            _session_id: &str,
+            _sql: &str,
+            _params: &ExecuteParams,
+        ) -> Result<crate::client::DirectOutcome> {
+            unimplemented!("execute_statement_direct not used by the link-fetcher mock")
+        }
 
         async fn fetch_completed_result(
             &self,

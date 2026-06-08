@@ -13,8 +13,15 @@ layout, or npm publishing. Pure-kernel changes go in the root
 ## [Unreleased]
 
 ### Added
+- `Connection.executeStatementDirect(sql, options?)` — exposes the kernel's
+  directResults `execute_direct`, returning `Either<Statement, AsyncStatement>`
+  (terminal `Statement` for a fast query, or an `AsyncStatement` poll/cancel
+  handle for a slow one). Consumed by the Node.js driver's default sync path.
 
 ### Updated
+- Removed `ExecuteOptions.queryTimeoutSecs`: it threaded onto the now-removed
+  kernel `query_timeout_secs`, which abused the SEA `wait_timeout` inline-hold
+  window rather than being a real statement timeout.
 
 ### Fixed
 

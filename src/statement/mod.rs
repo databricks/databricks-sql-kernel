@@ -40,5 +40,5 @@ pub(crate) mod validity;
 pub use executed::ExecutedStatement;
 pub use executed_async::{AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus};
 pub use handle::ExecutedStatementHandle;
-pub use mutable::{Statement, StatementCanceller};
+pub use mutable::{DirectStatement, Statement, StatementCanceller};
 pub use spec::{ResultFormat, StatementSpec, TypedValue};
