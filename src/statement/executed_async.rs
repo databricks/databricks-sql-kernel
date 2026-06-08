@@ -471,7 +471,23 @@ impl ExecutedAsyncStatement {
             .fetch_completed_result(&self.statement_id)
             .await?
         {
-            Some(result) => ResultStream::from_reader(result.reader).await,
+            Some(result) => {
+                let mut stream = ResultStream::from_reader(result.reader).await?;
+                // SEA carries no row count on the async status either; for a
+                // DML the count rides in the result set. Derive it once
+                // (non-consuming) and record it onto the latest status so
+                // `num_modified_rows()` matches the sync path / Thrift.
+                if self.num_modified_rows().is_none() {
+                    if let Some(n) =
+                        crate::statement::dml_count::read_dml_affected_rows(&mut stream).await?
+                    {
+                        if let Ok(mut guard) = self.latest_status.lock() {
+                            guard.num_modified_rows = Some(n);
+                        }
+                    }
+                }
+                Ok(stream)
+            }
             None => {
                 // Re-read the status so the error message names the
                 // observed state (Pending vs Running). Best-effort —

@@ -310,14 +310,24 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
-            let result_stream = ResultStream::from_reader(result.reader).await?;
+            let mut result_stream = ResultStream::from_reader(result.reader).await?;
+            // SEA puts no row count on the status envelope; for a DML it
+            // returns the count as the result set. If the server didn't
+            // already supply `num_modified_rows`, derive it from that
+            // result (non-consuming — the count row still reaches the
+            // caller's fetch) so `num_modified_rows()` matches Thrift.
+            let mut status = result.status;
+            if status.num_modified_rows.is_none() {
+                status.num_modified_rows =
+                    crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
+            }
             Ok(ExecutedStatement::new(
                 Arc::clone(&self.session),
                 result.statement_id,
                 valid,
                 result_stream,
                 closed,
-                result.status,
+                status,
             ))
         }
         .instrument(span)

@@ -453,6 +453,15 @@ pub struct ResultStream {
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
 
+    /// A single batch pulled early by [`peek_first_batch`](Self::peek_first_batch)
+    /// and buffered for replay so the peek is **non-consuming**: the next
+    /// [`next_batch`](Self::next_batch) returns this batch instead of
+    /// re-entering the reader. Lets the statement layer read a DML
+    /// row-count result (which SEA delivers as the result set) without
+    /// stealing it from the caller's fetch — keeping result rows at parity
+    /// with the Thrift path. `None` once drained or when never peeked.
+    prefetched: Option<ResultBatch>,
+
     /// Row cursor inside [`current`](Self::current). Reset to `0`
     /// every time `next_batch` populates a fresh batch.
     /// `next_row_in_batch` reads and increments.
@@ -526,6 +535,7 @@ impl ResultStream {
             reader,
             schema,
             current: None,
+            prefetched: None,
             current_row_idx: 0,
             exhausted: false,
             close_guard: None,
@@ -587,6 +597,13 @@ impl ResultStream {
     /// performed on this path, so calling from a tokio runtime
     /// (napi-rs, PyO3 async) is safe.
     pub async fn next_batch(&mut self) -> Result<Option<&ResultBatch>> {
+        // A batch buffered by `peek_first_batch` is replayed here first,
+        // so a non-consuming peek doesn't steal it from the caller.
+        if let Some(batch) = self.prefetched.take() {
+            self.current = Some(batch);
+            self.current_row_idx = 0;
+            return Ok(self.current.as_ref());
+        }
         if self.exhausted {
             return Ok(None);
         }
@@ -603,6 +620,25 @@ impl ResultStream {
                 Ok(None)
             }
         }
+    }
+
+    /// Non-consuming peek at the **first** batch of the stream.
+    ///
+    /// Pulls one batch from the reader exactly once and buffers it so a
+    /// subsequent [`next_batch`](Self::next_batch) still returns it — the
+    /// peek does not advance consumption. Returns `None` for an empty
+    /// stream. Only valid before any `next_batch`/`peek_first_batch` has
+    /// run (it no-ops if a batch is already current or buffered), which is
+    /// the only context it's used in: deriving a DML row-count off the
+    /// terminal result at statement-construction time.
+    pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
+        if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
+            match self.reader.next_batch().await? {
+                Some(rb) => self.prefetched = Some(ResultBatch::Arrow(rb)),
+                None => self.exhausted = true,
+            }
+        }
+        Ok(self.prefetched.as_ref())
     }
 
     /// The batch most recently buffered by
@@ -691,8 +727,13 @@ impl ResultStream {
     /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
     pub fn into_owned_batches(self) -> OwnedBatchIter {
+        // Preserve a peeked-but-not-yet-consumed first batch: it was
+        // pulled from the reader, so it must be yielded ahead of the
+        // reader's remaining batches or it would be silently dropped.
+        let prefetched = self.prefetched.map(|ResultBatch::Arrow(rb)| rb);
         OwnedBatchIter {
             reader: self.reader,
+            prefetched,
             done: false,
         }
     }
@@ -706,6 +747,10 @@ impl ResultStream {
 /// reader's natural end-of-stream the same way.
 pub struct OwnedBatchIter {
     reader: Box<dyn ResultReader>,
+    /// A batch peeked off the stream before conversion (see
+    /// [`ResultStream::peek_first_batch`]); yielded before the reader's
+    /// own batches so it isn't lost.
+    prefetched: Option<RecordBatch>,
     done: bool,
 }
 
@@ -715,6 +760,9 @@ impl Iterator for OwnedBatchIter {
     fn next(&mut self) -> Option<Self::Item> {
         if self.done {
             return None;
+        }
+        if let Some(batch) = self.prefetched.take() {
+            return Some(Ok(batch));
         }
         // Runtime-aware blocking poll: uses block_in_place + the
         // current Handle when there's a tokio runtime on this thread
