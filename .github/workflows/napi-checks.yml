@@ -133,6 +133,28 @@ jobs:
         # secrets — purely cdylib + rlib in-tree tests.
         run: cargo test --locked
 
+      # Drift guard for the committed loader (napi/index.js +
+      # napi/index.d.ts). PR #146 review feedback: nothing in CI
+      # detects when a contributor adds a top-level `#[napi]` symbol
+      # without recommitting the generated loader, and that already
+      # happened once (3 logger exports went missing in #146 before
+      # this check landed).
+      #
+      # This is a SURFACE audit, not a full regenerate-and-diff —
+      # parses napi/src/**.rs for top-level `#[napi]` items and
+      # compares against the destructured names in napi/index.js.
+      # Catches the "new export missing" bug class without needing
+      # an npm proxy on the protected runner (which doesn't yet
+      # exist; see .github/actions/setup-jfrog/action.yml — npm
+      # support is a "future" item). When npm-via-JFrog lands, this
+      # step should be replaced with the full reviewer-preferred
+      # form: `npx --yes @napi-rs/cli@2.18.4 build --platform ...`
+      # then `git diff --exit-code -- napi/index.js napi/index.d.ts`.
+      # Tracked in the PR #146 discussion.
+      - name: Check napi loader is in sync with #[napi] surface
+        working-directory: ${{ github.workspace }}
+        run: bash .github/scripts/check-napi-loader-drift.sh
+
       # Release-profile build verifies the cdylib actually links with
       # the production profile knobs (lto=true, codegen-units=1,
       # strip="debuginfo"). The lto=true link is the slow part (~4 min
