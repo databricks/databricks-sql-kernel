@@ -732,7 +732,12 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
                 false
             } else {
                 let t = types_arr.value(i);
-                types.contains(&t)
+                // Case-insensitive match: callers may pass `"view"` /
+                // `"Table"` (JDBC `getTables` allows any case) while the
+                // warehouse reports canonical uppercase (`TABLE` / `VIEW`
+                // / `SYSTEM_TABLE` / `METRIC_VIEW`). An exact match would
+                // silently drop all rows for a mixed-case request.
+                types.iter().any(|req| req.eq_ignore_ascii_case(t))
             }
         })
         .collect();
@@ -1426,5 +1431,45 @@ mod tests {
         assert!(out.column(9).is_null(0)); // UPDATE_RULE
         assert!(out.column(10).is_null(0)); // DELETE_RULE
         assert!(out.column(12).is_null(0)); // PK_NAME
+    }
+    // ─── filter_tables_by_type tests ───────────────────────────────
+
+    fn tables_with_types(types: &[&str]) -> RecordBatch {
+        // Minimal batch carrying only the TABLE_TYPE column that
+        // `filter_tables_by_type` inspects.
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "TABLE_TYPE",
+            DataType::Utf8,
+            true,
+        )]));
+        let arr = StringArray::from(types.iter().map(|s| Some(*s)).collect::<Vec<_>>());
+        RecordBatch::try_new(schema, vec![Arc::new(arr)]).unwrap()
+    }
+
+    fn kept_types(batch: &RecordBatch) -> Vec<String> {
+        let arr = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        (0..batch.num_rows())
+            .map(|i| arr.value(i).to_owned())
+            .collect()
+    }
+
+    #[test]
+    fn filter_tables_by_type_is_case_insensitive() {
+        // Warehouse reports canonical uppercase; a lowercase / mixed-case
+        // request must still match (JDBC getTables allows any case).
+        let batch = tables_with_types(&["TABLE", "VIEW", "SYSTEM_TABLE"]);
+        let out = filter_tables_by_type(&batch, &["view", "Table"]).unwrap();
+        assert_eq!(kept_types(&out), vec!["TABLE", "VIEW"]);
+    }
+
+    #[test]
+    fn filter_tables_by_type_drops_non_matching_and_nulls() {
+        let batch = tables_with_types(&["TABLE", "VIEW"]);
+        let out = filter_tables_by_type(&batch, &["MANAGED"]).unwrap();
+        assert_eq!(out.num_rows(), 0);
     }
 }
