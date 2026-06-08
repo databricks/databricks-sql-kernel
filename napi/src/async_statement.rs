@@ -217,6 +217,67 @@ impl AsyncStatement {
         .await
     }
 
+    // ─── SEA extended status accessors (Thrift parity, async path) ─────
+    //
+    // Mirror the same-named accessors on the sync `Statement`. The
+    // underlying values come off the kernel `ExecutedAsyncStatement`'s
+    // latest observed `StatementStatus`; for a DML the kernel derives
+    // `num_modified_rows` from the result that rides on the terminal
+    // GetStatement poll (see `SeaRestTransport::enrich_num_modified_rows`),
+    // so a caller gets the count after the statement has reached a terminal
+    // state via `status()` / `awaitResult()` — no extra fetch. `null` until
+    // then, and on SELECT / warehouses that don't surface the counter.
+    // Throws `InvalidStatementHandle` after `close()`, matching `status()`.
+
+    /// Rows modified by the statement (UPDATE / INSERT / DELETE / MERGE).
+    #[napi]
+    pub async fn num_modified_rows(&self) -> napi::Result<Option<i64>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
+            Ok(inner_state.executed_async.num_modified_rows())
+        })
+        .await
+    }
+
+    /// Server-supplied user-facing message (may contain SQL fragments —
+    /// redact before centralised logging).
+    #[napi]
+    pub async fn display_message(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
+            Ok(inner_state.executed_async.display_message())
+        })
+        .await
+    }
+
+    /// Server-supplied diagnostic detail.
+    #[napi]
+    pub async fn diagnostic_info(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
+            Ok(inner_state.executed_async.diagnostic_info())
+        })
+        .await
+    }
+
+    /// Server-supplied structured error detail (JSON), when enabled.
+    #[napi]
+    pub async fn error_details_json(&self) -> napi::Result<Option<String>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let guard = inner.lock().await;
+            let inner_state = guard.as_ref().ok_or_else(|| closed_err("AsyncStatement"))?;
+            Ok(inner_state.executed_async.error_details_json())
+        })
+        .await
+    }
+
     /// Block until the server reaches a terminal state, then return
     /// an `AsyncResultHandle` that wraps the materialised result
     /// stream. The handle exposes `fetchNextBatch()` / `schema()`

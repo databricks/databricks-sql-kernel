@@ -253,7 +253,48 @@ impl SeaRestTransport {
             sea_response.statement_id, sea_response.status.state
         );
 
-        Self::convert_response(sea_response)
+        let mut response = Self::convert_response(sea_response)?;
+        self.enrich_num_modified_rows(&mut response).await;
+        Ok(response)
+    }
+
+    /// SEA omits the DML row count from the status envelope — for an
+    /// INSERT/UPDATE/DELETE/MERGE it rides in the result set instead (a single
+    /// row of `num_*_rows` counters). Thrift, by contrast, reports it on the
+    /// operation status. When a terminal GetStatement response carries a
+    /// DML-count result inline, derive `num_affected_rows` (the total) and set
+    /// it on the status so the extended-status accessors reach Thrift parity —
+    /// crucially on the async path, where the count would otherwise require an
+    /// explicit result fetch. No extra round-trip: the count rides on the status
+    /// poll the caller already made.
+    ///
+    /// Gated on the manifest's column signature so SELECTs (real columns) never
+    /// hit the decode path; a DML-count result is always tiny and inline.
+    async fn enrich_num_modified_rows(&self, response: &mut ExecuteResponse) {
+        if response.status.num_modified_rows.is_some() {
+            return;
+        }
+        match response.manifest.as_ref() {
+            Some(m) if crate::statement::dml_count::manifest_is_dml_count(m) => {}
+            _ => return,
+        }
+        let Ok(factory) = self.reader_factory() else {
+            return;
+        };
+        // Decode the inline count via a throwaway reader; this is independent of
+        // any later fetch the caller makes (a fresh GetStatement builds its own
+        // reader), so result consumption is unaffected.
+        let reader = match factory.create_reader(&response.statement_id, response).await {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let mut stream = match crate::result_stream::ResultStream::from_reader(reader).await {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        if let Ok(Some(n)) = crate::statement::dml_count::read_dml_affected_rows(&mut stream).await {
+            response.status.num_modified_rows = Some(n);
+        }
     }
 
     /// Decode a single SEA `ExecuteResponse` into a terminal outcome.

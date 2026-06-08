@@ -36,6 +36,7 @@
 
 use crate::kernel_error::Result;
 use crate::result_stream::{ResultBatch, ResultStream};
+use crate::types::sea::ResultManifest;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type};
 use arrow_array::Array;
@@ -51,6 +52,21 @@ const DML_COUNT_COLUMNS: [&str; 4] = [
 
 /// The total-affected column whose value maps to `num_modified_rows`.
 const AFFECTED_ROWS_COLUMN: &str = "num_affected_rows";
+
+/// Does this result `manifest` describe a DML row-count result?
+///
+/// Same strict signature as [`read_dml_affected_rows`], but checked against
+/// the manifest's column metadata so a caller can decide whether the inline
+/// result is worth decoding *before* building a reader — keeping SELECTs (real
+/// columns) off the decode path entirely.
+pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
+    let cols = &manifest.schema.columns;
+    !cols.is_empty()
+        && cols
+            .iter()
+            .all(|c| DML_COUNT_COLUMNS.contains(&c.name.as_str()))
+        && cols.iter().any(|c| c.name == AFFECTED_ROWS_COLUMN)
+}
 
 /// If `stream`'s result set is a DML row-count result, return its
 /// `num_affected_rows` value; otherwise `None`.
@@ -128,6 +144,36 @@ mod tests {
         ResultStream::from_reader(Box::new(InMemoryReader::new(schema, vec![batch])))
             .await
             .unwrap()
+    }
+
+    #[test]
+    fn manifest_detection_gates_on_strict_signature() {
+        let dml: ResultManifest = serde_json::from_str(
+            r#"{"format":"ARROW_STREAM","schema":{"column_count":2,"columns":[
+                {"name":"num_affected_rows","type_name":"LONG","type_text":"BIGINT","position":0},
+                {"name":"num_inserted_rows","type_name":"LONG","type_text":"BIGINT","position":1}]},
+                "total_row_count":1}"#,
+        )
+        .unwrap();
+        assert!(manifest_is_dml_count(&dml));
+
+        let select: ResultManifest = serde_json::from_str(
+            r#"{"format":"ARROW_STREAM","schema":{"column_count":1,"columns":[
+                {"name":"id","type_name":"INT","type_text":"INT","position":0}]},
+                "total_row_count":3}"#,
+        )
+        .unwrap();
+        assert!(!manifest_is_dml_count(&select));
+
+        // Leads with the counter name but has a non-counter column → declined.
+        let aliased: ResultManifest = serde_json::from_str(
+            r#"{"format":"ARROW_STREAM","schema":{"column_count":2,"columns":[
+                {"name":"num_affected_rows","type_name":"LONG","type_text":"BIGINT","position":0},
+                {"name":"label","type_name":"STRING","type_text":"STRING","position":1}]},
+                "total_row_count":1}"#,
+        )
+        .unwrap();
+        assert!(!manifest_is_dml_count(&aliased));
     }
 
     #[tokio::test]
