@@ -285,9 +285,9 @@ impl Connection {
         let inner = Arc::clone(&self.inner);
         // Pull the scalar knobs out (both `i64`/`u32` are `Copy`) before
         // the `.take()`s below consume the map fields out of `options`.
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);        // Decode positional params before `options` is consumed below; a
-        // malformed entry surfaces as InvalidArgument here, before any wire
-        // round-trip.
+        let row_limit = options.as_ref().and_then(|o| o.row_limit); // Decode positional params before `options` is consumed below; a
+                                                                    // malformed entry surfaces as InvalidArgument here, before any wire
+                                                                    // round-trip.
         let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
@@ -371,7 +371,8 @@ impl Connection {
         mut options: Option<ExecuteOptions>,
     ) -> napi::Result<napi::Either<Statement, AsyncStatement>> {
         let inner = Arc::clone(&self.inner);
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);        let positional_params = options
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
             .map(decode_positional_params)
@@ -438,7 +439,8 @@ impl Connection {
     ) -> napi::Result<crate::cancellable::CancellableExecution> {
         let inner = Arc::clone(&self.inner);
         // Same option decoding as `execute_statement`.
-        let row_limit = options.as_ref().and_then(|o| o.row_limit);        let positional_params = options
+        let row_limit = options.as_ref().and_then(|o| o.row_limit);
+        let positional_params = options
             .as_mut()
             .and_then(|o| o.positional_params.take())
             .map(decode_positional_params)
