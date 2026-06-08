@@ -153,6 +153,15 @@ impl ResultReaderFactory {
         // or non-zero values fall through to the existing branch
         // dispatch — the manifest field is deprecated on newer
         // servers and we must not infer "empty" from its absence.
+        //
+        // Caller contract: returning here before the `status.state`
+        // match arms below is safe only because every caller of
+        // `create_inner_reader` has already verified a terminal-success
+        // outcome (`StatementOutcome::Done` in `src/client/sea.rs`).
+        // A future caller that invokes us on a Failed / Canceled /
+        // Pending / Running state with `total_chunk_count == Some(0)`
+        // would silently lose the error signal — re-gate here if that
+        // ever changes.
         if matches!(
             response.manifest.as_ref().and_then(|m| m.total_chunk_count),
             Some(0)
