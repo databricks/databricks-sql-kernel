@@ -298,6 +298,20 @@ pub struct StatementParameter {
     pub value: Option<String>,
 }
 
+/// A single per-statement query tag on the SEA `query_tags` array.
+///
+/// The SEA `POST /statements` API takes query tags as a native
+/// `[{ "key", "value" }]` array — *not* as a conf-overlay string (the SEA
+/// request has no conf overlay, unlike Thrift's `TExecuteStatementReq.
+/// confOverlay`). `value` is `None` for a bare key-only tag. This matches
+/// the wire shape the pure-Python SEA backend and the ADBC C# driver send.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueryTag {
+    pub key: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+}
+
 /// Request body for statement execution.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecuteStatementRequest {
@@ -326,6 +340,10 @@ pub struct ExecuteStatementRequest {
     /// Positional parameters for parameterized queries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<StatementParameter>,
+    /// Per-statement query tags, emitted as the native SEA `query_tags`
+    /// array (`[{key, value}]`). Empty → omitted from the request body.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub query_tags: Vec<QueryTag>,
 }
 
 /// Parameters for statement execution (passed to client methods).
@@ -338,6 +356,10 @@ pub struct ExecuteParams {
     pub row_limit: Option<i64>,
     /// Parameters for parameterized query execution.
     pub parameters: Vec<StatementParameter>,
+    /// Per-statement query tags, forwarded to the SEA request's native
+    /// `query_tags` array. Derived from `StatementSpec.statement_conf
+    /// ["query_tags"]` in `build_execute_params`.
+    pub query_tags: Vec<QueryTag>,
     /// Optional sink for the server statement id, published as soon as
     /// the initial `POST /statements` returns it — *before* the
     /// sync-execute poll loop. Lets a detached canceller
@@ -477,12 +499,39 @@ mod tests {
             row_limit: None,
             result_compression: None,
             parameters: vec![],
+            query_tags: vec![],
         };
 
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"warehouse_id\":\"abc123\""));
         assert!(json.contains("\"session_id\":\"session-1\""));
         assert!(!json.contains("\"catalog\"")); // None should be skipped
+        assert!(!json.contains("\"query_tags\"")); // empty should be skipped
+    }
+
+    #[test]
+    fn test_execute_statement_request_serializes_query_tags_as_array() {
+        let req = ExecuteStatementRequest {
+            warehouse_id: "abc123".to_string(),
+            statement: "SELECT 1".to_string(),
+            session_id: Some("session-1".to_string()),
+            catalog: None,
+            schema: None,
+            disposition: "ARROW_STREAM".to_string(),
+            format: "ARROW_STREAM".to_string(),
+            wait_timeout: None,
+            on_wait_timeout: None,
+            row_limit: None,
+            result_compression: None,
+            parameters: vec![],
+            query_tags: vec![
+                QueryTag { key: "team".to_string(), value: Some("eng".to_string()) },
+                QueryTag { key: "prod".to_string(), value: None },
+            ],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        // Native SEA array shape: [{"key":..,"value":..}], value omitted when None.
+        assert!(json.contains(r#""query_tags":[{"key":"team","value":"eng"},{"key":"prod"}]"#), "got: {json}");
     }
 
     #[test]
