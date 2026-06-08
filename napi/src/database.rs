@@ -280,6 +280,27 @@ pub struct ConnectionOptions {
     ///   identity. The NodeJS driver folds its `userAgentEntry` into a
     ///   `User-Agent` entry here.
     pub custom_headers: Option<Vec<HeaderEntry>>,
+
+    /// Retry/backoff tuning — all optional. An unset field keeps the kernel's
+    /// built-in policy (1s/60s exponential backoff, 6 total attempts, 900s
+    /// budget). Mirrors the pyo3 binding's `retry_*` kwargs so the Node.js
+    /// driver can forward the same retry knobs the Python connector does.
+    ///
+    /// Lower bound of the exponential backoff (also clamps a server
+    /// `Retry-After`). Maps onto [`HttpConfig::retry_min_wait`].
+    pub retry_min_wait_secs: Option<u32>,
+    /// Upper bound of the exponential backoff. Maps onto
+    /// [`HttpConfig::retry_max_wait`].
+    pub retry_max_wait_secs: Option<u32>,
+    /// **Total** number of attempts (matching the connector's
+    /// `_retry_stop_after_attempts_count` and JDBC count semantics). The
+    /// kernel's [`HttpConfig::retry_max_retries`] counts retries *after* the
+    /// first attempt, so this is converted with `max(0, attempts - 1)` in
+    /// [`build_http_config`] — `0` / `1` both mean a single attempt, no retry.
+    pub retry_max_attempts: Option<u32>,
+    /// Overall retry budget in whole seconds. Maps onto
+    /// [`HttpConfig::overall_timeout`].
+    pub retry_overall_timeout_secs: Option<u32>,
 }
 
 /// Map the JS `ConnectionOptions` auth fields onto the kernel
@@ -406,6 +427,23 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
         // duplicate names).
         http.custom_headers = headers.into_iter().map(|h| (h.name, h.value)).collect();
     }
+    // Retry/backoff knobs — only override the kernel default when the caller
+    // set one. `retry_max_attempts` is a TOTAL attempt count; the kernel's
+    // `retry_max_retries` counts retries *after* the first, so convert with
+    // `saturating_sub(1)` (0/1 ⇒ no retries). Centralises the off-by-one here,
+    // mirroring the pyo3 binding's `Session::new`.
+    if let Some(s) = options.retry_min_wait_secs {
+        http.retry_min_wait = std::time::Duration::from_secs(u64::from(s));
+    }
+    if let Some(s) = options.retry_max_wait_secs {
+        http.retry_max_wait = std::time::Duration::from_secs(u64::from(s));
+    }
+    if let Some(attempts) = options.retry_max_attempts {
+        http.retry_max_retries = attempts.saturating_sub(1);
+    }
+    if let Some(s) = options.retry_overall_timeout_secs {
+        http.overall_timeout = std::time::Duration::from_secs(u64::from(s));
+    }
     http
 }
 
@@ -522,6 +560,10 @@ mod tests {
             client_cert_pem: None,
             client_key_pem: None,
             custom_headers: None,
+            retry_min_wait_secs: None,
+            retry_max_wait_secs: None,
+            retry_max_attempts: None,
+            retry_overall_timeout_secs: None,
         }
     }
 
@@ -875,5 +917,41 @@ mod tests {
         assert_eq!(http.custom_headers.len(), 2);
         assert_eq!(http.custom_headers[0].1, "Caller/1.0");
         assert_eq!(http.custom_headers[1].1, "Connector/2.0");
+    }
+
+    #[test]
+    fn http_retry_knobs_map_onto_http_config() {
+        let mut o = base();
+        o.retry_min_wait_secs = Some(2);
+        o.retry_max_wait_secs = Some(45);
+        o.retry_max_attempts = Some(4); // total attempts → 3 retries
+        o.retry_overall_timeout_secs = Some(120);
+        let http = build_http_config(&mut o);
+        assert_eq!(http.retry_min_wait, std::time::Duration::from_secs(2));
+        assert_eq!(http.retry_max_wait, std::time::Duration::from_secs(45));
+        // total attempts (4) → retries after the first (3): the off-by-one.
+        assert_eq!(http.retry_max_retries, 3);
+        assert_eq!(http.overall_timeout, std::time::Duration::from_secs(120));
+    }
+
+    #[test]
+    fn http_retry_attempts_zero_or_one_means_no_retries() {
+        for attempts in [0u32, 1] {
+            let mut o = base();
+            o.retry_max_attempts = Some(attempts);
+            let http = build_http_config(&mut o);
+            assert_eq!(http.retry_max_retries, 0, "attempts={attempts}");
+        }
+    }
+
+    #[test]
+    fn http_retry_unset_keeps_kernel_defaults() {
+        let mut o = base();
+        let http = build_http_config(&mut o);
+        let def = HttpConfig::default();
+        assert_eq!(http.retry_min_wait, def.retry_min_wait);
+        assert_eq!(http.retry_max_wait, def.retry_max_wait);
+        assert_eq!(http.retry_max_retries, def.retry_max_retries);
+        assert_eq!(http.overall_timeout, def.overall_timeout);
     }
 }

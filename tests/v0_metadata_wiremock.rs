@@ -513,20 +513,22 @@ async fn list_columns_without_catalog_emits_all_catalogs_query() {
 }
 
 #[tokio::test]
-async fn primary_keys_passes_server_columns_through() {
+async fn primary_keys_reshaped_to_jdbc_columns() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
-    // Live `SHOW KEYS` shape — full 14-column row including the
-    // parent linkage columns and constraintType.
+    // Live `SHOW KEYS` shape — the kernel reshapes the server's
+    // `catalogName / namespace / tableName / col_name / keySeq /
+    // constraintName` columns into the JDBC `getPrimaryKeys` set.
     let raw = string_batch(vec![
-        ("catalogName", vec![Some("main")]),
-        ("namespace", vec![Some("d")]),
-        ("tableName", vec![Some("t")]),
-        ("col_name", vec![Some("id")]),
-        ("constraintName", vec![Some("pk_t")]),
-        ("constraintType", vec![Some("PRIMARY KEY")]),
+        ("catalogName", vec![Some("main"), Some("main")]),
+        ("namespace", vec![Some("d"), Some("d")]),
+        ("tableName", vec![Some("t"), Some("t")]),
+        ("col_name", vec![Some("id"), Some("code")]),
+        ("keySeq", vec![Some("1"), Some("2")]),
+        ("constraintName", vec![Some("pk_t"), Some("pk_t")]),
+        ("constraintType", vec![Some("PRIMARY"), Some("PRIMARY")]),
     ]);
     mount_execute(&server, succeeded_inline_response_body(&raw)).await;
 
@@ -544,25 +546,140 @@ async fn primary_keys_passes_server_columns_through() {
     assert_eq!(
         col_names(&stream.schema()),
         vec![
-            "catalogName",
-            "namespace",
-            "tableName",
-            "col_name",
-            "constraintName",
-            "constraintType",
+            "TABLE_CAT",
+            "TABLE_SCHEM",
+            "TABLE_NAME",
+            "COLUMN_NAME",
+            "KEY_SEQ",
+            "PK_NAME",
+        ]
+    );
+
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column_by_name("TABLE_CAT")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "main"
+    );
+    assert_eq!(
+        batches[0]
+            .column_by_name("COLUMN_NAME")
+            .unwrap()
+            .as_string::<i32>()
+            .value(1),
+        "code"
+    );
+    let key_seq = batches[0]
+        .column_by_name("KEY_SEQ")
+        .unwrap()
+        .as_any()
+        .downcast_ref::<arrow_array::Int32Array>()
+        .expect("KEY_SEQ is Int32");
+    assert_eq!(key_seq.value(0), 1);
+    assert_eq!(key_seq.value(1), 2);
+    assert_eq!(
+        batches[0]
+            .column_by_name("PK_NAME")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "pk_t"
+    );
+}
+
+#[tokio::test]
+async fn foreign_keys_reshaped_to_jdbc_columns() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    // Live `SHOW FOREIGN KEYS` shape — the FK-bearing side is in
+    // `catalogName / namespace / tableName / col_name`, the referenced
+    // primary side in the `parent*` columns. The kernel reshapes into
+    // the JDBC `getCrossReference` set; UPDATE_RULE / DELETE_RULE /
+    // PK_NAME have no server source and come back null.
+    let raw = string_batch(vec![
+        ("catalogName", vec![Some("main")]),
+        ("namespace", vec![Some("d")]),
+        ("tableName", vec![Some("child")]),
+        ("col_name", vec![Some("pid")]),
+        ("keySeq", vec![Some("1")]),
+        ("constraintName", vec![Some("fk_child")]),
+        ("constraintType", vec![Some("FOREIGN")]),
+        ("parentCatalogName", vec![Some("main")]),
+        ("parentNamespace", vec![Some("d")]),
+        ("parentTableName", vec![Some("parent")]),
+        ("parentColName", vec![Some("id")]),
+        ("deferrability", vec![Some("7")]),
+    ]);
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .foreign_keys(
+            None,
+            None,
+            None,
+            Some(Identifier::new("main").unwrap()),
+            Some(Identifier::new("d").unwrap()),
+            Some(Identifier::new("child").unwrap()),
+        )
+        .await
+        .expect("foreign_keys");
+
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "PKTABLE_CAT",
+            "PKTABLE_SCHEM",
+            "PKTABLE_NAME",
+            "PKCOLUMN_NAME",
+            "FKTABLE_CAT",
+            "FKTABLE_SCHEM",
+            "FKTABLE_NAME",
+            "FKCOLUMN_NAME",
+            "KEY_SEQ",
+            "UPDATE_RULE",
+            "DELETE_RULE",
+            "FK_NAME",
+            "PK_NAME",
+            "DEFERRABILITY",
         ]
     );
 
     let batches = drain_stream(&mut stream).await;
     assert_eq!(batches[0].num_rows(), 1);
+    let b = &batches[0];
     assert_eq!(
-        batches[0]
-            .column_by_name("constraintType")
+        b.column_by_name("PKTABLE_NAME")
             .unwrap()
             .as_string::<i32>()
             .value(0),
-        "PRIMARY KEY"
+        "parent"
     );
+    assert_eq!(
+        b.column_by_name("FKTABLE_NAME")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "child"
+    );
+    assert_eq!(
+        b.column_by_name("FK_NAME")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "fk_child"
+    );
+    // UPDATE_RULE / DELETE_RULE / PK_NAME have no server source → null.
+    assert!(b.column_by_name("UPDATE_RULE").unwrap().is_null(0));
+    assert!(b.column_by_name("DELETE_RULE").unwrap().is_null(0));
+    assert!(b.column_by_name("PK_NAME").unwrap().is_null(0));
 }
 
 #[tokio::test]

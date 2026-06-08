@@ -235,6 +235,14 @@ impl RetryStrategy {
 
     /// Whether the given network/client error is retryable.
     pub fn is_retryable_error(&self, error: &reqwest::Error) -> bool {
+        // A DNS *resolution* failure (the host name does not resolve) is
+        // permanent — retrying it just burns the whole retry budget on a host
+        // that will never come back. reqwest reports it as a "connect" error,
+        // which the branches below would otherwise treat as retryable, so
+        // short-circuit it here regardless of idempotency.
+        if is_dns_resolution_failure(error) {
+            return false;
+        }
         match self.idempotency {
             // Idempotent: all network errors are retryable
             RequestIdempotency::Idempotent => {
@@ -244,6 +252,43 @@ impl RetryStrategy {
             RequestIdempotency::NonIdempotent => error.is_connect(),
         }
     }
+}
+
+/// Heuristic: is this network error a DNS *resolution* failure (the host name
+/// does not resolve), as opposed to a transient connect/timeout error?
+///
+/// A non-existent host (NXDOMAIN) will never resolve, so it must not be
+/// retried. reqwest does not expose a typed DNS-error variant, so we walk the
+/// error's source chain and match the resolver's message. Matching is broad
+/// and lowercased to cover the common phrasings across platforms/resolvers:
+/// libc/getaddrinfo (`Name or service not known`), macOS
+/// (`nodename nor servname provided`), and hyper/hickory
+/// (`dns error`, `failed to lookup address information`).
+fn is_dns_resolution_failure(error: &reqwest::Error) -> bool {
+    error_chain_indicates_dns_failure(error)
+}
+
+/// Walk an error's `source()` chain looking for a DNS-resolution marker.
+///
+/// Split out from [`is_dns_resolution_failure`] so it can be unit-tested with a
+/// synthetic error chain — `reqwest::Error` has no public constructor, so the
+/// matching logic can't be exercised through the typed wrapper directly.
+fn error_chain_indicates_dns_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(err) = source {
+        let msg = err.to_string().to_ascii_lowercase();
+        if msg.contains("dns error")
+            || msg.contains("failed to lookup address")
+            || msg.contains("name or service not known")
+            || msg.contains("nodename nor servname")
+            || msg.contains("name resolution")
+            || msg.contains("no such host")
+        {
+            return true;
+        }
+        source = err.source();
+    }
+    false
 }
 
 // --- Backoff Calculator ---
@@ -306,6 +351,57 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- DNS-resolution detection tests ---
+
+    #[test]
+    fn dns_marker_detected_for_common_resolver_phrasings() {
+        use std::io::Error as IoError;
+        for msg in [
+            "failed to lookup address information: Name or service not known",
+            "dns error: failed to lookup address information",
+            "nodename nor servname provided, or not known",
+            "No such host is known. (os error 11001)",
+        ] {
+            let err = IoError::other(msg);
+            assert!(
+                error_chain_indicates_dns_failure(&err),
+                "expected DNS marker in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn non_dns_connect_errors_are_not_flagged() {
+        use std::io::{Error as IoError, ErrorKind};
+        let refused = IoError::new(
+            ErrorKind::ConnectionRefused,
+            "Connection refused (os error 111)",
+        );
+        assert!(!error_chain_indicates_dns_failure(&refused));
+        let reset = IoError::new(ErrorKind::ConnectionReset, "connection reset by peer");
+        assert!(!error_chain_indicates_dns_failure(&reset));
+    }
+
+    #[test]
+    fn dns_marker_detected_through_nested_source() {
+        #[derive(Debug)]
+        struct Wrapper(std::io::Error);
+        impl std::fmt::Display for Wrapper {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                // Top-level message has no DNS marker — the marker is only on
+                // the inner source, mirroring the reqwest → connector chain.
+                write!(f, "error sending request for url (https://bogus.invalid/)")
+            }
+        }
+        impl std::error::Error for Wrapper {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+        let inner = std::io::Error::other("dns error");
+        assert!(error_chain_indicates_dns_failure(&Wrapper(inner)));
+    }
 
     // --- RequestType mapping tests ---
 

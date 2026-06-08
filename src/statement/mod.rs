@@ -24,6 +24,7 @@
 //! `params` holds the protocol-neutral parameter conversion helpers used
 //! by `Statement` to encode `TypedValue` bindings for SEA.
 
+pub(crate) mod dml_count;
 pub mod executed;
 pub mod executed_async;
 pub mod handle;

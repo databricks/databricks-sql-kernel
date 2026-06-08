@@ -170,6 +170,53 @@ pub(crate) static GET_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     ]))
 });
 
+/// JDBC `getPrimaryKeys` — 6 columns. Matches
+/// `java.sql.DatabaseMetaData.getPrimaryKeys` (and the Databricks
+/// Thrift `TGetPrimaryKeysResp` column set). `KEY_SEQ` follows the
+/// Thrift wire type (`INT` / Int32), not JDBC's `short`, so the kernel
+/// backend is a drop-in replacement for existing PySQL / JDBC users.
+pub(crate) static GET_PRIMARY_KEYS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("TABLE_CAT", DataType::Utf8, true),
+        Field::new("TABLE_SCHEM", DataType::Utf8, true),
+        Field::new("TABLE_NAME", DataType::Utf8, false),
+        Field::new("COLUMN_NAME", DataType::Utf8, false),
+        // JDBC spec says non-null, but declare nullable so the reshape
+        // doesn't fail on the rare server response that omits `keySeq`;
+        // modern DBR always populates it and the value flows through.
+        Field::new("KEY_SEQ", DataType::Int32, true),
+        Field::new("PK_NAME", DataType::Utf8, true),
+    ]))
+});
+
+/// JDBC `getCrossReference` / `getImportedKeys` — 14 columns. Matches
+/// `java.sql.DatabaseMetaData.getCrossReference` (and the Databricks
+/// Thrift `TGetCrossReferenceResp` column set). `KEY_SEQ` is `INT`
+/// (Int32) and `UPDATE_RULE` / `DELETE_RULE` / `DEFERRABILITY` are
+/// `SMALLINT` (Int16), matching the Thrift wire types. `UPDATE_RULE` /
+/// `DELETE_RULE` / `PK_NAME` have no source in the Databricks
+/// `SHOW FOREIGN KEYS` response, so they are emitted as typed nulls
+/// (no value is synthesized).
+pub(crate) static GET_CROSS_REFERENCE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("PKTABLE_CAT", DataType::Utf8, true),
+        Field::new("PKTABLE_SCHEM", DataType::Utf8, true),
+        Field::new("PKTABLE_NAME", DataType::Utf8, false),
+        Field::new("PKCOLUMN_NAME", DataType::Utf8, false),
+        Field::new("FKTABLE_CAT", DataType::Utf8, true),
+        Field::new("FKTABLE_SCHEM", DataType::Utf8, true),
+        Field::new("FKTABLE_NAME", DataType::Utf8, false),
+        Field::new("FKCOLUMN_NAME", DataType::Utf8, false),
+        // Nullable for the same reason as `getPrimaryKeys` KEY_SEQ.
+        Field::new("KEY_SEQ", DataType::Int32, true),
+        Field::new("UPDATE_RULE", DataType::Int16, true),
+        Field::new("DELETE_RULE", DataType::Int16, true),
+        Field::new("FK_NAME", DataType::Utf8, true),
+        Field::new("PK_NAME", DataType::Utf8, true),
+        Field::new("DEFERRABILITY", DataType::Int16, true),
+    ]))
+});
+
 // ─── Helpers ───────────────────────────────────────────────────────
 
 /// Find the index of a column by name in the source schema, returning
@@ -296,6 +343,34 @@ fn null_int32(len: usize) -> ArrayRef {
 
 fn null_int16(len: usize) -> ArrayRef {
     Arc::new(arrow_array::Int16Array::from(vec![None::<i16>; len]))
+}
+
+/// Return the named source column as an `Int16` array, casting from a
+/// related integer type if necessary. Returns an all-null `Int16`
+/// array when the column is absent — symmetric with [`int32_column`].
+/// A cast failure is surfaced as `Error::data_loss` rather than
+/// silently producing nulls. Used for JDBC `SMALLINT` columns
+/// (`DEFERRABILITY`) whose server source ships as a wider integer.
+fn int16_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
+    match column_index(batch.schema_ref(), name) {
+        Some(idx) => {
+            let col = batch.column(idx);
+            if col.data_type() == &DataType::Int16 {
+                Ok(Arc::clone(col))
+            } else {
+                arrow_cast::cast(col.as_ref(), &DataType::Int16).map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "unexpected non-Int16 type for SHOW response column {name:?}: {e}"
+                    ))
+                })
+            }
+        }
+        None => Ok(Arc::new(arrow_array::Int16Array::from(vec![
+            None::<i16>;
+            batch
+                .num_rows()
+        ]))),
+    }
 }
 
 fn null_int8(len: usize) -> ArrayRef {
@@ -669,6 +744,84 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
     let mask = arrow_array::BooleanArray::from(keep);
     arrow_select::filter::filter_record_batch(batch, &mask)
         .map_err(|e| Error::data_loss().message(format!("filter_tables_by_type: {e}")))
+}
+
+/// Reshape Databricks `SHOW KEYS` output into the JDBC
+/// `getPrimaryKeys` shape.
+///
+/// Server shape (`SHOW KEYS IN ... TABLE ...`): `catalogName,
+/// namespace, tableName, col_name, keySeq, constraintName,
+/// constraintType, parentCatalogName, parentNamespace,
+/// parentTableName, parentColName, updateRule, deleteRule,
+/// deferrability`. For a primary-key lookup the server returns only
+/// the table's own primary-key rows, so this is a pure column
+/// rename + projection onto the six JDBC columns — no filtering and
+/// no value synthesis.
+pub(crate) fn reshape_primary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
+    let table_cat = utf8_column(batch, "catalogName")?;
+    let table_schem = utf8_column(batch, "namespace")?;
+    let table_name = utf8_column(batch, "tableName")?;
+    let column_name = utf8_column(batch, "col_name")?;
+    let key_seq = int32_column(batch, "keySeq")?;
+    let pk_name = utf8_column(batch, "constraintName")?;
+    RecordBatch::try_new(
+        GET_PRIMARY_KEYS_SCHEMA.clone(),
+        vec![
+            table_cat,
+            table_schem,
+            table_name,
+            column_name,
+            key_seq,
+            pk_name,
+        ],
+    )
+    .map_err(|e| Error::data_loss().message(format!("reshape primary_keys: {e}")))
+}
+
+/// Reshape Databricks `SHOW FOREIGN KEYS` output into the JDBC
+/// `getCrossReference` shape.
+///
+/// Server shape (same columns as `SHOW KEYS`): the foreign
+/// (FK-bearing) side is in `catalogName / namespace / tableName /
+/// col_name`, and the referenced primary side is in the `parent*`
+/// columns. This is a pure column rename + projection onto the 14
+/// JDBC columns. `UPDATE_RULE`, `DELETE_RULE`, and `PK_NAME` have no
+/// source in the server response — they are emitted as typed nulls
+/// rather than synthesizing a value (e.g. the kernel does not fabricate
+/// a JDBC `importedKeyNoAction` rule code).
+pub(crate) fn reshape_foreign_keys(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let pktable_cat = utf8_column(batch, "parentCatalogName")?;
+    let pktable_schem = utf8_column(batch, "parentNamespace")?;
+    let pktable_name = utf8_column(batch, "parentTableName")?;
+    let pkcolumn_name = utf8_column(batch, "parentColName")?;
+    let fktable_cat = utf8_column(batch, "catalogName")?;
+    let fktable_schem = utf8_column(batch, "namespace")?;
+    let fktable_name = utf8_column(batch, "tableName")?;
+    let fkcolumn_name = utf8_column(batch, "col_name")?;
+    let key_seq = int32_column(batch, "keySeq")?;
+    let fk_name = utf8_column(batch, "constraintName")?;
+    let deferrability = int16_column(batch, "deferrability")?;
+    RecordBatch::try_new(
+        GET_CROSS_REFERENCE_SCHEMA.clone(),
+        vec![
+            pktable_cat,
+            pktable_schem,
+            pktable_name,
+            pkcolumn_name,
+            fktable_cat,
+            fktable_schem,
+            fktable_name,
+            fkcolumn_name,
+            key_seq,
+            null_int16(n), // UPDATE_RULE — no server source; not synthesized
+            null_int16(n), // DELETE_RULE — no server source; not synthesized
+            fk_name,
+            null_utf8(n), // PK_NAME — no server source; not synthesized
+            deferrability,
+        ],
+    )
+    .map_err(|e| Error::data_loss().message(format!("reshape foreign_keys: {e}")))
 }
 
 // ─── Streaming reshape reader ──────────────────────────────────────
@@ -1137,6 +1290,148 @@ mod tests {
         assert_eq!(is_ai.value(0), "NO");
     }
 
+    // ─── primary / foreign keys reshape ────────────────────────────
+
+    fn server_show_keys() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("col_name", DataType::Utf8, false),
+            Field::new("keySeq", DataType::Int32, true),
+            Field::new("constraintName", DataType::Utf8, true),
+            Field::new("constraintType", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["main", "main"])),
+                Arc::new(StringArray::from(vec!["s", "s"])),
+                Arc::new(StringArray::from(vec!["t", "t"])),
+                Arc::new(StringArray::from(vec!["id", "code"])),
+                Arc::new(Int32Array::from(vec![Some(1), Some(2)])),
+                Arc::new(StringArray::from(vec!["pk_t", "pk_t"])),
+                Arc::new(StringArray::from(vec!["PRIMARY", "PRIMARY"])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn primary_keys_renames_to_jdbc_columns() {
+        let out = reshape_primary_keys(&server_show_keys()).unwrap();
+        assert_eq!(
+            out.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "TABLE_CAT",
+                "TABLE_SCHEM",
+                "TABLE_NAME",
+                "COLUMN_NAME",
+                "KEY_SEQ",
+                "PK_NAME",
+            ]
+        );
+        assert_eq!(out.num_rows(), 2);
+        let key_seq = out.column(4).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(key_seq.value(0), 1);
+        assert_eq!(key_seq.value(1), 2);
+        let pk_name = out
+            .column(5)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(pk_name.value(0), "pk_t");
+    }
+
+    fn server_show_foreign_keys() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("col_name", DataType::Utf8, false),
+            Field::new("keySeq", DataType::Int32, true),
+            Field::new("constraintName", DataType::Utf8, true),
+            Field::new("parentCatalogName", DataType::Utf8, true),
+            Field::new("parentNamespace", DataType::Utf8, true),
+            Field::new("parentTableName", DataType::Utf8, true),
+            Field::new("parentColName", DataType::Utf8, true),
+            Field::new("deferrability", DataType::Int32, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["main"])),
+                Arc::new(StringArray::from(vec!["s"])),
+                Arc::new(StringArray::from(vec!["child"])),
+                Arc::new(StringArray::from(vec!["pid"])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec!["fk_child"])),
+                Arc::new(StringArray::from(vec!["main"])),
+                Arc::new(StringArray::from(vec!["s"])),
+                Arc::new(StringArray::from(vec!["parent"])),
+                Arc::new(StringArray::from(vec!["id"])),
+                Arc::new(Int32Array::from(vec![Some(7)])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn foreign_keys_renames_to_jdbc_columns_and_nulls_unsourced() {
+        let out = reshape_foreign_keys(&server_show_foreign_keys()).unwrap();
+        assert_eq!(
+            out.schema()
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "PKTABLE_CAT",
+                "PKTABLE_SCHEM",
+                "PKTABLE_NAME",
+                "PKCOLUMN_NAME",
+                "FKTABLE_CAT",
+                "FKTABLE_SCHEM",
+                "FKTABLE_NAME",
+                "FKCOLUMN_NAME",
+                "KEY_SEQ",
+                "UPDATE_RULE",
+                "DELETE_RULE",
+                "FK_NAME",
+                "PK_NAME",
+                "DEFERRABILITY",
+            ]
+        );
+        assert_eq!(out.num_rows(), 1);
+        // Parent (PK) side and foreign (FK) side land in the right columns.
+        let pk_table = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(pk_table.value(0), "parent");
+        let fk_table = out
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(fk_table.value(0), "child");
+        // DEFERRABILITY is cast through to SMALLINT (Int16).
+        let deferr = out
+            .column(13)
+            .as_any()
+            .downcast_ref::<arrow_array::Int16Array>()
+            .unwrap();
+        assert_eq!(deferr.value(0), 7);
+        // No server source → typed nulls, not synthesized values.
+        assert!(out.column(9).is_null(0)); // UPDATE_RULE
+        assert!(out.column(10).is_null(0)); // DELETE_RULE
+        assert!(out.column(12).is_null(0)); // PK_NAME
+    }
     // ─── filter_tables_by_type tests ───────────────────────────────
 
     fn tables_with_types(types: &[&str]) -> RecordBatch {
