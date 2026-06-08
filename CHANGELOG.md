@@ -1,16 +1,19 @@
-# Version Changelog
+# Version Changelog — Rust crate (`databricks-sql-kernel`)
+
+This changelog tracks releases of the Rust crate published to crates.io.
+The Python (pyo3) and Node.js (napi) bindings have their own changelogs
+under [`pyo3/CHANGELOG.md`](pyo3/CHANGELOG.md) and
+[`napi/CHANGELOG.md`](napi/CHANGELOG.md); they ship on independent
+cadences and may not move in lockstep with the crate.
 
 ## [v0.1.2] - 2026-06-06
 
-Initial public release of the Databricks SQL Kernel and its language
-bindings.
+Initial public release of the Rust kernel core.
 
 ### Added
-- Rust core kernel (`databricks-sql-kernel`).
-- Python bindings published to PyPI as `databricks-sql-kernel` —
-  abi3 wheels for Linux (manylinux_2_28 x86_64/aarch64), macOS
-  (x86_64/arm64), and Windows (x86_64), plus an sdist.
-- Node.js (napi) bindings published to npm as
-  `@databricks/databricks-sql-kernel` — an umbrella loader plus
-  per-platform packages for Linux gnu/musl (x64/arm64), macOS
-  (x64/arm64), and Windows (x64/arm64).
+- `databricks-sql-kernel` Rust crate published to crates.io.
+- Async public API: `Session` → `Statement` → `ExecutedStatement` /
+  `ExecutedAsyncStatement` → `ResultStream`, plus a flat `Metadata`
+  surface (see `docs/spec-v0.md`).
+- SEA backend (Statement Execution API) with CloudFetch and inline-Arrow
+  result paths; PAT, OAuth M2M, and OAuth U2M authentication.

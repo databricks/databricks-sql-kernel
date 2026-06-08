@@ -1,4 +1,11 @@
-# NEXT CHANGELOG
+# NEXT CHANGELOG — Rust crate (`databricks-sql-kernel`)
+
+This file stages unreleased changes for the next Rust crate release.
+The Python (pyo3) and Node.js (napi) bindings stage their own
+unreleased changes under [`pyo3/NEXT_CHANGELOG.md`](pyo3/NEXT_CHANGELOG.md)
+and [`napi/NEXT_CHANGELOG.md`](napi/NEXT_CHANGELOG.md). Only land entries
+here that affect the Rust crate's public API or behaviour; binding-only
+changes go in their respective binding's NEXT_CHANGELOG.
 
 ## [Unreleased]
 
