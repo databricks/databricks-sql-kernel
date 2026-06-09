@@ -431,15 +431,23 @@ pub struct HttpConfig {
     /// where `auth_provider.add_headers` runs after the custom-header
     /// dict and overwrites those names.)
     ///
-    /// **`User-Agent` is special-cased:** rather than replacing the
-    /// kernel's base UA, a caller `User-Agent` here is **appended** to
-    /// it (`"<kernel-base-UA> <caller-UA>"`) — it is folded into the
-    /// effective UA at client construction and removed from this list.
-    /// The base UA carries the `DatabricksJDBCDriverOSS/...` token the
-    /// SEA server keys on to enable the `INLINE_OR_EXTERNAL_LINKS`
-    /// result disposition; replacing it would break result fetching.
-    /// Appending preserves that gating and still surfaces the caller's
-    /// identity (e.g. the connector's `PyDatabricksSqlConnector/x (entry)`).
+    /// **`User-Agent` is special-cased:** a caller `User-Agent` here
+    /// **replaces** the kernel's base UA entirely — it is folded into the
+    /// effective UA at client construction (becoming the UA verbatim) and
+    /// removed from this list. This gives the SEA server an accurate
+    /// driver identity for query-source attribution (e.g. the connector's
+    /// `PyDatabricksSqlConnector/x (entry)`), instead of the
+    /// `DatabricksJDBCDriverOSS/...` base.
+    ///
+    /// PRECONDITION: the caller UA's leading prefix MUST be in the
+    /// gateway's `databricks.sqlexecapi.known_driver_prefixes` SAFE flag.
+    /// The server gates the `INLINE_OR_EXTERNAL_LINKS` result disposition
+    /// (single-response chunk links → parallel downloads) on a
+    /// `startsWith` prefix match of that flag; a non-allow-listed prefix
+    /// is rejected (HTTP 400 / Thrift redirect). `PyDatabricksSqlConnector`
+    /// is allow-listed for this reason. When NO caller `User-Agent` is
+    /// supplied, the base UA stays `DatabricksJDBCDriverOSS/...` so the
+    /// gate still passes.
     ///
     /// **All other headers are sent as supplied.** A `Vec` (not a map)
     /// so order is preserved. No de-duplication is performed: duplicate
