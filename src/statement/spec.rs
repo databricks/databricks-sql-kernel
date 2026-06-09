@@ -420,7 +420,10 @@ pub(crate) fn deserialize_query_tags(serialized: &str) -> Vec<(String, Option<St
                 }
             }
             match split_at {
-                Some(i) => (unescape_query_tag(&pair[..i]), Some(unescape_query_tag(&pair[i + 1..]))),
+                Some(i) => (
+                    unescape_query_tag(&pair[..i]),
+                    Some(unescape_query_tag(&pair[i + 1..])),
+                ),
                 None => (unescape_query_tag(&pair), None),
             }
         })
@@ -717,8 +720,11 @@ mod tests {
         tags.insert("team".to_string(), Some("a:b,c\\d".to_string()));
         tags.insert("prod".to_string(), None);
         let round_tripped: std::collections::HashSet<(String, Option<String>)> =
-            deserialize_query_tags(&serialize_query_tags(&tags)).into_iter().collect();
-        let expected: std::collections::HashSet<(String, Option<String>)> = tags.into_iter().collect();
+            deserialize_query_tags(&serialize_query_tags(&tags))
+                .into_iter()
+                .collect();
+        let expected: std::collections::HashSet<(String, Option<String>)> =
+            tags.into_iter().collect();
         assert_eq!(round_tripped, expected);
     }
 }

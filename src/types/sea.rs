@@ -525,13 +525,22 @@ mod tests {
             result_compression: None,
             parameters: vec![],
             query_tags: vec![
-                QueryTag { key: "team".to_string(), value: Some("eng".to_string()) },
-                QueryTag { key: "prod".to_string(), value: None },
+                QueryTag {
+                    key: "team".to_string(),
+                    value: Some("eng".to_string()),
+                },
+                QueryTag {
+                    key: "prod".to_string(),
+                    value: None,
+                },
             ],
         };
         let json = serde_json::to_string(&req).unwrap();
         // Native SEA array shape: [{"key":..,"value":..}], value omitted when None.
-        assert!(json.contains(r#""query_tags":[{"key":"team","value":"eng"},{"key":"prod"}]"#), "got: {json}");
+        assert!(
+            json.contains(r#""query_tags":[{"key":"team","value":"eng"},{"key":"prod"}]"#),
+            "got: {json}"
+        );
     }
 
     #[test]
