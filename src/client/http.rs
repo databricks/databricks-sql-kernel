@@ -284,7 +284,7 @@ pub struct HttpClientConfig {
     /// Extra headers applied to every request, before the kernel's own
     /// `Authorization` / `x-databricks-org-id` (which are added last and
     /// therefore win). A caller `User-Agent` here is folded into the
-    /// effective UA at construction (appended to the base UA, then
+    /// effective UA at construction (it **replaces** the base UA, then is
     /// removed from this list). Populated from
     /// [`crate::config::HttpConfig::custom_headers`]; see its docs for
     /// the full precedence / reserved-name rules.
@@ -396,16 +396,28 @@ impl DatabricksHttpClient {
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
-        // re-applied per-request. **`User-Agent` is never replaced** —
-        // the kernel's base UA carries the `DatabricksJDBCDriverOSS/...`
-        // token the SEA server keys on to enable the
-        // `INLINE_OR_EXTERNAL_LINKS` result disposition; a caller UA that
-        // replaced it would break result fetching (HTTP 400
-        // "not a supported disposition"). Instead we APPEND the caller's
-        // UA as a suffix: `"<base> <caller>"`. This preserves the
-        // disposition gating and honors partner attribution (the
-        // connector's composed `PyDatabricksSqlConnector/x (entry)` UA
-        // rides along after the base token).
+        // re-applied per-request.
+        //
+        // A caller `User-Agent` **replaces** the kernel's base UA
+        // entirely: the effective UA becomes the caller string verbatim
+        // (e.g. the connector's composed `PyDatabricksSqlConnector/x
+        // (entry)`), with no `DatabricksJDBCDriverOSS/...` prefix. This is
+        // intentional — it gives the SEA server an accurate driver
+        // identity for query-source attribution (the appended-prefix shape
+        // matched none of the gateway's `parseUserAgent` patterns and was
+        // recorded as driver="other").
+        //
+        // PRECONDITION: the caller's UA prefix MUST be present in the
+        // gateway's `databricks.sqlexecapi.known_driver_prefixes` SAFE
+        // flag. The server gates the `INLINE_OR_EXTERNAL_LINKS` result
+        // disposition (which the kernel relies on for single-response
+        // chunk links / parallel downloads) on a `startsWith` prefix match
+        // of that flag; a UA whose prefix is not allow-listed is rejected
+        // with HTTP 400 "not a supported disposition" / redirected to
+        // Thrift. `PyDatabricksSqlConnector` is allow-listed for this
+        // reason. The base UA below remains `DatabricksJDBCDriverOSS/...`
+        // so requests with NO caller UA still pass the gate.
+        //
         // Last UA wins if a caller somehow set several.
         if let Some(caller_ua) = config
             .custom_headers
@@ -421,16 +433,27 @@ impl DatabricksHttpClient {
             // 1 KiB is far above any legitimate `product/version (entry)`
             // string; truncate (don't reject) so an over-long entry
             // degrades gracefully rather than failing the session.
-            const MAX_UA_SUFFIX: usize = 1024;
-            if caller_ua.len() > MAX_UA_SUFFIX {
+            const MAX_UA: usize = 1024;
+            let caller_ua = if caller_ua.len() > MAX_UA {
                 warn!(
                     len = caller_ua.len(),
-                    "caller User-Agent suffix exceeds {MAX_UA_SUFFIX} bytes; truncating"
+                    "caller User-Agent exceeds {MAX_UA} bytes; truncating"
                 );
-            }
-            let caller_ua = &caller_ua[..caller_ua.len().min(MAX_UA_SUFFIX)];
+                // Truncate on a UTF-8 char boundary at or below the limit so
+                // the byte slice can never split a multi-byte codepoint
+                // (which would panic).
+                let mut end = MAX_UA;
+                while end > 0 && !caller_ua.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &caller_ua[..end]
+            } else {
+                caller_ua
+            };
+            // An empty/whitespace-only caller UA is ignored — keep the
+            // base UA rather than blanking the identity.
             if !caller_ua.is_empty() {
-                config.user_agent = format!("{} {}", config.user_agent, caller_ua);
+                config.user_agent = caller_ua.to_string();
             }
         }
 
@@ -765,11 +788,11 @@ impl DatabricksHttpClient {
             // same-named headers rather than replacing, which for those
             // two would send a duplicate and could confuse the server).
             // `User-Agent` is NOT in this map — it was folded into the
-            // client's base UA in `new()` (appended, never replacing,
-            // to preserve the disposition-gating JDBC token).
+            // client's effective UA in `new()` (a caller UA replaces the
+            // base, which then becomes reqwest's default UA header).
             //
             // Note: this loop runs for BOTH `execute` and
-            // `execute_without_auth`, so custom headers (and the merged
+            // `execute_without_auth`, so custom headers (and the effective
             // User-Agent) also ride OAuth token-endpoint requests. This
             // is intentional and matches the Thrift connector, where
             // `setCustomHeaders` applies to every request on the
@@ -1012,24 +1035,22 @@ mod tests {
         let server = MockServer::start().await;
 
         // Expect: our benign custom header present; the caller's
-        // User-Agent is APPENDED to the kernel's base UA (never
-        // replacing it — the base token gates the SEA result
-        // disposition); Authorization is the kernel's real token (NOT
-        // the caller's bogus one).
+        // User-Agent REPLACES the kernel's base UA entirely (so the SEA
+        // server sees the caller's driver identity for attribution; its
+        // prefix is presumed allow-listed for the result disposition);
+        // Authorization is the kernel's real token (NOT the caller's
+        // bogus one).
         Mock::given(method("GET"))
             .and(path("/probe"))
             .and(header("x-custom-header", "custom-value"))
-            .and(header(
-                "user-agent",
-                "KernelBase/9.9 MyConnector/1.0 (entry)",
-            ))
+            .and(header("user-agent", "MyConnector/1.0 (entry)"))
             .and(header("authorization", "Bearer real-token"))
             .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 
         let config = HttpClientConfig {
-            // Fixed base UA so the merged-UA assertion is deterministic
+            // Fixed base UA to prove the caller UA fully replaces it
             // (the real default embeds the crate version).
             user_agent: "KernelBase/9.9".to_string(),
             custom_headers: vec![
@@ -1063,6 +1084,84 @@ mod tests {
         // If the matchers above didn't all match, wiremock returns the
         // default 404 and the status assert fails — so a 200 confirms
         // custom header + caller UA present AND auth = real-token.
+    }
+
+    #[test]
+    fn test_caller_user_agent_replaces_base() {
+        // A caller User-Agent fully replaces the base UA, and is removed
+        // from the custom-header list (so it isn't re-applied per request;
+        // it becomes reqwest's default UA instead).
+        let config = HttpClientConfig {
+            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            custom_headers: vec![
+                ("x-keep".to_string(), "v".to_string()),
+                (
+                    "user-agent".to_string(), // lowercase: match is case-insensitive
+                    "PyDatabricksSqlConnector/4.2.7 (entry)".to_string(),
+                ),
+            ],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        assert_eq!(
+            client.config().user_agent,
+            "PyDatabricksSqlConnector/4.2.7 (entry)"
+        );
+        assert!(
+            !client
+                .config()
+                .custom_headers
+                .iter()
+                .any(|(n, _)| n.eq_ignore_ascii_case("user-agent")),
+            "caller User-Agent must be folded out of custom_headers"
+        );
+        // Non-UA custom headers are untouched.
+        assert!(client
+            .config()
+            .custom_headers
+            .iter()
+            .any(|(n, v)| n == "x-keep" && v == "v"));
+    }
+
+    #[test]
+    fn test_empty_caller_user_agent_keeps_base() {
+        // A whitespace-only caller UA is ignored — the base UA stays so
+        // the request still carries an identity (and the
+        // disposition-gating prefix when the base is the JDBC token).
+        let config = HttpClientConfig {
+            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            custom_headers: vec![("User-Agent".to_string(), "   ".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        assert_eq!(client.config().user_agent, "DatabricksJDBCDriverOSS/9.9");
+    }
+
+    #[test]
+    fn test_no_caller_user_agent_keeps_base() {
+        let config = HttpClientConfig {
+            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        assert_eq!(client.config().user_agent, "DatabricksJDBCDriverOSS/9.9");
+    }
+
+    #[test]
+    fn test_oversized_caller_user_agent_truncated_on_char_boundary() {
+        // An over-long UA is truncated without panicking even when the
+        // 1024-byte cut would land inside a multi-byte codepoint.
+        let mut ua = "x".repeat(1023);
+        ua.push('é'); // 2 bytes straddling the 1024-byte limit
+        let config = HttpClientConfig {
+            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            custom_headers: vec![("User-Agent".to_string(), ua)],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        // Truncated to the char boundary at byte 1023 (the 'é' is dropped).
+        assert_eq!(client.config().user_agent.len(), 1023);
+        assert!(client.config().user_agent.chars().all(|c| c == 'x'));
     }
 
     #[test]
