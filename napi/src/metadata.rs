@@ -18,7 +18,7 @@
 //! Each method mirrors a `databricks_sql_kernel::Metadata` method
 //! one-to-one and returns the same `Statement` type that
 //! `executeStatement` returns, so the JS side can wrap any result in
-//! `SeaOperationBackend` uniformly. The `Statement` is constructed via
+//! `KernelOperationBackend` uniformly. The `Statement` is constructed via
 //! `Statement::from_result_stream` — no parent kernel `Statement` is
 //! involved (metadata calls don't use the mutable `Statement` path).
 //!
