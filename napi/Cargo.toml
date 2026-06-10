@@ -53,7 +53,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 # napi-rs v2 line; `napi6` enables N-API 6 surface, `async` enables the
 # `#[napi] async fn` glue that drives futures on napi-rs's tokio runtime.
-napi = { version = "2", default-features = false, features = ["napi6", "async"] }
+napi = { version = "3", default-features = false, features = ["napi6", "async"] }
 napi-derive = "2"
 
 # Kernel — path dep on the async-public-api branch worktree. Once the
