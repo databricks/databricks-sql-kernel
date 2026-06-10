@@ -76,6 +76,30 @@ pub(crate) struct OAuthParams {
 /// OAuth app identity, not the on-disk cache.
 const PYSQL_OAUTH_CLIENT_ID: &str = "databricks-sql-python";
 
+/// Default U2M scopes for the **Python** binding when the caller relies
+/// on the default `PYSQL_OAUTH_CLIENT_ID` above.
+///
+/// The kernel's intrinsic U2M default is `["all-apis", "offline_access"]`,
+/// which is correct for its bare-Rust default client (`databricks-cli`).
+/// But the Python binding overrides the default client to
+/// `databricks-sql-python` — and *that* client is only registered for
+/// `sql` (plus `offline_access`) on the Databricks IdP. Without a
+/// matching scope override here, an out-of-the-box
+/// `Session(auth_type="oauth-u2m")` from Python fails on the
+/// authorization request with
+/// `access_denied — Scopes 'all-apis' are not assigned to the client
+/// databricks-sql-python`.
+///
+/// Matches `PYSQL_OAUTH_SCOPES` in the Thrift connector
+/// (`databricks-sql-python` `auth/auth.py`), so `use_kernel=True` is
+/// drop-in compatible with the standalone Thrift path.
+///
+/// Only applied when the caller passed neither `client_id` nor `scopes`
+/// — a caller supplying their own `client_id` may legitimately want
+/// `all-apis` (or anything else), and an explicit `scopes` is always
+/// honoured verbatim.
+const PYSQL_OAUTH_SCOPES: &[&str] = &["sql", "offline_access"];
+
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
 /// constructor accepts.
 ///
@@ -157,23 +181,39 @@ fn build_auth_config_inner(
                         .to_owned(),
                 );
             }
+            // Default the U2M OAuth client to the Python connector's
+            // own registered client (`databricks-sql-python`), NOT the
+            // kernel's bare-Rust fallback (`databricks-cli`). This
+            // matches the standalone Thrift connector
+            // (`PYSQL_OAUTH_CLIENT_ID` in databricks-sql-python's
+            // auth.py) so a user gets the same OAuth app identity — and
+            // the same SSO token cache entry — whether they use the
+            // Thrift backend or `use_kernel=True`. It also keeps the
+            // kernel's per-{host,client_id,scopes} token cache distinct
+            // from the napi (Node) binding's, which defaults to its own
+            // client.
+            //
+            // When BOTH defaults are in play (caller passed no
+            // `client_id` and no `scopes`), also default the scopes to
+            // the Python-binding set so the default client/scopes pair
+            // is internally consistent. The kernel's intrinsic scope
+            // default is for its `databricks-cli` client, not for
+            // `databricks-sql-python` — see `PYSQL_OAUTH_SCOPES` above.
+            let caller_set_client_id = oauth.client_id.is_some();
+            let client_id = oauth
+                .client_id
+                .or_else(|| Some(PYSQL_OAUTH_CLIENT_ID.to_owned()));
+            let scopes = match oauth.scopes {
+                Some(s) => Some(s),
+                None if !caller_set_client_id => {
+                    Some(PYSQL_OAUTH_SCOPES.iter().map(|s| (*s).to_owned()).collect())
+                }
+                None => None,
+            };
             Ok(AuthConfig::OAuthU2M {
-                // Default the U2M OAuth client to the Python connector's
-                // own registered client (`databricks-sql-python`), NOT
-                // the kernel's bare-Rust fallback (`databricks-cli`).
-                // This matches the standalone Thrift connector
-                // (`PYSQL_OAUTH_CLIENT_ID` in databricks-sql-python's
-                // auth.py) so a user gets the same OAuth app identity —
-                // and the same SSO token cache entry — whether they use
-                // the Thrift backend or `use_kernel=True`. It also keeps
-                // the kernel's per-{host,client_id,scopes} token cache
-                // distinct from the napi (Node) binding's, which defaults
-                // to its own client.
-                client_id: oauth
-                    .client_id
-                    .or_else(|| Some(PYSQL_OAUTH_CLIENT_ID.to_owned())),
+                client_id,
                 redirect_port: oauth.redirect_port,
-                scopes: oauth.scopes,
+                scopes,
                 token_url_override: oauth.token_url,
                 callback_timeout: oauth.callback_timeout_secs.map(Duration::from_secs),
             })
@@ -285,11 +325,16 @@ mod tests {
     }
 
     #[test]
-    fn u2m_defaults_client_id_to_python_connector() {
+    fn u2m_defaults_client_id_and_scopes_to_python_connector() {
         // U2M takes no mandatory fields. The Python binding defaults the
         // OAuth client_id to `databricks-sql-python` (NOT the kernel's
         // bare `databricks-cli`) so it matches the standalone Thrift
         // connector and the napi binding gets a distinct cache key.
+        // It also defaults the scopes to `["sql", "offline_access"]` to
+        // match the scopes registered for that client on the Databricks
+        // IdP — the kernel's intrinsic `all-apis` default is for its
+        // own `databricks-cli` client, which `databricks-sql-python`
+        // isn't allowed to request.
         let cfg = build_auth_config_inner("oauth-u2m", None, OAuthParams::default()).unwrap();
         match cfg {
             AuthConfig::OAuthU2M {
@@ -301,7 +346,10 @@ mod tests {
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 assert!(redirect_port.is_none());
-                assert!(scopes.is_none());
+                assert_eq!(
+                    scopes,
+                    Some(vec!["sql".to_string(), "offline_access".to_string()])
+                );
                 assert!(token_url_override.is_none());
                 assert!(callback_timeout.is_none());
             }
@@ -321,8 +369,39 @@ mod tests {
         )
         .unwrap();
         match cfg {
-            AuthConfig::OAuthU2M { client_id, .. } => {
+            AuthConfig::OAuthU2M {
+                client_id, scopes, ..
+            } => {
                 assert_eq!(client_id.as_deref(), Some("my-custom-app"));
+                // Custom client_id without scopes: don't override the
+                // kernel's default scopes — a custom client may
+                // legitimately request `all-apis` (or anything else).
+                assert!(scopes.is_none());
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_explicit_scopes_are_honoured_verbatim() {
+        // Caller-supplied scopes win over the Python-binding default,
+        // both with the default client_id and with a custom one.
+        let custom = vec!["all-apis".to_string(), "offline_access".to_string()];
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                scopes: Some(custom.clone()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M {
+                client_id, scopes, ..
+            } => {
+                assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
+                assert_eq!(scopes, Some(custom));
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
