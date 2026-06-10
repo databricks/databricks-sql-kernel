@@ -446,6 +446,7 @@ impl SeaRestTransport {
             row_limit: params.row_limit,
             result_compression: Some("LZ4_FRAME".to_string()),
             parameters: params.parameters.clone(),
+            query_tags: params.query_tags.clone(),
         };
 
         debug!("Executing statement at {}: {}", url, sql);

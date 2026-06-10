@@ -144,17 +144,20 @@ async fn custom_http_headers_round_trip_succeeds() {
     // The kernel's own Authorization is applied last and wins; the
     // custom headers ride alongside. A header that broke the request
     // would surface as a failed execute here.
-    // A custom User-Agent here is APPENDED to the kernel's base UA (the
-    // kernel keeps its disposition-gating `DatabricksJDBCDriverOSS`
-    // token as a prefix), so we pass just the caller entry — the kernel
-    // prepends its base. Replacing the UA outright would break the SEA
-    // result disposition (HTTP 400), which is exactly the regression
-    // this exercises end-to-end.
+    //
+    // A caller `User-Agent` REPLACES the kernel's base UA entirely (see
+    // `HttpClient::new`). The SEA gateway gates the `INLINE_OR_EXTERNAL_LINKS`
+    // result disposition on a `startsWith` match against its allow-list of
+    // known driver prefixes, so the caller UA MUST carry a real, allow-listed
+    // connector prefix — a made-up prefix is rejected with HTTP 400
+    // ("not a supported disposition"). Use the actual Node connector UA
+    // (`NodejsDatabricksSqlConnector/...`), the way the NodeJS driver forwards
+    // its composed UA over the napi binding.
     let session = live_session_with_headers(vec![
         ("X-Custom-E2E-Header".to_string(), "kernel-e2e".to_string()),
         (
             "User-Agent".to_string(),
-            "KernelE2E/1.0 (smoke-test)".to_string(),
+            "NodejsDatabricksSqlConnector/1.0 (smoke-test)".to_string(),
         ),
     ])
     .await;

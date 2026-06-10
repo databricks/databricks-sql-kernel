@@ -184,9 +184,15 @@ async fn execute_direct_inline_failure_surfaces_eagerly() {
 async fn execute_direct_running_handle_is_cancellable() {
     let session = live_session().await;
     let mut stmt = session.statement();
-    // A 40B-row scan reliably runs past the ~10s server inline wait.
+    // The `execute_direct` inline wait is the SEA server's default for an
+    // OMITTED `wait_timeout`, which holds up to the 50s SEA maximum — not the
+    // ~10s an earlier comment assumed. A ~35s scan (range(40e9)) therefore sits
+    // right at that boundary and flakily returns `Completed`. Use a scan that
+    // cannot finish within ANY inline wait (range(1e12), minutes of work) so the
+    // Running arm is deterministic; it is cancelled below, so its full runtime
+    // never elapses (execute_direct returns once the inline wait is exhausted).
     stmt.spec()
-        .sql("SELECT count(*) FROM range(40000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
+        .sql("SELECT count(*) FROM range(1000000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
     match stmt
         .execute_direct()
         .await
@@ -203,7 +209,7 @@ async fn execute_direct_running_handle_is_cancellable() {
             }
         }
         DirectStatement::Completed(_) => {
-            panic!("a 40B-row scan must not finish within the inline wait")
+            panic!("a 1T-row scan must not finish within the inline wait")
         }
     }
     session.close().await.expect("session close");
@@ -216,8 +222,14 @@ async fn execute_direct_running_handle_is_cancellable() {
 async fn execute_direct_running_await_result_completes() {
     let session = live_session().await;
     let mut stmt = session.statement();
+    // Must reliably exceed the server's inline wait (the SEA default for an
+    // OMITTED `wait_timeout`, observed well under the 50s SEA max) so
+    // `execute_direct` returns `Running`, yet still finish in bounded time since
+    // `await_result` drives it to completion below. range(100e9) (~90s of scan on
+    // the test warehouse) clears the inline-wait ceiling with comfortable margin
+    // — the prior ~35s range(40e9) sat right at the boundary and flaked.
     stmt.spec()
-        .sql("SELECT count(*) AS c FROM range(40000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
+        .sql("SELECT count(*) AS c FROM range(100000000000) WHERE id % 7 = 3 AND rand() < 0.9999");
     match stmt
         .execute_direct()
         .await
@@ -230,7 +242,9 @@ async fn execute_direct_running_await_result_completes() {
                 .expect("await_result to terminal");
             assert_eq!(drain_rows(&mut stream).await, 1, "count(*) returns one row");
         }
-        DirectStatement::Completed(_) => panic!("a 40B-row scan must be Running"),
+        DirectStatement::Completed(_) => {
+            panic!("a 200B-row scan must exceed the inline wait and be Running")
+        }
     }
     session.close().await.expect("session close");
 }

@@ -664,32 +664,49 @@ impl SessionBuilder {
 /// Translate the public [`HttpConfig`] (+ proxy / TLS / org_id) into
 /// the internal [`HttpClientConfig`] the HTTP client expects.
 ///
-/// The public [`ProxyConfig`] is still a reserved `#[non_exhaustive]`
-/// struct (no fields wired yet); the public [`TlsConfig`] now carries
-/// `custom_ca_cert` / `accept_self_signed` /
-/// `skip_hostname_verification` and is projected onto the internal
+/// The public [`ProxyConfig`] is projected onto the internal
+/// [`HttpProxyConfig`] (`url` set ⇒ override env vars and route all
+/// traffic through it; `url` unset ⇒ reqwest's env-var behaviour). The
+/// public [`TlsConfig`] carries `custom_ca_cert` / `accept_self_signed`
+/// / `skip_hostname_verification` and is projected onto the internal
 /// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
-    let mut hcc = HttpClientConfig {
+    HttpClientConfig {
         connect_timeout: Duration::from_secs(30),
         // The internal `read_timeout` corresponds to the public
         // `request_timeout` — both gate a single HTTP round-trip.
         read_timeout: config.http.request_timeout,
         max_connections_per_host: config.http.pool_max_idle_per_host,
-        proxy: HttpProxyConfig::default(),
+        proxy: build_proxy_config(config.proxy.as_ref()),
         tls: HttpTlsConfig::from_public(&config.tls),
         org_id,
         custom_headers: config.http.custom_headers.clone(),
         ..HttpClientConfig::default()
+    }
+}
+
+/// Project the public [`ProxyConfig`] onto the internal
+/// [`HttpProxyConfig`]. `None` (no proxy config supplied) yields the
+/// default internal config (`url == None`), under which the HTTP client
+/// keeps reqwest's standard env-var behaviour. A destructuring binding
+/// (NOT `..`) is used so a future public-field addition surfaces as a
+/// compile error here rather than being silently dropped.
+fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
+    let Some(proxy) = proxy else {
+        return HttpProxyConfig::default();
     };
-    // Touch the still-reserved proxy config so a future field addition
-    // (without setting it through here) shows up as a compile error
-    // rather than a silently-dropped option. Explicit `ProxyConfig {}`
-    // (NOT `{ .. }`) — the `..` rest pattern would defeat the
-    // tripwire by silently accepting any new field.
-    let ProxyConfig {} = config.proxy.clone().unwrap_or_default();
-    let _ = &mut hcc;
-    hcc
+    let ProxyConfig {
+        url,
+        username,
+        password,
+        bypass_hosts,
+    } = proxy.clone();
+    HttpProxyConfig {
+        url,
+        username,
+        password,
+        bypass_hosts,
+    }
 }
 
 /// Build the per-category retry config for the HTTP client.
@@ -900,5 +917,52 @@ mod retry_config_tests {
         assert_eq!(sea.max_wait, Duration::from_secs(60));
         assert_eq!(sea.max_retries, 5);
         assert_eq!(sea.overall_timeout, Duration::from_secs(900));
+    }
+
+    // ─── Proxy / socket-timeout projection ─────────────────────────
+
+    /// `None` (no public proxy config) ⇒ internal proxy `url` stays
+    /// unset, preserving reqwest's env-var behaviour.
+    #[test]
+    fn proxy_absent_keeps_env_var_behaviour() {
+        let proxy = build_proxy_config(None);
+        assert!(proxy.url.is_none());
+        let cfg = config_with_http(HttpConfig::default());
+        assert!(build_http_client_config(&cfg, None).proxy.url.is_none());
+    }
+
+    /// A public `ProxyConfig` with a URL (and optional auth / bypass)
+    /// projects field-for-field onto the internal proxy config.
+    #[test]
+    fn proxy_fields_project_onto_internal_config() {
+        let mut cfg = config_with_http(HttpConfig::default());
+        cfg.proxy = Some(crate::config::ProxyConfig {
+            url: Some("http://proxy.corp.example.com:8080".to_string()),
+            username: Some("alice".to_string()),
+            password: Some("secret".to_string()),
+            bypass_hosts: Some("localhost,*.internal".to_string()),
+            ..Default::default()
+        });
+        let proxy = build_http_client_config(&cfg, None).proxy;
+        assert_eq!(
+            proxy.url.as_deref(),
+            Some("http://proxy.corp.example.com:8080")
+        );
+        assert_eq!(proxy.username.as_deref(), Some("alice"));
+        assert_eq!(proxy.password.as_deref(), Some("secret"));
+        assert_eq!(proxy.bypass_hosts.as_deref(), Some("localhost,*.internal"));
+    }
+
+    /// The public `request_timeout` becomes the internal HTTP client's
+    /// `read_timeout` (the per-connection socket read timeout the napi
+    /// `socketTimeoutMs` option drives).
+    #[test]
+    fn request_timeout_becomes_internal_read_timeout() {
+        let http = HttpConfig {
+            request_timeout: Duration::from_millis(4500),
+            ..HttpConfig::default()
+        };
+        let hcc = build_http_client_config(&config_with_http(http), None);
+        assert_eq!(hcc.read_timeout, Duration::from_millis(4500));
     }
 }
