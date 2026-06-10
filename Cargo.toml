@@ -92,7 +92,7 @@ thiserror = "2"
 # kernel's own `tls-native` / `tls-rustls` feature controls the TLS
 # backend for reqwest, and oauth2 inherits whichever the consumer picks.
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }  # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
-sha2 = "0.10"        # SHA-256 for token cache key generation
+sha2 = "0.11"        # SHA-256 for token cache key generation
 open = "5"           # Browser launch for interactive OAuth flows
 dirs = "5"           # Cross-platform config directory (~/.config/)
 
