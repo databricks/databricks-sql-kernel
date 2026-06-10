@@ -6,6 +6,16 @@ crate and Node.js binding have their own changelogs under
 [`../CHANGELOG.md`](../CHANGELOG.md) and [`../napi/CHANGELOG.md`](../napi/CHANGELOG.md);
 they ship on independent cadences.
 
+## [v0.2.0] - 2026-06-08
+
+**Beta release of the Databricks SQL Kernel (Python binding).**
+Ships on PyPI as `databricks-sql-kernel==0.2.0`. The pyo3 surface
+is unchanged from v0.1.2; this release picks up the
+kernel-side v0.2.0 behaviour changes (see the root
+[`../CHANGELOG.md`](../CHANGELOG.md) — `execute_direct`,
+`wait_timeout` removal, `CLOSED`-as-success fix). Intended for
+downstream-driver adoption in `databricks-sql-connector[kernel]`.
+
 ## [v0.1.2] - 2026-06-06
 
 Initial public release of the Python binding.
