@@ -6,6 +6,26 @@ The Rust crate and Python binding have their own changelogs under
 [`../CHANGELOG.md`](../CHANGELOG.md) and [`../pyo3/CHANGELOG.md`](../pyo3/CHANGELOG.md);
 they ship on independent cadences.
 
+## [v0.2.0] - 2026-06-08
+
+**Beta release of the Databricks SQL Kernel (Node.js binding).**
+Ships on npm as `@databricks/databricks-sql-kernel@0.2.0` (umbrella
++ 8 platform packages). Intended for downstream-driver adoption in
+`@databricks/sql`'s kernel-backed path.
+
+### Added
+- `Connection.executeStatementDirect(sql, options?)` — exposes the
+  kernel's directResults `execute_direct`, returning
+  `Either<Statement, AsyncStatement>` (terminal `Statement` for a
+  fast query, or an `AsyncStatement` poll/cancel handle for a slow
+  one). Consumed by the Node.js driver's default sync path.
+
+### Updated
+- Removed `ExecuteOptions.queryTimeoutSecs`: it threaded onto the
+  now-removed kernel `query_timeout_secs`, which abused the SEA
+  `wait_timeout` inline-hold window rather than being a real
+  statement timeout.
+
 ## [v0.1.2] - 2026-06-06
 
 Initial public release of the Node.js binding.
