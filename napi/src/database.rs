@@ -34,7 +34,8 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ResultConfig, Session, TlsConfig,
+    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ProxyConfig, ResultConfig, Session,
+    TlsConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -114,6 +115,25 @@ pub enum AuthMode {
 pub struct HeaderEntry {
     pub name: String,
     pub value: String,
+}
+
+/// Programmatic HTTP/HTTPS proxy configuration, mirroring the kernel's
+/// internal [`ProxyConfig`]. Supplied as a structured object rather than a
+/// flattened URL so credentials never have to be percent-encoded into the URL
+/// and the bypass-host list can be expressed.
+///
+/// - `url` — proxy endpoint, e.g. `"http://proxy.corp.example.com:8080"`. Must
+///   use the `http://` or `https://` scheme.
+/// - `username` / `password` — optional proxy basic-auth, applied via
+///   `reqwest`'s `Proxy::basic_auth` (not embedded in the URL).
+/// - `bypassHosts` — optional comma-separated host/domain list that should
+///   bypass the proxy (e.g. `"localhost,*.internal.corp"`).
+#[napi(object)]
+pub struct ProxyInput {
+    pub url: String,
+    pub username: Option<String>,
+    pub password: Option<String>,
+    pub bypass_hosts: Option<String>,
 }
 
 /// JS-visible options for opening a Databricks SQL session.
@@ -301,6 +321,29 @@ pub struct ConnectionOptions {
     /// Overall retry budget in whole seconds. Maps onto
     /// [`HttpConfig::overall_timeout`].
     pub retry_overall_timeout_secs: Option<u32>,
+    /// Programmatic HTTP/HTTPS proxy ([`ProxyInput`]) to route all kernel
+    /// traffic through. Carries the proxy `url`, optional basic-auth
+    /// `username` / `password`, and an optional `bypassHosts` list — mapped
+    /// field-for-field onto the kernel [`ProxyConfig`].
+    ///
+    /// Omitted ⇒ the kernel does NOT configure a proxy explicitly and
+    /// `reqwest`'s standard behaviour applies — the `HTTPS_PROXY` /
+    /// `HTTP_PROXY` / `NO_PROXY` environment variables are still honoured.
+    /// Setting this **overrides** those env vars. This complements the env-var
+    /// path: callers who cannot set process env vars (e.g. a long-lived Node
+    /// server) can now route a single connection through a proxy
+    /// programmatically.
+    pub proxy: Option<ProxyInput>,
+    /// Per-connection socket read timeout, in milliseconds. Caps how
+    /// long a single HTTP round-trip may block waiting on the server
+    /// before the request errors out. Maps onto the kernel
+    /// [`HttpConfig::request_timeout`] (the internal reqwest
+    /// `Client::timeout`).
+    ///
+    /// Omitted ⇒ kernel default (120 000 ms / 120 s). Napi-rs
+    /// serialises `u32` as JS `number`; the largest representable value
+    /// (~49.7 days) far exceeds any sensible socket timeout.
+    pub socket_timeout_ms: Option<u32>,
 }
 
 /// Map the JS `ConnectionOptions` auth fields onto the kernel
@@ -444,6 +487,12 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     if let Some(s) = options.retry_overall_timeout_secs {
         http.overall_timeout = std::time::Duration::from_secs(u64::from(s));
     }
+    // Per-connection socket read timeout. Maps onto the kernel's
+    // `request_timeout` (the reqwest `Client::timeout`). Omitted ⇒ kernel
+    // default (120 s).
+    if let Some(ms) = options.socket_timeout_ms {
+        http.request_timeout = std::time::Duration::from_millis(u64::from(ms));
+    }
     http
 }
 
@@ -518,10 +567,24 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
             result.complex_types_as_json = complex_types_as_json;
             builder = builder.result(result);
         }
-        // HTTP config (pool sizing + custom headers) was built up-front
-        // by `build_http_config` before the transport fields moved.
+        // HTTP config (pool sizing + custom headers + retry knobs +
+        // socket-read timeout) was built up-front by `build_http_config`
+        // before the transport fields moved.
         builder = builder.http(http_config);
         builder = builder.tls(tls_config);
+        // Programmatic HTTP/HTTPS proxy. Only wire a `ProxyConfig` when a
+        // proxy is supplied; otherwise leave it unset so the kernel keeps
+        // reqwest's env-var behaviour (HTTPS_PROXY / NO_PROXY).
+        // `ProxyConfig` is `#[non_exhaustive]` — construct via `default()`
+        // then mutate, mapping the structured `ProxyInput` field-for-field.
+        if let Some(p) = options.proxy {
+            let mut proxy = ProxyConfig::default();
+            proxy.url = Some(p.url);
+            proxy.username = p.username;
+            proxy.password = p.password;
+            proxy.bypass_hosts = p.bypass_hosts;
+            builder = builder.proxy(proxy);
+        }
         let session = builder.open().await.map_err(napi_err_from_kernel)?;
         let session_id = session.session_id().to_owned();
         Ok(Connection {
@@ -564,6 +627,8 @@ mod tests {
             retry_max_wait_secs: None,
             retry_max_attempts: None,
             retry_overall_timeout_secs: None,
+            proxy: None,
+            socket_timeout_ms: None,
         }
     }
 
