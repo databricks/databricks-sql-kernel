@@ -16,16 +16,6 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ### Updated
 
 ### Fixed
-- `auth_type="oauth-u2m"` now defaults scopes to `["sql", "offline_access"]`
-  when the caller passes neither `client_id` nor `scopes`. The Python binding
-  defaults the U2M client to `databricks-sql-python` (vs. the kernel's
-  `databricks-cli`), but that client isn't registered for the `all-apis` scope
-  the kernel intrinsically defaults to — so an out-of-the-box
-  `Session(auth_type="oauth-u2m")` failed the authorization request with
-  `access_denied — Scopes 'all-apis' are not assigned to the client
-  databricks-sql-python`. Defaults now match `PYSQL_OAUTH_SCOPES` in the
-  standalone Thrift connector, restoring `use_kernel=True` parity. A
-  caller-supplied `client_id` or `scopes` is still honoured verbatim.
 
 ---
 *Note: When making changes, please add your change under the appropriate

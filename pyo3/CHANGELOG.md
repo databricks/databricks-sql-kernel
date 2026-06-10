@@ -9,12 +9,25 @@ they ship on independent cadences.
 ## [v0.2.0] - 2026-06-08
 
 **Beta release of the Databricks SQL Kernel (Python binding).**
-Ships on PyPI as `databricks-sql-kernel==0.2.0`. The pyo3 surface
-is unchanged from v0.1.2; this release picks up the
+Ships on PyPI as `databricks-sql-kernel==0.2.0`. Picks up the
 kernel-side v0.2.0 behaviour changes (see the root
 [`../CHANGELOG.md`](../CHANGELOG.md) — `execute_direct`,
-`wait_timeout` removal, `CLOSED`-as-success fix). Intended for
-downstream-driver adoption in `databricks-sql-connector[kernel]`.
+`wait_timeout` removal, `CLOSED`-as-success fix) plus the pyo3-side
+fix below. Intended for downstream-driver adoption in
+`databricks-sql-connector[kernel]`.
+
+### Fixed
+- `auth_type="oauth-u2m"` now defaults scopes to `["sql", "offline_access"]`
+  when the caller passes neither `client_id` nor `scopes` (#153). The
+  Python binding defaults the U2M client to `databricks-sql-python` (vs.
+  the kernel's `databricks-cli`), but that client isn't registered for
+  the `all-apis` scope the kernel intrinsically defaults to — so an
+  out-of-the-box `Session(auth_type="oauth-u2m")` failed the
+  authorization request with `access_denied — Scopes 'all-apis' are not
+  assigned to the client databricks-sql-python`. Defaults now match
+  `PYSQL_OAUTH_SCOPES` in the standalone Thrift connector, restoring
+  `use_kernel=True` parity. A caller-supplied `client_id` or `scopes` is
+  still honoured verbatim.
 
 ## [v0.1.2] - 2026-06-06
 
