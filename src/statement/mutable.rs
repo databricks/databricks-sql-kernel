@@ -62,9 +62,9 @@ use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
-use crate::statement::spec::{ResultFormat, StatementSpec};
+use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
-use crate::types::sea::{ExecuteParams, StatementState};
+use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tracing::Instrument;
@@ -166,6 +166,15 @@ fn build_execute_params(
         exec_params
             .parameters
             .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
+    }
+    // Per-statement query tags: both `Statement::query_tags` and a raw
+    // `statement_conf["query_tags"]` land in the serialized conf string;
+    // the SEA wire wants the native `[{key, value}]` array, so convert here.
+    if let Some(serialized) = spec.statement_conf.get("query_tags") {
+        exec_params.query_tags = deserialize_query_tags(serialized)
+            .into_iter()
+            .map(|(key, value)| QueryTag { key, value })
+            .collect();
     }
     Ok((sql, exec_params))
 }
@@ -814,6 +823,43 @@ mod tests {
         let (sql, params) = build_execute_params(&spec, None).unwrap();
         assert_eq!(sql, "SELECT 1");
         assert_eq!(params.row_limit, Some(100));
+    }
+
+    #[test]
+    fn build_execute_params_threads_query_tags_to_wire_array() {
+        // Per-statement query tags set via Statement::query_tags must reach
+        // ExecuteParams.query_tags as the native SEA {key, value} array (the
+        // SEA request has no conf overlay). Regression guard for the seam
+        // where statement_conf["query_tags"] is converted to the array.
+        use std::collections::HashMap;
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT 1");
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), Some("eng".to_string()));
+        tags.insert("prod".to_string(), None);
+        spec.query_tags(tags).unwrap();
+
+        let (_sql, params) = build_execute_params(&spec, None).unwrap();
+        let got: std::collections::HashSet<(String, Option<String>)> = params
+            .query_tags
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect();
+        let expected: std::collections::HashSet<(String, Option<String>)> = [
+            ("team".to_string(), Some("eng".to_string())),
+            ("prod".to_string(), None),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn build_execute_params_no_query_tags_yields_empty_array() {
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT 1");
+        let (_sql, params) = build_execute_params(&spec, None).unwrap();
+        assert!(params.query_tags.is_empty());
     }
 
     #[test]

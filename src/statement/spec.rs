@@ -360,6 +360,93 @@ fn serialize_query_tags(tags: &HashMap<String, Option<String>>) -> String {
         .join(",")
 }
 
+/// Parse the comma-separated `key:value` wire shape produced by
+/// [`serialize_query_tags`] back into structured `(key, value)` pairs.
+///
+/// The Thrift backend sends query tags as a single `confOverlay.query_tags`
+/// string, but the SEA `POST /statements` API takes them as a native
+/// `[{key, value}]` array (it has no conf overlay). Both binding paths
+/// (`Statement::query_tags` and a raw `statement_conf["query_tags"]`) land
+/// in the same serialized string, so this is the single conversion point to
+/// the structured form for the SEA wire.
+///
+/// Inverse of the escaping in [`serialize_query_tags`]: a `\` escapes the
+/// next character (`\\`→`\`, `\:`→`:`, `\,`→`,`); the first *unescaped* `:`
+/// in a pair splits key from value; *unescaped* `,` separates pairs; a pair
+/// with no unescaped `:` is a bare key (value `None`). Empty input → no tags.
+pub(crate) fn deserialize_query_tags(serialized: &str) -> Vec<(String, Option<String>)> {
+    if serialized.is_empty() {
+        return Vec::new();
+    }
+    // Pass 1: split into pair substrings on unescaped commas, preserving
+    // the escape sequences for the per-pair split below.
+    let mut pairs: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut escaped = false;
+    for c in serialized.chars() {
+        if escaped {
+            current.push('\\');
+            current.push(c);
+            escaped = false;
+        } else if c == '\\' {
+            escaped = true;
+        } else if c == ',' {
+            pairs.push(std::mem::take(&mut current));
+        } else {
+            current.push(c);
+        }
+    }
+    if escaped {
+        current.push('\\'); // trailing lone backslash — keep verbatim
+    }
+    pairs.push(current);
+
+    // Pass 2: split each pair on its first unescaped ':' and unescape both
+    // sides. Skip empty pairs (e.g. a trailing comma).
+    pairs
+        .into_iter()
+        .filter(|p| !p.is_empty())
+        .map(|pair| {
+            let mut esc = false;
+            let mut split_at = None;
+            for (i, c) in pair.char_indices() {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == ':' {
+                    split_at = Some(i);
+                    break;
+                }
+            }
+            match split_at {
+                Some(i) => (
+                    unescape_query_tag(&pair[..i]),
+                    Some(unescape_query_tag(&pair[i + 1..])),
+                ),
+                None => (unescape_query_tag(&pair), None),
+            }
+        })
+        .collect()
+}
+
+/// Resolve `\X` escape sequences to the literal `X` (used by
+/// [`deserialize_query_tags`]).
+fn unescape_query_tag(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,5 +658,73 @@ mod tests {
         let s = serialize_query_tags(&tags);
         let pairs: std::collections::HashSet<&str> = s.split(',').collect();
         assert!(pairs == ["a:1", "b"].iter().copied().collect(), "got: {s}",);
+    }
+
+    // ─── deserialize_query_tags (SEA native-array conversion) ─────────────
+
+    #[test]
+    fn deserialize_query_tags_empty_string_yields_no_tags() {
+        assert!(deserialize_query_tags("").is_empty());
+    }
+
+    #[test]
+    fn deserialize_query_tags_single_pair() {
+        assert_eq!(
+            deserialize_query_tags("team:platform"),
+            vec![("team".to_string(), Some("platform".to_string()))]
+        );
+    }
+
+    #[test]
+    fn deserialize_query_tags_bare_key_is_none_value() {
+        assert_eq!(
+            deserialize_query_tags("production"),
+            vec![("production".to_string(), None)]
+        );
+    }
+
+    #[test]
+    fn deserialize_query_tags_unescapes_value_specials() {
+        // Inverse of `serialize_query_tags_matches_thrift_byte_shape_escapes`:
+        // wire `k:v\:1\,v\\2` → value `v:1,v\2`.
+        assert_eq!(
+            deserialize_query_tags("k:v\\:1\\,v\\\\2"),
+            vec![("k".to_string(), Some("v:1,v\\2".to_string()))]
+        );
+    }
+
+    #[test]
+    fn deserialize_query_tags_unescapes_key_backslash() {
+        // wire `k\\1:v` → key `k\1`.
+        assert_eq!(
+            deserialize_query_tags("k\\\\1:v"),
+            vec![("k\\1".to_string(), Some("v".to_string()))]
+        );
+    }
+
+    #[test]
+    fn deserialize_query_tags_empty_value_after_colon() {
+        // `key:` → an explicit empty-string value, distinct from a bare key.
+        assert_eq!(
+            deserialize_query_tags("key:"),
+            vec![("key".to_string(), Some(String::new()))]
+        );
+    }
+
+    #[test]
+    fn deserialize_query_tags_round_trips_serialize() {
+        // Round-trip a mixed map (valued tag with specials + a bare-key tag)
+        // through serialize → deserialize; compare order-insensitively since
+        // serialize follows non-deterministic HashMap order.
+        let mut tags = HashMap::new();
+        tags.insert("team".to_string(), Some("a:b,c\\d".to_string()));
+        tags.insert("prod".to_string(), None);
+        let round_tripped: std::collections::HashSet<(String, Option<String>)> =
+            deserialize_query_tags(&serialize_query_tags(&tags))
+                .into_iter()
+                .collect();
+        let expected: std::collections::HashSet<(String, Option<String>)> =
+            tags.into_iter().collect();
+        assert_eq!(round_tripped, expected);
     }
 }
