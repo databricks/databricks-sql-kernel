@@ -99,7 +99,7 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # (`RecordBatch`, `SchemaRef`); `arrow-ipc` is for the `StreamWriter`
 # we use on the encode side. Versions kept in lock-step with the
 # kernel's `arrow-*` deps to avoid two arrow versions in the dep graph.
-arrow-array = "57"
+arrow-array = "59"
 arrow-schema = "57"
 arrow-ipc = "57"
 
