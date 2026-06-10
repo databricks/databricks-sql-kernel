@@ -40,7 +40,7 @@ arrow-cast = "57"
 arrow-ord = "57"
 arrow-schema = "57"
 arrow-select = "57"
-arrow-ipc = "57"
+arrow-ipc = "59"
 
 # HTTP client and async runtime
 #
