@@ -7,9 +7,10 @@ name = "databricks-sql-kernel"
 version = "0.2.0"
 description = "Python bindings for the Databricks SQL Kernel (PyO3)"
 # Floor matches the tested CI matrix in
-# .github/workflows/pyo3-checks.yml (3.10 .. 3.14). 3.9 is no longer
-# exercised in CI, so it is not claimed as supported here.
-requires-python = ">=3.10"
+# .github/workflows/pyo3-checks.yml (3.9 .. 3.14). The abi3-py39
+# wheel (see pyo3/Cargo.toml) loads on every CPython at or above
+# this floor from a single artifact.
+requires-python = ">=3.9"
 license = { text = "Apache-2.0" }
 authors = [{ name = "Databricks" }]
 # Runtime dependency for downstream consumers. Major-version bound
@@ -20,15 +21,26 @@ authors = [{ name = "Databricks" }]
 # `[dependency-groups].dev` block below + the workflow comment in
 # `.github/workflows/pyo3-checks.yml` for the policy rationale.
 #
-# Floor is `>=23.0.1` to match databricks-sql-connector 5.0.0
-# (databricks/databricks-sql-python#818): pyarrow only ships cp314
-# (Python 3.14) wheels from 23.x onward, so the previous `<19` ceiling
-# forced a from-source build that fails on 3.14. Keeping the floor
-# aligned with the connector also keeps the two surfaces installable
-# side by side. The `<24` ceiling preserves the major-version upper
-# bound the go/pinning-python-deps policy requires (a future pyarrow
-# major then surfaces as a deliberate bump, not a silent auto-resolve).
-dependencies = ["pyarrow>=23.0.1,<24"]
+# Split by interpreter via PEP 508 environment markers because the
+# two ends of the supported range need different pyarrow floors:
+#
+#  * Python 3.10+: `>=23.0.1` matches databricks-sql-connector 5.0.0
+#    (databricks/databricks-sql-python#818). pyarrow only ships cp314
+#    (Python 3.14) wheels from 23.x onward, so an older ceiling forces
+#    a from-source build that fails on 3.14. Keeping the floor aligned
+#    with the connector also keeps the two surfaces installable side
+#    by side.
+#  * Python 3.9: pyarrow 23.x dropped 3.9 wheels, so 3.9 takes the
+#    last series that still ships them (`>=14,<19`). 3.9 never sees
+#    3.14, so the cp314 concern does not apply here.
+#
+# Both `<24` / `<19` ceilings preserve the major-version upper bound
+# the go/pinning-python-deps policy requires (a future pyarrow major
+# then surfaces as a deliberate bump, not a silent auto-resolve).
+dependencies = [
+    "pyarrow>=23.0.1,<24; python_version >= '3.10'",
+    "pyarrow>=14,<19; python_version < '3.10'",
+]
 
 # Dev / CI dependencies. PEP 735 standard; uv reads this directly.
 # CI runs `uv sync --group dev` (no `--frozen`, no committed
