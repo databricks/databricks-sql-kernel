@@ -51,6 +51,7 @@ pub(crate) mod result;
 pub(crate) mod runtime;
 pub(crate) mod statement;
 pub(crate) mod util;
+pub(crate) mod zerocopy;
 
 /// Returns the native binding's crate version (`CARGO_PKG_VERSION`).
 ///

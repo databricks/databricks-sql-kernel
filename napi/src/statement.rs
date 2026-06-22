@@ -381,6 +381,77 @@ impl Statement {
         .await
     }
 
+    /// Copy-into-cage variant of `fetchNextBatch` (Flavour A): hands the
+    /// batch's Arrow buffers to JS as in-cage (V8-allocated) `ArrayBuffer`s
+    /// with the bytes `memcpy`'d in, instead of serialising to Arrow IPC
+    /// bytes (`fetchNextBatch`). See `crate::zerocopy::CopyCageBatch`.
+    ///
+    /// Cage-safe (works under the V8 sandbox / Electron) and GC-clean — V8
+    /// owns the bytes, so no Arc/finalizer is needed. Costs one plain copy
+    /// per buffer but still avoids the IPC path's serialize + decode passes.
+    ///
+    /// Any offset-sliced array is compacted to offset 0 first
+    /// (`zerocopy::compact_to_offset_zero`), because the JS importer's
+    /// `makeData` cannot apply a logical element offset.
+    ///
+    /// Returns `null` at end of stream, exactly like `fetchNextBatch`. Same
+    /// error/auto-close/finished semantics — only the result encoding
+    /// differs, so the two are interchangeable per-fetch.
+    ///
+    /// `ts_return_type` pins a structural shape in the generated d.ts:
+    /// `CopyCageBatch` is a manual `ToNapiValue` type (not a `#[napi(object)]`
+    /// struct), so napi-rs has no interface to emit for it. The driver
+    /// re-types the value precisely via `KernelArrowImport.ts`.
+    #[napi(ts_return_type = "Promise<{ numRows: number, columns: any[] } | null>")]
+    pub async fn fetch_next_batch_copycage(
+        &self,
+    ) -> napi::Result<Option<crate::zerocopy::CopyCageBatch>> {
+        let inner = Arc::clone(&self.inner);
+        let finished = Arc::clone(&self.finished);
+        guarded(async move {
+            let mut guard = inner.lock().await;
+            let inner_state = guard.as_mut().ok_or_else(statement_closed_err)?;
+            let maybe_batch = inner_state
+                .next_batch()
+                .await
+                .map_err(napi_err_from_kernel)?;
+            let Some(batch) = maybe_batch else {
+                finished.store(true, Ordering::Release);
+                return Ok(None);
+            };
+            let record_batch = match batch {
+                ResultBatch::Arrow(rb) => rb,
+                _ => {
+                    return Err(napi_err_from_kernel(
+                        KernelError::invalid_argument().message(format!(
+                            "non-Arrow ResultBatch variant from kernel — \
+                             databricks-sql-kernel-napi v{} cannot decode this batch \
+                             shape, upgrade the binding",
+                            env!("CARGO_PKG_VERSION"),
+                        )),
+                    ));
+                }
+            };
+            // Normalise any offset-sliced array to offset 0 — the JS importer
+            // builds every `Data` at offset 0 and cannot honour a logical
+            // element offset, so a sliced array would read the wrong rows.
+            // Inline (non-sliced) Databricks batches return unchanged.
+            let record_batch = crate::zerocopy::compact_to_offset_zero(record_batch.clone())
+                .map_err(|e| {
+                    napi_err_from_kernel(
+                        KernelError::internal()
+                            .message(format!("copycage offset-0 compaction failed: {e}")),
+                    )
+                })?;
+            // `RecordBatch::clone` is a shallow Arc bump (no buffer copy); the
+            // owned batch lives until the bytes are memcpy'd into the cage in
+            // `CopyCageBatch`'s `ToNapiValue`, after which it drops — V8 owns
+            // the copies, so no finalizer keeps the native memory alive.
+            Ok(Some(crate::zerocopy::CopyCageBatch::new(record_batch)))
+        })
+        .await
+    }
+
     /// Result schema as an Arrow IPC payload (schema header only, no
     /// record-batch message). Available before any batches have been
     /// fetched, and remains available after `close()` — the kernel

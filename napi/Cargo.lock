@@ -410,8 +410,11 @@ name = "databricks-sql-kernel-napi"
 version = "0.2.0"
 dependencies = [
  "arrow-array",
+ "arrow-buffer",
+ "arrow-data",
  "arrow-ipc",
  "arrow-schema",
+ "arrow-select",
  "chrono",
  "databricks-sql-kernel",
  "futures",

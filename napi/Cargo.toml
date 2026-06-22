@@ -102,6 +102,19 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 arrow-array = "57"
 arrow-schema = "57"
 arrow-ipc = "57"
+# Copy-into-cage result handoff (`zerocopy.rs`): we read each `RecordBatch`'s
+# `ArrayData` buffer tree and copy each buffer into a fresh in-cage
+# (V8-allocated) napi `ArrayBuffer`. `arrow-data` names `ArrayData`,
+# `arrow-buffer` names `Buffer` / `NullBuffer` / `MutableBuffer`. Both arrive
+# transitively via `arrow-array`; declared explicitly (same `57` line) so we
+# can name the types directly without leaning on a re-export.
+arrow-data = "57"
+arrow-buffer = "57"
+# `arrow-select::concat::concat_batches` compacts a sliced (non-zero-offset)
+# batch into an offset-0 copy before the copycage handoff — the JS importer's
+# `makeData` cannot apply a logical element offset, so the kernel normalises
+# offsets to 0 here. Same `57` line as the rest of the arrow deps.
+arrow-select = "57"
 
 # Error envelope serialization. Already a kernel transitive dep; the
 # direct declaration is so we can use `serde_json::json!` in

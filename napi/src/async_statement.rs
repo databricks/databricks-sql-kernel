@@ -474,6 +474,60 @@ impl AsyncResultHandle {
         .await
     }
 
+    /// Copy-into-cage variant of `fetchNextBatch` (Flavour A): hands the
+    /// batch's Arrow buffers to JS as in-cage (V8-allocated) `ArrayBuffer`s
+    /// with the bytes `memcpy`'d in, instead of serialising to Arrow IPC
+    /// bytes. Mirrors `Statement::fetch_next_batch_copycage` exactly — this
+    /// is the handle the *async query path* (`awaitResult()`) exposes, so
+    /// the driver's normal `executeStatement` flow can use copycage rather
+    /// than silently falling back to IPC. See `crate::zerocopy::CopyCageBatch`.
+    ///
+    /// Any offset-sliced array is compacted to offset 0 first
+    /// (`zerocopy::compact_to_offset_zero`); the JS importer's `makeData`
+    /// cannot apply a logical element offset. Returns `null` at end of
+    /// stream, exactly like `fetchNextBatch`.
+    #[napi(ts_return_type = "Promise<{ numRows: number, columns: any[] } | null>")]
+    pub async fn fetch_next_batch_copycage(
+        &self,
+    ) -> napi::Result<Option<crate::zerocopy::CopyCageBatch>> {
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let mut guard = inner.lock().await;
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| closed_err("AsyncResultHandle"))?;
+            let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
+            let Some(batch) = maybe_batch else {
+                return Ok(None);
+            };
+            let record_batch = match batch {
+                ResultBatch::Arrow(rb) => rb,
+                _ => {
+                    return Err(napi_err_from_kernel(
+                        KernelError::invalid_argument().message(format!(
+                            "non-Arrow ResultBatch variant from kernel — \
+                             databricks-sea-native v{} cannot decode this batch \
+                             shape, upgrade the binding",
+                            env!("CARGO_PKG_VERSION"),
+                        )),
+                    ));
+                }
+            };
+            // Normalise any offset-sliced array to offset 0 — the JS importer
+            // builds every `Data` at offset 0 and cannot honour a logical
+            // element offset. Inline (non-sliced) batches return unchanged.
+            let record_batch = crate::zerocopy::compact_to_offset_zero(record_batch.clone())
+                .map_err(|e| {
+                    napi_err_from_kernel(
+                        KernelError::internal()
+                            .message(format!("copycage offset-0 compaction failed: {e}")),
+                    )
+                })?;
+            Ok(Some(crate::zerocopy::CopyCageBatch::new(record_batch)))
+        })
+        .await
+    }
+
     /// Result schema as an Arrow IPC payload (schema header only,
     /// no record-batch message). Available before any batches have
     /// been fetched. Sync because the body has no `.await` —
