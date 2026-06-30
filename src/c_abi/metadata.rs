@@ -99,7 +99,7 @@ where
     )
         -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResultStream>> + '_>>,
 {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(session) = (session as *const Session).as_ref() else {
         return store_null("metadata: session must not be null");
     };
@@ -301,7 +301,7 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
 
 /// Store an `InvalidArgument` for a null pointer and return its code.
 fn store_null(msg: &str) -> KernelStatusCode {
-    crate::ffi::error::store_error(Error::invalid_argument().message(msg));
+    crate::c_abi::error::store_error(Error::invalid_argument().message(msg));
     KernelStatusCode::InvalidArgument
 }
 

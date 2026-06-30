@@ -20,6 +20,26 @@
 //! C strings / structs into `SessionConfig`, and exposes opaque handles
 //! for `Session`, `Statement`, `ExecutedStatement`,
 //! `ExecutedAsyncStatement`, and `ResultStream`.
+//!
+//! ## Why this lives in the core crate (and the bindings don't)
+//!
+//! The PyO3 (`pyo3/`) and napi (`napi/`) bindings are *separate Cargo
+//! workspaces* that depend on the kernel via `path = ".."`. They are
+//! split out for one reason: they build the kernel with `tls-rustls`,
+//! while the kernel core builds with the default `tls-native`. Living in
+//! one workspace would unify those features (`tls-native ∪ tls-rustls`),
+//! trip the mutual-exclusion `compile_error!` in `lib.rs`, and otherwise
+//! link two TLS stacks into one artifact.
+//!
+//! The C ABI has no such conflict — it uses the same `tls-native` backend
+//! as the core. Keeping it here means it compiles straight into
+//! `libdatabricks_sql_kernel.{a,so}`, which is exactly what a C / C++
+//! consumer wants to link: one static library, no satellite crate. The
+//! module is named `c_abi` (not `ffi`) to distinguish it from the
+//! PyO3 / napi FFI bindings, which are also "FFI" in the broad sense.
+//!
+//! A `cbindgen`-generated header is a v0.1 follow-up; today the header at
+//! `include/databricks_kernel.h` is hand-maintained alongside this module.
 
 // Each `extern "C"` function carries its own `# Safety` section; the
 // module-wide allow that masked them in the skeleton phase is gone now
@@ -85,7 +105,7 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
 /// at the `block_on` edge and surfaced as `Internal` rather than
 /// unwinding across the FFI boundary (which is UB).
 ///
-/// [`KernelStatusCode`]: crate::ffi::KernelStatusCode
+/// [`KernelStatusCode`]: crate::c_abi::KernelStatusCode
 /// [`Error`]: crate::kernel_error::Error
 pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
 where

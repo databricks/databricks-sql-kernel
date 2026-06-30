@@ -128,7 +128,7 @@ pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
 
 /// Crate-internal: write a typed kernel [`Error`] into the thread-local
 /// last-error buffer. Every FFI function that returns a non-`Success`
-/// status code calls this (via [`crate::ffi::block_on_ffi`] or directly)
+/// status code calls this (via [`crate::c_abi::block_on_ffi`] or directly)
 /// so the consumer can retrieve the structured detail with
 /// [`kernel_get_last_error`].
 pub(crate) fn store_error(err: Error) {
@@ -159,7 +159,7 @@ pub(crate) fn store_error(err: Error) {
 }
 
 /// Crate-internal: clear the thread-local last-error buffer. Called at
-/// the entry of every FFI function (via [`crate::ffi::block_on_ffi`] or
+/// the entry of every FFI function (via [`crate::c_abi::block_on_ffi`] or
 /// directly) so a previous call's stale error can't leak into a
 /// subsequent one that succeeds.
 pub(crate) fn clear_error() {

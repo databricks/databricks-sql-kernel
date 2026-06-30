@@ -28,8 +28,8 @@
 //! ## Error reporting convention
 //!
 //! Every function returns [`KernelStatusCode`]. On any non-`Success`
-//! return, the consumer calls [`crate::ffi::error::kernel_get_last_error`]
-//! to populate a [`crate::ffi::error::KernelError`] with the typed
+//! return, the consumer calls [`crate::c_abi::error::kernel_get_last_error`]
+//! to populate a [`crate::c_abi::error::KernelError`] with the typed
 //! detail. The thread-local error buffer is reset at the start of every
 //! FFI function.
 
@@ -229,7 +229,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
     stmt: *mut kernel_statement_t,
     out: *mut *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(stmt) = statement_mut(stmt) else {
         return store_null_handle("kernel_statement_execute: stmt must not be null");
     };
@@ -266,7 +266,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
 /// not previously closed.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_close(stmt: *mut kernel_statement_t) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if stmt.is_null() {
         return store_null_handle("kernel_statement_close: stmt must not be null");
     }
@@ -294,7 +294,7 @@ pub unsafe extern "C" fn kernel_executed_statement_get_result_stream(
     exec: *mut kernel_executed_statement_t,
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if exec.is_null() {
         return store_null_handle("get_result_stream: exec must not be null");
     }
@@ -330,7 +330,7 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
 pub unsafe extern "C" fn kernel_executed_statement_close(
     exec: *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if exec.is_null() {
         return store_null_handle("kernel_executed_statement_close: exec must not be null");
     }
@@ -354,8 +354,8 @@ pub unsafe extern "C" fn kernel_statement_submit(
     out: *mut *mut kernel_executed_async_statement_t,
 ) -> KernelStatusCode {
     let _ = (stmt, out);
-    crate::ffi::error::clear_error();
-    crate::ffi::error::store_error(Error::invalid_argument().message(
+    crate::c_abi::error::clear_error();
+    crate::c_abi::error::store_error(Error::invalid_argument().message(
         "async submit is not exposed over the v0 C ABI; use the synchronous execute path",
     ));
     KernelStatusCode::InvalidArgument
@@ -372,7 +372,7 @@ unsafe fn with_statement(
     stmt: *mut kernel_statement_t,
     f: impl FnOnce(&mut Statement) -> Result<(), Error>,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(stmt) = statement_mut(stmt) else {
         return store_null_handle("statement handle must not be null");
     };
@@ -380,7 +380,7 @@ unsafe fn with_statement(
         Ok(()) => KernelStatusCode::Success,
         Err(e) => {
             let code = KernelStatusCode::from(e.code);
-            crate::ffi::error::store_error(e);
+            crate::c_abi::error::store_error(e);
             code
         }
     }
@@ -389,6 +389,6 @@ unsafe fn with_statement(
 /// Store an `InvalidArgument` for a null handle and return the matching
 /// status code.
 fn store_null_handle(msg: &str) -> KernelStatusCode {
-    crate::ffi::error::store_error(Error::invalid_argument().message(msg));
+    crate::c_abi::error::store_error(Error::invalid_argument().message(msg));
     KernelStatusCode::InvalidArgument
 }

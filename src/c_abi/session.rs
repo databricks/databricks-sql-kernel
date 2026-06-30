@@ -108,9 +108,9 @@ unsafe fn required_str(ptr: *const c_char, what: &str) -> Result<String, Error> 
 pub unsafe extern "C" fn kernel_session_config_new(
     out: *mut *mut KernelSessionConfig,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if out.is_null() {
-        crate::ffi::error::store_error(
+        crate::c_abi::error::store_error(
             Error::invalid_argument().message("kernel_session_config_new: out must not be null"),
         );
         return KernelStatusCode::InvalidArgument;
@@ -257,9 +257,9 @@ unsafe fn set_on_config(
     config: *mut KernelSessionConfig,
     f: impl FnOnce(&mut KernelSessionConfig) -> Result<(), Error>,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(config) = config.as_mut() else {
-        crate::ffi::error::store_error(
+        crate::c_abi::error::store_error(
             Error::invalid_argument().message("config handle must not be null"),
         );
         return KernelStatusCode::InvalidArgument;
@@ -268,7 +268,7 @@ unsafe fn set_on_config(
         Ok(()) => KernelStatusCode::Success,
         Err(e) => {
             let code = KernelStatusCode::from(e.code);
-            crate::ffi::error::store_error(e);
+            crate::c_abi::error::store_error(e);
             code
         }
     }
@@ -291,9 +291,9 @@ pub unsafe extern "C" fn kernel_session_open(
     config: *mut KernelSessionConfig,
     out: *mut *mut kernel_session_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if config.is_null() || out.is_null() {
-        crate::ffi::error::store_error(
+        crate::c_abi::error::store_error(
             Error::invalid_argument()
                 .message("kernel_session_open: config and out must be non-null"),
         );
@@ -377,9 +377,9 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
 /// to any other `kernel_*` function is UB.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if session.is_null() {
-        crate::ffi::error::store_error(
+        crate::c_abi::error::store_error(
             Error::invalid_argument().message("kernel_session_close: session must not be null"),
         );
         return KernelStatusCode::InvalidArgument;
@@ -404,9 +404,9 @@ pub unsafe extern "C" fn kernel_session_new_statement(
     session: *mut kernel_session_t,
     out: *mut *mut super::statement::kernel_statement_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if session.is_null() || out.is_null() {
-        crate::ffi::error::store_error(
+        crate::c_abi::error::store_error(
             Error::invalid_argument()
                 .message("kernel_session_new_statement: session and out must be non-null"),
         );

@@ -97,7 +97,7 @@ pub unsafe extern "C" fn kernel_result_stream_get_schema(
     stream: *mut kernel_result_stream_t,
     out: *mut FFI_ArrowSchema,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(inner) = (stream as *mut ResultStreamInner).as_mut() else {
         return store_null("kernel_result_stream_get_schema: stream must not be null");
     };
@@ -140,7 +140,7 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     let Some(inner) = (stream as *mut ResultStreamInner).as_mut() else {
         return store_null("kernel_result_stream_next_batch: stream must not be null");
     };
@@ -215,7 +215,7 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
 pub unsafe extern "C" fn kernel_result_stream_close(
     stream: *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
-    crate::ffi::error::clear_error();
+    crate::c_abi::error::clear_error();
     if stream.is_null() {
         return store_null("kernel_result_stream_close: stream must not be null");
     }
@@ -225,13 +225,13 @@ pub unsafe extern "C" fn kernel_result_stream_close(
 
 /// Store an `InvalidArgument` for a null pointer and return its code.
 fn store_null(msg: &str) -> KernelStatusCode {
-    crate::ffi::error::store_error(Error::invalid_argument().message(msg));
+    crate::c_abi::error::store_error(Error::invalid_argument().message(msg));
     KernelStatusCode::InvalidArgument
 }
 
 /// Store a typed error and return its mapped status code.
 fn store_error(e: Error) -> KernelStatusCode {
     let code = KernelStatusCode::from(e.code);
-    crate::ffi::error::store_error(e);
+    crate::c_abi::error::store_error(e);
     code
 }
