@@ -19,10 +19,10 @@
 //! function clears the buffer at entry and writes to it on error;
 //! callers fetch detail with `kernel_get_last_error`.
 
-#![allow(dead_code, unused_variables)]
-
+use super::KernelStatusCode;
 use crate::kernel_error::Error;
-use std::ffi::c_char;
+use std::cell::RefCell;
+use std::ffi::{c_char, CString};
 
 /// Mirror of `crate::kernel_error::Error` in `repr(C)` form.
 ///
@@ -47,10 +47,52 @@ pub struct KernelError {
     pub query_id: *const c_char,
 }
 
+/// Owned backing store for the thread-local last error.
+///
+/// Holds the `CString`s alive so the `*const c_char` pointers handed
+/// back through [`KernelError`] stay valid until the next FFI call on
+/// this thread clears or overwrites the buffer. `code == None` means
+/// "no error recorded since the last clear".
+#[derive(Default)]
+struct LastError {
+    code: Option<crate::kernel_error::ErrorCode>,
+    message: Option<CString>,
+    sql_state: Option<CString>,
+    vendor_code: i32,
+    http_status: u16,
+    retryable: bool,
+    query_id: Option<CString>,
+}
+
+thread_local! {
+    /// Per-thread last-error slot. The C ABI is call-response on a
+    /// single thread: a function clears this on entry, populates it on
+    /// failure, and the caller reads it via `kernel_get_last_error`
+    /// before making the next FFI call on the same thread.
+    static LAST_ERROR: RefCell<LastError> = RefCell::new(LastError::default());
+}
+
+/// Turn a Rust `String` into a `CString`, replacing any interior NUL
+/// bytes with `?` so a message that happens to contain `\0` can't make
+/// `CString::new` fail (which would lose the error detail entirely).
+fn to_cstring_lossy(s: &str) -> CString {
+    // Fast path: no interior NUL.
+    match CString::new(s) {
+        Ok(c) => c,
+        Err(_) => {
+            let sanitised: String = s.chars().map(|c| if c == '\0' { '?' } else { c }).collect();
+            CString::new(sanitised).unwrap_or_else(|_| CString::new("").expect("empty CString"))
+        }
+    }
+}
+
 /// Fetch the last error set on this thread.
 ///
 /// Returns `false` if no error has been recorded since the last
-/// `clear_last_error()` (or thread-start).
+/// [`clear_error`] (or thread start), leaving `*out` untouched. On
+/// `true`, `*out` is fully populated; its `*const c_char` fields point
+/// into this thread's last-error buffer and are valid until the next
+/// `kernel_*` call on this thread.
 ///
 /// # Safety
 /// `out` must be a valid, writable pointer to a `KernelError`. The
@@ -58,23 +100,165 @@ pub struct KernelError {
 /// this thread.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
-    unimplemented!("PR 7a: thread-local last-error pattern")
+    if out.is_null() {
+        return false;
+    }
+    LAST_ERROR.with(|cell| {
+        let last = cell.borrow();
+        let Some(code) = last.code else {
+            return false;
+        };
+        let as_ptr = |c: &Option<CString>| c.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+        // SAFETY: `out` is non-null and writable per the contract.
+        std::ptr::write(
+            out,
+            KernelError {
+                code: KernelStatusCode::from(code) as i32,
+                message: as_ptr(&last.message),
+                sql_state: as_ptr(&last.sql_state),
+                vendor_code: last.vendor_code,
+                http_status: last.http_status,
+                retryable: last.retryable,
+                query_id: as_ptr(&last.query_id),
+            },
+        );
+        true
+    })
 }
 
-/// Crate-internal: write a typed kernel `Error` into the thread-local
+/// Crate-internal: write a typed kernel [`Error`] into the thread-local
 /// last-error buffer. Every FFI function that returns a non-`Success`
-/// status code calls this with the underlying `Error` first; the
-/// consumer then retrieves it via `kernel_get_last_error`.
-///
-/// PR 7a fills the body. The signature is captured here so PR 7a's
-/// implementation is a body-only change with no public-API surface.
+/// status code calls this (via [`crate::ffi::block_on_ffi`] or directly)
+/// so the consumer can retrieve the structured detail with
+/// [`kernel_get_last_error`].
 pub(crate) fn store_error(err: Error) {
-    unimplemented!("PR 7a: serialize Error into the thread-local KernelError buffer")
+    LAST_ERROR.with(|cell| {
+        let mut last = cell.borrow_mut();
+        // Prefer the structured `vendor_code`; the SEA wire ships a
+        // string `error_code` slug, which we surface in the message
+        // rather than the numeric slot (the C struct has no string
+        // error-code field in v0).
+        let mut message = err.message.clone();
+        if let Some(ec) = err.error_code.as_deref() {
+            if !message.is_empty() {
+                message.push_str("; ");
+            }
+            message.push_str("error_code=");
+            message.push_str(ec);
+        }
+        *last = LastError {
+            code: Some(err.code),
+            message: Some(to_cstring_lossy(&message)),
+            sql_state: err.sql_state.as_deref().map(to_cstring_lossy),
+            vendor_code: err.vendor_code.unwrap_or(0),
+            http_status: err.http_status.unwrap_or(0),
+            retryable: err.retryable,
+            query_id: err.query_id.as_deref().map(to_cstring_lossy),
+        };
+    });
 }
 
-/// Crate-internal: clear the thread-local last-error buffer. Called
-/// at the entry of every FFI function so a previous thread's stale
-/// error doesn't leak into a subsequent call.
+/// Crate-internal: clear the thread-local last-error buffer. Called at
+/// the entry of every FFI function (via [`crate::ffi::block_on_ffi`] or
+/// directly) so a previous call's stale error can't leak into a
+/// subsequent one that succeeds.
 pub(crate) fn clear_error() {
-    unimplemented!("PR 7a: zero out the thread-local")
+    LAST_ERROR.with(|cell| *cell.borrow_mut() = LastError::default());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Helper: read the thread-local error into a `KernelError` and run
+    /// `f` with the borrowed C strings still alive.
+    fn with_last_error<R>(f: impl FnOnce(Option<KernelError>) -> R) -> R {
+        let mut out = std::mem::MaybeUninit::<KernelError>::uninit();
+        // SAFETY: out is a valid writable pointer.
+        let present = unsafe { kernel_get_last_error(out.as_mut_ptr()) };
+        if present {
+            // SAFETY: kernel_get_last_error returned true so out is init.
+            f(Some(unsafe { out.assume_init() }))
+        } else {
+            f(None)
+        }
+    }
+
+    #[test]
+    fn no_error_after_clear() {
+        clear_error();
+        with_last_error(|e| assert!(e.is_none()));
+    }
+
+    #[test]
+    fn store_then_fetch_roundtrips_core_fields() {
+        store_error(
+            Error::sql_error()
+                .message("boom")
+                .with_sql_state("42601")
+                .with_http_status(400)
+                .with_query_id("q-123"),
+        );
+        with_last_error(|e| {
+            let e = e.expect("error present");
+            assert_eq!(e.code, KernelStatusCode::SqlError as i32);
+            assert_eq!(e.http_status, 400);
+            // SAFETY: message is non-null after a store.
+            let msg = unsafe { std::ffi::CStr::from_ptr(e.message) }
+                .to_str()
+                .unwrap();
+            assert!(msg.contains("boom"));
+            let ss = unsafe { std::ffi::CStr::from_ptr(e.sql_state) }
+                .to_str()
+                .unwrap();
+            assert_eq!(ss, "42601");
+            let qid = unsafe { std::ffi::CStr::from_ptr(e.query_id) }
+                .to_str()
+                .unwrap();
+            assert_eq!(qid, "q-123");
+        });
+        clear_error();
+    }
+
+    #[test]
+    fn store_error_folds_error_code_slug_into_message() {
+        store_error(
+            Error::sql_error()
+                .message("statement gone")
+                .with_error_code("STATEMENT_NOT_FOUND"),
+        );
+        with_last_error(|e| {
+            let e = e.expect("error present");
+            let msg = unsafe { std::ffi::CStr::from_ptr(e.message) }
+                .to_str()
+                .unwrap();
+            assert!(msg.contains("statement gone"));
+            assert!(msg.contains("STATEMENT_NOT_FOUND"));
+        });
+        clear_error();
+    }
+
+    #[test]
+    fn retryable_flag_carries_through() {
+        store_error(Error::unavailable().message("cold start"));
+        with_last_error(|e| {
+            let e = e.expect("error present");
+            assert_eq!(e.code, KernelStatusCode::Unavailable as i32);
+            assert!(e.retryable);
+        });
+        clear_error();
+    }
+
+    #[test]
+    fn message_with_interior_nul_is_sanitised() {
+        store_error(Error::internal().message("a\0b"));
+        with_last_error(|e| {
+            let e = e.expect("error present");
+            let msg = unsafe { std::ffi::CStr::from_ptr(e.message) }
+                .to_str()
+                .unwrap();
+            assert_eq!(msg, "a?b");
+        });
+        clear_error();
+    }
 }

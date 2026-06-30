@@ -12,48 +12,55 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Statement FFI — four opaque handle types per `docs/spec-v0.md`
-//! addendum A1.
+//! Statement FFI — set sql, bind params, execute, and fetch results.
+//!
+//! ## Scope in v0
+//!
+//! The C ABI wires the **synchronous** execute path
+//! (`kernel_statement_execute` → `kernel_executed_statement_t` →
+//! `kernel_result_stream_t`), which is what the ODBC consumer needs. The
+//! **async** submit path (`kernel_statement_submit` +
+//! `kernel_executed_async_statement_*`) keeps its skeleton declarations
+//! and `unimplemented!()` bodies until a consumer needs caller-driven
+//! polling over the C ABI; Rust-crate consumers use `Statement::submit`
+//! directly.
 //!
 //! ## Error reporting convention
 //!
 //! Every function returns [`KernelStatusCode`]. On any non-`Success`
 //! return, the consumer calls [`crate::ffi::error::kernel_get_last_error`]
 //! to populate a [`crate::ffi::error::KernelError`] with the typed
-//! detail (sql_state, vendor_code, retryable, query_id, …). The
-//! thread-local error buffer is reset at the start of every FFI
-//! function.
+//! detail. The thread-local error buffer is reset at the start of every
+//! FFI function.
 
-#![allow(dead_code, unused_variables, non_camel_case_types)]
+#![allow(non_camel_case_types)]
 
-use super::KernelStatusCode;
-use std::ffi::c_char;
+use super::result::{into_raw_executed_stream, kernel_result_stream_t};
+use super::{block_on_ffi, KernelStatusCode};
+use crate::kernel_error::Error;
+use crate::statement::executed::ExecutedStatement;
+use crate::statement::mutable::Statement;
+use crate::statement::spec::TypedValue;
+use std::ffi::{c_char, CStr};
 
 // ─── Opaque handles ──────────────────────────────────────────────────────────
 
-/// Plain-data spec (sql, params, conf, result format). Constructible
-/// without a session; useful for caller-side spec building.
-#[repr(C)]
-pub struct kernel_statement_spec_t {
-    _private: [u8; 0],
-}
-
-/// Lifecycle owner. Returned by `kernel_session_new_statement`. Owns
-/// one `kernel_statement_spec_t` and at most one live executed handle.
+/// Lifecycle owner. Returned by `kernel_session_new_statement`. Boxed
+/// [`Statement`] on the Rust side.
 #[repr(C)]
 pub struct kernel_statement_t {
     _private: [u8; 0],
 }
 
 /// Sync-consumption executed handle. Returned by
-/// `kernel_statement_execute`.
+/// [`kernel_statement_execute`]. Boxed [`ExecutedStatement`].
 #[repr(C)]
 pub struct kernel_executed_statement_t {
     _private: [u8; 0],
 }
 
 /// Async-consumption executed handle. Returned by
-/// `kernel_statement_submit`.
+/// `kernel_statement_submit` (deferred in v0 — see module docs).
 #[repr(C)]
 pub struct kernel_executed_async_statement_t {
     _private: [u8; 0],
@@ -62,14 +69,8 @@ pub struct kernel_executed_async_statement_t {
 /// Server-side execution status — C-side mirror of
 /// [`crate::statement::executed_async::StatementStatus`].
 ///
-/// The Rust-side `StatementStatus::Failed(Error)` carries an `Error`
-/// payload that cannot be encoded as a scalar enum. The C ABI
-/// flattens to the kind tag here; on `Failed`, the consumer calls
-/// [`crate::ffi::error::kernel_get_last_error`] to retrieve the
-/// detail.
-///
-/// `#[repr(C)]` with explicit discriminants so wrappers can declare
-/// the enum verbatim in their generated bindings.
+/// `#[repr(C)]` with explicit discriminants so wrappers can declare the
+/// enum verbatim in their generated bindings.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KernelStatementStatusKind {
@@ -77,226 +78,317 @@ pub enum KernelStatementStatusKind {
     Running = 1,
     Succeeded = 2,
     /// Server-side execution failed. Call `kernel_get_last_error` for
-    /// the underlying `KernelError` (sql_state, vendor_code, …).
+    /// the underlying `KernelError`.
     Failed = 3,
     Cancelled = 4,
     Closed = 5,
 }
 
-// ─── Spec setters ────────────────────────────────────────────────────────────
+// ─── Crate-internal raw-handle helpers ───────────────────────────────────────
 
-#[no_mangle]
-pub unsafe extern "C" fn kernel_statement_spec_new(
-    out: *mut *mut kernel_statement_spec_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b: alloc StatementSpec, return owned ptr")
+/// Box a [`Statement`] and erase it to the opaque C handle type.
+pub(crate) fn into_raw_statement(stmt: Statement) -> *mut kernel_statement_t {
+    Box::into_raw(Box::new(stmt)) as *mut kernel_statement_t
 }
 
-/// Free a `kernel_statement_spec_t`.
+/// Borrow the boxed [`Statement`] behind a handle, mutably.
 ///
 /// # Safety
-///
-/// `spec` must have been returned by `kernel_statement_spec_new` and
-/// not previously freed. After this call, `spec` is invalid; passing
-/// it to any other `kernel_*` function is UB.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_statement_spec_free(
-    spec: *mut kernel_statement_spec_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+/// `stmt` must be a live handle from `kernel_session_new_statement`.
+unsafe fn statement_mut<'a>(stmt: *mut kernel_statement_t) -> Option<&'a mut Statement> {
+    (stmt as *mut Statement).as_mut()
 }
 
+// ─── SQL + parameter binding ─────────────────────────────────────────────────
+
+/// Set the statement's SQL text, replacing any previously set SQL.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `sql` must be a
+/// NUL-terminated C string.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_statement_spec_set_sql(
-    spec: *mut kernel_statement_spec_t,
+pub unsafe extern "C" fn kernel_statement_set_sql(
+    stmt: *mut kernel_statement_t,
     sql: *const c_char,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+    with_statement(stmt, |stmt| {
+        if sql.is_null() {
+            return Err(Error::invalid_argument().message("sql must not be null"));
+        }
+        let sql = CStr::from_ptr(sql)
+            .to_str()
+            .map_err(|_| Error::invalid_argument().message("sql is not valid UTF-8"))?;
+        stmt.spec().sql(sql);
+        Ok(())
+    })
 }
 
-// PR 7b: bind_param, bind_param_named, set_statement_conf, set_result_format
-
-// ─── Statement (lifecycle owner) ─────────────────────────────────────────────
-
-/// Borrow the statement's spec. Mutating the returned spec mutates
-/// the statement's spec in place.
+/// Bind a 1-based positional parameter to a NULL value.
 ///
-/// **Lifetime:** the returned pointer is valid as long as `stmt` is.
-/// Do not pass it to `kernel_statement_spec_free` — it is borrowed,
-/// not owned.
+/// # Safety
+/// `stmt` must be a live statement handle.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_statement_get_spec(
+pub unsafe extern "C" fn kernel_statement_bind_null(
     stmt: *mut kernel_statement_t,
-    out: *mut *mut kernel_statement_spec_t,
+    ordinal: usize,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b: return &mut self.spec via raw ptr")
+    bind_positional(stmt, ordinal, TypedValue::Null)
 }
 
-/// Wait-for-result execution. Auto-cancels + closes any prior
-/// executed handle from this statement. On success, `*out` holds an
-/// owned `kernel_executed_statement_t` the caller releases with
-/// `kernel_executed_statement_close`.
+/// Bind a 1-based positional `BIGINT` parameter.
+///
+/// # Safety
+/// `stmt` must be a live statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_int64(
+    stmt: *mut kernel_statement_t,
+    ordinal: usize,
+    value: i64,
+) -> KernelStatusCode {
+    bind_positional(stmt, ordinal, TypedValue::Int64(value))
+}
+
+/// Bind a 1-based positional `DOUBLE` parameter.
+///
+/// # Safety
+/// `stmt` must be a live statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_double(
+    stmt: *mut kernel_statement_t,
+    ordinal: usize,
+    value: f64,
+) -> KernelStatusCode {
+    bind_positional(stmt, ordinal, TypedValue::Float64(value))
+}
+
+/// Bind a 1-based positional `BOOLEAN` parameter.
+///
+/// # Safety
+/// `stmt` must be a live statement handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_bool(
+    stmt: *mut kernel_statement_t,
+    ordinal: usize,
+    value: bool,
+) -> KernelStatusCode {
+    bind_positional(stmt, ordinal, TypedValue::Bool(value))
+}
+
+/// Bind a 1-based positional `STRING` parameter.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `value` must be a
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_string(
+    stmt: *mut kernel_statement_t,
+    ordinal: usize,
+    value: *const c_char,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if value.is_null() {
+            return Err(
+                Error::invalid_argument().message("string parameter value must not be null")
+            );
+        }
+        let value = CStr::from_ptr(value).to_str().map_err(|_| {
+            Error::invalid_argument().message("string parameter is not valid UTF-8")
+        })?;
+        stmt.spec()
+            .param(ordinal, TypedValue::String(value.to_owned()))?;
+        Ok(())
+    })
+}
+
+/// Shared body for the scalar `bind_*` setters.
+///
+/// # Safety
+/// `stmt` must be a live statement handle.
+unsafe fn bind_positional(
+    stmt: *mut kernel_statement_t,
+    ordinal: usize,
+    value: TypedValue,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        stmt.spec().param(ordinal, value)?;
+        Ok(())
+    })
+}
+
+// ─── Execute (sync) ──────────────────────────────────────────────────────────
+
+/// Wait-for-result execution. Auto-cancels + closes any prior executed
+/// handle from this statement. On success, `*out` holds an owned
+/// `kernel_executed_statement_t` the caller releases with
+/// [`kernel_executed_statement_close`].
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `out` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_execute(
     stmt: *mut kernel_statement_t,
     out: *mut *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b: block_on Statement::execute")
+    crate::ffi::error::clear_error();
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_null_handle("kernel_statement_execute: stmt must not be null");
+    };
+    if out.is_null() {
+        return store_null_handle("kernel_statement_execute: out must not be null");
+    }
+
+    // `Statement::execute` borrows `&mut self`; we need that borrow to
+    // live across the `block_on`. Raw-pointer the statement so the
+    // closure can re-borrow it inside the runtime without entangling
+    // lifetimes with `block_on_ffi`'s `'static` future bound.
+    let stmt_ptr: *mut Statement = stmt;
+    let executed = block_on_ffi(move || {
+        let stmt: &mut Statement = unsafe { &mut *stmt_ptr };
+        Box::pin(async move { stmt.execute().await })
+    });
+    match executed {
+        Ok(executed) => {
+            std::ptr::write(
+                out,
+                Box::into_raw(Box::new(executed)) as *mut kernel_executed_statement_t,
+            );
+            KernelStatusCode::Success
+        }
+        Err(code) => code,
+    }
 }
 
-/// Submit-and-return. Same auto-cancel-and-close semantics. On
-/// success, `*out` holds an owned
-/// `kernel_executed_async_statement_t` the caller releases with
-/// `kernel_executed_async_statement_close`.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_statement_submit(
-    stmt: *mut kernel_statement_t,
-    out: *mut *mut kernel_executed_async_statement_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b: block_on Statement::submit")
-}
-
-/// Free the lifecycle owner.
-///
-/// **Non-destructive for executed-handle pointers.** If a previously
-/// returned `kernel_executed_statement_t` or
-/// `kernel_executed_async_statement_t` from this statement is still
-/// held by the caller, that pointer **remains safe to call** after
-/// this function returns: subsequent calls dispatch through the
-/// shared validity flag and return `KernelStatusCode::InvalidStatementHandle`
-/// (no network round-trip). The caller is still responsible for
-/// freeing each executed-handle pointer via the corresponding
-/// `kernel_executed_*_close` function.
-///
-/// Net effect: this function frees only the statement-lifecycle box
-/// and flips the validity flag. It does *not* free executed-handle
-/// boxes — those live independently with their own refcounts.
+/// Free the statement-lifecycle owner. Does not free executed-handle
+/// boxes (those are owned independently); see the spec contract.
 ///
 /// # Safety
-///
-/// `stmt` must have been returned by `kernel_session_new_statement`
-/// and not previously closed. After this call, `stmt` is invalid;
-/// passing it to any other `kernel_*` function is UB.
+/// `stmt` must have been returned by `kernel_session_new_statement` and
+/// not previously closed.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_close(stmt: *mut kernel_statement_t) -> KernelStatusCode {
-    unimplemented!("PR 7b: flip validity flag, drop the lifecycle owner box")
+    crate::ffi::error::clear_error();
+    if stmt.is_null() {
+        return store_null_handle("kernel_statement_close: stmt must not be null");
+    }
+    drop(Box::from_raw(stmt as *mut Statement));
+    KernelStatusCode::Success
 }
 
 // ─── ExecutedStatement (sync) ────────────────────────────────────────────────
 
-/// Server-issued statement id, NUL-terminated.
+/// Obtain a result-stream handle that **borrows** the sync executed
+/// handle. The returned `kernel_result_stream_t` drives the executed
+/// handle's own stream, so the executed handle's drain-driven
+/// auto-close and lazy CloudFetch link fetches keep working.
 ///
-/// **Lifetime:** the returned pointer is valid as long as `exec` is.
-/// Do not free it; do not retain past
-/// `kernel_executed_statement_close`.
+/// **Lifetime:** the returned stream is valid only as long as `exec` is.
+/// The caller must close the stream (`kernel_result_stream_close`)
+/// before closing the executed handle (`kernel_executed_statement_close`).
 ///
-/// **On stale handle:** returns `null` if `exec` has been invalidated
-/// by a re-execute on the parent statement. Callers should null-check
-/// before dereferencing.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_statement_id(
-    exec: *const kernel_executed_statement_t,
-) -> *const c_char {
-    unimplemented!("PR 7b")
-}
-
-/// Borrow the result stream. Pointer is valid as long as `exec` is.
+/// On success `*out` holds the stream handle.
+///
+/// # Safety
+/// `exec` must be a live executed handle; `out` must be writable.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_statement_get_result_stream(
     exec: *mut kernel_executed_statement_t,
-    out: *mut *mut super::result::kernel_result_stream_t,
+    out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+    crate::ffi::error::clear_error();
+    if exec.is_null() {
+        return store_null_handle("get_result_stream: exec must not be null");
+    }
+    if out.is_null() {
+        return store_null_handle("get_result_stream: out must not be null");
+    }
+    let exec_ptr = exec as *mut ExecutedStatement;
+    std::ptr::write(out, into_raw_executed_stream(exec_ptr));
+    KernelStatusCode::Success
 }
 
+/// Number of rows modified by a DML statement, or `-1` if not
+/// applicable / unknown.
+///
+/// # Safety
+/// `exec` must be a live executed handle.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_executed_statement_cancel(
-    exec: *mut kernel_executed_statement_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
+    exec: *const kernel_executed_statement_t,
+) -> i64 {
+    let Some(exec) = (exec as *const ExecutedStatement).as_ref() else {
+        return -1;
+    };
+    exec.num_modified_rows().unwrap_or(-1)
 }
 
 /// Free a sync executed handle.
 ///
 /// # Safety
-///
-/// `exec` must have been returned by `kernel_statement_execute` and
-/// not previously closed. After this call, `exec` is invalid;
-/// passing it to any other `kernel_*` function is UB.
+/// `exec` must have been returned by [`kernel_statement_execute`] and
+/// not previously closed.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_statement_close(
     exec: *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+    crate::ffi::error::clear_error();
+    if exec.is_null() {
+        return store_null_handle("kernel_executed_statement_close: exec must not be null");
+    }
+    drop(Box::from_raw(exec as *mut ExecutedStatement));
+    KernelStatusCode::Success
 }
 
-// ─── ExecutedAsyncStatement (async) ──────────────────────────────────────────
+// ─── ExecutedAsyncStatement (async) — deferred in v0 ─────────────────────────
+//
+// The async submit path keeps its skeleton until a consumer needs
+// caller-driven polling over the C ABI. Rust-crate consumers use
+// `Statement::submit` + `ExecutedAsyncStatement` directly.
 
-/// Server-issued statement id, NUL-terminated.
-///
-/// **Lifetime:** the returned pointer is valid as long as `exec` is.
-/// Do not free it; do not retain past
-/// `kernel_executed_async_statement_close`.
-///
-/// **On stale handle:** returns `null` if `exec` has been invalidated
-/// by a re-execute on the parent statement.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_id(
-    exec: *const kernel_executed_async_statement_t,
-) -> *const c_char {
-    unimplemented!("PR 7b")
-}
-
-/// One-shot status check. Writes a [`KernelStatementStatusKind`] kind
-/// tag to `out_status`. On `Failed`, the caller invokes
-/// `kernel_get_last_error` to retrieve the underlying error detail.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_status(
-    exec: *mut kernel_executed_async_statement_t,
-    out_status: *mut KernelStatementStatusKind,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
-}
-
-/// Block until the server reaches a terminal state, then return the
-/// result stream. On success, `*out` holds an owned
-/// `kernel_result_stream_t` the caller releases with
-/// `kernel_result_stream_close`.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_await_result(
-    exec: *mut kernel_executed_async_statement_t,
-    out: *mut *mut super::result::kernel_result_stream_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
-}
-
-/// Fetch the result without polling. Same ownership rules as
-/// `kernel_executed_async_statement_await_result`.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_fetch_result(
-    exec: *mut kernel_executed_async_statement_t,
-    out: *mut *mut super::result::kernel_result_stream_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
-}
-
-#[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_cancel(
-    exec: *mut kernel_executed_async_statement_t,
-) -> KernelStatusCode {
-    unimplemented!("PR 7b")
-}
-
-/// Free an async executed handle.
+/// Submit-and-return. **Deferred in v0** — see module docs.
 ///
 /// # Safety
-///
-/// `exec` must have been returned by `kernel_statement_submit` and
-/// not previously closed. After this call, `exec` is invalid;
-/// passing it to any other `kernel_*` function is UB.
+/// `stmt` / `out` must be valid pointers.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_executed_async_statement_close(
-    exec: *mut kernel_executed_async_statement_t,
+pub unsafe extern "C" fn kernel_statement_submit(
+    stmt: *mut kernel_statement_t,
+    out: *mut *mut kernel_executed_async_statement_t,
 ) -> KernelStatusCode {
-    unimplemented!("PR 7b")
+    let _ = (stmt, out);
+    crate::ffi::error::clear_error();
+    crate::ffi::error::store_error(Error::invalid_argument().message(
+        "async submit is not exposed over the v0 C ABI; use the synchronous execute path",
+    ));
+    KernelStatusCode::InvalidArgument
+}
+
+// ─── Shared helpers ──────────────────────────────────────────────────────────
+
+/// Clear the thread-local error, null-check the statement handle, run
+/// `f` against the borrowed statement, and store/translate any error.
+///
+/// # Safety
+/// `stmt` must be a live `*mut kernel_statement_t`.
+unsafe fn with_statement(
+    stmt: *mut kernel_statement_t,
+    f: impl FnOnce(&mut Statement) -> Result<(), Error>,
+) -> KernelStatusCode {
+    crate::ffi::error::clear_error();
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_null_handle("statement handle must not be null");
+    };
+    match f(stmt) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(e) => {
+            let code = KernelStatusCode::from(e.code);
+            crate::ffi::error::store_error(e);
+            code
+        }
+    }
+}
+
+/// Store an `InvalidArgument` for a null handle and return the matching
+/// status code.
+fn store_null_handle(msg: &str) -> KernelStatusCode {
+    crate::ffi::error::store_error(Error::invalid_argument().message(msg));
+    KernelStatusCode::InvalidArgument
 }

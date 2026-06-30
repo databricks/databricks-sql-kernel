@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: all build test fmt lint clean check coverage coverage-check
+.PHONY: all build test fmt lint clean check coverage coverage-check c-abi-test
 
 all: build
 
@@ -31,7 +31,20 @@ fmt-check:
 lint:
 	cargo clippy -- -D warnings
 
-check: fmt-check lint test
+# Compile the hand-written C smoke tests against the cdylib and run them.
+# Proves the C ABI in `src/ffi/` links and behaves from a real C consumer
+# (the ODBC / Go path). Hermetic — no live warehouse needed.
+c-abi-test:
+	cargo build --lib
+	@mkdir -p target/c-abi
+	@for src in tests/c/*.c; do \
+		name=$$(basename $$src .c); \
+		echo "cc $$src"; \
+		cc -I include $$src -L target/debug -ldatabricks_sql_kernel -o target/c-abi/$$name || exit 1; \
+		LD_LIBRARY_PATH=target/debug DYLD_LIBRARY_PATH=target/debug ./target/c-abi/$$name || exit 1; \
+	done
+
+check: fmt-check lint test c-abi-test
 
 clean:
 	cargo clean

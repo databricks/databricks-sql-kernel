@@ -21,17 +21,118 @@
 //! for `Session`, `Statement`, `ExecutedStatement`,
 //! `ExecutedAsyncStatement`, and `ResultStream`.
 
-#![allow(dead_code, unused_variables)]
-// Skeleton: each function will get its `# Safety` doc when its body
-// lands in PRs 7a–7d. Suppress the lint at the module root for now so
-// reviewers can read the signatures without 31 lint markers.
-#![allow(clippy::missing_safety_doc)]
+// Each `extern "C"` function carries its own `# Safety` section; the
+// module-wide allow that masked them in the skeleton phase is gone now
+// that bodies have landed.
 
 pub mod error;
 pub mod metadata;
 pub mod result;
 pub mod session;
 pub mod statement;
+
+use std::sync::OnceLock;
+
+/// Process-wide tokio runtime owned by the C ABI.
+///
+/// Rust-crate consumers (PyO3 / napi-rs) own their own runtime and call
+/// the async surface directly; the C ABI has no caller-owned runtime to
+/// borrow, so it owns one here and `block_on`s every entry point through
+/// it. Initialised lazily on the first `kernel_session_open` and shared
+/// by every session for the life of the process (matches the
+/// migration-plan §5.2 contract).
+static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
+
+/// Fetch (initialising on first use) the process-wide C-ABI runtime.
+///
+/// A multi-thread runtime so concurrent FFI calls from different host
+/// threads (e.g. an ODBC app issuing queries on several connections)
+/// don't serialise behind a single worker. Returns an [`Error`] tagged
+/// `Internal` if the runtime fails to build — the only failure mode is
+/// the OS refusing to spawn worker threads, which is fatal and not
+/// retryable.
+///
+/// [`Error`]: crate::kernel_error::Error
+pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::Runtime> {
+    // `OnceLock::get_or_init` can't carry a fallible initialiser, so do
+    // the build-or-fetch dance by hand: try to fetch, and on a miss
+    // build once and install. A lost race just drops our spare runtime.
+    if let Some(rt) = RUNTIME.get() {
+        return Ok(rt);
+    }
+    let built = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("kernel-c-abi")
+        .build()
+        .map_err(|e| {
+            crate::kernel_error::Error::internal()
+                .message(format!("failed to build the C-ABI tokio runtime: {e}"))
+                .location(concat!(file!(), ":", line!()))
+        })?;
+    // If another thread installed one between our `get` and here, keep
+    // theirs and drop ours.
+    let _ = RUNTIME.set(built);
+    Ok(RUNTIME.get().expect("runtime just set"))
+}
+
+/// Run a fallible async block to completion on the process-wide runtime,
+/// translating the outcome into a [`KernelStatusCode`] and storing the
+/// typed [`Error`] in the thread-local last-error buffer on failure.
+///
+/// Every `extern "C"` entry point that drives async work funnels through
+/// here so the runtime-fetch, `block_on`, error-store, and status-map
+/// steps stay in exactly one place. A panic inside the future is caught
+/// at the `block_on` edge and surfaced as `Internal` rather than
+/// unwinding across the FFI boundary (which is UB).
+///
+/// [`KernelStatusCode`]: crate::ffi::KernelStatusCode
+/// [`Error`]: crate::kernel_error::Error
+pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
+{
+    error::clear_error();
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            return Err(code);
+        }
+    };
+    // Catch panics so a kernel bug can't unwind across `extern "C"`.
+    let result =
+        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(fut_builder())));
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(e)) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            Err(code)
+        }
+        Err(panic) => {
+            let detail = panic_message(&panic);
+            let e = crate::kernel_error::Error::internal()
+                .message(format!("panic in kernel C ABI: {detail}"))
+                .location(concat!(file!(), ":", line!()));
+            error::store_error(e);
+            Err(KernelStatusCode::Internal)
+        }
+    }
+}
+
+/// Best-effort extraction of a human-readable message from a caught
+/// panic payload.
+fn panic_message(panic: &Box<dyn std::any::Any + Send>) -> String {
+    if let Some(s) = panic.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = panic.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "<non-string panic payload>".to_string()
+    }
+}
 
 /// Status enum returned by every C entry point.
 ///
