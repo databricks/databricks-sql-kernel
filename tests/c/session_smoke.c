@@ -125,11 +125,55 @@ static void test_open_unreachable_host_errors(void) {
   CHECK(err.message != NULL, "error has a message");
 }
 
+/* http_path + M2M setters accept valid input. */
+static void test_http_path_and_m2m_setters(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+  KernelStatusCode rc =
+      kernel_session_config_set_http_path(config, "https://example.databricks.com",
+                                          "/sql/1.0/warehouses/abc123");
+  CHECK(rc == KernelStatusCode_Success, "set_http_path succeeds");
+  rc = kernel_session_config_set_auth_m2m(config, "client-id", "client-secret");
+  CHECK(rc == KernelStatusCode_Success, "set_auth_m2m succeeds");
+  kernel_session_config_free(config);
+}
+
+/* A null required string argument to a setter → InvalidArgument. */
+static void test_setter_null_arg_rejected(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+  KernelStatusCode rc = kernel_session_config_set_auth_pat(config, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_auth_pat(NULL token) → InvalidArgument");
+  kernel_session_config_free(config);
+}
+
+/* The async submit path is a deferred stub → InvalidArgument, no network. */
+static void test_submit_stub_rejects(void) {
+  kernel_executed_async_statement_t* out = NULL;
+  /* A null statement is fine here — the stub rejects before touching it. */
+  KernelStatusCode rc = kernel_statement_submit(NULL, &out);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "submit stub → InvalidArgument");
+}
+
+/* bind_* on a null statement handle → InvalidArgument, no crash. */
+static void test_bind_null_handle_rejected(void) {
+  KernelStatusCode rc = kernel_statement_bind_int64(NULL, 1, 42);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "bind_int64(NULL stmt) → InvalidArgument");
+  rc = kernel_statement_bind_null(NULL, 1);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "bind_null(NULL stmt) → InvalidArgument");
+  rc = kernel_statement_set_sql(NULL, "SELECT 1");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_sql(NULL stmt) → InvalidArgument");
+}
+
 int main(void) {
   test_config_lifecycle();
   test_null_guards();
   test_open_requires_connection_and_auth();
   test_open_unreachable_host_errors();
+  test_http_path_and_m2m_setters();
+  test_setter_null_arg_rejected();
+  test_submit_stub_rejects();
+  test_bind_null_handle_rejected();
 
   if (failures == 0) {
     fprintf(stderr, "\nAll C ABI smoke checks passed.\n");

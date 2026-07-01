@@ -46,6 +46,12 @@ enum ConnectionSpec {
 
 /// Auth choice captured from the C-side setters. v0 C ABI wires PAT and
 /// OAuth M2M; other [`AuthConfig`] variants stay Rust-crate-only.
+///
+/// NOTE (secret handling): `token` / `client_secret` are copied out of
+/// the C string into owned `String`s and are not zeroized on drop, so
+/// plaintext lingers in freed heap. This matches the rest of the crate
+/// (no `zeroize`/`secrecy` anywhere); when the crate adopts a
+/// zeroize-on-drop policy, these copies must be included.
 enum AuthSpec {
     Pat {
         token: String,
@@ -60,25 +66,18 @@ enum AuthSpec {
 ///
 /// Constructed by [`kernel_session_config_new`], populated by the
 /// `kernel_session_config_set_*` setters, and consumed by
-/// [`kernel_session_open`]. Heap-boxed; the C side holds a
-/// `*mut KernelSessionConfig` and never sees the field layout — the
-/// struct stays effectively opaque to C even though it carries real
-/// fields on the Rust side.
-///
-/// The `version` field leads the struct per the C-ABI versioning
-/// convention (every public struct carries a `uint32_t version` so a
-/// future reader can detect older callers); it is set by
-/// `kernel_session_config_new` and not exposed to setters.
-#[repr(C)]
+/// [`kernel_session_open`]. Heap-boxed; C only ever holds a
+/// `*mut KernelSessionConfig` to an incomplete type and never reads the
+/// fields — so this is a private Rust-side builder box (like the boxed
+/// `Session` / `Statement` handles) and is intentionally **not**
+/// `#[repr(C)]`: it holds non-FFI-safe fields (`Option`, `HashMap`) and
+/// a `#[repr(C)]` annotation would imply a stable C layout that neither
+/// exists nor is needed.
 pub struct KernelSessionConfig {
-    /// ABI version tag. `1` for v0.
-    version: u32,
     connection: Option<ConnectionSpec>,
     auth: Option<AuthSpec>,
     session_conf: HashMap<String, String>,
 }
-
-const KERNEL_SESSION_CONFIG_VERSION: u32 = 1;
 
 /// Read a required C string argument into an owned `String`, mapping a
 /// null or non-UTF-8 pointer to a typed `InvalidArgument` error.
@@ -116,7 +115,6 @@ pub unsafe extern "C" fn kernel_session_config_new(
         return KernelStatusCode::InvalidArgument;
     }
     let config = Box::new(KernelSessionConfig {
-        version: KERNEL_SESSION_CONFIG_VERSION,
         connection: None,
         auth: None,
         session_conf: HashMap::new(),
@@ -321,7 +319,6 @@ pub unsafe extern "C" fn kernel_session_open(
 /// code.
 fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCode> {
     let KernelSessionConfig {
-        version: _,
         connection,
         auth,
         session_conf,

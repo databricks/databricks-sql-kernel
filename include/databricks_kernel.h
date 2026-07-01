@@ -18,7 +18,7 @@
  * Databricks SQL Kernel — C ABI (v0).
  *
  * Hand-written header for the kernel's custom C ABI (cbindgen
- * integration is a v0.1 concern). The bodies live in `src/ffi/` in the
+ * integration is a v0.1 concern). The bodies live in `src/c_abi/` in the
  * `databricks-sql-kernel` crate, compiled as a `cdylib` / `staticlib`.
  *
  * This is the surface ODBC / Go consumers link against. It is NOT ADBC:
@@ -38,9 +38,29 @@
  *
  * ## ABI versioning
  *
- * Every public struct carries a leading `uint32_t version`. Struct
- * layout may change freely through v0.x (no ABI promise); ABI stability
- * is committed at v1.0.
+ * There is no ABI promise through v0.x: struct layouts and the function
+ * set may change freely; ABI stability is committed at v1.0. All handle
+ * types below are *opaque* (incomplete) to C — you only ever hold
+ * pointers to them, never read their fields — so their Rust-side layout
+ * is irrelevant. The one caller-*readable* struct, `KernelError`, is laid
+ * out exactly as declared here; copy its fields out before the next
+ * `kernel_*` call on the thread.
+ *
+ * ## Lifecycle & threading notes
+ *
+ * - **Re-execution invalidates prior handles.** `kernel_statement_execute`
+ *   auto-cancels and closes any `kernel_executed_statement_t` previously
+ *   returned by the same statement; calls on the stale handle then return
+ *   `KernelStatusCode_InvalidStatementHandle`. Don't hold two live
+ *   executed handles from one statement.
+ * - **A result stream borrows its executed handle.** Closing the executed
+ *   handle invalidates any stream obtained from it: subsequent stream
+ *   calls return `InvalidStatementHandle` (a defined error, not UB).
+ * - **Close is best-effort async.** `kernel_session_close` returns once
+ *   the server-side delete is *initiated*, not completed — a detached task
+ *   runs it on the kernel's process-wide runtime. A process that exits
+ *   immediately after `kernel_session_close` may drop that task before it
+ *   runs, leaving the server session to expire on its own idle timeout.
  */
 
 #ifndef DATABRICKS_KERNEL_H
@@ -94,7 +114,7 @@ struct ArrowArray {
 
 /* ─── Status + error ──────────────────────────────────────────────────
  *
- * Discriminants match `crate::ffi::KernelStatusCode`. Keep this enum in
+ * Discriminants match `crate::c_abi::KernelStatusCode`. Keep this enum in
  * lockstep with that Rust enum (the Rust side enforces a 1:1 mapping
  * against `ErrorCode` with an exhaustive match).
  */
@@ -163,6 +183,10 @@ typedef struct kernel_session_config_t KernelSessionConfig;
 typedef struct kernel_session_t kernel_session_t;
 typedef struct kernel_statement_t kernel_statement_t;
 typedef struct kernel_executed_statement_t kernel_executed_statement_t;
+/* Async-consumption executed handle. Reserved: the async submit path is
+ * deferred in v0 (see kernel_statement_submit), so no consumer receives a
+ * live instance yet. */
+typedef struct kernel_executed_async_statement_t kernel_executed_async_statement_t;
 typedef struct kernel_result_stream_t kernel_result_stream_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
@@ -229,6 +253,16 @@ KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t o
  */
 KernelStatusCode kernel_statement_execute(kernel_statement_t* stmt,
                                           kernel_executed_statement_t** out);
+
+/*
+ * Submit-and-return (async). DEFERRED in v0: this always returns
+ * `KernelStatusCode_InvalidArgument` (with an explanatory last error) and
+ * writes nothing to `*out`. Use the synchronous `kernel_statement_execute`
+ * path. Declared so the symbol/contract is visible; wired when an ODBC /
+ * Go consumer needs caller-driven polling.
+ */
+KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
+                                         kernel_executed_async_statement_t** out);
 
 /*
  * Free the statement lifecycle owner. Does NOT free executed-handle

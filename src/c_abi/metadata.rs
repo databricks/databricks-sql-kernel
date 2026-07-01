@@ -26,13 +26,15 @@
 //! kernel's `Metadata` produces; ODBC / JDBC drivers keep their own
 //! rename / reshape layer on top.
 
+use super::error::store_invalid_arg;
 use super::result::{into_raw_result_stream, kernel_result_stream_t};
 use super::session::kernel_session_t;
 use super::{block_on_ffi, KernelStatusCode};
 use crate::kernel_error::{Error, Result};
 use crate::metadata_v0::{Identifier, LikePattern};
-use crate::result_stream::{OwnedBatchIter, ResultStream, SchemaRef};
+use crate::result_stream::{ResultBatch, ResultStream, SchemaRef};
 use crate::session::Session;
+use arrow_array::RecordBatch;
 use std::ffi::{c_char, CStr};
 
 /// Read an optional C string: null → `None`, else borrowed `&str`
@@ -75,11 +77,34 @@ unsafe fn opt_pattern<'a>(ptr: *const c_char, what: &str) -> Result<Option<LikeP
     }
 }
 
-/// Capture a `ResultStream`'s schema and consume it into an owned batch
-/// iterator, ready to wrap in a `kernel_result_stream_t`.
-fn into_parts(stream: ResultStream) -> (SchemaRef, OwnedBatchIter) {
+/// Drain a metadata `ResultStream` fully into owned batches **on the
+/// runtime** (this runs inside `block_on_ffi`), capturing the schema.
+///
+/// Metadata results are bounded (a handful of batches at most), so full
+/// materialisation here is cheap and lets the C-side `next_batch` be a
+/// pure in-memory pop — avoiding driving a possibly-CloudFetch-backed
+/// reader off the tokio reactor from a plain C thread.
+async fn drain_metadata(mut stream: ResultStream) -> Result<(SchemaRef, Vec<RecordBatch>)> {
     let schema = stream.schema();
-    (schema, stream.into_owned_batches())
+    let mut batches = Vec::new();
+    while let Some(batch) = stream.next_batch().await? {
+        // `ResultBatch` is `#[non_exhaustive]`; the wildcard is unreachable
+        // today (Arrow is the only variant) but is the defined fallback
+        // for a future non-Arrow variant at this Arrow-only boundary.
+        #[allow(
+            unreachable_patterns,
+            reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
+        )]
+        match batch {
+            ResultBatch::Arrow(rb) => batches.push(rb.clone()),
+            _ => {
+                return Err(Error::not_implemented().message(
+                    "metadata stream yielded a non-Arrow batch; C ABI exports Arrow only",
+                ))
+            }
+        }
+    }
+    Ok((schema, batches))
 }
 
 /// Shared body for the metadata entry points: clear the error, null-check
@@ -101,18 +126,18 @@ where
 {
     crate::c_abi::error::clear_error();
     let Some(session) = (session as *const Session).as_ref() else {
-        return store_null("metadata: session must not be null");
+        return store_invalid_arg("metadata: session must not be null");
     };
     if out.is_null() {
-        return store_null("metadata: out must not be null");
+        return store_invalid_arg("metadata: out must not be null");
     }
     let result = block_on_ffi(move || async move {
         let stream = build(session).await?;
-        Ok(into_parts(stream))
+        drain_metadata(stream).await
     });
     match result {
-        Ok((schema, iter)) => {
-            std::ptr::write(out, into_raw_result_stream(schema, iter));
+        Ok((schema, batches)) => {
+            std::ptr::write(out, into_raw_result_stream(schema, batches));
             KernelStatusCode::Success
         }
         Err(code) => code,
@@ -297,12 +322,6 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
                 .await
         })
     })
-}
-
-/// Store an `InvalidArgument` for a null pointer and return its code.
-fn store_null(msg: &str) -> KernelStatusCode {
-    crate::c_abi::error::store_error(Error::invalid_argument().message(msg));
-    KernelStatusCode::InvalidArgument
 }
 
 // PR 7d follow-ups: functions, procedures, type_info, table_types — the

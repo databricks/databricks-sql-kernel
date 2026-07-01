@@ -131,15 +131,57 @@ where
             error::store_error(e);
             Err(code)
         }
-        Err(panic) => {
-            let detail = panic_message(&panic);
-            let e = crate::kernel_error::Error::internal()
-                .message(format!("panic in kernel C ABI: {detail}"))
-                .location(concat!(file!(), ":", line!()));
-            error::store_error(e);
-            Err(KernelStatusCode::Internal)
-        }
+        Err(panic) => Err(handle_panic(panic)),
     }
+}
+
+/// Run a **synchronous** fallible closure at an `extern "C"` boundary,
+/// catching any panic so it can't unwind across the FFI frame (UB) and
+/// mapping it to [`KernelStatusCode::Internal`].
+///
+/// Sibling of [`block_on_ffi`] for entry points that do no async work
+/// (parameter binding, config setters, the Arrow C Data Interface
+/// export, handle teardown). The closure returns a `KernelStatusCode`
+/// directly — it is expected to have already stored any typed error via
+/// [`error::store_error`] on its own failure paths; this wrapper only
+/// adds the panic guard (and clears the thread-local error on entry, so
+/// a caller reading `kernel_get_last_error` after a `Success` never sees
+/// a stale error).
+///
+/// # Safety note
+/// The closure runs under `AssertUnwindSafe`; callers that hold a `&mut`
+/// to a handle across this boundary must treat the handle as potentially
+/// half-mutated on an `Internal` return (see `kernel_statement_execute`).
+pub(crate) fn catch_ffi<F>(f: F) -> KernelStatusCode
+where
+    F: FnOnce() -> KernelStatusCode,
+{
+    error::clear_error();
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(f)) {
+        Ok(code) => code,
+        Err(panic) => handle_panic(panic),
+    }
+}
+
+/// Shared panic handler for both FFI wrappers: log it (so a recurring
+/// panic bug is visible to on-call rather than silently folded into
+/// `Internal`), store a typed `Internal` error in the thread-local
+/// buffer, and return the `Internal` status code.
+fn handle_panic(panic: Box<dyn std::any::Any + Send>) -> KernelStatusCode {
+    let detail = panic_message(&panic);
+    // Log at ERROR so a recurring panic (bad CloudFetch batch, reader
+    // unwrap) is observable in aggregate — a caught panic across the C
+    // ABI is always a kernel bug, never a routine query failure.
+    tracing::error!(
+        target: crate::klog::KERNEL_LOG_TARGET,
+        detail = %detail,
+        "panic caught at the kernel C ABI boundary"
+    );
+    let e = crate::kernel_error::Error::internal()
+        .message(format!("panic in kernel C ABI: {detail}"))
+        .location(concat!(file!(), ":", line!()));
+    error::store_error(e);
+    KernelStatusCode::Internal
 }
 
 /// Best-effort extraction of a human-readable message from a caught

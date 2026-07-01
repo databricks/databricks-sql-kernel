@@ -166,6 +166,24 @@ pub(crate) fn clear_error() {
     LAST_ERROR.with(|cell| *cell.borrow_mut() = LastError::default());
 }
 
+/// Store a typed [`Error`] and return its mapped [`KernelStatusCode`].
+///
+/// The single "map code + store + return code" helper shared by every
+/// C entry point that surfaces a typed error (previously reimplemented
+/// per module).
+pub(crate) fn store_and_code(err: Error) -> KernelStatusCode {
+    let code = KernelStatusCode::from(err.code);
+    store_error(err);
+    code
+}
+
+/// Store an `InvalidArgument` with `msg` and return
+/// [`KernelStatusCode::InvalidArgument`]. Used for the null-pointer /
+/// bad-argument guards at the top of every entry point.
+pub(crate) fn store_invalid_arg(msg: &str) -> KernelStatusCode {
+    store_and_code(Error::invalid_argument().message(msg))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

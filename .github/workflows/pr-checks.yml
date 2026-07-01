@@ -136,7 +136,7 @@ jobs:
 
       - name: make c-abi-test
         # Builds the cdylib and compiles + runs the hand-written C smoke
-        # tests in tests/c/ against the C ABI exported from src/ffi/.
+        # tests in tests/c/ against the C ABI exported from src/c_abi/.
         # Hermetic (no live warehouse) — proves ODBC / Go consumers can
         # link and call the kernel. `cc` is preinstalled on the runner.
         run: make c-abi-test
