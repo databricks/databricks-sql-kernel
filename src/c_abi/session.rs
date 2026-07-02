@@ -24,7 +24,7 @@
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
 use super::{block_on_ffi, KernelStatusCode};
-use crate::config::{AuthConfig, ConnectionConfig};
+use crate::config::{AuthConfig, ConnectionConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
@@ -77,6 +77,29 @@ pub struct KernelSessionConfig {
     connection: Option<ConnectionSpec>,
     auth: Option<AuthSpec>,
     session_conf: HashMap<String, String>,
+    /// Programmatic HTTP proxy (populated by `..._set_proxy`). `None` ⇒
+    /// reqwest's env-var proxy behaviour.
+    proxy: Option<ProxySpec>,
+    /// TLS relaxations / custom trust (populated by the `..._set_tls_*`
+    /// setters). Defaults to the kernel's strict validation.
+    tls: TlsSpec,
+}
+
+/// C-side proxy config captured from `kernel_session_config_set_proxy`.
+struct ProxySpec {
+    url: String,
+    username: Option<String>,
+    password: Option<String>,
+    bypass_hosts: Option<String>,
+}
+
+/// C-side TLS config captured from the `..._set_tls_*` setters.
+#[derive(Default)]
+struct TlsSpec {
+    /// PEM-encoded CA bundle bytes (from a file the ODBC layer read).
+    custom_ca_cert: Option<Vec<u8>>,
+    accept_self_signed: bool,
+    skip_hostname_verification: bool,
 }
 
 /// Read a required C string argument into an owned `String`, mapping a
@@ -118,6 +141,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         connection: None,
         auth: None,
         session_conf: HashMap::new(),
+        proxy: None,
+        tls: TlsSpec::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -245,6 +270,103 @@ pub unsafe extern "C" fn kernel_session_config_set_session_conf(
     })
 }
 
+/// Read an optional C string: null → `None`, else an owned `String`
+/// (errors on non-UTF-8).
+///
+/// # Safety
+/// `ptr`, if non-null, must be a NUL-terminated C string.
+unsafe fn optional_str(ptr: *const c_char, what: &str) -> Result<Option<String>, Error> {
+    if ptr.is_null() {
+        return Ok(None);
+    }
+    CStr::from_ptr(ptr)
+        .to_str()
+        .map(|s| Some(s.to_owned()))
+        .map_err(|_| Error::invalid_argument().message(format!("{what} is not valid UTF-8")))
+}
+
+/// Configure an HTTP/HTTPS proxy. `url` is required (e.g.
+/// `http://proxy:8080`); `username` / `password` / `bypass_hosts` are
+/// optional (pass NULL to omit). Maps to the kernel's `ProxyConfig`.
+///
+/// # Safety
+/// `config` must be a live config handle; `url` must be a NUL-terminated
+/// C string; the optional args, if non-null, must be NUL-terminated C
+/// strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_proxy(
+    config: *mut KernelSessionConfig,
+    url: *const c_char,
+    username: *const c_char,
+    password: *const c_char,
+    bypass_hosts: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.proxy = Some(ProxySpec {
+            url: required_str(url, "proxy url")?,
+            username: optional_str(username, "proxy username")?,
+            password: optional_str(password, "proxy password")?,
+            bypass_hosts: optional_str(bypass_hosts, "proxy bypass_hosts")?,
+        });
+        Ok(())
+    })
+}
+
+/// Add a PEM-encoded CA-certificate bundle (bytes) to the TLS trust store
+/// on top of the system roots — for a corporate re-signing proxy or an
+/// on-prem CA. Maps to `TlsConfig::custom_ca_cert`.
+///
+/// # Safety
+/// `config` must be a live config handle; `pem` must point to `len`
+/// readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_trusted_certs(
+    config: *mut KernelSessionConfig,
+    pem: *const u8,
+    len: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if pem.is_null() {
+            return Err(Error::invalid_argument().message("trusted certs pem must not be null"));
+        }
+        c.tls.custom_ca_cert = Some(std::slice::from_raw_parts(pem, len).to_vec());
+        Ok(())
+    })
+}
+
+/// Accept self-signed / otherwise-invalid server certificates (disables
+/// chain validation). Dev/on-prem only. Maps to
+/// `TlsConfig::accept_self_signed`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_allow_self_signed(
+    config: *mut KernelSessionConfig,
+    allow: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.tls.accept_self_signed = allow;
+        Ok(())
+    })
+}
+
+/// Skip the certificate hostname-vs-SNI check. Dev/lab only. Maps to
+/// `TlsConfig::skip_hostname_verification`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_skip_hostname_verification(
+    config: *mut KernelSessionConfig,
+    skip: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.tls.skip_hostname_verification = skip;
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -330,6 +452,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         connection,
         auth,
         session_conf,
+        proxy,
+        tls,
     } = config;
 
     block_on_ffi(move || {
@@ -362,12 +486,38 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None)?,
             };
 
-            Session::builder()
+            let mut builder = Session::builder()
                 .connection(connection)
                 .auth(auth)
-                .session_conf(session_conf)
-                .open()
-                .await
+                .session_conf(session_conf);
+
+            // Programmatic proxy (env-var behaviour preserved when unset).
+            if let Some(p) = proxy {
+                builder = builder.proxy(ProxyConfig {
+                    url: Some(p.url),
+                    username: p.username,
+                    password: p.password,
+                    bypass_hosts: p.bypass_hosts,
+                    ..ProxyConfig::default()
+                });
+            }
+
+            // TLS relaxations / custom trust. Only build a TlsConfig when a
+            // non-default knob was set, so the strict default is preserved
+            // otherwise.
+            if tls.custom_ca_cert.is_some()
+                || tls.accept_self_signed
+                || tls.skip_hostname_verification
+            {
+                builder = builder.tls(TlsConfig {
+                    custom_ca_cert: tls.custom_ca_cert,
+                    accept_self_signed: tls.accept_self_signed,
+                    skip_hostname_verification: tls.skip_hostname_verification,
+                    ..TlsConfig::default()
+                });
+            }
+
+            builder.open().await
         })
     })
 }

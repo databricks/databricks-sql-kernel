@@ -219,6 +219,36 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
                                                         const char* key,
                                                         const char* value);
 
+/* ─── Proxy / TLS (optional) ──────────────────────────────────────────
+ *
+ * All optional; defaults are: no explicit proxy (reqwest honours
+ * HTTP(S)_PROXY / NO_PROXY env vars) and strict TLS (system trust store,
+ * valid chain, hostname verified). Any setter below is a relaxation or
+ * override.
+ */
+
+/* Route traffic through an HTTP/HTTPS proxy. `url` is required (e.g.
+ * "http://proxy.corp:8080"); `username` / `password` / `bypass_hosts`
+ * (comma-separated) are optional — pass NULL to omit. */
+KernelStatusCode kernel_session_config_set_proxy(KernelSessionConfig* config, const char* url,
+                                                 const char* username, const char* password,
+                                                 const char* bypass_hosts);
+
+/* Add a PEM-encoded CA-certificate bundle (`pem`/`len` bytes) to the TLS
+ * trust store on top of the system roots (corporate re-signing proxy /
+ * on-prem CA). */
+KernelStatusCode kernel_session_config_set_tls_trusted_certs(KernelSessionConfig* config,
+                                                             const uint8_t* pem, size_t len);
+
+/* Accept self-signed / invalid server certs (disables chain validation).
+ * Development / on-prem only. */
+KernelStatusCode kernel_session_config_set_tls_allow_self_signed(KernelSessionConfig* config,
+                                                                 bool allow);
+
+/* Skip the certificate hostname-vs-SNI check. Development / lab only. */
+KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(KernelSessionConfig* config,
+                                                                         bool skip);
+
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*

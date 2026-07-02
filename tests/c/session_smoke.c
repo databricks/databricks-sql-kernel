@@ -147,6 +147,26 @@ static void test_setter_null_arg_rejected(void) {
   kernel_session_config_free(config);
 }
 
+/* Proxy + TLS setters accept valid input. */
+static void test_proxy_and_tls_setters(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+  KernelStatusCode rc =
+      kernel_session_config_set_proxy(config, "http://localhost:3128", "u", "p", "localhost");
+  CHECK(rc == KernelStatusCode_Success, "set_proxy succeeds");
+  rc = kernel_session_config_set_proxy(config, NULL, NULL, NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_proxy(NULL url) → InvalidArgument");
+
+  const unsigned char pem[] = "-----BEGIN CERTIFICATE-----\n";
+  rc = kernel_session_config_set_tls_trusted_certs(config, pem, sizeof(pem) - 1);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_trusted_certs succeeds");
+  rc = kernel_session_config_set_tls_allow_self_signed(config, true);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_allow_self_signed succeeds");
+  rc = kernel_session_config_set_tls_skip_hostname_verification(config, true);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_skip_hostname_verification succeeds");
+  kernel_session_config_free(config);
+}
+
 /* The async submit path is a deferred stub → InvalidArgument, no network. */
 static void test_submit_stub_rejects(void) {
   kernel_executed_async_statement_t* out = NULL;
@@ -172,6 +192,7 @@ int main(void) {
   test_open_unreachable_host_errors();
   test_http_path_and_m2m_setters();
   test_setter_null_arg_rejected();
+  test_proxy_and_tls_setters();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
 
