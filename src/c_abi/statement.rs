@@ -326,7 +326,14 @@ pub unsafe extern "C" fn kernel_statement_execute(
 }
 
 /// Free the statement-lifecycle owner. Does not free executed-handle
-/// boxes (those are owned independently); see the spec contract.
+/// boxes (those are separate allocations, closed via
+/// `kernel_executed_statement_close`).
+///
+/// Close the statement LAST: it shares a validity flag with the executed
+/// handles it produced, so closing it invalidates any still-live executed
+/// handle (and its borrowed result stream), which then return
+/// `InvalidStatementHandle` on further use. Drain/close streams and
+/// executed handles first. See the `databricks_kernel.h` contract.
 ///
 /// # Safety
 /// `stmt` must have been returned by `kernel_session_new_statement` and
@@ -375,11 +382,13 @@ pub unsafe extern "C" fn kernel_executed_statement_get_result_stream(
     if out.is_null() {
         return store_invalid_arg("get_result_stream: out must not be null");
     }
-    // Reject if the parent statement was re-executed (this handle is stale).
+    // Reject if the parent statement was re-executed or closed (this
+    // handle shares the statement's validity flag; both flip it).
     if !handle.exec.is_valid() {
         return store_and_code(Error::new(
             crate::kernel_error::ErrorCode::InvalidStatementHandle,
-            "executed statement was invalidated by a re-execute on its statement",
+            "executed statement was invalidated by a re-execute or close on its parent statement; \
+             drain/close result streams and executed handles before closing the statement",
         ));
     }
     // At most one live stream per handle: a second reborrow of `&mut exec`
@@ -421,13 +430,14 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
         );
         return -1;
     };
-    // Stale after a re-execute on the parent statement → -1 with a stored
-    // InvalidStatementHandle (distinct from the not-applicable -1, which
-    // stores no error).
+    // Stale after a re-execute or close on the parent statement → -1 with
+    // a stored InvalidStatementHandle (distinct from the not-applicable
+    // -1, which stores no error).
     if !handle.exec.is_valid() {
         crate::c_abi::error::store_and_code(Error::new(
             crate::kernel_error::ErrorCode::InvalidStatementHandle,
-            "executed statement was invalidated by a re-execute on its statement",
+            "executed statement was invalidated by a re-execute or close on its parent statement; \
+             query num_modified_rows before closing the statement",
         ));
         return -1;
     }

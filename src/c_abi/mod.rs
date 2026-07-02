@@ -105,6 +105,16 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
 /// at the `block_on` edge and surfaced as `Internal` rather than
 /// unwinding across the FFI boundary (which is UB).
 ///
+/// **Threading contract:** the C ABI must be driven from threads that are
+/// NOT already running inside a Tokio runtime. `Runtime::block_on` panics
+/// ("Cannot start a runtime from within a runtime") if called from a
+/// worker of any runtime — including this one — so a reentrant C-ABI call
+/// (e.g. a consumer that invokes a `kernel_*` entry point from a callback
+/// executing on a runtime worker) is rejected up front with a clear
+/// `Internal` error instead of the opaque caught-panic path. Native
+/// (non-runtime) caller threads — the intended ODBC / Go usage — are
+/// unaffected.
+///
 /// [`KernelStatusCode`]: crate::c_abi::KernelStatusCode
 /// [`Error`]: crate::kernel_error::Error
 pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
@@ -113,6 +123,19 @@ where
     Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
 {
     error::clear_error();
+    // Reject reentrancy explicitly: calling `block_on` from within any
+    // Tokio runtime would panic. Surface a typed, actionable error rather
+    // than a caught panic mapped to a generic `Internal`.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let e = crate::kernel_error::Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel C ABI called from within a Tokio runtime thread; entry points must be \
+             invoked from a native (non-async-runtime) thread",
+        );
+        let code = KernelStatusCode::from(e.code);
+        error::store_error(e);
+        return Err(code);
+    }
     let rt = match runtime() {
         Ok(rt) => rt,
         Err(e) => {
@@ -243,5 +266,40 @@ impl From<crate::kernel_error::ErrorCode> for KernelStatusCode {
             ErrorCode::NetworkError => Self::NetworkError,
             ErrorCode::SqlError => Self::SqlError,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `block_on_ffi` must reject a reentrant call (one made from a thread
+    /// already inside a Tokio runtime) with a typed `Internal` error and a
+    /// populated last-error, rather than letting `Runtime::block_on` panic
+    /// into the caught-panic path (which also maps to `Internal` but loses
+    /// the actionable message). Guards the threading contract documented on
+    /// `block_on_ffi`.
+    #[test]
+    fn block_on_ffi_rejects_reentrancy_from_runtime_thread() {
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let result: Result<(), KernelStatusCode> = block_on_ffi(|| async { Ok(()) });
+            assert_eq!(result, Err(KernelStatusCode::Internal));
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            // SAFETY: out is a valid writable pointer.
+            let present = unsafe { crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()) };
+            assert!(present, "reentrancy must populate the last-error buffer");
+            // SAFETY: present is true, so out is initialised.
+            let err = unsafe { out.assume_init() };
+            // SAFETY: message is non-null after a store.
+            let msg = unsafe { std::ffi::CStr::from_ptr(err.message) }
+                .to_str()
+                .unwrap();
+            assert!(
+                msg.contains("within a Tokio runtime"),
+                "reentrancy error should explain the threading contract, got: {msg}",
+            );
+        });
     }
 }

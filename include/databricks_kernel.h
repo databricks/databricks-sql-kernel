@@ -296,7 +296,18 @@ KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
 
 /*
  * Free the statement lifecycle owner. Does NOT free executed-handle
- * boxes; close each of those separately.
+ * boxes — each executed handle is a separate allocation that you must
+ * release with `kernel_executed_statement_close`.
+ *
+ * ORDERING: close the statement LAST. Executed handles produced by this
+ * statement (and any result stream borrowed from them) share a validity
+ * flag with the statement; closing the statement invalidates them, after
+ * which `kernel_executed_statement_get_result_stream`,
+ * `kernel_executed_statement_num_modified_rows`, and
+ * `kernel_result_stream_next_batch` on those handles return
+ * `KernelStatusCode_InvalidStatementHandle` (a defined error, never UB).
+ * Drain / close the result stream, then the executed handle(s), then the
+ * statement. The statement must outlive every handle it produced.
  */
 KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
 
@@ -305,12 +316,22 @@ KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
 /*
  * Obtain a result-stream handle that BORROWS `exec`. The stream is valid
  * only as long as `exec` is: close the stream
- * (`kernel_result_stream_close`) before closing `exec`.
+ * (`kernel_result_stream_close`) before closing `exec`, and keep the
+ * parent statement open until the stream is drained/closed (see
+ * `kernel_statement_close`). At most one stream per executed handle; a
+ * second call returns `KernelStatusCode_InvalidArgument`. Returns
+ * `KernelStatusCode_InvalidStatementHandle` if the parent statement was
+ * re-executed or closed.
  */
 KernelStatusCode kernel_executed_statement_get_result_stream(kernel_executed_statement_t* exec,
                                                              kernel_result_stream_t** out);
 
-/* Rows modified by a DML statement, or -1 if not applicable / unknown. */
+/*
+ * Rows modified by a DML statement, or -1 if not applicable / unknown.
+ * A -1 with NO stored last error means "not applicable"; a -1 after a
+ * stored `InvalidStatementHandle` means the parent statement was
+ * re-executed or closed (call `kernel_get_last_error` to distinguish).
+ */
 int64_t kernel_executed_statement_num_modified_rows(const kernel_executed_statement_t* exec);
 
 KernelStatusCode kernel_executed_statement_close(kernel_executed_statement_t* exec);
@@ -332,8 +353,17 @@ KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
  *
  * Each returns a self-contained result stream (released via
  * `kernel_result_stream_close`) carrying the server-shaped
- * (JDBC-canonical) columns. NULL string args mean "unfiltered". Pattern
- * args accept SQL LIKE wildcards; identifier args are exact.
+ * (JDBC-canonical) columns. Pattern args accept SQL LIKE wildcards;
+ * identifier args are exact.
+ *
+ * NULL string args mean "unfiltered" for the list_* calls (catalogs /
+ * schemas / tables / columns). The key/constraint calls are stricter:
+ * `kernel_metadata_primary_keys` requires a non-NULL catalog, schema, AND
+ * table (Databricks SHOW KEYS must target a fully-qualified table), and
+ * `kernel_metadata_foreign_keys` requires the full foreign_* (referencing)
+ * triple while the parent_* (referenced) triple is optional. Passing NULL
+ * for a required identifier returns `KernelStatusCode_InvalidArgument`
+ * with an explanatory last error (see each function's comment).
  */
 KernelStatusCode kernel_metadata_list_catalogs(kernel_session_t* session,
                                                kernel_result_stream_t** out);
@@ -348,9 +378,16 @@ KernelStatusCode kernel_metadata_list_columns(kernel_session_t* session, const c
                                               const char* schema_pattern, const char* table_pattern,
                                               const char* column_pattern,
                                               kernel_result_stream_t** out);
+/* `catalog`, `schema`, and `table` are all REQUIRED (non-NULL): the
+ * underlying SHOW KEYS targets a fully-qualified table. NULL for any of
+ * them returns `KernelStatusCode_InvalidArgument`. */
 KernelStatusCode kernel_metadata_primary_keys(kernel_session_t* session, const char* catalog,
                                               const char* schema, const char* table,
                                               kernel_result_stream_t** out);
+/* The foreign_* (referencing) triple is REQUIRED (all non-NULL); the
+ * parent_* (referenced) triple is optional and filters the referenced
+ * side. NULL for any foreign_* arg returns
+ * `KernelStatusCode_InvalidArgument`. */
 KernelStatusCode kernel_metadata_foreign_keys(kernel_session_t* session, const char* parent_catalog,
                                               const char* parent_schema, const char* parent_table,
                                               const char* foreign_catalog,

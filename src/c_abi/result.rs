@@ -107,9 +107,10 @@ pub(crate) unsafe fn into_raw_executed_stream(
 /// 1. `alive` (shared with the executed handle, invalidated on its
 ///    `close`) — checked BEFORE the deref, because a closed handle has
 ///    been freed and the pointer would dangle.
-/// 2. `ExecutedStatement::is_valid()` (the handle's own flag, flipped
-///    when the parent statement is re-executed) — checked AFTER the
-///    deref, since it lives on the (now known-live) object.
+/// 2. `ExecutedStatement::is_valid()` (the flag shared with the parent
+///    statement, flipped when that statement is re-executed OR closed) —
+///    checked AFTER the deref, since it lives on the (now known-live)
+///    object. This is why the parent statement must outlive the stream.
 ///
 /// # Safety
 /// Caller must hold `&mut ResultStreamInner`.
@@ -131,7 +132,8 @@ unsafe fn executed_ref<'a>(
     if !e.is_valid() {
         return Err(store_and_code(Error::new(
             ErrorCode::InvalidStatementHandle,
-            "result stream's executed statement was invalidated by a re-execute",
+            "result stream's executed statement was invalidated by a re-execute or close on its \
+             parent statement; drain/close the stream before closing the statement",
         )));
     }
     Ok(e)
