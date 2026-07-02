@@ -57,15 +57,26 @@ const MAX_PARAM_ORDINAL: usize = 65_536;
 
 /// Owned box behind a `kernel_executed_statement_t`.
 ///
-/// Wraps the [`ExecutedStatement`] together with a [`ValidityFlag`]
-/// shared with any result stream borrowed from it
-/// (`kernel_executed_statement_get_result_stream`). Closing the executed
-/// handle invalidates the flag *before* dropping the box, so a stream
-/// used after its executed handle is closed short-circuits to
-/// `InvalidStatementHandle` instead of dereferencing freed memory.
+/// Wraps the [`ExecutedStatement`] with the state the C ABI needs to keep
+/// stale-handle access defined rather than UB:
+///
+/// - `alive`: a [`ValidityFlag`] shared with any borrowed result stream.
+///   `kernel_executed_statement_close` invalidates it *before* dropping
+///   the box, so a stream used after its executed handle is closed
+///   short-circuits to `InvalidStatementHandle` instead of dereferencing
+///   freed memory (out-of-order **close** guard).
+/// - `stream_taken`: enforces **at most one** live result stream per
+///   executed handle. Two streams would each reborrow `&mut exec` into a
+///   raw pointer and alias `&mut ExecutedStatement` — UB. A second
+///   `get_result_stream` returns `InvalidArgument`.
+///
+/// Note the re-execute guard is separate: a result stream also checks
+/// `exec.is_valid()` (the `ExecutedStatement`'s own flag, flipped when the
+/// parent `Statement` is re-executed) — see `result.rs`.
 pub(crate) struct ExecutedHandle {
     pub(crate) exec: ExecutedStatement,
-    pub(crate) stream_valid: ValidityFlag,
+    pub(crate) alive: ValidityFlag,
+    pub(crate) stream_taken: std::sync::atomic::AtomicBool,
 }
 
 // ─── Opaque handles ──────────────────────────────────────────────────────────
@@ -301,7 +312,8 @@ pub unsafe extern "C" fn kernel_statement_execute(
         Ok(exec) => {
             let handle = ExecutedHandle {
                 exec,
-                stream_valid: ValidityFlag::new(),
+                alive: ValidityFlag::new(),
+                stream_taken: std::sync::atomic::AtomicBool::new(false),
             };
             std::ptr::write(
                 out,
@@ -336,11 +348,16 @@ pub unsafe extern "C" fn kernel_statement_close(stmt: *mut kernel_statement_t) -
 /// handle's own stream, so the executed handle's drain-driven
 /// auto-close and lazy CloudFetch link fetches keep working.
 ///
-/// **Lifetime:** the returned stream borrows the executed handle. Closing
-/// the executed handle (`kernel_executed_statement_close`) invalidates the
-/// stream: subsequent stream calls return
-/// `KernelStatusCode::InvalidStatementHandle` (a defined error, not
-/// undefined behaviour). Close the stream first for orderly teardown.
+/// **At most one stream per handle.** A second call returns
+/// `InvalidArgument` — handing out two streams would alias `&mut
+/// ExecutedStatement` (UB) and corrupt the shared drain state.
+///
+/// **Lifetime / validity:** the returned stream borrows the executed
+/// handle. It short-circuits to `InvalidStatementHandle` (a defined
+/// error, never UB) if either (a) the executed handle is closed first
+/// (`kernel_executed_statement_close`), or (b) the parent statement is
+/// re-executed (which invalidates this handle). Close the stream first
+/// for orderly teardown.
 ///
 /// On success `*out` holds the stream handle.
 ///
@@ -358,13 +375,31 @@ pub unsafe extern "C" fn kernel_executed_statement_get_result_stream(
     if out.is_null() {
         return store_invalid_arg("get_result_stream: out must not be null");
     }
-    // Share the validity flag with the stream so an out-of-order close of
-    // the executed handle turns stream use into a defined error rather
-    // than a use-after-free.
+    // Reject if the parent statement was re-executed (this handle is stale).
+    if !handle.exec.is_valid() {
+        return store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::InvalidStatementHandle,
+            "executed statement was invalidated by a re-execute on its statement",
+        ));
+    }
+    // At most one live stream per handle: a second reborrow of `&mut exec`
+    // into a raw pointer would alias `&mut ExecutedStatement` (UB).
+    if handle
+        .stream_taken
+        .swap(true, std::sync::atomic::Ordering::AcqRel)
+    {
+        return store_invalid_arg(
+            "a result stream has already been taken from this executed statement; \
+             only one is allowed",
+        );
+    }
+    // The stream shares `alive` (invalidated on close) for the
+    // out-of-order-close UAF guard; it separately calls `exec.is_valid()`
+    // through the pointer on each use to honour re-execute invalidation.
     let exec_ptr: *mut ExecutedStatement = &mut handle.exec;
     std::ptr::write(
         out,
-        into_raw_executed_stream(exec_ptr, handle.stream_valid.clone()),
+        into_raw_executed_stream(exec_ptr, handle.alive.clone()),
     );
     KernelStatusCode::Success
 }
@@ -386,6 +421,16 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
         );
         return -1;
     };
+    // Stale after a re-execute on the parent statement → -1 with a stored
+    // InvalidStatementHandle (distinct from the not-applicable -1, which
+    // stores no error).
+    if !handle.exec.is_valid() {
+        crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::InvalidStatementHandle,
+            "executed statement was invalidated by a re-execute on its statement",
+        ));
+        return -1;
+    }
     handle.exec.num_modified_rows().unwrap_or(-1)
 }
 
@@ -407,7 +452,7 @@ pub unsafe extern "C" fn kernel_executed_statement_close(
     let handle = Box::from_raw(exec as *mut ExecutedHandle);
     // Invalidate before drop so a still-open borrowed stream sees the
     // handle as gone and returns InvalidStatementHandle.
-    handle.stream_valid.invalidate();
+    handle.alive.invalidate();
     drop(handle);
     KernelStatusCode::Success
 }

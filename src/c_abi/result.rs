@@ -98,28 +98,43 @@ pub(crate) unsafe fn into_raw_executed_stream(
         as *mut kernel_result_stream_t
 }
 
-/// Resolve the backing `ExecutedStatement` for the `Executed` shape,
-/// checking the shared validity flag first so a closed executed handle
-/// yields `InvalidStatementHandle` rather than a dangling deref.
+/// Resolve the backing `ExecutedStatement` for the `Executed` shape.
+///
+/// Two independent stale-handle guards, checked in this order so the
+/// pointer is only dereferenced once it is known to be live (either
+/// failing yields `InvalidStatementHandle` rather than UB):
+///
+/// 1. `alive` (shared with the executed handle, invalidated on its
+///    `close`) — checked BEFORE the deref, because a closed handle has
+///    been freed and the pointer would dangle.
+/// 2. `ExecutedStatement::is_valid()` (the handle's own flag, flipped
+///    when the parent statement is re-executed) — checked AFTER the
+///    deref, since it lives on the (now known-live) object.
 ///
 /// # Safety
 /// Caller must hold `&mut ResultStreamInner`.
 unsafe fn executed_ref<'a>(
     exec: *mut ExecutedStatement,
-    valid: &ValidityFlag,
+    alive: &ValidityFlag,
 ) -> Result<&'a mut ExecutedStatement, KernelStatusCode> {
-    if valid.check().is_err() {
+    if alive.check().is_err() {
         return Err(store_and_code(Error::new(
             ErrorCode::InvalidStatementHandle,
             "result stream used after its executed statement was closed",
         )));
     }
-    match exec.as_mut() {
-        Some(e) => Ok(e),
-        None => Err(store_invalid_arg(
+    let Some(e) = exec.as_mut() else {
+        return Err(store_invalid_arg(
             "result stream: backing executed handle is null",
-        )),
+        ));
+    };
+    if !e.is_valid() {
+        return Err(store_and_code(Error::new(
+            ErrorCode::InvalidStatementHandle,
+            "result stream's executed statement was invalidated by a re-execute",
+        )));
     }
+    Ok(e)
 }
 
 /// Export the schema as an `FFI_ArrowSchema`.

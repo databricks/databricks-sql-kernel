@@ -204,12 +204,22 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
             // Split the comma-separated table types into a borrowed slice.
+            // An empty / whitespace-only / comma-only CSV must mean
+            // "all types" (like a NULL arg), NOT "match nothing": the
+            // kernel treats Some(&[]) as a filter that rejects every row,
+            // so collapse an empty result back to None.
             let types_csv = opt_str(table_types_csv, "table_types")?;
-            let types_owned: Option<Vec<&str>> = types_csv.map(|csv| {
-                csv.split(',')
+            let types_owned: Option<Vec<&str>> = types_csv.and_then(|csv| {
+                let v: Vec<&str> = csv
+                    .split(',')
                     .map(str::trim)
                     .filter(|s| !s.is_empty())
-                    .collect()
+                    .collect();
+                if v.is_empty() {
+                    None
+                } else {
+                    Some(v)
+                }
             });
             session
                 .metadata()

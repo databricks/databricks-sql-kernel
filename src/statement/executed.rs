@@ -185,6 +185,17 @@ impl ExecutedStatement {
         self.status.num_modified_rows
     }
 
+    /// Whether this executed handle is still valid, i.e. the parent
+    /// `Statement` has not been re-executed (which flips the shared
+    /// `ValidityFlag` and closes this statement server-side). The C ABI
+    /// checks this so a stale handle — or a result stream borrowed from
+    /// it — returns `InvalidStatementHandle` rather than driving a
+    /// superseded server statement. Crate-internal; Rust-crate consumers
+    /// hold the handle by value and can't observe a re-execute.
+    pub(crate) fn is_valid(&self) -> bool {
+        self.valid.check().is_ok()
+    }
+
     // TODO(pr23-followup): add `progress()` once the SEA server emits
     // a progress field. Verified empirically on 2026-05-27 that a 37s
     // TPC-H query against a SQL warehouse returns no

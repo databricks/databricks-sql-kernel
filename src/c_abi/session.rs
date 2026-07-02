@@ -290,16 +290,24 @@ pub unsafe extern "C" fn kernel_session_open(
     out: *mut *mut kernel_session_t,
 ) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
-    if config.is_null() || out.is_null() {
+    // The contract is "config is consumed on every path". Reclaim the box
+    // up front (when non-null) so it is dropped even on the argument-guard
+    // error paths below — otherwise a valid config + null out would leak
+    // the box and its owned Strings (including any auth secret).
+    let config = if config.is_null() {
+        None
+    } else {
+        Some(Box::from_raw(config))
+    };
+    if config.is_none() || out.is_null() {
+        // `config` (if Some) drops here, honouring the consume contract.
         crate::c_abi::error::store_error(
             Error::invalid_argument()
                 .message("kernel_session_open: config and out must be non-null"),
         );
         return KernelStatusCode::InvalidArgument;
     }
-    // Take ownership of the config box; it is dropped at end of scope on
-    // every path, so the caller never frees it.
-    let config = Box::from_raw(config);
+    let config = config.expect("config is Some (checked above)");
 
     let session = match build_session(*config) {
         Ok(s) => s,
