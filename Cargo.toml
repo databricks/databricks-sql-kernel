@@ -34,7 +34,11 @@ categories = ["database"]
 tracing = { version = "0.1", features = ["log"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 
-arrow-array = "57"
+# `ffi` enables the Arrow C Data Interface (`FFI_ArrowArray` /
+# `FFI_ArrowSchema`, `to_ffi`) used by the C ABI's result-stream export
+# (`src/ffi/result.rs`) so ODBC / Go consumers can pull result batches
+# across the boundary without re-encoding.
+arrow-array = { version = "57", features = ["ffi"] }
 arrow-buffer = "57"
 arrow-cast = "57"
 arrow-ord = "57"

@@ -37,8 +37,12 @@
 //!
 //! - **Direct Rust crate** for PyO3 / napi-rs wrappers (Python and
 //!   Node.js).
-//! - **Custom C ABI** under `crate::ffi` (skeleton today; bodies land
-//!   when an ODBC / Go consumer needs them).
+//! - **Custom C ABI** under [`crate::c_abi`] for ODBC / Go consumers
+//!   that cannot link the Rust crate directly. It lives *in* the core
+//!   crate (not a separate crate like the PyO3 / napi bindings) because
+//!   it shares the kernel's default `tls-native` backend — the bindings
+//!   are split out only to carry `tls-rustls` without unifying it into
+//!   the kernel build. See the `c_abi` module docs.
 //!
 //! ## Example
 //!
@@ -114,8 +118,9 @@ pub mod result_stream;
 pub mod session;
 pub(crate) mod util;
 
-// Custom C ABI for ODBC / Go consumers (skeleton).
-pub mod ffi;
+// Custom C ABI for ODBC / Go consumers (lives in the core crate; see
+// `c_abi` module docs for why it is not a separate crate like pyo3 / napi).
+pub mod c_abi;
 
 // === Public re-exports ===
 pub use config::{

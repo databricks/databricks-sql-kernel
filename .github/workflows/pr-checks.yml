@@ -118,6 +118,29 @@ jobs:
         # a live workspace; `rust-e2e.yml` runs them separately.
         run: cargo test --workspace
 
+  c-abi:
+    name: C ABI smoke test
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+
+      - uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+        with:
+          toolchain: stable
+
+      - name: make c-abi-test
+        # Builds the cdylib and compiles + runs the hand-written C smoke
+        # tests in tests/c/ against the C ABI exported from src/c_abi/.
+        # Hermetic (no live warehouse) — proves ODBC / Go consumers can
+        # link and call the kernel. `cc` is preinstalled on the runner.
+        run: make c-abi-test
+
   check-tls-rustls:
     name: Build (tls-rustls feature)
     runs-on:
