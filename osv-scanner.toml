@@ -23,4 +23,27 @@
 # separately so this file stays empty on the initial landing; once we
 # have real suppressions to enforce against, wire it up.
 
-# (intentionally empty — add entries here as needed)
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0176"
+# pyo3 0.24.0..=0.28.x: out-of-bounds read in
+# Bound{List,Tuple}Iterator::nth / nth_back (unchecked usize add/sub
+# before the bounds check). Fixed in pyo3 0.29.0.
+# Justification: the pyo3 sub-crate never iterates a Python list or
+# tuple via pyo3's Bound iterators, and never calls nth / nth_back on
+# one. All `.iter()` / `.into_iter()` / `.nth()` uses in pyo3/src are
+# over Rust std collections (Vec / slice), which are unaffected. We
+# cannot bump to the fixed 0.29 yet because arrow-pyarrow (through
+# arrow 59) still caps pyo3 at ^0.28.
+# Expiry: 2026-10-01 (revisit once arrow-pyarrow supports pyo3 0.29)
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0177"
+# pyo3 <=0.28.x: PyCFunction::new_closure accepted closures that were
+# Send + 'static but not Sync, allowing concurrent invocation of a
+# non-Sync closure (data race, notably under free-threaded Python).
+# Fixed in pyo3 0.29.0.
+# Justification: this crate does not call PyCFunction::new_closure (or
+# new_closure_bound) anywhere — we expose #[pyclass] / #[pymethods]
+# types, not dynamically-built C closures. Same 0.29 upgrade blocker
+# as RUSTSEC-2026-0176 (arrow-pyarrow caps pyo3 at ^0.28).
+# Expiry: 2026-10-01 (revisit once arrow-pyarrow supports pyo3 0.29)

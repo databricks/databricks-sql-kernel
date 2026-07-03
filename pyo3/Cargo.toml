@@ -72,6 +72,12 @@ databricks-sql-kernel = { path = "..", default-features = false, features = ["tl
 # step with `requires-python = ">=3.9"` in pyproject.toml; bumping
 # both together avoids shipping a wheel whose ABI tag advertises an
 # interpreter the package no longer claims to support.
+#
+# Pinned to 0.26 to match `arrow-pyarrow` (the arrow ecosystem still
+# caps pyo3 at ^0.28 as of arrow 59, so we cannot yet reach the 0.29
+# release that fixes RUSTSEC-2026-0176 / -0177). Neither advisory is
+# reachable from this crate — see the [[IgnoredVulns]] justifications
+# in ../osv-scanner.toml. Bump to 0.29 once arrow-pyarrow supports it.
 pyo3 = { version = "0.26", features = ["extension-module", "abi3-py39"] }
 
 # Multi-thread runtime — one per Session, owned on the Rust side.
