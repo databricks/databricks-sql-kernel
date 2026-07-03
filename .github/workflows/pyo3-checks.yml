@@ -114,17 +114,17 @@ jobs:
           cargo: "true"
           uv: "true"
 
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
         with:
           python-version: ${{ matrix.python-version }}
 
-      - uses: actions-rust-lang/setup-rust-toolchain@46268bd060767258de96ed93c1251119784f2ab6  # v1.16.1
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
 
       # uv is the Python package manager the kernel pyo3 sub-crate
       # uses for env management. uv itself is installed via
       # astral-sh/setup-uv (SHA-pinned) rather than via
       # `pip install uv` so the bootstrap is also hash-locked.
-      - uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b  # v8.1.0
+      - uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39  # v8.2.0
         with:
           # Pin uv to a known good version; bump deliberately.
           version: "0.11.14"
