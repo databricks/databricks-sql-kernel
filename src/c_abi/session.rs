@@ -522,8 +522,10 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
     })
 }
 
-/// Close a session. Releases the underlying Rust [`Session`] (which
-/// fires `DeleteSession` server-side on drop / explicit close).
+/// Close a session. Initiates the fire-and-forget server-side
+/// `DeleteSession` immediately (even if statement / executed handles from
+/// this session are still open) and releases the underlying Rust
+/// [`Session`]. Does not block on the delete completing.
 ///
 /// # Safety
 ///
@@ -539,12 +541,19 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
         );
         return KernelStatusCode::InvalidArgument;
     }
-    // Reclaim the box; its `Drop` fires the fire-and-forget
-    // `DeleteSession`. We deliberately don't `block_on` an explicit
-    // `Session::close()` here — `Drop` already handles server cleanup,
-    // and a synchronous close would make `kernel_session_close` block on
-    // the network for no caller benefit.
-    drop(Box::from_raw(session as *mut Session));
+    // Reclaim the box and initiate the fire-and-forget `DeleteSession`
+    // right now. We call `initiate_delete()` explicitly rather than
+    // relying on `Drop`: a still-live statement / executed handle holds
+    // its own `Arc<SessionInner>` clone, so `SessionInner::Drop` (which
+    // only fires when the *last* Arc drops) would otherwise defer the
+    // server-side delete until those handles are released — contradicting
+    // the header's "close initiates the delete" contract. `initiate_delete`
+    // is idempotent, so the eventual `Drop` becomes a no-op. We still don't
+    // `block_on` an awaited close — that would make close block on the
+    // network for no caller benefit.
+    let session = Box::from_raw(session as *mut Session);
+    session.initiate_delete();
+    drop(session);
     KernelStatusCode::Success
 }
 

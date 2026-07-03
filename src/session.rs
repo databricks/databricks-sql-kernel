@@ -138,23 +138,45 @@ impl SessionInner {
     pub(crate) fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.runtime_handle
     }
-}
 
-impl Drop for SessionInner {
-    fn drop(&mut self) {
-        // If `Session::close()` already ran the delete, skip.
-        if self.closed.load(std::sync::atomic::Ordering::Acquire) {
-            return;
+    /// Initiate the fire-and-forget server-side `DeleteSession` now,
+    /// idempotently. Flips `closed` first (via a compare-and-swap) so at
+    /// most one delete is ever spawned — a later `Drop` (or a second
+    /// call) becomes a no-op. Unlike waiting for the last `Arc` to drop,
+    /// this fires immediately even while child handles (statements /
+    /// executed handles) still hold `Arc<SessionInner>` clones, so an
+    /// explicit close genuinely *initiates* the delete rather than
+    /// deferring it to an idle-timeout.
+    pub(crate) fn initiate_delete(&self) {
+        if self
+            .closed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .is_err()
+        {
+            return; // already closed / closing
         }
-        // Fire-and-forget DeleteSession when the last `Arc` reference
-        // goes away. Swallows errors — Drop must not panic, and we
-        // can't surface a failure here. The runtime keeps the
-        // background task alive until completion.
         let transport = Arc::clone(&self.transport);
         let session_id = self.session_id.clone();
         self.runtime_handle.spawn(async move {
             let _ = transport.delete_session(&session_id).await;
         });
+    }
+}
+
+impl Drop for SessionInner {
+    fn drop(&mut self) {
+        // Fire-and-forget DeleteSession when the last `Arc` reference
+        // goes away, unless an explicit close / a prior initiation
+        // already fired it. `initiate_delete` is idempotent (flips
+        // `closed` via compare-and-swap) and swallows errors — Drop must
+        // not panic. The runtime keeps the background task alive until
+        // completion.
+        self.initiate_delete();
     }
 }
 
@@ -340,6 +362,16 @@ impl Session {
     /// Metadata operations — flat, per-method (ODBC-shaped).
     pub fn metadata(&self) -> Metadata {
         Metadata::new(Arc::clone(&self.inner))
+    }
+
+    /// Initiate the fire-and-forget server-side `DeleteSession` now,
+    /// without awaiting it or consuming `self`. Idempotent. Used by the C
+    /// ABI's `kernel_session_close` so the delete is initiated on close
+    /// even when child handles still hold `Arc<SessionInner>` clones
+    /// (otherwise it would be deferred until the last handle drops). For
+    /// an awaitable close that surfaces failure, use [`Session::close`].
+    pub(crate) fn initiate_delete(&self) {
+        self.inner.initiate_delete();
     }
 
     /// Adopt an already-submitted server statement by its id, producing

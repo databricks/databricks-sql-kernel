@@ -23,9 +23,13 @@
 //!
 //! Two stream shapes back the same opaque handle:
 //!
-//! - **Owned** — a `ResultStream` consumed into an `OwnedBatchIter` plus
-//!   its schema. Produced by the metadata calls (`kernel_metadata_*`),
-//!   which return a standalone stream not tied to an executed handle.
+//! - **Owned** — a standalone `ResultStream` the handle owns outright.
+//!   Produced by the metadata calls (`kernel_metadata_*`), which return a
+//!   stream not tied to an executed handle. `next_batch` drives it lazily
+//!   on the runtime (via `block_on_ffi`), one batch at a time, so a large
+//!   result (e.g. `list_columns` with no catalog filter → SHOW COLUMNS IN
+//!   ALL CATALOGS) streams with bounded memory instead of being buffered
+//!   up front.
 //! - **Executed** — a borrow of the `ExecutedStatement` that produced
 //!   it. `next_batch` drives the executed handle's own stream so the
 //!   handle's drain-driven auto-close and lazy CloudFetch link fetches
@@ -51,13 +55,14 @@ pub struct kernel_result_stream_t {
 
 /// Backing state for a result-stream handle.
 enum ResultStreamInner {
-    /// Self-contained owned stream (metadata path). The batches are
-    /// **fully drained on the runtime at construction** (metadata results
-    /// are bounded), so iterating here is pure in-memory — no tokio
-    /// reactor needed, sidestepping the off-runtime CloudFetch hang.
+    /// Self-contained owned stream (metadata path). The handle owns the
+    /// `ResultStream` and drives `next_batch` lazily on the runtime (via
+    /// `block_on_ffi`) — one batch per C call — so an unbounded metadata
+    /// result (e.g. cross-catalog column listing) streams with bounded
+    /// memory rather than being drained into a `Vec` at construction.
     Owned {
         schema: SchemaRef,
-        batches: std::vec::IntoIter<RecordBatch>,
+        stream: crate::result_stream::ResultStream,
     },
     /// Borrow of the executed statement that produced this stream
     /// (sync execute path). The raw pointer is only dereferenced after
@@ -70,17 +75,16 @@ enum ResultStreamInner {
     },
 }
 
-/// Crate-internal: build an owned result-stream handle from a schema and
-/// a fully-materialised batch list (used by the metadata FFI, which
-/// drains its bounded result on the runtime before calling this).
+/// Crate-internal: build an owned result-stream handle that lazily drives
+/// the given `ResultStream` (used by the metadata FFI). `schema` is
+/// captured up front so `get_schema` needs no runtime; each `next_batch`
+/// pulls one batch on the runtime.
 pub(crate) fn into_raw_result_stream(
     schema: SchemaRef,
-    batches: Vec<RecordBatch>,
+    stream: crate::result_stream::ResultStream,
 ) -> *mut kernel_result_stream_t {
-    Box::into_raw(Box::new(ResultStreamInner::Owned {
-        schema,
-        batches: batches.into_iter(),
-    })) as *mut kernel_result_stream_t
+    Box::into_raw(Box::new(ResultStreamInner::Owned { schema, stream }))
+        as *mut kernel_result_stream_t
 }
 
 /// Crate-internal: build a result-stream handle that borrows from an
@@ -205,10 +209,34 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
 
         // Pull the next owned batch from whichever backing shape this is.
         let next: Option<Result<RecordBatch, Error>> = match inner {
-            // Owned (metadata): batches were fully drained on the runtime
-            // at construction, so this is a pure in-memory pop — no tokio
-            // reactor needed (avoids the off-runtime CloudFetch hang).
-            ResultStreamInner::Owned { batches, .. } => batches.next().map(Ok),
+            // Owned (metadata): drive the owned ResultStream lazily on the
+            // runtime, one batch at a time, so an unbounded result streams
+            // with bounded memory. Running through block_on_ffi keeps the
+            // (possibly CloudFetch-backed) reader on the tokio reactor
+            // rather than off a plain C thread.
+            ResultStreamInner::Owned { stream, .. } => {
+                match super::block_on_ffi(move || {
+                    let stream: &mut crate::result_stream::ResultStream = stream;
+                    Box::pin(async move {
+                        #[allow(
+                            unreachable_patterns,
+                            reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
+                        )]
+                        match stream.next_batch().await? {
+                            Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
+                            Some(_) => Err(Error::not_implemented().message(
+                                "metadata stream yielded a non-Arrow batch; the C ABI exports \
+                                 Arrow only",
+                            )),
+                            None => Ok(None),
+                        }
+                    })
+                }) {
+                    Ok(Some(rb)) => Some(Ok(rb)),
+                    Ok(None) => None,
+                    Err(code) => return code, // error already stored
+                }
+            }
             ResultStreamInner::Executed { exec, valid } => {
                 let exec = match executed_ref(*exec, valid) {
                     Ok(e) => e,
@@ -306,6 +334,24 @@ mod tests {
         (schema, batch)
     }
 
+    /// Build an Owned result-stream handle over the given in-memory
+    /// batches (mirrors the metadata FFI's lazy `ResultStream`-backed
+    /// handle) using a throwaway runtime for the async `from_reader`.
+    fn owned_stream_over(
+        schema: SchemaRef,
+        batches: Vec<RecordBatch>,
+    ) -> *mut kernel_result_stream_t {
+        use crate::reader::test_utils::MockReader;
+        use crate::result_stream::ResultStream;
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let stream = rt.block_on(async {
+            ResultStream::from_reader(Box::new(MockReader::new(batches)))
+                .await
+                .unwrap()
+        });
+        into_raw_result_stream(schema, stream)
+    }
+
     /// End-of-stream on an Owned stream returns `Success` with a
     /// **released** array (`release == null`) — the sentinel ODBC / Go
     /// consumers loop on. A regression that returned a non-released empty
@@ -313,7 +359,7 @@ mod tests {
     #[test]
     fn owned_stream_exhaustion_yields_released_array() {
         let (schema, batch) = one_row_batch();
-        let stream = into_raw_result_stream(schema, vec![batch]);
+        let stream = owned_stream_over(schema, vec![batch]);
 
         // First call: a real batch (release non-null).
         let mut arr = FFI_ArrowArray::empty();
