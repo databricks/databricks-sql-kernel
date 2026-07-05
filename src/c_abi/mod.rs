@@ -74,6 +74,12 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 ///
 /// [`Error`]: crate::kernel_error::Error
 pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::Runtime> {
+    // Initialise tracing once (idempotent via the logging module's OnceLock) so
+    // RUST_LOG=databricks_sql_kernel=debug surfaces the kernel's per-request logs
+    // for a C-ABI consumer (Go/ODBC) that installs no Rust-side subscriber.
+    // Without this, RUST_LOG is a no-op over the C ABI. Called here because
+    // runtime() is the funnel every async entry point passes through.
+    crate::logging::init_logging(&crate::logging::LogConfig::default());
     // `OnceLock::get_or_init` can't carry a fallible initialiser, so do
     // the build-or-fetch dance by hand: try to fetch, and on a miss
     // build once and install. A lost race just drops our spare runtime.

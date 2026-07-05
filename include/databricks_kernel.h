@@ -183,9 +183,8 @@ typedef struct kernel_session_config_t KernelSessionConfig;
 typedef struct kernel_session_t kernel_session_t;
 typedef struct kernel_statement_t kernel_statement_t;
 typedef struct kernel_executed_statement_t kernel_executed_statement_t;
-/* Async-consumption executed handle. Reserved: the async submit path is
- * deferred in v0 (see kernel_statement_submit), so no consumer receives a
- * live instance yet. */
+/* Async-consumption executed handle, returned by kernel_statement_submit
+ * and polled via kernel_executed_async_statement_status. */
 typedef struct kernel_executed_async_statement_t kernel_executed_async_statement_t;
 typedef struct kernel_result_stream_t kernel_result_stream_t;
 
@@ -285,14 +284,46 @@ KernelStatusCode kernel_statement_execute(kernel_statement_t* stmt,
                                           kernel_executed_statement_t** out);
 
 /*
- * Submit-and-return (async). DEFERRED in v0: this always returns
- * `KernelStatusCode_InvalidArgument` (with an explanatory last error) and
- * writes nothing to `*out`. Use the synchronous `kernel_statement_execute`
- * path. Declared so the symbol/contract is visible; wired when an ODBC /
- * Go consumer needs caller-driven polling.
+ * Submit-and-return (async). Submits the statement for asynchronous
+ * execution and writes an async handle to `*out`; the caller then polls
+ * `kernel_executed_async_statement_status` (sleeping between polls, so no
+ * server-side worker thread is held), fetches the result once
+ * terminal-succeeded, and may cancel a running statement. This is the path
+ * a host driver uses to honor caller-side cancellation/deadlines. The
+ * returned handle must be released with `kernel_executed_async_statement_close`.
  */
 KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
                                          kernel_executed_async_statement_t** out);
+
+/*
+ * Poll the server-side status of an async statement into `*out_kind`.
+ * A `Failed` status stores the underlying error (retrievable via
+ * `kernel_get_last_error`) and writes `KernelStatementStatusKind_Failed`;
+ * the poll call itself still returns `KernelStatusCode_Success`.
+ */
+KernelStatusCode kernel_executed_async_statement_status(
+    kernel_executed_async_statement_t* aexec, KernelStatementStatusKind* out_kind);
+
+/*
+ * Fetch the result stream once the statement is terminal-succeeded. `*out`
+ * receives an owned result stream that is driven lazily (CloudFetch chunks
+ * are fetched on demand, not materialised up front). Release it with
+ * `kernel_result_stream_close`. Calling this before the statement succeeds
+ * returns an error.
+ */
+KernelStatusCode kernel_executed_async_statement_get_result_stream(
+    kernel_executed_async_statement_t* aexec, kernel_result_stream_t** out);
+
+/* Cancel a running async statement. */
+KernelStatusCode kernel_executed_async_statement_cancel(
+    kernel_executed_async_statement_t* aexec);
+
+/*
+ * Free an async executed handle. Does NOT touch the parent statement,
+ * which you release separately with `kernel_statement_close`.
+ */
+KernelStatusCode kernel_executed_async_statement_close(
+    kernel_executed_async_statement_t* aexec);
 
 /*
  * Free the statement lifecycle owner. Does NOT free executed-handle

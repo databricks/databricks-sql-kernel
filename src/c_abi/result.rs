@@ -37,7 +37,7 @@
 use super::error::{store_and_code, store_invalid_arg};
 use super::{catch_ffi, KernelStatusCode};
 use crate::kernel_error::{Error, ErrorCode};
-use crate::result_stream::{ResultBatch, SchemaRef};
+use crate::result_stream::{ResultBatch, ResultStream, SchemaRef};
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::validity::ValidityFlag;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
@@ -68,6 +68,14 @@ enum ResultStreamInner {
         exec: *mut ExecutedStatement,
         valid: ValidityFlag,
     },
+    /// Owns a `ResultStream` and drives it lazily, one batch per
+    /// `next_batch` call (async execute path, via
+    /// `kernel_executed_async_statement_get_result_stream`). Unlike
+    /// `Owned`, batches are NOT pre-drained — a large CloudFetch result
+    /// streams chunk-by-chunk instead of materialising in memory. Unlike
+    /// `Executed`, the stream is owned outright (no borrow / validity
+    /// flag), so it stays valid regardless of the async handle's lifetime.
+    OwnedLazy { stream: Box<ResultStream> },
 }
 
 /// Crate-internal: build an owned result-stream handle from a schema and
@@ -96,6 +104,16 @@ pub(crate) unsafe fn into_raw_executed_stream(
 ) -> *mut kernel_result_stream_t {
     Box::into_raw(Box::new(ResultStreamInner::Executed { exec, valid }))
         as *mut kernel_result_stream_t
+}
+
+/// Crate-internal: build a result-stream handle that owns a `ResultStream`
+/// and drives it lazily (async execute path). The stream is driven one
+/// batch per `next_batch` call on the runtime, so CloudFetch chunks are
+/// fetched on demand rather than pre-materialised.
+pub(crate) fn into_raw_owned_lazy_stream(stream: ResultStream) -> *mut kernel_result_stream_t {
+    Box::into_raw(Box::new(ResultStreamInner::OwnedLazy {
+        stream: Box::new(stream),
+    })) as *mut kernel_result_stream_t
 }
 
 /// Resolve the backing `ExecutedStatement` for the `Executed` shape.
@@ -166,6 +184,7 @@ pub unsafe extern "C" fn kernel_result_stream_get_schema(
                 Ok(e) => e.schema(),
                 Err(code) => return code,
             },
+            ResultStreamInner::OwnedLazy { stream } => stream.schema(),
         };
         match FFI_ArrowSchema::try_from(schema.as_ref()) {
             Ok(ffi_schema) => {
@@ -229,6 +248,33 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
                             reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
                         )]
                         match exec.next_batch().await? {
+                            Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
+                            Some(_) => Err(Error::not_implemented().message(
+                                "result stream yielded a non-Arrow batch; the C ABI exports \
+                                 Arrow only",
+                            )),
+                            None => Ok(None),
+                        }
+                    })
+                }) {
+                    Ok(Some(rb)) => Some(Ok(rb)),
+                    Ok(None) => None,
+                    Err(code) => return code, // error already stored
+                }
+            }
+            ResultStreamInner::OwnedLazy { stream } => {
+                // Owned stream: drive its next_batch on the runtime so lazy
+                // CloudFetch link fetches keep working, cloning the borrowed
+                // Arrow batch into an owned RecordBatch for FFI export. Same
+                // #[non_exhaustive] fallback as the Executed arm.
+                match super::block_on_ffi(move || {
+                    let stream: &mut ResultStream = stream;
+                    Box::pin(async move {
+                        #[allow(
+                            unreachable_patterns,
+                            reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
+                        )]
+                        match stream.next_batch().await? {
                             Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
                             Some(_) => Err(Error::not_implemented().message(
                                 "result stream yielded a non-Arrow batch; the C ABI exports \

@@ -16,14 +16,13 @@
 //!
 //! ## Scope in v0
 //!
-//! The C ABI wires the **synchronous** execute path
-//! (`kernel_statement_execute` → `kernel_executed_statement_t` →
-//! `kernel_result_stream_t`), which is what the ODBC consumer needs. The
-//! **async** submit path (`kernel_statement_submit` +
-//! `kernel_executed_async_statement_*`) keeps its skeleton declarations
-//! and `unimplemented!()` bodies until a consumer needs caller-driven
-//! polling over the C ABI; Rust-crate consumers use `Statement::submit`
-//! directly.
+//! The C ABI wires both execute paths:
+//! - **synchronous** (`kernel_statement_execute` →
+//!   `kernel_executed_statement_t` → `kernel_result_stream_t`), and
+//! - **async submit + poll** (`kernel_statement_submit` →
+//!   `kernel_executed_async_statement_*`), which lets a host driver poll
+//!   status and cancel a running statement to honor caller-side
+//!   cancellation/deadlines.
 //!
 //! ## Error reporting convention
 //!
@@ -36,10 +35,11 @@
 #![allow(non_camel_case_types)]
 
 use super::error::{store_and_code, store_invalid_arg};
-use super::result::{into_raw_executed_stream, kernel_result_stream_t};
+use super::result::{into_raw_executed_stream, into_raw_owned_lazy_stream, kernel_result_stream_t};
 use super::{block_on_ffi, catch_ffi, KernelStatusCode};
 use crate::kernel_error::Error;
 use crate::statement::executed::ExecutedStatement;
+use crate::statement::executed_async::{ExecutedAsyncStatement, StatementStatus};
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
@@ -96,7 +96,7 @@ pub struct kernel_executed_statement_t {
 }
 
 /// Async-consumption executed handle. Returned by
-/// `kernel_statement_submit` (deferred in v0 — see module docs).
+/// `kernel_statement_submit`.
 #[repr(C)]
 pub struct kernel_executed_async_statement_t {
     _private: [u8; 0],
@@ -467,13 +467,32 @@ pub unsafe extern "C" fn kernel_executed_statement_close(
     KernelStatusCode::Success
 }
 
-// ─── ExecutedAsyncStatement (async) — deferred in v0 ─────────────────────────
+// ─── ExecutedAsyncStatement (async submit + poll) ────────────────────────────
 //
-// The async submit path keeps its skeleton until a consumer needs
-// caller-driven polling over the C ABI. Rust-crate consumers use
-// `Statement::submit` + `ExecutedAsyncStatement` directly.
+// The async path lets a C-ABI consumer submit a statement, poll its status
+// while sleeping between polls (holding no worker thread server-side), fetch
+// the result stream once terminal-succeeded, and cancel a running statement.
+// This is what gives Go's database/sql path context-cancellation parity with
+// the Thrift backend: the host polls and calls _cancel on ctx.Done().
 
-/// Submit-and-return. **Deferred in v0** — see module docs.
+/// Boxed behind `kernel_executed_async_statement_t`. Owns the async handle.
+struct AsyncHandle {
+    aexec: ExecutedAsyncStatement,
+}
+
+/// Borrow the boxed [`AsyncHandle`] behind an opaque async handle pointer.
+///
+/// # Safety
+/// `aexec` must be a live handle from `kernel_statement_submit`.
+unsafe fn async_handle<'a>(
+    aexec: *mut kernel_executed_async_statement_t,
+) -> Option<&'a mut AsyncHandle> {
+    (aexec as *mut AsyncHandle).as_mut()
+}
+
+/// Submit the statement for asynchronous execution, returning immediately
+/// with an async handle the caller polls via
+/// [`kernel_executed_async_statement_status`].
 ///
 /// # Safety
 /// `stmt` / `out` must be valid pointers.
@@ -482,11 +501,147 @@ pub unsafe extern "C" fn kernel_statement_submit(
     stmt: *mut kernel_statement_t,
     out: *mut *mut kernel_executed_async_statement_t,
 ) -> KernelStatusCode {
-    let _ = (stmt, out);
-    crate::c_abi::error::clear_error();
-    store_invalid_arg(
-        "async submit is not exposed over the v0 C ABI; use the synchronous execute path",
-    )
+    catch_ffi(|| {
+        let Some(stmt) = statement_mut(stmt) else {
+            return store_invalid_arg("kernel_statement_submit: stmt must not be null");
+        };
+        if out.is_null() {
+            return store_invalid_arg("kernel_statement_submit: out must not be null");
+        }
+        // Raw-pointer the statement across the block_on so the borrow doesn't
+        // have to outlive the future (mirrors kernel_statement_execute).
+        let stmt_ptr: *mut Statement = stmt;
+        match block_on_ffi(move || {
+            let stmt: &mut Statement = unsafe { &mut *stmt_ptr };
+            Box::pin(async move { stmt.submit().await })
+        }) {
+            Ok(aexec) => {
+                std::ptr::write(
+                    out,
+                    Box::into_raw(Box::new(AsyncHandle { aexec }))
+                        as *mut kernel_executed_async_statement_t,
+                );
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Poll the server-side status into `*out_kind`. A `Failed` status stores the
+/// underlying error (retrievable via `kernel_get_last_error`) and writes
+/// `Failed`; the poll itself still returns `Success`.
+///
+/// # Safety
+/// `aexec` / `out_kind` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_status(
+    aexec: *mut kernel_executed_async_statement_t,
+    out_kind: *mut KernelStatementStatusKind,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        let Some(handle) = async_handle(aexec) else {
+            return store_invalid_arg("async status: handle must not be null");
+        };
+        if out_kind.is_null() {
+            return store_invalid_arg("async status: out_kind must not be null");
+        }
+        let aexec_ptr: *const ExecutedAsyncStatement = &handle.aexec;
+        match block_on_ffi(move || {
+            let a: &ExecutedAsyncStatement = unsafe { &*aexec_ptr };
+            Box::pin(async move { a.status().await })
+        }) {
+            Ok(st) => {
+                let kind = match st {
+                    StatementStatus::Pending => KernelStatementStatusKind::Pending,
+                    StatementStatus::Running => KernelStatementStatusKind::Running,
+                    StatementStatus::Succeeded => KernelStatementStatusKind::Succeeded,
+                    StatementStatus::Cancelled => KernelStatementStatusKind::Cancelled,
+                    StatementStatus::Closed => KernelStatementStatusKind::Closed,
+                    StatementStatus::Failed(e) => {
+                        let _ = store_and_code(e);
+                        KernelStatementStatusKind::Failed
+                    }
+                };
+                std::ptr::write(out_kind, kind);
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Fetch the result stream once the statement is terminal-succeeded. `*out`
+/// receives an owned, lazily-driven `kernel_result_stream_t` (CloudFetch
+/// chunks are fetched on demand, not pre-materialised).
+///
+/// # Safety
+/// `aexec` / `out` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_get_result_stream(
+    aexec: *mut kernel_executed_async_statement_t,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        let Some(handle) = async_handle(aexec) else {
+            return store_invalid_arg("async get_result_stream: handle must not be null");
+        };
+        if out.is_null() {
+            return store_invalid_arg("async get_result_stream: out must not be null");
+        }
+        let aexec_ptr: *const ExecutedAsyncStatement = &handle.aexec;
+        match block_on_ffi(move || {
+            let a: &ExecutedAsyncStatement = unsafe { &*aexec_ptr };
+            Box::pin(async move { a.fetch_result().await })
+        }) {
+            Ok(stream) => {
+                std::ptr::write(out, into_raw_owned_lazy_stream(stream));
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Cancel a running statement.
+///
+/// # Safety
+/// `aexec` must be a live async executed handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_cancel(
+    aexec: *mut kernel_executed_async_statement_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        let Some(handle) = async_handle(aexec) else {
+            return store_invalid_arg("async cancel: handle must not be null");
+        };
+        let aexec_ptr: *const ExecutedAsyncStatement = &handle.aexec;
+        match block_on_ffi(move || {
+            let a: &ExecutedAsyncStatement = unsafe { &*aexec_ptr };
+            Box::pin(async move { a.canceller().cancel().await })
+        }) {
+            Ok(()) => KernelStatusCode::Success,
+            Err(code) => code,
+        }
+    })
+}
+
+/// Free an async executed handle. Does not touch the parent statement.
+///
+/// # Safety
+/// `aexec` must have been returned by `kernel_statement_submit` and not
+/// previously closed.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_close(
+    aexec: *mut kernel_executed_async_statement_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if aexec.is_null() {
+            return store_invalid_arg("async close: handle must not be null");
+        }
+        drop(Box::from_raw(aexec as *mut AsyncHandle));
+        KernelStatusCode::Success
+    })
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -512,4 +667,50 @@ unsafe fn with_statement(
             Err(e) => store_and_code(e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The async entry points need a live server to do real work, so the
+    // server-driven paths are covered by the e2e/wiremock integration tests.
+    // Here we pin the pointer-safety contract: every async function returns
+    // InvalidArgument (never crashes / dereferences null) when handed a null
+    // handle or null out-param, matching the guard style of the sync path.
+
+    #[test]
+    fn submit_null_guards_return_invalid_argument() {
+        let mut out: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        let rc = unsafe { kernel_statement_submit(std::ptr::null_mut(), &mut out) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn status_null_guards_return_invalid_argument() {
+        let mut kind = KernelStatementStatusKind::Pending;
+        let rc = unsafe { kernel_executed_async_statement_status(std::ptr::null_mut(), &mut kind) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn get_result_stream_null_guards_return_invalid_argument() {
+        let mut out: *mut kernel_result_stream_t = std::ptr::null_mut();
+        let rc = unsafe {
+            kernel_executed_async_statement_get_result_stream(std::ptr::null_mut(), &mut out)
+        };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn cancel_null_guard_returns_invalid_argument() {
+        let rc = unsafe { kernel_executed_async_statement_cancel(std::ptr::null_mut()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn close_null_guard_returns_invalid_argument() {
+        let rc = unsafe { kernel_executed_async_statement_close(std::ptr::null_mut()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
 }
