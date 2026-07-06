@@ -523,9 +523,16 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
 }
 
 /// Close a session. Initiates the fire-and-forget server-side
-/// `DeleteSession` immediately (even if statement / executed handles from
-/// this session are still open) and releases the underlying Rust
+/// `DeleteSession` immediately and releases the underlying Rust
 /// [`Session`]. Does not block on the delete completing.
+///
+/// Close the session **last**: because the delete is initiated eagerly,
+/// any still-open handle against this session — a statement / executed
+/// handle, or a metadata result stream (which holds its own
+/// `Arc<SessionInner>` and stays drivable) — must be drained and closed
+/// before this call. Driving such a handle afterwards issues RPCs against
+/// an already-deleting session and surfaces server errors. See the
+/// `databricks_kernel.h` teardown-ordering contract.
 ///
 /// # Safety
 ///

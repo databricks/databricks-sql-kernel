@@ -58,13 +58,18 @@
  *   calls return `InvalidStatementHandle` (a defined error, not UB).
  * - **Close is best-effort async.** `kernel_session_close` initiates the
  *   server-side delete before returning — a detached task runs it on the
- *   kernel's process-wide runtime — but does not wait for completion. The
- *   delete is initiated even if statement / executed handles from this
- *   session are still open (they may keep running until you close them;
- *   close them first for orderly teardown). A process that exits
- *   immediately after `kernel_session_close` may drop the detached task
- *   before it runs, leaving the server session to expire on its own idle
- *   timeout.
+ *   kernel's process-wide runtime — but does not wait for completion. A
+ *   process that exits immediately after `kernel_session_close` may drop
+ *   the detached task before it runs, leaving the server session to expire
+ *   on its own idle timeout.
+ * - **Close the session LAST.** Because close initiates the server-side
+ *   delete, any handle still open against that session — a statement /
+ *   executed handle, or a metadata result stream (which holds its own
+ *   session reference and remains drivable) — must be drained and closed
+ *   BEFORE `kernel_session_close`. Driving such a handle afterwards issues
+ *   RPCs against a session whose delete has already been initiated and
+ *   will surface server errors. Order teardown: result streams → executed
+ *   handles → statements → session.
  */
 
 #ifndef DATABRICKS_KERNEL_H
