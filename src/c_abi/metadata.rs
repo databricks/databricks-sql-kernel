@@ -16,11 +16,12 @@
 //! a `kernel_result_stream_t` the caller drives via
 //! `kernel_result_stream_*`.
 //!
-//! Each call captures the result schema and consumes the stream into an
-//! owned batch iterator (metadata results are bounded — a handful of
-//! batches at most), so the returned handle is self-contained and does
-//! not borrow the session. The session must still outlive the call
-//! itself.
+//! Each call captures the result schema up front and hands the owned
+//! `ResultStream` to a self-contained handle that drives it lazily (one
+//! batch per `kernel_result_stream_next_batch`), so the handle does not
+//! borrow the session and a large result (e.g. a cross-catalog column
+//! listing) streams with bounded memory. The session must still outlive
+//! the call itself.
 //!
 //! Results carry the **server-shaped** (JDBC-canonical) columns the
 //! kernel's `Metadata` produces; ODBC / JDBC drivers keep their own
@@ -32,9 +33,8 @@ use super::session::kernel_session_t;
 use super::{block_on_ffi, KernelStatusCode};
 use crate::kernel_error::{Error, Result};
 use crate::metadata_v0::{Identifier, LikePattern};
-use crate::result_stream::{ResultBatch, ResultStream, SchemaRef};
+use crate::result_stream::ResultStream;
 use crate::session::Session;
-use arrow_array::RecordBatch;
 use std::ffi::{c_char, CStr};
 
 /// Read an optional C string: null → `None`, else borrowed `&str`
@@ -61,50 +61,35 @@ unsafe fn req_str<'a>(ptr: *const c_char, what: &str) -> Result<&'a str> {
         .ok_or_else(|| Error::invalid_argument().message(format!("{what} must not be null")))
 }
 
-/// Optional [`Identifier`] from a C string (null → `None`).
+/// Read an optional C string, treating both a null pointer AND an empty /
+/// whitespace-only string as "unfiltered" (`None`).
+///
+/// ODBC/JDBC drivers routinely pass an empty string rather than NULL to
+/// mean "match all catalogs/schemas/tables"; the header only documents
+/// NULL, but rejecting `""` with `InvalidArgument` (as `Identifier::new`
+/// would) breaks those callers. Normalising empty → `None` here makes the
+/// two spellings equivalent for every filter arg.
+///
+/// # Safety
+/// As [`opt_str`].
+unsafe fn opt_filter_str<'a>(ptr: *const c_char, what: &str) -> Result<Option<&'a str>> {
+    Ok(opt_str(ptr, what)?.filter(|s| !s.trim().is_empty()))
+}
+
+/// Optional [`Identifier`] from a C string (null or empty → `None`).
 unsafe fn opt_ident<'a>(ptr: *const c_char, what: &str) -> Result<Option<Identifier<'a>>> {
-    match opt_str(ptr, what)? {
+    match opt_filter_str(ptr, what)? {
         Some(s) => Ok(Some(Identifier::new(s)?)),
         None => Ok(None),
     }
 }
 
-/// Optional [`LikePattern`] from a C string (null → `None`).
+/// Optional [`LikePattern`] from a C string (null or empty → `None`).
 unsafe fn opt_pattern<'a>(ptr: *const c_char, what: &str) -> Result<Option<LikePattern<'a>>> {
-    match opt_str(ptr, what)? {
+    match opt_filter_str(ptr, what)? {
         Some(s) => Ok(Some(LikePattern::new(s)?)),
         None => Ok(None),
     }
-}
-
-/// Drain a metadata `ResultStream` fully into owned batches **on the
-/// runtime** (this runs inside `block_on_ffi`), capturing the schema.
-///
-/// Metadata results are bounded (a handful of batches at most), so full
-/// materialisation here is cheap and lets the C-side `next_batch` be a
-/// pure in-memory pop — avoiding driving a possibly-CloudFetch-backed
-/// reader off the tokio reactor from a plain C thread.
-async fn drain_metadata(mut stream: ResultStream) -> Result<(SchemaRef, Vec<RecordBatch>)> {
-    let schema = stream.schema();
-    let mut batches = Vec::new();
-    while let Some(batch) = stream.next_batch().await? {
-        // `ResultBatch` is `#[non_exhaustive]`; the wildcard is unreachable
-        // today (Arrow is the only variant) but is the defined fallback
-        // for a future non-Arrow variant at this Arrow-only boundary.
-        #[allow(
-            unreachable_patterns,
-            reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
-        )]
-        match batch {
-            ResultBatch::Arrow(rb) => batches.push(rb.clone()),
-            _ => {
-                return Err(Error::not_implemented().message(
-                    "metadata stream yielded a non-Arrow batch; C ABI exports Arrow only",
-                ))
-            }
-        }
-    }
-    Ok((schema, batches))
 }
 
 /// Shared body for the metadata entry points: clear the error, null-check
@@ -131,13 +116,18 @@ where
     if out.is_null() {
         return store_invalid_arg("metadata: out must not be null");
     }
+    // Build the stream on the runtime and capture its schema; the stream
+    // itself is handed to the owned handle and driven lazily (one batch
+    // per `kernel_result_stream_next_batch`), so a large metadata result
+    // (e.g. cross-catalog column listing) is not buffered up front.
     let result = block_on_ffi(move || async move {
         let stream = build(session).await?;
-        drain_metadata(stream).await
+        let schema = stream.schema();
+        Ok((schema, stream))
     });
     match result {
-        Ok((schema, batches)) => {
-            std::ptr::write(out, into_raw_result_stream(schema, batches));
+        Ok((schema, stream)) => {
+            std::ptr::write(out, into_raw_result_stream(schema, stream));
             KernelStatusCode::Success
         }
         Err(code) => code,
@@ -338,3 +328,50 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
 // kernel `Metadata` exposes these (some synthesised in-memory). Wire them
 // over the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
 // SQLProcedures.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::CString;
+
+    /// A null pointer, an empty string, and a whitespace-only string all
+    /// mean "unfiltered" (`None`); a real value is borrowed through. This
+    /// lets ODBC/JDBC callers pass "" (their common "match all" spelling)
+    /// instead of NULL without hitting `Identifier`'s empty-string reject.
+    #[test]
+    fn opt_filter_str_treats_null_and_blank_as_unfiltered() {
+        unsafe {
+            assert_eq!(opt_filter_str(std::ptr::null(), "catalog").unwrap(), None);
+
+            let empty = CString::new("").unwrap();
+            assert_eq!(opt_filter_str(empty.as_ptr(), "catalog").unwrap(), None);
+
+            let blank = CString::new("   ").unwrap();
+            assert_eq!(opt_filter_str(blank.as_ptr(), "catalog").unwrap(), None);
+
+            let real = CString::new("main").unwrap();
+            assert_eq!(
+                opt_filter_str(real.as_ptr(), "catalog").unwrap(),
+                Some("main")
+            );
+        }
+    }
+
+    /// `opt_ident` inherits the same normalisation: null / empty / blank →
+    /// `None` (no `InvalidArgument`), a real value → `Some(ident)`.
+    #[test]
+    fn opt_ident_maps_empty_to_none_not_error() {
+        unsafe {
+            assert!(opt_ident(std::ptr::null(), "catalog").unwrap().is_none());
+
+            let empty = CString::new("").unwrap();
+            assert!(
+                opt_ident(empty.as_ptr(), "catalog").unwrap().is_none(),
+                "empty identifier must be treated as unfiltered, not rejected"
+            );
+
+            let real = CString::new("main").unwrap();
+            assert!(opt_ident(real.as_ptr(), "catalog").unwrap().is_some());
+        }
+    }
+}
