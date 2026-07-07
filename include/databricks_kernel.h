@@ -202,8 +202,8 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  *
  * Build a config, set exactly one connection form and exactly one auth
  * form, then hand it to `kernel_session_open` (which consumes it). Only
- * PAT and OAuth M2M auth are exposed over the C ABI in v0; OAuth U2M
- * (interactive browser flow) is Rust-crate-only.
+ * PAT, OAuth M2M, and OAuth U2M (interactive browser flow) auth are
+ * exposed over the C ABI.
  */
 KernelStatusCode kernel_session_config_new(KernelSessionConfig** out);
 void kernel_session_config_free(KernelSessionConfig* config);
@@ -222,11 +222,33 @@ KernelStatusCode kernel_session_config_set_auth_pat(KernelSessionConfig* config,
 KernelStatusCode kernel_session_config_set_auth_m2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     const char* client_secret);
+/* OAuth U2M (user-to-machine: authorization code + PKCE, browser flow).
+ * All args optional: `client_id` NULL → public `databricks-cli` client;
+ * `redirect_port` 0 → kernel default (8020); `scopes` (comma-separated)
+ * NULL → kernel default (`all-apis`,`offline_access`; `offline_access`
+ * yields a cached, auto-refreshed refresh token). INTERACTIVE: opening the
+ * session starts a localhost listener and opens the user's browser. */
+KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
+                                                    const char* client_id,
+                                                    uint16_t redirect_port,
+                                                    const char* scopes);
 
 /* Add (or overwrite) one server-bound session-conf entry. */
 KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* config,
                                                         const char* key,
                                                         const char* value);
+
+/* Append one HTTP header sent on every request. Call once per header
+ * (order preserved); `name` and `value` are both required. */
+KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
+                                                         const char* name, const char* value);
+
+/* Initialize kernel logging, process-wide and ONCE (first call wins;
+ * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
+ * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
+ * a session — lets a host route kernel logs into its own log file. Always
+ * returns Success. */
+KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
@@ -267,6 +289,12 @@ KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(Kernel
  */
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
+
+/* Report whether a session is still valid (not closed). Writes true/false
+ * to `*out`. LOCAL check only — no server round-trip, so it does not
+ * detect a server idle-timeout or dropped link; it reports whether the
+ * handle has been closed/superseded. Does not take ownership. */
+KernelStatusCode kernel_session_is_valid(const kernel_session_t* session, bool* out);
 
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,

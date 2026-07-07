@@ -24,7 +24,7 @@
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
 use super::{block_on_ffi, KernelStatusCode};
-use crate::config::{AuthConfig, ConnectionConfig, ProxyConfig, TlsConfig};
+use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
@@ -60,6 +60,16 @@ enum AuthSpec {
         client_id: String,
         client_secret: String,
     },
+    /// OAuth user-to-machine (authorization code + PKCE, browser flow).
+    /// All fields optional — the kernel fills `databricks-cli` /
+    /// port 8020 / default scopes when omitted.
+    OAuthU2M {
+        client_id: Option<String>,
+        redirect_port: Option<u16>,
+        /// Comma-separated scopes (split at build time). `None` ⇒ kernel
+        /// default (`all-apis`, `offline_access`).
+        scopes: Option<String>,
+    },
 }
 
 /// C-side session config builder state.
@@ -83,6 +93,9 @@ pub struct KernelSessionConfig {
     /// TLS relaxations / custom trust (populated by the `..._set_tls_*`
     /// setters). Defaults to the kernel's strict validation.
     tls: TlsSpec,
+    /// Extra HTTP headers sent on every request (accumulated by
+    /// `..._set_custom_header`, one `(name, value)` pair per call).
+    custom_headers: Vec<(String, String)>,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -143,6 +156,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         session_conf: HashMap::new(),
         proxy: None,
         tls: TlsSpec::default(),
+        custom_headers: Vec::new(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -247,6 +261,94 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_m2m(
         });
         Ok(())
     })
+}
+
+/// Set OAuth U2M (user-to-machine: authorization code + PKCE, browser
+/// flow) authentication. Mutually exclusive with the other `set_auth_*`
+/// setters — the last one called wins.
+///
+/// All args are optional (pass NULL to omit): `client_id` defaults to the
+/// public `databricks-cli` client, `redirect_port` to 8020, and `scopes`
+/// (a comma-separated list) to the kernel default (`all-apis`,
+/// `offline_access`). `offline_access` yields a refresh token, which the
+/// kernel caches and refreshes transparently.
+///
+/// **Behaviour:** opening a session with U2M is interactive — at
+/// `kernel_session_open` the kernel starts a localhost listener on the
+/// redirect port and opens the user's browser to the workspace authorize
+/// endpoint. Only use from an interactive context.
+///
+/// # Safety
+/// `config` must be a live config handle; the optional args, if non-null,
+/// must be NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
+    config: *mut KernelSessionConfig,
+    client_id: *const c_char,
+    redirect_port: u16,
+    scopes: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.auth = Some(AuthSpec::OAuthU2M {
+            client_id: optional_str(client_id, "client_id")?,
+            // 0 is the "unset" sentinel → kernel default (8020).
+            redirect_port: (redirect_port != 0).then_some(redirect_port),
+            scopes: optional_str(scopes, "scopes")?,
+        });
+        Ok(())
+    })
+}
+
+/// Append one HTTP header sent on every request (e.g. a partner-supplied
+/// `X-…` header). Call once per header; order is preserved. Both `name`
+/// and `value` are required. Maps to the kernel's `custom_headers`.
+///
+/// # Safety
+/// `config` must be a live config handle; `name` / `value` must be
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_custom_header(
+    config: *mut KernelSessionConfig,
+    name: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        let name = required_str(name, "header name")?;
+        let value = required_str(value, "header value")?;
+        c.custom_headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Initialize kernel logging, **process-wide and once**. `level` is one
+/// of "OFF"/"ERROR"/"WARN"/"INFO"/"DEBUG"/"TRACE" (NULL ⇒ honour
+/// `RUST_LOG`, default `warn`); `file_path` is a log file (NULL ⇒ stderr).
+///
+/// Idempotent: the underlying `tracing` subscriber can only be installed
+/// once per process, so the **first** call wins and later calls are
+/// no-ops (a driver that opens many connections calls this each time with
+/// the same target — only the first takes effect). Not tied to a session;
+/// call it before/around `kernel_session_open`. Lets an ODBC/Go host route
+/// the kernel's logs into the same file it writes its own logs to.
+///
+/// Always returns `KernelStatusCode::Success` (a bad path is reported to
+/// stderr by the logging layer, not surfaced as an error, to match the
+/// crate's best-effort logging-init contract).
+///
+/// # Safety
+/// `level` / `file_path`, if non-null, must be NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_init_logging(
+    level: *const c_char,
+    file_path: *const c_char,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    // Best-effort: a non-UTF-8 arg is treated as absent rather than an
+    // error, matching the layer's own tolerance.
+    let level = optional_str(level, "log level").ok().flatten();
+    let file = optional_str(file_path, "log file path").ok().flatten();
+    crate::logging::init_logging(&crate::logging::LogConfig { level, file });
+    KernelStatusCode::Success
 }
 
 /// Add (or overwrite) one server-bound session-conf entry. Unknown keys
@@ -454,6 +556,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         session_conf,
         proxy,
         tls,
+        custom_headers,
     } = config;
 
     block_on_ffi(move || {
@@ -484,12 +587,39 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     client_id,
                     client_secret,
                 } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None)?,
+                AuthSpec::OAuthU2M {
+                    client_id,
+                    redirect_port,
+                    scopes,
+                } => {
+                    // Split the comma-separated scope string; empty ⇒ None
+                    // (kernel default scopes).
+                    let scopes = scopes.and_then(|s| {
+                        let v: Vec<String> = s
+                            .split(',')
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                        (!v.is_empty()).then_some(v)
+                    });
+                    AuthConfig::oauth_u2m(client_id, redirect_port, scopes, None, None)
+                }
             };
 
             let mut builder = Session::builder()
                 .connection(connection)
                 .auth(auth)
                 .session_conf(session_conf);
+
+            // Extra HTTP headers, if any. Build a fresh HttpConfig so all
+            // other HTTP defaults (timeouts, pool, retry) are preserved.
+            if !custom_headers.is_empty() {
+                builder = builder.http(HttpConfig {
+                    custom_headers,
+                    ..HttpConfig::default()
+                });
+            }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
             if let Some(p) = proxy {
@@ -561,6 +691,42 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
     let session = Box::from_raw(session as *mut Session);
     session.initiate_delete();
     drop(session);
+    KernelStatusCode::Success
+}
+
+/// Report whether a session is still valid. Writes `true` to `*out` when
+/// the session has not been closed (its server-side delete has not been
+/// initiated), `false` otherwise.
+///
+/// This is a **local** liveness check — it does NOT round-trip to the
+/// server, so it won't detect a server-side idle timeout or a dropped
+/// network link. It answers "is this handle still usable" (not
+/// closed/superseded), which is what `SQLGetConnectAttr(
+/// SQL_ATTR_CONNECTION_DEAD)` needs to avoid driving an already-deleted
+/// session. Does not borrow ownership; the caller still owns `session`.
+///
+/// # Safety
+/// `session` must be a live handle from [`kernel_session_open`] (not yet
+/// closed via [`kernel_session_close`]); `out` must be a writable `bool*`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_is_valid(
+    session: *const kernel_session_t,
+    out: *mut bool,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument().message("kernel_session_is_valid: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    if out.is_null() {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument().message("kernel_session_is_valid: out must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    }
+    std::ptr::write(out, session.is_valid());
     KernelStatusCode::Success
 }
 
