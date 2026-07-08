@@ -374,15 +374,14 @@ impl Session {
         self.inner.initiate_delete();
     }
 
-    /// Whether this session is still valid — i.e. its server-side delete
+    /// Whether this session is still open — i.e. its server-side delete
     /// has not been initiated (via [`Session::close`] or
-    /// [`Session::initiate_delete`]). This is a **local** liveness signal,
-    /// not a server round-trip: it reports that the handle has not been
-    /// closed/superseded, so a subsequent operation won't drive an
-    /// already-deleted session. It does not detect a server-side idle
-    /// timeout or a dropped network link. Used by the C ABI's
-    /// `kernel_session_is_valid`.
-    pub(crate) fn is_valid(&self) -> bool {
+    /// [`Session::initiate_delete`]). This is a **local** check, not a
+    /// server round-trip: it reports whether the handle has been
+    /// closed/superseded, so a caller doesn't drive an already-deleted
+    /// session. It does **not** detect a server-side idle timeout or a
+    /// dropped network link. Backs the C ABI's `kernel_session_is_open`.
+    pub(crate) fn is_open(&self) -> bool {
         !self.inner.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 

@@ -199,15 +199,16 @@ static void test_init_logging(void) {
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
 }
 
-/* is_valid null-guards its args. */
-static void test_is_valid_null_guards(void) {
-  bool valid = true;
-  KernelStatusCode rc = kernel_session_is_valid(NULL, &valid);
-  CHECK(rc == KernelStatusCode_InvalidArgument, "is_valid(NULL session) → InvalidArgument");
+/* is_open null-guards its args. (The true→false behavior is covered by a
+ * Rust unit test that can build and close a Session without a network.) */
+static void test_is_open_null_guards(void) {
+  bool open = true;
+  KernelStatusCode rc = kernel_session_is_open(NULL, &open);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "is_open(NULL session) → InvalidArgument");
   /* A non-null-but-bogus session pointer is UB per the contract, so we only
    * exercise the null-out guard against a null session (checked first). */
-  rc = kernel_session_is_valid(NULL, NULL);
-  CHECK(rc == KernelStatusCode_InvalidArgument, "is_valid(NULL, NULL) → InvalidArgument");
+  rc = kernel_session_is_open(NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "is_open(NULL, NULL) → InvalidArgument");
 }
 
 /* The async submit path is a deferred stub → InvalidArgument, no network. */
@@ -238,7 +239,7 @@ int main(void) {
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
   test_init_logging();
-  test_is_valid_null_guards();
+  test_is_open_null_guards();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
 

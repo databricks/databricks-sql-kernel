@@ -31,8 +31,8 @@ use std::time::Duration;
 
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
-    kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
-    kernel_session_t, KernelSessionConfig,
+    kernel_session_config_set_http_path, kernel_session_is_open, kernel_session_new_statement,
+    kernel_session_open, kernel_session_t, KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::statement::{kernel_statement_close, kernel_statement_t};
 use databricks_sql_kernel::c_abi::KernelStatusCode;
@@ -89,6 +89,18 @@ fn session_close_initiates_delete_with_statement_still_open() {
             KernelStatusCode::Success
         );
         assert!(!session.is_null());
+
+        // A freshly-opened session reports open (guards against an inverted
+        // or hardcoded-false is_open). The false case can't be probed over
+        // the C ABI — kernel_session_close frees the handle in the same
+        // call — so it's covered by the crate-internal Session::is_open
+        // path instead.
+        let mut is_open = false;
+        assert_eq!(
+            kernel_session_is_open(session, &mut is_open),
+            KernelStatusCode::Success
+        );
+        assert!(is_open, "a freshly-opened session must report open");
 
         // Mint a statement — it holds an Arc<SessionInner> clone, so the
         // session's inner won't drop when we close the session below.

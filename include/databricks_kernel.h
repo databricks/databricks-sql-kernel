@@ -244,10 +244,13 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
                                                          const char* name, const char* value);
 
 /* Initialize kernel logging, process-wide and ONCE (first call wins;
- * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
- * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
- * a session — lets a host route kernel logs into its own log file. Always
- * returns Success. */
+ * later calls are no-ops returning the first call's outcome). `level` is
+ * OFF/ERROR/WARN/INFO/DEBUG/TRACE (NULL → RUST_LOG, default warn);
+ * `file_path` NULL → stderr. Not tied to a session — lets a host route
+ * kernel logs into its own log file. Returns Success when logging was
+ * installed (or skipped for level OFF); returns Internal (with a stored
+ * last-error) when the requested `file_path` could not be opened — in
+ * that case logging falls back to stderr so it still functions. */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
@@ -290,11 +293,13 @@ KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(Kernel
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
 
-/* Report whether a session is still valid (not closed). Writes true/false
- * to `*out`. LOCAL check only — no server round-trip, so it does not
- * detect a server idle-timeout or dropped link; it reports whether the
- * handle has been closed/superseded. Does not take ownership. */
-KernelStatusCode kernel_session_is_valid(const kernel_session_t* session, bool* out);
+/* Report whether a session is still OPEN (its delete has not been
+ * initiated). Writes true/false to `*out`. LOCAL check only — no server
+ * round-trip, so it does NOT detect a server idle-timeout or dropped
+ * link; it reports only whether the handle has been closed/superseded.
+ * A host backing SQL_ATTR_CONNECTION_DEAD should read `true` as
+ * "not known-dead", not a positive liveness guarantee. No ownership. */
+KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* out);
 
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
