@@ -102,6 +102,15 @@ pub struct kernel_executed_async_statement_t {
     _private: [u8; 0],
 }
 
+/// Detached canceller for a sync-executing statement. Returned by
+/// `kernel_statement_canceller_new`. Holds only cloned Arcs, so it is safe to
+/// use concurrently with the blocking `kernel_statement_execute` on the
+/// originating statement.
+#[repr(C)]
+pub struct kernel_statement_canceller_t {
+    _private: [u8; 0],
+}
+
 /// Server-side execution status — C-side mirror of
 /// [`crate::statement::executed_async::StatementStatus`].
 ///
@@ -348,6 +357,89 @@ pub unsafe extern "C" fn kernel_statement_close(stmt: *mut kernel_statement_t) -
     KernelStatusCode::Success
 }
 
+// ─── Sync-execute cancellation (detached canceller) ──────────────────────────
+
+/// Owned box behind a `kernel_statement_canceller_t`; holds a detached
+/// [`StatementCanceller`].
+struct CancellerHandle {
+    canceller: crate::statement::mutable::StatementCanceller,
+}
+
+/// Create a detached canceller for `stmt`, obtained BEFORE
+/// `kernel_statement_execute` (which blocks the calling thread, so the
+/// statement cannot be cancelled through its own handle). From another thread,
+/// `kernel_statement_canceller_cancel` then cancels the in-flight execute. Free
+/// with `kernel_statement_canceller_free`.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_new(
+    stmt: *mut kernel_statement_t,
+    out: *mut *mut kernel_statement_canceller_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_invalid_arg("kernel_statement_canceller_new: stmt must not be null");
+    };
+    if out.is_null() {
+        return store_invalid_arg("kernel_statement_canceller_new: out must not be null");
+    }
+    let handle = CancellerHandle {
+        canceller: stmt.canceller(),
+    };
+    std::ptr::write(
+        out,
+        Box::into_raw(Box::new(handle)) as *mut kernel_statement_canceller_t,
+    );
+    KernelStatusCode::Success
+}
+
+/// Fire a server-side cancel of the statement this canceller was created for.
+/// Idempotent and safe to call concurrently with `kernel_statement_execute` on
+/// the originating statement. A no-op (still `Success`) if no server statement
+/// id has been observed yet (query still in its initial round-trip) or the
+/// statement already reached a terminal state.
+///
+/// # Safety
+/// `canceller` must be a live handle from `kernel_statement_canceller_new`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_cancel(
+    canceller: *mut kernel_statement_canceller_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
+            return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
+        };
+        let canceller_ptr: *const crate::statement::mutable::StatementCanceller = &handle.canceller;
+        match block_on_ffi(move || {
+            let c: &crate::statement::mutable::StatementCanceller = unsafe { &*canceller_ptr };
+            Box::pin(async move { c.cancel().await })
+        }) {
+            Ok(_dispatched) => KernelStatusCode::Success,
+            Err(code) => code,
+        }
+    })
+}
+
+/// Free a canceller handle. Does not touch the originating statement.
+///
+/// # Safety
+/// `canceller` must have been returned by `kernel_statement_canceller_new` and
+/// not previously freed.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_free(
+    canceller: *mut kernel_statement_canceller_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if canceller.is_null() {
+            return store_invalid_arg("kernel_statement_canceller_free: handle must not be null");
+        }
+        drop(Box::from_raw(canceller as *mut CancellerHandle));
+        KernelStatusCode::Success
+    })
+}
+
 // ─── ExecutedStatement (sync) ────────────────────────────────────────────────
 
 /// Obtain a result-stream handle that **borrows** the sync executed
@@ -512,4 +604,25 @@ unsafe fn with_statement(
             Err(e) => store_and_code(e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // The detached canceller's server-driven behavior (cancel dispatched to a
+    // live statement id) is exercised by the e2e/wiremock suites; here we pin the
+    // null-pointer guards so a bad handle yields InvalidArgument, never a crash.
+    #[test]
+    fn canceller_null_guards_return_invalid_argument() {
+        let mut out: *mut kernel_statement_canceller_t = std::ptr::null_mut();
+        let rc = unsafe { kernel_statement_canceller_new(std::ptr::null_mut(), &mut out) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+
+        let rc = unsafe { kernel_statement_canceller_cancel(std::ptr::null_mut()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+
+        let rc = unsafe { kernel_statement_canceller_free(std::ptr::null_mut()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
 }

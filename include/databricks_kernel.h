@@ -197,6 +197,10 @@ typedef struct kernel_executed_statement_t kernel_executed_statement_t;
  * live instance yet. */
 typedef struct kernel_executed_async_statement_t kernel_executed_async_statement_t;
 typedef struct kernel_result_stream_t kernel_result_stream_t;
+/* Detached canceller for a sync-executing statement, returned by
+ * kernel_statement_canceller_new. Safe to use concurrently with the blocking
+ * kernel_statement_execute on the originating statement. */
+typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -319,6 +323,34 @@ KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
  * statement. The statement must outlive every handle it produced.
  */
 KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
+
+/* ─── Sync-execute cancellation (detached canceller) ──────────────────*/
+
+/*
+ * Create a detached canceller for `stmt`. Obtain it BEFORE
+ * `kernel_statement_execute`, which blocks the calling thread for the
+ * whole query — the statement cannot be cancelled through its own handle
+ * mid-execute (that would alias the mutable borrow). The canceller holds
+ * only cloned Arcs, so it is safe to use from another thread concurrently
+ * with the in-flight execute. On success `*out` holds a canceller released
+ * with `kernel_statement_canceller_free`.
+ */
+KernelStatusCode kernel_statement_canceller_new(
+    kernel_statement_t* stmt, kernel_statement_canceller_t** out);
+
+/*
+ * Cancel the originating statement, server-side. Statement-scoped: targets
+ * the specific server statement id observed for this statement. Idempotent
+ * and safe to call concurrently with `kernel_statement_execute`; returns
+ * `Success` even when it is a no-op (no server statement id observed yet,
+ * or already terminal).
+ */
+KernelStatusCode kernel_statement_canceller_cancel(
+    kernel_statement_canceller_t* canceller);
+
+/* Free a canceller handle. Does not touch the originating statement. */
+KernelStatusCode kernel_statement_canceller_free(
+    kernel_statement_canceller_t* canceller);
 
 /* ─── Executed statement (sync) ───────────────────────────────────────*/
 
