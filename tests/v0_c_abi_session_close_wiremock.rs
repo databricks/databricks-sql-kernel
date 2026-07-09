@@ -93,8 +93,8 @@ fn session_close_initiates_delete_with_statement_still_open() {
         // A freshly-opened session reports open (guards against an inverted
         // or hardcoded-false is_open). The false case can't be probed over
         // the C ABI — kernel_session_close frees the handle in the same
-        // call — so it's covered by the crate-internal Session::is_open
-        // path instead.
+        // call — so it's covered by the crate-internal
+        // `session::is_open_tests::is_open_flips_true_to_false_on_delete`.
         let mut is_open = false;
         assert_eq!(
             kernel_session_is_open(session, &mut is_open),

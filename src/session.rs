@@ -1009,3 +1009,58 @@ mod retry_config_tests {
         assert_eq!(hcc.read_timeout, Duration::from_millis(4500));
     }
 }
+
+#[cfg(test)]
+mod is_open_tests {
+    use super::*;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// `Session::is_open` reports true for a freshly-opened session and
+    /// false once its server-side delete has been initiated. This is the
+    /// only place the false path is reachable — over the C ABI
+    /// `kernel_session_close` frees the handle in the same call, so the C
+    /// wrapper can't observe it; `is_open`/`initiate_delete` are
+    /// `pub(crate)`, so this must live in-crate. Guards against an
+    /// inverted / hardcoded-true regression (hosts back
+    /// `SQL_ATTR_CONNECTION_DEAD` on this).
+    #[tokio::test]
+    async fn is_open_flips_true_to_false_on_delete() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"session_id":"sess-is-open","warehouse_id":"test_wh"}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-is-open"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        assert!(
+            session.is_open(),
+            "a freshly-opened session must report open"
+        );
+        session.initiate_delete();
+        assert!(
+            !session.is_open(),
+            "after initiate_delete the session must report not-open"
+        );
+    }
+}

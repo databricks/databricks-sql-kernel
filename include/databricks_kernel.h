@@ -244,13 +244,17 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
                                                          const char* name, const char* value);
 
 /* Initialize kernel logging, process-wide and ONCE (first call wins;
- * later calls are no-ops returning the first call's outcome). `level` is
- * OFF/ERROR/WARN/INFO/DEBUG/TRACE (NULL → RUST_LOG, default warn);
- * `file_path` NULL → stderr. Not tied to a session — lets a host route
- * kernel logs into its own log file. Returns Success when logging was
- * installed (or skipped for level OFF); returns Internal (with a stored
- * last-error) when the requested `file_path` could not be opened — in
- * that case logging falls back to stderr so it still functions. */
+ * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
+ * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
+ * a session — lets a host route kernel logs into its own log file.
+ *
+ * A non-UTF-8 `file_path` returns InvalidArgument. Otherwise the result
+ * reflects the FIRST call's outcome (a later call's level/file have no
+ * effect and are not described by its return): Success when logging was
+ * installed against the request (or skipped for level OFF); Internal (with
+ * a stored last-error) when that install did not fully honour the request
+ * — the file could not be opened (falls back to stderr) or a global
+ * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────

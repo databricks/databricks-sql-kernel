@@ -330,13 +330,17 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
 /// call it before/around `kernel_session_open`. Lets an ODBC/Go host route
 /// the kernel's logs into the same file it writes its own logs to.
 ///
-/// Returns `KernelStatusCode::Success` when logging was installed (or
-/// intentionally skipped for level `OFF`). Returns
-/// `KernelStatusCode::Internal` (with a stored last-error) when the
-/// subscriber could not be installed — currently only when the requested
-/// `file_path` fails to open — so a caller that can't see stderr (GUI /
-/// BI host) can surface the failure or fall back deliberately. Because
-/// init is once-per-process, this reflects the FIRST call's outcome.
+/// A non-UTF-8 `file_path` returns `InvalidArgument` (the requested path
+/// can't be honoured). Otherwise returns `Success` when the FIRST call
+/// installed logging against the requested destination (or was skipped for
+/// level `OFF`), or `Internal` (with a stored last-error) when that first
+/// install did not fully honour the request — the log file couldn't be
+/// opened (logging fell back to stderr) or a global subscriber was already
+/// installed (no kernel subscriber installed). Because init is
+/// once-per-process, the Success/Internal result reflects the **first**
+/// call's outcome, NOT a later call's `level`/`file_path` (which have no
+/// effect). A caller that can't see stderr can use `Internal` to surface
+/// the degradation.
 ///
 /// # Safety
 /// `level` / `file_path`, if non-null, must be NUL-terminated C strings.
@@ -346,16 +350,24 @@ pub unsafe extern "C" fn kernel_init_logging(
     file_path: *const c_char,
 ) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
-    // Best-effort on the args: a non-UTF-8 arg is treated as absent rather
-    // than an error, matching the layer's own tolerance.
+    // `level` is best-effort: a non-UTF-8 or unrecognized value falls back
+    // to RUST_LOG / the default, so treat a bad level as absent.
     let level = optional_str(level, "log level").ok().flatten();
-    let file = optional_str(file_path, "log file path").ok().flatten();
+    // `file_path` is NOT best-effort: a non-UTF-8 path is a real error (the
+    // caller asked us to write there and we can't), so surface it rather
+    // than silently dropping the path and reporting Success.
+    let file = match optional_str(file_path, "log file path") {
+        Ok(f) => f,
+        Err(e) => return crate::c_abi::error::store_and_code(e),
+    };
     if crate::logging::init_logging(&crate::logging::LogConfig { level, file }) {
         KernelStatusCode::Success
     } else {
         crate::c_abi::error::store_and_code(Error::new(
             crate::kernel_error::ErrorCode::Internal,
-            "kernel_init_logging: failed to install the logging subscriber (log file could not be opened)",
+            "kernel_init_logging: logging was not fully initialized as requested (the log file \
+             could not be opened, or a global subscriber was already installed); kernel logs may \
+             go to stderr or not flow",
         ))
     }
 }

@@ -199,8 +199,11 @@ static void test_init_logging(void) {
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
 }
 
-/* is_open null-guards its args. (The true→false behavior is covered by a
- * Rust unit test that can build and close a Session without a network.) */
+/* is_open null-guards its args. (The true→false behavior is covered by the
+ * in-crate Rust test
+ * `session::is_open_tests::is_open_flips_true_to_false_on_delete`, which can
+ * reach the pub(crate) Session::is_open / initiate_delete the C ABI can't
+ * observe after close.) */
 static void test_is_open_null_guards(void) {
   bool open = true;
   KernelStatusCode rc = kernel_session_is_open(NULL, &open);

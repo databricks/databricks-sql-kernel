@@ -76,15 +76,19 @@ pub(crate) struct LogConfig {
 /// Initialize the tracing subscriber.
 ///
 /// Uses `OnceLock` to ensure this runs at most once per process — the
-/// first call configures logging and subsequent calls are no-ops that
-/// return the first call's outcome.
+/// **first** call configures logging and installs the subscriber; every
+/// later call is a no-op that returns that **first call's** outcome (the
+/// subscriber can only be installed once, so a later call's `config` — its
+/// level / file — has no effect and its return does not describe its own
+/// arguments).
 ///
-/// Returns `true` if the subscriber was installed (or intentionally
-/// skipped because the level is `OFF`), `false` if it could not be
-/// installed — currently only when the requested log file fails to open.
-/// Callers that cannot see stderr (GUI / BI hosts) can use the `false`
-/// return to surface the failure their own way instead of assuming logs
-/// are flowing.
+/// Returns `true` if the first call installed the subscriber against the
+/// requested destination (or was intentionally skipped for level `OFF`).
+/// Returns `false` if that install did not fully honour the request —
+/// either the requested log file could not be opened (logging fell back to
+/// stderr) or the global subscriber was already installed by another
+/// component (so no kernel subscriber was installed). Callers that cannot
+/// see stderr (GUI / BI hosts) can use `false` to surface the degradation.
 pub(crate) fn init_logging(config: &LogConfig) -> bool {
     *LOGGING_INITIALIZED.get_or_init(|| {
         // Check if the configured level is "OFF" — skip initialization
@@ -124,7 +128,11 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
         });
         let file_requested_ok = config.file.is_none() || file.is_some();
 
-        if let Some(file) = file {
+        // `try_init` returns Err if a global subscriber was already
+        // installed by another component — in which case NO kernel
+        // subscriber is installed and logs won't flow, so that must fold
+        // into the outcome (not be swallowed with `.ok()`).
+        let installed = if let Some(file) = file {
             tracing_subscriber::registry()
                 .with(filter)
                 .with(
@@ -135,7 +143,7 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
                         .with_timer(SystemTime),
                 )
                 .try_init()
-                .ok();
+                .is_ok()
         } else {
             tracing_subscriber::registry()
                 .with(filter)
@@ -146,9 +154,11 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
                         .with_timer(SystemTime),
                 )
                 .try_init()
-                .ok();
-        }
-        file_requested_ok
+                .is_ok()
+        };
+        // Success only if the subscriber installed AND the requested file
+        // (if any) was honoured.
+        installed && file_requested_ok
     })
 }
 
@@ -191,21 +201,27 @@ mod tests {
         let _filter = EnvFilter::new(directive);
     }
 
-    /// `init_logging` returns a bool signal and is idempotent in its
-    /// return value. (The subscriber is process-global, so we assert the
-    /// contract via the return rather than installing/observing output,
-    /// which would be order-dependent across the shared test binary.)
+    /// `init_logging` is idempotent in its return value: because the
+    /// subscriber installs once per process, every call returns the SAME
+    /// (first-call) outcome. We assert only that invariant — not a
+    /// specific true/false — because the absolute value depends on whether
+    /// some other test in the shared binary installed the global
+    /// subscriber first (which would make this call's try_init fail). The
+    /// first-call-installs-cleanly case is exercised end-to-end by the
+    /// wiremock session tests.
     #[test]
-    fn init_logging_returns_signal_and_is_idempotent() {
-        // stderr config always succeeds; a second call returns the same
-        // (first-call-wins) outcome.
+    fn init_logging_return_is_idempotent() {
         let cfg = LogConfig {
             level: Some("warn".to_string()),
             file: None,
         };
         let first = init_logging(&cfg);
-        let second = init_logging(&cfg);
-        assert!(first, "stderr logging should install successfully");
+        // A later call with a different config must still return the first
+        // outcome (its own args have no effect).
+        let second = init_logging(&LogConfig {
+            level: Some("debug".to_string()),
+            file: Some("/nonexistent/dir/should-not-matter.log".to_string()),
+        });
         assert_eq!(first, second, "later calls return the first-call outcome");
     }
 }
