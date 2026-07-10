@@ -202,8 +202,8 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  *
  * Build a config, set exactly one connection form and exactly one auth
  * form, then hand it to `kernel_session_open` (which consumes it). Only
- * PAT and OAuth M2M auth are exposed over the C ABI in v0; OAuth U2M
- * (interactive browser flow) is Rust-crate-only.
+ * PAT, OAuth M2M, and OAuth U2M (interactive browser flow) auth are
+ * exposed over the C ABI.
  */
 KernelStatusCode kernel_session_config_new(KernelSessionConfig** out);
 void kernel_session_config_free(KernelSessionConfig* config);
@@ -222,11 +222,40 @@ KernelStatusCode kernel_session_config_set_auth_pat(KernelSessionConfig* config,
 KernelStatusCode kernel_session_config_set_auth_m2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     const char* client_secret);
+/* OAuth U2M (user-to-machine: authorization code + PKCE, browser flow).
+ * All args optional: `client_id` NULL → public `databricks-cli` client;
+ * `redirect_port` 0 → kernel default (8020); `scopes` (comma-separated)
+ * NULL → kernel default (`all-apis`,`offline_access`; `offline_access`
+ * yields a cached, auto-refreshed refresh token). INTERACTIVE: opening the
+ * session starts a localhost listener and opens the user's browser. */
+KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
+                                                    const char* client_id,
+                                                    uint16_t redirect_port,
+                                                    const char* scopes);
 
 /* Add (or overwrite) one server-bound session-conf entry. */
 KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* config,
                                                         const char* key,
                                                         const char* value);
+
+/* Append one HTTP header sent on every request. Call once per header
+ * (order preserved); `name` and `value` are both required. */
+KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
+                                                         const char* name, const char* value);
+
+/* Initialize kernel logging, process-wide and ONCE (first call wins;
+ * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
+ * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
+ * a session — lets a host route kernel logs into its own log file.
+ *
+ * A non-UTF-8 `file_path` returns InvalidArgument. Otherwise the result
+ * reflects the FIRST call's outcome (a later call's level/file have no
+ * effect and are not described by its return): Success when logging was
+ * installed against the request (or skipped for level OFF); Internal (with
+ * a stored last-error) when that install did not fully honour the request
+ * — the file could not be opened (falls back to stderr) or a global
+ * subscriber was already installed (no kernel subscriber installed). */
+KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
@@ -267,6 +296,14 @@ KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(Kernel
  */
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
+
+/* Report whether a session is still OPEN (its delete has not been
+ * initiated). Writes true/false to `*out`. LOCAL check only — no server
+ * round-trip, so it does NOT detect a server idle-timeout or dropped
+ * link; it reports only whether the handle has been closed/superseded.
+ * A host backing SQL_ATTR_CONNECTION_DEAD should read `true` as
+ * "not known-dead", not a positive liveness guarantee. No ownership. */
+KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* out);
 
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,

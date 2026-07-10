@@ -167,6 +167,53 @@ static void test_proxy_and_tls_setters(void) {
   kernel_session_config_free(config);
 }
 
+/* U2M + custom-header setters accept valid input; header requires args. */
+static void test_u2m_and_header_setters(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  /* All U2M args optional — NULL client_id / 0 port / NULL scopes → kernel
+   * defaults. This only populates the config; it does not open a session,
+   * so no browser is launched. */
+  KernelStatusCode rc = kernel_session_config_set_auth_u2m(config, NULL, 0, NULL);
+  CHECK(rc == KernelStatusCode_Success, "set_auth_u2m (all defaults) succeeds");
+  rc = kernel_session_config_set_auth_u2m(config, "my-client", 8020, "all-apis,offline_access");
+  CHECK(rc == KernelStatusCode_Success, "set_auth_u2m (explicit) succeeds");
+
+  rc = kernel_session_config_set_custom_header(config, "X-Trace-Id", "abc123");
+  CHECK(rc == KernelStatusCode_Success, "set_custom_header succeeds");
+  rc = kernel_session_config_set_custom_header(config, NULL, "v");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_custom_header(NULL name) → InvalidArgument");
+  rc = kernel_session_config_set_custom_header(config, "X-Foo", NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_custom_header(NULL value) → InvalidArgument");
+
+  kernel_session_config_free(config);
+}
+
+/* kernel_init_logging is idempotent and null-tolerant. */
+static void test_init_logging(void) {
+  KernelStatusCode rc = kernel_init_logging("WARN", NULL);
+  CHECK(rc == KernelStatusCode_Success, "init_logging(level, NULL file) succeeds");
+  /* Second call is a no-op (subscriber already installed) but still Success. */
+  rc = kernel_init_logging(NULL, NULL);
+  CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
+}
+
+/* is_open null-guards its args. (The true→false behavior is covered by the
+ * in-crate Rust test
+ * `session::is_open_tests::is_open_flips_true_to_false_on_delete`, which can
+ * reach the pub(crate) Session::is_open / initiate_delete the C ABI can't
+ * observe after close.) */
+static void test_is_open_null_guards(void) {
+  bool open = true;
+  KernelStatusCode rc = kernel_session_is_open(NULL, &open);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "is_open(NULL session) → InvalidArgument");
+  /* A non-null-but-bogus session pointer is UB per the contract, so we only
+   * exercise the null-out guard against a null session (checked first). */
+  rc = kernel_session_is_open(NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "is_open(NULL, NULL) → InvalidArgument");
+}
+
 /* The async submit path is a deferred stub → InvalidArgument, no network. */
 static void test_submit_stub_rejects(void) {
   kernel_executed_async_statement_t* out = NULL;
@@ -193,6 +240,9 @@ int main(void) {
   test_http_path_and_m2m_setters();
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
+  test_u2m_and_header_setters();
+  test_init_logging();
+  test_is_open_null_guards();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
 
