@@ -420,9 +420,9 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
 /// no-op), `false` if no id has been observed yet — nothing has executed, or the
 /// query is still in its initial round-trip before the server issued an id. Both
 /// cases return `Success`; the flag is how a host distinguishes a dispatched
-/// cancel from a no-op. `*dispatched` is written on every non-null path (set to
-/// `false` before the RPC and to the RPC outcome on `Success`), so it always
-/// holds a defined value once this returns; a null `dispatched` is ignored.
+/// cancel from a no-op. `*dispatched` is set to `false` before the RPC and to
+/// the outcome on `Success`, so it is always defined once this returns; a null
+/// `dispatched` is ignored.
 ///
 /// # Safety
 /// `canceller` must be a live handle from `kernel_statement_canceller_new`.
@@ -447,10 +447,7 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
             return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
         };
         // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
-        // session and id-slot handles rather than borrowing through this box. The
-        // clone lets the RPC run without holding a borrow into the box; safety
-        // against a concurrent `_free` rests on the single-owner contract below
-        // (no thread inside `_cancel` when `_free` runs), not on the clone.
+        // session and id-slot handles rather than borrowing through this box.
         let canceller = handle.canceller.clone();
         match block_on_ffi(move || Box::pin(async move { canceller.cancel().await })) {
             Ok(fired) => {
