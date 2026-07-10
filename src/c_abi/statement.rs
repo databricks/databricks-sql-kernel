@@ -427,22 +427,25 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
 /// # Safety
 /// `canceller` must be a live handle from `kernel_statement_canceller_new`.
 /// `dispatched`, if non-null, must be writable. The handle must not be freed by
-/// another thread while this call is in flight (the cancel RPC blocks for a full
-/// round-trip); order any `kernel_statement_canceller_free` after this returns.
+/// another thread while this call is in flight: it blocks on the cancel RPC,
+/// which on a retryable server error retries with backoff and can take much
+/// longer than one round-trip. Order any `kernel_statement_canceller_free` after
+/// this returns.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_cancel(
     canceller: *mut kernel_statement_canceller_t,
     dispatched: *mut bool,
 ) -> KernelStatusCode {
     catch_ffi(|| {
-        let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
-            return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
-        };
-        // Define the out-param before anything fallible, so a caller that reads
-        // it sees `false` (no cancel dispatched) on every path, including errors.
+        // Define the out-param before anything else, so a caller that reads it
+        // sees `false` (no cancel dispatched) on every path, including the
+        // null-handle and error returns below.
         if !dispatched.is_null() {
             std::ptr::write(dispatched, false);
         }
+        let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
+            return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
+        };
         // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
         // session and id-slot handles rather than borrowing through this box. The
         // clone lets the RPC run without holding a borrow into the box; safety
@@ -466,9 +469,10 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
 /// # Safety
 /// `canceller` must have been returned by `kernel_statement_canceller_new` and
 /// not previously freed. The canceller is single-owner: no other thread may be
-/// inside `kernel_statement_canceller_cancel` on this handle when it is freed
-/// (that call blocks for a full cancel round-trip). Join or otherwise quiesce any
-/// cancelling thread before freeing.
+/// inside `kernel_statement_canceller_cancel` on this handle when it is freed.
+/// That call blocks on the cancel RPC, which on a retryable server error retries
+/// with backoff and can stay in flight far longer than one round-trip, so join or
+/// otherwise quiesce any cancelling thread before freeing.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_free(
     canceller: *mut kernel_statement_canceller_t,

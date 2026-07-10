@@ -26,6 +26,8 @@
 //!   returns `Success` with `dispatched == false`, and is idempotent.
 //! - `cancel_rpc_failure_returns_error_and_sets_dispatched_false`: a failing
 //!   cancel RPC surfaces a non-Success status with `dispatched` written `false`.
+//! - `cancel_after_terminal_dispatches_and_reports_true`: a cancel with an
+//!   observed id dispatches and reports `dispatched == true`, even post-terminal.
 //! - `canceller_retargets_the_current_execution_on_reuse`: a canceller kept
 //!   across a re-execute cancels the second query, not the finished first.
 //!
@@ -394,6 +396,12 @@ fn cancel_before_execute_is_a_noop_success() {
             KernelStatusCode::Success
         );
 
+        // A null `out` is rejected rather than written through.
+        assert_eq!(
+            kernel_statement_canceller_new(stmt, std::ptr::null_mut()),
+            KernelStatusCode::InvalidArgument
+        );
+
         let mut canceller: *mut kernel_statement_canceller_t = std::ptr::null_mut();
         assert_eq!(
             kernel_statement_canceller_new(stmt, &mut canceller),
@@ -456,9 +464,12 @@ fn cancel_rpc_failure_returns_error_and_sets_dispatched_false() {
             .respond_with(ResponseTemplate::new(200).set_body_string(canceled_body("stmt-err")))
             .mount(&server)
             .await;
+        // 404 is non-retryable for an idempotent cancel, so the RPC fails after
+        // one round-trip rather than exhausting the retry ladder (a 5xx would add
+        // ~60s of backoff to this test).
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/statements/stmt-err/cancel"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("not found"))
             .mount(&server)
             .await;
         server
@@ -489,7 +500,7 @@ fn cancel_rpc_failure_returns_error_and_sets_dispatched_false() {
         let exec_rc = kernel_statement_execute(stmt, &mut exec);
         assert_ne!(exec_rc, KernelStatusCode::Success);
 
-        // Now cancel: an id is observed, so the RPC dispatches — and fails (500).
+        // Now cancel: an id is observed, so the RPC dispatches — and fails (404).
         // A pre-seeded `true` sentinel confirms the error path still defined the
         // out-param (to false), per the always-write contract.
         let mut dispatched = true;
@@ -502,6 +513,83 @@ fn cancel_rpc_failure_returns_error_and_sets_dispatched_false() {
         assert!(
             !dispatched,
             "on the error path, *dispatched is written false (never left undefined)"
+        );
+
+        assert_eq!(
+            kernel_statement_canceller_free(canceller),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn cancel_after_terminal_dispatches_and_reports_true() {
+    // Once a statement id has been observed it stays in the shared slot until the
+    // next execute. A cancel after the statement is already terminal therefore
+    // still dispatches an RPC against that id (the server treats it as its own
+    // no-op) and reports dispatched == true — distinct from the never-executed
+    // no-op, which reports false.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-term")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-term"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(canceled_body("stmt-term")))
+            .mount(&server)
+            .await;
+        // The cancel succeeds here (unlike the failure test's 404).
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-term/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut canceller: *mut kernel_statement_canceller_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_canceller_new(stmt, &mut canceller),
+            KernelStatusCode::Success
+        );
+
+        // Drive execute to its terminal state, leaving the id in the shared slot.
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_ne!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        // Cancel after terminal: id still observed → RPC dispatched, dispatched == true.
+        let mut dispatched = false;
+        assert_eq!(
+            kernel_statement_canceller_cancel(canceller, &mut dispatched),
+            KernelStatusCode::Success
+        );
+        assert!(
+            dispatched,
+            "a cancel with an observed id dispatches and reports true, even post-terminal"
         );
 
         assert_eq!(

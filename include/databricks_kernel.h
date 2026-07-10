@@ -369,8 +369,10 @@ KernelStatusCode kernel_statement_canceller_cancel(
 /*
  * Free a canceller handle. Does not touch the originating statement. The
  * canceller is single-owner: no other thread may be inside
- * kernel_statement_canceller_cancel on this handle when it is freed (that call
- * blocks for a full cancel round-trip). Quiesce any cancelling thread first.
+ * kernel_statement_canceller_cancel on this handle when it is freed. That call
+ * blocks on the cancel RPC, which on a retryable server error retries with
+ * backoff and can stay in flight far longer than one round-trip, so quiesce any
+ * cancelling thread first.
  */
 KernelStatusCode kernel_statement_canceller_free(
     kernel_statement_canceller_t* canceller);
