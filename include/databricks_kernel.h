@@ -69,7 +69,12 @@
  *   BEFORE `kernel_session_close`. Driving such a handle afterwards issues
  *   RPCs against a session whose delete has already been initiated and
  *   will surface server errors. Order teardown: result streams → executed
- *   handles → statements → session.
+ *   handles → statement cancellers → statements → session.
+ * - **Free statement cancellers too.** A `kernel_statement_canceller_t`
+ *   holds its own session reference, so a leaked canceller pins the
+ *   client-side session (and its connection pool) past
+ *   `kernel_session_close`. Free it once its execute has returned,
+ *   regardless of statement/session close.
  */
 
 #ifndef DATABRICKS_KERNEL_H
@@ -199,7 +204,10 @@ typedef struct kernel_executed_async_statement_t kernel_executed_async_statement
 typedef struct kernel_result_stream_t kernel_result_stream_t;
 /* Detached canceller for a sync-executing statement, returned by
  * kernel_statement_canceller_new. Safe to use concurrently with the blocking
- * kernel_statement_execute on the originating statement. */
+ * kernel_statement_execute on the originating statement. Statement-scoped, not
+ * execution-scoped: it tracks whichever query is currently in flight on its
+ * statement, so a canceller retained across a re-execute cancels the LATER
+ * query. Use one per execute (new before execute, free after it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
@@ -332,23 +340,38 @@ KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
  * whole query — the statement cannot be cancelled through its own handle
  * mid-execute (that would alias the mutable borrow). The canceller holds
  * only cloned Arcs, so it is safe to use from another thread concurrently
- * with the in-flight execute. On success `*out` holds a canceller released
- * with `kernel_statement_canceller_free`.
+ * with the in-flight execute. It holds its own session reference, so it must
+ * be freed regardless of whether the statement or session is closed. On
+ * success `*out` holds a canceller released with
+ * `kernel_statement_canceller_free`.
  */
 KernelStatusCode kernel_statement_canceller_new(
     kernel_statement_t* stmt, kernel_statement_canceller_t** out);
 
 /*
  * Cancel the originating statement, server-side. Statement-scoped: targets
- * the specific server statement id observed for this statement. Idempotent
- * and safe to call concurrently with `kernel_statement_execute`; returns
- * `Success` even when it is a no-op (no server statement id observed yet,
- * or already terminal).
+ * the server statement id currently observed for this statement. Idempotent
+ * and safe to call concurrently with `kernel_statement_execute`.
+ *
+ * On Success, `*dispatched` reports whether a cancel RPC was actually sent:
+ * true if a server statement id had been observed and the RPC was dispatched
+ * (the server treats a cancel of an already-finished statement as its own
+ * no-op), false if no id has been observed yet — nothing has executed, or the
+ * query is still in its initial round-trip before the server issued an id. Both
+ * cases return Success; `*dispatched` is how a host tells a dispatched cancel
+ * from a no-op. `*dispatched` is written on every non-NULL path (false before
+ * the RPC, then the RPC outcome on Success), so it holds a defined value once
+ * this returns; a NULL `dispatched` is ignored.
  */
 KernelStatusCode kernel_statement_canceller_cancel(
-    kernel_statement_canceller_t* canceller);
+    kernel_statement_canceller_t* canceller, bool* dispatched);
 
-/* Free a canceller handle. Does not touch the originating statement. */
+/*
+ * Free a canceller handle. Does not touch the originating statement. The
+ * canceller is single-owner: no other thread may be inside
+ * kernel_statement_canceller_cancel on this handle when it is freed (that call
+ * blocks for a full cancel round-trip). Quiesce any cancelling thread first.
+ */
 KernelStatusCode kernel_statement_canceller_free(
     kernel_statement_canceller_t* canceller);
 

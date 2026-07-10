@@ -106,6 +106,13 @@ pub struct kernel_executed_async_statement_t {
 /// `kernel_statement_canceller_new`. Holds only cloned Arcs, so it is safe to
 /// use concurrently with the blocking `kernel_statement_execute` on the
 /// originating statement.
+///
+/// Statement-scoped, not execution-scoped: it tracks whichever query is
+/// currently in flight on its originating statement. Re-executing the same
+/// statement retargets the canceller to the new query, so a canceller retained
+/// across a re-execute cancels the *later* query. Use one canceller per execute:
+/// obtain it before `kernel_statement_execute`, `kernel_statement_canceller_free`
+/// it after that execute returns, before re-executing.
 #[repr(C)]
 pub struct kernel_statement_canceller_t {
     _private: [u8; 0],
@@ -371,8 +378,16 @@ struct CancellerHandle {
 /// `kernel_statement_canceller_cancel` then cancels the in-flight execute. Free
 /// with `kernel_statement_canceller_free`.
 ///
+/// The canceller holds its own reference to the session, so it keeps that
+/// session's client-side state alive until freed and must be freed regardless of
+/// whether the statement or session is closed. It does not extend the teardown
+/// order beyond the statement; free it before closing the statement it came from.
+///
 /// # Safety
-/// `stmt` must be a live statement handle; `out` must be writable.
+/// `stmt` must be a live statement handle; `out` must be writable. `stmt` must
+/// not have an `kernel_statement_execute` in flight on another thread: this
+/// borrows the statement mutably, and execute holds its own mutable borrow for
+/// the duration of the query, so obtain the canceller before dispatching.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_new(
     stmt: *mut kernel_statement_t,
@@ -397,26 +412,50 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
 
 /// Fire a server-side cancel of the statement this canceller was created for.
 /// Idempotent and safe to call concurrently with `kernel_statement_execute` on
-/// the originating statement. A no-op (still `Success`) if no server statement
-/// id has been observed yet (query still in its initial round-trip) or the
-/// statement already reached a terminal state.
+/// the originating statement.
+///
+/// On `Success`, `*dispatched` reports whether a cancel RPC was actually sent:
+/// `true` if a server statement id had been observed and the RPC was dispatched
+/// (the server treats a cancel of an already-finished statement as its own
+/// no-op), `false` if no id has been observed yet — nothing has executed, or the
+/// query is still in its initial round-trip before the server issued an id. Both
+/// cases return `Success`; the flag is how a host distinguishes a dispatched
+/// cancel from a no-op. `*dispatched` is written on every non-null path (set to
+/// `false` before the RPC and to the RPC outcome on `Success`), so it always
+/// holds a defined value once this returns; a null `dispatched` is ignored.
 ///
 /// # Safety
 /// `canceller` must be a live handle from `kernel_statement_canceller_new`.
+/// `dispatched`, if non-null, must be writable. The handle must not be freed by
+/// another thread while this call is in flight (the cancel RPC blocks for a full
+/// round-trip); order any `kernel_statement_canceller_free` after this returns.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_cancel(
     canceller: *mut kernel_statement_canceller_t,
+    dispatched: *mut bool,
 ) -> KernelStatusCode {
     catch_ffi(|| {
         let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
             return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
         };
-        let canceller_ptr: *const crate::statement::mutable::StatementCanceller = &handle.canceller;
-        match block_on_ffi(move || {
-            let c: &crate::statement::mutable::StatementCanceller = unsafe { &*canceller_ptr };
-            Box::pin(async move { c.cancel().await })
-        }) {
-            Ok(_dispatched) => KernelStatusCode::Success,
+        // Define the out-param before anything fallible, so a caller that reads
+        // it sees `false` (no cancel dispatched) on every path, including errors.
+        if !dispatched.is_null() {
+            std::ptr::write(dispatched, false);
+        }
+        // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
+        // session and id-slot handles rather than borrowing through this box. The
+        // clone lets the RPC run without holding a borrow into the box; safety
+        // against a concurrent `_free` rests on the single-owner contract below
+        // (no thread inside `_cancel` when `_free` runs), not on the clone.
+        let canceller = handle.canceller.clone();
+        match block_on_ffi(move || Box::pin(async move { canceller.cancel().await })) {
+            Ok(fired) => {
+                if !dispatched.is_null() {
+                    std::ptr::write(dispatched, fired);
+                }
+                KernelStatusCode::Success
+            }
             Err(code) => code,
         }
     })
@@ -426,7 +465,10 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
 ///
 /// # Safety
 /// `canceller` must have been returned by `kernel_statement_canceller_new` and
-/// not previously freed.
+/// not previously freed. The canceller is single-owner: no other thread may be
+/// inside `kernel_statement_canceller_cancel` on this handle when it is freed
+/// (that call blocks for a full cancel round-trip). Join or otherwise quiesce any
+/// cancelling thread before freeing.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_free(
     canceller: *mut kernel_statement_canceller_t,
@@ -610,16 +652,25 @@ unsafe fn with_statement(
 mod tests {
     use super::*;
 
-    // The detached canceller's server-driven behavior (cancel dispatched to a
-    // live statement id) is exercised by the e2e/wiremock suites; here we pin the
-    // null-pointer guards so a bad handle yields InvalidArgument, never a crash.
+    // Null-pointer guards only: a bad handle yields InvalidArgument, never a
+    // crash. The success + concurrent-cancel-during-execute paths are covered by
+    // tests/v0_c_abi_canceller_wiremock.rs, which drives these entry points
+    // against a mock SEA server.
     #[test]
     fn canceller_null_guards_return_invalid_argument() {
         let mut out: *mut kernel_statement_canceller_t = std::ptr::null_mut();
         let rc = unsafe { kernel_statement_canceller_new(std::ptr::null_mut(), &mut out) };
         assert_eq!(rc, KernelStatusCode::InvalidArgument);
 
-        let rc = unsafe { kernel_statement_canceller_cancel(std::ptr::null_mut()) };
+        // A null dispatched out-param is tolerated; the null handle is what makes
+        // this InvalidArgument.
+        let mut dispatched = false;
+        let rc =
+            unsafe { kernel_statement_canceller_cancel(std::ptr::null_mut(), &mut dispatched) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+        let rc = unsafe {
+            kernel_statement_canceller_cancel(std::ptr::null_mut(), std::ptr::null_mut())
+        };
         assert_eq!(rc, KernelStatusCode::InvalidArgument);
 
         let rc = unsafe { kernel_statement_canceller_free(std::ptr::null_mut()) };
