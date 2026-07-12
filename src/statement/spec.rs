@@ -191,6 +191,16 @@ pub struct StatementSpec {
     /// kernel rejects at bind time before the wire.
     pub named_params: HashMap<String, TypedValue>,
 
+    /// Pre-marshalled SEA parameters (name/ordinal + Databricks type name +
+    /// stringified value). This is the shape a C-ABI host driver already
+    /// produces — e.g. the Go driver stringifies every value and carries the
+    /// SQL type name (`BIGINT`, `STRING`, `DECIMAL(..)`, `VOID` for NULL) — so
+    /// rather than round-trip through `TypedValue`, such a host pushes
+    /// `StatementParameter`s here directly. Mutually exclusive with
+    /// `positional_params` / `named_params` (mixing marker styles is rejected
+    /// the same way). Empty unless a host used the raw-bind path.
+    pub raw_params: Vec<crate::types::sea::StatementParameter>,
+
     /// Per-statement conf overlay. Maps to SEA `parameters` /
     /// Thrift `confOverlay`. Merged on top of the session-level
     /// `session_conf` at execute time; this map wins on key collisions.
@@ -213,9 +223,21 @@ impl StatementSpec {
         Self::default()
     }
 
-    /// Set the SQL text. Replaces any previously set SQL.
+    /// Set the SQL text. Replaces any previously set SQL, and clears any
+    /// pre-marshalled `raw_params` so each `sql()` begins a fresh parameter set.
+    ///
+    /// This is the reset point for the raw-bind path: unlike positional
+    /// `TypedValue` binds, which overwrite by ordinal (`param`) and so are
+    /// idempotent across a re-execute, raw binds carry no ordinal and only
+    /// `push`, so without a reset a host reusing one statement handle across
+    /// queries (`set_sql` → bind → execute, repeat) would accumulate stale
+    /// markers from the prior query. Clearing here ties the raw parameter set to
+    /// the current SQL, matching the prepared-statement mental model (new SQL →
+    /// fresh binds). The `TypedValue` sets are left untouched (they are already
+    /// reuse-safe by overwrite).
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self {
         self.sql = Some(sql.into());
+        self.raw_params.clear();
         self
     }
 
@@ -262,6 +284,27 @@ impl StatementSpec {
         }
         self.named_params.insert(name, value);
         Ok(self)
+    }
+
+    /// Push a pre-marshalled SEA parameter (host-stringified value + Databricks
+    /// type name). `name` empty → positional (ordinal assigned at execute in
+    /// push order, 1-based); non-empty → named. `value` None → SQL NULL (the
+    /// host passes type "VOID"). This is the raw-bind path a C-ABI host uses; it
+    /// bypasses `TypedValue` inference because the host already knows the wire
+    /// type and string form.
+    pub fn param_raw(
+        &mut self,
+        name: Option<String>,
+        param_type: impl Into<String>,
+        value: Option<String>,
+    ) -> &mut Self {
+        self.raw_params.push(crate::types::sea::StatementParameter {
+            name,
+            ordinal: None, // assigned at build time for positional
+            param_type: param_type.into(),
+            value,
+        });
+        self
     }
 
     /// Set the per-statement conf overlay. Replaces any previously-set map.
@@ -519,6 +562,24 @@ mod tests {
         let err = s.param_named("", TypedValue::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(s.named_params.is_empty());
+    }
+
+    #[test]
+    fn sql_clears_raw_params_so_reuse_does_not_accumulate() {
+        // A host reusing one statement (set_sql → bind → execute, repeat) must not
+        // accumulate stale raw params: raw binds only push (no overwrite-by-ordinal),
+        // so sql() is the reset point. After a second set_sql + bind, exactly the
+        // second query's params remain.
+        let mut s = StatementSpec::new();
+        s.sql("SELECT ?");
+        s.param_raw(None, "BIGINT", Some("1".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
+
+        s.sql("SELECT ?"); // re-set for the next execute
+        assert!(s.raw_params.is_empty(), "sql() must clear prior raw params");
+        s.param_raw(None, "STRING", Some("hi".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
+        assert_eq!(s.raw_params[0].value.as_deref(), Some("hi"));
     }
 
     // ─── query_tags merge behaviour ─────────────────────────────────────

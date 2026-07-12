@@ -339,6 +339,17 @@ KernelStatusCode kernel_statement_bind_bool(kernel_statement_t* stmt, size_t ord
 KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t ordinal,
                                               const char* value);
 
+/* Bind a pre-marshalled parameter: host-supplied Databricks type name +
+ * stringified value, positional or named. For a host that already stringifies
+ * values and knows the SQL type (e.g. the Go driver). name NULL/empty ->
+ * positional (ordinal assigned at execute in push order); non-empty -> named.
+ * value NULL -> SQL NULL (pass sql_type "VOID"). Positional and named raw params
+ * are mutually exclusive within a statement, as are raw vs typed params. */
+KernelStatusCode kernel_statement_bind_parameter(kernel_statement_t* stmt,
+                                                 const char* name,
+                                                 const char* sql_type,
+                                                 const char* value);
+
 /*
  * Wait-for-result execution. On success, `*out` holds an executed handle
  * released with `kernel_executed_statement_close`.

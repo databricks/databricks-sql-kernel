@@ -253,6 +253,70 @@ pub unsafe extern "C" fn kernel_statement_bind_string(
     })
 }
 
+/// Bind a pre-marshalled parameter: host-supplied Databricks type name +
+/// stringified value, positional or named. This is the binding path for a host
+/// driver that already stringifies values and knows the SQL type (e.g. the Go
+/// driver's `backend.Param{Name, Type, Value}`) — it avoids round-tripping
+/// through the kernel's `TypedValue` inference.
+///
+/// - `name`: NULL/empty → positional (ordinal assigned at execute in push
+///   order); non-empty → named (`:name` marker).
+/// - `sql_type`: Databricks type name (e.g. "BIGINT", "STRING", "DECIMAL(5,2)").
+///   For a NULL value the host passes "VOID" (matches the driver convention).
+/// - `value`: NULL → SQL NULL; otherwise the stringified value sent verbatim.
+///
+/// Positional and named raw params are mutually exclusive within one statement
+/// (enforced at execute), as are raw vs TypedValue params.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `sql_type` must be a NUL-terminated C
+/// string; `name`/`value` are NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_parameter(
+    stmt: *mut kernel_statement_t,
+    name: *const c_char,
+    sql_type: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if sql_type.is_null() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be null"));
+        }
+        let sql_type = CStr::from_ptr(sql_type)
+            .to_str()
+            .map_err(|_| {
+                Error::invalid_argument().message("parameter sql_type is not valid UTF-8")
+            })?
+            .to_owned();
+        let name_opt = if name.is_null() {
+            None
+        } else {
+            let s = CStr::from_ptr(name).to_str().map_err(|_| {
+                Error::invalid_argument().message("parameter name is not valid UTF-8")
+            })?;
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_owned())
+            }
+        };
+        let value_opt = if value.is_null() {
+            None
+        } else {
+            Some(
+                CStr::from_ptr(value)
+                    .to_str()
+                    .map_err(|_| {
+                        Error::invalid_argument().message("parameter value is not valid UTF-8")
+                    })?
+                    .to_owned(),
+            )
+        };
+        stmt.spec().param_raw(name_opt, sql_type, value_opt);
+        Ok(())
+    })
+}
+
 /// Shared body for the scalar `bind_*` setters.
 ///
 /// # Safety

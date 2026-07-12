@@ -150,6 +150,14 @@ fn build_execute_params(
         return Err(Error::invalid_argument()
             .message("positional and named parameters are mutually exclusive; pass only one"));
     }
+    // raw_params (the C-ABI host-marshalled path) is mutually exclusive with the
+    // TypedValue paths — a host uses one binding style per statement.
+    if !spec.raw_params.is_empty()
+        && (!spec.positional_params.is_empty() || !spec.named_params.is_empty())
+    {
+        return Err(Error::invalid_argument()
+            .message("raw parameters cannot be mixed with positional/named TypedValue params"));
+    }
     let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
     let mut exec_params = ExecuteParams {
         wait_timeout,
@@ -166,6 +174,28 @@ fn build_execute_params(
         exec_params
             .parameters
             .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
+    }
+    // Raw (host-marshalled) params: emit verbatim. Positional entries (name
+    // None) get a 1-based ordinal in push order; named entries pass through.
+    // Positional and named raw params are mutually exclusive for the same reason
+    // TypedValue ones are (the SEA server rejects a mixed markers array).
+    {
+        let has_named_raw = spec.raw_params.iter().any(|p| p.name.is_some());
+        let has_pos_raw = spec.raw_params.iter().any(|p| p.name.is_none());
+        if has_named_raw && has_pos_raw {
+            return Err(Error::invalid_argument().message(
+                "positional and named raw parameters are mutually exclusive; pass only one",
+            ));
+        }
+        let mut ordinal = 0i32;
+        for p in spec.raw_params.iter() {
+            let mut param = p.clone();
+            if param.name.is_none() {
+                ordinal += 1;
+                param.ordinal = Some(ordinal);
+            }
+            exec_params.parameters.push(param);
+        }
     }
     // Per-statement query tags: both `Statement::query_tags` and a raw
     // `statement_conf["query_tags"]` land in the serialized conf string;
@@ -965,5 +995,67 @@ mod tests {
             "expected 'mutually exclusive' in error, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn build_execute_params_binds_raw_positional_params_one_based() {
+        // The C-ABI raw-bind path (kernel_statement_bind_parameter with no name):
+        // ordinals are assigned 1-based in push order, the host's type name and
+        // string value pass through verbatim.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ?, ?");
+        spec.param_raw(None, "BIGINT", Some("7".to_owned()));
+        spec.param_raw(None, "STRING", Some("hi".to_owned()));
+        let (_, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.parameters[0].ordinal, Some(1));
+        assert_eq!(params.parameters[0].param_type, "BIGINT");
+        assert_eq!(params.parameters[0].value.as_deref(), Some("7"));
+        assert!(params.parameters[0].name.is_none());
+        assert_eq!(params.parameters[1].ordinal, Some(2));
+        assert_eq!(params.parameters[1].value.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn build_execute_params_binds_raw_named_and_null() {
+        // A named raw param passes its name through; a NULL value is bound as
+        // type VOID with no value (the host convention for SQL NULL).
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT :flag, :maybe");
+        spec.param_raw(Some("flag".to_owned()), "BOOLEAN", Some("true".to_owned()));
+        spec.param_raw(Some("maybe".to_owned()), "VOID", None);
+        let (_, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.parameters[0].ordinal.is_none());
+        assert_eq!(params.parameters[1].name.as_deref(), Some("maybe"));
+        assert_eq!(params.parameters[1].param_type, "VOID");
+        assert!(params.parameters[1].value.is_none());
+    }
+
+    #[test]
+    fn build_execute_params_rejects_raw_mixed_with_typed() {
+        // A host uses one binding style per statement: raw + TypedValue is rejected.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ?, ?");
+        spec.param(1, TypedValue::Int64(7)).unwrap();
+        spec.param_raw(None, "STRING", Some("x".to_owned()));
+        let err = build_execute_params(&spec, None).expect_err("raw + typed must be rejected");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("raw parameters cannot be mixed"));
+    }
+
+    #[test]
+    fn build_execute_params_rejects_raw_mixed_positional_and_named() {
+        // Positional and named raw params are mutually exclusive, like the
+        // TypedValue markers — a mixed markers array is rejected by the server.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ?, :n");
+        spec.param_raw(None, "BIGINT", Some("1".to_owned()));
+        spec.param_raw(Some("n".to_owned()), "BIGINT", Some("2".to_owned()));
+        let err = build_execute_params(&spec, None)
+            .expect_err("mixed positional + named raw must be rejected");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("mutually exclusive"));
     }
 }
