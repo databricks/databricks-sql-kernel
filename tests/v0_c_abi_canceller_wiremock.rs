@@ -52,10 +52,10 @@ use databricks_sql_kernel::c_abi::session::{
     kernel_session_t, KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::statement::{
-    kernel_executed_statement_close, kernel_executed_statement_t,
-    kernel_statement_canceller_cancel, kernel_statement_canceller_free,
-    kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
-    kernel_statement_execute, kernel_statement_set_sql, kernel_statement_t,
+    kernel_executed_statement_close, kernel_executed_statement_query_id,
+    kernel_executed_statement_t, kernel_statement_canceller_cancel,
+    kernel_statement_canceller_free, kernel_statement_canceller_new, kernel_statement_canceller_t,
+    kernel_statement_close, kernel_statement_execute, kernel_statement_set_sql, kernel_statement_t,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -474,6 +474,66 @@ fn cancel_before_execute_is_a_noop_success() {
 
         assert_eq!(
             kernel_statement_canceller_free(canceller),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn query_id_returns_server_statement_id_on_success() {
+    // A successful inline execute exposes the server statement id through
+    // kernel_executed_statement_query_id — the success-path counterpart to the
+    // query id on KernelError. The returned pointer is borrowed from the handle.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        // POST /statements returns a terminal SUCCEEDED body carrying the id.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-qid-1")),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        assert!(!exec.is_null());
+
+        let qid_ptr = kernel_executed_statement_query_id(exec);
+        assert!(
+            !qid_ptr.is_null(),
+            "a successful execute must expose a query id"
+        );
+        let qid = std::ffi::CStr::from_ptr(qid_ptr).to_str().unwrap();
+        assert_eq!(qid, "stmt-qid-1");
+
+        // After close the handle is invalidated → NULL (with a stored error),
+        // rather than a dangling pointer.
+        assert_eq!(
+            kernel_executed_statement_close(exec),
             KernelStatusCode::Success
         );
         assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);

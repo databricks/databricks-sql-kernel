@@ -262,6 +262,16 @@ impl ExecutedStatement {
     pub fn error_details_json(&self) -> Option<&str> {
         self.status.error_details_json.as_deref()
     }
+
+    /// The server statement id assigned to this executed statement. This is the
+    /// correlation handle to server-side query history, and the id a C-ABI host
+    /// (e.g. the Go driver) surfaces on the success path for EXECUTE_STATEMENT
+    /// telemetry. Same value the `ExecutedStatementHandle` trait exposes;
+    /// duplicated as an inherent accessor so consumers holding a concrete
+    /// `ExecutedStatement` need not import the trait.
+    pub fn statement_id(&self) -> &str {
+        &self.statement_id
+    }
 }
 
 #[async_trait]

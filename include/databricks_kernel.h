@@ -477,6 +477,17 @@ KernelStatusCode kernel_executed_statement_get_result_stream(kernel_executed_sta
  */
 int64_t kernel_executed_statement_num_modified_rows(const kernel_executed_statement_t* exec);
 
+/*
+ * Server statement (query) id of a successfully executed statement, as a
+ * NUL-terminated C string — the success-path counterpart to the query id on
+ * KernelError. Used by a host driver for EXECUTE_STATEMENT telemetry and
+ * query-history correlation. The pointer is BORROWED from the executed handle,
+ * valid until kernel_executed_statement_close; do NOT free it, and copy it out
+ * to outlive the handle. Returns NULL on a null / invalidated handle (with a
+ * stored last error); a live handle from a successful execute never returns NULL.
+ */
+const char* kernel_executed_statement_query_id(const kernel_executed_statement_t* exec);
+
 KernelStatusCode kernel_executed_statement_close(kernel_executed_statement_t* exec);
 
 /* ─── Result stream ───────────────────────────────────────────────────

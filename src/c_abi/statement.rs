@@ -43,7 +43,7 @@ use crate::statement::executed::ExecutedStatement;
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 
 /// Upper bound on a positional parameter ordinal accepted over the C ABI.
 ///
@@ -77,6 +77,13 @@ pub(crate) struct ExecutedHandle {
     pub(crate) exec: ExecutedStatement,
     pub(crate) alive: ValidityFlag,
     pub(crate) stream_taken: std::sync::atomic::AtomicBool,
+    /// The server statement id as a NUL-terminated C string, built once at
+    /// construction so `kernel_executed_statement_query_id` can hand back a
+    /// borrowed `*const c_char` valid for the handle's lifetime (no per-call
+    /// allocation, nothing for the caller to free). Interior NULs are stripped
+    /// (a statement id is a server-generated UUID, so this never occurs in
+    /// practice).
+    pub(crate) statement_id_c: CString,
 }
 
 // ─── Opaque handles ──────────────────────────────────────────────────────────
@@ -390,10 +397,17 @@ pub unsafe extern "C" fn kernel_statement_execute(
     });
     match executed {
         Ok(exec) => {
+            // Snapshot the server statement id as a C string now, while the exec
+            // handle is fresh, so the query-id accessor is a borrow with no
+            // allocation. Strip any interior NUL defensively (a server UUID has
+            // none) rather than fail construction.
+            let statement_id_c = CString::new(exec.statement_id().replace('\0', ""))
+                .unwrap_or_else(|_| CString::default());
             let handle = ExecutedHandle {
                 exec,
                 alive: ValidityFlag::new(),
                 stream_taken: std::sync::atomic::AtomicBool::new(false),
+                statement_id_c,
             };
             std::ptr::write(
                 out,
@@ -655,6 +669,43 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
         return -1;
     }
     handle.exec.num_modified_rows().unwrap_or(-1)
+}
+
+/// The server statement (query) id of a successfully executed statement, as a
+/// NUL-terminated C string. This is the success-path counterpart to the query id
+/// on `KernelError` (which crosses only on failure): a host driver uses it for
+/// EXECUTE_STATEMENT telemetry and query-history correlation.
+///
+/// The returned pointer is **borrowed** from the executed handle and valid until
+/// the handle is closed (`kernel_executed_statement_close`); the caller must NOT
+/// free it and should copy it out if it needs to outlive the handle. Returns
+/// NULL on a null or invalidated handle (with a stored last error). A successful
+/// execute always has an id, so a live handle never returns NULL.
+///
+/// # Safety
+/// `exec` must be a live executed handle from [`kernel_statement_execute`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_statement_query_id(
+    exec: *const kernel_executed_statement_t,
+) -> *const c_char {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedHandle).as_ref() else {
+        crate::c_abi::error::store_invalid_arg(
+            "kernel_executed_statement_query_id: exec must not be null",
+        );
+        return std::ptr::null();
+    };
+    // Stale after a re-execute or close on the parent statement → NULL with a
+    // stored InvalidStatementHandle, matching num_modified_rows' staleness rule.
+    if !handle.exec.is_valid() {
+        crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::InvalidStatementHandle,
+            "executed statement was invalidated by a re-execute or close on its parent statement; \
+             read query_id before closing the statement",
+        ));
+        return std::ptr::null();
+    }
+    handle.statement_id_c.as_ptr()
 }
 
 /// Free a sync executed handle. Invalidates any result stream borrowed
