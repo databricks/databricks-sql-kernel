@@ -69,11 +69,13 @@
  *   BEFORE `kernel_session_close`. Driving such a handle afterwards issues
  *   RPCs against a session whose delete has already been initiated and
  *   will surface server errors. Order teardown: result streams → executed
- *   handles → statement cancellers → statements → session.
+ *   handles → statements → session. (Statement cancellers are not in this
+ *   chain — freeing one drives no RPC; see the next bullet.)
  * - **Free statement cancellers too.** A `kernel_statement_canceller_t`
  *   holds its own session reference, so a leaked canceller pins the
  *   client-side session (and its connection pool) past
- *   `kernel_session_close`. Free it once its execute has returned,
+ *   `kernel_session_close`. Freeing one drives no RPC, so its order is
+ *   independent of the chain above: free it once its execute has returned,
  *   regardless of statement/session close.
  */
 
@@ -203,11 +205,13 @@ typedef struct kernel_executed_statement_t kernel_executed_statement_t;
 typedef struct kernel_executed_async_statement_t kernel_executed_async_statement_t;
 typedef struct kernel_result_stream_t kernel_result_stream_t;
 /* Detached canceller for a sync-executing statement, returned by
- * kernel_statement_canceller_new. Safe to use concurrently with the blocking
- * kernel_statement_execute on the originating statement. Statement-scoped, not
- * execution-scoped: it tracks whichever query is currently in flight on its
- * statement, so a canceller retained across a re-execute cancels the LATER
- * query. Use one per execute (new before execute, free after it returns). */
+ * kernel_statement_canceller_new. The returned handle is safe to use from
+ * another thread concurrently with the blocking kernel_statement_execute on the
+ * originating statement (the _new call itself is NOT — see its doc).
+ * Statement-scoped, not execution-scoped: it tracks whichever query is currently
+ * in flight on its statement, so a canceller retained across a re-execute
+ * cancels the LATER query. Use one per execute (new before execute, free after
+ * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
@@ -375,12 +379,22 @@ KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
  * Create a detached canceller for `stmt`. Obtain it BEFORE
  * `kernel_statement_execute`, which blocks the calling thread for the
  * whole query — the statement cannot be cancelled through its own handle
- * mid-execute (that would alias the mutable borrow). The canceller holds
- * only cloned Arcs, so it is safe to use from another thread concurrently
- * with the in-flight execute. It holds its own session reference, so it must
- * be freed regardless of whether the statement or session is closed. On
- * success `*out` holds a canceller released with
- * `kernel_statement_canceller_free`.
+ * mid-execute (that would alias the mutable borrow).
+ *
+ * UNDEFINED BEHAVIOR: this call itself borrows `stmt` mutably. Calling it
+ * while a `kernel_statement_execute` on the same `stmt` is in flight on
+ * another thread aliases that execute's own mutable borrow — undefined
+ * behavior (memory corruption), not a returned error. Create the canceller on
+ * the same thread that owns `stmt`, before dispatching execute. The natural
+ * "spawn the blocking execute, then lazily create a canceller when the host
+ * decides to cancel" pattern is exactly this misuse — do not do it; create the
+ * canceller first, hand it to the cancelling thread, then dispatch execute.
+ * Only the RETURNED handle is concurrency-safe: it holds only cloned Arcs, so
+ * once you have it, cancelling from another thread while execute runs is fine.
+ *
+ * The canceller holds its own session reference, so it must be freed
+ * regardless of whether the statement or session is closed. On success `*out`
+ * holds a canceller released with `kernel_statement_canceller_free`.
  */
 KernelStatusCode kernel_statement_canceller_new(
     kernel_statement_t* stmt, kernel_statement_canceller_t** out);
@@ -390,26 +404,40 @@ KernelStatusCode kernel_statement_canceller_new(
  * the server statement id currently observed for this statement. Idempotent
  * and safe to call concurrently with `kernel_statement_execute`.
  *
- * On Success, `*dispatched` reports whether a cancel RPC was actually sent:
- * true if a server statement id had been observed and the RPC was dispatched
- * (the server treats a cancel of an already-finished statement as its own
- * no-op), false if no id has been observed yet — nothing has executed, or the
- * query is still in its initial round-trip before the server issued an id. Both
- * cases return Success; `*dispatched` is how a host tells a dispatched cancel
- * from a no-op. `*dispatched` is written on every non-NULL path (false before
- * the RPC, then the RPC outcome on Success), so it holds a defined value once
- * this returns; a NULL `dispatched` is ignored.
+ * On Success, `*dispatched` reports whether a cancel RPC was POSTed:
+ * true if a server statement id had been observed and the RPC was sent for it,
+ * false if no id has been observed yet — nothing has executed, or the query is
+ * still in its initial round-trip before the server issued an id. Both cases
+ * return Success; `*dispatched` is how a host tells a dispatched cancel from a
+ * no-op. `*dispatched` is written on every non-NULL path (false before the RPC,
+ * then the RPC outcome on Success), so it holds a defined value once this
+ * returns; a NULL `dispatched` is ignored.
+ *
+ * `dispatched == true` means only that a cancel was POSTed for the currently
+ * observed statement id — NOT that a running query was interrupted. The id slot
+ * retains the last observed id after a query finishes, so a cancel fired
+ * post-terminal (or, in the narrow re-execute handoff, against a superseded id)
+ * still POSTs and still reports true; the server treats a cancel of an
+ * already-finished statement as its own no-op.
+ *
+ * This call blocks on the cancel RPC, which on a retryable server error retries
+ * with backoff and can run far longer than one round-trip — up to the SEA retry
+ * budget (~15 min: overall_timeout 900s, max_retries 5, by default) during a
+ * partial server outage. There is no cancel-of-cancel or timeout parameter, so
+ * a host wiring this into a Ctrl-C / query-timeout handler should call it from
+ * an abandonable/joinable thread rather than the app's main thread.
  */
 KernelStatusCode kernel_statement_canceller_cancel(
     kernel_statement_canceller_t* canceller, bool* dispatched);
 
 /*
  * Free a canceller handle. Does not touch the originating statement. The
- * canceller is single-owner: no other thread may be inside
- * kernel_statement_canceller_cancel on this handle when it is freed. That call
- * blocks on the cancel RPC, which on a retryable server error retries with
- * backoff and can stay in flight far longer than one round-trip, so quiesce any
- * cancelling thread first.
+ * canceller is single-owner: freeing it while another thread is inside
+ * kernel_statement_canceller_cancel on this handle is UNDEFINED BEHAVIOR
+ * (use-after-free), not merely wasteful. That call blocks on the cancel RPC,
+ * which on a retryable server error retries with backoff and can stay in flight
+ * far longer than one round-trip (see _cancel), so join or otherwise quiesce any
+ * cancelling thread BEFORE freeing.
  */
 KernelStatusCode kernel_statement_canceller_free(
     kernel_statement_canceller_t* canceller);

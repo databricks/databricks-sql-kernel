@@ -414,23 +414,32 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
 /// Idempotent and safe to call concurrently with `kernel_statement_execute` on
 /// the originating statement.
 ///
-/// On `Success`, `*dispatched` reports whether a cancel RPC was actually sent:
-/// `true` if a server statement id had been observed and the RPC was dispatched
-/// (the server treats a cancel of an already-finished statement as its own
-/// no-op), `false` if no id has been observed yet — nothing has executed, or the
+/// On `Success`, `*dispatched` reports whether a cancel RPC was POSTed:
+/// `true` if a server statement id had been observed and the RPC was sent for
+/// it, `false` if no id has been observed yet — nothing has executed, or the
 /// query is still in its initial round-trip before the server issued an id. Both
 /// cases return `Success`; the flag is how a host distinguishes a dispatched
 /// cancel from a no-op. `*dispatched` is set to `false` before the RPC and to
 /// the outcome on `Success`, so it is always defined once this returns; a null
 /// `dispatched` is ignored.
 ///
+/// `dispatched == true` means only that a cancel was POSTed for the currently
+/// observed statement id — **not** that a running query was interrupted. The id
+/// slot retains the last observed id after a query finishes, so a cancel fired
+/// post-terminal (or, in the narrow re-execute handoff, against a superseded id)
+/// still POSTs and still reports `true`; the server treats a cancel of an
+/// already-finished statement as its own no-op.
+///
 /// # Safety
 /// `canceller` must be a live handle from `kernel_statement_canceller_new`.
 /// `dispatched`, if non-null, must be writable. The handle must not be freed by
 /// another thread while this call is in flight: it blocks on the cancel RPC,
-/// which on a retryable server error retries with backoff and can take much
-/// longer than one round-trip. Order any `kernel_statement_canceller_free` after
-/// this returns.
+/// which on a retryable server error retries with backoff and can therefore run
+/// far longer than one round-trip — up to the SEA retry budget (~15 min:
+/// `overall_timeout` 900s, `max_retries` 5, by default) during a partial server
+/// outage. A host wiring this into a Ctrl-C / query-timeout handler should drive
+/// it from an abandonable/joinable thread rather than the app's main thread.
+/// Order any `kernel_statement_canceller_free` after this returns.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_cancel(
     canceller: *mut kernel_statement_canceller_t,
@@ -465,11 +474,12 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
 ///
 /// # Safety
 /// `canceller` must have been returned by `kernel_statement_canceller_new` and
-/// not previously freed. The canceller is single-owner: no other thread may be
-/// inside `kernel_statement_canceller_cancel` on this handle when it is freed.
-/// That call blocks on the cancel RPC, which on a retryable server error retries
-/// with backoff and can stay in flight far longer than one round-trip, so join or
-/// otherwise quiesce any cancelling thread before freeing.
+/// not previously freed. The canceller is single-owner: freeing it while another
+/// thread is inside `kernel_statement_canceller_cancel` on this handle is
+/// undefined behavior (use-after-free), not merely wasteful. That call blocks on
+/// the cancel RPC, which on a retryable server error retries with backoff and can
+/// stay in flight far longer than one round-trip, so join or otherwise quiesce
+/// any cancelling thread before freeing.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_free(
     canceller: *mut kernel_statement_canceller_t,

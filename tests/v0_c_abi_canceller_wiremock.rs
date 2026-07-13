@@ -30,6 +30,10 @@
 //!   observed id dispatches and reports `dispatched == true`, even post-terminal.
 //! - `canceller_retargets_the_current_execution_on_reuse`: a canceller kept
 //!   across a re-execute cancels the second query, not the finished first.
+//! - `canceller_outlives_statement_and_session_close`: a canceller stays usable
+//!   after its statement AND session are closed — the cancel still dispatches
+//!   (`dispatched == true`) and its POST reaches the server, proving the cloned
+//!   session `Arc` keeps the client-side session alive past `kernel_session_close`.
 //!
 //! The C ABI drives its own process-wide tokio runtime inside `block_on_ffi`,
 //! so the entry points must be called from plain (non-async) threads — hence
@@ -758,5 +762,126 @@ fn canceller_retargets_the_current_execution_on_reuse() {
     assert!(
         !saw_a,
         "cancel must not target the first (finished) statement id"
+    );
+}
+
+#[test]
+fn canceller_outlives_statement_and_session_close() {
+    // The header's motivating claim for the detached canceller is that it holds
+    // its OWN session reference (a cloned `Arc<SessionInner>`) and its own clone
+    // of the statement's in-flight-id slot, so it stays usable — and keeps the
+    // client-side session alive — even after the statement and session it came
+    // from are closed. Every other test frees the canceller first, so none
+    // exercises this cross-lifetime contract; a refactor that made `_new` borrow
+    // (rather than clone) the session, or that cleared the id slot on statement
+    // close, would regress this silently while all those tests still passed.
+    //
+    // Here: execute to a terminal id, then close the executed handle, the
+    // statement, AND the session, and only THEN cancel. The cancel must still
+    // succeed with dispatched == true and its POST must actually reach the
+    // server — proving the cloned Arc kept the client-side session (transport +
+    // connection pool) alive past `kernel_session_close`. Free the canceller
+    // last, as the header's teardown note allows.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        // POST returns RUNNING carrying the id; GET reports SUCCEEDED so the
+        // query finishes cleanly (its mid-execute cancel guard defuses — no
+        // cleanup cancel fires) and the id "stmt-outlive" stays in the slot.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-outlive")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-outlive"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-outlive")),
+            )
+            .mount(&server)
+            .await;
+        // The post-close cancel POST. If the cloned session Arc did NOT keep the
+        // client alive, this endpoint would never be hit.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-outlive/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        // Canceller obtained before execute (the required order); kept past all
+        // three closes below.
+        let mut canceller: *mut kernel_statement_canceller_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_canceller_new(stmt, &mut canceller),
+            KernelStatusCode::Success
+        );
+
+        // Execute to a terminal SUCCEEDED, leaving "stmt-outlive" in the slot.
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        // Tear down everything the canceller came from BEFORE cancelling: the
+        // executed handle, the statement, then the session.
+        assert_eq!(
+            kernel_executed_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+
+        // The canceller still holds the observed id and a live session clone, so
+        // the cancel dispatches (server treats a cancel of a finished statement
+        // as its own no-op) and reports true — proving the client-side session
+        // survived `kernel_session_close`.
+        let mut dispatched = false;
+        assert_eq!(
+            kernel_statement_canceller_cancel(canceller, &mut dispatched),
+            KernelStatusCode::Success
+        );
+        assert!(
+            dispatched,
+            "a canceller must stay usable after statement/session close: its cloned \
+             session Arc keeps the client alive and its id slot still holds the observed id"
+        );
+
+        assert_eq!(
+            kernel_statement_canceller_free(canceller),
+            KernelStatusCode::Success
+        );
+    }
+
+    // The cancel POST actually reached the server — the strongest proof the
+    // cloned session Arc kept the transport alive past session close.
+    let saw_cancel = rt.block_on(async {
+        let requests = server.received_requests().await.unwrap_or_default();
+        requests.iter().any(|r| {
+            r.method.as_str() == "POST" && r.url.path().ends_with("/statements/stmt-outlive/cancel")
+        })
+    });
+    assert!(
+        saw_cancel,
+        "the post-close cancel POST must reach the server, proving the canceller's \
+         cloned session reference kept the client-side session alive"
     );
 }
