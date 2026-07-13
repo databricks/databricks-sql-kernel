@@ -380,8 +380,11 @@ struct CancellerHandle {
 ///
 /// The canceller holds its own reference to the session, so it keeps that
 /// session's client-side state alive until freed and must be freed regardless of
-/// whether the statement or session is closed. It does not extend the teardown
-/// order beyond the statement; free it before closing the statement it came from.
+/// whether the statement or session is closed. Its free is order-independent:
+/// `kernel_statement_canceller_free` drives no RPC (it only drops the box), so it
+/// may run before or after the statement/session close — the cloned session `Arc`
+/// keeps the client side alive for a cancel even after `kernel_session_close`
+/// (exercised by `canceller_outlives_statement_and_session_close`).
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `out` must be writable. `stmt` must
@@ -435,10 +438,11 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
 /// `dispatched`, if non-null, must be writable. The handle must not be freed by
 /// another thread while this call is in flight: it blocks on the cancel RPC,
 /// which on a retryable server error retries with backoff and can therefore run
-/// far longer than one round-trip — up to the SEA retry budget (~15 min:
-/// `overall_timeout` 900s, `max_retries` 5, by default) during a partial server
-/// outage. A host wiring this into a Ctrl-C / query-timeout handler should drive
-/// it from an abandonable/joinable thread rather than the app's main thread.
+/// far longer than one round-trip — bounded by the SEA retry budget (the
+/// `overall_timeout` / `max_retries` defaults in `crate::client::retry`), which
+/// can reach minutes during a partial server outage. A host wiring this into a
+/// Ctrl-C / query-timeout handler should drive it from an abandonable/joinable
+/// thread rather than the app's main thread.
 /// Order any `kernel_statement_canceller_free` after this returns.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_canceller_cancel(

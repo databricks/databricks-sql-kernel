@@ -421,11 +421,12 @@ KernelStatusCode kernel_statement_canceller_new(
  * already-finished statement as its own no-op.
  *
  * This call blocks on the cancel RPC, which on a retryable server error retries
- * with backoff and can run far longer than one round-trip — up to the SEA retry
- * budget (~15 min: overall_timeout 900s, max_retries 5, by default) during a
- * partial server outage. There is no cancel-of-cancel or timeout parameter, so
- * a host wiring this into a Ctrl-C / query-timeout handler should call it from
- * an abandonable/joinable thread rather than the app's main thread.
+ * with backoff and can run far longer than one round-trip — bounded by the SEA
+ * retry budget (the overall_timeout / max_retries defaults in the kernel's retry
+ * config), which can reach minutes during a partial server outage. There is no
+ * cancel-of-cancel or timeout parameter, so a host wiring this into a Ctrl-C /
+ * query-timeout handler should call it from an abandonable/joinable thread rather
+ * than the app's main thread.
  */
 KernelStatusCode kernel_statement_canceller_cancel(
     kernel_statement_canceller_t* canceller, bool* dispatched);

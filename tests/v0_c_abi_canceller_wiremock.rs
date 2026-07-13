@@ -186,6 +186,40 @@ impl Respond for SequencedExecute {
     }
 }
 
+/// Execute POST responder that returns `first` immediately, then on the second
+/// call flags `second_entered` (the moment the second dispatch's POST reaches
+/// the server — the transport has NOT yet received the body, so the new id is
+/// NOT yet republished into the shared slot) and holds the response open for
+/// `hold` before returning `rest`. That open window is where a concurrent
+/// cancel observes the slot: with `reset_inflight_slot` in place the slot reads
+/// `None` (the second dispatch cleared it at entry, before its first await);
+/// without the fix it still holds the prior query's id. This is the
+/// discriminating pre-observer window that a POST-arrival gate steps over.
+struct HeldSecondExecute {
+    first: String,
+    rest: String,
+    hold: Duration,
+    calls: AtomicUsize,
+    second_entered: Arc<AtomicBool>,
+}
+
+impl Respond for HeldSecondExecute {
+    fn respond(&self, _req: &Request) -> ResponseTemplate {
+        let n = self.calls.fetch_add(1, Ordering::SeqCst);
+        if n == 0 {
+            ResponseTemplate::new(200).set_body_string(self.first.clone())
+        } else {
+            self.second_entered.store(true, Ordering::SeqCst);
+            // Hold the response so the cancel thread has a wide, deterministic
+            // window to read the slot before this POST returns and the transport
+            // republishes the new id.
+            ResponseTemplate::new(200)
+                .set_body_string(self.rest.clone())
+                .set_delay(self.hold)
+        }
+    }
+}
+
 /// Build a config and open a session over the C ABI, returning the raw handle.
 /// Mirrors the minting sequence in tests/v0_c_abi_session_close_wiremock.rs.
 ///
@@ -883,5 +917,168 @@ fn canceller_outlives_statement_and_session_close() {
         saw_cancel,
         "the post-close cancel POST must reach the server, proving the canceller's \
          cloned session reference kept the client-side session alive"
+    );
+}
+
+#[test]
+fn retained_canceller_noops_in_the_reexecute_handoff_window() {
+    // Guards the headline `reset_inflight_slot()` fix (src/statement/mutable.rs).
+    // The prior `canceller_retargets_the_current_execution_on_reuse` test gates
+    // its cancel on the second POST *arriving*, which is past the point where the
+    // new id is about to be published — so the stale-prior-id window is already
+    // closed and that test passes with OR without the fix.
+    //
+    // This test sits deterministically INSIDE that window: `HeldSecondExecute`
+    // flags `second_entered` the instant the second execute's POST reaches the
+    // server, then holds the response open. During that hold the second
+    // dispatch has already cleared the slot at entry (the fix) but has not yet
+    // republished its id, so a cancel fired here must observe an EMPTY slot:
+    // `dispatched == false` and no POST against the prior (finished) id. Remove
+    // `reset_inflight_slot()` and the slot still holds `stmt-A` in this window —
+    // both assertions flip — so this test fails, which the retarget test does not.
+    let second_entered = Arc::new(AtomicBool::new(false));
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        // First execute → stmt-A immediately; second → stmt-B held open 2s.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(HeldSecondExecute {
+                first: running_body("stmt-A"),
+                rest: running_body("stmt-B"),
+                hold: Duration::from_secs(2),
+                calls: AtomicUsize::new(0),
+                second_entered: Arc::clone(&second_entered),
+            })
+            .mount(&server)
+            .await;
+        // Both executes run to SUCCEEDED so their mid-execute cancel guards
+        // defuse — the only cancel that can reach stmt-A/cancel is a buggy stale
+        // dispatch from our own cancel call.
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-A"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-A")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-B"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-B")),
+            )
+            .mount(&server)
+            .await;
+        // Accept a cancel POST on either id so a stale (buggy) dispatch does not
+        // 404-hang; received_requests then tells us whether stmt-A/cancel was hit.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-A/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-B/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    let session;
+    let stmt;
+    let dispatched_in_window = Arc::new(AtomicBool::new(false));
+    unsafe {
+        session = open_session_c_abi(&uri);
+        let mut s: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut s),
+            KernelStatusCode::Success
+        );
+        stmt = s;
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut canceller: *mut kernel_statement_canceller_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_canceller_new(stmt, &mut canceller),
+            KernelStatusCode::Success
+        );
+
+        // First execute runs to terminal, publishing stmt-A into the shared slot.
+        let mut exec1: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec1),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_statement_close(exec1),
+            KernelStatusCode::Success
+        );
+
+        // Second execute (its POST is held open by the mock) on another thread.
+        let stmt_send = SendPtr(stmt);
+        let execute_thread = std::thread::spawn(move || {
+            let stmt = stmt_send.into_ptr();
+            let mut exec2: *mut kernel_executed_statement_t = std::ptr::null_mut();
+            kernel_statement_execute(stmt, &mut exec2)
+        });
+
+        // Cancel thread: fire exactly once inside the held window.
+        let canceller_send = SendPtr(canceller);
+        let second_entered_c = Arc::clone(&second_entered);
+        let dispatched_flag = Arc::clone(&dispatched_in_window);
+        let cancel_thread = std::thread::spawn(move || {
+            let canceller = canceller_send.into_ptr();
+            // Wait until the second dispatch's POST has entered the server (its
+            // entry already cleared the slot); the response is now held, so the
+            // new id is not yet republished — this is the discriminating window.
+            while !second_entered_c.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let mut dispatched = false;
+            let rc = kernel_statement_canceller_cancel(canceller, &mut dispatched);
+            assert_eq!(rc, KernelStatusCode::Success);
+            dispatched_flag.store(dispatched, Ordering::SeqCst);
+        });
+
+        let exec2_rc = execute_thread.join().expect("execute thread panicked");
+        cancel_thread.join().expect("cancel thread panicked");
+        assert_eq!(
+            exec2_rc,
+            KernelStatusCode::Success,
+            "the second execute should still complete normally"
+        );
+
+        assert_eq!(
+            kernel_statement_canceller_free(canceller),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    // The cancel fired in the handoff window saw an empty slot — the second
+    // dispatch cleared it at entry before its first await.
+    assert!(
+        !dispatched_in_window.load(Ordering::SeqCst),
+        "a cancel in the re-execute handoff must no-op (dispatched=false): the slot \
+         is cleared at dispatch entry, so it never targets the prior finished id"
+    );
+    // And the strong post-hoc proof: no cancel was ever POSTed against stmt-A.
+    let saw_stmt_a_cancel = rt.block_on(async {
+        let requests = server.received_requests().await.unwrap_or_default();
+        requests.iter().any(|r| {
+            r.method.as_str() == "POST" && r.url.path().ends_with("/statements/stmt-A/cancel")
+        })
+    });
+    assert!(
+        !saw_stmt_a_cancel,
+        "no cancel may be POSTed against the prior (finished) statement id during \
+         the re-execute handoff"
     );
 }
