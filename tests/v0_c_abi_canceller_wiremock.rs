@@ -46,6 +46,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
     kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
@@ -53,9 +54,10 @@ use databricks_sql_kernel::c_abi::session::{
 };
 use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_statement_close, kernel_executed_statement_query_id,
-    kernel_executed_statement_t, kernel_statement_canceller_cancel,
-    kernel_statement_canceller_free, kernel_statement_canceller_new, kernel_statement_canceller_t,
-    kernel_statement_close, kernel_statement_execute, kernel_statement_set_sql, kernel_statement_t,
+    kernel_executed_statement_t, kernel_statement_bind_parameter,
+    kernel_statement_canceller_cancel, kernel_statement_canceller_free,
+    kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
+    kernel_statement_execute, kernel_statement_set_sql, kernel_statement_t,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -530,8 +532,11 @@ fn query_id_returns_server_statement_id_on_success() {
         let qid = std::ffi::CStr::from_ptr(qid_ptr).to_str().unwrap();
         assert_eq!(qid, "stmt-qid-1");
 
-        // After close the handle is invalidated → NULL (with a stored error),
-        // rather than a dangling pointer.
+        // Teardown (order: executed handle → statement → session). The
+        // invalidated-handle → NULL path is covered separately by
+        // `query_id_is_null_after_reexecute_invalidates_the_handle` (closing this
+        // handle here would free it, so calling query_id after close would be a
+        // use-after-free, not the staleness path this accessor guards).
         assert_eq!(
             kernel_executed_statement_close(exec),
             KernelStatusCode::Success
@@ -539,6 +544,308 @@ fn query_id_returns_server_statement_id_on_success() {
         assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
         assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
     }
+}
+
+#[test]
+fn query_id_is_null_after_reexecute_invalidates_the_handle() {
+    // The staleness guard: re-executing on the same statement flips the prior
+    // executed handle's shared ValidityFlag (invalidate_prior), so a query_id
+    // call on that now-stale handle returns NULL with a stored
+    // InvalidStatementHandle — a defined error, not a borrow into a dead handle.
+    // (Distinct from `close(exec)`, which frees the handle; re-execute leaves the
+    // C handle allocated but logically invalid, which is what this accessor must
+    // detect.) Two executes issue distinct ids so the assertion is unambiguous.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let second_started = Arc::new(AtomicBool::new(false));
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        // Both executes run to SUCCEEDED (terminal inline), so neither leaves a
+        // running query behind; the second execute is what invalidates exec1.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(SequencedExecute {
+                first: succeeded_empty_body("stmt-qid-A"),
+                rest: succeeded_empty_body("stmt-qid-B"),
+                calls: AtomicUsize::new(0),
+                second_started: Arc::clone(&second_started),
+            })
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        // First execute → exec1 exposes stmt-qid-A while it is live.
+        let mut exec1: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec1),
+            KernelStatusCode::Success
+        );
+        let qid1 = kernel_executed_statement_query_id(exec1);
+        assert!(!qid1.is_null(), "live handle must expose its id");
+        assert_eq!(
+            std::ffi::CStr::from_ptr(qid1).to_str().unwrap(),
+            "stmt-qid-A"
+        );
+
+        // Re-execute on the same statement invalidates exec1 (does NOT free it).
+        let mut exec2: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec2),
+            KernelStatusCode::Success
+        );
+
+        // exec1 is now stale: query_id → NULL with a stored InvalidStatementHandle.
+        let stale = kernel_executed_statement_query_id(exec1);
+        assert!(
+            stale.is_null(),
+            "query_id on a re-execute-invalidated handle must be NULL, not a stale borrow"
+        );
+        let mut err = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(
+            kernel_get_last_error(err.as_mut_ptr()),
+            "a stored error must accompany the NULL"
+        );
+        assert_eq!(
+            err.assume_init().code,
+            KernelStatusCode::InvalidStatementHandle as i32,
+            "stale-handle query_id must store InvalidStatementHandle"
+        );
+
+        // exec2 (the live handle) still works and returns the second id.
+        let qid2 = kernel_executed_statement_query_id(exec2);
+        assert!(!qid2.is_null());
+        assert_eq!(
+            std::ffi::CStr::from_ptr(qid2).to_str().unwrap(),
+            "stmt-qid-B"
+        );
+
+        assert_eq!(
+            kernel_executed_statement_close(exec2),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn bind_parameter_null_and_empty_sql_type_are_rejected_at_bind() {
+    // The bridge validates sql_type before pushing: NULL type and empty type both
+    // return InvalidArgument at bind (a typed error beats an opaque wire-level
+    // BAD_REQUEST at execute). A NULL value with a valid type is accepted (SQL
+    // NULL, the host passes "VOID"). No server round-trip is needed for the
+    // rejections, so this drives the bridge directly on a live statement.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT ?").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let bigint = CString::new("BIGINT").unwrap();
+        let empty = CString::new("").unwrap();
+        let seven = CString::new("7").unwrap();
+
+        // NULL sql_type → InvalidArgument.
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                std::ptr::null(),
+                std::ptr::null(),
+                seven.as_ptr()
+            ),
+            KernelStatusCode::InvalidArgument,
+            "NULL sql_type must be rejected at bind"
+        );
+        // Empty sql_type → InvalidArgument (symmetric with the NULL guard).
+        assert_eq!(
+            kernel_statement_bind_parameter(stmt, std::ptr::null(), empty.as_ptr(), seven.as_ptr()),
+            KernelStatusCode::InvalidArgument,
+            "empty sql_type must be rejected at bind"
+        );
+        // A NULL value with a valid type is fine (SQL NULL via "VOID" is the more
+        // idiomatic form, but a null value with any type binds as NULL).
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                std::ptr::null(),
+                bigint.as_ptr(),
+                std::ptr::null()
+            ),
+            KernelStatusCode::Success,
+            "NULL value with a valid type binds as SQL NULL"
+        );
+
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn bind_parameter_positive_flow_normalizes_and_reaches_the_wire() {
+    // End-to-end reference for a consuming host: bind a positional raw param
+    // (empty name → positional), a named raw param, and a NULL value through the
+    // real C entry point, execute against the mock, and read back the server id.
+    // Asserts the bridge's normalization (empty-name → positional ordinal, null
+    // value → SQL NULL) actually reaches the SEA `parameters` wire array — the
+    // path all the param_raw unit tests bypass by calling param_raw directly.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-bind-1")),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        // Two positional markers + a NULL — all positional (empty/NULL name).
+        let sql = CString::new("SELECT ?, ?, ?").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let empty_name = CString::new("").unwrap();
+        let bigint = CString::new("BIGINT").unwrap();
+        let string_t = CString::new("STRING").unwrap();
+        let void_t = CString::new("VOID").unwrap();
+        let v_seven = CString::new("7").unwrap();
+        let v_empty = CString::new("").unwrap();
+
+        // Empty name → positional ordinal 1, value "7".
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                empty_name.as_ptr(),
+                bigint.as_ptr(),
+                v_seven.as_ptr()
+            ),
+            KernelStatusCode::Success
+        );
+        // NULL name → positional ordinal 2, empty-string value (present, not NULL).
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                std::ptr::null(),
+                string_t.as_ptr(),
+                v_empty.as_ptr()
+            ),
+            KernelStatusCode::Success
+        );
+        // NULL value → positional ordinal 3, SQL NULL (type VOID).
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                std::ptr::null(),
+                void_t.as_ptr(),
+                std::ptr::null()
+            ),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        assert!(!exec.is_null());
+
+        // query_id round-trips on the success path after a param bind.
+        let qid = kernel_executed_statement_query_id(exec);
+        assert!(!qid.is_null());
+        assert_eq!(
+            std::ffi::CStr::from_ptr(qid).to_str().unwrap(),
+            "stmt-bind-1"
+        );
+
+        assert_eq!(
+            kernel_executed_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    // The normalization reached the wire: inspect the POST body.
+    let posts = rt.block_on(async {
+        server
+            .received_requests()
+            .await
+            .expect("received_requests available")
+            .into_iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::POST
+                    && r.url.path() == "/api/2.0/sql/statements"
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(posts.len(), 1, "exactly one execute POST");
+    let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+    let params = body["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 3, "three bound params on the wire");
+    // Positional ordinals assigned 1..=3 in push order; no name key emitted.
+    assert_eq!(params[0]["ordinal"], 1);
+    assert_eq!(params[0]["type"], "BIGINT");
+    assert_eq!(params[0]["value"], "7");
+    assert!(
+        params[0].get("name").is_none(),
+        "positional param has no name"
+    );
+    // Empty-string value stays present (distinct from SQL NULL below).
+    assert_eq!(params[1]["ordinal"], 2);
+    assert_eq!(params[1]["value"], "");
+    // NULL value: `value` omitted (serde skips None), type VOID.
+    assert_eq!(params[2]["ordinal"], 3);
+    assert_eq!(params[2]["type"], "VOID");
+    assert!(
+        params[2].get("value").is_none() || params[2]["value"].is_null(),
+        "SQL NULL param emits no value"
+    );
 }
 
 #[test]

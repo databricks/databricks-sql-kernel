@@ -327,9 +327,16 @@ KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
 
 /* ─── Statement ───────────────────────────────────────────────────────*/
 
+/* Set the statement's SQL text, replacing any previously set SQL. Also clears
+ * every previously-bound parameter (raw and the typed positional binders below),
+ * so a reused statement handle starts each query with a fresh parameter set. */
 KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* sql);
 
-/* Positional parameter binding (1-based ordinal). */
+/* Typed positional parameter binding (1-based ordinal); the kernel infers the
+ * SEA wire type from the C type. These are the "typed params" the
+ * kernel_statement_bind_parameter contract refers to: within one statement they
+ * cannot be combined with kernel_statement_bind_parameter (raw binds) — pick one
+ * binding style. The conflict is reported at kernel_statement_execute, not here. */
 KernelStatusCode kernel_statement_bind_null(kernel_statement_t* stmt, size_t ordinal);
 KernelStatusCode kernel_statement_bind_int64(kernel_statement_t* stmt, size_t ordinal,
                                              int64_t value);
@@ -343,8 +350,23 @@ KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t o
  * stringified value, positional or named. For a host that already stringifies
  * values and knows the SQL type (e.g. the Go driver). name NULL/empty ->
  * positional (ordinal assigned at execute in push order); non-empty -> named.
- * value NULL -> SQL NULL (pass sql_type "VOID"). Positional and named raw params
- * are mutually exclusive within a statement, as are raw vs typed params. */
+ * value NULL -> SQL NULL (pass sql_type "VOID"); sql_type must be non-NULL and
+ * non-empty (an empty type is rejected here with InvalidArgument).
+ *
+ * Lifecycle: raw binds ACCUMULATE (each call appends a marker in push order);
+ * they carry no ordinal to overwrite by. kernel_statement_set_sql is the sole
+ * reset point — it clears ALL prior binds (raw AND the typed positional binders
+ * below) so each set_sql begins a fresh parameter set. kernel_statement_execute
+ * does NOT clear them, so a host reusing one statement handle across queries must
+ * call set_sql before re-binding, or the prior query's markers persist and the
+ * server sees the wrong parameter count.
+ *
+ * Two mutual-exclusion rules hold within one statement, both enforced at
+ * kernel_statement_execute (this call always returns Success on a valid
+ * arg — the conflict surfaces later as InvalidArgument from execute):
+ *   - positional and named raw params cannot be mixed;
+ *   - raw params cannot be mixed with the typed positional binders
+ *     (kernel_statement_bind_null/int64/double/bool/string above). */
 KernelStatusCode kernel_statement_bind_parameter(kernel_statement_t* stmt,
                                                  const char* name,
                                                  const char* sql_type,

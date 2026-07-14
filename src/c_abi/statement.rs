@@ -160,7 +160,10 @@ unsafe fn statement_mut<'a>(stmt: *mut kernel_statement_t) -> Option<&'a mut Sta
 
 // ─── SQL + parameter binding ─────────────────────────────────────────────────
 
-/// Set the statement's SQL text, replacing any previously set SQL.
+/// Set the statement's SQL text, replacing any previously set SQL. Also clears
+/// every previously-bound parameter (raw and typed), so a reused statement
+/// handle begins each query with a fresh parameter set — see
+/// [`crate::statement::spec::StatementSpec::sql`].
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `sql` must be a
@@ -295,6 +298,13 @@ pub unsafe extern "C" fn kernel_statement_bind_parameter(
                 Error::invalid_argument().message("parameter sql_type is not valid UTF-8")
             })?
             .to_owned();
+        // Reject an empty type here rather than letting it reach the wire as
+        // `"type":""` and surface as an opaque server BAD_REQUEST at execute —
+        // symmetric with the NULL guard above and with param_named rejecting an
+        // empty name (a bind-time typed error beats a wire-level rejection).
+        if sql_type.is_empty() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be empty"));
+        }
         let name_opt = if name.is_null() {
             None
         } else {
@@ -399,10 +409,12 @@ pub unsafe extern "C" fn kernel_statement_execute(
         Ok(exec) => {
             // Snapshot the server statement id as a C string now, while the exec
             // handle is fresh, so the query-id accessor is a borrow with no
-            // allocation. Strip any interior NUL defensively (a server UUID has
-            // none) rather than fail construction.
-            let statement_id_c = CString::new(exec.statement_id().replace('\0', ""))
-                .unwrap_or_else(|_| CString::default());
+            // allocation. An interior NUL (never in a server-generated UUID)
+            // would make CString::new fail; fall back to an empty C string
+            // rather than fail construction — the query-id accessor stays
+            // non-NULL for any live handle per its header contract.
+            let statement_id_c =
+                CString::new(exec.statement_id()).unwrap_or_else(|_| CString::default());
             let handle = ExecutedHandle {
                 exec,
                 alive: ValidityFlag::new(),

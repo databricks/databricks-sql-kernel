@@ -223,21 +223,29 @@ impl StatementSpec {
         Self::default()
     }
 
-    /// Set the SQL text. Replaces any previously set SQL, and clears any
-    /// pre-marshalled `raw_params` so each `sql()` begins a fresh parameter set.
+    /// Set the SQL text. Replaces any previously set SQL and clears **every**
+    /// bound parameter — raw, positional-typed, and named-typed — so each
+    /// `sql()` begins a genuinely fresh parameter set.
     ///
-    /// This is the reset point for the raw-bind path: unlike positional
-    /// `TypedValue` binds, which overwrite by ordinal (`param`) and so are
-    /// idempotent across a re-execute, raw binds carry no ordinal and only
-    /// `push`, so without a reset a host reusing one statement handle across
-    /// queries (`set_sql` → bind → execute, repeat) would accumulate stale
-    /// markers from the prior query. Clearing here ties the raw parameter set to
-    /// the current SQL, matching the prepared-statement mental model (new SQL →
-    /// fresh binds). The `TypedValue` sets are left untouched (they are already
-    /// reuse-safe by overwrite).
+    /// This is the single reset point for a reused statement handle. New SQL has
+    /// its own parameter markers, so carrying prior binds into it is never
+    /// correct; clearing all three here matches the prepared-statement mental
+    /// model (new SQL → fresh binds) and keeps the reset uniform across binding
+    /// styles. Without it, a reused handle leaks stale binds into the next query
+    /// in two ways: raw binds only `push` (no overwrite-by-ordinal), so they
+    /// would accumulate across executes; and typed positional binds overwrite by
+    /// ordinal (`param`) but a *shrinking* arity would keep the stale
+    /// high-ordinal slots, emitting more markers than the new SQL has. A host
+    /// that bound typed params for one query then raw-binds the next would also
+    /// trip the raw-vs-typed exclusion check on the leftover typed slots.
+    ///
+    /// The idiom is always `set_sql` → bind → execute per query, so binds are
+    /// re-supplied after each `sql()` and nothing depends on them surviving it.
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self {
         self.sql = Some(sql.into());
         self.raw_params.clear();
+        self.positional_params.clear();
+        self.named_params.clear();
         self
     }
 
@@ -565,11 +573,11 @@ mod tests {
     }
 
     #[test]
-    fn sql_clears_raw_params_so_reuse_does_not_accumulate() {
+    fn sql_clears_all_params_so_reuse_does_not_accumulate() {
         // A host reusing one statement (set_sql → bind → execute, repeat) must not
-        // accumulate stale raw params: raw binds only push (no overwrite-by-ordinal),
-        // so sql() is the reset point. After a second set_sql + bind, exactly the
-        // second query's params remain.
+        // carry stale params into the next query: sql() is the single reset point
+        // and clears EVERY binding style. After a second set_sql + bind, exactly
+        // the second query's params remain — for raw and typed alike.
         let mut s = StatementSpec::new();
         s.sql("SELECT ?");
         s.param_raw(None, "BIGINT", Some("1".to_owned()));
@@ -580,6 +588,33 @@ mod tests {
         s.param_raw(None, "STRING", Some("hi".to_owned()));
         assert_eq!(s.raw_params.len(), 1);
         assert_eq!(s.raw_params[0].value.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn sql_clears_typed_params_so_reuse_does_not_accumulate() {
+        // The typed path is reset by sql() too: a shrinking-arity reuse must not
+        // keep stale high-ordinal slots, and a switch from typed to raw binds must
+        // not trip the raw-vs-typed exclusion on leftover typed params.
+        let mut s = StatementSpec::new();
+        s.sql("SELECT ?, ?");
+        s.param(1, TypedValue::Int64(1)).unwrap();
+        s.param(2, TypedValue::Int64(2)).unwrap();
+        s.param_named("k", TypedValue::Null).unwrap();
+        assert_eq!(s.positional_params.len(), 2);
+        assert_eq!(s.named_params.len(), 1);
+
+        s.sql("SELECT ?"); // narrower query on the reused handle
+        assert!(
+            s.positional_params.is_empty(),
+            "sql() must clear prior positional typed params"
+        );
+        assert!(
+            s.named_params.is_empty(),
+            "sql() must clear prior named typed params"
+        );
+        // The reused handle can now raw-bind without tripping raw-vs-typed exclusion.
+        s.param_raw(None, "BIGINT", Some("9".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
     }
 
     // ─── query_tags merge behaviour ─────────────────────────────────────

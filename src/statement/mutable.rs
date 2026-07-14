@@ -1058,4 +1058,42 @@ mod tests {
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("mutually exclusive"));
     }
+
+    #[test]
+    fn build_execute_params_rejects_raw_mixed_with_named_typed() {
+        // The raw-vs-typed guard's second disjunct: raw mixed with a *named*
+        // TypedValue bind (not just positional) is equally rejected — a host
+        // uses one binding style per statement.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT :n, ?");
+        spec.param_named("n", TypedValue::Int64(99)).unwrap();
+        spec.param_raw(None, "STRING", Some("x".to_owned()));
+        let err =
+            build_execute_params(&spec, None).expect_err("raw + named-typed must be rejected");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert!(err.message.contains("raw parameters cannot be mixed"));
+    }
+
+    #[test]
+    fn build_execute_params_binds_raw_empty_string_value_distinct_from_null() {
+        // A SQL driver must distinguish an empty-string value from SQL NULL:
+        // Some("") stays a present empty value on the wire, while None (VOID) is
+        // SQL NULL. The C bridge maps a null `value` pointer → None and any
+        // non-null (including "") → Some, so this pins that boundary.
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT ?, ?");
+        spec.param_raw(None, "STRING", Some(String::new()));
+        spec.param_raw(None, "VOID", None);
+        let (_, params) = build_execute_params(&spec, None).unwrap();
+        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(
+            params.parameters[0].value.as_deref(),
+            Some(""),
+            "empty-string value must stay a present empty value, not NULL"
+        );
+        assert!(
+            params.parameters[1].value.is_none(),
+            "VOID/None must be SQL NULL, distinct from an empty string"
+        );
+    }
 }
