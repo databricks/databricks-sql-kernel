@@ -56,7 +56,7 @@
 
 use crate::client::DirectOutcome;
 use crate::kernel_error::{Error, Result};
-use crate::klog::warn;
+use crate::klog::{debug, warn};
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
@@ -291,6 +291,10 @@ impl Statement {
         // `self.session` (once in the async body, once on the
         // `.instrument()` argument).
         let span = self.session.log_span().clone();
+        // Clear the shared in-flight-id slot before the first `.await` so a
+        // canceller retained across a re-execute can't target the prior
+        // query during the handoff (see `reset_inflight_slot`).
+        self.reset_inflight_slot();
         async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
@@ -304,9 +308,9 @@ impl Statement {
             // Publish the server statement id to the shared in-flight
             // slot as soon as the initial POST returns (the transport
             // fills this before its poll loop) so a concurrent
-            // `StatementCanceller` can cancel a still-running query.
-            // `MidExecuteCancelState::new` already cleared the slot, so
-            // set the observer after it.
+            // `StatementCanceller` can cancel a still-running query. The
+            // slot was already cleared at method entry, so set the observer
+            // now.
             exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             // SeaRestTransport::execute_statement polls to completion
@@ -369,6 +373,9 @@ impl Statement {
     /// `execute()`'s sync polling budget belong on this path.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
         let span = self.session.log_span().clone();
+        // Clear the shared in-flight-id slot before the first `.await`
+        // (see `reset_inflight_slot`).
+        self.reset_inflight_slot();
         async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
@@ -444,6 +451,9 @@ impl Statement {
     /// `AsyncStatementCanceller` targets it without an observer race.
     pub async fn execute_direct(&mut self) -> Result<DirectStatement> {
         let span = self.session.log_span().clone();
+        // Clear the shared in-flight-id slot before the first `.await`
+        // (see `reset_inflight_slot`).
+        self.reset_inflight_slot();
         async {
             self.invalidate_prior().await;
             // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
@@ -581,6 +591,32 @@ impl Statement {
         build_execute_params(&self.spec, wait_timeout_secs)
     }
 
+    /// Clear the shared in-flight-id slot at the very start of a new
+    /// dispatch, before any `.await`.
+    ///
+    /// The slot still holds the *prior* execution's server statement id
+    /// until this runs. A [`StatementCanceller`] retained across a
+    /// re-execute reads that slot; without this early clear there is a
+    /// window — from entry of `execute()` / `submit()` /
+    /// `execute_direct()` through `invalidate_prior().await` and
+    /// `prepare_for_dispatch` until [`MidExecuteCancelState`] captures the
+    /// new execution — in which a concurrent `cancel()` would fire against
+    /// the already-finished prior query and (worse) report
+    /// `dispatched = true`, contradicting the "cancels the LATER query"
+    /// contract. Clearing synchronously at entry collapses that window to
+    /// nothing: a canceller firing before the new id is observed is a
+    /// tolerated no-op (`dispatched = false`), never a hit on the stale id.
+    ///
+    /// Kept out of [`invalidate_prior`] deliberately — that is also called
+    /// by [`Statement::close`], where the slot must survive so a detached
+    /// canceller can still dispatch against the just-closed statement (its
+    /// cloned session `Arc` keeps the client side alive).
+    fn reset_inflight_slot(&self) {
+        if let Ok(mut slot) = self.inflight_id.lock() {
+            *slot = None;
+        }
+    }
+
     /// Auto-close any prior executed handle this `Statement` produced.
     ///
     /// Happy path: by the time the caller is starting a *new*
@@ -647,19 +683,19 @@ struct MidExecuteCancelState {
     session: Arc<SessionInner>,
     /// Shared with the owning [`Statement::inflight_id`] so an
     /// out-of-band [`StatementCanceller`] reads the same id this guard
-    /// observes. Reset to `None` on construction (new execution).
+    /// observes. The dispatch method clears it at entry (see
+    /// [`Statement::reset_inflight_slot`]); this guard only ever writes
+    /// the new execution's id into it via [`observe`](Self::observe).
     observed_id: InflightId,
     defused: std::sync::atomic::AtomicBool,
 }
 
 impl MidExecuteCancelState {
-    /// `inflight_id` is the owning `Statement`'s shared slot. We clear
-    /// it here so a canceller can't fire against a prior statement
-    /// while this execution is still establishing its own id.
+    /// `inflight_id` is the owning `Statement`'s shared slot, already
+    /// cleared to `None` by `reset_inflight_slot` at the start of this
+    /// dispatch. We only capture it here; [`observe`](Self::observe)
+    /// later publishes the new execution's id.
     fn new(session: Arc<SessionInner>, inflight_id: InflightId) -> Arc<Self> {
-        if let Ok(mut slot) = inflight_id.lock() {
-            *slot = None;
-        }
         Arc::new(Self {
             session,
             observed_id: inflight_id,
@@ -735,14 +771,21 @@ impl StatementCanceller {
     /// Server-side cancel of the in-flight statement via
     /// `cancel_statement(statement_id)`.
     ///
-    /// Returns `Ok(true)` if a cancel RPC was actually dispatched (a
-    /// statement id had been observed) and `Ok(false)` if it was a no-op
-    /// because no id has been observed yet — either nothing has executed,
-    /// or the query is still in its initial submit round-trip and the
-    /// server hasn't issued an id. The dispatched/no-op decision and the
-    /// returned flag come from the *same* id read, so a caller can attribute
-    /// a subsequent execute error to this cancel without a separate (racy)
+    /// Returns `Ok(true)` if a cancel RPC was POSTed for the currently
+    /// observed statement id, and `Ok(false)` if it was a no-op because no
+    /// id has been observed yet — either nothing has executed, or the query
+    /// is still in its initial submit round-trip and the server hasn't
+    /// issued an id. The dispatch/no-op decision and the returned flag come
+    /// from the *same* id read, so a caller can attribute a subsequent
+    /// execute error to this cancel without a separate (racy)
     /// `statement_id()` re-check.
+    ///
+    /// `Ok(true)` means only that a `CancelStatement` was sent for the
+    /// observed id — **not** that a running query was interrupted. The id
+    /// slot retains the last observed id after a query finishes, so a cancel
+    /// fired post-terminal (or, in the narrow re-execute handoff, against a
+    /// superseded id) still POSTs and still reports `true`; the server
+    /// treats a cancel of an already-terminal statement as its own no-op.
     ///
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
@@ -750,10 +793,20 @@ impl StatementCanceller {
     /// only the id slot (behind a `Mutex`), no mutable statement state.
     pub async fn cancel(&self) -> Result<bool> {
         let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
-        let Some(id) = id else {
-            return Ok(false);
-        };
         async {
+            // Log both outcomes at the decision point so a host debugging a
+            // cancel can tell "raced ahead of the id" (no-op) from "wired to
+            // the wrong handle" in one `RUST_LOG=databricks_sql_kernel=debug`
+            // stream — the no-op branch returns before the transport, which
+            // is the only other place a cancel is logged.
+            let Some(id) = id else {
+                debug!(
+                    "statement cancel requested, but no server statement id observed yet; \
+                     no-op (nothing executed, or still in the initial submit round-trip)"
+                );
+                return Ok(false);
+            };
+            debug!(statement_id = %id, "dispatching statement cancel RPC");
             self.session.transport().cancel_statement(&id).await?;
             Ok(true)
         }
