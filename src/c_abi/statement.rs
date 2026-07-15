@@ -80,9 +80,11 @@ pub(crate) struct ExecutedHandle {
     /// The server statement id as a NUL-terminated C string, built once at
     /// construction so `kernel_executed_statement_query_id` can hand back a
     /// borrowed `*const c_char` valid for the handle's lifetime (no per-call
-    /// allocation, nothing for the caller to free). Interior NULs are stripped
-    /// (a statement id is a server-generated UUID, so this never occurs in
-    /// practice).
+    /// allocation, nothing for the caller to free). Any interior NUL is
+    /// stripped (replaced with `?`) via `to_cstring_lossy` — the same semantics
+    /// as the error-path `KernelError.query_id` — so the two query-id paths
+    /// agree. A statement id is a server-generated UUID, so this never occurs in
+    /// practice.
     pub(crate) statement_id_c: CString,
 }
 
@@ -409,12 +411,13 @@ pub unsafe extern "C" fn kernel_statement_execute(
         Ok(exec) => {
             // Snapshot the server statement id as a C string now, while the exec
             // handle is fresh, so the query-id accessor is a borrow with no
-            // allocation. An interior NUL (never in a server-generated UUID)
-            // would make CString::new fail; fall back to an empty C string
-            // rather than fail construction — the query-id accessor stays
-            // non-NULL for any live handle per its header contract.
-            let statement_id_c =
-                CString::new(exec.statement_id()).unwrap_or_else(|_| CString::default());
+            // allocation. `to_cstring_lossy` strips any interior NUL (→ `?`)
+            // rather than discarding the whole id — never happens for a
+            // server-generated UUID, but keeps this success-path id and the
+            // error-path `KernelError.query_id` on identical NUL semantics, and
+            // guarantees the accessor stays non-NULL for any live handle per its
+            // header contract.
+            let statement_id_c = crate::c_abi::error::to_cstring_lossy(exec.statement_id());
             let handle = ExecutedHandle {
                 exec,
                 alive: ValidityFlag::new(),

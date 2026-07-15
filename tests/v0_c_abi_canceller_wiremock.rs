@@ -849,6 +849,183 @@ fn bind_parameter_positive_flow_normalizes_and_reaches_the_wire() {
 }
 
 #[test]
+fn bind_parameter_named_reaches_the_wire_with_name_and_no_ordinal() {
+    // Companion to the positional-only positive flow: a non-empty name must
+    // serialize a `:name` marker on the SEA `parameters` array — a `"name"` key
+    // and NO `"ordinal"` key. The named-raw path is a documented first-class
+    // binding for a C-ABI host (e.g. the Go driver's named `backend.Param`), and
+    // the param_raw unit tests exercise it only by calling param_raw directly,
+    // bypassing the C bridge. This pins name → wire through the real entry point,
+    // so a bridge regression (name dropped, spurious ordinal, `:` mishandled)
+    // fails a test instead of shipping a malformed markers array to the server.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-named-1")),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT :id, :label").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let name_id = CString::new("id").unwrap();
+        let name_label = CString::new("label").unwrap();
+        let bigint = CString::new("BIGINT").unwrap();
+        let string_t = CString::new("STRING").unwrap();
+        let v_seven = CString::new("7").unwrap();
+        let v_hi = CString::new("hi").unwrap();
+
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                name_id.as_ptr(),
+                bigint.as_ptr(),
+                v_seven.as_ptr()
+            ),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                name_label.as_ptr(),
+                string_t.as_ptr(),
+                v_hi.as_ptr()
+            ),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        assert!(!exec.is_null());
+
+        assert_eq!(
+            kernel_executed_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    let posts = rt.block_on(async {
+        server
+            .received_requests()
+            .await
+            .expect("received_requests available")
+            .into_iter()
+            .filter(|r| {
+                r.method == wiremock::http::Method::POST
+                    && r.url.path() == "/api/2.0/sql/statements"
+            })
+            .collect::<Vec<_>>()
+    });
+    assert_eq!(posts.len(), 1, "exactly one execute POST");
+    let body: serde_json::Value = serde_json::from_slice(&posts[0].body).unwrap();
+    let params = body["parameters"].as_array().expect("parameters array");
+    assert_eq!(params.len(), 2, "two named params on the wire");
+    // Named markers carry a `name` key and NO `ordinal` key (serde skips None).
+    for (i, (name, ty, val)) in [("id", "BIGINT", "7"), ("label", "STRING", "hi")]
+        .iter()
+        .enumerate()
+    {
+        assert_eq!(params[i]["name"], *name, "named param {i} keeps its name");
+        assert_eq!(params[i]["type"], *ty);
+        assert_eq!(params[i]["value"], *val);
+        assert!(
+            params[i].get("ordinal").is_none(),
+            "named param {i} emits no ordinal"
+        );
+    }
+}
+
+#[test]
+fn bind_parameter_rejects_non_utf8_in_each_string_arg() {
+    // The C boundary the Go driver hits carries arbitrary bytes. Each of the
+    // three string args (sql_type, name, value) has its own `to_str()` guard that
+    // must reject a non-UTF-8 sequence with InvalidArgument, keeping the
+    // SQL-NULL-vs-corrupt-value distinction crisp (a future from_utf8_lossy swap
+    // would silently smuggle replacement chars to the wire — this fails first).
+    // No round-trip needed; the rejections happen at bind on a live statement.
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        server
+    });
+    let uri = server.uri();
+
+    // A lone 0xFF byte is never valid UTF-8. CString rejects interior NULs, not
+    // high bytes, so this builds a valid NUL-terminated C string of invalid UTF-8.
+    let bad = CString::new(vec![0xffu8]).unwrap();
+    let bigint = CString::new("BIGINT").unwrap();
+    let name_ok = CString::new("id").unwrap();
+    let value_ok = CString::new("7").unwrap();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT ?").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        // Non-UTF-8 sql_type → InvalidArgument.
+        assert_eq!(
+            kernel_statement_bind_parameter(
+                stmt,
+                name_ok.as_ptr(),
+                bad.as_ptr(),
+                value_ok.as_ptr()
+            ),
+            KernelStatusCode::InvalidArgument,
+            "non-UTF-8 sql_type must be rejected at bind"
+        );
+        // Non-UTF-8 name → InvalidArgument.
+        assert_eq!(
+            kernel_statement_bind_parameter(stmt, bad.as_ptr(), bigint.as_ptr(), value_ok.as_ptr()),
+            KernelStatusCode::InvalidArgument,
+            "non-UTF-8 name must be rejected at bind"
+        );
+        // Non-UTF-8 value → InvalidArgument.
+        assert_eq!(
+            kernel_statement_bind_parameter(stmt, name_ok.as_ptr(), bigint.as_ptr(), bad.as_ptr()),
+            KernelStatusCode::InvalidArgument,
+            "non-UTF-8 value must be rejected at bind"
+        );
+
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
 fn cancel_rpc_failure_returns_error_and_sets_dispatched_false() {
     let rt = tokio::runtime::Runtime::new().unwrap();
     let server = rt.block_on(async {

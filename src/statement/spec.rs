@@ -199,7 +199,14 @@ pub struct StatementSpec {
     /// `StatementParameter`s here directly. Mutually exclusive with
     /// `positional_params` / `named_params` (mixing marker styles is rejected
     /// the same way). Empty unless a host used the raw-bind path.
-    pub raw_params: Vec<crate::types::sea::StatementParameter>,
+    ///
+    /// `pub(crate)` deliberately: this holds the raw SEA wire struct
+    /// (`StatementParameter`, `#[derive(Serialize)]`, not `#[non_exhaustive]`),
+    /// so exposing it publicly would make evolving the wire type — trivially
+    /// non-breaking on the wire — a breaking change to the kernel crate. The
+    /// public surface is [`Self::param_raw`], which takes only strings; a
+    /// future alternate transport can then re-shape this field freely.
+    pub(crate) raw_params: Vec<crate::types::sea::StatementParameter>,
 
     /// Per-statement conf overlay. Maps to SEA `parameters` /
     /// Thrift `confOverlay`. Merged on top of the session-level
@@ -225,13 +232,19 @@ impl StatementSpec {
 
     /// Set the SQL text. Replaces any previously set SQL and clears **every**
     /// bound parameter — raw, positional-typed, and named-typed — so each
-    /// `sql()` begins a genuinely fresh parameter set.
+    /// `sql()` begins a fresh set of *bound parameters*.
     ///
-    /// This is the single reset point for a reused statement handle. New SQL has
-    /// its own parameter markers, so carrying prior binds into it is never
-    /// correct; clearing all three here matches the prepared-statement mental
-    /// model (new SQL → fresh binds) and keeps the reset uniform across binding
-    /// styles. Without it, a reused handle leaks stale binds into the next query
+    /// Scope note: this clears the three parameter collections only. It does
+    /// **not** reset `statement_conf` (e.g. query tags) or `row_limit`, which
+    /// survive a `sql()` call and must be re-set explicitly if a reused handle
+    /// should not carry them into the next query.
+    ///
+    /// This is the single reset point for the *bound parameters* of a reused
+    /// statement handle. New SQL has its own parameter markers, so carrying
+    /// prior binds into it is never correct; clearing all three here matches the
+    /// prepared-statement mental model (new SQL → fresh binds) and keeps the
+    /// reset uniform across binding styles. Without it, a reused handle leaks
+    /// stale binds into the next query
     /// in two ways: raw binds only `push` (no overwrite-by-ordinal), so they
     /// would accumulate across executes; and typed positional binds overwrite by
     /// ordinal (`param`) but a *shrinking* arity would keep the stale
@@ -300,6 +313,18 @@ impl StatementSpec {
     /// host passes type "VOID"). This is the raw-bind path a C-ABI host uses; it
     /// bypasses `TypedValue` inference because the host already knows the wire
     /// type and string form.
+    ///
+    /// **Append-only, one-shot per query.** Each call *appends* a marker; unlike
+    /// the typed [`Self::param`] binder there is no overwrite-by-ordinal (a raw
+    /// positional carries no ordinal until execute assigns it in push order), so
+    /// re-binding to "correct" a value adds a second marker rather than
+    /// replacing the first. Bind each marker exactly once per query; the only
+    /// reset is [`Self::sql`]. This matches the intended consumer contract — a
+    /// C-ABI host (e.g. the Go driver) binds its arg set once per execute on a
+    /// fresh handle and never re-binds in place. Duplicate-name detection on the
+    /// named raw path is deferred to a later PR, in lockstep with the same
+    /// tightening on [`Self::param_named`], so the raw and typed-named paths stay
+    /// symmetric rather than raw being stricter.
     pub fn param_raw(
         &mut self,
         name: Option<String>,
