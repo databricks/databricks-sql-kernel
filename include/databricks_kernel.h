@@ -306,6 +306,68 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
+/* ─── Log callback (reverse-call) ─────────────────────────────────────
+ *
+ * A host that links the kernel crate directly (pyo3 / napi) bridges the
+ * kernel's tracing output into its own logger in-process. A C-ABI consumer
+ * can't install a Rust subscriber, so this is the reverse-call path: register
+ * a callback the kernel invokes with each `databricks*`-targeted log event, so
+ * kernel-internal diagnostics flow into the host's logger instead of only
+ * reaching stderr via kernel_init_logging.
+ *
+ * The callback fires from the kernel's log-drain thread (NOT a query worker),
+ * so it MUST be thread-safe. It SHOULD NOT unwind: the kernel guards each call
+ * with catch_unwind (the callback pointer uses Rust's C-unwind ABI), so a
+ * panicking callback poisons the sink and stops delivering rather than aborting
+ * the process — but subsequent logs are then silently dropped, so a well-behaved
+ * callback must still not throw across the boundary. It MUST NOT call back into
+ * any kernel_* entry point: a reentrant blocking kernel_* call from this thread
+ * is NOT rejected (that guard only covers calls from a kernel worker) — it would
+ * stall the drain thread and drop queued logs. `ctx`
+ * is passed back verbatim on every call and must stay valid for the process
+ * lifetime. `level` (the callback arg) is 1=ERROR..5=TRACE; `target` and
+ * `message` are valid only for the duration of the call — copy them out.
+ * Records are enqueued on a bounded channel and DROPPED on overflow (logs are
+ * advisory and never back-pressure a kernel hot path); the drop count is
+ * observable via kernel_logging_stats and a synthetic "N dropped" line the
+ * drain thread emits through the callback on recovery.
+ *
+ * The `level` PARAMETER (OFF/ERROR/WARN/INFO/DEBUG/TRACE, case-insensitive, or
+ * NULL) sets the forward threshold with the SAME precedence as
+ * kernel_init_logging: an explicit recognised level wins, else RUST_LOG. A host
+ * that maps its own logger level (Go's DATABRICKS_LOG_LEVEL) passes it here so
+ * the callback filters on that one knob rather than only RUST_LOG. When neither
+ * resolves (NULL/unrecognised AND no matching RUST_LOG) the current threshold
+ * is left UNCHANGED — the warn default on the first call, or the
+ * previously-set level on a re-registration.
+ *
+ * Mutually exclusive with kernel_init_logging: both install the one
+ * process-global tracing subscriber. kernel_set_log_callback returns Internal
+ * (with a stored last error) if a global subscriber was already installed, or
+ * if it won the subscriber but the log-drain thread could not be started (the
+ * two cases carry distinct error messages); install exactly ONE of the two.
+ * Passing a NULL `cb` returns InvalidArgument (there is no detach in v0). */
+typedef void (*kernel_log_callback)(void* ctx, int level, const char* target,
+                                    const char* message);
+KernelStatusCode kernel_set_log_callback(kernel_log_callback cb, void* ctx,
+                                         const char* level);
+
+/* Report the log-callback bridge's health, so a host can distinguish "kernel
+ * logs are quiet" from "kernel logs are being dropped / the sink died / never
+ * installed". Writes to each non-NULL out-param (a NULL out-param is skipped):
+ *   - `installed`: true iff kernel logs are CURRENTLY delivering — the callback
+ *     won the process-global subscriber AND the sink is not poisoned. A callback
+ *     that unwinds poisons the sink (delivery stops), which reads false here even
+ *     though the subscriber is still installed; registering a new callback clears
+ *     the poison and flips this back to true.
+ *   - `dropped`: cumulative kernel log records dropped AFTER install — because
+ *     the bounded delivery channel was full (slow callback) or the sink was
+ *     poisoned by a callback that unwound. Does NOT count the drain-thread-never-
+ *     started case (a spawn failure leaves no channel to overflow); there
+ *     `installed` reads false and kernel_set_log_callback returned Internal.
+ * Never fails; safe to poll at any time. */
+void kernel_logging_stats(bool* installed, uint64_t* dropped);
+
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
  * All optional; defaults are: no explicit proxy (reqwest honours

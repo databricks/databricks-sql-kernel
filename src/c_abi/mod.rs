@@ -47,6 +47,7 @@
 
 pub mod cancel;
 pub mod error;
+pub mod logging;
 pub mod metadata;
 pub mod result;
 pub mod session;

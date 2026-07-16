@@ -38,6 +38,18 @@ changes go in their respective binding's NEXT_CHANGELOG.
   (maps to `ResultConfig::cloudfetch_enabled`); `false` forces the inline-Arrow
   path (`can_cloud_download=false`) for all result sizes. `None` (unset) keeps
   the kernel default (on).
+- C ABI: `kernel_set_log_callback(cb, ctx, level)` + the `kernel_log_callback`
+  typedef — a reverse-call log sink so a C-ABI host (ODBC / Go) that can't
+  install a Rust `tracing` subscriber still receives the kernel's
+  `databricks*`-targeted log events, routed into its own logger instead of only
+  reaching stderr via `kernel_init_logging`. Events are captured by a
+  process-global layer, filtered by `level` (explicit level > `RUST_LOG` > the
+  `warn` default — the same precedence as `kernel_init_logging`, so a host maps
+  one knob), enqueued on a bounded channel (drop-on-full — logs never
+  back-pressure a kernel hot path), and delivered from a dedicated drain thread.
+  Mutually exclusive with `kernel_init_logging` (one process-global subscriber;
+  the first to install wins, the other returns `Internal`); a NULL callback is
+  rejected with `InvalidArgument`.
 
 ### Updated
 

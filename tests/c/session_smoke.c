@@ -230,6 +230,49 @@ static void test_init_logging(void) {
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
 }
 
+/* kernel_set_log_callback: NULL cb is rejected; a real cb installs (or reports
+ * the mutual-exclusion outcome if init_logging already won the one global
+ * subscriber). Hermetic — no network, no events forced. The `level` arg is
+ * exercised as an explicit "WARN" and NULL to cover both precedence paths. */
+static int g_log_calls = 0;
+static void count_log_cb(void* ctx, int level, const char* target, const char* message) {
+  (void)level;
+  (void)target;
+  (void)message;
+  int* counter = (int*)ctx;
+  if (counter) {
+    (*counter)++;
+  }
+}
+
+static void test_log_callback(void) {
+  KernelStatusCode rc = kernel_set_log_callback(NULL, NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_log_callback(NULL cb) → InvalidArgument");
+
+  /* This runs AFTER test_init_logging, which already won the one process-global
+   * subscriber, so the mutual-exclusion contract is deterministic here: the
+   * callback install must report Internal (not Success, not a silent no-op).
+   * The explicit "WARN" level arg is accepted regardless. */
+  rc = kernel_set_log_callback(count_log_cb, &g_log_calls, "WARN");
+  CHECK(rc == KernelStatusCode_Internal,
+        "set_log_callback after init_logging → Internal (mutual exclusion)");
+
+  /* A NULL level (defer to RUST_LOG / current) is also accepted; same
+   * mutual-exclusion outcome on a refresh. */
+  rc = kernel_set_log_callback(count_log_cb, &g_log_calls, NULL);
+  CHECK(rc == KernelStatusCode_Internal,
+        "set_log_callback(NULL level) after init_logging → Internal");
+
+  /* kernel_logging_stats never fails and honours NULL out-params. init_logging
+   * won the subscriber, so the callback did NOT install. */
+  bool installed = true;
+  uint64_t dropped = 123;
+  kernel_logging_stats(&installed, &dropped);
+  CHECK(!installed, "logging_stats: callback not installed (init_logging won)");
+  kernel_logging_stats(NULL, NULL); /* must not crash on NULL out-params */
+  CHECK(true, "logging_stats(NULL, NULL) is safe");
+}
+
 /* is_open null-guards its args. (The true→false behavior is covered by the
  * in-crate Rust test
  * `session::is_open_tests::is_open_flips_true_to_false_on_delete`, which can
@@ -354,6 +397,10 @@ int main(void) {
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
   test_init_logging();
+  /* After test_init_logging so it wins the one process-global subscriber; the
+   * callback install then deterministically reports the mutual-exclusion
+   * outcome (Internal). */
+  test_log_callback();
   test_is_open_null_guards();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
