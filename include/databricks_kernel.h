@@ -46,6 +46,17 @@
  * out exactly as declared here; copy its fields out before the next
  * `kernel_*` call on the thread.
  *
+ * Because there is no promise through v0.x, a consumer that links a
+ * prebuilt library can drift from the header it compiled against (a stale
+ * header vs a newer `.a`, or vice versa). The `DATABRICKS_KERNEL_ABI_VERSION`
+ * macro below is the version this header describes; `kernel_abi_version()`
+ * returns the version compiled into the linked library. A consumer should
+ * compare the two once at load time and refuse to run on a mismatch —
+ * otherwise a layout change (e.g. a reordered `KernelStatusCode`) would be
+ * misread as valid data rather than surfaced as a clean error. The macro is
+ * bumped in lockstep with the Rust `KERNEL_ABI_VERSION` on any layout or
+ * semantic change.
+ *
  * ## Lifecycle & threading notes
  *
  * - **Re-execution invalidates prior handles.** `kernel_statement_execute`
@@ -89,6 +100,19 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* ─── ABI version ─────────────────────────────────────────────────────
+ *
+ * The C-ABI version this header describes. `kernel_abi_version()` returns
+ * the version compiled into the linked library; compare the two once at
+ * load time and refuse to run on a mismatch (see "ABI versioning" above).
+ * Bumped in lockstep with the Rust `KERNEL_ABI_VERSION`.
+ */
+#define DATABRICKS_KERNEL_ABI_VERSION 1
+
+/* Version of the C ABI compiled into the linked library. Infallible and
+ * side-effect-free. */
+uint32_t kernel_abi_version(void);
 
 /* ─── Arrow C Data Interface ──────────────────────────────────────────
  *
@@ -312,6 +336,27 @@ KernelStatusCode kernel_session_config_set_tls_allow_self_signed(KernelSessionCo
 KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(KernelSessionConfig* config,
                                                                          bool skip);
 
+/* Configure a client certificate + private key for mutual TLS (mTLS).
+ * BOTH halves are required and passed together: `cert_pem`/`cert_len` is a
+ * PEM leaf cert optionally followed by its intermediate chain; `key_pem`/
+ * `key_len` is the matching PEM private key (use PKCS#8 for portability
+ * across the tls-native and tls-rustls backends). Taking both at once makes
+ * cert-without-key unrepresentable. A null buffer or zero length for either
+ * half returns InvalidArgument. The private key is never rendered in logs. */
+KernelStatusCode kernel_session_config_set_tls_client_certificate(KernelSessionConfig* config,
+                                                                  const uint8_t* cert_pem,
+                                                                  size_t cert_len,
+                                                                  const uint8_t* key_pem,
+                                                                  size_t key_len);
+
+/* Enable or disable CloudFetch (cloud-storage-backed download of large result
+ * sets). Default enabled; `false` forces the inline-Arrow path for all result
+ * sizes (mirrors JDBC EnableQueryResultDownload=0). The kernel sets the
+ * `can_cloud_download` session conf internally — do NOT set that conf directly
+ * via set_session_conf (the server rejects it as not user-settable). */
+KernelStatusCode kernel_session_config_set_cloudfetch_enabled(KernelSessionConfig* config,
+                                                              bool enabled);
+
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*
@@ -321,6 +366,17 @@ KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(Kernel
  */
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
+
+/*
+ * Close a session and BLOCK until the server-side DeleteSession completes
+ * (or errors). Unlike kernel_session_close (fire-and-forget), a program
+ * that exits right after this returns has a confirmed server-side delete —
+ * the parity path for a host that wants close to behave like the
+ * synchronous DeleteSession RPC. CONSUMES `session` like
+ * kernel_session_close (released on success and failure alike); the same
+ * "close the session LAST" teardown ordering applies.
+ */
+KernelStatusCode kernel_session_close_blocking(kernel_session_t* session);
 
 /*
  * Like kernel_session_open, but races the (blocking) connect against

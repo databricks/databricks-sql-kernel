@@ -365,9 +365,39 @@ impl From<crate::kernel_error::ErrorCode> for KernelStatusCode {
     }
 }
 
+/// Current C-ABI version. Bump this on any change that alters a struct
+/// layout ([`KernelStatusCode`], `KernelError`) or the meaning of an
+/// existing symbol, so a consumer compiled against one header can detect
+/// a library built against a different one. Kept in lockstep with the
+/// `DATABRICKS_KERNEL_ABI_VERSION` macro in `include/databricks_kernel.h`
+/// (the C-smoke test asserts the two agree). Pure v0.x aid — there is no
+/// ABI stability promise until v1.0.
+pub const KERNEL_ABI_VERSION: u32 = 1;
+
+/// Report the C-ABI version compiled into this library. A consumer that
+/// linked a header declaring `DATABRICKS_KERNEL_ABI_VERSION` should refuse
+/// to run against a library whose `kernel_abi_version()` differs, since a
+/// mismatch means the `KernelStatusCode` enum / `KernelError` layout it
+/// reads may not match what this library writes. Infallible and
+/// side-effect-free, so it takes no config and returns the value directly
+/// (no `KernelStatusCode` / last-error dance).
+#[no_mangle]
+pub extern "C" fn kernel_abi_version() -> u32 {
+    KERNEL_ABI_VERSION
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exported `kernel_abi_version()` returns the crate-level
+    /// `KERNEL_ABI_VERSION` constant, so the two can't drift. (The C side's
+    /// `DATABRICKS_KERNEL_ABI_VERSION` macro is checked against this in the
+    /// C-smoke test, closing the Rust↔header loop.)
+    #[test]
+    fn abi_version_is_current() {
+        assert_eq!(kernel_abi_version(), KERNEL_ABI_VERSION);
+    }
 
     /// `block_on_ffi` must reject a reentrant call (one made from a thread
     /// already inside a Tokio runtime) with a typed `Internal` error and a

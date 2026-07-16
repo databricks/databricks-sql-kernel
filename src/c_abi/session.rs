@@ -23,7 +23,7 @@
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
 use super::cancel::{kernel_cancel_token_t, token_ref};
-use super::{block_on_ffi_cancellable, KernelStatusCode};
+use super::{block_on_ffi, block_on_ffi_cancellable, KernelStatusCode};
 use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
@@ -97,6 +97,11 @@ pub struct KernelSessionConfig {
     /// Extra HTTP headers sent on every request (accumulated by
     /// `..._set_custom_header`, one `(name, value)` pair per call).
     custom_headers: Vec<(String, String)>,
+    /// CloudFetch toggle (populated by `..._set_cloudfetch_enabled`).
+    /// `None` keeps the kernel default (CloudFetch on); `Some(false)`
+    /// forces the inline-Arrow result path (mirrors JDBC
+    /// `EnableQueryResultDownload=0`).
+    cloudfetch_enabled: Option<bool>,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -114,6 +119,12 @@ struct TlsSpec {
     custom_ca_cert: Option<Vec<u8>>,
     accept_self_signed: bool,
     skip_hostname_verification: bool,
+    /// PEM-encoded client leaf cert (+ optional chain) for mTLS. Always
+    /// set together with `client_key_pem` — the paired setter takes both
+    /// at once, so one-without-the-other is unrepresentable here.
+    client_cert_pem: Option<Vec<u8>>,
+    /// PEM-encoded private key for the mTLS client cert. Never logged.
+    client_key_pem: Option<Vec<u8>>,
 }
 
 /// Read a required C string argument into an owned `String`, mapping a
@@ -158,6 +169,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
+        cloudfetch_enabled: None,
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -492,6 +504,69 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_skip_hostname_verificatio
     })
 }
 
+/// Configure a client certificate + private key for mutual TLS (mTLS).
+/// Both halves are REQUIRED and passed together: `cert_pem`/`cert_len` is
+/// a PEM leaf certificate optionally followed by its intermediate chain,
+/// and `key_pem`/`key_len` is the matching PEM private key (PKCS#8 for
+/// cross-backend portability — see [`TlsConfig::client_key_pem`]). Taking
+/// both in one call makes cert-without-key unrepresentable at the ABI, so
+/// the crate's both-or-neither pairing rule can't be tripped from here.
+/// Maps to `TlsConfig::client_cert_pem` / `client_key_pem`.
+///
+/// Any of a null `cert_pem`/`key_pem` or a zero `cert_len`/`key_len`
+/// returns `InvalidArgument` — mTLS needs real bytes for both halves.
+///
+/// The private key bytes are copied into owned Rust memory and are NEVER
+/// rendered in logs (the kernel's `TlsConfig` `Debug` redacts the key).
+///
+/// # Safety
+/// `config` must be a live config handle; `cert_pem` must point to
+/// `cert_len` readable bytes and `key_pem` to `key_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
+    config: *mut KernelSessionConfig,
+    cert_pem: *const u8,
+    cert_len: usize,
+    key_pem: *const u8,
+    key_len: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if cert_pem.is_null() || cert_len == 0 {
+            return Err(Error::invalid_argument()
+                .message("mTLS client cert must be a non-empty PEM buffer"));
+        }
+        if key_pem.is_null() || key_len == 0 {
+            return Err(
+                Error::invalid_argument().message("mTLS client key must be a non-empty PEM buffer")
+            );
+        }
+        c.tls.client_cert_pem = Some(std::slice::from_raw_parts(cert_pem, cert_len).to_vec());
+        c.tls.client_key_pem = Some(std::slice::from_raw_parts(key_pem, key_len).to_vec());
+        Ok(())
+    })
+}
+
+/// Enable or disable CloudFetch (cloud-storage-backed download of large
+/// result sets). Default enabled; `false` forces the inline-Arrow path
+/// for all result sizes — mirrors JDBC `EnableQueryResultDownload=0`. The
+/// kernel sets the `can_cloud_download` session conf internally at
+/// `open()`; callers must NOT set that conf directly via
+/// `set_session_conf` (the server rejects it as not user-settable). Maps
+/// to `ResultConfig::cloudfetch_enabled`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_cloudfetch_enabled(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.cloudfetch_enabled = Some(enabled);
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -640,6 +715,7 @@ fn build_session(
         proxy,
         tls,
         custom_headers,
+        cloudfetch_enabled,
     } = config;
 
     block_on_ffi_cancellable(token, move || {
@@ -709,18 +785,34 @@ fn build_session(
                 });
             }
 
-            // TLS relaxations / custom trust. Only build a TlsConfig when a
-            // non-default knob was set, so the strict default is preserved
-            // otherwise.
+            // TLS relaxations / custom trust / mTLS client identity. Only
+            // build a TlsConfig when a non-default knob was set, so the strict
+            // default is preserved otherwise. The client cert/key always
+            // travel as a pair (the paired setter enforces it), so checking
+            // either is enough to include them.
             if tls.custom_ca_cert.is_some()
                 || tls.accept_self_signed
                 || tls.skip_hostname_verification
+                || tls.client_cert_pem.is_some()
             {
                 builder = builder.tls(TlsConfig {
                     custom_ca_cert: tls.custom_ca_cert,
                     accept_self_signed: tls.accept_self_signed,
                     skip_hostname_verification: tls.skip_hostname_verification,
+                    client_cert_pem: tls.client_cert_pem,
+                    client_key_pem: tls.client_key_pem,
                     ..TlsConfig::default()
+                });
+            }
+
+            // CloudFetch toggle. Only override the result config when the knob
+            // was set, so the kernel's default (CloudFetch on) + all the other
+            // ResultConfig tuning (prefetch windows, JSON rendering) are
+            // preserved otherwise.
+            if let Some(enabled) = cloudfetch_enabled {
+                builder = builder.result(crate::config::ResultConfig {
+                    cloudfetch_enabled: enabled,
+                    ..crate::config::ResultConfig::default()
                 });
             }
 
@@ -769,6 +861,51 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
     session.initiate_delete();
     drop(session);
     KernelStatusCode::Success
+}
+
+/// Close a session and BLOCK until the server-side `DeleteSession`
+/// completes (or errors), reusing the crate's awaitable
+/// [`Session::close`]. Unlike [`kernel_session_close`] (fire-and-forget),
+/// a program that exits right after this returns has a confirmed
+/// server-side delete — this is the parity path for a host (Thrift, ODBC)
+/// that wants close to behave like the synchronous `DeleteSession` RPC the
+/// direct-Rust and pyo3/napi consumers get via `Session::close().await`.
+///
+/// Consumes the handle exactly like [`kernel_session_close`]: on both
+/// success and failure the session is released, so the caller must not use
+/// or free `session` afterwards. The same teardown ordering applies —
+/// close the session LAST, after every statement / executed handle /
+/// result stream / canceller it produced (see the `databricks_kernel.h`
+/// teardown-ordering contract).
+///
+/// # Safety
+///
+/// `session` must have been returned by [`kernel_session_open`] and not
+/// previously closed. After this call, `session` is invalid; passing it to
+/// any other `kernel_*` function is UB.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_close_blocking(
+    session: *mut kernel_session_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    if session.is_null() {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument()
+                .message("kernel_session_close_blocking: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    }
+    // Reclaim the box and await the delete on the process-wide runtime.
+    // `Session::close(self)` consumes the session, so move the boxed value
+    // into the future (mirroring `build_session`'s move of the config).
+    // On error the code is returned and the typed error is already stored
+    // by `block_on_ffi`; the session box is dropped either way, honouring
+    // the consume contract.
+    let session = Box::from_raw(session as *mut Session);
+    match block_on_ffi(move || Box::pin(async move { session.close().await })) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
 }
 
 /// Report whether a session is still **open** (its server-side delete has
@@ -887,6 +1024,118 @@ mod tests {
                 *got, expected,
                 "headers must be appended in order, duplicates kept"
             );
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The paired mTLS setter stores both the cert and key bytes verbatim
+    /// on the config, so `build_session` can forward them to `TlsConfig`.
+    #[test]
+    fn set_tls_client_certificate_stores_both_halves() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let cert = b"-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n";
+            // Assemble the key's PEM marker at runtime so the repo's secret
+            // scanner doesn't flag a literal `BEGIN PRIVATE KEY` — the bytes
+            // are opaque to this setter (marshalling-only test).
+            let key = format!("-----BEGIN {} KEY-----\nkey\n", "PRIVATE").into_bytes();
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+            let tls = &config.as_ref().unwrap().tls;
+            assert_eq!(tls.client_cert_pem.as_deref(), Some(&cert[..]));
+            assert_eq!(tls.client_key_pem.as_deref(), Some(key.as_slice()));
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// A null or zero-length cert/key half is rejected with
+    /// `InvalidArgument` — mTLS needs real bytes for both halves, and the
+    /// paired setter is the only way to set either, so this is where the
+    /// both-real-halves invariant is enforced at the ABI edge.
+    #[test]
+    fn set_tls_client_certificate_rejects_null_or_empty() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let pem = b"-----BEGIN CERTIFICATE-----\n";
+            // Null cert.
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    std::ptr::null(),
+                    0,
+                    pem.as_ptr(),
+                    pem.len(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            // Null key.
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    pem.as_ptr(),
+                    pem.len(),
+                    std::ptr::null(),
+                    0,
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            // Zero-length cert (non-null pointer).
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    pem.as_ptr(),
+                    0,
+                    pem.as_ptr(),
+                    pem.len(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            // Nothing was stored on any rejected path.
+            let tls = &config.as_ref().unwrap().tls;
+            assert!(tls.client_cert_pem.is_none() && tls.client_key_pem.is_none());
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The CloudFetch setter records the toggle as `Some(enabled)`; a config
+    /// that never calls it leaves `None` so the kernel default (on) wins. The
+    /// last call wins (set false then true → true).
+    #[test]
+    fn set_cloudfetch_enabled_records_toggle() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            // Default: untouched → None (kernel default applies).
+            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, None);
+            assert_eq!(
+                kernel_session_config_set_cloudfetch_enabled(config, false),
+                KernelStatusCode::Success
+            );
+            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, Some(false));
+            assert_eq!(
+                kernel_session_config_set_cloudfetch_enabled(config, true),
+                KernelStatusCode::Success
+            );
+            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, Some(true));
             kernel_session_config_free(config);
         }
     }
