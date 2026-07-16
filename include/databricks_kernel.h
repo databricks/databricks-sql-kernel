@@ -213,6 +213,15 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  * cancels the LATER query. Use one per execute (new before execute, free after
  * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
+/* Cooperative cancel token for the blocking `*_cancellable` entry points
+ * (kernel_session_open_cancellable, kernel_result_stream_next_batch_cancellable).
+ * Create one before a blocking call, pass it in, and fire it from ANOTHER
+ * thread (kernel_cancel_token_cancel) when the caller's deadline elapses; the
+ * blocked call then drops its in-flight request future and returns
+ * KernelStatusCode_Cancelled. One-shot (a fired token stays fired) — create a
+ * fresh token per logical operation. Firing is purely local (no RPC), so it
+ * never blocks. See "Cooperative cancellation" below. */
+typedef struct kernel_cancel_token_t kernel_cancel_token_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -312,6 +321,21 @@ KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(Kernel
  */
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
+
+/*
+ * Like kernel_session_open, but races the (blocking) connect against
+ * `cancel_token` so a host can bound a slow warehouse cold-start or a
+ * connect-time network partition by its own deadline. A NULL `cancel_token`
+ * behaves EXACTLY like kernel_session_open. If the token fires (or is already
+ * fired) before connect completes, the connect future is dropped — aborting
+ * the in-flight request — and this returns KernelStatusCode_Cancelled; `config`
+ * is CONSUMED on every path regardless. `cancel_token` is borrowed, not
+ * consumed: the caller still owns and must free it after this returns, and may
+ * fire it from another thread while this call is in flight.
+ */
+KernelStatusCode kernel_session_open_cancellable(KernelSessionConfig* config,
+                                                 kernel_session_t** out,
+                                                 const kernel_cancel_token_t* cancel_token);
 
 /* Report whether a session is still OPEN (its delete has not been
  * initiated). Writes true/false to `*out`. LOCAL check only — no server
@@ -476,6 +500,32 @@ KernelStatusCode kernel_statement_canceller_cancel(
 KernelStatusCode kernel_statement_canceller_free(
     kernel_statement_canceller_t* canceller);
 
+/* ─── Cooperative cancellation (blocking-call cancel token) ────────────
+ *
+ * The statement canceller above cancels a server-side STATEMENT (right for a
+ * query still executing). A cancel token cancels a blocking C-ABI CALL itself —
+ * connect or a stalled result-stream fetch — neither of which the statement
+ * canceller reaches (the server statement is already done; the stall is
+ * client-side). It is the generic mechanism a host uses to honour a caller
+ * deadline / context on the `*_cancellable` entry points.
+ *
+ * Usage: create a token, spawn a watcher on the caller's deadline/context, make
+ * the blocking `*_cancellable` call on the owning thread, and from the watcher
+ * fire kernel_cancel_token_cancel when the deadline elapses. The blocked call
+ * drops its in-flight request future and returns KernelStatusCode_Cancelled.
+ * Firing is purely local (flip an atomic, wake the waiter) — no RPC, never
+ * blocks. The token is ONE-SHOT (a fired token stays fired), so create a fresh
+ * one per logical operation. Safe to fire from a different thread than the
+ * blocking call (that is the intended use); do NOT free the token until both
+ * the blocking call and any in-flight cancel have returned.
+ */
+KernelStatusCode kernel_cancel_token_new(kernel_cancel_token_t** out);
+KernelStatusCode kernel_cancel_token_cancel(kernel_cancel_token_t* token);
+/* Report whether the token has been fired (writes true/false to *out). Local
+ * atomic read — no RPC, never blocks. Symmetric with kernel_session_is_open. */
+KernelStatusCode kernel_cancel_token_is_cancelled(const kernel_cancel_token_t* token, bool* out);
+KernelStatusCode kernel_cancel_token_free(kernel_cancel_token_t* token);
+
 /* ─── Executed statement (sync) ───────────────────────────────────────*/
 
 /*
@@ -523,6 +573,21 @@ KernelStatusCode kernel_result_stream_get_schema(kernel_result_stream_t* stream,
 KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
+/*
+ * Like kernel_result_stream_next_batch, but races the (blocking) fetch against
+ * `cancel_token` so a host can interrupt a HUNG CloudFetch chunk (a wedged S3 /
+ * pre-signed-URL GET) instead of blocking on it forever. A NULL `cancel_token`
+ * behaves EXACTLY like kernel_result_stream_next_batch. If the token fires
+ * before the batch is ready, the fetch future is dropped (aborting the in-flight
+ * download) and this returns KernelStatusCode_Cancelled; the stream handle stays
+ * valid and owned by the caller (close it with kernel_result_stream_close as
+ * usual — a cancelled fetch neither consumes nor frees it). `cancel_token` is
+ * borrowed and safe to fire from another thread while this call is in flight
+ * (see kernel_session_open_cancellable).
+ */
+KernelStatusCode kernel_result_stream_next_batch_cancellable(
+    kernel_result_stream_t* stream, struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema, const kernel_cancel_token_t* cancel_token);
 KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
 
 /* ─── Metadata ────────────────────────────────────────────────────────

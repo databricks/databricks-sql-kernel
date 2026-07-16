@@ -45,6 +45,7 @@
 // module-wide allow that masked them in the skeleton phase is gone now
 // that bodies have landed.
 
+pub mod cancel;
 pub mod error;
 pub mod metadata;
 pub mod result;
@@ -150,6 +151,101 @@ where
     match result {
         Ok(Ok(value)) => Ok(value),
         Ok(Err(e)) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            Err(code)
+        }
+        Err(panic) => Err(handle_panic(panic)),
+    }
+}
+
+/// Like [`block_on_ffi`], but races the future against a cooperative
+/// [`CancellationToken`] so a host watcher thread can interrupt an otherwise
+/// uninterruptible blocking C-ABI call (connect, or a hung result-stream
+/// fetch).
+///
+/// When `token` fires before the future completes, this **drops the future**
+/// and returns [`KernelStatusCode::Cancelled`] with a typed `Cancelled` error
+/// in the thread-local buffer. Dropping the future is what makes the cancel
+/// *real* rather than a bare stop-waiting: the kernel's HTTP client is
+/// `reqwest`, whose in-flight request futures abort when dropped (the crate's
+/// documented cancellation model — see the CloudFetch streaming provider's own
+/// token use), so the underlying socket work is torn down, not leaked.
+///
+/// A **null** token means "no cancellation" and this behaves exactly like
+/// [`block_on_ffi`] — so a single implementation body can back both the plain
+/// and the `*_cancellable` entry points. An **already-fired** token short-
+/// circuits to `Cancelled` without starting the future (matching a caller whose
+/// deadline had already elapsed at the call site).
+///
+/// The same threading contract as [`block_on_ffi`] applies (must be driven
+/// from a non-runtime thread); reentrancy is rejected identically.
+///
+/// [`CancellationToken`]: tokio_util::sync::CancellationToken
+pub(crate) fn block_on_ffi_cancellable<F, Fut, T>(
+    token: Option<&tokio_util::sync::CancellationToken>,
+    fut_builder: F,
+) -> Result<T, KernelStatusCode>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
+{
+    // No token → identical to the plain path (one body, two entry shapes).
+    let Some(token) = token else {
+        return block_on_ffi(fut_builder);
+    };
+
+    error::clear_error();
+    // Reject reentrancy explicitly (same reasoning as block_on_ffi): block_on
+    // from within any Tokio runtime would panic.
+    if tokio::runtime::Handle::try_current().is_ok() {
+        let e = crate::kernel_error::Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel C ABI called from within a Tokio runtime thread; entry points must be \
+             invoked from a native (non-async-runtime) thread",
+        );
+        let code = KernelStatusCode::from(e.code);
+        error::store_error(e);
+        return Err(code);
+    }
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            return Err(code);
+        }
+    };
+
+    // Race the work against the token. `select!` drops the losing branch's
+    // future, so a cancel here drops the in-flight request future. Wrapped in
+    // catch_unwind on the same AssertUnwindSafe basis as block_on_ffi so a
+    // panic inside the future can't unwind across `extern "C"`.
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rt.block_on(async {
+            tokio::select! {
+                // Bias toward the cancel branch so an already-fired token is
+                // honoured deterministically before the work is polled — the
+                // "ctx already done at call time" case must not run the future.
+                biased;
+                _ = token.cancelled() => None,
+                out = fut_builder() => Some(out),
+            }
+        })
+    }));
+    match result {
+        Ok(Some(Ok(value))) => Ok(value),
+        Ok(Some(Err(e))) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            Err(code)
+        }
+        Ok(None) => {
+            // Cancelled: the future was dropped mid-flight. Surface a typed
+            // Cancelled error so the host sees the same shape as a server-side
+            // Cancelled, and can prefer its own deadline/context error.
+            let e = crate::kernel_error::Error::cancelled()
+                .message("kernel C-ABI call cancelled by the caller's cancel token");
             let code = KernelStatusCode::from(e.code);
             error::store_error(e);
             Err(code)

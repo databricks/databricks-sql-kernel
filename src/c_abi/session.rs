@@ -22,12 +22,14 @@
 //! Transaction methods (autocommit / commit / rollback) are deferred to
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
-use super::{block_on_ffi, KernelStatusCode};
+use super::cancel::{kernel_cancel_token_t, token_ref};
+use super::{block_on_ffi_cancellable, KernelStatusCode};
 use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
+use tokio_util::sync::CancellationToken;
 
 /// Opaque session handle. Boxed [`Session`] on the Rust side.
 #[repr(C)]
@@ -534,6 +536,48 @@ pub unsafe extern "C" fn kernel_session_open(
     config: *mut KernelSessionConfig,
     out: *mut *mut kernel_session_t,
 ) -> KernelStatusCode {
+    session_open_inner(config, out, None)
+}
+
+/// Open a session, racing the (blocking) connect against `cancel_token` so a
+/// host can bound a slow warehouse cold-start / connect-time network partition
+/// by its own deadline. A **null** `cancel_token` behaves exactly like
+/// [`kernel_session_open`]. If the token fires (or is already fired) before
+/// connect completes, the connect future is dropped — aborting the in-flight
+/// request — and this returns [`KernelStatusCode::Cancelled`]; the config is
+/// still consumed either way.
+///
+/// The `cancel_token` is borrowed, not consumed: the caller still owns it and
+/// must [`kernel_cancel_token_free`](crate::c_abi::cancel::kernel_cancel_token_free)
+/// it after this returns. It is safe to fire the token from another thread
+/// while this call is in flight (that is the intended use).
+///
+/// # Safety
+/// `config` and `out` carry the same contract as [`kernel_session_open`].
+/// `cancel_token`, if non-null, must be a live handle from
+/// [`kernel_cancel_token_new`](crate::c_abi::cancel::kernel_cancel_token_new)
+/// that is not freed until this call returns.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_open_cancellable(
+    config: *mut KernelSessionConfig,
+    out: *mut *mut kernel_session_t,
+    cancel_token: *const kernel_cancel_token_t,
+) -> KernelStatusCode {
+    session_open_inner(config, out, token_ref(cancel_token))
+}
+
+/// Shared body for [`kernel_session_open`] and
+/// [`kernel_session_open_cancellable`]. Owns the "config is consumed on every
+/// path" contract in one place; `token` (None for the plain entry point) is
+/// threaded into `build_session`'s `block_on`.
+///
+/// # Safety
+/// See [`kernel_session_open`]. `token` must outlive the call when `Some`.
+unsafe fn session_open_inner(
+    config: *mut KernelSessionConfig,
+    out: *mut *mut kernel_session_t,
+    token: Option<&CancellationToken>,
+) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
     // The contract is "config is consumed on every path". Reclaim the box
     // up front (when non-null) so it is dropped even on the argument-guard
@@ -554,7 +598,7 @@ pub unsafe extern "C" fn kernel_session_open(
     }
     let config = config.expect("config is Some (checked above)");
 
-    let session = match build_session(*config) {
+    let session = match build_session(*config, token) {
         Ok(s) => s,
         Err(code) => return code, // error already stored by build_session
     };
@@ -580,10 +624,15 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
 }
 
 /// Translate the C-side config into a [`Session`], driving the async
-/// `Session::open` on the process-wide runtime. Errors are stored in the
-/// thread-local buffer; the returned `KernelStatusCode` is the mapped
-/// code.
-fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCode> {
+/// `Session::open` on the process-wide runtime. When `token` is `Some`, the
+/// connect is raced against it so a fired token drops the connect future
+/// (aborting the in-flight request) and yields `Cancelled` — the connect-side
+/// deadline path. Errors are stored in the thread-local buffer; the returned
+/// `KernelStatusCode` is the mapped code.
+fn build_session(
+    config: KernelSessionConfig,
+    token: Option<&CancellationToken>,
+) -> Result<Session, KernelStatusCode> {
     let KernelSessionConfig {
         connection,
         auth,
@@ -593,7 +642,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
     } = config;
 
-    block_on_ffi(move || {
+    block_on_ffi_cancellable(token, move || {
         Box::pin(async move {
             let connection = connection.ok_or_else(|| {
                 Error::invalid_argument().message(

@@ -11,6 +11,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Cooperative cancel token for the blocking C-ABI entry points
+  (`kernel_cancel_token_new` / `_cancel` / `_is_cancelled` / `_free`), plus
+  cancellable variants `kernel_session_open_cancellable` and
+  `kernel_result_stream_next_batch_cancellable`. A host creates a token before a
+  blocking call, passes it in, and fires it from another thread when its
+  deadline elapses; the call drops its in-flight request future (a real
+  `reqwest` abort) and returns `Cancelled`. A null token is byte-for-byte the
+  plain path, so existing symbols and the default path are unchanged. Additive
+  only — ABI unchanged.
+
 ### Updated
 
 ### Fixed

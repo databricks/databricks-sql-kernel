@@ -38,6 +38,7 @@
 
 #![allow(non_camel_case_types)]
 
+use super::cancel::{kernel_cancel_token_t, token_ref};
 use super::error::{store_and_code, store_invalid_arg};
 use super::{catch_ffi, KernelStatusCode};
 use crate::kernel_error::{Error, ErrorCode};
@@ -46,6 +47,7 @@ use crate::statement::executed::ExecutedStatement;
 use crate::statement::validity::ValidityFlag;
 use arrow_array::ffi::{FFI_ArrowArray, FFI_ArrowSchema};
 use arrow_array::{Array, RecordBatch};
+use tokio_util::sync::CancellationToken;
 
 /// Opaque result-stream handle. Boxed [`ResultStreamInner`].
 #[repr(C)]
@@ -197,6 +199,49 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
     out_array: *mut FFI_ArrowArray,
     out_schema: *mut FFI_ArrowSchema,
 ) -> KernelStatusCode {
+    next_batch_inner(stream, out_array, out_schema, None)
+}
+
+/// Fetch the next batch, racing the (blocking) fetch against `cancel_token` so
+/// a host can interrupt a hung CloudFetch chunk (a wedged S3 / pre-signed-URL
+/// GET) instead of blocking on it forever. A **null** `cancel_token` behaves
+/// exactly like [`kernel_result_stream_next_batch`].
+///
+/// If the token fires before the batch is ready, the fetch future is dropped
+/// (aborting the in-flight download) and this returns
+/// [`KernelStatusCode::Cancelled`]. The stream handle stays valid and owned by
+/// the caller — close it with [`kernel_result_stream_close`] as usual; a
+/// cancelled fetch does not consume or free it.
+///
+/// # Safety
+/// `stream`, `out_array`, `out_schema` carry the same contract as
+/// [`kernel_result_stream_next_batch`]. `cancel_token`, if non-null, must be a
+/// live handle from
+/// [`kernel_cancel_token_new`](crate::c_abi::cancel::kernel_cancel_token_new)
+/// not freed until this call returns; it is safe to fire from another thread
+/// while this call is in flight.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_result_stream_next_batch_cancellable(
+    stream: *mut kernel_result_stream_t,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+    cancel_token: *const kernel_cancel_token_t,
+) -> KernelStatusCode {
+    next_batch_inner(stream, out_array, out_schema, token_ref(cancel_token))
+}
+
+/// Shared body for the two next-batch entry points. `token` (None for the plain
+/// one) is raced against the fetch via `block_on_ffi_cancellable`.
+///
+/// # Safety
+/// See [`kernel_result_stream_next_batch`]. `token` must outlive the call when
+/// `Some`.
+unsafe fn next_batch_inner(
+    stream: *mut kernel_result_stream_t,
+    out_array: *mut FFI_ArrowArray,
+    out_schema: *mut FFI_ArrowSchema,
+    token: Option<&CancellationToken>,
+) -> KernelStatusCode {
     catch_ffi(|| {
         let Some(inner) = (stream as *mut ResultStreamInner).as_mut() else {
             return store_invalid_arg("kernel_result_stream_next_batch: stream must not be null");
@@ -211,11 +256,12 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
         let next: Option<Result<RecordBatch, Error>> = match inner {
             // Owned (metadata): drive the owned ResultStream lazily on the
             // runtime, one batch at a time, so an unbounded result streams
-            // with bounded memory. Running through block_on_ffi keeps the
-            // (possibly CloudFetch-backed) reader on the tokio reactor
-            // rather than off a plain C thread.
+            // with bounded memory. Running through block_on_ffi_cancellable
+            // keeps the (possibly CloudFetch-backed) reader on the tokio
+            // reactor rather than off a plain C thread, and lets a fired token
+            // drop the fetch future.
             ResultStreamInner::Owned { stream, .. } => {
-                match super::block_on_ffi(move || {
+                match super::block_on_ffi_cancellable(token, move || {
                     let stream: &mut crate::result_stream::ResultStream = stream;
                     Box::pin(async move {
                         #[allow(
@@ -248,8 +294,9 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
                 // RecordBatch for FFI export. Explicit match on the
                 // #[non_exhaustive] ResultBatch so a future non-Arrow
                 // variant surfaces as a defined error, not a compile break
-                // with no fallback.
-                match super::block_on_ffi(move || {
+                // with no fallback. Cancellable so a hung CloudFetch chunk on
+                // the query path can be interrupted.
+                match super::block_on_ffi_cancellable(token, move || {
                     let exec: &mut ExecutedStatement = exec;
                     Box::pin(async move {
                         #[allow(

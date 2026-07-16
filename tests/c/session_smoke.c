@@ -242,6 +242,76 @@ static void test_executed_null_handle_rejected(void) {
   CHECK(n == -1, "num_modified_rows(NULL exec) → -1");
 }
 
+/* Cancel token: new → cancel → free round-trips; null guards on every entry
+ * point return InvalidArgument. (The mid-flight interrupt behaviour is proven
+ * by the wiremock integration test, which needs a mock server; this smoke only
+ * exercises the lifecycle from C.) */
+static void test_cancel_token_lifecycle(void) {
+  kernel_cancel_token_t* tok = NULL;
+  KernelStatusCode rc = kernel_cancel_token_new(&tok);
+  CHECK(rc == KernelStatusCode_Success, "cancel_token_new succeeds");
+  CHECK(tok != NULL, "cancel_token_new writes a non-null handle");
+
+  bool fired = true;
+  rc = kernel_cancel_token_is_cancelled(tok, &fired);
+  CHECK(rc == KernelStatusCode_Success, "cancel_token_is_cancelled succeeds");
+  CHECK(!fired, "a fresh token reports not-cancelled");
+
+  rc = kernel_cancel_token_cancel(tok);
+  CHECK(rc == KernelStatusCode_Success, "cancel_token_cancel succeeds");
+  rc = kernel_cancel_token_is_cancelled(tok, &fired);
+  CHECK(rc == KernelStatusCode_Success && fired, "is_cancelled reports true after a fire");
+  /* One-shot: a second fire is a no-op but still Success. */
+  rc = kernel_cancel_token_cancel(tok);
+  CHECK(rc == KernelStatusCode_Success, "cancel_token_cancel is idempotent");
+
+  rc = kernel_cancel_token_free(tok);
+  CHECK(rc == KernelStatusCode_Success, "cancel_token_free succeeds");
+
+  CHECK(kernel_cancel_token_new(NULL) == KernelStatusCode_InvalidArgument,
+        "cancel_token_new(NULL) → InvalidArgument");
+  CHECK(kernel_cancel_token_cancel(NULL) == KernelStatusCode_InvalidArgument,
+        "cancel_token_cancel(NULL) → InvalidArgument");
+  CHECK(kernel_cancel_token_is_cancelled(NULL, &fired) == KernelStatusCode_InvalidArgument,
+        "cancel_token_is_cancelled(NULL) → InvalidArgument");
+  CHECK(kernel_cancel_token_free(NULL) == KernelStatusCode_InvalidArgument,
+        "cancel_token_free(NULL) → InvalidArgument");
+}
+
+/* A pre-fired token short-circuits kernel_session_open_cancellable to Cancelled
+ * without touching the network, and consumes the config regardless. Hermetic
+ * (never dials out — the biased select honours the fired token first). */
+static void test_open_cancellable_prefired(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+  (void)kernel_session_config_set_warehouse(config, "https://192.0.2.1", "wh123");
+  (void)kernel_session_config_set_auth_pat(config, "dapi-not-a-real-token");
+
+  kernel_cancel_token_t* tok = NULL;
+  (void)kernel_cancel_token_new(&tok);
+  (void)kernel_cancel_token_cancel(tok); /* fire before the call */
+
+  kernel_session_t* session = NULL;
+  KernelStatusCode rc = kernel_session_open_cancellable(config, &session, tok);
+  CHECK(rc == KernelStatusCode_Cancelled,
+        "open_cancellable with a pre-fired token → Cancelled");
+  CHECK(session == NULL, "session stays null on a cancelled open");
+
+  /* A NULL token behaves like the plain open: same unreachable host, so it
+   * must fail with a NON-Cancelled transport error (proving NULL != cancel). */
+  KernelSessionConfig* config2 = NULL;
+  (void)kernel_session_config_new(&config2);
+  (void)kernel_session_config_set_warehouse(config2, "https://192.0.2.1", "wh123");
+  (void)kernel_session_config_set_auth_pat(config2, "dapi-not-a-real-token");
+  kernel_session_t* session2 = NULL;
+  rc = kernel_session_open_cancellable(config2, &session2, NULL);
+  CHECK(rc != KernelStatusCode_Success && rc != KernelStatusCode_Cancelled,
+        "open_cancellable(NULL token) behaves like plain open (transport error)");
+  CHECK(session2 == NULL, "session stays null on failed open");
+
+  kernel_cancel_token_free(tok);
+}
+
 int main(void) {
   test_config_lifecycle();
   test_null_guards();
@@ -256,6 +326,8 @@ int main(void) {
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
   test_executed_null_handle_rejected();
+  test_cancel_token_lifecycle();
+  test_open_cancellable_prefired();
 
   if (failures == 0) {
     fprintf(stderr, "\nAll C ABI smoke checks passed.\n");
