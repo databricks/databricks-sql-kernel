@@ -191,6 +191,23 @@ pub struct StatementSpec {
     /// kernel rejects at bind time before the wire.
     pub named_params: HashMap<String, TypedValue>,
 
+    /// Pre-marshalled SEA parameters (name/ordinal + Databricks type name +
+    /// stringified value). This is the shape a C-ABI host driver already
+    /// produces — e.g. the Go driver stringifies every value and carries the
+    /// SQL type name (`BIGINT`, `STRING`, `DECIMAL(..)`, `VOID` for NULL) — so
+    /// rather than round-trip through `TypedValue`, such a host pushes
+    /// `StatementParameter`s here directly. Mutually exclusive with
+    /// `positional_params` / `named_params` (mixing marker styles is rejected
+    /// the same way). Empty unless a host used the raw-bind path.
+    ///
+    /// `pub(crate)` deliberately: this holds the raw SEA wire struct
+    /// (`StatementParameter`, `#[derive(Serialize)]`, not `#[non_exhaustive]`),
+    /// so exposing it publicly would make evolving the wire type — trivially
+    /// non-breaking on the wire — a breaking change to the kernel crate. The
+    /// public surface is [`Self::param_raw`], which takes only strings; a
+    /// future alternate transport can then re-shape this field freely.
+    pub(crate) raw_params: Vec<crate::types::sea::StatementParameter>,
+
     /// Per-statement conf overlay. Maps to SEA `parameters` /
     /// Thrift `confOverlay`. Merged on top of the session-level
     /// `session_conf` at execute time; this map wins on key collisions.
@@ -213,9 +230,35 @@ impl StatementSpec {
         Self::default()
     }
 
-    /// Set the SQL text. Replaces any previously set SQL.
+    /// Set the SQL text. Replaces any previously set SQL and clears **every**
+    /// bound parameter — raw, positional-typed, and named-typed — so each
+    /// `sql()` begins a fresh set of *bound parameters*.
+    ///
+    /// Scope note: this clears the three parameter collections only. It does
+    /// **not** reset `statement_conf` (e.g. query tags) or `row_limit`, which
+    /// survive a `sql()` call and must be re-set explicitly if a reused handle
+    /// should not carry them into the next query.
+    ///
+    /// This is the single reset point for the *bound parameters* of a reused
+    /// statement handle. New SQL has its own parameter markers, so carrying
+    /// prior binds into it is never correct; clearing all three here matches the
+    /// prepared-statement mental model (new SQL → fresh binds) and keeps the
+    /// reset uniform across binding styles. Without it, a reused handle leaks
+    /// stale binds into the next query
+    /// in two ways: raw binds only `push` (no overwrite-by-ordinal), so they
+    /// would accumulate across executes; and typed positional binds overwrite by
+    /// ordinal (`param`) but a *shrinking* arity would keep the stale
+    /// high-ordinal slots, emitting more markers than the new SQL has. A host
+    /// that bound typed params for one query then raw-binds the next would also
+    /// trip the raw-vs-typed exclusion check on the leftover typed slots.
+    ///
+    /// The idiom is always `set_sql` → bind → execute per query, so binds are
+    /// re-supplied after each `sql()` and nothing depends on them surviving it.
     pub fn sql(&mut self, sql: impl Into<String>) -> &mut Self {
         self.sql = Some(sql.into());
+        self.raw_params.clear();
+        self.positional_params.clear();
+        self.named_params.clear();
         self
     }
 
@@ -262,6 +305,39 @@ impl StatementSpec {
         }
         self.named_params.insert(name, value);
         Ok(self)
+    }
+
+    /// Push a pre-marshalled SEA parameter (host-stringified value + Databricks
+    /// type name). `name` empty → positional (ordinal assigned at execute in
+    /// push order, 1-based); non-empty → named. `value` None → SQL NULL (the
+    /// host passes type "VOID"). This is the raw-bind path a C-ABI host uses; it
+    /// bypasses `TypedValue` inference because the host already knows the wire
+    /// type and string form.
+    ///
+    /// **Append-only, one-shot per query.** Each call *appends* a marker; unlike
+    /// the typed [`Self::param`] binder there is no overwrite-by-ordinal (a raw
+    /// positional carries no ordinal until execute assigns it in push order), so
+    /// re-binding to "correct" a value adds a second marker rather than
+    /// replacing the first. Bind each marker exactly once per query; the only
+    /// reset is [`Self::sql`]. This matches the intended consumer contract — a
+    /// C-ABI host (e.g. the Go driver) binds its arg set once per execute on a
+    /// fresh handle and never re-binds in place. Duplicate-name detection on the
+    /// named raw path is deferred to a later PR, in lockstep with the same
+    /// tightening on [`Self::param_named`], so the raw and typed-named paths stay
+    /// symmetric rather than raw being stricter.
+    pub fn param_raw(
+        &mut self,
+        name: Option<String>,
+        param_type: impl Into<String>,
+        value: Option<String>,
+    ) -> &mut Self {
+        self.raw_params.push(crate::types::sea::StatementParameter {
+            name,
+            ordinal: None, // assigned at build time for positional
+            param_type: param_type.into(),
+            value,
+        });
+        self
     }
 
     /// Set the per-statement conf overlay. Replaces any previously-set map.
@@ -519,6 +595,51 @@ mod tests {
         let err = s.param_named("", TypedValue::Null).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
         assert!(s.named_params.is_empty());
+    }
+
+    #[test]
+    fn sql_clears_all_params_so_reuse_does_not_accumulate() {
+        // A host reusing one statement (set_sql → bind → execute, repeat) must not
+        // carry stale params into the next query: sql() is the single reset point
+        // and clears EVERY binding style. After a second set_sql + bind, exactly
+        // the second query's params remain — for raw and typed alike.
+        let mut s = StatementSpec::new();
+        s.sql("SELECT ?");
+        s.param_raw(None, "BIGINT", Some("1".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
+
+        s.sql("SELECT ?"); // re-set for the next execute
+        assert!(s.raw_params.is_empty(), "sql() must clear prior raw params");
+        s.param_raw(None, "STRING", Some("hi".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
+        assert_eq!(s.raw_params[0].value.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn sql_clears_typed_params_so_reuse_does_not_accumulate() {
+        // The typed path is reset by sql() too: a shrinking-arity reuse must not
+        // keep stale high-ordinal slots, and a switch from typed to raw binds must
+        // not trip the raw-vs-typed exclusion on leftover typed params.
+        let mut s = StatementSpec::new();
+        s.sql("SELECT ?, ?");
+        s.param(1, TypedValue::Int64(1)).unwrap();
+        s.param(2, TypedValue::Int64(2)).unwrap();
+        s.param_named("k", TypedValue::Null).unwrap();
+        assert_eq!(s.positional_params.len(), 2);
+        assert_eq!(s.named_params.len(), 1);
+
+        s.sql("SELECT ?"); // narrower query on the reused handle
+        assert!(
+            s.positional_params.is_empty(),
+            "sql() must clear prior positional typed params"
+        );
+        assert!(
+            s.named_params.is_empty(),
+            "sql() must clear prior named typed params"
+        );
+        // The reused handle can now raw-bind without tripping raw-vs-typed exclusion.
+        s.param_raw(None, "BIGINT", Some("9".to_owned()));
+        assert_eq!(s.raw_params.len(), 1);
     }
 
     // ─── query_tags merge behaviour ─────────────────────────────────────

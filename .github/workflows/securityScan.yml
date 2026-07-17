@@ -293,69 +293,17 @@ jobs:
           echo "Full step summary: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
           exit 1
 
-      - name: Compose email body
-        # See "Collect findings" above for why this step intentionally
-        # omits `-e`.
-        if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
-        run: |
-          set -uo pipefail
-          {
-            echo "<!DOCTYPE html><html><head><title>Kernel Security Scan Results</title>"
-            echo "<style>"
-            echo "  body { font-family: -apple-system, sans-serif; }"
-            echo "  table { border-collapse: collapse; margin-top: 1em; }"
-            echo "  th, td { border: 1px solid #ddd; padding: 6px 12px; text-align: left; }"
-            echo "  th { background: #f5f5f5; }"
-            echo "  tr.high { background: #ffe5e5; }"
-            echo "  tr.medium { background: #fff5e5; }"
-            # Unscored findings are also gate-blocking under the
-            # fail-on-any policy (textual-severity advisories often
-            # describe HIGH-impact issues with no numeric CVSS).
-            # Style them the same as high so recipients don't misread
-            # the lack of a number as "low risk".
-            echo "  tr.unscored { background: #ffe5e5; }"
-            echo "</style></head><body>"
-            echo "<h1>Security Vulnerabilities Found</h1>"
-            echo "<p><b>${{ steps.findings.outputs.total_findings }}</b> unsuppressed finding(s) on main.</p>"
-            echo "<p>All findings fail the run; document accepted risk via osv-scanner.toml.</p>"
-            echo "<p>Full reports: <a href='https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}'>View Artifacts</a></p>"
-            echo "<table><tr><th>Severity</th><th>Package</th><th>IDs</th></tr>"
-            jq -r '.[] |
-              (if .display == "unscored" then "unscored"
-               elif .severity >= 7 then "high"
-               elif .severity >= 4 then "medium"
-               else "" end) as $cls |
-              "<tr class=\"\($cls)\"><td>\(.display)</td><td>\(.pkg)</td><td>\(.ids | join(", "))</td></tr>"
-            ' /tmp/all-findings.json
-            echo "</table>"
-            echo "</body></html>"
-          } > security-scan-report.html
-
-      # Email notification deferred — the SMTP credentials path
-      # (SMTP_USERNAME / SMTP_PASSWORD / EMAIL_RECIPIENTS) hasn't
-      # been provisioned. The HTML report is still produced and
-      # uploaded as a run artifact (see `Upload reports` below), so
-      # triagers can pull it after a scheduled-run failure without
-      # needing the email. Re-enable when SMTP creds are wired up.
-      #
-      # - name: Send Email
-      #   if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
-      #   uses: dawidd6/action-send-mail@4226df7daafa6fc901a43789c49bf7ab309066e7  # v3.11.0
-      #   with:
-      #     server_address: smtp.gmail.com
-      #     server_port: 465
-      #     username: ${{ secrets.SMTP_USERNAME }}
-      #     password: ${{ secrets.SMTP_PASSWORD }}
-      #     subject: Databricks SQL Kernel Security Scan - Vulnerabilities Found
-      #     html_body: file://security-scan-report.html
-      #     to: ${{ secrets.EMAIL_RECIPIENTS }}
-      #     from: Kernel Security Scanner
-      #     content_type: text/html
-
+      # Notification is intentionally NOT done here (no email, no HTML
+      # report). A separate cross-repo action collates the uploaded raw
+      # osv-out.json / all-findings.json artifacts across all driver repos
+      # and sends a single digest -- parity with the Go / Node / Python /
+      # JDBC gates. This job's job is to (a) fail so the scheduled run is
+      # red when anything is found, and (b) upload the machine-readable
+      # findings for the collator to consume.
       - name: Fail on findings (scheduled/manual)
         if: (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && steps.findings.outputs.total_findings != '0'
         run: |
-          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s) on main. Download the security-scan-reports artifact for the HTML report."
+          echo "::error::${{ steps.findings.outputs.total_findings }} unsuppressed OSV finding(s) on main. Download the security-scan-reports artifact for the raw findings."
           exit 1
 
       - name: Upload reports
@@ -365,8 +313,8 @@ jobs:
           name: security-scan-reports
           path: |
             /tmp/osv-out.json
+            /tmp/all-findings.json
             /tmp/sboms/
-            security-scan-report.html
           if-no-files-found: ignore
           # SBOMs/reports stick around long enough to triage a finding
           # without being part of the 90-day default retention.

@@ -43,7 +43,7 @@ use crate::statement::executed::ExecutedStatement;
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 
 /// Upper bound on a positional parameter ordinal accepted over the C ABI.
 ///
@@ -77,6 +77,15 @@ pub(crate) struct ExecutedHandle {
     pub(crate) exec: ExecutedStatement,
     pub(crate) alive: ValidityFlag,
     pub(crate) stream_taken: std::sync::atomic::AtomicBool,
+    /// The server statement id as a NUL-terminated C string, built once at
+    /// construction so `kernel_executed_statement_query_id` can hand back a
+    /// borrowed `*const c_char` valid for the handle's lifetime (no per-call
+    /// allocation, nothing for the caller to free). Any interior NUL is
+    /// stripped (replaced with `?`) via `to_cstring_lossy` — the same semantics
+    /// as the error-path `KernelError.query_id` — so the two query-id paths
+    /// agree. A statement id is a server-generated UUID, so this never occurs in
+    /// practice.
+    pub(crate) statement_id_c: CString,
 }
 
 // ─── Opaque handles ──────────────────────────────────────────────────────────
@@ -99,6 +108,22 @@ pub struct kernel_executed_statement_t {
 /// `kernel_statement_submit` (deferred in v0 — see module docs).
 #[repr(C)]
 pub struct kernel_executed_async_statement_t {
+    _private: [u8; 0],
+}
+
+/// Detached canceller for a sync-executing statement. Returned by
+/// `kernel_statement_canceller_new`. Holds only cloned Arcs, so it is safe to
+/// use concurrently with the blocking `kernel_statement_execute` on the
+/// originating statement.
+///
+/// Statement-scoped, not execution-scoped: it tracks whichever query is
+/// currently in flight on its originating statement. Re-executing the same
+/// statement retargets the canceller to the new query, so a canceller retained
+/// across a re-execute cancels the *later* query. Use one canceller per execute:
+/// obtain it before `kernel_statement_execute`, `kernel_statement_canceller_free`
+/// it after that execute returns, before re-executing.
+#[repr(C)]
+pub struct kernel_statement_canceller_t {
     _private: [u8; 0],
 }
 
@@ -137,7 +162,10 @@ unsafe fn statement_mut<'a>(stmt: *mut kernel_statement_t) -> Option<&'a mut Sta
 
 // ─── SQL + parameter binding ─────────────────────────────────────────────────
 
-/// Set the statement's SQL text, replacing any previously set SQL.
+/// Set the statement's SQL text, replacing any previously set SQL. Also clears
+/// every previously-bound parameter (raw and typed), so a reused statement
+/// handle begins each query with a fresh parameter set — see
+/// [`crate::statement::spec::StatementSpec::sql`].
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `sql` must be a
@@ -237,6 +265,77 @@ pub unsafe extern "C" fn kernel_statement_bind_string(
     })
 }
 
+/// Bind a pre-marshalled parameter: host-supplied Databricks type name +
+/// stringified value, positional or named. This is the binding path for a host
+/// driver that already stringifies values and knows the SQL type (e.g. the Go
+/// driver's `backend.Param{Name, Type, Value}`) — it avoids round-tripping
+/// through the kernel's `TypedValue` inference.
+///
+/// - `name`: NULL/empty → positional (ordinal assigned at execute in push
+///   order); non-empty → named (`:name` marker).
+/// - `sql_type`: Databricks type name (e.g. "BIGINT", "STRING", "DECIMAL(5,2)").
+///   For a NULL value the host passes "VOID" (matches the driver convention).
+/// - `value`: NULL → SQL NULL; otherwise the stringified value sent verbatim.
+///
+/// Positional and named raw params are mutually exclusive within one statement
+/// (enforced at execute), as are raw vs TypedValue params.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `sql_type` must be a NUL-terminated C
+/// string; `name`/`value` are NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_parameter(
+    stmt: *mut kernel_statement_t,
+    name: *const c_char,
+    sql_type: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if sql_type.is_null() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be null"));
+        }
+        let sql_type = CStr::from_ptr(sql_type)
+            .to_str()
+            .map_err(|_| {
+                Error::invalid_argument().message("parameter sql_type is not valid UTF-8")
+            })?
+            .to_owned();
+        // Reject an empty type here rather than letting it reach the wire as
+        // `"type":""` and surface as an opaque server BAD_REQUEST at execute —
+        // symmetric with the NULL guard above and with param_named rejecting an
+        // empty name (a bind-time typed error beats a wire-level rejection).
+        if sql_type.is_empty() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be empty"));
+        }
+        let name_opt = if name.is_null() {
+            None
+        } else {
+            let s = CStr::from_ptr(name).to_str().map_err(|_| {
+                Error::invalid_argument().message("parameter name is not valid UTF-8")
+            })?;
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_owned())
+            }
+        };
+        let value_opt = if value.is_null() {
+            None
+        } else {
+            Some(
+                CStr::from_ptr(value)
+                    .to_str()
+                    .map_err(|_| {
+                        Error::invalid_argument().message("parameter value is not valid UTF-8")
+                    })?
+                    .to_owned(),
+            )
+        };
+        stmt.spec().param_raw(name_opt, sql_type, value_opt);
+        Ok(())
+    })
+}
+
 /// Shared body for the scalar `bind_*` setters.
 ///
 /// # Safety
@@ -310,10 +409,20 @@ pub unsafe extern "C" fn kernel_statement_execute(
     });
     match executed {
         Ok(exec) => {
+            // Snapshot the server statement id as a C string now, while the exec
+            // handle is fresh, so the query-id accessor is a borrow with no
+            // allocation. `to_cstring_lossy` strips any interior NUL (→ `?`)
+            // rather than discarding the whole id — never happens for a
+            // server-generated UUID, but keeps this success-path id and the
+            // error-path `KernelError.query_id` on identical NUL semantics, and
+            // guarantees the accessor stays non-NULL for any live handle per its
+            // header contract.
+            let statement_id_c = crate::c_abi::error::to_cstring_lossy(exec.statement_id());
             let handle = ExecutedHandle {
                 exec,
                 alive: ValidityFlag::new(),
                 stream_taken: std::sync::atomic::AtomicBool::new(false),
+                statement_id_c,
             };
             std::ptr::write(
                 out,
@@ -346,6 +455,139 @@ pub unsafe extern "C" fn kernel_statement_close(stmt: *mut kernel_statement_t) -
     }
     drop(Box::from_raw(stmt as *mut Statement));
     KernelStatusCode::Success
+}
+
+// ─── Sync-execute cancellation (detached canceller) ──────────────────────────
+
+/// Owned box behind a `kernel_statement_canceller_t`; holds a detached
+/// [`StatementCanceller`].
+struct CancellerHandle {
+    canceller: crate::statement::mutable::StatementCanceller,
+}
+
+/// Create a detached canceller for `stmt`, obtained BEFORE
+/// `kernel_statement_execute` (which blocks the calling thread, so the
+/// statement cannot be cancelled through its own handle). From another thread,
+/// `kernel_statement_canceller_cancel` then cancels the in-flight execute. Free
+/// with `kernel_statement_canceller_free`.
+///
+/// The canceller holds its own reference to the session, so it keeps that
+/// session's client-side state alive until freed and must be freed regardless of
+/// whether the statement or session is closed. Its free is order-independent:
+/// `kernel_statement_canceller_free` drives no RPC (it only drops the box), so it
+/// may run before or after the statement/session close — the cloned session `Arc`
+/// keeps the client side alive for a cancel even after `kernel_session_close`
+/// (exercised by `canceller_outlives_statement_and_session_close`).
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `out` must be writable. `stmt` must
+/// not have an `kernel_statement_execute` in flight on another thread: this
+/// borrows the statement mutably, and execute holds its own mutable borrow for
+/// the duration of the query, so obtain the canceller before dispatching.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_new(
+    stmt: *mut kernel_statement_t,
+    out: *mut *mut kernel_statement_canceller_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_invalid_arg("kernel_statement_canceller_new: stmt must not be null");
+    };
+    if out.is_null() {
+        return store_invalid_arg("kernel_statement_canceller_new: out must not be null");
+    }
+    let handle = CancellerHandle {
+        canceller: stmt.canceller(),
+    };
+    std::ptr::write(
+        out,
+        Box::into_raw(Box::new(handle)) as *mut kernel_statement_canceller_t,
+    );
+    KernelStatusCode::Success
+}
+
+/// Fire a server-side cancel of the statement this canceller was created for.
+/// Idempotent and safe to call concurrently with `kernel_statement_execute` on
+/// the originating statement.
+///
+/// On `Success`, `*dispatched` reports whether a cancel RPC was POSTed:
+/// `true` if a server statement id had been observed and the RPC was sent for
+/// it, `false` if no id has been observed yet — nothing has executed, or the
+/// query is still in its initial round-trip before the server issued an id. Both
+/// cases return `Success`; the flag is how a host distinguishes a dispatched
+/// cancel from a no-op. `*dispatched` is set to `false` before the RPC and to
+/// the outcome on `Success`, so it is always defined once this returns; a null
+/// `dispatched` is ignored.
+///
+/// `dispatched == true` means only that a cancel was POSTed for the currently
+/// observed statement id — **not** that a running query was interrupted. The id
+/// slot retains the last observed id after a query finishes, so a cancel fired
+/// post-terminal (or, in the narrow re-execute handoff, against a superseded id)
+/// still POSTs and still reports `true`; the server treats a cancel of an
+/// already-finished statement as its own no-op.
+///
+/// # Safety
+/// `canceller` must be a live handle from `kernel_statement_canceller_new`.
+/// `dispatched`, if non-null, must be writable. The handle must not be freed by
+/// another thread while this call is in flight: it blocks on the cancel RPC,
+/// which on a retryable server error retries with backoff and can therefore run
+/// far longer than one round-trip — bounded by the SEA retry budget (the
+/// `overall_timeout` / `max_retries` defaults in `crate::client::retry`), which
+/// can reach minutes during a partial server outage. A host wiring this into a
+/// Ctrl-C / query-timeout handler should drive it from an abandonable/joinable
+/// thread rather than the app's main thread.
+/// Order any `kernel_statement_canceller_free` after this returns.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_cancel(
+    canceller: *mut kernel_statement_canceller_t,
+    dispatched: *mut bool,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        // Define the out-param before anything else, so a caller that reads it
+        // sees `false` (no cancel dispatched) on every path, including the
+        // null-handle and error returns below.
+        if !dispatched.is_null() {
+            std::ptr::write(dispatched, false);
+        }
+        let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
+            return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
+        };
+        // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
+        // session and id-slot handles rather than borrowing through this box.
+        let canceller = handle.canceller.clone();
+        match block_on_ffi(move || Box::pin(async move { canceller.cancel().await })) {
+            Ok(fired) => {
+                if !dispatched.is_null() {
+                    std::ptr::write(dispatched, fired);
+                }
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
+    })
+}
+
+/// Free a canceller handle. Does not touch the originating statement.
+///
+/// # Safety
+/// `canceller` must have been returned by `kernel_statement_canceller_new` and
+/// not previously freed. The canceller is single-owner: freeing it while another
+/// thread is inside `kernel_statement_canceller_cancel` on this handle is
+/// undefined behavior (use-after-free), not merely wasteful. That call blocks on
+/// the cancel RPC, which on a retryable server error retries with backoff and can
+/// stay in flight far longer than one round-trip, so join or otherwise quiesce
+/// any cancelling thread before freeing.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_canceller_free(
+    canceller: *mut kernel_statement_canceller_t,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if canceller.is_null() {
+            return store_invalid_arg("kernel_statement_canceller_free: handle must not be null");
+        }
+        drop(Box::from_raw(canceller as *mut CancellerHandle));
+        KernelStatusCode::Success
+    })
 }
 
 // ─── ExecutedStatement (sync) ────────────────────────────────────────────────
@@ -444,6 +686,43 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
     handle.exec.num_modified_rows().unwrap_or(-1)
 }
 
+/// The server statement (query) id of a successfully executed statement, as a
+/// NUL-terminated C string. This is the success-path counterpart to the query id
+/// on `KernelError` (which crosses only on failure): a host driver uses it for
+/// EXECUTE_STATEMENT telemetry and query-history correlation.
+///
+/// The returned pointer is **borrowed** from the executed handle and valid until
+/// the handle is closed (`kernel_executed_statement_close`); the caller must NOT
+/// free it and should copy it out if it needs to outlive the handle. Returns
+/// NULL on a null or invalidated handle (with a stored last error). A successful
+/// execute always has an id, so a live handle never returns NULL.
+///
+/// # Safety
+/// `exec` must be a live executed handle from [`kernel_statement_execute`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_statement_query_id(
+    exec: *const kernel_executed_statement_t,
+) -> *const c_char {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedHandle).as_ref() else {
+        crate::c_abi::error::store_invalid_arg(
+            "kernel_executed_statement_query_id: exec must not be null",
+        );
+        return std::ptr::null();
+    };
+    // Stale after a re-execute or close on the parent statement → NULL with a
+    // stored InvalidStatementHandle, matching num_modified_rows' staleness rule.
+    if !handle.exec.is_valid() {
+        crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::InvalidStatementHandle,
+            "executed statement was invalidated by a re-execute or close on its parent statement; \
+             read query_id before closing the statement",
+        ));
+        return std::ptr::null();
+    }
+    handle.statement_id_c.as_ptr()
+}
+
 /// Free a sync executed handle. Invalidates any result stream borrowed
 /// from it before dropping (so a stream outliving its handle fails
 /// cleanly rather than dereferencing freed memory).
@@ -512,4 +791,34 @@ unsafe fn with_statement(
             Err(e) => store_and_code(e),
         }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Null-pointer guards only: a bad handle yields InvalidArgument, never a
+    // crash. The success + concurrent-cancel-during-execute paths are covered by
+    // tests/v0_c_abi_canceller_wiremock.rs, which drives these entry points
+    // against a mock SEA server.
+    #[test]
+    fn canceller_null_guards_return_invalid_argument() {
+        let mut out: *mut kernel_statement_canceller_t = std::ptr::null_mut();
+        let rc = unsafe { kernel_statement_canceller_new(std::ptr::null_mut(), &mut out) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+
+        // A null dispatched out-param is tolerated; the null handle is what makes
+        // this InvalidArgument.
+        let mut dispatched = false;
+        let rc =
+            unsafe { kernel_statement_canceller_cancel(std::ptr::null_mut(), &mut dispatched) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+        let rc = unsafe {
+            kernel_statement_canceller_cancel(std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+
+        let rc = unsafe { kernel_statement_canceller_free(std::ptr::null_mut()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
 }

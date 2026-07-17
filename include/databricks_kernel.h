@@ -69,7 +69,14 @@
  *   BEFORE `kernel_session_close`. Driving such a handle afterwards issues
  *   RPCs against a session whose delete has already been initiated and
  *   will surface server errors. Order teardown: result streams → executed
- *   handles → statements → session.
+ *   handles → statements → session. (Statement cancellers are not in this
+ *   chain — freeing one drives no RPC; see the next bullet.)
+ * - **Free statement cancellers too.** A `kernel_statement_canceller_t`
+ *   holds its own session reference, so a leaked canceller pins the
+ *   client-side session (and its connection pool) past
+ *   `kernel_session_close`. Freeing one drives no RPC, so its order is
+ *   independent of the chain above: free it once its execute has returned,
+ *   regardless of statement/session close.
  */
 
 #ifndef DATABRICKS_KERNEL_H
@@ -197,6 +204,15 @@ typedef struct kernel_executed_statement_t kernel_executed_statement_t;
  * live instance yet. */
 typedef struct kernel_executed_async_statement_t kernel_executed_async_statement_t;
 typedef struct kernel_result_stream_t kernel_result_stream_t;
+/* Detached canceller for a sync-executing statement, returned by
+ * kernel_statement_canceller_new. The returned handle is safe to use from
+ * another thread concurrently with the blocking kernel_statement_execute on the
+ * originating statement (the _new call itself is NOT — see its doc).
+ * Statement-scoped, not execution-scoped: it tracks whichever query is currently
+ * in flight on its statement, so a canceller retained across a re-execute
+ * cancels the LATER query. Use one per execute (new before execute, free after
+ * it returns). */
+typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -311,9 +327,16 @@ KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
 
 /* ─── Statement ───────────────────────────────────────────────────────*/
 
+/* Set the statement's SQL text, replacing any previously set SQL. Also clears
+ * every previously-bound parameter (raw and the typed positional binders below),
+ * so a reused statement handle starts each query with a fresh parameter set. */
 KernelStatusCode kernel_statement_set_sql(kernel_statement_t* stmt, const char* sql);
 
-/* Positional parameter binding (1-based ordinal). */
+/* Typed positional parameter binding (1-based ordinal); the kernel infers the
+ * SEA wire type from the C type. These are the "typed params" the
+ * kernel_statement_bind_parameter contract refers to: within one statement they
+ * cannot be combined with kernel_statement_bind_parameter (raw binds) — pick one
+ * binding style. The conflict is reported at kernel_statement_execute, not here. */
 KernelStatusCode kernel_statement_bind_null(kernel_statement_t* stmt, size_t ordinal);
 KernelStatusCode kernel_statement_bind_int64(kernel_statement_t* stmt, size_t ordinal,
                                              int64_t value);
@@ -322,6 +345,32 @@ KernelStatusCode kernel_statement_bind_double(kernel_statement_t* stmt, size_t o
 KernelStatusCode kernel_statement_bind_bool(kernel_statement_t* stmt, size_t ordinal, bool value);
 KernelStatusCode kernel_statement_bind_string(kernel_statement_t* stmt, size_t ordinal,
                                               const char* value);
+
+/* Bind a pre-marshalled parameter: host-supplied Databricks type name +
+ * stringified value, positional or named. For a host that already stringifies
+ * values and knows the SQL type (e.g. the Go driver). name NULL/empty ->
+ * positional (ordinal assigned at execute in push order); non-empty -> named.
+ * value NULL -> SQL NULL (pass sql_type "VOID"); sql_type must be non-NULL and
+ * non-empty (an empty type is rejected here with InvalidArgument).
+ *
+ * Lifecycle: raw binds ACCUMULATE (each call appends a marker in push order);
+ * they carry no ordinal to overwrite by. kernel_statement_set_sql is the sole
+ * reset point — it clears ALL prior binds (raw AND the typed positional binders
+ * below) so each set_sql begins a fresh parameter set. kernel_statement_execute
+ * does NOT clear them, so a host reusing one statement handle across queries must
+ * call set_sql before re-binding, or the prior query's markers persist and the
+ * server sees the wrong parameter count.
+ *
+ * Two mutual-exclusion rules hold within one statement, both enforced at
+ * kernel_statement_execute (this call always returns Success on a valid
+ * arg — the conflict surfaces later as InvalidArgument from execute):
+ *   - positional and named raw params cannot be mixed;
+ *   - raw params cannot be mixed with the typed positional binders
+ *     (kernel_statement_bind_null/int64/double/bool/string above). */
+KernelStatusCode kernel_statement_bind_parameter(kernel_statement_t* stmt,
+                                                 const char* name,
+                                                 const char* sql_type,
+                                                 const char* value);
 
 /*
  * Wait-for-result execution. On success, `*out` holds an executed handle
@@ -357,6 +406,76 @@ KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
  */
 KernelStatusCode kernel_statement_close(kernel_statement_t* stmt);
 
+/* ─── Sync-execute cancellation (detached canceller) ──────────────────*/
+
+/*
+ * Create a detached canceller for `stmt`. Obtain it BEFORE
+ * `kernel_statement_execute`, which blocks the calling thread for the
+ * whole query — the statement cannot be cancelled through its own handle
+ * mid-execute (that would alias the mutable borrow).
+ *
+ * UNDEFINED BEHAVIOR: this call itself borrows `stmt` mutably. Calling it
+ * while a `kernel_statement_execute` on the same `stmt` is in flight on
+ * another thread aliases that execute's own mutable borrow — undefined
+ * behavior (memory corruption), not a returned error. Create the canceller on
+ * the same thread that owns `stmt`, before dispatching execute. The natural
+ * "spawn the blocking execute, then lazily create a canceller when the host
+ * decides to cancel" pattern is exactly this misuse — do not do it; create the
+ * canceller first, hand it to the cancelling thread, then dispatch execute.
+ * Only the RETURNED handle is concurrency-safe: it holds only cloned Arcs, so
+ * once you have it, cancelling from another thread while execute runs is fine.
+ *
+ * The canceller holds its own session reference, so it must be freed
+ * regardless of whether the statement or session is closed. On success `*out`
+ * holds a canceller released with `kernel_statement_canceller_free`.
+ */
+KernelStatusCode kernel_statement_canceller_new(
+    kernel_statement_t* stmt, kernel_statement_canceller_t** out);
+
+/*
+ * Cancel the originating statement, server-side. Statement-scoped: targets
+ * the server statement id currently observed for this statement. Idempotent
+ * and safe to call concurrently with `kernel_statement_execute`.
+ *
+ * On Success, `*dispatched` reports whether a cancel RPC was POSTed:
+ * true if a server statement id had been observed and the RPC was sent for it,
+ * false if no id has been observed yet — nothing has executed, or the query is
+ * still in its initial round-trip before the server issued an id. Both cases
+ * return Success; `*dispatched` is how a host tells a dispatched cancel from a
+ * no-op. `*dispatched` is written on every non-NULL path (false before the RPC,
+ * then the RPC outcome on Success), so it holds a defined value once this
+ * returns; a NULL `dispatched` is ignored.
+ *
+ * `dispatched == true` means only that a cancel was POSTed for the currently
+ * observed statement id — NOT that a running query was interrupted. The id slot
+ * retains the last observed id after a query finishes, so a cancel fired
+ * post-terminal (or, in the narrow re-execute handoff, against a superseded id)
+ * still POSTs and still reports true; the server treats a cancel of an
+ * already-finished statement as its own no-op.
+ *
+ * This call blocks on the cancel RPC, which on a retryable server error retries
+ * with backoff and can run far longer than one round-trip — bounded by the SEA
+ * retry budget (the overall_timeout / max_retries defaults in the kernel's retry
+ * config), which can reach minutes during a partial server outage. There is no
+ * cancel-of-cancel or timeout parameter, so a host wiring this into a Ctrl-C /
+ * query-timeout handler should call it from an abandonable/joinable thread rather
+ * than the app's main thread.
+ */
+KernelStatusCode kernel_statement_canceller_cancel(
+    kernel_statement_canceller_t* canceller, bool* dispatched);
+
+/*
+ * Free a canceller handle. Does not touch the originating statement. The
+ * canceller is single-owner: freeing it while another thread is inside
+ * kernel_statement_canceller_cancel on this handle is UNDEFINED BEHAVIOR
+ * (use-after-free), not merely wasteful. That call blocks on the cancel RPC,
+ * which on a retryable server error retries with backoff and can stay in flight
+ * far longer than one round-trip (see _cancel), so join or otherwise quiesce any
+ * cancelling thread BEFORE freeing.
+ */
+KernelStatusCode kernel_statement_canceller_free(
+    kernel_statement_canceller_t* canceller);
+
 /* ─── Executed statement (sync) ───────────────────────────────────────*/
 
 /*
@@ -379,6 +498,17 @@ KernelStatusCode kernel_executed_statement_get_result_stream(kernel_executed_sta
  * re-executed or closed (call `kernel_get_last_error` to distinguish).
  */
 int64_t kernel_executed_statement_num_modified_rows(const kernel_executed_statement_t* exec);
+
+/*
+ * Server statement (query) id of a successfully executed statement, as a
+ * NUL-terminated C string — the success-path counterpart to the query id on
+ * KernelError. Used by a host driver for EXECUTE_STATEMENT telemetry and
+ * query-history correlation. The pointer is BORROWED from the executed handle,
+ * valid until kernel_executed_statement_close; do NOT free it, and copy it out
+ * to outlive the handle. Returns NULL on a null / invalidated handle (with a
+ * stored last error); a live handle from a successful execute never returns NULL.
+ */
+const char* kernel_executed_statement_query_id(const kernel_executed_statement_t* exec);
 
 KernelStatusCode kernel_executed_statement_close(kernel_executed_statement_t* exec);
 
