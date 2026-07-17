@@ -81,7 +81,7 @@ jobs:
           cargo: "true"
 
       - name: Set up Rust toolchain
-        uses: actions-rust-lang/setup-rust-toolchain@9d7e65c320fdb52dcd45ffaa68deb6c02c8754d9 # v1.13.0
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.13.0
 
       # Sanity-check the tag-vs-Cargo.toml-version alignment so a typo
       # in the tag (`v0.1.0` vs Cargo.toml `0.1.1`) fails loudly here
