@@ -44,6 +44,17 @@ static int failures = 0;
     }                                                          \
   } while (0)
 
+/* The library's compiled-in ABI version must match the macro this header
+ * declares. This is the C half of the Rust↔header lockstep: the in-crate
+ * `abi_version_is_current` test pins kernel_abi_version() to the Rust
+ * KERNEL_ABI_VERSION constant, and this check pins it to the header's
+ * DATABRICKS_KERNEL_ABI_VERSION — together they catch header/library drift. */
+static void test_abi_version_matches_header(void) {
+  uint32_t lib = kernel_abi_version();
+  CHECK(lib == DATABRICKS_KERNEL_ABI_VERSION,
+        "kernel_abi_version() matches DATABRICKS_KERNEL_ABI_VERSION");
+}
+
 /* Config new → set warehouse + PAT → free, with no open. */
 static void test_config_lifecycle(void) {
   KernelSessionConfig* config = NULL;
@@ -333,6 +344,7 @@ static void test_open_cancellable_prefired(void) {
 }
 
 int main(void) {
+  test_abi_version_matches_header();
   test_config_lifecycle();
   test_null_guards();
   test_open_requires_connection_and_auth();
