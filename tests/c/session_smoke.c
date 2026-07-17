@@ -230,6 +230,16 @@ static void test_bind_null_handle_rejected(void) {
   CHECK(rc == KernelStatusCode_InvalidArgument, "bind_null(NULL stmt) → InvalidArgument");
   rc = kernel_statement_set_sql(NULL, "SELECT 1");
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_sql(NULL stmt) → InvalidArgument");
+  rc = kernel_statement_bind_parameter(NULL, NULL, "BIGINT", "7");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "bind_parameter(NULL stmt) → InvalidArgument");
+}
+
+/* Executed-handle accessors on a null handle → sentinel + stored error, no crash. */
+static void test_executed_null_handle_rejected(void) {
+  const char* qid = kernel_executed_statement_query_id(NULL);
+  CHECK(qid == NULL, "query_id(NULL exec) → NULL");
+  int64_t n = kernel_executed_statement_num_modified_rows(NULL);
+  CHECK(n == -1, "num_modified_rows(NULL exec) → -1");
 }
 
 int main(void) {
@@ -245,6 +255,7 @@ int main(void) {
   test_is_open_null_guards();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
+  test_executed_null_handle_rejected();
 
   if (failures == 0) {
     fprintf(stderr, "\nAll C ABI smoke checks passed.\n");

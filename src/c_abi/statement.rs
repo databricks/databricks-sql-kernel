@@ -43,7 +43,7 @@ use crate::statement::executed::ExecutedStatement;
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
-use std::ffi::{c_char, CStr};
+use std::ffi::{c_char, CStr, CString};
 
 /// Upper bound on a positional parameter ordinal accepted over the C ABI.
 ///
@@ -77,6 +77,15 @@ pub(crate) struct ExecutedHandle {
     pub(crate) exec: ExecutedStatement,
     pub(crate) alive: ValidityFlag,
     pub(crate) stream_taken: std::sync::atomic::AtomicBool,
+    /// The server statement id as a NUL-terminated C string, built once at
+    /// construction so `kernel_executed_statement_query_id` can hand back a
+    /// borrowed `*const c_char` valid for the handle's lifetime (no per-call
+    /// allocation, nothing for the caller to free). Any interior NUL is
+    /// stripped (replaced with `?`) via `to_cstring_lossy` — the same semantics
+    /// as the error-path `KernelError.query_id` — so the two query-id paths
+    /// agree. A statement id is a server-generated UUID, so this never occurs in
+    /// practice.
+    pub(crate) statement_id_c: CString,
 }
 
 // ─── Opaque handles ──────────────────────────────────────────────────────────
@@ -153,7 +162,10 @@ unsafe fn statement_mut<'a>(stmt: *mut kernel_statement_t) -> Option<&'a mut Sta
 
 // ─── SQL + parameter binding ─────────────────────────────────────────────────
 
-/// Set the statement's SQL text, replacing any previously set SQL.
+/// Set the statement's SQL text, replacing any previously set SQL. Also clears
+/// every previously-bound parameter (raw and typed), so a reused statement
+/// handle begins each query with a fresh parameter set — see
+/// [`crate::statement::spec::StatementSpec::sql`].
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `sql` must be a
@@ -253,6 +265,77 @@ pub unsafe extern "C" fn kernel_statement_bind_string(
     })
 }
 
+/// Bind a pre-marshalled parameter: host-supplied Databricks type name +
+/// stringified value, positional or named. This is the binding path for a host
+/// driver that already stringifies values and knows the SQL type (e.g. the Go
+/// driver's `backend.Param{Name, Type, Value}`) — it avoids round-tripping
+/// through the kernel's `TypedValue` inference.
+///
+/// - `name`: NULL/empty → positional (ordinal assigned at execute in push
+///   order); non-empty → named (`:name` marker).
+/// - `sql_type`: Databricks type name (e.g. "BIGINT", "STRING", "DECIMAL(5,2)").
+///   For a NULL value the host passes "VOID" (matches the driver convention).
+/// - `value`: NULL → SQL NULL; otherwise the stringified value sent verbatim.
+///
+/// Positional and named raw params are mutually exclusive within one statement
+/// (enforced at execute), as are raw vs TypedValue params.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `sql_type` must be a NUL-terminated C
+/// string; `name`/`value` are NUL-terminated C strings or NULL.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_bind_parameter(
+    stmt: *mut kernel_statement_t,
+    name: *const c_char,
+    sql_type: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if sql_type.is_null() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be null"));
+        }
+        let sql_type = CStr::from_ptr(sql_type)
+            .to_str()
+            .map_err(|_| {
+                Error::invalid_argument().message("parameter sql_type is not valid UTF-8")
+            })?
+            .to_owned();
+        // Reject an empty type here rather than letting it reach the wire as
+        // `"type":""` and surface as an opaque server BAD_REQUEST at execute —
+        // symmetric with the NULL guard above and with param_named rejecting an
+        // empty name (a bind-time typed error beats a wire-level rejection).
+        if sql_type.is_empty() {
+            return Err(Error::invalid_argument().message("parameter sql_type must not be empty"));
+        }
+        let name_opt = if name.is_null() {
+            None
+        } else {
+            let s = CStr::from_ptr(name).to_str().map_err(|_| {
+                Error::invalid_argument().message("parameter name is not valid UTF-8")
+            })?;
+            if s.is_empty() {
+                None
+            } else {
+                Some(s.to_owned())
+            }
+        };
+        let value_opt = if value.is_null() {
+            None
+        } else {
+            Some(
+                CStr::from_ptr(value)
+                    .to_str()
+                    .map_err(|_| {
+                        Error::invalid_argument().message("parameter value is not valid UTF-8")
+                    })?
+                    .to_owned(),
+            )
+        };
+        stmt.spec().param_raw(name_opt, sql_type, value_opt);
+        Ok(())
+    })
+}
+
 /// Shared body for the scalar `bind_*` setters.
 ///
 /// # Safety
@@ -326,10 +409,20 @@ pub unsafe extern "C" fn kernel_statement_execute(
     });
     match executed {
         Ok(exec) => {
+            // Snapshot the server statement id as a C string now, while the exec
+            // handle is fresh, so the query-id accessor is a borrow with no
+            // allocation. `to_cstring_lossy` strips any interior NUL (→ `?`)
+            // rather than discarding the whole id — never happens for a
+            // server-generated UUID, but keeps this success-path id and the
+            // error-path `KernelError.query_id` on identical NUL semantics, and
+            // guarantees the accessor stays non-NULL for any live handle per its
+            // header contract.
+            let statement_id_c = crate::c_abi::error::to_cstring_lossy(exec.statement_id());
             let handle = ExecutedHandle {
                 exec,
                 alive: ValidityFlag::new(),
                 stream_taken: std::sync::atomic::AtomicBool::new(false),
+                statement_id_c,
             };
             std::ptr::write(
                 out,
@@ -591,6 +684,43 @@ pub unsafe extern "C" fn kernel_executed_statement_num_modified_rows(
         return -1;
     }
     handle.exec.num_modified_rows().unwrap_or(-1)
+}
+
+/// The server statement (query) id of a successfully executed statement, as a
+/// NUL-terminated C string. This is the success-path counterpart to the query id
+/// on `KernelError` (which crosses only on failure): a host driver uses it for
+/// EXECUTE_STATEMENT telemetry and query-history correlation.
+///
+/// The returned pointer is **borrowed** from the executed handle and valid until
+/// the handle is closed (`kernel_executed_statement_close`); the caller must NOT
+/// free it and should copy it out if it needs to outlive the handle. Returns
+/// NULL on a null or invalidated handle (with a stored last error). A successful
+/// execute always has an id, so a live handle never returns NULL.
+///
+/// # Safety
+/// `exec` must be a live executed handle from [`kernel_statement_execute`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_statement_query_id(
+    exec: *const kernel_executed_statement_t,
+) -> *const c_char {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedHandle).as_ref() else {
+        crate::c_abi::error::store_invalid_arg(
+            "kernel_executed_statement_query_id: exec must not be null",
+        );
+        return std::ptr::null();
+    };
+    // Stale after a re-execute or close on the parent statement → NULL with a
+    // stored InvalidStatementHandle, matching num_modified_rows' staleness rule.
+    if !handle.exec.is_valid() {
+        crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::InvalidStatementHandle,
+            "executed statement was invalidated by a re-execute or close on its parent statement; \
+             read query_id before closing the statement",
+        ));
+        return std::ptr::null();
+    }
+    handle.statement_id_c.as_ptr()
 }
 
 /// Free a sync executed handle. Invalidates any result stream borrowed

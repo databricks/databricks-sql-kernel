@@ -75,7 +75,11 @@ thread_local! {
 /// Turn a Rust `String` into a `CString`, replacing any interior NUL
 /// bytes with `?` so a message that happens to contain `\0` can't make
 /// `CString::new` fail (which would lose the error detail entirely).
-fn to_cstring_lossy(s: &str) -> CString {
+///
+/// Shared by the error-path `KernelError.query_id` and the success-path
+/// `kernel_executed_statement_query_id`, so both accessors have identical
+/// interior-NUL semantics (strip → `?`, never discard the whole value).
+pub(crate) fn to_cstring_lossy(s: &str) -> CString {
     // Fast path: no interior NUL.
     match CString::new(s) {
         Ok(c) => c,
