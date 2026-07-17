@@ -200,7 +200,34 @@ fn parse_level_word(s: &str) -> Option<u8> {
 /// directive (`databricks::sql::kernel=debug` / `databricks_sql_kernel=debug`), or
 /// a global fallback among comma-separated directives. Returns `None` (keep the
 /// current default) if nothing matches.
+///
+/// When several directives match, this mirrors `EnvFilter` specificity rather
+/// than taking the first one listed: `EnvFilter` applies a target directive to
+/// an event only when the directive's target is a **prefix of the event's
+/// target** (`meta.target().starts_with(directive_target)`), and among the
+/// matching directives the **most specific** (longest target) wins, independent
+/// of order. So `RUST_LOG=databricks=warn,databricks::sql::kernel=debug`
+/// resolves to `debug` for a `databricks::sql::kernel` event — the same
+/// threshold `kernel_init_logging`'s `EnvFilter` would apply — not the
+/// first-listed `warn`. On a specificity tie the later directive wins
+/// (`EnvFilter` dedups identical directives last-writer-wins). A matching
+/// target directive always beats a bare global level, since a target-less
+/// directive is the least specific match `EnvFilter` recognises.
+///
+/// Applicability is judged against the kernel's canonical target roots (see
+/// [`directive_targets_kernel`]), NOT a bare `starts_with("databricks")`: a
+/// longer non-matching sibling such as `databricksfoo=warn` or
+/// `databricks::sql::kernel::foo=trace` is a prefix of no kernel event, so
+/// `EnvFilter` skips it — and so must this, or it would wrongly outrank a real
+/// `databricks=debug`. (This resolves a single scalar for the whole bridge, so
+/// a directive naming a specific sub-module deeper than a root — e.g.
+/// `databricks_sql_kernel::session=trace` — is conservatively treated as
+/// non-selecting; the dominant `klog!` target `databricks::sql::kernel` is
+/// resolved exactly.)
 fn level_from_rust_log(rust_log: &str) -> Option<u8> {
+    // Best kernel-applicable target directive seen so far, as (target length
+    // used as the specificity key, resolved level).
+    let mut best_target: Option<(usize, u8)> = None;
     let mut global: Option<u8> = None;
     for directive in rust_log.split(',') {
         let d = directive.trim();
@@ -209,9 +236,20 @@ fn level_from_rust_log(rust_log: &str) -> Option<u8> {
         }
         match d.split_once('=') {
             Some((target, level)) => {
-                if target.trim().starts_with("databricks") {
+                let target = target.trim();
+                if directive_targets_kernel(target) {
                     if let Some(l) = parse_level_word(level) {
-                        return Some(l); // the kernel target's own directive wins
+                        // Longest target = most specific; on a tie the later
+                        // directive wins (matches `EnvFilter`'s last-writer
+                        // dedup), so replace on `>=`.
+                        let specificity = target.len();
+                        let wins = match best_target {
+                            Some((len, _)) => specificity >= len,
+                            None => true,
+                        };
+                        if wins {
+                            best_target = Some((specificity, l));
+                        }
                     }
                 }
             }
@@ -224,7 +262,30 @@ fn level_from_rust_log(rust_log: &str) -> Option<u8> {
             }
         }
     }
-    global
+    // A matching target directive is always more specific than a bare global
+    // level, so it wins when both are present.
+    best_target.map(|(_, l)| l).or(global)
+}
+
+/// The kernel's canonical `tracing` target roots: the `klog!` target
+/// ([`KERNEL_LOG_TARGET`](crate::klog::KERNEL_LOG_TARGET),
+/// `databricks::sql::kernel`) and the crate's module-path root
+/// (`databricks_sql_kernel`). A `RUST_LOG` target directive selects the kernel
+/// only when `EnvFilter` would apply it, i.e. its target is a prefix of a
+/// target the kernel actually emits at — so its target must be a prefix of one
+/// of these roots.
+const KERNEL_TARGET_ROOTS: [&str; 2] = [crate::klog::KERNEL_LOG_TARGET, "databricks_sql_kernel"];
+
+/// Whether a `RUST_LOG` directive target names (a prefix of) a kernel target,
+/// so `EnvFilter` would apply it to kernel events. Mirrors `EnvFilter`'s
+/// `event_target.starts_with(directive_target)` against the canonical kernel
+/// roots: a directive target that is a proper extension of a root
+/// (`databricks::sql::kernel::foo`) or an unrelated `databricks`-prefixed
+/// sibling (`databricksfoo`) matches no kernel event and is rejected.
+fn directive_targets_kernel(target: &str) -> bool {
+    KERNEL_TARGET_ROOTS
+        .iter()
+        .any(|root| root.starts_with(target))
 }
 
 /// Returns whether an event at `level` should currently be forwarded.
@@ -806,6 +867,88 @@ mod tests {
         // Nothing recognisable → None (keep the default).
         assert_eq!(level_from_rust_log("hyper=warn"), None);
         assert_eq!(level_from_rust_log(""), None);
+    }
+
+    #[test]
+    fn level_from_rust_log_mirrors_envfilter_specificity() {
+        // With a broad and a specific `databricks*` directive both present, the
+        // MORE SPECIFIC (longer target) one wins — matching `EnvFilter`, not
+        // first-match-wins — and the result is order-independent.
+        assert_eq!(
+            level_from_rust_log("databricks=warn,databricks::sql::kernel=debug"),
+            Some(LEVEL_DEBUG),
+            "the specific kernel directive must win over the broad databricks=warn"
+        );
+        assert_eq!(
+            level_from_rust_log("databricks::sql::kernel=debug,databricks=warn"),
+            Some(LEVEL_DEBUG),
+            "resolution must not depend on directive order"
+        );
+        // Same, for the underscore module-path spelling.
+        assert_eq!(
+            level_from_rust_log("databricks=warn,databricks_sql_kernel=trace"),
+            Some(LEVEL_TRACE)
+        );
+        assert_eq!(
+            level_from_rust_log("databricks_sql_kernel=trace,databricks=warn"),
+            Some(LEVEL_TRACE)
+        );
+        // A targeted `databricks*` directive beats a bare global level in either
+        // order (a target-less directive is the least specific match).
+        assert_eq!(
+            level_from_rust_log("info,databricks=error"),
+            Some(LEVEL_ERROR)
+        );
+        assert_eq!(
+            level_from_rust_log("databricks=error,info"),
+            Some(LEVEL_ERROR)
+        );
+    }
+
+    #[test]
+    fn level_from_rust_log_ignores_non_matching_databricks_siblings() {
+        // `EnvFilter` applies a target directive only when its target is a
+        // prefix of the event target. A longer `databricks`-prefixed sibling
+        // that matches NO kernel target must NOT outrank a real `databricks=`
+        // directive just because it's longer.
+        assert_eq!(
+            level_from_rust_log("databricksfoo=warn,databricks=debug"),
+            Some(LEVEL_DEBUG),
+            "an unrelated databricks-prefixed sibling must be ignored"
+        );
+        // A directive DEEPER than the klog target matches no emitted event
+        // (klog stamps exactly `databricks::sql::kernel`), so it's skipped and
+        // the broad `databricks=debug` applies.
+        assert_eq!(
+            level_from_rust_log("databricks::sql::kernel::foo=trace,databricks=debug"),
+            Some(LEVEL_DEBUG),
+            "a directive deeper than the kernel target must be ignored"
+        );
+        // A non-matching sibling as the ONLY databricks directive must fall back
+        // to the bare global level (not the sibling's level).
+        assert_eq!(
+            level_from_rust_log("databricksfoo=trace,info"),
+            Some(LEVEL_INFO)
+        );
+        // Two equal-length siblings that match no kernel root resolve to None
+        // (keep the default) rather than letting order pick a bogus level.
+        assert_eq!(
+            level_from_rust_log("databricks::aa=warn,databricks::bb=debug"),
+            None
+        );
+    }
+
+    #[test]
+    fn directive_targets_kernel_matches_prefixes_of_kernel_roots() {
+        // Prefixes of the klog target and the module-path root are accepted.
+        assert!(directive_targets_kernel("databricks"));
+        assert!(directive_targets_kernel("databricks::sql"));
+        assert!(directive_targets_kernel(crate::klog::KERNEL_LOG_TARGET));
+        assert!(directive_targets_kernel("databricks_sql_kernel"));
+        // Unrelated siblings and over-specific extensions are rejected.
+        assert!(!directive_targets_kernel("databricksfoo"));
+        assert!(!directive_targets_kernel("databricks::sql::kernel::foo"));
+        assert!(!directive_targets_kernel("hyper"));
     }
 
     #[test]
