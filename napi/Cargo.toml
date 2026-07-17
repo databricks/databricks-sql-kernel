@@ -50,6 +50,19 @@ publish = false
 # Mirrors the equivalent decision in `pyo3/Cargo.toml`.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Resolve N-API symbols at runtime via libloading (with no-op stubs when
+# the host doesn't export them) instead of at link time. Enabled only for
+# `cargo test`: napi-rs 3's `napi::error` references N-API symbols
+# (`napi_reference_unref`, …) from a `Drop` impl unconditionally, so the
+# `lib test` executable — which has no Node host — fails to link (and,
+# with undefined-symbol linking, crashes on load). `dyn-symbols` makes
+# those calls fall back to stubs, so the pure-logic Rust unit tests
+# (error envelope, params codec, panic recovery) run hostless. The
+# release cdylib deliberately does NOT enable this: loaded inside Node,
+# it wants the real link-time symbols.
+dyn-symbols = ["napi/dyn-symbols"]
+
 [dependencies]
 # napi-rs v3 line; `napi6` enables N-API 6 surface, `async` enables the
 # `#[napi] async fn` glue that drives futures on napi-rs's tokio runtime.

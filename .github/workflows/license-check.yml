@@ -75,7 +75,12 @@ jobs:
       - name: Install cargo-deny
         uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145 # v2.83.1
         with:
-          tool: cargo-deny
+          # Pin the version: an unpinned `tool: cargo-deny` lets
+          # install-action grab whatever's newest, and cargo-deny's CLI
+          # grammar drifts across minor releases (e.g. `--config` moved
+          # to a global flag). Bump deliberately, in step with the
+          # invocation below.
+          tool: cargo-deny@0.20.2
 
       - name: Check licenses, advisories, bans, sources (root workspace)
         # `licenses` is the load-bearing check; `advisories` flags
@@ -90,11 +95,12 @@ jobs:
         # its transitive graph is NOT seen by the root run above. Scan
         # it explicitly against the same deny.toml policy. `--config`
         # points back at the root deny.toml so both workspaces share
-        # one allowlist rather than drifting. `--manifest-path` is a
-        # global cargo-deny flag (before the subcommand); `--config`
-        # is a `check` flag (after it). Both paths are absolute via
+        # one allowlist rather than drifting. Both `--manifest-path`
+        # and `--config` are global cargo-deny flags (before the
+        # `check` subcommand) — recent cargo-deny rejects `--config`
+        # when placed after `check`. Both paths are absolute via
         # $GITHUB_WORKSPACE so the step is immune to any
         # `defaults.run.working-directory` a future edit might add
         # (a relative `--config` would otherwise resolve against the
         # manifest dir and look for napi/deny.toml).
-        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" check --config "$GITHUB_WORKSPACE/deny.toml"
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check

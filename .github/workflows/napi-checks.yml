@@ -131,7 +131,14 @@ jobs:
         # The napi crate's Rust-side unit tests (error envelope, panic
         # guard, runtime handle, version) run here. No network, no
         # secrets — purely cdylib + rlib in-tree tests.
-        run: cargo test --locked
+        #
+        # `--features dyn-symbols`: napi-rs 3 references N-API symbols
+        # from a `Drop` impl unconditionally, so the hostless `lib test`
+        # executable can't link/run without them. dyn-symbols resolves
+        # N-API via libloading with no-op stubs when absent, letting the
+        # pure-logic tests run with no Node host. The release cdylib
+        # (built below) intentionally omits it and keeps link-time symbols.
+        run: cargo test --locked --features dyn-symbols
 
       # Drift guard for the committed loader (napi/index.js +
       # napi/index.d.ts). PR #146 review feedback: nothing in CI
