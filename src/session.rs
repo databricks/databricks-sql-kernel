@@ -217,7 +217,7 @@ impl Session {
     /// auth provider, the transport, and the result-reader factory;
     /// then calls `Transport::create_session` to mint a session id
     /// on the server.
-    pub async fn open(config: SessionConfig) -> Result<Session> {
+    pub async fn open(mut config: SessionConfig) -> Result<Session> {
         // Fetch the runtime handle up-front so a misconfigured
         // caller (e.g. running outside a tokio context) gets a clear
         // error instead of a panic deep in the transport setup.
@@ -226,6 +226,12 @@ impl Session {
                 "Session::open must be called from a tokio runtime context: {e}"
             ))
         })?;
+
+        // Fold client-only result knobs (e.g. cloudfetch_max_chunks_in_memory)
+        // carried in session_conf into the typed ResultConfig and strip them
+        // from session_conf, before either the reader factory reads
+        // config.result (below) or filter_session_conf runs on the wire body.
+        apply_client_result_overrides(&mut config);
 
         let host = config.connection.host.clone();
         let warehouse_id = config.connection.warehouse_id.clone();
@@ -785,6 +791,56 @@ fn build_retry_configs_for_session(
     build_retry_configs(&global, &overrides)
 }
 
+/// Client-only `session_conf` key that tunes how many decompressed
+/// CloudFetch chunks the kernel holds in memory at once (peak RSS on
+/// large result sets). It is a **client** knob, not a server SET
+/// parameter: it is read by [`apply_client_result_overrides`] before
+/// session creation and is deliberately absent from
+/// [`SESSION_CONF_ALLOWLIST`](crate::config), so `filter_session_conf`
+/// drops it and it never reaches the SEA wire. Exposed this way (rather
+/// than as a new C-ABI symbol) so the Go/ODBC consumers can set it
+/// through the existing `set_session_conf` entry point.
+pub(crate) const CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS: &str = "cloudfetch_max_chunks_in_memory";
+
+/// Fold client-only result-management knobs carried in `session_conf`
+/// into the typed [`ResultConfig`], then remove them from `session_conf`
+/// so they cannot leak onto the SEA wire.
+///
+/// Today this handles only [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`]. A key
+/// that is absent leaves the field at its `ResultConfig` default (16); a
+/// present-but-unparseable or zero value is ignored (default preserved)
+/// with a warning rather than failing session creation — a
+/// best-effort tuning knob should never turn a typo into a connect
+/// error. Matched case-insensitively, consistent with the rest of the
+/// `session_conf` handling.
+fn apply_client_result_overrides(config: &mut SessionConfig) {
+    let key = config
+        .session_conf
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS))
+        .cloned();
+    let Some(key) = key else { return };
+    // Remove it regardless of parse outcome: it is a client knob and must
+    // never survive into `filter_session_conf` / the wire.
+    let raw = config.session_conf.remove(&key).unwrap_or_default();
+    match raw.trim().parse::<usize>() {
+        Ok(n) if n > 0 => {
+            config.result.cloudfetch_max_chunks_in_memory = n;
+            crate::klog::debug!(
+                max_chunks_in_memory = n,
+                "applied client cloudfetch_max_chunks_in_memory override",
+            );
+        }
+        _ => {
+            crate::klog::warn!(
+                value = %raw,
+                "ignoring invalid cloudfetch_max_chunks_in_memory (want a positive integer); \
+                 keeping the default",
+            );
+        }
+    }
+}
+
 /// Project the public [`ResultConfig`] (today only carries
 /// CloudFetch knobs; future result-management options slot in here
 /// too) onto the internal `CloudFetchConfig`.
@@ -1007,6 +1063,94 @@ mod retry_config_tests {
         };
         let hcc = build_http_client_config(&config_with_http(http), None);
         assert_eq!(hcc.read_timeout, Duration::from_millis(4500));
+    }
+
+    // ─── Client result-config override (cloudfetch_max_chunks_in_memory) ───
+
+    /// Build a minimal config carrying the given session_conf, for
+    /// exercising `apply_client_result_overrides` in isolation.
+    fn config_with_session_conf(conf: HashMap<String, String>) -> SessionConfig {
+        let mut cfg = config_with_http(HttpConfig::default());
+        cfg.session_conf = conf;
+        cfg
+    }
+
+    /// A valid positive value folds into ResultConfig and the key is
+    /// stripped from session_conf so it can never reach the SEA wire.
+    #[test]
+    fn cloudfetch_max_chunks_override_applies_and_is_stripped() {
+        let mut cfg = config_with_session_conf(HashMap::from([(
+            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            "4".to_string(),
+        )]));
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 4);
+        assert!(
+            cfg.session_conf.is_empty(),
+            "client knob must be removed from session_conf, got {:?}",
+            cfg.session_conf
+        );
+    }
+
+    /// The key is matched case-insensitively, like the rest of the
+    /// session_conf handling, and still stripped.
+    #[test]
+    fn cloudfetch_max_chunks_override_is_case_insensitive() {
+        let mut cfg = config_with_session_conf(HashMap::from([(
+            "CloudFetch_Max_Chunks_In_Memory".to_string(),
+            "8".to_string(),
+        )]));
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 8);
+        assert!(cfg.session_conf.is_empty());
+    }
+
+    /// Absent key ⇒ the ResultConfig default (16) is preserved.
+    #[test]
+    fn cloudfetch_max_chunks_absent_keeps_default() {
+        let mut cfg = config_with_session_conf(HashMap::new());
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(
+            cfg.result.cloudfetch_max_chunks_in_memory,
+            ResultConfig::default().cloudfetch_max_chunks_in_memory
+        );
+    }
+
+    /// A non-numeric or zero value is ignored (default preserved, no
+    /// connect error) but still stripped from session_conf.
+    #[test]
+    fn cloudfetch_max_chunks_invalid_is_ignored_but_stripped() {
+        for bad in ["0", "-1", "abc", ""] {
+            let mut cfg = config_with_session_conf(HashMap::from([(
+                CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+                bad.to_string(),
+            )]));
+            apply_client_result_overrides(&mut cfg);
+            assert_eq!(
+                cfg.result.cloudfetch_max_chunks_in_memory, 16,
+                "value {bad:?} should keep the default",
+            );
+            assert!(
+                cfg.session_conf.is_empty(),
+                "value {bad:?} should still be stripped",
+            );
+        }
+    }
+
+    /// The client knob is NOT in the server allowlist, so even if it were
+    /// left in session_conf it would be filtered before the wire. This
+    /// pins that invariant so a future allowlist edit can't accidentally
+    /// promote it to a server SET parameter.
+    #[test]
+    fn cloudfetch_max_chunks_key_is_not_server_allowlisted() {
+        let filtered = crate::config::filter_session_conf(HashMap::from([(
+            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            "4".to_string(),
+        )]));
+        assert!(
+            filtered.is_empty(),
+            "client knob must not survive the server allowlist, got {filtered:?}",
+        );
     }
 }
 
