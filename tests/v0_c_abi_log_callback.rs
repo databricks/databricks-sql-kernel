@@ -31,7 +31,8 @@ use std::os::raw::{c_char, c_int, c_void};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-use databricks_sql_kernel::c_abi::logging::kernel_set_log_callback;
+use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
+use databricks_sql_kernel::c_abi::logging::{kernel_logging_stats, kernel_set_log_callback};
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 
 // Captured (level, target, message) tuples, keyed via a process-global slot the
@@ -315,4 +316,38 @@ fn log_callback_delivers_and_level_gates_end_to_end() {
         drop(Box::from_raw(panic_ctx_ptr as *mut u64));
         drop(Box::from_raw(recover_ctx_ptr as *mut u64));
     }
+}
+
+/// `kernel_logging_stats` clears the thread-local last-error on entry like every
+/// other C-ABI entry point, so a host that polls this infallible accessor
+/// between a failed call and reading the error doesn't observe the prior error
+/// through it. Runs on its own test thread (last-error is thread-local), and the
+/// null-cb rejection that seeds the error returns BEFORE any install logic, so
+/// this test is independent of the delivery test's process-global subscriber.
+#[test]
+fn kernel_logging_stats_clears_stale_last_error() {
+    // Seed a stale error on this thread: a null callback is rejected with
+    // InvalidArgument and stores a last error.
+    let rc = unsafe { kernel_set_log_callback(None, std::ptr::null_mut(), std::ptr::null()) };
+    assert_eq!(
+        rc,
+        KernelStatusCode::InvalidArgument,
+        "a null callback must be rejected and seed a last error"
+    );
+    let mut seeded = std::mem::MaybeUninit::<KernelError>::uninit();
+    assert!(
+        unsafe { kernel_get_last_error(seeded.as_mut_ptr()) },
+        "precondition: the null-cb rejection must have seeded a last error"
+    );
+
+    // The infallible stats accessor must clear the stale error on entry.
+    let mut installed = false;
+    let mut dropped = 0u64;
+    unsafe { kernel_logging_stats(&mut installed, &mut dropped) };
+
+    let mut after = std::mem::MaybeUninit::<KernelError>::uninit();
+    assert!(
+        !unsafe { kernel_get_last_error(after.as_mut_ptr()) },
+        "kernel_logging_stats must clear the stale last error on entry"
+    );
 }

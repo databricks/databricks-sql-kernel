@@ -198,10 +198,6 @@ static INSTALL_STATUS: AtomicU8 = AtomicU8::new(INSTALL_PENDING);
 /// so the returned `Internal` can carry the underlying OS error for triage.
 static SPAWN_ERROR: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// Producer end, published once after the drain thread is confirmed running so
-/// a live producer never outlives its consumer.
-static SENDER: OnceLock<SyncSender<Record>> = OnceLock::new();
-
 /// Current sink. Last-writer-wins; read by the drain thread per record.
 static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 
@@ -263,6 +259,10 @@ fn parse_level_word(s: &str) -> Option<u8> {
 ///   - `global`: a bare level (`debug`), the least-specific match `EnvFilter`
 ///     recognises, used as the default for kernel targets no directive matches.
 ///
+/// A directive with no `=` is a bare LEVEL (`debug` → global) or a bare TARGET;
+/// `EnvFilter` reads a bare kernel target (`databricks::sql::kernel`) as that
+/// target at TRACE, so it is retained as `(target, TRACE)` rather than ignored.
+///
 /// Applicability is judged by [`directive_targets_kernel`], NOT a bare
 /// `starts_with("databricks")`: a non-matching sibling such as `databricksfoo=warn`
 /// or an extension of the fixed-depth `klog!` target
@@ -290,10 +290,17 @@ fn parse_rust_log(rust_log: &str) -> (Vec<(String, u8)>, Option<u8>) {
                 }
             }
             None => {
-                // A bare word is either a global level (`debug`) or a bare target;
-                // only treat it as a level if it parses as one.
+                // A directive with no `=` is either a bare level (`debug`) or a
+                // target with no level. `EnvFilter` reads a bare level as the
+                // global and a bare TARGET as "that target at TRACE" (the max),
+                // so a kernel target-only directive (`databricks::sql::kernel`)
+                // must raise the threshold to TRACE — not be ignored, which
+                // would leave the callback at WARN where kernel_init_logging
+                // emits debug/trace.
                 if let Some(l) = parse_level_word(d) {
                     global = Some(l);
+                } else if directive_targets_kernel(d) {
+                    directives.push((d.to_owned(), LEVEL_TRACE));
                 }
             }
         }
@@ -375,11 +382,26 @@ fn should_emit(target: &str, level: &Level) -> bool {
     threshold != LEVEL_OFF && severity(level) <= threshold
 }
 
-/// Targets the bridge forwards: the `klog!` shim's `databricks::sql::kernel`
-/// and kernel module paths (`databricks_sql_kernel::*`). A raw `starts_with`
-/// (not a `::`-segmented filter) so the underscore module-path variants match.
+/// Whether `target` is exactly `root` or a `::`-delimited submodule of it
+/// (`root::…`) — a SEGMENT-boundary match, not a raw prefix. This is what keeps
+/// an unrelated sibling like `databricksfoo` or `databricks_sql_kernel_ext` from
+/// matching `databricks_sql_kernel`: the byte after the root must be a `::`
+/// separator (or end of string), never a bare identifier continuation.
+fn is_target_or_submodule(target: &str, root: &str) -> bool {
+    target
+        .strip_prefix(root)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
+}
+
+/// Targets the bridge forwards: the `klog!` shim's `databricks::sql::kernel` (and
+/// any submodule of it) and the crate's module paths (`databricks_sql_kernel`
+/// and `databricks_sql_kernel::…`). A SEGMENT-boundary match, NOT a raw
+/// `starts_with("databricks")` — the latter would route unrelated
+/// `databricks`-prefixed host/library targets (`databricksfoo`, another
+/// `databricks_*` crate) into the kernel callback.
 fn is_kernel_target(target: &str) -> bool {
-    target.starts_with("databricks")
+    is_target_or_submodule(target, crate::klog::KERNEL_LOG_TARGET)
+        || is_target_or_submodule(target, KERNEL_MODULE_ROOT)
 }
 
 /// The most-verbose configured level as a `tracing` [`LevelFilter`], for
@@ -468,7 +490,17 @@ impl Visit for MessageVisitor {
 /// Process-global `tracing` Layer: formats each kernel event and enqueues it
 /// (drop-on-full). The per-layer [`KernelFilter`] already excludes foreign
 /// targets and below-level events.
-struct KernelLogLayer;
+///
+/// The producer end of the delivery channel lives HERE, in the layer instance,
+/// rather than in a separately-published global. `set_global_default` makes the
+/// subscriber (and this layer) visible atomically, so from the instant an event
+/// can reach [`on_event`](KernelLogLayer::on_event) the sender is already
+/// present — there is no window where the subscriber is installed but the sender
+/// isn't yet published (which would silently drop a concurrent kernel log
+/// without counting it).
+struct KernelLogLayer {
+    tx: SyncSender<Record>,
+}
 
 /// Per-layer filter gating the bridge: foreign callsites cache off, kernel
 /// callsites re-evaluate per event, and `max_level_hint` tracks the level.
@@ -498,9 +530,6 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        let Some(tx) = SENDER.get() else {
-            return;
-        };
         // Once a callback has unwound the sink is poisoned and the drain thread
         // drops everything until re-registration. Short-circuit HERE — before the
         // field visit, the message allocation, and the enqueue — so a poisoned
@@ -525,7 +554,7 @@ where
         // task on a slow host callback. Count the loss so it's observable (via
         // kernel_logging_stats and the drain thread's synthetic recovery line)
         // rather than vanishing silently.
-        if tx.try_send(record).is_err() {
+        if self.tx.try_send(record).is_err() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -759,11 +788,17 @@ fn apply_filter(filter: ResolvedFilter) -> bool {
 ///     out BEFORE touching the global subscriber, so the slot stays free and the
 ///     host can still fall back to `kernel_init_logging`. The status stays
 ///     retryable, so a later call can try again. (Claiming the subscriber first
-///     would strand it with no `SENDER`, silently dropping every event.)
+///     would strand it with no drain thread, silently dropping every event.)
 ///   - Lost race: if another subscriber (e.g. `kernel_init_logging`) already
-///     won, we DROP the sender so the freshly-spawned drain thread's `recv()`
-///     errors and it exits — no idle-thread leak, and `SENDER` stays unset so
-///     `on_event` short-circuits.
+///     won, `set_global_default` drops the subscriber it was handed — and with
+///     it the [`KernelLogLayer`]'s sender — so the freshly-spawned drain
+///     thread's `recv()` errors and it exits (no idle-thread leak). No global
+///     sender was ever published, so nothing can enqueue after the loss.
+///
+/// The sender lives in the layer instance (not a separately-published global),
+/// so there is no window where the subscriber is visible but the sender isn't
+/// yet published: a concurrent kernel log in that gap would otherwise reach
+/// `on_event`, find no sender, and be dropped WITHOUT being counted.
 ///
 /// `set_global_default` is attempted at most once per process: it runs only
 /// after a drain thread is confirmed up, and both its outcomes (won / lost) are
@@ -800,19 +835,19 @@ fn ensure_installed() -> bool {
         INSTALL_STATUS.store(INSTALL_SPAWN_FAILED, Ordering::Release);
         return false;
     }
-    // Drain thread is running. Now claim the one global subscriber.
-    let subscriber = tracing_subscriber::registry().with(KernelLogLayer.with_filter(KernelFilter));
+    // Drain thread is running. Build the layer holding the sender, then claim the
+    // one global subscriber. Because the sender is inside the layer, it is
+    // published atomically with the subscriber — on_event never observes an
+    // installed-but-senderless state.
+    let subscriber =
+        tracing_subscriber::registry().with(KernelLogLayer { tx }.with_filter(KernelFilter));
     if tracing::subscriber::set_global_default(subscriber).is_err() {
-        // Another global subscriber won. Drop the sender so the drain thread
-        // (blocked on recv()) unblocks with an error and exits cleanly, then
-        // leave SENDER unset so on_event's `let Some(tx)` short-circuits.
-        drop(tx);
+        // Another global subscriber won. `set_global_default` dropped the
+        // subscriber (and the layer's sender) on the error path, so the drain
+        // thread's blocked `recv()` unblocks with an error and it exits cleanly.
         INSTALL_STATUS.store(INSTALL_ALREADY_SET, Ordering::Release);
         return false;
     }
-    // We own the subscriber AND have a live consumer. Publish SENDER only now, so
-    // a live producer never outlives its consumer.
-    let _ = SENDER.set(tx);
     INSTALL_STATUS.store(INSTALL_OK, Ordering::Release);
     true
 }
@@ -1120,6 +1155,27 @@ mod tests {
     }
 
     #[test]
+    fn parse_rust_log_target_only_directive_is_trace() {
+        // `EnvFilter` reads a bare kernel target (no `=level`) as that target at
+        // TRACE — it must NOT be ignored, which would leave the callback at WARN
+        // where kernel_init_logging emits trace.
+        let (dirs, global) = parse_rust_log("databricks::sql::kernel");
+        assert_eq!(
+            dirs,
+            vec![("databricks::sql::kernel".to_owned(), LEVEL_TRACE)]
+        );
+        assert_eq!(global, None);
+        // A foreign target-only directive is dropped; a kernel one becomes TRACE;
+        // a bare level word still sets the global.
+        let (dirs, global) = parse_rust_log("hyper,databricks_sql_kernel::session,info");
+        assert_eq!(
+            dirs,
+            vec![("databricks_sql_kernel::session".to_owned(), LEVEL_TRACE)]
+        );
+        assert_eq!(global, Some(LEVEL_INFO));
+    }
+
+    #[test]
     fn resolve_threshold_per_target_does_not_widen_klog() {
         // The reviewer's case: a klog directive and an unrelated submodule
         // directive must NOT widen each other. Each target resolves against only
@@ -1310,13 +1366,32 @@ mod tests {
         assert_eq!(v.finish(), "hello statement_id=abc-123");
     }
 
-    /// Drift guard: the bridge routes on the `databricks` prefix; the kernel
-    /// stamps every `klog!` with `KERNEL_LOG_TARGET`. If that constant ever
-    /// changed to a non-`databricks` prefix, kernel logs would silently stop
-    /// reaching the callback — pin the two together.
+    /// Drift guard: the bridge routes kernel events by matching the `klog!`
+    /// target root; the kernel stamps every `klog!` with `KERNEL_LOG_TARGET`. If
+    /// that constant ever changed out from under the routing roots, kernel logs
+    /// would silently stop reaching the callback — pin the two together.
     #[test]
     fn filter_prefix_still_matches_kernel_emit_target() {
         assert!(is_kernel_target(crate::klog::KERNEL_LOG_TARGET));
+    }
+
+    #[test]
+    fn is_kernel_target_matches_only_roots_and_submodules() {
+        // The kernel's own targets — exact roots and their `::` submodules — are
+        // forwarded.
+        assert!(is_kernel_target(crate::klog::KERNEL_LOG_TARGET));
+        assert!(is_kernel_target("databricks::sql::kernel::reader"));
+        assert!(is_kernel_target("databricks_sql_kernel"));
+        assert!(is_kernel_target("databricks_sql_kernel::session"));
+        assert!(is_kernel_target("databricks_sql_kernel::reader::inline"));
+        // Unrelated `databricks`-prefixed targets are NOT forwarded: matching is
+        // on a `::` SEGMENT boundary, not a raw `starts_with("databricks")`, so a
+        // sibling crate/library log can't be routed into the kernel callback.
+        assert!(!is_kernel_target("databricksfoo"));
+        assert!(!is_kernel_target("databricks_sql_kernel_ext"));
+        assert!(!is_kernel_target("databricks::sql::other"));
+        assert!(!is_kernel_target("databricks"));
+        assert!(!is_kernel_target("hyper"));
     }
 
     // NOTE: the end-to-end "MessageVisitor renders a REAL tracing event" test
