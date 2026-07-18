@@ -28,6 +28,7 @@ use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
+use std::time::Duration;
 
 /// Opaque session handle. Boxed [`Session`] on the Rust side.
 #[repr(C)]
@@ -95,6 +96,12 @@ pub struct KernelSessionConfig {
     /// Extra HTTP headers sent on every request (accumulated by
     /// `..._set_custom_header`, one `(name, value)` pair per call).
     custom_headers: Vec<(String, String)>,
+    /// HTTP retry / backoff knobs (populated by `..._set_retry_config`).
+    /// `None` keeps the kernel default policy (exponential backoff with
+    /// jitter, 5 retries, 1s..60s, 900s budget); `Some` lets a host make its
+    /// own backoff/attempt policy authoritative (a JDBC-style `RetryWaitMin` /
+    /// `RetryWaitMax` / `RetryMax` surface).
+    retry: Option<RetrySpec>,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -103,6 +110,20 @@ struct ProxySpec {
     username: Option<String>,
     password: Option<String>,
     bypass_hosts: Option<String>,
+}
+
+/// C-side HTTP retry config captured from
+/// `kernel_session_config_set_retry_config`. The JDBC-style backoff/attempt
+/// knobs a host tunes, plus the cumulative retry budget (`overall_timeout`, to
+/// match the pyo3/napi `retry_overall_timeout` surface); every other
+/// `HttpConfig` field (per-request timeout, pool size) keeps its default when a
+/// retry spec is set. `overall_timeout` is `None` when the host left it 0, so
+/// the kernel's default budget (900s) is preserved.
+struct RetrySpec {
+    min_wait: Duration,
+    max_wait: Duration,
+    max_retries: u32,
+    overall_timeout: Option<Duration>,
 }
 
 /// C-side TLS config captured from the `..._set_tls_*` setters.
@@ -156,6 +177,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
+        retry: None,
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -315,6 +337,61 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
         let name = required_str(name, "header name")?;
         let value = required_str(value, "header value")?;
         c.custom_headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Configure the HTTP retry / backoff policy: the minimum and maximum
+/// backoff wait between attempts (milliseconds), the maximum number of
+/// retries after the initial attempt (so a request is tried at most
+/// `max_retries + 1` times), and the cumulative retry budget
+/// (`overall_timeout_ms`) across all attempts. Lets a host make its own
+/// `RetryWaitMin` / `RetryWaitMax` / `RetryMax` / retry-timeout surface
+/// authoritative instead of the kernel's built-in default policy.
+/// `max_retries == 0` disables retries (single attempt); the backoff between
+/// attempts is still exponential with jitter, clamped to
+/// `[min_wait_ms, max_wait_ms]`. `overall_timeout_ms == 0` keeps the kernel's
+/// default budget (900s) — pass a non-zero value to override it (matching the
+/// pyo3/napi `retry_overall_timeout` knob). When this setter is not called the
+/// kernel keeps its default policy (5 retries, 1s..60s, 900s budget).
+/// `min_wait_ms == 0` and `max_wait_ms < min_wait_ms` are rejected as
+/// `InvalidArgument`. Maps to `HttpConfig::retry_min_wait` /
+/// `retry_max_wait` / `retry_max_retries` / `overall_timeout`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_retry_config(
+    config: *mut KernelSessionConfig,
+    min_wait_ms: u64,
+    max_wait_ms: u64,
+    max_retries: u32,
+    overall_timeout_ms: u64,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if min_wait_ms == 0 {
+            return Err(Error::invalid_argument().message("retry min_wait_ms must be > 0"));
+        }
+        if max_wait_ms < min_wait_ms {
+            return Err(
+                Error::invalid_argument().message("retry max_wait_ms must be >= min_wait_ms")
+            );
+        }
+        c.retry = Some(RetrySpec {
+            min_wait: Duration::from_millis(min_wait_ms),
+            max_wait: Duration::from_millis(max_wait_ms),
+            // Clamp to `u32::MAX - 1` so the HTTP client's `max_retries + 1`
+            // total-attempts computation (src/client/http.rs) can never
+            // overflow — a debug build would panic and a release build would
+            // wrap to 0, silently disabling all retries. This matches the
+            // effective ceiling the napi/pyo3 bindings already enforce (they
+            // derive the field via `saturating_sub(1)`); the C ABI is the only
+            // path that could otherwise hand the client an unclamped u32.
+            max_retries: max_retries.min(u32::MAX - 1),
+            // 0 => keep the kernel default budget; any non-zero value overrides it.
+            overall_timeout: (overall_timeout_ms != 0)
+                .then(|| Duration::from_millis(overall_timeout_ms)),
+        });
         Ok(())
     })
 }
@@ -591,6 +668,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         proxy,
         tls,
         custom_headers,
+        retry,
     } = config;
 
     block_on_ffi(move || {
@@ -640,13 +718,28 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .auth(auth)
                 .session_conf(session_conf);
 
-            // Extra HTTP headers, if any. Build a fresh HttpConfig so all
-            // other HTTP defaults (timeouts, pool, retry) are preserved.
-            if !custom_headers.is_empty() {
-                builder = builder.http(HttpConfig {
+            // HTTP config: custom headers and/or an overriding retry policy.
+            // Both live on HttpConfig, so build one from defaults and set only
+            // the fields a setter populated — every other HTTP default
+            // (timeouts, pool size, and retry when no retry spec was set) is
+            // preserved. Skip the .http() call entirely when neither was set so
+            // the kernel's full HttpConfig::default() applies untouched.
+            if !custom_headers.is_empty() || retry.is_some() {
+                let mut http = HttpConfig {
                     custom_headers,
                     ..HttpConfig::default()
-                });
+                };
+                if let Some(r) = retry {
+                    http.retry_min_wait = r.min_wait;
+                    http.retry_max_wait = r.max_wait;
+                    http.retry_max_retries = r.max_retries;
+                    // Only override the cumulative budget when the host set it;
+                    // otherwise HttpConfig::default()'s 900s is preserved.
+                    if let Some(t) = r.overall_timeout {
+                        http.overall_timeout = t;
+                    }
+                }
+                builder = builder.http(http);
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
@@ -838,6 +931,82 @@ mod tests {
                 *got, expected,
                 "headers must be appended in order, duplicates kept"
             );
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The retry setter records the backoff/attempt knobs as a `RetrySpec` (in
+    /// milliseconds → `Duration`); an untouched config leaves `None` so the
+    /// kernel's default policy applies. `max_retries = 0` is valid (disables
+    /// retries) and must still be recorded — not conflated with "unset".
+    /// `overall_timeout_ms = 0` records as `None` (keep the kernel default
+    /// budget); a non-zero value records as `Some`.
+    #[test]
+    fn set_retry_config_records_knobs() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().retry.is_none());
+            // overall_timeout_ms = 0 → keep the kernel default budget (None).
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 500, 30_000, 0, 0),
+                KernelStatusCode::Success
+            );
+            let r = config.as_ref().unwrap().retry.as_ref().unwrap();
+            assert_eq!(r.min_wait, Duration::from_millis(500));
+            assert_eq!(r.max_wait, Duration::from_millis(30_000));
+            assert_eq!(r.max_retries, 0, "max_retries=0 (disable) must be recorded");
+            assert_eq!(
+                r.overall_timeout, None,
+                "overall_timeout_ms=0 must keep the kernel default (None)"
+            );
+            // A non-zero overall_timeout_ms is recorded as Some(Duration).
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 500, 30_000, 3, 120_000),
+                KernelStatusCode::Success
+            );
+            let r = config.as_ref().unwrap().retry.as_ref().unwrap();
+            assert_eq!(r.overall_timeout, Some(Duration::from_millis(120_000)));
+            // max_retries is clamped to u32::MAX - 1 so the HTTP client's
+            // `max_retries + 1` total-attempts computation can't overflow.
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 500, 30_000, u32::MAX, 0),
+                KernelStatusCode::Success
+            );
+            let r = config.as_ref().unwrap().retry.as_ref().unwrap();
+            assert_eq!(
+                r.max_retries,
+                u32::MAX - 1,
+                "max_retries must clamp to u32::MAX - 1 to keep max_retries + 1 from overflowing"
+            );
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The retry setter rejects a zero min_wait and a max_wait below min_wait
+    /// with `InvalidArgument` — a degenerate range would otherwise reach the
+    /// HTTP client as nonsense backoff bounds.
+    #[test]
+    fn set_retry_config_rejects_bad_range() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 0, 1_000, 3, 0),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 5_000, 1_000, 3, 0),
+                KernelStatusCode::InvalidArgument
+            );
+            // A rejected call leaves the config's retry unset.
+            assert!(config.as_ref().unwrap().retry.is_none());
             kernel_session_config_free(config);
         }
     }

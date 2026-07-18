@@ -11,6 +11,14 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
+  HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
+  `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own
+  `RetryWaitMin` / `RetryWaitMax` / `RetryMax` / retry-budget policy authoritative
+  instead of the kernel default; `max_retries=0` disables retries, and
+  `overall_timeout_ms=0` keeps the kernel's default 900s budget (non-zero overrides
+  it, matching the pyo3/napi `retry_overall_timeout` knob). Benefits ODBC too.
+
 ### Updated
 
 ### Fixed

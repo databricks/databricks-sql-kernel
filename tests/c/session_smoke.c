@@ -164,6 +164,19 @@ static void test_proxy_and_tls_setters(void) {
   CHECK(rc == KernelStatusCode_Success, "set_tls_allow_self_signed succeeds");
   rc = kernel_session_config_set_tls_skip_hostname_verification(config, true);
   CHECK(rc == KernelStatusCode_Success, "set_tls_skip_hostname_verification succeeds");
+
+  /* Retry config: a valid range (incl. max_retries=0 to disable, overall
+   * timeout 0 = keep default) succeeds; a non-zero overall timeout also
+   * succeeds; a zero min_wait or an inverted range is rejected. */
+  rc = kernel_session_config_set_retry_config(config, 500, 30000, 0, 0);
+  CHECK(rc == KernelStatusCode_Success, "set_retry_config (valid, disable, default budget) succeeds");
+  rc = kernel_session_config_set_retry_config(config, 500, 30000, 3, 120000);
+  CHECK(rc == KernelStatusCode_Success, "set_retry_config (valid, overall_timeout=120s) succeeds");
+  rc = kernel_session_config_set_retry_config(config, 0, 1000, 3, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_retry_config(min=0) → InvalidArgument");
+  rc = kernel_session_config_set_retry_config(config, 5000, 1000, 3, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_retry_config(max<min) → InvalidArgument");
+
   kernel_session_config_free(config);
 }
 

@@ -303,6 +303,22 @@ KernelStatusCode kernel_session_config_set_tls_allow_self_signed(KernelSessionCo
 KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(KernelSessionConfig* config,
                                                                          bool skip);
 
+/* Configure the HTTP retry / backoff policy. `min_wait_ms` / `max_wait_ms`
+ * are the backoff-wait bounds between attempts (the wait is exponential
+ * with jitter, clamped to this range); `max_retries` is the number of
+ * retries AFTER the initial attempt (so at most `max_retries + 1` total
+ * attempts, and `0` disables retries); `overall_timeout_ms` is the cumulative
+ * retry budget across all attempts (`0` keeps the kernel default of 900s —
+ * pass non-zero to override, matching the pyo3/napi retry_overall_timeout
+ * knob). Lets a host's RetryWaitMin / RetryWaitMax / RetryMax / retry-timeout
+ * surface override the kernel's built-in policy (default 5 retries, 1s..60s,
+ * 900s budget) when this setter is not called. `min_wait_ms == 0` or
+ * `max_wait_ms < min_wait_ms` returns InvalidArgument. Benefits ODBC too. */
+KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* config,
+                                                        uint64_t min_wait_ms, uint64_t max_wait_ms,
+                                                        uint32_t max_retries,
+                                                        uint64_t overall_timeout_ms);
+
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*
