@@ -13,9 +13,11 @@
 // limitations under the License.
 
 //! End-to-end delivery test for the `kernel_set_log_callback` reverse-call log
-//! bridge. Registers a C callback, emits a kernel `tracing` event on the
-//! contract target, and asserts the callback received it with the message and
-//! target intact.
+//! bridge. Registers a C callback, emits kernel `tracing` events on the
+//! contract target, and asserts the callback received them with the message and
+//! target intact — and that the `level` argument gates delivery in both
+//! directions (a restrictive level filters a below-threshold event; a
+//! permissive level delivers an event below the default threshold).
 //!
 //! This lives in its own integration-test binary (NOT a `#[cfg(test)] mod` in
 //! `src/c_abi/logging.rs`) on purpose: installing the process-global `tracing`
@@ -58,60 +60,96 @@ extern "C-unwind" fn capture_cb(
     CAPTURED.lock().unwrap().push((level, target, message));
 }
 
+/// Poll up to ~1s for the captured records to satisfy `pred`, returning the
+/// final snapshot either way (delivery is async via the bridge's drain thread).
+fn wait_until(pred: impl Fn(&[(c_int, String, String)]) -> bool) -> Vec<(c_int, String, String)> {
+    for _ in 0..100 {
+        let got = CAPTURED.lock().unwrap().clone();
+        if pred(&got) {
+            return got;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    CAPTURED.lock().unwrap().clone()
+}
+
+/// Whether a kernel-target record carrying `marker` in its message was captured.
+fn saw_marker(got: &[(c_int, String, String)], marker: &str) -> bool {
+    got.iter()
+        .any(|(_, t, m)| t == databricks_sql_kernel::KERNEL_LOG_TARGET && m.contains(marker))
+}
+
 #[test]
-fn log_callback_receives_kernel_event_end_to_end() {
-    // Drive the threshold through the explicit `level` argument (the one-knob
-    // path a host uses) rather than RUST_LOG, so the test proves the level
-    // param actually gates delivery. "trace" lets every kernel event through.
+fn log_callback_delivers_and_level_gates_end_to_end() {
     // Register a real (non-null) ctx so we can assert the round-trip returns the
     // exact pointer we passed — a stand-in for the Go cgo.Handle token.
     let ctx_marker: Box<u64> = Box::new(0xC0FFEE);
     let ctx_ptr = Box::into_raw(ctx_marker) as *mut c_void;
-    let level = std::ffi::CString::new("trace").unwrap();
-    let rc = unsafe { kernel_set_log_callback(Some(capture_cb), ctx_ptr, level.as_ptr()) };
-    // Success is expected in this fresh binary (nothing else installed a global
-    // subscriber). If some future test in THIS binary installs one first, the
-    // bridge would report Internal — accept both so the test pins delivery, not
-    // install ordering.
-    assert!(
-        rc == KernelStatusCode::Success || rc == KernelStatusCode::Internal,
-        "kernel_set_log_callback returned an unexpected status: {rc:?}"
-    );
-    if rc != KernelStatusCode::Success {
-        // A global subscriber was already installed by another test in this
-        // binary; delivery can't be asserted. There is only one test here today,
-        // so this branch is defensive.
-        return;
-    }
 
-    // Emit an event on the kernel's contract target with a message + a field.
-    // `klog::warn!` is pub(crate); from this external test binary we emit the
+    // === Step 1: a RESTRICTIVE level must FILTER a below-threshold event. ===
+    // Install at ERROR. A WARN event must not be delivered — this is what proves
+    // the `level` argument actually gates delivery (the previous "trace + WARN"
+    // shape would pass even if `level` were ignored, since WARN clears the
+    // default WARN threshold). This is a fresh, single-test binary, so nothing
+    // else has installed a global subscriber: install MUST succeed. Accepting
+    // `Internal` here would let a regression that never installs stay green.
+    let level_error = std::ffi::CString::new("error").unwrap();
+    let rc = unsafe { kernel_set_log_callback(Some(capture_cb), ctx_ptr, level_error.as_ptr()) };
+    assert_eq!(
+        rc,
+        KernelStatusCode::Success,
+        "kernel_set_log_callback must succeed on first install in a fresh binary; got {rc:?}"
+    );
+
+    let filtered_marker = "probe-warn-should-be-filtered-a1";
+    let barrier_marker = "probe-error-barrier-b2";
+    // Emit the (to-be-filtered) WARN first, then an ERROR barrier. The single
+    // drain thread delivers FIFO, so once the ERROR barrier lands we know the
+    // earlier WARN would already have arrived had it passed the filter — a
+    // deterministic negative assertion, not a "sleep and hope".
+    tracing::warn!(target: databricks_sql_kernel::KERNEL_LOG_TARGET, "{}", filtered_marker);
+    tracing::error!(target: databricks_sql_kernel::KERNEL_LOG_TARGET, "{}", barrier_marker);
+    let got = wait_until(|g| saw_marker(g, barrier_marker));
+    assert!(
+        saw_marker(&got, barrier_marker),
+        "the ERROR barrier event must be delivered at level=error; captured={got:?}"
+    );
+    assert!(
+        !saw_marker(&got, filtered_marker),
+        "a WARN event must NOT be delivered when level=error — this proves the level \
+         argument gates delivery; captured={got:?}"
+    );
+
+    // === Step 2: a PERMISSIVE level must DELIVER a below-default event. ===
+    // Re-register at TRACE and emit a DEBUG event. DEBUG is below the static
+    // WARN default, so its delivery proves the `level` argument also loosens the
+    // threshold (not just that WARN happens to clear the default). Same ctx, so
+    // the round-trip assertion below still holds.
+    let level_trace = std::ffi::CString::new("trace").unwrap();
+    let rc = unsafe { kernel_set_log_callback(Some(capture_cb), ctx_ptr, level_trace.as_ptr()) };
+    assert_eq!(
+        rc,
+        KernelStatusCode::Success,
+        "re-registering the callback must succeed; got {rc:?}"
+    );
+
+    // `klog::debug!` is pub(crate); from this external test binary we emit the
     // exact `tracing` event it expands to (same target + event field).
     let stmt = "stmt-cb-probe-9c1";
-    tracing::warn!(
+    tracing::debug!(
         target: databricks_sql_kernel::KERNEL_LOG_TARGET,
         statement_id = stmt,
         "callback probe message"
     );
-
-    // Delivery is via the bridge's drain thread; poll briefly for it to land.
-    let mut got = Vec::new();
-    for _ in 0..100 {
-        got = CAPTURED.lock().unwrap().clone();
-        if got
-            .iter()
-            .any(|(_, t, m)| t == databricks_sql_kernel::KERNEL_LOG_TARGET && m.contains(stmt))
-        {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
-
+    let got = wait_until(|g| saw_marker(g, stmt));
     let hit = got
         .iter()
         .find(|(_, t, m)| t == databricks_sql_kernel::KERNEL_LOG_TARGET && m.contains(stmt));
     let (_level, _target, message) = hit.unwrap_or_else(|| {
-        panic!("the log callback did not receive the kernel event; captured={got:?}")
+        panic!(
+            "a DEBUG kernel event must be delivered at level=trace (the default WARN would \
+             drop it) — this proves the level argument is honoured; captured={got:?}"
+        )
     });
     assert!(
         message.contains("callback probe message"),
@@ -120,6 +158,36 @@ fn log_callback_receives_kernel_event_end_to_end() {
     assert!(
         message.contains("statement_id"),
         "structured field should render into the message, got: {message}"
+    );
+
+    // === Step 3: an event emitted INSIDE a (now-disabled) kernel span must
+    // still be delivered. ===
+    // The bridge's filter is event-only: kernel SPAN callsites cache off
+    // (`callsite_interest_for(_, is_event=false)` → never), so the kernel's own
+    // `info_span!` / `#[instrument]` spans become no-op disabled spans and pay
+    // no span machinery. This must NOT suppress EVENTS emitted while such a span
+    // is on the stack — `tracing` evaluates span and event callsites
+    // independently, and the kernel logs most of its events from inside
+    // instrumented functions (e.g. a `klog::debug!` inside the `#[instrument]`ed
+    // `next_batch`). Reproduce that shape: enter a kernel span (disabled by our
+    // filter) and emit a kernel event within it; the callback must still get the
+    // event. Guards against a filter/`tracing` change silently dropping every
+    // in-span kernel log.
+    let in_span_marker = "probe-event-inside-disabled-span-c3";
+    let kernel_span = tracing::info_span!(
+        target: databricks_sql_kernel::KERNEL_LOG_TARGET,
+        "kernel.session",
+        session_id = "sess-guard"
+    );
+    {
+        let _entered = kernel_span.enter();
+        tracing::debug!(target: databricks_sql_kernel::KERNEL_LOG_TARGET, "{}", in_span_marker);
+    }
+    let got = wait_until(|g| saw_marker(g, in_span_marker));
+    assert!(
+        saw_marker(&got, in_span_marker),
+        "an event emitted inside a disabled kernel span must still be delivered — disabling \
+         span callsites must not suppress in-span events; captured={got:?}"
     );
 
     // The ctx round-trip: the kernel must hand back the exact pointer we
@@ -131,7 +199,7 @@ fn log_callback_receives_kernel_event_end_to_end() {
     );
 
     // Stats accessor: this callback won the subscriber (installed=true) and a
-    // healthy delivery drops nothing.
+    // healthy delivery drops nothing (the filtered WARN was never enqueued).
     let mut installed = false;
     let mut dropped: u64 = 0;
     unsafe {
@@ -143,6 +211,6 @@ fn log_callback_receives_kernel_event_end_to_end() {
     );
     assert_eq!(dropped, 0, "a healthy delivery should not drop records");
 
-    // Reclaim the leaked ctx marker (kept alive across the call above).
+    // Reclaim the leaked ctx marker (kept alive across the calls above).
     unsafe { drop(Box::from_raw(ctx_ptr as *mut u64)) };
 }

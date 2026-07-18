@@ -314,11 +314,20 @@ fn current_level_filter() -> LevelFilter {
     }
 }
 
-/// Per-callsite interest: kernel callsites re-evaluate per event (`sometimes`,
-/// for the dynamic level); foreign callsites cache off forever (`never`), so
-/// `hyper`/`rustls`/etc. never dispatch.
-fn callsite_interest_for(target: &str) -> Interest {
-    if is_kernel_target(target) {
+/// Per-callsite interest. Kernel EVENT callsites re-evaluate per event
+/// (`sometimes`, for the dynamic level). Everything else caches off forever
+/// (`never`):
+///
+///   - foreign targets (`hyper`/`rustls`/…) never dispatch, and
+///   - SPAN callsites never dispatch — even on kernel targets. This bridge is
+///     event-only ([`KernelLogLayer`] implements just `on_event` and never
+///     reads span data), so admitting spans would make the kernel's own
+///     `databricks*` spans (`Session`'s `info_span!`, the `#[instrument]` on
+///     the `next_batch()` hot path) pay span create/enter/exit in the registry
+///     at INFO/DEBUG/TRACE thresholds for output that never comes. Caching them
+///     off turns those into no-op disabled spans.
+fn callsite_interest_for(target: &str, is_event: bool) -> Interest {
+    if is_event && is_kernel_target(target) {
         Interest::sometimes()
     } else {
         Interest::never()
@@ -383,11 +392,12 @@ struct KernelFilter;
 
 impl<S> Filter<S> for KernelFilter {
     fn callsite_enabled(&self, meta: &'static Metadata<'static>) -> Interest {
-        callsite_interest_for(meta.target())
+        callsite_interest_for(meta.target(), meta.is_event())
     }
 
     fn enabled(&self, meta: &Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
-        is_kernel_target(meta.target()) && should_emit(meta.level())
+        // Event-only: never enable spans (the layer has no span consumer).
+        meta.is_event() && is_kernel_target(meta.target()) && should_emit(meta.level())
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
@@ -972,10 +982,26 @@ mod tests {
 
     #[test]
     fn foreign_callsites_cache_off_kernel_callsites_reevaluate() {
-        assert!(callsite_interest_for("hyper::client::pool").is_never());
-        assert!(callsite_interest_for("rustls::conn").is_never());
-        assert!(callsite_interest_for("databricks::sql::kernel").is_sometimes());
-        assert!(callsite_interest_for("databricks_sql_kernel::session").is_sometimes());
+        // Kernel EVENT callsites re-evaluate; foreign ones cache off.
+        assert!(callsite_interest_for("hyper::client::pool", true).is_never());
+        assert!(callsite_interest_for("rustls::conn", true).is_never());
+        assert!(callsite_interest_for("databricks::sql::kernel", true).is_sometimes());
+        assert!(callsite_interest_for("databricks_sql_kernel::session", true).is_sometimes());
+    }
+
+    #[test]
+    fn span_callsites_cache_off_even_on_kernel_targets() {
+        // The bridge is event-only, so SPAN callsites never dispatch — even on
+        // kernel targets — so the kernel's own `databricks*` spans (Session's
+        // info_span!, the #[instrument] on next_batch) don't pay span machinery
+        // for output that never comes.
+        assert!(callsite_interest_for("databricks::sql::kernel", false).is_never());
+        assert!(
+            callsite_interest_for("databricks_sql_kernel::reader::inline::streaming", false)
+                .is_never()
+        );
+        // Foreign spans stay off too.
+        assert!(callsite_interest_for("hyper::client::pool", false).is_never());
     }
 
     #[test]
