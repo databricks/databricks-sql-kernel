@@ -112,6 +112,11 @@ struct Record {
 struct Sink {
     cb: kernel_log_callback,
     ctx: usize,
+    /// Monotonic registration id. The drain thread captures this alongside
+    /// `(cb, ctx)` and only poisons the sink on a callback unwind if this id is
+    /// still the installed one — so a slow/old callback that unwinds AFTER the
+    /// host re-registered a new one cannot kill the replacement.
+    gen: u64,
 }
 
 const CHANNEL_CAPACITY: usize = 4096;
@@ -168,6 +173,11 @@ static SENDER: OnceLock<SyncSender<Record>> = OnceLock::new();
 /// Current sink. Last-writer-wins; read by the drain thread per record.
 static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 
+/// Source of monotonic sink registration ids ([`Sink::gen`]). Bumped under the
+/// `SINK` lock on every (re-)registration so the drain thread can tell whether
+/// the callback it just invoked is still the installed one.
+static NEXT_SINK_GEN: AtomicU64 = AtomicU64::new(0);
+
 /// Guards the one-time subscriber install + channel + drain-thread spawn.
 static INSTALL: Once = Once::new();
 
@@ -214,16 +224,16 @@ fn parse_level_word(s: &str) -> Option<u8> {
 /// target directive always beats a bare global level, since a target-less
 /// directive is the least specific match `EnvFilter` recognises.
 ///
-/// Applicability is judged against the kernel's canonical target roots (see
-/// [`directive_targets_kernel`]), NOT a bare `starts_with("databricks")`: a
-/// longer non-matching sibling such as `databricksfoo=warn` or
-/// `databricks::sql::kernel::foo=trace` is a prefix of no kernel event, so
-/// `EnvFilter` skips it — and so must this, or it would wrongly outrank a real
-/// `databricks=debug`. (This resolves a single scalar for the whole bridge, so
-/// a directive naming a specific sub-module deeper than a root — e.g.
-/// `databricks_sql_kernel::session=trace` — is conservatively treated as
-/// non-selecting; the dominant `klog!` target `databricks::sql::kernel` is
-/// resolved exactly.)
+/// Applicability is judged by [`directive_targets_kernel`], NOT a bare
+/// `starts_with("databricks")`: a non-matching sibling such as `databricksfoo=warn`
+/// or an extension of the fixed-depth `klog!` target (`databricks::sql::kernel::foo=trace`)
+/// is a prefix of no kernel event, so `EnvFilter` skips it — and so must this,
+/// or it would wrongly outrank a real `databricks=debug`. A submodule directive
+/// on the module-path namespace the bridge forwards
+/// (`databricks_sql_kernel::session=debug`) IS honoured (most specific wins).
+/// (This resolves a single scalar for the whole bridge, so with a mix of
+/// targets the most specific matching directive sets the one threshold; the
+/// dominant `klog!` target `databricks::sql::kernel` is resolved exactly.)
 fn level_from_rust_log(rust_log: &str) -> Option<u8> {
     // Best kernel-applicable target directive seen so far, as (target length
     // used as the specificity key, resolved level).
@@ -267,25 +277,37 @@ fn level_from_rust_log(rust_log: &str) -> Option<u8> {
     best_target.map(|(_, l)| l).or(global)
 }
 
+/// The crate's module-path root: the `#[instrument]` / default-target namespace
+/// (`databricks_sql_kernel::*`) the bridge also forwards (see `is_kernel_target`).
+const KERNEL_MODULE_ROOT: &str = "databricks_sql_kernel";
+
 /// The kernel's canonical `tracing` target roots: the `klog!` target
 /// ([`KERNEL_LOG_TARGET`](crate::klog::KERNEL_LOG_TARGET),
 /// `databricks::sql::kernel`) and the crate's module-path root
-/// (`databricks_sql_kernel`). A `RUST_LOG` target directive selects the kernel
-/// only when `EnvFilter` would apply it, i.e. its target is a prefix of a
-/// target the kernel actually emits at — so its target must be a prefix of one
-/// of these roots.
-const KERNEL_TARGET_ROOTS: [&str; 2] = [crate::klog::KERNEL_LOG_TARGET, "databricks_sql_kernel"];
+/// ([`KERNEL_MODULE_ROOT`]).
+const KERNEL_TARGET_ROOTS: [&str; 2] = [crate::klog::KERNEL_LOG_TARGET, KERNEL_MODULE_ROOT];
 
-/// Whether a `RUST_LOG` directive target names (a prefix of) a kernel target,
-/// so `EnvFilter` would apply it to kernel events. Mirrors `EnvFilter`'s
-/// `event_target.starts_with(directive_target)` against the canonical kernel
-/// roots: a directive target that is a proper extension of a root
-/// (`databricks::sql::kernel::foo`) or an unrelated `databricks`-prefixed
-/// sibling (`databricksfoo`) matches no kernel event and is rejected.
+/// Whether a `RUST_LOG` directive target selects kernel events under
+/// `EnvFilter`'s `event_target.starts_with(directive_target)` prefix match,
+/// against the targets the bridge actually forwards. A directive applies when:
+///
+///   - its target is a **prefix of a canonical root** (`databricks`,
+///     `databricks::sql`, `databricks_sql_kernel`, …) — it matches events at
+///     that root; or
+///   - its target **extends the module-path root** (`databricks_sql_kernel::session`)
+///     — those submodule events are forwarded by `is_kernel_target`, so a host
+///     targeting a specific kernel submodule must raise the threshold rather
+///     than be silently ignored.
+///
+/// It is rejected otherwise: an unrelated `databricks`-prefixed sibling
+/// (`databricksfoo`) matches no kernel event, and an extension of the
+/// fixed-depth `klog!` target (`databricks::sql::kernel::foo`) matches nothing
+/// either, since the kernel never emits deeper than `databricks::sql::kernel`.
 fn directive_targets_kernel(target: &str) -> bool {
-    KERNEL_TARGET_ROOTS
-        .iter()
-        .any(|root| root.starts_with(target))
+    target.starts_with(KERNEL_MODULE_ROOT)
+        || KERNEL_TARGET_ROOTS
+            .iter()
+            .any(|root| root.starts_with(target))
 }
 
 /// Returns whether an event at `level` should currently be forwarded.
@@ -463,6 +485,23 @@ fn invoke_callback(
     .is_ok()
 }
 
+/// Poison the sink — stop delivery — but ONLY if generation `gen` is still the
+/// installed registration. The drain thread copies `(cb, ctx, gen)` out and
+/// runs the callback without the lock, so the host may re-register (bumping the
+/// generation and clearing the poison) while an OLD callback is mid-unwind.
+/// Comparing under the `SINK` lock (which the setter also holds while it swaps
+/// the sink + clears the poison) means an old callback's failure can never kill
+/// the newer registration.
+fn poison_sink_if_current(gen: u64) {
+    if let Some(lock) = SINK.get() {
+        if let Ok(guard) = lock.lock() {
+            if guard.as_ref().map(|s| s.gen) == Some(gen) {
+                SINK_POISONED.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+}
+
 /// Drain loop (own OS thread): pull one record at a time and invoke the host
 /// callback with borrowed C strings. Runs off the kernel's tokio workers so a
 /// slow callback can't stall query execution.
@@ -471,7 +510,8 @@ fn drain_loop(rx: Receiver<Record>) {
     // "dropped N" notice for the delta since the last delivered record.
     let mut reported_drops: u64 = 0;
     // `recv` errors only once the (process-global) sender is dropped, which
-    // never happens in practice; exit cleanly if the channel is torn down.
+    // happens on a lost subscriber race (the setter drops the sender so this
+    // thread exits) or process teardown; exit cleanly either way.
     while let Ok(record) = rx.recv() {
         // A callback that unwound once is assumed to keep unwinding; stop
         // delivering to protect the process (the loss is counted + surfaced via
@@ -483,14 +523,14 @@ fn drain_loop(rx: Receiver<Record>) {
         let Some(sink_lock) = SINK.get() else {
             continue;
         };
-        // Copy the sink out under the lock (cheap: a fn pointer + usize) so the
-        // callback runs without holding the mutex — a reentrant setter can't
-        // deadlock, and a slow callback can't block a level/sink update.
+        // Copy the sink out under the lock (cheap: a fn pointer + usize + gen)
+        // so the callback runs without holding the mutex — a reentrant setter
+        // can't deadlock, and a slow callback can't block a level/sink update.
         let sink = match sink_lock.lock() {
-            Ok(g) => g.as_ref().map(|s| (s.cb, s.ctx)),
+            Ok(g) => g.as_ref().map(|s| (s.cb, s.ctx, s.gen)),
             Err(_) => None,
         };
-        let Some((cb, ctx)) = sink else {
+        let Some((cb, ctx, gen)) = sink else {
             continue;
         };
         // Surface any records dropped since the last delivery as one synthetic
@@ -511,12 +551,21 @@ fn drain_loop(rx: Receiver<Record>) {
                 is_kernel_target_str(),
                 &notice,
             ) {
-                SINK_POISONED.store(true, Ordering::Relaxed);
+                // The notice unwound, so `record` won't be delivered either —
+                // count it as dropped (the health contract), then poison iff
+                // this callback is still the installed one.
+                DROPPED.fetch_add(1, Ordering::Relaxed);
+                poison_sink_if_current(gen);
                 continue;
             }
         }
         if !invoke_callback(cb, ctx, record.level, record.target, &record.message) {
-            SINK_POISONED.store(true, Ordering::Relaxed);
+            // The callback unwound and did NOT deliver this record — count the
+            // loss so kernel_logging_stats reflects it (previously the first
+            // failing record was silently uncounted), then poison iff this
+            // callback is still the installed one.
+            DROPPED.fetch_add(1, Ordering::Relaxed);
+            poison_sink_if_current(gen);
         }
     }
 }
@@ -630,58 +679,68 @@ pub unsafe extern "C" fn kernel_set_log_callback(
     // it here (before releasing the SINK lock) is immediately effective.
     let sink = SINK.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = sink.lock() {
+        // A fresh generation so the drain thread won't let an old in-flight
+        // callback's unwind poison this new registration (see poison_sink_if_current).
+        let gen = NEXT_SINK_GEN.fetch_add(1, Ordering::Relaxed);
         *guard = Some(Sink {
             cb,
             ctx: ctx as usize,
+            gen,
         });
         SINK_POISONED.store(false, Ordering::Relaxed);
     }
 
     // Install the process-global subscriber + drain thread exactly once.
     //
-    // Order matters: attempt `set_global_default` FIRST, and only spawn the
-    // drain thread if we win the one global subscriber. The common sequence is
-    // "host called kernel_init_logging, a layer later calls this" — there we
-    // lose the race and must NOT leave a drain thread parked on recv() forever
-    // (an idle-thread leak). We use a plain Once-guarded closure rather than the
-    // channel/thread first.
+    // Order matters: stand up the drain thread FIRST, and only then claim the
+    // one global subscriber via `set_global_default`. This keeps two failure
+    // modes clean:
+    //
+    //   - Spawn failure: if the OS refuses the drain thread (EAGAIN/ENOMEM) we
+    //     bail out BEFORE touching the global subscriber, so the slot stays free
+    //     and the host can still fall back to `kernel_init_logging` for the rest
+    //     of the process. (Claiming the subscriber first would strand it with no
+    //     `SENDER`, silently dropping every event with no recovery path.)
+    //   - Lost race: if another subscriber (e.g. `kernel_init_logging`) already
+    //     won, we DROP the sender so the freshly-spawned drain thread's `recv()`
+    //     errors and it exits — no idle-thread leak, and `SENDER` stays unset so
+    //     `on_event` short-circuits.
     let mut did_install = false;
     INSTALL.call_once(|| {
         did_install = true;
-        let subscriber =
-            tracing_subscriber::registry().with(KernelLogLayer.with_filter(KernelFilter));
-        if tracing::subscriber::set_global_default(subscriber).is_err() {
-            // Another global subscriber (e.g. kernel_init_logging) won. Do not
-            // spawn a drain thread — SENDER stays unset, so on_event's `let Some
-            // (tx)` short-circuits and nothing is enqueued.
-            INSTALL_STATUS.store(INSTALL_ALREADY_SET, Ordering::Release);
-            return;
-        }
-        // We own the subscriber; now stand up the delivery path. Spawn the drain
-        // thread and publish SENDER only after it is confirmed running, so a
-        // live producer never outlives its consumer.
+        // Stand up the delivery path first (thread + channel), so a spawn
+        // failure never leaves the global subscriber slot occupied.
         let (tx, rx) = sync_channel::<Record>(CHANNEL_CAPACITY);
-        match std::thread::Builder::new()
+        if let Err(e) = std::thread::Builder::new()
             .name("kernel-log-drain".to_owned())
             .spawn(move || drain_loop(rx))
         {
-            Ok(_) => {
-                let _ = SENDER.set(tx);
-                INSTALL_STATUS.store(INSTALL_OK, Ordering::Release);
+            // Record the OS error distinctly so on-call can tell a spawn failure
+            // from the benign "already installed" case. Use `.lock().ok()` (not
+            // `.unwrap()`) so a poisoned mutex can't panic across the FFI
+            // boundary — the message is best-effort diagnostics. `tx` drops here
+            // (no thread was spawned); the global subscriber is left untouched.
+            if let Ok(mut guard) = SPAWN_ERROR.get_or_init(|| Mutex::new(None)).lock() {
+                *guard = Some(e.to_string());
             }
-            Err(e) => {
-                // We hold the subscriber but have no consumer; leave SENDER
-                // unset (events short-circuit). Record the OS error distinctly
-                // so on-call can tell a spawn failure (EAGAIN/ENOMEM) from the
-                // benign "already installed" case. Use `.lock().ok()` (not
-                // `.unwrap()`) so a poisoned mutex can't panic across the FFI
-                // boundary — the message is best-effort diagnostics.
-                if let Ok(mut guard) = SPAWN_ERROR.get_or_init(|| Mutex::new(None)).lock() {
-                    *guard = Some(e.to_string());
-                }
-                INSTALL_STATUS.store(INSTALL_SPAWN_FAILED, Ordering::Release);
-            }
+            INSTALL_STATUS.store(INSTALL_SPAWN_FAILED, Ordering::Release);
+            return;
         }
+        // Drain thread is running. Now claim the one global subscriber.
+        let subscriber =
+            tracing_subscriber::registry().with(KernelLogLayer.with_filter(KernelFilter));
+        if tracing::subscriber::set_global_default(subscriber).is_err() {
+            // Another global subscriber won. Drop the sender so the drain thread
+            // (blocked on recv()) unblocks with an error and exits cleanly, then
+            // leave SENDER unset so on_event's `let Some(tx)` short-circuits.
+            drop(tx);
+            INSTALL_STATUS.store(INSTALL_ALREADY_SET, Ordering::Release);
+            return;
+        }
+        // We own the subscriber AND have a live consumer. Publish SENDER only
+        // now, so a live producer never outlives its consumer.
+        let _ = SENDER.set(tx);
+        INSTALL_STATUS.store(INSTALL_OK, Ordering::Release);
     });
     // Rebuild the process-wide callsite interest cache only when it can matter:
     // on the install that set our filter, or when a later call changed LEVEL.
@@ -913,6 +972,17 @@ mod tests {
             level_from_rust_log("databricks=error,info"),
             Some(LEVEL_ERROR)
         );
+        // A submodule directive on the module-path namespace the bridge forwards
+        // (`databricks_sql_kernel::*`) is honoured (most specific wins) rather
+        // than silently ignored — the host asked for that submodule.
+        assert_eq!(
+            level_from_rust_log("databricks=warn,databricks_sql_kernel::session=debug"),
+            Some(LEVEL_DEBUG)
+        );
+        assert_eq!(
+            level_from_rust_log("databricks_sql_kernel::session=debug"),
+            Some(LEVEL_DEBUG)
+        );
     }
 
     #[test]
@@ -955,7 +1025,14 @@ mod tests {
         assert!(directive_targets_kernel("databricks::sql"));
         assert!(directive_targets_kernel(crate::klog::KERNEL_LOG_TARGET));
         assert!(directive_targets_kernel("databricks_sql_kernel"));
-        // Unrelated siblings and over-specific extensions are rejected.
+        // Submodules of the module-path root are accepted (those events are
+        // forwarded by is_kernel_target, so a host targeting them must gate).
+        assert!(directive_targets_kernel("databricks_sql_kernel::session"));
+        assert!(directive_targets_kernel(
+            "databricks_sql_kernel::reader::inline"
+        ));
+        // Unrelated siblings and over-specific extensions of the fixed-depth
+        // klog target are rejected.
         assert!(!directive_targets_kernel("databricksfoo"));
         assert!(!directive_targets_kernel("databricks::sql::kernel::foo"));
         assert!(!directive_targets_kernel("hyper"));
@@ -987,6 +1064,51 @@ mod tests {
         assert!(callsite_interest_for("rustls::conn", true).is_never());
         assert!(callsite_interest_for("databricks::sql::kernel", true).is_sometimes());
         assert!(callsite_interest_for("databricks_sql_kernel::session", true).is_sometimes());
+    }
+
+    #[test]
+    fn poison_sink_if_current_respects_generation() {
+        // Guards the re-registration race: the drain thread copies a sink's
+        // generation out, runs the callback unlocked, and only poisons on unwind
+        // if that generation is STILL installed — so an old in-flight callback's
+        // failure can't kill a callback the host registered in the meantime.
+        let lock = SINK.get_or_init(|| Mutex::new(None));
+
+        // Install a sink at generation `g_old`, unpoisoned.
+        let g_old = NEXT_SINK_GEN.fetch_add(1, Ordering::Relaxed);
+        *lock.lock().unwrap() = Some(Sink {
+            cb: ok_cb,
+            ctx: 0,
+            gen: g_old,
+        });
+        SINK_POISONED.store(false, Ordering::Relaxed);
+
+        // A failure attributed to the CURRENT generation poisons.
+        poison_sink_if_current(g_old);
+        assert!(
+            SINK_POISONED.load(Ordering::Relaxed),
+            "a failure on the installed generation must poison"
+        );
+
+        // Simulate a re-registration: newer generation, poison cleared.
+        let g_new = NEXT_SINK_GEN.fetch_add(1, Ordering::Relaxed);
+        *lock.lock().unwrap() = Some(Sink {
+            cb: ok_cb,
+            ctx: 0,
+            gen: g_new,
+        });
+        SINK_POISONED.store(false, Ordering::Relaxed);
+
+        // A LATE failure from the OLD generation must NOT poison the new sink.
+        poison_sink_if_current(g_old);
+        assert!(
+            !SINK_POISONED.load(Ordering::Relaxed),
+            "an old callback's unwind must not poison a newer registration"
+        );
+
+        // Restore the process-global sink state for any other test.
+        *lock.lock().unwrap() = None;
+        SINK_POISONED.store(false, Ordering::Relaxed);
     }
 
     #[test]

@@ -60,6 +60,18 @@ extern "C-unwind" fn capture_cb(
     CAPTURED.lock().unwrap().push((level, target, message));
 }
 
+/// A callback that always unwinds across the FFI boundary. The bridge's
+/// `catch_unwind` must contain it, count the undelivered record, and poison the
+/// sink (stop delivery) rather than abort the process.
+extern "C-unwind" fn panic_cb(
+    _ctx: *mut c_void,
+    _level: c_int,
+    _target: *const c_char,
+    _message: *const c_char,
+) {
+    panic!("callback boom");
+}
+
 /// Poll up to ~1s for the captured records to satisfy `pred`, returning the
 /// final snapshot either way (delivery is async via the bridge's drain thread).
 fn wait_until(pred: impl Fn(&[(c_int, String, String)]) -> bool) -> Vec<(c_int, String, String)> {
@@ -211,6 +223,55 @@ fn log_callback_delivers_and_level_gates_end_to_end() {
     );
     assert_eq!(dropped, 0, "a healthy delivery should not drop records");
 
-    // Reclaim the leaked ctx marker (kept alive across the calls above).
-    unsafe { drop(Box::from_raw(ctx_ptr as *mut u64)) };
+    // === Step 4: a callback that unwinds is counted as a drop and poisons the
+    // sink. ===
+    // Re-register a callback that always panics (which clears the poison and
+    // starts a fresh generation), emit one kernel event, and confirm the bridge
+    // (a) contained the unwind — the process is still alive to run these asserts
+    // — (b) counted the undelivered record in `dropped` (previously the first
+    // unwinding record was silently uncounted), and (c) poisoned the sink so
+    // `installed` now reads false.
+    let panic_ctx: Box<u64> = Box::new(0xBADF00D);
+    let panic_ctx_ptr = Box::into_raw(panic_ctx) as *mut c_void;
+    let level_trace2 = std::ffi::CString::new("trace").unwrap();
+    let rc =
+        unsafe { kernel_set_log_callback(Some(panic_cb), panic_ctx_ptr, level_trace2.as_ptr()) };
+    assert_eq!(
+        rc,
+        KernelStatusCode::Success,
+        "re-registering the panicking callback must succeed; got {rc:?}"
+    );
+
+    let dropped_before = dropped;
+    tracing::error!(target: databricks_sql_kernel::KERNEL_LOG_TARGET, "probe-unwinds-d4");
+    // Poll for the sink to be poisoned (delivery attempted, callback unwound).
+    let mut installed_after = true;
+    let mut dropped_after = dropped_before;
+    for _ in 0..100 {
+        unsafe {
+            databricks_sql_kernel::c_abi::logging::kernel_logging_stats(
+                &mut installed_after,
+                &mut dropped_after,
+            )
+        };
+        if !installed_after {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    assert!(
+        !installed_after,
+        "a callback that unwinds must poison the sink so installed reads false"
+    );
+    assert!(
+        dropped_after > dropped_before,
+        "the record whose callback unwound must be counted in dropped \
+         (before={dropped_before}, after={dropped_after})"
+    );
+
+    // Reclaim the leaked ctx markers (kept alive across the calls above).
+    unsafe {
+        drop(Box::from_raw(ctx_ptr as *mut u64));
+        drop(Box::from_raw(panic_ctx_ptr as *mut u64));
+    }
 }
