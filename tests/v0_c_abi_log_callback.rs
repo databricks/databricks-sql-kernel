@@ -269,9 +269,50 @@ fn log_callback_delivers_and_level_gates_end_to_end() {
          (before={dropped_before}, after={dropped_after})"
     );
 
+    // === Step 5: re-registering a good callback after poison restores delivery.
+    // ===
+    // The host's documented recovery path: install a fresh, well-behaved
+    // callback. Registration clears the poison and starts a new generation, so
+    // `installed` must flip back to true and a NEW event must be delivered again
+    // — proving a single misbehaving callback doesn't permanently wedge the
+    // bridge for the rest of the process.
+    let recover_ctx: Box<u64> = Box::new(0x600D);
+    let recover_ctx_ptr = Box::into_raw(recover_ctx) as *mut c_void;
+    let level_trace3 = std::ffi::CString::new("trace").unwrap();
+    let rc = unsafe {
+        kernel_set_log_callback(Some(capture_cb), recover_ctx_ptr, level_trace3.as_ptr())
+    };
+    assert_eq!(
+        rc,
+        KernelStatusCode::Success,
+        "re-registering a good callback after poison must succeed; got {rc:?}"
+    );
+
+    let mut installed_recovered = false;
+    let mut dropped_recovered = 0u64;
+    unsafe {
+        databricks_sql_kernel::c_abi::logging::kernel_logging_stats(
+            &mut installed_recovered,
+            &mut dropped_recovered,
+        )
+    };
+    assert!(
+        installed_recovered,
+        "re-registering a good callback must clear the poison and flip installed back to true"
+    );
+
+    let recovery_marker = "probe-recovered-e5";
+    tracing::error!(target: databricks_sql_kernel::KERNEL_LOG_TARGET, "{}", recovery_marker);
+    let got = wait_until(|g| saw_marker(g, recovery_marker));
+    assert!(
+        saw_marker(&got, recovery_marker),
+        "delivery must resume after re-registering a good callback post-poison; captured={got:?}"
+    );
+
     // Reclaim the leaked ctx markers (kept alive across the calls above).
     unsafe {
         drop(Box::from_raw(ctx_ptr as *mut u64));
         drop(Box::from_raw(panic_ctx_ptr as *mut u64));
+        drop(Box::from_raw(recover_ctx_ptr as *mut u64));
     }
 }
