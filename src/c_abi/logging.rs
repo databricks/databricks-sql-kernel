@@ -72,6 +72,7 @@ use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
 use std::sync::{Mutex, OnceLock, RwLock};
+use std::time::{Duration, Instant};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
@@ -123,6 +124,13 @@ struct Sink {
 
 const CHANNEL_CAPACITY: usize = 4096;
 
+/// Minimum spacing between synthetic "dropped N" notices the drain thread emits
+/// through the callback. Bounds notice frequency under sustained overflow so an
+/// already-slow callback isn't handed ~2× the invocations (a notice before every
+/// real record); the exact cumulative count remains available via
+/// [`kernel_logging_stats`].
+const NOTICE_MIN_INTERVAL: Duration = Duration::from_secs(1);
+
 const LEVEL_OFF: u8 = 0;
 const LEVEL_ERROR: u8 = 1;
 const LEVEL_WARN: u8 = 2;
@@ -160,9 +168,11 @@ static DIRECTIVES: OnceLock<RwLock<Vec<(String, u8)>>> = OnceLock::new();
 
 /// Count of log records dropped because the bounded channel was full (a slow
 /// host callback) or the drain thread stopped. Surfaced via
-/// [`kernel_logging_stats`] and via a synthetic "dropped N" line the drain
-/// thread emits on recovery, so drop-on-full loss is observable rather than
-/// silent (parity with the napi bridge's `DROPPED`).
+/// [`kernel_logging_stats`] (exact cumulative count) and via a synthetic
+/// "dropped N" line the drain thread emits on recovery — throttled to at most
+/// one per [`NOTICE_MIN_INTERVAL`] so it can't amplify an overloaded callback —
+/// so drop-on-full loss is observable rather than silent (parity with the napi
+/// bridge's `DROPPED`).
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
 /// Set if the host callback ever unwound (panicked) across the FFI boundary.
@@ -323,19 +333,23 @@ const KERNEL_TARGET_ROOTS: [&str; 2] = [crate::klog::KERNEL_LOG_TARGET, KERNEL_M
 /// against the targets the bridge actually forwards. A directive applies when:
 ///
 ///   - its target is a **prefix of a canonical root** (`databricks`,
-///     `databricks::sql`, `databricks_sql_kernel`, …) — it matches events at
-///     that root; or
-///   - its target **extends the module-path root** (`databricks_sql_kernel::session`)
-///     — those submodule events are forwarded by `is_kernel_target`, so a host
-///     targeting a specific kernel submodule must raise the threshold rather
-///     than be silently ignored.
+///     `databricks::sql`, `databricks_sql`, `databricks_sql_kernel`, …) — it
+///     matches events at that root; or
+///   - its target is the module-path root or a `::`-boundary submodule of it
+///     (`databricks_sql_kernel::session`) — those submodule events are
+///     forwarded by `is_kernel_target`, so a host targeting a specific kernel
+///     submodule must raise the threshold rather than be silently ignored.
 ///
-/// It is rejected otherwise: an unrelated `databricks`-prefixed sibling
-/// (`databricksfoo`) matches no kernel event, and an extension of the
-/// fixed-depth `klog!` target (`databricks::sql::kernel::foo`) matches nothing
-/// either, since the kernel never emits deeper than `databricks::sql::kernel`.
+/// The submodule check uses the SAME segment-boundary helper as
+/// [`is_kernel_target`] ([`is_target_or_submodule`]), so an unrelated
+/// module-root SIBLING (`databricks_sql_kernel_ext`) is rejected: it matches no
+/// forwarded event, and accepting it as a raw prefix would needlessly raise
+/// `MAX_LEVEL` and push kernel events onto the directive lock/scan path.
+/// Also rejected: a `databricks`-prefixed sibling that isn't a root prefix
+/// (`databricksfoo`), and an extension of the fixed-depth `klog!` target
+/// (`databricks::sql::kernel::foo`), which the kernel never emits.
 fn directive_targets_kernel(target: &str) -> bool {
-    target.starts_with(KERNEL_MODULE_ROOT)
+    is_target_or_submodule(target, KERNEL_MODULE_ROOT)
         || KERNEL_TARGET_ROOTS
             .iter()
             .any(|root| root.starts_with(target))
@@ -613,9 +627,12 @@ fn poison_sink_if_current(gen: u64) {
 /// callback with borrowed C strings. Runs off the kernel's tokio workers so a
 /// slow callback can't stall query execution.
 fn drain_loop(rx: Receiver<Record>) {
-    // Drop count already reported to the host, so we only emit a synthetic
-    // "dropped N" notice for the delta since the last delivered record.
+    // Drop count already reported to the host, so a synthetic "dropped N" notice
+    // only carries the delta since the last notice.
     let mut reported_drops: u64 = 0;
+    // Timestamp of the last drop-notice, for throttling (see NOTICE_MIN_INTERVAL).
+    // `None` until the first notice, so the first drop is reported promptly.
+    let mut last_notice: Option<Instant> = None;
     // `recv` errors only once the (process-global) sender is dropped, which
     // happens on a lost subscriber race (the setter drops the sender so this
     // thread exits) or process teardown; exit cleanly either way.
@@ -640,17 +657,22 @@ fn drain_loop(rx: Receiver<Record>) {
         let Some((cb, ctx, gen)) = sink else {
             continue;
         };
-        // Surface any records dropped since the last delivery as one synthetic
-        // WARN line through the callback itself, so a host that only reads the
+        // Surface records dropped since the last notice as one synthetic WARN
+        // line through the callback itself, so a host that only reads the
         // callback stream still learns it missed events (kernel_logging_stats
-        // carries the cumulative count for a host that polls).
+        // carries the cumulative count for a host that polls). THROTTLED to at
+        // most one notice per NOTICE_MIN_INTERVAL: under sustained overflow an
+        // unthrottled per-record notice would double callback invocations and
+        // prolong the very backlog it reports.
         let dropped = DROPPED.load(Ordering::Relaxed);
-        if dropped > reported_drops {
+        let notice_due = last_notice.is_none_or(|t| t.elapsed() >= NOTICE_MIN_INTERVAL);
+        if dropped > reported_drops && notice_due {
             let notice = format!(
                 "{} kernel log record(s) dropped (slow log callback); increase callback throughput",
                 dropped - reported_drops
             );
             reported_drops = dropped;
+            last_notice = Some(Instant::now());
             if !invoke_callback(
                 cb,
                 ctx,
@@ -1257,6 +1279,10 @@ mod tests {
         assert!(!directive_targets_kernel("databricksfoo"));
         assert!(!directive_targets_kernel("databricks::sql::kernel::foo"));
         assert!(!directive_targets_kernel("hyper"));
+        // A module-root SIBLING (not a `::`-boundary submodule) is rejected —
+        // it raw-prefixes `databricks_sql_kernel` but matches no forwarded event
+        // (this is the segment-boundary alignment with is_kernel_target).
+        assert!(!directive_targets_kernel("databricks_sql_kernel_ext"));
     }
 
     #[test]

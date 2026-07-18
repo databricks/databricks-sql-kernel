@@ -55,7 +55,9 @@
  * otherwise a layout change (e.g. a reordered `KernelStatusCode`) would be
  * misread as valid data rather than surfaced as a clean error. The macro is
  * bumped in lockstep with the Rust `KERNEL_ABI_VERSION` on any layout or
- * semantic change.
+ * semantic change AND on any change to the exported symbol set (a
+ * consumer built against a header declaring a newer symbol would otherwise
+ * link an older library missing it and fail only at load/run time).
  *
  * ## Lifecycle & threading notes
  *
@@ -108,7 +110,7 @@ extern "C" {
  * load time and refuse to run on a mismatch (see "ABI versioning" above).
  * Bumped in lockstep with the Rust `KERNEL_ABI_VERSION`.
  */
-#define DATABRICKS_KERNEL_ABI_VERSION 1
+#define DATABRICKS_KERNEL_ABI_VERSION 2
 
 /* Version of the C ABI compiled into the linked library. Infallible and
  * side-effect-free. */
@@ -329,8 +331,9 @@ KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
  * `message` are valid only for the duration of the call — copy them out.
  * Records are enqueued on a bounded channel and DROPPED on overflow (logs are
  * advisory and never back-pressure a kernel hot path); the drop count is
- * observable via kernel_logging_stats and a synthetic "N dropped" line the
- * drain thread emits through the callback on recovery.
+ * observable via kernel_logging_stats (exact cumulative count) and a synthetic
+ * "N dropped" line the drain thread emits through the callback on recovery
+ * (throttled to at most once per second so it can't amplify a slow callback).
  *
  * The `level` PARAMETER (OFF/ERROR/WARN/INFO/DEBUG/TRACE, case-insensitive, or
  * NULL) sets the forward threshold with the SAME precedence as

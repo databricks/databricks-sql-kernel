@@ -367,13 +367,20 @@ impl From<crate::kernel_error::ErrorCode> for KernelStatusCode {
 }
 
 /// Current C-ABI version. Bump this on any change that alters a struct
-/// layout ([`KernelStatusCode`], `KernelError`) or the meaning of an
-/// existing symbol, so a consumer compiled against one header can detect
-/// a library built against a different one. Kept in lockstep with the
-/// `DATABRICKS_KERNEL_ABI_VERSION` macro in `include/databricks_kernel.h`
-/// (the C-smoke test asserts the two agree). Pure v0.x aid — there is no
-/// ABI stability promise until v1.0.
-pub const KERNEL_ABI_VERSION: u32 = 1;
+/// layout ([`KernelStatusCode`], `KernelError`), changes the meaning of an
+/// existing symbol, or ADDS / REMOVES an exported symbol — so a consumer
+/// compiled against one header can detect a library built against a
+/// different one. The symbol-set case matters as much as the layout one: a
+/// consumer built against a header that declares a new symbol
+/// (`kernel_set_log_callback`, `kernel_logging_stats`, …) could otherwise
+/// link an older library that lacks it and only discover the missing symbol
+/// at load/run time. Kept in lockstep with the `DATABRICKS_KERNEL_ABI_VERSION`
+/// macro in `include/databricks_kernel.h` (the C smoke test asserts the two
+/// agree). Pure v0.x aid — there is no ABI stability promise until v1.0.
+///
+/// History: `1` = initial surface; `2` = added the log-callback bridge
+/// (`kernel_set_log_callback`, `kernel_logging_stats`, `kernel_log_callback`).
+pub const KERNEL_ABI_VERSION: u32 = 2;
 
 /// Report the C-ABI version compiled into this library. A consumer that
 /// linked a header declaring `DATABRICKS_KERNEL_ABI_VERSION` should refuse
