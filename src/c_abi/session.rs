@@ -23,7 +23,7 @@
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
 use super::cancel::{kernel_cancel_token_t, token_ref};
-use super::{block_on_ffi, block_on_ffi_cancellable, KernelStatusCode};
+use super::{block_on_ffi_cancellable, KernelStatusCode};
 use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
@@ -898,6 +898,52 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
 pub unsafe extern "C" fn kernel_session_close_blocking(
     session: *mut kernel_session_t,
 ) -> KernelStatusCode {
+    session_close_blocking_inner(session, None)
+}
+
+/// Blocking close, racing the (blocking) `DeleteSession` against `cancel_token`
+/// so a host can bound a wedged / partitioned close by its own deadline instead
+/// of blocking up to the retry ceiling. A **null** `cancel_token` behaves
+/// exactly like [`kernel_session_close_blocking`]. If the token fires (or is
+/// already fired) before the delete completes, this returns
+/// [`KernelStatusCode::Cancelled`].
+///
+/// Consumes the handle on **every** path — success, delete error, AND
+/// `Cancelled`. On cancel the awaited future (which owns the boxed session) is
+/// dropped, so the session is released via its `Drop` (a best-effort
+/// fire-and-forget delete, like [`kernel_session_close`]); the caller must not
+/// use or free `session` afterwards regardless of the return code.
+///
+/// The `cancel_token` is borrowed, not consumed: the caller still owns it and
+/// must [`kernel_cancel_token_free`](crate::c_abi::cancel::kernel_cancel_token_free)
+/// it after this returns. It is safe to fire the token from another thread while
+/// this call is in flight (that is the intended use).
+///
+/// # Safety
+/// `session` carries the same contract as [`kernel_session_close_blocking`].
+/// `cancel_token`, if non-null, must be a live handle from
+/// [`kernel_cancel_token_new`](crate::c_abi::cancel::kernel_cancel_token_new)
+/// that is not freed until this call returns.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_close_blocking_cancellable(
+    session: *mut kernel_session_t,
+    cancel_token: *const kernel_cancel_token_t,
+) -> KernelStatusCode {
+    session_close_blocking_inner(session, token_ref(cancel_token))
+}
+
+/// Shared body for [`kernel_session_close_blocking`] and
+/// [`kernel_session_close_blocking_cancellable`]. Owns the "handle is consumed
+/// on every path" contract in one place; `token` (None for the plain entry
+/// point) is threaded into `Session::close`'s `block_on`.
+///
+/// # Safety
+/// See [`kernel_session_close_blocking`]. `token` must outlive the call when
+/// `Some`.
+unsafe fn session_close_blocking_inner(
+    session: *mut kernel_session_t,
+    token: Option<&CancellationToken>,
+) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
     if session.is_null() {
         crate::c_abi::error::store_error(
@@ -909,11 +955,14 @@ pub unsafe extern "C" fn kernel_session_close_blocking(
     // Reclaim the box and await the delete on the process-wide runtime.
     // `Session::close(self)` consumes the session, so move the boxed value
     // into the future (mirroring `build_session`'s move of the config).
-    // On error the code is returned and the typed error is already stored
-    // by `block_on_ffi`; the session box is dropped either way, honouring
-    // the consume contract.
+    // On error the code is returned and the typed error is already stored;
+    // on a fired token the future is dropped, taking the boxed session with
+    // it (its `Drop` runs the fire-and-forget delete). Either way the box is
+    // released, honouring the consume-on-every-path contract.
     let session = Box::from_raw(session as *mut Session);
-    match block_on_ffi(move || Box::pin(async move { session.close().await })) {
+    match block_on_ffi_cancellable(token, move || {
+        Box::pin(async move { session.close().await })
+    }) {
         Ok(()) => KernelStatusCode::Success,
         Err(code) => code,
     }

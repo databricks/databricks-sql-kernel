@@ -240,14 +240,23 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  * cancels the LATER query. Use one per execute (new before execute, free after
  * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
-/* Cooperative cancel token for the blocking `*_cancellable` entry points
- * (kernel_session_open_cancellable, kernel_result_stream_next_batch_cancellable).
- * Create one before a blocking call, pass it in, and fire it from ANOTHER
- * thread (kernel_cancel_token_cancel) when the caller's deadline elapses; the
- * blocked call then drops its in-flight request future and returns
- * KernelStatusCode_Cancelled. One-shot (a fired token stays fired) — create a
- * fresh token per logical operation. Firing is purely local (no RPC), so it
- * never blocks. See "Cooperative cancellation" below. */
+/* Cooperative cancel token for the blocking `*_cancellable` entry points:
+ * kernel_session_open_cancellable, kernel_result_stream_next_batch_cancellable,
+ * and kernel_session_close_blocking_cancellable — i.e. the blocking calls a
+ * host issues on the connect / fetch / close lifecycle path. Create one before
+ * a blocking call, pass it in, and fire it from ANOTHER thread
+ * (kernel_cancel_token_cancel) when the caller's deadline elapses; the blocked
+ * call then stops waiting and returns KernelStatusCode_Cancelled. One-shot (a
+ * fired token stays fired) — create a fresh token per logical operation. Firing
+ * is purely local (no RPC), so it never blocks. See "Cooperative cancellation"
+ * below.
+ *
+ * NOT cancellable (by design, for now): the metadata entry points
+ * (kernel_metadata_*) have no `_cancellable` twin — they have no host consumer
+ * that needs a caller deadline yet, so the surface isn't added speculatively. A
+ * metadata call against a wedged warehouse is still bounded by the transport's
+ * request/overall timeouts. Twins can be added the same additive way (route
+ * run_metadata through block_on_ffi_cancellable) if a host adopts them. */
 typedef struct kernel_cancel_token_t kernel_cancel_token_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
@@ -442,15 +451,34 @@ KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session
 KernelStatusCode kernel_session_close(kernel_session_t* session);
 
 /*
- * Close a session and BLOCK until the server-side DeleteSession completes
- * (or errors). Unlike kernel_session_close (fire-and-forget), a program
- * that exits right after this returns has a confirmed server-side delete —
- * the parity path for a host that wants close to behave like the
- * synchronous DeleteSession RPC. CONSUMES `session` like
+ * Close a session and BLOCK until the server-side DeleteSession has been
+ * ATTEMPTED to completion. Unlike kernel_session_close (fire-and-forget),
+ * this waits for the delete round-trip — the parity path for a host that
+ * wants close to behave like the synchronous DeleteSession RPC. NOTE:
+ * Success means the delete was attempted, NOT server-confirmed — a transient
+ * failure after retries is logged and swallowed (matching the direct-Rust /
+ * pyo3 / napi Session::close), so a partitioned delete still returns Success
+ * (the server reclaims the session on idle-timeout). CONSUMES `session` like
  * kernel_session_close (released on success and failure alike); the same
  * "close the session LAST" teardown ordering applies.
  */
 KernelStatusCode kernel_session_close_blocking(kernel_session_t* session);
+
+/*
+ * Like kernel_session_close_blocking, but races the (blocking) DeleteSession
+ * against `cancel_token` so a host can bound a wedged / partitioned close by
+ * its own deadline instead of blocking up to the retry ceiling. A NULL
+ * `cancel_token` behaves EXACTLY like kernel_session_close_blocking. If the
+ * token fires (or is already fired), this returns KernelStatusCode_Cancelled.
+ * CONSUMES `session` on EVERY path — success, delete error, AND Cancelled: on
+ * cancel the session is released via a best-effort fire-and-forget delete
+ * (like kernel_session_close), so the caller must not use or free it after
+ * this returns regardless of the code. `cancel_token` is borrowed, not
+ * consumed: the caller still owns and must free it after this returns, and may
+ * fire it from another thread while this call is in flight.
+ */
+KernelStatusCode kernel_session_close_blocking_cancellable(
+    kernel_session_t* session, const kernel_cancel_token_t* cancel_token);
 
 /*
  * Like kernel_session_open, but races the (blocking) connect against
