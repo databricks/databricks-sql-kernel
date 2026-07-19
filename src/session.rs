@@ -802,6 +802,16 @@ fn build_retry_configs_for_session(
 /// through the existing `set_session_conf` entry point.
 pub(crate) const CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS: &str = "cloudfetch_max_chunks_in_memory";
 
+/// Upper bound applied to a host-supplied
+/// [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`] value. Peak RSS grows roughly
+/// linearly with this knob (each in-memory chunk is tens of MB), so an
+/// unbounded value — a typo like `"1000000"` meant as `"100"`, or a host bug —
+/// risks OOM on large result sets. This ceiling (16× the default of 16, and 8×
+/// the most aggressive value we've measured) is comfortably above any real
+/// tuning yet bounds the blast radius of a fat-fingered value; a request above
+/// it is clamped with a `warn!`, mirroring the retry setter's clamp discipline.
+pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
+
 /// Fold client-only result-management knobs carried in `session_conf`
 /// into the typed [`ResultConfig`], then remove them from `session_conf`
 /// so they cannot leak onto the SEA wire.
@@ -811,8 +821,10 @@ pub(crate) const CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS: &str = "cloudfetch_max_chunk
 /// present-but-unparseable or zero value is ignored (default preserved)
 /// with a warning rather than failing session creation — a
 /// best-effort tuning knob should never turn a typo into a connect
-/// error. Matched case-insensitively, consistent with the rest of the
-/// `session_conf` handling.
+/// error. A value above [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to
+/// that ceiling (with a warning) so a fat-fingered value can't drive peak
+/// RSS toward OOM. Matched case-insensitively, consistent with the rest of
+/// the `session_conf` handling.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
     let key = config
         .session_conf
@@ -825,9 +837,20 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
     let raw = config.session_conf.remove(&key).unwrap_or_default();
     match raw.trim().parse::<usize>() {
         Ok(n) if n > 0 => {
-            config.result.cloudfetch_max_chunks_in_memory = n;
+            // Clamp to a sane ceiling: peak RSS scales with this knob, so an
+            // absurd value (typo / host bug) would otherwise risk OOM.
+            let clamped = n.min(CLOUDFETCH_MAX_CHUNKS_CEILING);
+            if clamped != n {
+                crate::klog::warn!(
+                    requested = n,
+                    ceiling = CLOUDFETCH_MAX_CHUNKS_CEILING,
+                    "clamping cloudfetch_max_chunks_in_memory to the ceiling \
+                     (peak RSS scales with this knob)",
+                );
+            }
+            config.result.cloudfetch_max_chunks_in_memory = clamped;
             crate::klog::debug!(
-                max_chunks_in_memory = n,
+                max_chunks_in_memory = clamped,
                 "applied client cloudfetch_max_chunks_in_memory override",
             );
         }
@@ -1135,6 +1158,35 @@ mod retry_config_tests {
                 "value {bad:?} should still be stripped",
             );
         }
+    }
+
+    /// A value above the ceiling is clamped (not rejected) so a fat-fingered
+    /// value can't drive peak RSS toward OOM; the just-at-ceiling value passes
+    /// through unclamped. Both are still stripped from session_conf.
+    #[test]
+    fn cloudfetch_max_chunks_above_ceiling_is_clamped() {
+        // Well above the ceiling → clamped down.
+        let mut cfg = config_with_session_conf(HashMap::from([(
+            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            "1000000".to_string(),
+        )]));
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(
+            cfg.result.cloudfetch_max_chunks_in_memory, CLOUDFETCH_MAX_CHUNKS_CEILING,
+            "an absurd value must clamp to the ceiling"
+        );
+        assert!(cfg.session_conf.is_empty());
+
+        // Exactly at the ceiling → unchanged (boundary is inclusive).
+        let mut cfg = config_with_session_conf(HashMap::from([(
+            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            CLOUDFETCH_MAX_CHUNKS_CEILING.to_string(),
+        )]));
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(
+            cfg.result.cloudfetch_max_chunks_in_memory,
+            CLOUDFETCH_MAX_CHUNKS_CEILING,
+        );
     }
 
     /// The client knob is NOT in the server allowlist, so even if it were

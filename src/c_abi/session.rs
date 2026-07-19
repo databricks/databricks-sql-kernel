@@ -656,6 +656,36 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
     (!v.is_empty()).then_some(v)
 }
 
+/// Fold the C-side custom headers and optional [`RetrySpec`] onto a fresh
+/// [`HttpConfig`]. Both live on `HttpConfig`, so we start from defaults and set
+/// only the fields a setter populated — every other HTTP default (per-request
+/// timeout, pool size, and the retry knobs when no `RetrySpec` was set) is
+/// preserved.
+///
+/// This is the code that actually configures live retries (called from
+/// `build_session` whenever headers or a retry spec were set), so it is a pure
+/// helper kept unit-testable without a live session.
+fn merge_http_config(
+    custom_headers: Vec<(String, String)>,
+    retry: Option<RetrySpec>,
+) -> HttpConfig {
+    let mut http = HttpConfig {
+        custom_headers,
+        ..HttpConfig::default()
+    };
+    if let Some(r) = retry {
+        http.retry_min_wait = r.min_wait;
+        http.retry_max_wait = r.max_wait;
+        http.retry_max_retries = r.max_retries;
+        // Only override the cumulative budget when the host set it; otherwise
+        // HttpConfig::default()'s 900s is preserved.
+        if let Some(t) = r.overall_timeout {
+            http.overall_timeout = t;
+        }
+    }
+    http
+}
+
 /// Translate the C-side config into a [`Session`], driving the async
 /// `Session::open` on the process-wide runtime. Errors are stored in the
 /// thread-local buffer; the returned `KernelStatusCode` is the mapped
@@ -719,27 +749,13 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .session_conf(session_conf);
 
             // HTTP config: custom headers and/or an overriding retry policy.
-            // Both live on HttpConfig, so build one from defaults and set only
-            // the fields a setter populated — every other HTTP default
-            // (timeouts, pool size, and retry when no retry spec was set) is
-            // preserved. Skip the .http() call entirely when neither was set so
-            // the kernel's full HttpConfig::default() applies untouched.
+            // Skip the .http() call entirely when neither was set so the
+            // kernel's full HttpConfig::default() applies untouched. The merge
+            // itself is a pure helper (`merge_http_config`) so it can be
+            // unit-tested without a live session — it is the code that actually
+            // configures live retries.
             if !custom_headers.is_empty() || retry.is_some() {
-                let mut http = HttpConfig {
-                    custom_headers,
-                    ..HttpConfig::default()
-                };
-                if let Some(r) = retry {
-                    http.retry_min_wait = r.min_wait;
-                    http.retry_max_wait = r.max_wait;
-                    http.retry_max_retries = r.max_retries;
-                    // Only override the cumulative budget when the host set it;
-                    // otherwise HttpConfig::default()'s 900s is preserved.
-                    if let Some(t) = r.overall_timeout {
-                        http.overall_timeout = t;
-                    }
-                }
-                builder = builder.http(http);
+                builder = builder.http(merge_http_config(custom_headers, retry));
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
@@ -1009,5 +1025,81 @@ mod tests {
             assert!(config.as_ref().unwrap().retry.is_none());
             kernel_session_config_free(config);
         }
+    }
+
+    /// A `RetrySpec` maps field-for-field onto `HttpConfig`, and a `Some`
+    /// `overall_timeout` overrides the default budget. This covers the merge
+    /// that actually configures live retries — a min/max swap or a dropped
+    /// assignment would be caught here.
+    #[test]
+    fn merge_http_config_maps_every_retry_field() {
+        let http = merge_http_config(
+            Vec::new(),
+            Some(RetrySpec {
+                min_wait: Duration::from_millis(500),
+                max_wait: Duration::from_millis(30_000),
+                max_retries: 9,
+                overall_timeout: Some(Duration::from_millis(120_000)),
+            }),
+        );
+        assert_eq!(http.retry_min_wait, Duration::from_millis(500));
+        assert_eq!(http.retry_max_wait, Duration::from_millis(30_000));
+        assert_eq!(http.retry_max_retries, 9);
+        assert_eq!(http.overall_timeout, Duration::from_millis(120_000));
+    }
+
+    /// A `None` `overall_timeout` (host left it 0) preserves the kernel's
+    /// default 900s budget while still applying the other retry knobs — the
+    /// case a `&&`/`||` gate slip or an unconditional override would break.
+    #[test]
+    fn merge_http_config_none_timeout_keeps_default_budget() {
+        let default_budget = HttpConfig::default().overall_timeout;
+        let http = merge_http_config(
+            Vec::new(),
+            Some(RetrySpec {
+                min_wait: Duration::from_millis(1),
+                max_wait: Duration::from_millis(1_000),
+                max_retries: 2,
+                overall_timeout: None,
+            }),
+        );
+        assert_eq!(
+            http.overall_timeout, default_budget,
+            "None overall_timeout must keep HttpConfig::default()'s budget"
+        );
+        assert_eq!(http.retry_max_retries, 2, "other knobs still apply");
+    }
+
+    /// A retry-only config (no custom headers) still produces a populated
+    /// `HttpConfig` — guards against a merge that only fires when headers are
+    /// present. Conversely a headers-only config leaves every retry knob at
+    /// its default.
+    #[test]
+    fn merge_http_config_retry_only_and_headers_only() {
+        // Retry-only: knobs applied, headers empty.
+        let retry_only = merge_http_config(
+            Vec::new(),
+            Some(RetrySpec {
+                min_wait: Duration::from_millis(250),
+                max_wait: Duration::from_millis(5_000),
+                max_retries: 4,
+                overall_timeout: None,
+            }),
+        );
+        assert!(retry_only.custom_headers.is_empty());
+        assert_eq!(retry_only.retry_min_wait, Duration::from_millis(250));
+        assert_eq!(retry_only.retry_max_retries, 4);
+
+        // Headers-only: header carried through, retry knobs untouched from default.
+        let default = HttpConfig::default();
+        let headers_only = merge_http_config(vec![("X-Test".to_string(), "1".to_string())], None);
+        assert_eq!(
+            headers_only.custom_headers,
+            vec![("X-Test".to_string(), "1".to_string())]
+        );
+        assert_eq!(headers_only.retry_min_wait, default.retry_min_wait);
+        assert_eq!(headers_only.retry_max_wait, default.retry_max_wait);
+        assert_eq!(headers_only.retry_max_retries, default.retry_max_retries);
+        assert_eq!(headers_only.overall_timeout, default.overall_timeout);
     }
 }
