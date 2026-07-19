@@ -73,9 +73,9 @@ use tracing_subscriber::layer::{Context, Filter, Layer, SubscriberExt};
 use tracing_subscriber::registry::LookupSpan;
 
 /// Host log sink: a C function pointer plus an opaque host context passed back
-/// verbatim on every call. `level` is 1=ERROR..5=TRACE (mirrors the bridge's
-/// numeric severity); `target` and `message` are NUL-terminated C strings valid
-/// only for the duration of the call.
+/// verbatim on every call. `level` is a `KernelLogLevel` value (1=ERROR..5=TRACE;
+/// see the `LEVEL_*` constants and the header enum); `target` and `message` are
+/// NUL-terminated C strings valid only for the duration of the call.
 ///
 /// The ABI is `C-unwind` so a panicking host callback propagates across the
 /// boundary and `invoke_callback`'s `catch_unwind` can contain it; a plain
@@ -112,12 +112,18 @@ struct Sink {
 
 const CHANNEL_CAPACITY: usize = 4096;
 
-const LEVEL_OFF: u8 = 0;
-const LEVEL_ERROR: u8 = 1;
-const LEVEL_WARN: u8 = 2;
-const LEVEL_INFO: u8 = 3;
-const LEVEL_DEBUG: u8 = 4;
-const LEVEL_TRACE: u8 = 5;
+// Numeric severity delivered to the host callback and used as the forward
+// threshold (low = more severe; `0` = off / emit nothing). These are the Rust
+// side of the header's `KernelLogLevel` enum and MUST stay in lockstep with it
+// (`KernelLogLevel_Off`..`KernelLogLevel_Trace`); `pub` so a consumer of the
+// crate (and the C-ABI documentation) can reference them by name rather than
+// hard-coding 1..5.
+pub const LEVEL_OFF: u8 = 0;
+pub const LEVEL_ERROR: u8 = 1;
+pub const LEVEL_WARN: u8 = 2;
+pub const LEVEL_INFO: u8 = 3;
+pub const LEVEL_DEBUG: u8 = 4;
+pub const LEVEL_TRACE: u8 = 5;
 
 /// Forward threshold for all kernel events: the explicit one-knob level, the
 /// most-verbose kernel-applicable `RUST_LOG` level, or the static `warn`
@@ -581,14 +587,18 @@ fn ensure_installed() -> bool {
 /// `level` (a NUL-terminated `OFF`/`ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE`
 /// string, case-insensitive, or NULL) sets the forward filter with the same
 /// precedence as `kernel_init_logging`: an explicit recognised level wins as a
-/// uniform threshold, else `RUST_LOG` is applied per target. When neither
-/// resolves, the current filter is left unchanged — the `warn` default on the
-/// first call, or the previously-set filter on a re-registration.
+/// uniform threshold, else the single most-verbose kernel-applicable `RUST_LOG`
+/// level (collapsed to one threshold, not per-target filtering — the bridge
+/// carries one level). When neither resolves, the current filter is left
+/// unchanged — the `warn` default on the first call, or the previously-set
+/// filter on a re-registration.
 ///
-/// Returns `Internal` (with a stored last error) if a global `tracing`
-/// subscriber was already installed (they are mutually exclusive; install
-/// exactly one), or if the log-drain thread could not be spawned (retryable —
-/// a later call attempts the install again).
+/// On failure the return code encodes whether a retry could help, so a host
+/// doesn't have to string-match the message: `Internal` (terminal,
+/// `retryable=false`) if a global `tracing` subscriber was already installed
+/// (they are mutually exclusive; install exactly one), or `ResourceExhausted`
+/// (`retryable=true`) if the log-drain thread could not be spawned — a later
+/// call attempts the install again.
 ///
 /// # Safety
 /// `cb` must be a valid function pointer that is thread-safe, does not unwind,
@@ -655,13 +665,15 @@ pub unsafe extern "C" fn kernel_set_log_callback(
                 .get()
                 .and_then(|m| m.lock().ok().and_then(|g| g.clone()))
                 .unwrap_or_else(|| "unknown".to_owned());
-            crate::c_abi::error::store_and_code(Error::new(
-                ErrorCode::Internal,
-                format!(
-                    "kernel_set_log_callback: the log-drain thread could not be started ({detail}); \
+            // `ResourceExhausted` (retryable=true) not `Internal` (retryable=false):
+            // an OS refusal to spawn the drain thread (EAGAIN/ENOMEM) is transient
+            // and a later call retries the install, so the machine-readable
+            // `KernelError.retryable` must say so — distinct from the terminal
+            // already-installed case below, which stays a non-retryable `Internal`.
+            crate::c_abi::error::store_and_code(Error::resource_exhausted().message(format!(
+                "kernel_set_log_callback: the log-drain thread could not be started ({detail}); \
                      kernel logs will not reach the callback"
-                ),
-            ))
+            )))
         }
         // INSTALL_ALREADY_SET (or a still-PENDING install we couldn't take the
         // lock for): a global subscriber was already installed, or the install

@@ -325,8 +325,9 @@ KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
  * back into any kernel_* entry point — a blocking reentrant call would stall the
  * drain thread (that reentrancy guard only covers query workers). `ctx` is
  * passed back verbatim and must stay valid for the process lifetime; `level` is
- * 1=ERROR..5=TRACE; `target` and `message` are valid only for the call — copy
- * them out. Records are enqueued on a bounded channel and DROPPED on overflow
+ * a `KernelLogLevel` value (1=ERROR..5=TRACE); `target` and `message` are valid
+ * only for the call — copy them out. Records are enqueued on a bounded channel
+ * and DROPPED on overflow
  * (logs never back-pressure a kernel hot path); the drop count is observable via
  * kernel_logging_stats.
  *
@@ -338,9 +339,30 @@ KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
  * first call, or the previously-set level on a re-registration.
  *
  * Mutually exclusive with kernel_init_logging (both install the one
- * process-global subscriber): returns Internal, with distinct error messages,
- * if a subscriber was already installed or the drain thread could not start —
- * install exactly ONE. A NULL `cb` returns InvalidArgument (no detach in v0). */
+ * process-global subscriber). The failure code says whether a retry helps
+ * (KernelError.retryable matches, so no message string-matching needed):
+ * Internal (retryable=false) if a subscriber was already installed — terminal,
+ * install exactly ONE; ResourceExhausted (retryable=true) if the drain thread
+ * could not start (EAGAIN/ENOMEM) — a later call retries. A NULL `cb` returns
+ * InvalidArgument (no detach in v0). */
+
+/*
+ * Severity delivered to a `kernel_log_callback` as its `int level`. Values match
+ * the kernel's internal numeric severity (low = more severe). Prefer these
+ * symbols over hard-coded 1..5 so a future level insertion (with an ABI bump)
+ * surfaces as a build change rather than a silent host-side remap. `Off` (0) is
+ * never delivered to a callback — it only appears as a filter threshold meaning
+ * "emit nothing".
+ */
+typedef enum KernelLogLevel {
+  KernelLogLevel_Off = 0,
+  KernelLogLevel_Error = 1,
+  KernelLogLevel_Warn = 2,
+  KernelLogLevel_Info = 3,
+  KernelLogLevel_Debug = 4,
+  KernelLogLevel_Trace = 5,
+} KernelLogLevel;
+
 typedef void (*kernel_log_callback)(void* ctx, int level, const char* target,
                                     const char* message);
 KernelStatusCode kernel_set_log_callback(kernel_log_callback cb, void* ctx,
@@ -682,16 +704,27 @@ KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
 /*
- * Like kernel_result_stream_next_batch, but races the (blocking) fetch against
- * `cancel_token` so a host can interrupt a HUNG CloudFetch chunk (a wedged S3 /
- * pre-signed-URL GET) instead of blocking on it forever. A NULL `cancel_token`
- * behaves EXACTLY like kernel_result_stream_next_batch. If the token fires
- * before the batch is ready, the fetch future is dropped (aborting the in-flight
- * download) and this returns KernelStatusCode_Cancelled; the stream handle stays
- * valid and owned by the caller (close it with kernel_result_stream_close as
- * usual — a cancelled fetch neither consumes nor frees it). `cancel_token` is
- * borrowed and safe to fire from another thread while this call is in flight
- * (see kernel_session_open_cancellable).
+ * Like kernel_result_stream_next_batch, but races the (blocking) wait for the
+ * next batch against `cancel_token` so a host can stop waiting on a HUNG
+ * CloudFetch chunk (a wedged S3 / pre-signed-URL GET) instead of blocking on it
+ * forever. A NULL `cancel_token` behaves EXACTLY like
+ * kernel_result_stream_next_batch. If the token fires before the batch is ready,
+ * this call unblocks promptly and returns KernelStatusCode_Cancelled; the stream
+ * handle stays valid and owned by the caller (close it with
+ * kernel_result_stream_close as usual — a cancelled fetch neither consumes nor
+ * frees it).
+ *
+ * NOTE ON SCOPE: cancel here interrupts the CALLER'S WAIT, not the background
+ * download. The CloudFetch chunk GET runs on a detached kernel task; firing the
+ * token drops only this call's waiter, so the return is prompt but the in-flight
+ * download continues to completion or its own read-timeout (~60s) before its
+ * in-memory slot is released. Closing the stream after a cancel triggers the
+ * provider's own teardown, but does not abort a GET already on the wire either.
+ * (The connect-side kernel_session_open_cancellable DOES abort its in-flight
+ * request, because create-session runs inline in the raced future.)
+ *
+ * `cancel_token` is borrowed and safe to fire from another thread while this
+ * call is in flight (see kernel_session_open_cancellable).
  */
 KernelStatusCode kernel_result_stream_next_batch_cancellable(
     kernel_result_stream_t* stream, struct ArrowArray* out_array,

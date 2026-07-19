@@ -402,3 +402,228 @@ fn next_batch_cancellable_prefired_token_short_circuits_fetch() {
         assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
     }
 }
+
+/// One chunk's worth of Arrow IPC stream bytes carrying a single Int64 column
+/// `n`. Used to build multi-chunk CloudFetch (external-link) results.
+fn arrow_chunk_ipc(values: Vec<i64>) -> Vec<u8> {
+    let batch = RecordBatch::try_from_iter([(
+        "n",
+        std::sync::Arc::new(Int64Array::from(values)) as arrow_array::ArrayRef,
+    )])
+    .unwrap();
+    let mut ipc = Vec::new();
+    {
+        let mut w = StreamWriter::try_new(&mut ipc, &batch.schema()).unwrap();
+        w.write(&batch).unwrap();
+        w.finish().unwrap();
+    }
+    ipc
+}
+
+/// A SUCCEEDED statement body describing a **two-chunk** CloudFetch result whose
+/// chunks are served as external links back at the mock server. Chunk 0 carries
+/// its own `next_chunk_index=1` so the reader keeps going after the first batch.
+fn succeeded_two_chunk_external_body(
+    statement_id: &str,
+    chunk0_url: &str,
+    chunk1_url: &str,
+    chunk0_bytes: i64,
+    chunk1_bytes: i64,
+) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": { "column_count": 1, "columns": [
+                { "name": "n", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0 }
+            ]},
+            "total_chunk_count": 2,
+            "total_row_count": 4,
+            "truncated": false,
+        },
+        "result": {
+            "external_links": [
+                {
+                    "external_link": chunk0_url,
+                    "expiration": "2099-01-01T00:00:00.000Z",
+                    "chunk_index": 0,
+                    "row_offset": 0,
+                    "row_count": 2,
+                    "byte_count": chunk0_bytes,
+                    "next_chunk_index": 1,
+                },
+                {
+                    "external_link": chunk1_url,
+                    "expiration": "2099-01-01T00:00:00.000Z",
+                    "chunk_index": 1,
+                    "row_offset": 2,
+                    "row_count": 2,
+                    "byte_count": chunk1_bytes,
+                },
+            ],
+        },
+    })
+    .to_string()
+}
+
+/// F4: a token fired WHILE a CloudFetch chunk download is genuinely in flight
+/// interrupts the caller's wait promptly. This is the mid-flight fetch property
+/// the pre-fired inline test can't reach (there, no download exists).
+///
+/// Shape: a two-chunk external-link result. Chunk 0's GET returns valid Arrow
+/// IPC immediately, so `execute()` + `get_schema()` (which eagerly waits on
+/// chunk 0) and the FIRST `next_batch` both complete normally. Chunk 1's GET is
+/// STALLED with a long `set_delay`, so the SECOND `next_batch_cancellable` is
+/// blocked on an actually-in-flight download. A watcher thread fires the token
+/// mid-fetch, and the call must return `Cancelled` well before the stall would
+/// elapse — proving cancel interrupts the wait on a live fetch.
+///
+/// Per the corrected F1 contract, this asserts the caller unblocks promptly; it
+/// does NOT assert the background download is torn down (it isn't — the detached
+/// task drains to its read-timeout), which is exactly why the header/rows.go
+/// docs were reworded from "aborts the download" to "stops waiting".
+#[test]
+fn next_batch_cancellable_fires_during_stalled_fetch() {
+    let chunk0 = arrow_chunk_ipc(vec![1, 2]);
+    let chunk0_len = chunk0.len() as i64;
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server =
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            let chunk0_url = format!("{}/cf/stmt-stall/chunk-0.arrow", server.uri());
+            let chunk1_url = format!("{}/cf/stmt-stall/chunk-1.arrow", server.uri());
+
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-stall-fetch","warehouse_id":"test_wh"}"#,
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/2.0/sql/sessions/sess-stall-fetch"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    succeeded_two_chunk_external_body(
+                        "stmt-stall",
+                        &chunk0_url,
+                        &chunk1_url,
+                        chunk0_len,
+                        1024,
+                    ),
+                ))
+                .mount(&server)
+                .await;
+            // Chunk 0: immediate valid Arrow IPC (drives schema + first batch).
+            Mock::given(method("GET"))
+                .and(path("/cf/stmt-stall/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(chunk0.clone()))
+                .mount(&server)
+                .await;
+            // Chunk 1: STALLED — the download the second next_batch blocks on. The
+            // 30s delay is far longer than the cancel latency we assert below.
+            Mock::given(method("GET"))
+                .and(path("/cf/stmt-stall/chunk-1.arrow"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(30))
+                        .set_body_bytes(arrow_chunk_ipc(vec![3, 4])),
+                )
+                .mount(&server)
+                .await;
+            server
+        });
+    let uri = server.uri();
+
+    unsafe {
+        let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_config_new(&mut config),
+            KernelStatusCode::Success
+        );
+        let _held = address_config(config, &uri);
+        let mut session: *mut kernel_session_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_open(config, &mut session),
+            KernelStatusCode::Success
+        );
+        assert!(!session.is_null());
+
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT n FROM t").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+
+        // First batch (chunk 0) fetches normally with a NULL token.
+        let mut arr0 = FFI_ArrowArray::empty();
+        let mut sch0 = FFI_ArrowSchema::empty();
+        let rc = kernel_result_stream_next_batch_cancellable(
+            stream,
+            &mut arr0,
+            &mut sch0,
+            std::ptr::null(),
+        );
+        assert_eq!(
+            rc,
+            KernelStatusCode::Success,
+            "chunk 0 must fetch normally before the stalled chunk 1"
+        );
+
+        // Second batch (chunk 1) is stalled server-side. Fire the token from a
+        // watcher thread after a short beat; the call must return Cancelled well
+        // before the 30s stall elapses.
+        let mut tok: *mut kernel_cancel_token_t = std::ptr::null_mut();
+        assert_eq!(kernel_cancel_token_new(&mut tok), KernelStatusCode::Success);
+        let tok_addr = tok as usize;
+        let watcher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(200));
+            let t = tok_addr as *mut kernel_cancel_token_t;
+            assert_eq!(kernel_cancel_token_cancel(t), KernelStatusCode::Success);
+        });
+
+        let mut arr1 = FFI_ArrowArray::empty();
+        let mut sch1 = FFI_ArrowSchema::empty();
+        let start = Instant::now();
+        let rc = kernel_result_stream_next_batch_cancellable(stream, &mut arr1, &mut sch1, tok);
+        let elapsed = start.elapsed();
+        watcher.join().unwrap();
+
+        assert_eq!(
+            rc,
+            KernelStatusCode::Cancelled,
+            "a token fired mid-fetch must interrupt the wait on the stalled chunk"
+        );
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "cancel must unblock the stalled fetch promptly, took {elapsed:?}"
+        );
+        assert_eq!(kernel_cancel_token_free(tok), KernelStatusCode::Success);
+
+        kernel_result_stream_close(stream);
+        kernel_executed_statement_close(exec);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}

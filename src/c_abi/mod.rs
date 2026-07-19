@@ -119,11 +119,14 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
 ///
 /// [`KernelStatusCode`]: crate::c_abi::KernelStatusCode
 /// [`Error`]: crate::kernel_error::Error
-pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
-{
+/// Shared preamble for the two `block_on_ffi*` entry shapes: clear the
+/// thread-local last error, reject reentrancy from a Tokio runtime thread, and
+/// fetch the process-wide runtime. On failure the typed [`Error`] is already
+/// stored and the mapped [`KernelStatusCode`] is returned, so the caller just
+/// propagates it. Kept in one place so the load-bearing threading-contract guard
+/// (and its exact message) can't drift between `block_on_ffi` and
+/// `block_on_ffi_cancellable`.
+fn ffi_prepare_runtime() -> Result<&'static tokio::runtime::Runtime, KernelStatusCode> {
     error::clear_error();
     // Reject reentrancy explicitly: calling `block_on` from within any
     // Tokio runtime would panic. Surface a typed, actionable error rather
@@ -138,14 +141,19 @@ where
         error::store_error(e);
         return Err(code);
     }
-    let rt = match runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            let code = KernelStatusCode::from(e.code);
-            error::store_error(e);
-            return Err(code);
-        }
-    };
+    runtime().map_err(|e| {
+        let code = KernelStatusCode::from(e.code);
+        error::store_error(e);
+        code
+    })
+}
+
+pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
+{
+    let rt = ffi_prepare_runtime()?;
     // Catch panics so a kernel bug can't unwind across `extern "C"`.
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(fut_builder())));
@@ -167,11 +175,19 @@ where
 ///
 /// When `token` fires before the future completes, this **drops the future**
 /// and returns [`KernelStatusCode::Cancelled`] with a typed `Cancelled` error
-/// in the thread-local buffer. Dropping the future is what makes the cancel
-/// *real* rather than a bare stop-waiting: the kernel's HTTP client is
-/// `reqwest`, whose in-flight request futures abort when dropped (the crate's
-/// documented cancellation model — see the CloudFetch streaming provider's own
-/// token use), so the underlying socket work is torn down, not leaked.
+/// in the thread-local buffer.
+///
+/// How much the drop actually tears down depends on the raced future. Where the
+/// I/O is awaited *inline* in that future — the connect path
+/// (`kernel_session_open_cancellable`) — dropping it drops the in-flight
+/// `reqwest` request, which aborts on drop (the crate's documented cancellation
+/// model), so the socket work is genuinely torn down. Where the I/O runs on a
+/// *detached* task and the future only awaits a waiter — the CloudFetch fetch
+/// path (`kernel_result_stream_next_batch_cancellable`), whose download lives on
+/// a spawned task — the drop unblocks the caller promptly but the background
+/// download continues to completion or its own read-timeout. So this is a prompt
+/// stop-waiting in general, and additionally a real abort wherever the request
+/// is awaited inline.
 ///
 /// A **null** token means "no cancellation" and this behaves exactly like
 /// [`block_on_ffi`] — so a single implementation body can back both the plain
@@ -196,27 +212,9 @@ where
         return block_on_ffi(fut_builder);
     };
 
-    error::clear_error();
-    // Reject reentrancy explicitly (same reasoning as block_on_ffi): block_on
-    // from within any Tokio runtime would panic.
-    if tokio::runtime::Handle::try_current().is_ok() {
-        let e = crate::kernel_error::Error::new(
-            crate::kernel_error::ErrorCode::Internal,
-            "kernel C ABI called from within a Tokio runtime thread; entry points must be \
-             invoked from a native (non-async-runtime) thread",
-        );
-        let code = KernelStatusCode::from(e.code);
-        error::store_error(e);
-        return Err(code);
-    }
-    let rt = match runtime() {
-        Ok(rt) => rt,
-        Err(e) => {
-            let code = KernelStatusCode::from(e.code);
-            error::store_error(e);
-            return Err(code);
-        }
-    };
+    // Same preamble as block_on_ffi (clear-error + reentrancy-reject + runtime
+    // fetch), shared so the threading-contract guard can't drift between them.
+    let rt = ffi_prepare_runtime()?;
 
     // Race the work against the token. `select!` drops the losing branch's
     // future, so a cancel here drops the in-flight request future. Wrapped in
@@ -415,6 +413,35 @@ mod tests {
         let rt = tokio::runtime::Runtime::new().expect("runtime");
         rt.block_on(async {
             let result: Result<(), KernelStatusCode> = block_on_ffi(|| async { Ok(()) });
+            assert_eq!(result, Err(KernelStatusCode::Internal));
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            // SAFETY: out is a valid writable pointer.
+            let present = unsafe { crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()) };
+            assert!(present, "reentrancy must populate the last-error buffer");
+            // SAFETY: present is true, so out is initialised.
+            let err = unsafe { out.assume_init() };
+            // SAFETY: message is non-null after a store.
+            let msg = unsafe { std::ffi::CStr::from_ptr(err.message) }
+                .to_str()
+                .unwrap();
+            assert!(
+                msg.contains("within a Tokio runtime"),
+                "reentrancy error should explain the threading contract, got: {msg}",
+            );
+        });
+    }
+
+    #[test]
+    fn block_on_ffi_cancellable_rejects_reentrancy_from_runtime_thread() {
+        // The cancellable entry shape shares block_on_ffi's preamble via
+        // ffi_prepare_runtime, so it must reject reentrancy identically. This
+        // locks in the shared guard the two shapes used to duplicate.
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        rt.block_on(async {
+            let token = tokio_util::sync::CancellationToken::new();
+            let result: Result<(), KernelStatusCode> =
+                block_on_ffi_cancellable(Some(&token), || async { Ok(()) });
             assert_eq!(result, Err(KernelStatusCode::Internal));
 
             let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();

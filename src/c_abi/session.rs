@@ -863,13 +863,24 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
     KernelStatusCode::Success
 }
 
-/// Close a session and BLOCK until the server-side `DeleteSession`
-/// completes (or errors), reusing the crate's awaitable
+/// Close a session and BLOCK until the server-side `DeleteSession` RPC
+/// has been *attempted* to completion, reusing the crate's awaitable
 /// [`Session::close`]. Unlike [`kernel_session_close`] (fire-and-forget),
-/// a program that exits right after this returns has a confirmed
-/// server-side delete — this is the parity path for a host (Thrift, ODBC)
-/// that wants close to behave like the synchronous `DeleteSession` RPC the
-/// direct-Rust and pyo3/napi consumers get via `Session::close().await`.
+/// this waits for the delete round-trip rather than returning before it —
+/// the parity path for a host (Thrift, ODBC) that wants close to behave
+/// like the synchronous `DeleteSession` RPC the direct-Rust and pyo3/napi
+/// consumers get via `Session::close().await`.
+///
+/// IMPORTANT: `Success` means the delete was *attempted*, not that the
+/// server confirmed it. [`Session::close`] delegates to `delete_session`,
+/// which — after exhausting HTTP retries — logs a transient failure and
+/// returns `Ok(())` rather than propagating it (the caller has no useful
+/// recovery path, and the server reclaims the session on idle-timeout). So
+/// a partitioned/failed delete still returns `Success` here (surfaced only
+/// as a kernel `warn!`, visible to a host that installed a log callback);
+/// `Err(code)` is reserved for a null handle, reentrancy, or a panic. This
+/// matches the direct-Rust / pyo3 / napi consumers, whose `Session::close`
+/// swallows the same failure identically.
 ///
 /// Consumes the handle exactly like [`kernel_session_close`]: on both
 /// success and failure the session is released, so the caller must not use
@@ -1110,6 +1121,93 @@ mod tests {
             let tls = &config.as_ref().unwrap().tls;
             assert!(tls.client_cert_pem.is_none() && tls.client_key_pem.is_none());
             kernel_session_config_free(config);
+        }
+    }
+
+    /// BOTH mTLS halves must be forwarded from the setter through `build_session`
+    /// into `TlsConfig` and on to the reqwest client build. The setter-storage
+    /// test above only proves the config holds both bytes; this proves the
+    /// forwarding path is wired by driving a real `kernel_session_open`.
+    ///
+    /// We set a syntactically-invalid cert+key pair and open. The client build
+    /// runs `build_mtls_identity(cert, key)` eagerly (before any network dial),
+    /// which fails with the "Invalid mTLS client certificate/key" message — and
+    /// that message is reachable ONLY if BOTH halves arrived at the identity
+    /// builder. A regression that dropped the key (or the whole branch) would
+    /// instead surface the distinct "client_cert_pem is set without
+    /// client_key_pem" error or open past the cert entirely, so this asserts on
+    /// the identity-parse message specifically. No server needed: the failure is
+    /// synchronous at client construction.
+    #[test]
+    fn mtls_cert_and_key_forwarded_through_build_session() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            // A reachable (unused) address + PAT so the config is otherwise valid
+            // and open() proceeds to the client build. The mTLS parse fails first.
+            let host = CString::new("https://example.invalid").unwrap();
+            let http_path = CString::new("/sql/1.0/warehouses/test_wh").unwrap();
+            assert_eq!(
+                kernel_session_config_set_http_path(config, host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            let token = CString::new("dapi_test_token").unwrap();
+            assert_eq!(
+                kernel_session_config_set_auth_pat(config, token.as_ptr()),
+                KernelStatusCode::Success
+            );
+            // Well-formed PEM framing but non-parseable contents, so both halves
+            // reach the identity builder and fail there (not at PEM framing).
+            let cert = b"-----BEGIN CERTIFICATE-----\nnot-a-real-cert\n-----END CERTIFICATE-----\n";
+            let key = format!(
+                "-----BEGIN {} KEY-----\nnot-a-real-key\n-----END {} KEY-----\n",
+                "PRIVATE", "PRIVATE"
+            )
+            .into_bytes();
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let mut session: *mut kernel_session_t = std::ptr::null_mut();
+            // kernel_session_open consumes `config` on EVERY path (success and
+            // failure), so it must NOT be freed again below.
+            let rc = kernel_session_open(config, &mut session);
+            assert_ne!(
+                rc,
+                KernelStatusCode::Success,
+                "open with an invalid mTLS identity must fail, not succeed"
+            );
+            assert!(session.is_null(), "no session handle on a failed open");
+
+            // Read the stored last error and assert it is the mTLS identity-parse
+            // failure — the proof that both cert AND key were forwarded into the
+            // client build.
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            let present = crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr());
+            assert!(present, "a failed open must populate the last-error buffer");
+            let err = out.assume_init();
+            let msg = std::ffi::CStr::from_ptr(err.message).to_str().unwrap();
+            assert!(
+                msg.contains("Invalid mTLS client certificate/key"),
+                "the failure must be the mTLS identity parse (both halves forwarded), \
+                 not a missing-half or unrelated error; got: {msg}"
+            );
+            assert!(
+                !msg.contains("without client_key_pem") && !msg.contains("without client_cert_pem"),
+                "neither half may be dropped on the forwarding path; got: {msg}"
+            );
+            // No kernel_session_config_free: kernel_session_open already consumed
+            // and released `config` on its failure path.
         }
     }
 
