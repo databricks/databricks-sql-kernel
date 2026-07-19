@@ -28,36 +28,29 @@
 //!
 //! - [`kernel_set_log_callback`] installs a process-global [`KernelLogLayer`]
 //!   (once) and records the `(callback, ctx)` sink. The layer captures
-//!   `databricks*` events, filters by a per-target threshold (an explicit
-//!   one-knob level, else `RUST_LOG`'s per-target `EnvFilter` precedence),
-//!   formats each into a [`Record`], and pushes it onto a **bounded** channel
+//!   `databricks*` events, filters by a single level (an explicit one-knob
+//!   level, else the most-verbose kernel-applicable `RUST_LOG` level), formats
+//!   each into a [`Record`], and pushes it onto a **bounded** channel
 //!   (drop-on-full — logs are advisory and must never block or back-pressure a
 //!   kernel hot path).
 //! - A dedicated drain thread pulls records and invokes the C callback once per
 //!   record with borrowed C strings (valid only for the call).
 //!
-//! ## Threading & safety contract (documented in `databricks_kernel.h`)
+//! ## Threading & safety contract (full version in `databricks_kernel.h`)
 //!
 //! The callback fires from the drain thread (never a kernel tokio worker), so
-//! the host callback must be thread-safe. It must NOT call back into any
-//! `kernel_*` entry point: unlike a call from a tokio worker (which
-//! `block_on_ffi` rejects), the drain thread is a plain `std::thread`, so a
-//! reentrant blocking `kernel_*` call is NOT caught — it would run its own
-//! `block_on`, stalling the drain thread and dropping queued logs. A callback
-//! that unwinds is contained: the type is `extern "C-unwind"` and the drain
-//! thread wraps every invocation in `catch_unwind`, so a panicking host callback
-//! poisons the sink (delivery stops) rather than aborting the process — but a
-//! well-behaved callback still must not unwind, since poisoning silently drops
-//! all subsequent logs.
+//! it must be thread-safe and must not call back into any `kernel_*` entry
+//! point (the reentrancy guard only covers tokio workers, so a blocking
+//! `kernel_*` call here would stall the drain thread). An unwinding callback is
+//! contained by `catch_unwind` and poisons the sink rather than aborting the
+//! process, but a well-behaved callback still must not unwind, since poisoning
+//! stops delivery.
 //!
 //! ## Mutual exclusion with `kernel_init_logging`
 //!
-//! Both this and `kernel_init_logging` install the one process-global `tracing`
-//! subscriber; only the first `set_global_default` wins. If a global subscriber
-//! was already installed, `kernel_set_log_callback` returns `Internal` (with a
-//! stored last error), exactly as `kernel_init_logging` does for the reverse —
-//! a C consumer picks ONE of the two. Last-writer-wins for the sink itself
-//! (the callback slot is refreshed on every call).
+//! Both install the one process-global `tracing` subscriber; the first
+//! `set_global_default` wins and the loser returns `Internal`, so a C consumer
+//! picks one. The sink itself is last-writer-wins, refreshed on every call.
 
 // The callback type mirrors the C typedef name `kernel_log_callback` (snake
 // case) so the Rust and header names read identically, matching the rest of the
@@ -71,8 +64,7 @@ use std::os::raw::{c_char, c_int};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender};
-use std::sync::{Mutex, OnceLock, RwLock};
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
 use tracing::field::{Field, Visit};
 use tracing::level_filters::LevelFilter;
 use tracing::subscriber::Interest;
@@ -85,13 +77,10 @@ use tracing_subscriber::registry::LookupSpan;
 /// numeric severity); `target` and `message` are NUL-terminated C strings valid
 /// only for the duration of the call.
 ///
-/// The ABI is `C-unwind`, not plain `C`: a plain `extern "C"` fn that panics
-/// aborts at its OWN boundary (Rust ≥ 1.81), so an outer `catch_unwind` around
-/// the call could never contain it. `C-unwind` lets a panic propagate across the
-/// boundary so `invoke_callback`'s `catch_unwind` can catch a misbehaving host
-/// callback and poison the sink instead of aborting the process. The C
-/// representation is identical (`void (*)(void*, int, const char*, const char*)`),
-/// and non-unwinding C / Go-with-recover callbacks are unaffected.
+/// The ABI is `C-unwind` so a panicking host callback propagates across the
+/// boundary and `invoke_callback`'s `catch_unwind` can contain it; a plain
+/// `extern "C"` fn would instead abort the process. The C representation is
+/// unchanged, and non-unwinding callbacks are unaffected.
 pub type kernel_log_callback = extern "C-unwind" fn(
     ctx: *mut c_void,
     level: c_int,
@@ -115,21 +104,13 @@ struct Record {
 struct Sink {
     cb: kernel_log_callback,
     ctx: usize,
-    /// Monotonic registration id. The drain thread captures this alongside
-    /// `(cb, ctx)` and only poisons the sink on a callback unwind if this id is
-    /// still the installed one — so a slow/old callback that unwinds AFTER the
-    /// host re-registered a new one cannot kill the replacement.
+    /// Monotonic registration id. The drain thread poisons the sink on an unwind
+    /// only if this id is still installed, so an old callback that unwinds after
+    /// a re-registration can't kill the replacement.
     gen: u64,
 }
 
 const CHANNEL_CAPACITY: usize = 4096;
-
-/// Minimum spacing between synthetic "dropped N" notices the drain thread emits
-/// through the callback. Bounds notice frequency under sustained overflow so an
-/// already-slow callback isn't handed ~2× the invocations (a notice before every
-/// real record); the exact cumulative count remains available via
-/// [`kernel_logging_stats`].
-const NOTICE_MIN_INTERVAL: Duration = Duration::from_secs(1);
 
 const LEVEL_OFF: u8 = 0;
 const LEVEL_ERROR: u8 = 1;
@@ -138,51 +119,21 @@ const LEVEL_INFO: u8 = 3;
 const LEVEL_DEBUG: u8 = 4;
 const LEVEL_TRACE: u8 = 5;
 
-/// Default forward threshold for kernel targets not matched by a more specific
-/// [`DIRECTIVES`] entry: the explicit one-knob level, `RUST_LOG`'s bare global
-/// level, or the static `warn` default. Numeric severity, low = more severe;
-/// `0` means "off / emit nothing".
+/// Forward threshold for all kernel events: the explicit one-knob level, the
+/// most-verbose kernel-applicable `RUST_LOG` level, or the static `warn`
+/// default. Numeric severity, low = more severe; `0` means "off / emit nothing".
 static LEVEL: AtomicU8 = AtomicU8::new(LEVEL_WARN);
 
-/// Most verbose threshold across [`LEVEL`] and every [`DIRECTIVES`] entry, for
-/// `max_level_hint` so the process-global gate admits everything any directive
-/// could enable (the per-event [`KernelFilter::enabled`] then applies the
-/// precise per-target threshold). Tracking only [`LEVEL`] here would wrongly
-/// gate out a more-verbose submodule directive before it reached `enabled`.
-static MAX_LEVEL: AtomicU8 = AtomicU8::new(LEVEL_WARN);
-
-/// Fast-path flag: whether [`DIRECTIVES`] holds any per-target directive. The
-/// common one-knob / bare-level case has none, so the hot path
-/// ([`threshold_for_target`]) reads [`LEVEL`] directly and never takes the
-/// [`DIRECTIVES`] lock.
-static HAS_DIRECTIVES: AtomicBool = AtomicBool::new(false);
-
-/// Per-target `RUST_LOG` thresholds `(target, level)`, applied with `EnvFilter`
-/// precedence: a directive matches an event when its target is a **prefix** of
-/// the event target (`event_target.starts_with(target)`), and the most specific
-/// (longest) match wins. Collapsing these into one scalar would let a verbose
-/// submodule directive (`databricks_sql_kernel::reader=trace`) widen the
-/// canonical `klog!` target (`databricks::sql::kernel`) that `EnvFilter` would
-/// keep at its own directive's level. Consulted only when [`HAS_DIRECTIVES`].
-static DIRECTIVES: OnceLock<RwLock<Vec<(String, u8)>>> = OnceLock::new();
-
-/// Count of log records dropped because the bounded channel was full (a slow
-/// host callback) or the drain thread stopped. Surfaced via
-/// [`kernel_logging_stats`] (exact cumulative count) and via a synthetic
-/// "dropped N" line the drain thread emits on recovery — throttled to at most
-/// one per [`NOTICE_MIN_INTERVAL`] so it can't amplify an overloaded callback —
-/// so drop-on-full loss is observable rather than silent (parity with the napi
-/// bridge's `DROPPED`).
+/// Count of log records dropped because the bounded channel was full or the
+/// sink was poisoned. Surfaced via [`kernel_logging_stats`] so the loss is
+/// observable, not silent.
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
-/// Set if the host callback ever unwound (panicked) across the FFI boundary.
-/// The `extern "C-unwind"` type lets the panic propagate so the drain thread's
-/// `catch_unwind` catches it (a plain `extern "C"` would instead abort the
-/// process at the callback's own boundary); we record it here and stop
-/// delivering — a callback that panics once is assumed to keep panicking, so we
-/// protect the process rather than re-invoke it. Surfaced via
-/// [`kernel_logging_stats`] (`installed` reads `false` while poisoned). Cleared
-/// when a NEW callback is registered, so a host can recover by re-installing.
+/// Set if the host callback ever unwound across the FFI boundary. A callback
+/// that panics once is assumed to keep panicking, so the drain thread stops
+/// delivering rather than re-invoke it. Surfaced via [`kernel_logging_stats`]
+/// (`installed` reads `false` while poisoned), and cleared when a new callback
+/// is registered so a host can recover by re-installing.
 static SINK_POISONED: AtomicBool = AtomicBool::new(false);
 
 const INSTALL_PENDING: u8 = 0;
@@ -190,11 +141,9 @@ const INSTALL_OK: u8 = 1;
 /// Lost the one-global-subscriber race (e.g. `kernel_init_logging` won) — a
 /// benign outcome; the host picks one of the two logging routes.
 const INSTALL_ALREADY_SET: u8 = 2;
-/// The OS refused to start the drain thread (EAGAIN/ENOMEM) before the global
-/// subscriber was claimed — a real failure the host should surface distinctly.
-/// NON-terminal: a later `kernel_set_log_callback` retries the install (the
-/// subscriber slot was never touched), so a transient spawn failure doesn't
-/// permanently disable callback logging.
+/// The OS refused to start the drain thread (EAGAIN/ENOMEM) before the
+/// subscriber was claimed. Non-terminal: a later `kernel_set_log_callback`
+/// retries, so a transient spawn failure isn't permanent.
 const INSTALL_SPAWN_FAILED: u8 = 3;
 
 /// Outcome of the subscriber install. `INSTALL_OK` and `INSTALL_ALREADY_SET` are
@@ -216,15 +165,9 @@ static SINK: OnceLock<Mutex<Option<Sink>>> = OnceLock::new();
 /// the callback it just invoked is still the installed one.
 static NEXT_SINK_GEN: AtomicU64 = AtomicU64::new(0);
 
-/// Serializes install attempts (subscriber + channel + drain-thread spawn).
-///
-/// Deliberately NOT a `Once`: a `Once` is consumed by the first attempt, so a
-/// transient drain-thread spawn failure (EAGAIN/ENOMEM) would permanently
-/// disable callback logging for the process — no later `kernel_set_log_callback`
-/// could retry. A plain lock + retryable [`INSTALL_STATUS`] lets a spawn failure
-/// stay non-terminal so a subsequent call tries again, while `set_global_default`
-/// is still attempted at most once (only after a drain thread is confirmed up,
-/// which transitions to a terminal state).
+/// Serializes install attempts (subscriber + channel + drain-thread spawn). A
+/// plain lock rather than a `Once` so a transient spawn failure stays retryable
+/// via [`INSTALL_STATUS`]; `set_global_default` is still attempted at most once.
 static INSTALL_LOCK: Mutex<()> = Mutex::new(());
 
 fn severity(level: &Level) -> u8 {
@@ -250,72 +193,43 @@ fn parse_level_word(s: &str) -> Option<u8> {
     }
 }
 
-/// Parse a `RUST_LOG`-style directive string into the kernel-applicable
-/// per-target directives plus an optional bare global level, so the callback
-/// can filter per target exactly as the stderr path (`kernel_init_logging`)'s
-/// `EnvFilter` would — rather than collapsing everything into one scalar.
+/// Resolve a `RUST_LOG`-style string to the single most-verbose level that
+/// applies to kernel events, or `None` if nothing kernel-applicable is present.
 ///
-/// Returns `(directives, global)`:
-///
-///   - `directives`: each retained `(target, level)` keeps its target string so
-///     the hot path can apply `EnvFilter`'s prefix rule per event — a directive
-///     matches an event only when its target is a **prefix of the event target**
-///     (`event_target.starts_with(target)`), and among matches the most specific
-///     (longest) wins ([`resolve_threshold`]). Keeping them separate is what
-///     stops a verbose submodule directive
-///     (`databricks_sql_kernel::reader::inline=trace`) from widening the
-///     canonical `klog!` target (`databricks::sql::kernel`), which `EnvFilter`
-///     would keep at its own `databricks::sql::kernel=error` directive.
-///   - `global`: a bare level (`debug`), the least-specific match `EnvFilter`
-///     recognises, used as the default for kernel targets no directive matches.
-///
-/// A directive with no `=` is a bare LEVEL (`debug` → global) or a bare TARGET;
-/// `EnvFilter` reads a bare kernel target (`databricks::sql::kernel`) as that
-/// target at TRACE, so it is retained as `(target, TRACE)` rather than ignored.
-///
-/// Applicability is judged by [`directive_targets_kernel`], NOT a bare
-/// `starts_with("databricks")`: a non-matching sibling such as `databricksfoo=warn`
-/// or an extension of the fixed-depth `klog!` target
-/// (`databricks::sql::kernel::foo=trace`) is a prefix of no kernel event, so
-/// `EnvFilter` skips it — and so does this. A submodule directive on the
-/// module-path namespace the bridge forwards
-/// (`databricks_sql_kernel::session=debug`) IS retained (those events are
-/// forwarded by `is_kernel_target`). Foreign directives (`hyper=warn`) are
-/// dropped, since the bridge never forwards their events.
-fn parse_rust_log(rust_log: &str) -> (Vec<(String, u8)>, Option<u8>) {
-    let mut directives: Vec<(String, u8)> = Vec::new();
-    let mut global: Option<u8> = None;
+/// The callback carries one level, so directives are collapsed by taking the
+/// max (most verbose) across the bare global level and every kernel-applicable
+/// target directive ([`directive_targets_kernel`]). A directive with no `=` is
+/// a bare level (the global) or a bare kernel target (TRACE, as `EnvFilter`
+/// reads it). Foreign directives (`hyper=warn`) and non-matching `databricks`
+/// siblings are ignored. This can forward a superset of what the stderr path's
+/// per-target `EnvFilter` would — acceptable for advisory logging, and a host
+/// wanting exact per-target control uses `kernel_init_logging` instead.
+fn parse_rust_log(rust_log: &str) -> Option<u8> {
+    let mut level: Option<u8> = None;
+    let mut bump = |l: u8| level = Some(level.map_or(l, |cur| cur.max(l)));
     for directive in rust_log.split(',') {
         let d = directive.trim();
         if d.is_empty() {
             continue;
         }
         match d.split_once('=') {
-            Some((target, level)) => {
-                let target = target.trim();
-                if directive_targets_kernel(target) {
-                    if let Some(l) = parse_level_word(level) {
-                        directives.push((target.to_owned(), l));
+            Some((target, lvl)) => {
+                if directive_targets_kernel(target.trim()) {
+                    if let Some(l) = parse_level_word(lvl) {
+                        bump(l);
                     }
                 }
             }
             None => {
-                // A directive with no `=` is either a bare level (`debug`) or a
-                // target with no level. `EnvFilter` reads a bare level as the
-                // global and a bare TARGET as "that target at TRACE" (the max),
-                // so a kernel target-only directive (`databricks::sql::kernel`)
-                // must raise the threshold to TRACE — not be ignored, which
-                // would leave the callback at WARN where kernel_init_logging
-                // emits debug/trace.
                 if let Some(l) = parse_level_word(d) {
-                    global = Some(l);
+                    bump(l);
                 } else if directive_targets_kernel(d) {
-                    directives.push((d.to_owned(), LEVEL_TRACE));
+                    bump(LEVEL_TRACE);
                 }
             }
         }
     }
-    (directives, global)
+    level
 }
 
 /// The crate's module-path root: the `#[instrument]` / default-target namespace
@@ -328,26 +242,14 @@ const KERNEL_MODULE_ROOT: &str = "databricks_sql_kernel";
 /// ([`KERNEL_MODULE_ROOT`]).
 const KERNEL_TARGET_ROOTS: [&str; 2] = [crate::klog::KERNEL_LOG_TARGET, KERNEL_MODULE_ROOT];
 
-/// Whether a `RUST_LOG` directive target selects kernel events under
-/// `EnvFilter`'s `event_target.starts_with(directive_target)` prefix match,
-/// against the targets the bridge actually forwards. A directive applies when:
-///
-///   - its target is a **prefix of a canonical root** (`databricks`,
-///     `databricks::sql`, `databricks_sql`, `databricks_sql_kernel`, …) — it
-///     matches events at that root; or
-///   - its target is the module-path root or a `::`-boundary submodule of it
-///     (`databricks_sql_kernel::session`) — those submodule events are
-///     forwarded by `is_kernel_target`, so a host targeting a specific kernel
-///     submodule must raise the threshold rather than be silently ignored.
-///
-/// The submodule check uses the SAME segment-boundary helper as
-/// [`is_kernel_target`] ([`is_target_or_submodule`]), so an unrelated
-/// module-root SIBLING (`databricks_sql_kernel_ext`) is rejected: it matches no
-/// forwarded event, and accepting it as a raw prefix would needlessly raise
-/// `MAX_LEVEL` and push kernel events onto the directive lock/scan path.
-/// Also rejected: a `databricks`-prefixed sibling that isn't a root prefix
-/// (`databricksfoo`), and an extension of the fixed-depth `klog!` target
-/// (`databricks::sql::kernel::foo`), which the kernel never emits.
+/// Whether a `RUST_LOG` directive target selects any event the bridge forwards,
+/// under `EnvFilter`'s prefix match. True when the target is a prefix of a
+/// canonical root (`databricks`, `databricks::sql`, `databricks_sql_kernel`, …)
+/// or a `::`-boundary submodule of the module-path root
+/// (`databricks_sql_kernel::session`). Uses the same segment-boundary helper as
+/// [`is_kernel_target`], so a module-root sibling (`databricks_sql_kernel_ext`),
+/// a non-root sibling (`databricksfoo`), and an over-specific extension of the
+/// fixed-depth `klog!` target (`databricks::sql::kernel::foo`) are all rejected.
 fn directive_targets_kernel(target: &str) -> bool {
     is_target_or_submodule(target, KERNEL_MODULE_ROOT)
         || KERNEL_TARGET_ROOTS
@@ -355,76 +257,36 @@ fn directive_targets_kernel(target: &str) -> bool {
             .any(|root| root.starts_with(target))
 }
 
-/// Resolve the forward threshold for `target` under `EnvFilter` precedence: the
-/// most specific (longest) directive whose target is a **prefix** of `target`
-/// wins; on a specificity tie the later entry wins (matching `EnvFilter`'s
-/// last-writer dedup); with no matching directive the `default` applies. Pure
-/// (no globals) so the precedence logic is unit-testable without touching the
-/// process-global filter state.
-fn resolve_threshold(target: &str, default: u8, directives: &[(String, u8)]) -> u8 {
-    let mut best: Option<(usize, u8)> = None;
-    for (t, lvl) in directives {
-        if target.starts_with(t.as_str()) {
-            let specificity = t.len();
-            let wins = best.is_none_or(|(len, _)| specificity >= len);
-            if wins {
-                best = Some((specificity, *lvl));
-            }
-        }
-    }
-    best.map_or(default, |(_, l)| l)
-}
-
-/// The current forward threshold for `target`, reading the process-global filter
-/// state. Fast path: with no per-target directives (the one-knob / bare-level
-/// case) this is a single relaxed load of [`LEVEL`] and never locks.
-fn threshold_for_target(target: &str) -> u8 {
-    let default = LEVEL.load(Ordering::Relaxed);
-    if !HAS_DIRECTIVES.load(Ordering::Relaxed) {
-        return default;
-    }
-    match DIRECTIVES.get().and_then(|lock| lock.read().ok()) {
-        Some(dirs) => resolve_threshold(target, default, &dirs),
-        None => default,
-    }
-}
-
-/// Returns whether an event at `level` on `target` should currently be
-/// forwarded, applying the per-target threshold ([`threshold_for_target`]).
-fn should_emit(target: &str, level: &Level) -> bool {
-    let threshold = threshold_for_target(target);
+/// Returns whether an event at `level` should currently be forwarded, against
+/// the single configured [`LEVEL`] threshold.
+fn should_emit(level: &Level) -> bool {
+    let threshold = LEVEL.load(Ordering::Relaxed);
     threshold != LEVEL_OFF && severity(level) <= threshold
 }
 
-/// Whether `target` is exactly `root` or a `::`-delimited submodule of it
-/// (`root::…`) — a SEGMENT-boundary match, not a raw prefix. This is what keeps
-/// an unrelated sibling like `databricksfoo` or `databricks_sql_kernel_ext` from
-/// matching `databricks_sql_kernel`: the byte after the root must be a `::`
-/// separator (or end of string), never a bare identifier continuation.
+/// Whether `target` is exactly `root` or a `::`-delimited submodule of it — a
+/// segment-boundary match, so a sibling like `databricks_sql_kernel_ext` does
+/// not match `databricks_sql_kernel`.
 fn is_target_or_submodule(target: &str, root: &str) -> bool {
     target
         .strip_prefix(root)
         .is_some_and(|rest| rest.is_empty() || rest.starts_with("::"))
 }
 
-/// Targets the bridge forwards: the `klog!` shim's `databricks::sql::kernel` (and
-/// any submodule of it) and the crate's module paths (`databricks_sql_kernel`
-/// and `databricks_sql_kernel::…`). A SEGMENT-boundary match, NOT a raw
-/// `starts_with("databricks")` — the latter would route unrelated
-/// `databricks`-prefixed host/library targets (`databricksfoo`, another
-/// `databricks_*` crate) into the kernel callback.
+/// Targets the bridge forwards: the `klog!` shim's `databricks::sql::kernel`
+/// and the crate's module paths (`databricks_sql_kernel`), plus any submodule
+/// of either. A segment-boundary match, so an unrelated `databricks`-prefixed
+/// target from another crate is not routed into the kernel callback.
 fn is_kernel_target(target: &str) -> bool {
     is_target_or_submodule(target, crate::klog::KERNEL_LOG_TARGET)
         || is_target_or_submodule(target, KERNEL_MODULE_ROOT)
 }
 
-/// The most-verbose configured level as a `tracing` [`LevelFilter`], for
-/// `max_level_hint` so the process-global gate tracks the kernel level instead
-/// of pinning at TRACE. Reads [`MAX_LEVEL`] (the max across the default and all
-/// per-target directives) so a verbose submodule directive isn't gated out
-/// before the per-event [`KernelFilter::enabled`] can apply it.
+/// The configured [`LEVEL`] as a `tracing` [`LevelFilter`], for `max_level_hint`
+/// so the process-global gate tracks the kernel level rather than pinning at
+/// TRACE.
 fn current_level_filter() -> LevelFilter {
-    match MAX_LEVEL.load(Ordering::Relaxed) {
+    match LEVEL.load(Ordering::Relaxed) {
         LEVEL_OFF => LevelFilter::OFF,
         LEVEL_ERROR => LevelFilter::ERROR,
         LEVEL_WARN => LevelFilter::WARN,
@@ -435,17 +297,10 @@ fn current_level_filter() -> LevelFilter {
 }
 
 /// Per-callsite interest. Kernel EVENT callsites re-evaluate per event
-/// (`sometimes`, for the dynamic level). Everything else caches off forever
-/// (`never`):
-///
-///   - foreign targets (`hyper`/`rustls`/…) never dispatch, and
-///   - SPAN callsites never dispatch — even on kernel targets. This bridge is
-///     event-only ([`KernelLogLayer`] implements just `on_event` and never
-///     reads span data), so admitting spans would make the kernel's own
-///     `databricks*` spans (`Session`'s `info_span!`, the `#[instrument]` on
-///     the `next_batch()` hot path) pay span create/enter/exit in the registry
-///     at INFO/DEBUG/TRACE thresholds for output that never comes. Caching them
-///     off turns those into no-op disabled spans.
+/// (`sometimes`, for the dynamic level); everything else caches off (`never`).
+/// The bridge is event-only, so span callsites cache off even on kernel targets
+/// — the kernel's own `databricks*` spans then pay no span machinery for output
+/// this layer never produces.
 fn callsite_interest_for(target: &str, is_event: bool) -> Interest {
     if is_event && is_kernel_target(target) {
         Interest::sometimes()
@@ -505,13 +360,10 @@ impl Visit for MessageVisitor {
 /// (drop-on-full). The per-layer [`KernelFilter`] already excludes foreign
 /// targets and below-level events.
 ///
-/// The producer end of the delivery channel lives HERE, in the layer instance,
-/// rather than in a separately-published global. `set_global_default` makes the
-/// subscriber (and this layer) visible atomically, so from the instant an event
-/// can reach [`on_event`](KernelLogLayer::on_event) the sender is already
-/// present — there is no window where the subscriber is installed but the sender
-/// isn't yet published (which would silently drop a concurrent kernel log
-/// without counting it).
+/// The channel sender lives in the layer instance, so `set_global_default`
+/// publishes the subscriber and its sender atomically —
+/// [`on_event`](KernelLogLayer::on_event) never sees an installed-but-senderless
+/// state that would drop a concurrent log uncounted.
 struct KernelLogLayer {
     tx: SyncSender<Record>,
 }
@@ -526,12 +378,8 @@ impl<S> Filter<S> for KernelFilter {
     }
 
     fn enabled(&self, meta: &Metadata<'_>, _ctx: &Context<'_, S>) -> bool {
-        // Event-only: never enable spans (the layer has no span consumer). The
-        // per-target threshold applies `RUST_LOG`'s `EnvFilter` precedence so a
-        // verbose submodule directive can't widen the canonical `klog!` target.
-        meta.is_event()
-            && is_kernel_target(meta.target())
-            && should_emit(meta.target(), meta.level())
+        // Event-only: never enable spans (the layer has no span consumer).
+        meta.is_event() && is_kernel_target(meta.target()) && should_emit(meta.level())
     }
 
     fn max_level_hint(&self) -> Option<LevelFilter> {
@@ -544,14 +392,10 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
-        // Once a callback has unwound the sink is poisoned and the drain thread
-        // drops everything until re-registration. Short-circuit HERE — before the
-        // field visit, the message allocation, and the enqueue — so a poisoned
-        // sink stops paying producer-side formatting for records it will only
-        // drop. Still count the loss so kernel_logging_stats stays accurate
-        // (parity with the drain thread's own poison drop-count; each record is
-        // counted exactly once — here if produced while poisoned, or by the drain
-        // thread if it was already queued when the poison landed).
+        // A poisoned sink drops everything until re-registration; short-circuit
+        // before the field visit and enqueue so we don't format a record we'll
+        // drop. Still count the loss (each record is counted exactly once — here
+        // if produced while poisoned, or by the drain thread if already queued).
         if SINK_POISONED.load(Ordering::Relaxed) {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             return;
@@ -565,20 +409,17 @@ where
             message: visitor.finish(),
         };
         // Drop-on-full / disconnected: logs are advisory, never block a kernel
-        // task on a slow host callback. Count the loss so it's observable (via
-        // kernel_logging_stats and the drain thread's synthetic recovery line)
-        // rather than vanishing silently.
+        // task on a slow host callback. Count the loss so it's observable via
+        // kernel_logging_stats rather than vanishing silently.
         if self.tx.try_send(record).is_err() {
             DROPPED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
-/// Invoke the host callback once, guarded against an unwind. A panic crossing
-/// `extern "C"` aborts the process (Rust ≥ 1.81), so a host callback that
-/// unwinds must be contained here — this is the same `catch_unwind` guard every
-/// other FFI boundary in the crate uses (`block_on_ffi`, `catch_ffi`). Returns
-/// `false` if the callback unwound, so the caller can poison the sink.
+/// Invoke the host callback once, containing any unwind with `catch_unwind`
+/// (the same guard every FFI boundary in the crate uses). Returns `false` if
+/// the callback unwound, so the caller can poison the sink.
 fn invoke_callback(
     cb: kernel_log_callback,
     ctx: usize,
@@ -586,12 +427,9 @@ fn invoke_callback(
     target: &str,
     message: &str,
 ) -> bool {
-    // Interior NULs can't appear in a C string; on the rare event whose text
-    // contains one, TRUNCATE at the first NUL rather than replacing the whole
-    // string with a placeholder — the informative prefix (up to the NUL) is
-    // preserved. CString::new only fails on an interior NUL, so on error rebuild
-    // from the bytes up to it (which cannot themselves contain a NUL → unwrap is
-    // infallible).
+    // On the rare message with an interior NUL, truncate at the first NUL
+    // (keeping the prefix) instead of dropping the whole string. The bytes
+    // before the NUL can't contain one, so the rebuild is infallible.
     let to_cstring = |s: &str| {
         CString::new(s).unwrap_or_else(|e| {
             let n = e.nul_position();
@@ -606,13 +444,11 @@ fn invoke_callback(
     .is_ok()
 }
 
-/// Poison the sink — stop delivery — but ONLY if generation `gen` is still the
-/// installed registration. The drain thread copies `(cb, ctx, gen)` out and
-/// runs the callback without the lock, so the host may re-register (bumping the
-/// generation and clearing the poison) while an OLD callback is mid-unwind.
-/// Comparing under the `SINK` lock (which the setter also holds while it swaps
-/// the sink + clears the poison) means an old callback's failure can never kill
-/// the newer registration.
+/// Poison the sink — stop delivery — but only if generation `gen` is still the
+/// installed registration. The drain thread runs the callback unlocked, so the
+/// host may re-register (bumping the generation, clearing the poison) while an
+/// old callback is mid-unwind; comparing under the `SINK` lock keeps that old
+/// failure from killing the newer registration.
 fn poison_sink_if_current(gen: u64) {
     if let Some(lock) = SINK.get() {
         if let Ok(guard) = lock.lock() {
@@ -627,12 +463,6 @@ fn poison_sink_if_current(gen: u64) {
 /// callback with borrowed C strings. Runs off the kernel's tokio workers so a
 /// slow callback can't stall query execution.
 fn drain_loop(rx: Receiver<Record>) {
-    // Drop count already reported to the host, so a synthetic "dropped N" notice
-    // only carries the delta since the last notice.
-    let mut reported_drops: u64 = 0;
-    // Timestamp of the last drop-notice, for throttling (see NOTICE_MIN_INTERVAL).
-    // `None` until the first notice, so the first drop is reported promptly.
-    let mut last_notice: Option<Instant> = None;
     // `recv` errors only once the (process-global) sender is dropped, which
     // happens on a lost subscriber race (the setter drops the sender so this
     // thread exits) or process teardown; exit cleanly either way.
@@ -647,9 +477,9 @@ fn drain_loop(rx: Receiver<Record>) {
         let Some(sink_lock) = SINK.get() else {
             continue;
         };
-        // Copy the sink out under the lock (cheap: a fn pointer + usize + gen)
-        // so the callback runs without holding the mutex — a reentrant setter
-        // can't deadlock, and a slow callback can't block a level/sink update.
+        // Copy the sink out under the lock so the callback runs without holding
+        // the mutex — a reentrant setter can't deadlock and a slow callback
+        // can't block a level/sink update.
         let sink = match sink_lock.lock() {
             Ok(g) => g.as_ref().map(|s| (s.cb, s.ctx, s.gen)),
             Err(_) => None,
@@ -657,174 +487,48 @@ fn drain_loop(rx: Receiver<Record>) {
         let Some((cb, ctx, gen)) = sink else {
             continue;
         };
-        // Surface records dropped since the last notice as one synthetic WARN
-        // line through the callback itself, so a host that only reads the
-        // callback stream still learns it missed events (kernel_logging_stats
-        // carries the cumulative count for a host that polls). THROTTLED to at
-        // most one notice per NOTICE_MIN_INTERVAL: under sustained overflow an
-        // unthrottled per-record notice would double callback invocations and
-        // prolong the very backlog it reports.
-        let dropped = DROPPED.load(Ordering::Relaxed);
-        let notice_due = last_notice.is_none_or(|t| t.elapsed() >= NOTICE_MIN_INTERVAL);
-        if dropped > reported_drops && notice_due {
-            let notice = format!(
-                "{} kernel log record(s) dropped (slow log callback); increase callback throughput",
-                dropped - reported_drops
-            );
-            reported_drops = dropped;
-            last_notice = Some(Instant::now());
-            if !invoke_callback(
-                cb,
-                ctx,
-                LEVEL_WARN as c_int,
-                is_kernel_target_str(),
-                &notice,
-            ) {
-                // The notice unwound, so `record` won't be delivered either —
-                // count it as dropped (the health contract), then poison iff
-                // this callback is still the installed one.
-                DROPPED.fetch_add(1, Ordering::Relaxed);
-                poison_sink_if_current(gen);
-                continue;
-            }
-        }
         if !invoke_callback(cb, ctx, record.level, record.target, &record.message) {
-            // The callback unwound and did NOT deliver this record — count the
-            // loss so kernel_logging_stats reflects it (previously the first
-            // failing record was silently uncounted), then poison iff this
-            // callback is still the installed one.
+            // The callback unwound without delivering this record; count the
+            // loss, then poison iff this callback is still the installed one.
             DROPPED.fetch_add(1, Ordering::Relaxed);
             poison_sink_if_current(gen);
         }
     }
 }
 
-/// The kernel log target as a plain `&str`, for the synthetic drop-notice line
-/// so it carries the same target as real kernel events.
-fn is_kernel_target_str() -> &'static str {
-    crate::klog::KERNEL_LOG_TARGET
+/// Resolve the callback's forward level, mirroring `kernel_init_logging`'s
+/// precedence: an explicit recognised `level` word wins (Go maps its driver
+/// level through here); else the most-verbose kernel-applicable `RUST_LOG` level
+/// ([`parse_rust_log`]); else `None`, leaving the current level untouched.
+///
+/// The explicit path matters because a host at `DATABRICKS_LOG_LEVEL=debug` with
+/// no `RUST_LOG` must still get kernel debug lines.
+fn resolve_level(explicit: Option<&str>) -> Option<u8> {
+    explicit.and_then(parse_level_word).or_else(|| {
+        std::env::var("RUST_LOG")
+            .ok()
+            .and_then(|r| parse_rust_log(&r))
+    })
 }
 
-/// A resolved forward filter: the default threshold for unmatched kernel
-/// targets plus the per-target `RUST_LOG` directives ([`resolve_threshold`]).
-struct ResolvedFilter {
-    /// Threshold for kernel targets no `directives` entry matches — the explicit
-    /// one-knob level, `RUST_LOG`'s bare global level, or the `warn` default.
-    default_level: u8,
-    /// Per-target `RUST_LOG` thresholds. Empty for the one-knob explicit-level
-    /// case (a uniform threshold), so the hot path stays lock-free.
-    directives: Vec<(String, u8)>,
+/// Install `level` as the process-global threshold, returning whether it changed
+/// (so the caller only rebuilds the callsite interest cache when it matters).
+fn apply_level(level: u8) -> bool {
+    LEVEL.swap(level, Ordering::Relaxed) != level
 }
 
-/// Resolve the callback's forward filter from the caller's explicit `level`
-/// argument, mirroring `kernel_init_logging`'s precedence so the two C-ABI
-/// logging routes filter identically:
+/// Stand up the process-global subscriber + drain thread, retryable across
+/// calls (see [`INSTALL_LOCK`]). Returns `true` iff THIS call performed the
+/// successful install; a benign lost-race or a spawn failure returns `false`,
+/// with the outcome recorded in [`INSTALL_STATUS`] for the caller's return code.
 ///
-///   1. an explicit, recognised `level` word wins as a UNIFORM one-knob
-///      threshold (e.g. Go's driver level mapped through `DATABRICKS_LOG_LEVEL`),
-///      with no per-target directives — the host asked for one level everywhere;
-///   2. otherwise `RUST_LOG`, parsed into per-target directives + a bare global
-///      level ([`parse_rust_log`]), applied with `EnvFilter` precedence;
-///   3. otherwise `None` — the current filter is left untouched.
-///
-/// This keeps the callback on the one-knob contract PECOBLR-3650 established:
-/// `kernel_init_logging` maps the driver level to a level string, and the
-/// callback path must honour that same string rather than only `RUST_LOG` —
-/// otherwise a host at `DATABRICKS_LOG_LEVEL=debug` (but no `RUST_LOG`) would
-/// silently drop kernel debug lines.
-///
-/// Note the target matching still differs slightly from `kernel_init_logging`:
-/// that path builds an `EnvFilter` (`::`-segment match), whereas this bridge
-/// matches the broader `databricks` prefix (see `is_kernel_target`) for
-/// forwarding, then applies the same per-target precedence for the threshold. So
-/// for a `RUST_LOG` target directive the two routes select the same threshold
-/// but not necessarily the identical event set.
-fn resolve_filter(explicit: Option<&str>) -> Option<ResolvedFilter> {
-    if let Some(word) = explicit {
-        // A recognised explicit level always wins as a uniform threshold. "off"
-        // is honoured (the host asked for silence); an unrecognised word falls
-        // through to RUST_LOG.
-        if let Some(l) = parse_level_word(word) {
-            return Some(ResolvedFilter {
-                default_level: l,
-                directives: Vec::new(),
-            });
-        }
-    }
-    if let Ok(rust_log) = std::env::var("RUST_LOG") {
-        let (directives, global) = parse_rust_log(&rust_log);
-        if !directives.is_empty() || global.is_some() {
-            return Some(ResolvedFilter {
-                // A `RUST_LOG` with only target directives (no bare level) leaves
-                // unmatched kernel targets at the static `warn` default.
-                default_level: global.unwrap_or(LEVEL_WARN),
-                directives,
-            });
-        }
-    }
-    None
-}
-
-/// Install `filter` into the process-global filter state, returning whether it
-/// actually changed anything (so the caller only rebuilds the callsite interest
-/// cache when it matters). Writes the directives first, then the fast-path flag,
-/// then the levels, so a concurrent reader never sees `HAS_DIRECTIVES` set
-/// against a stale directive list.
-fn apply_filter(filter: ResolvedFilter) -> bool {
-    let new_default = filter.default_level;
-    let new_max = filter
-        .directives
-        .iter()
-        .map(|(_, l)| *l)
-        .fold(new_default, u8::max);
-    let has_dirs = !filter.directives.is_empty();
-
-    let dirs_lock = DIRECTIVES.get_or_init(|| RwLock::new(Vec::new()));
-    let dirs_changed = match dirs_lock.write() {
-        Ok(mut w) => {
-            let changed = *w != filter.directives;
-            *w = filter.directives;
-            changed
-        }
-        // Couldn't inspect the old list (poisoned lock) — assume changed so the
-        // interest cache is rebuilt conservatively.
-        Err(_) => true,
-    };
-    HAS_DIRECTIVES.store(has_dirs, Ordering::Relaxed);
-    MAX_LEVEL.store(new_max, Ordering::Relaxed);
-    let prev_default = LEVEL.swap(new_default, Ordering::Relaxed);
-    prev_default != new_default || dirs_changed
-}
-
-/// Stand up the process-global subscriber + drain thread, retryable across calls
-/// (see [`INSTALL_LOCK`]). Returns `true` iff THIS call performed the successful
-/// install (so the caller rebuilds the interest cache for the freshly-installed
-/// filter). A benign lost-race or a spawn failure returns `false`; the outcome
-/// is recorded in [`INSTALL_STATUS`] for the caller's return code.
-///
-/// Ordering matters: stand up the drain thread FIRST, and only then claim the
-/// one global subscriber via `set_global_default`. This keeps two failure modes
-/// clean:
-///
-///   - Spawn failure: if the OS refuses the drain thread (EAGAIN/ENOMEM) we bail
-///     out BEFORE touching the global subscriber, so the slot stays free and the
-///     host can still fall back to `kernel_init_logging`. The status stays
-///     retryable, so a later call can try again. (Claiming the subscriber first
-///     would strand it with no drain thread, silently dropping every event.)
-///   - Lost race: if another subscriber (e.g. `kernel_init_logging`) already
-///     won, `set_global_default` drops the subscriber it was handed — and with
-///     it the [`KernelLogLayer`]'s sender — so the freshly-spawned drain
-///     thread's `recv()` errors and it exits (no idle-thread leak). No global
-///     sender was ever published, so nothing can enqueue after the loss.
-///
-/// The sender lives in the layer instance (not a separately-published global),
-/// so there is no window where the subscriber is visible but the sender isn't
-/// yet published: a concurrent kernel log in that gap would otherwise reach
-/// `on_event`, find no sender, and be dropped WITHOUT being counted.
-///
-/// `set_global_default` is attempted at most once per process: it runs only
-/// after a drain thread is confirmed up, and both its outcomes (won / lost) are
-/// terminal, so a retry never re-attempts it.
+/// The drain thread is spawned FIRST, then the subscriber is claimed. So a
+/// spawn failure (EAGAIN/ENOMEM) bails before touching the global slot, leaving
+/// it free for `kernel_init_logging` and the status retryable; and a lost race
+/// drops the layer (and its sender), so the freshly-spawned drain thread's
+/// `recv()` errors and it exits without leaking. `set_global_default` runs at
+/// most once per process — only after the drain thread is up, and both its
+/// outcomes are terminal.
 fn ensure_installed() -> bool {
     // Terminal states need no work and no lock.
     match INSTALL_STATUS.load(Ordering::Acquire) {
@@ -846,27 +550,22 @@ fn ensure_installed() -> bool {
         .name("kernel-log-drain".to_owned())
         .spawn(move || drain_loop(rx))
     {
-        // Record the OS error distinctly so on-call can tell a spawn failure from
-        // the benign "already installed" case. Use `.lock().ok()` (not
-        // `.unwrap()`) so a poisoned mutex can't panic across the FFI boundary.
-        // `tx` drops here (no thread was spawned); the global subscriber is left
-        // untouched, and the status stays retryable for a later call.
+        // Record the OS error distinctly from the benign "already installed"
+        // case. `.lock().ok()` so a poisoned mutex can't panic across the FFI
+        // boundary; `tx` drops here, leaving the subscriber slot untouched.
         if let Ok(mut guard) = SPAWN_ERROR.get_or_init(|| Mutex::new(None)).lock() {
             *guard = Some(e.to_string());
         }
         INSTALL_STATUS.store(INSTALL_SPAWN_FAILED, Ordering::Release);
         return false;
     }
-    // Drain thread is running. Build the layer holding the sender, then claim the
-    // one global subscriber. Because the sender is inside the layer, it is
-    // published atomically with the subscriber — on_event never observes an
-    // installed-but-senderless state.
+    // Drain thread is up; build the layer (holding the sender) and claim the
+    // one global subscriber.
     let subscriber =
         tracing_subscriber::registry().with(KernelLogLayer { tx }.with_filter(KernelFilter));
     if tracing::subscriber::set_global_default(subscriber).is_err() {
-        // Another global subscriber won. `set_global_default` dropped the
-        // subscriber (and the layer's sender) on the error path, so the drain
-        // thread's blocked `recv()` unblocks with an error and it exits cleanly.
+        // Another subscriber won; the dropped layer takes its sender with it, so
+        // the drain thread's `recv()` errors and it exits cleanly.
         INSTALL_STATUS.store(INSTALL_ALREADY_SET, Ordering::Release);
         return false;
     }
@@ -882,21 +581,14 @@ fn ensure_installed() -> bool {
 /// `level` (a NUL-terminated `OFF`/`ERROR`/`WARN`/`INFO`/`DEBUG`/`TRACE`
 /// string, case-insensitive, or NULL) sets the forward filter with the same
 /// precedence as `kernel_init_logging`: an explicit recognised level wins as a
-/// UNIFORM threshold, else `RUST_LOG` is applied per target with `EnvFilter`
-/// precedence (so a submodule directive doesn't widen the canonical `klog!`
-/// target). A host that maps its own logger level (Go's `DATABRICKS_LOG_LEVEL`)
-/// passes it here so the callback filters on the one knob rather than only
-/// `RUST_LOG`. When neither resolves (NULL / unrecognised level AND no matching
-/// `RUST_LOG`) the current filter is LEFT UNCHANGED — the static `warn` default
-/// on the first-ever call, but the previously-set filter on a re-registration
-/// (the filter is process-global and last-writer-wins only when a writer
-/// actually resolves one).
+/// uniform threshold, else `RUST_LOG` is applied per target. When neither
+/// resolves, the current filter is left unchanged — the `warn` default on the
+/// first call, or the previously-set filter on a re-registration.
 ///
 /// Returns `Internal` (with a stored last error) if a global `tracing`
-/// subscriber was already installed (e.g. by `kernel_init_logging`) — the two
-/// are mutually exclusive; a C consumer installs exactly one — or if the
-/// log-drain thread could not be spawned (a transient spawn failure is
-/// retryable: a later call attempts the install again).
+/// subscriber was already installed (they are mutually exclusive; install
+/// exactly one), or if the log-drain thread could not be spawned (retryable —
+/// a later call attempts the install again).
 ///
 /// # Safety
 /// `cb` must be a valid function pointer that is thread-safe, does not unwind,
@@ -917,35 +609,26 @@ pub unsafe extern "C" fn kernel_set_log_callback(
         return KernelStatusCode::InvalidArgument;
     };
 
-    // Resolve the forward threshold: explicit `level` (the host's mapped logger
-    // level) wins, else RUST_LOG, else the WARN default is left in place. A
-    // non-UTF-8 `level` is treated as absent (best-effort, like
-    // kernel_init_logging's level arg) rather than a hard error. This keeps the
-    // callback filtering on the same knob as the stderr path.
+    // A non-UTF-8 `level` is treated as absent (best-effort, like
+    // kernel_init_logging's level arg) rather than a hard error.
     let explicit_level = if level.is_null() {
         None
     } else {
         std::ffi::CStr::from_ptr(level).to_str().ok()
     };
-    // Track whether the filter actually changed so we only rebuild the (process-
-    // wide, lock-taking) callsite interest cache when it matters — a same-filter
-    // ctx refresh or a call that loses the subscriber race shouldn't serialize
-    // all logging dispatch.
+    // Track whether the level actually changed, so the lock-taking callsite
+    // interest cache is only rebuilt when it matters (not on a ctx refresh).
     let mut filter_changed = false;
-    if let Some(resolved) = resolve_filter(explicit_level) {
-        filter_changed = apply_filter(resolved);
+    if let Some(level) = resolve_level(explicit_level) {
+        filter_changed = apply_level(level);
     }
 
-    // Record / refresh the sink (last writer wins). Clear any prior poison: a
-    // callback that unwound poisons the sink (drain_loop stops delivering to
-    // protect the process), but registering a NEW callback is an explicit
-    // request for a fresh start, so honour the last-writer-wins contract and let
-    // delivery resume. The drain thread reads the flag per record, so clearing
-    // it here (before releasing the SINK lock) is immediately effective.
+    // Record / refresh the sink (last writer wins) and clear any prior poison:
+    // registering a new callback is an explicit request to resume delivery.
     let sink = SINK.get_or_init(|| Mutex::new(None));
     if let Ok(mut guard) = sink.lock() {
-        // A fresh generation so the drain thread won't let an old in-flight
-        // callback's unwind poison this new registration (see poison_sink_if_current).
+        // A fresh generation so an old in-flight callback's unwind can't poison
+        // this new registration (see poison_sink_if_current).
         let gen = NEXT_SINK_GEN.fetch_add(1, Ordering::Relaxed);
         *guard = Some(Sink {
             cb,
@@ -958,12 +641,9 @@ pub unsafe extern "C" fn kernel_set_log_callback(
     // Install the process-global subscriber + drain thread (retryable across
     // calls after a transient spawn failure — see ensure_installed).
     let did_install = ensure_installed();
-    // Rebuild the process-wide callsite interest cache only when it can matter:
-    // on the install that set our filter, or when a later call changed the
-    // filter. set_global_default rebuilds on its own, but the filter may have
-    // been set before install, and a re-filter after install needs a rebuild
-    // too; a same-filter ctx refresh or a race-loss does not (the rebuild takes
-    // the global callsite lock and re-evaluates every callsite in the binary).
+    // Rebuild the callsite interest cache only when it can matter: on the
+    // install that set our filter, or a later call that changed the filter. The
+    // rebuild takes the global callsite lock, so skip it on a ctx-only refresh.
     if did_install || filter_changed {
         tracing::callsite::rebuild_interest_cache();
     }
@@ -995,30 +675,15 @@ pub unsafe extern "C" fn kernel_set_log_callback(
     }
 }
 
-/// Report the log-callback bridge's health so a host can tell whether kernel
-/// logs are actually flowing. Writes to each (optional) out-param:
-///
-///   - `installed`: `true` iff kernel logs are CURRENTLY being delivered — this
-///     callback won the process-global subscriber AND the sink is not poisoned.
-///     A callback that unwound poisons the sink (delivery stops); this then
-///     reads `false` even though the subscriber is still installed, so a host
-///     polling it sees a dead sink rather than a silent no-op. Registering a new
-///     callback clears the poison and flips this back to `true`.
-///   - `dropped`: cumulative count of kernel log records dropped after the
-///     subscriber was installed — because the bounded delivery channel was full
-///     (a slow callback) or the sink was poisoned by a callback that unwound.
-///     This does NOT cover the drain-thread-never-started case (a spawn failure
-///     leaves no channel to overflow); there `installed` reads `false` and
-///     `kernel_set_log_callback` returned `Internal` with the spawn error.
-///
-/// A NULL out-param is skipped. Never fails — a host can poll it to distinguish
-/// "logs are quiet" from "logs are being dropped / the sink died / never
-/// installed" (parity with the napi binding's `kernelLoggingStats()`).
+/// Report the log-callback bridge's health (full contract in
+/// `databricks_kernel.h`). `installed` is `true` iff this callback won the
+/// subscriber and the sink is not poisoned; `dropped` is the cumulative records
+/// lost to channel overflow or poisoning. A NULL out-param is skipped, and it
+/// never fails.
 ///
 /// Clears the thread-local last-error on entry like every other C-ABI entry
-/// point, so a host that calls this (successful, infallible) accessor between a
-/// failed API call and reading the error doesn't observe the prior call's stale
-/// error through it.
+/// point, so a host polling this infallible accessor between a failed call and
+/// reading the error doesn't observe a stale error through it.
 ///
 /// # Safety
 /// Each non-null out-param must point to a writable `bool` / `uint64_t`.
@@ -1129,51 +794,38 @@ mod tests {
 
     #[test]
     fn should_emit_respects_configured_level() {
-        let target = crate::klog::KERNEL_LOG_TARGET;
         LEVEL.store(LEVEL_INFO, Ordering::Relaxed);
-        assert!(should_emit(target, &Level::ERROR));
-        assert!(should_emit(target, &Level::INFO));
-        assert!(!should_emit(target, &Level::DEBUG));
+        assert!(should_emit(&Level::ERROR));
+        assert!(should_emit(&Level::INFO));
+        assert!(!should_emit(&Level::DEBUG));
         LEVEL.store(LEVEL_OFF, Ordering::Relaxed);
-        assert!(!should_emit(target, &Level::ERROR));
+        assert!(!should_emit(&Level::ERROR));
         LEVEL.store(LEVEL_WARN, Ordering::Relaxed); // restore
     }
 
     #[test]
-    fn parse_rust_log_keeps_kernel_directives_and_global() {
-        // Kernel directives are retained with their target (for per-event prefix
-        // matching); foreign directives are dropped; a bare word is the global.
-        let (dirs, global) = parse_rust_log("hyper=off,databricks::sql::kernel=info,rustls=warn");
+    fn parse_rust_log_collapses_to_most_verbose_kernel_level() {
+        // Foreign directives are ignored; the kernel one sets the level.
         assert_eq!(
-            dirs,
-            vec![("databricks::sql::kernel".to_owned(), LEVEL_INFO)]
+            parse_rust_log("hyper=off,databricks::sql::kernel=info,rustls=warn"),
+            Some(LEVEL_INFO)
         );
-        assert_eq!(global, None);
-
-        // Either kernel spelling is kept.
-        let (dirs, _) = parse_rust_log("databricks_sql_kernel=trace");
+        // Either kernel spelling is accepted.
         assert_eq!(
-            dirs,
-            vec![("databricks_sql_kernel".to_owned(), LEVEL_TRACE)]
+            parse_rust_log("databricks_sql_kernel=trace"),
+            Some(LEVEL_TRACE)
         );
-
-        // A bare global level with no kernel directive.
-        let (dirs, global) = parse_rust_log("debug");
-        assert!(dirs.is_empty());
-        assert_eq!(global, Some(LEVEL_DEBUG));
-
-        // Nothing kernel-applicable and no bare level → empty.
-        let (dirs, global) = parse_rust_log("hyper=warn");
-        assert!(dirs.is_empty());
-        assert_eq!(global, None);
-        let (dirs, global) = parse_rust_log("");
-        assert!(dirs.is_empty());
-        assert_eq!(global, None);
-
-        // Non-matching databricks siblings and over-specific extensions of the
-        // fixed-depth klog target are dropped (prefixes of no kernel event).
-        let (dirs, _) = parse_rust_log("databricksfoo=warn,databricks::sql::kernel::foo=trace");
-        assert!(dirs.is_empty());
+        // A bare level word applies.
+        assert_eq!(parse_rust_log("debug"), Some(LEVEL_DEBUG));
+        // Nothing kernel-applicable and no bare level → None.
+        assert_eq!(parse_rust_log("hyper=warn"), None);
+        assert_eq!(parse_rust_log(""), None);
+        // Non-matching databricks siblings and over-specific klog extensions are
+        // ignored (prefixes of no kernel event).
+        assert_eq!(
+            parse_rust_log("databricksfoo=warn,databricks::sql::kernel::foo=trace"),
+            None
+        );
     }
 
     #[test]
@@ -1181,84 +833,32 @@ mod tests {
         // `EnvFilter` reads a bare kernel target (no `=level`) as that target at
         // TRACE — it must NOT be ignored, which would leave the callback at WARN
         // where kernel_init_logging emits trace.
-        let (dirs, global) = parse_rust_log("databricks::sql::kernel");
+        assert_eq!(parse_rust_log("databricks::sql::kernel"), Some(LEVEL_TRACE));
+        // A foreign target-only directive is ignored; a bare kernel target is
+        // TRACE and a bare level word is INFO, so the max (TRACE) wins.
         assert_eq!(
-            dirs,
-            vec![("databricks::sql::kernel".to_owned(), LEVEL_TRACE)]
-        );
-        assert_eq!(global, None);
-        // A foreign target-only directive is dropped; a kernel one becomes TRACE;
-        // a bare level word still sets the global.
-        let (dirs, global) = parse_rust_log("hyper,databricks_sql_kernel::session,info");
-        assert_eq!(
-            dirs,
-            vec![("databricks_sql_kernel::session".to_owned(), LEVEL_TRACE)]
-        );
-        assert_eq!(global, Some(LEVEL_INFO));
-    }
-
-    #[test]
-    fn resolve_threshold_per_target_does_not_widen_klog() {
-        // The reviewer's case: a klog directive and an unrelated submodule
-        // directive must NOT widen each other. Each target resolves against only
-        // the directives whose target is a PREFIX of it (EnvFilter's rule), so a
-        // single scalar can't collapse them into the most verbose one.
-        let (dirs, global) = parse_rust_log(
-            "databricks::sql::kernel=error,databricks_sql_kernel::reader::inline=trace",
-        );
-        assert_eq!(global, None);
-        let default = global.unwrap_or(LEVEL_WARN);
-        // The canonical klog target keeps ERROR — the reader::inline=trace
-        // directive is not a prefix of it, so it does not apply (previously the
-        // single scalar collapsed to TRACE and widened klog to trace/debug).
-        assert_eq!(
-            resolve_threshold("databricks::sql::kernel", default, &dirs),
-            LEVEL_ERROR
-        );
-        // A module event under the submodule keeps its own TRACE directive.
-        assert_eq!(
-            resolve_threshold(
-                "databricks_sql_kernel::reader::inline::stream",
-                default,
-                &dirs
-            ),
-            LEVEL_TRACE
-        );
-        // A kernel target matched by neither directive falls back to the default.
-        assert_eq!(
-            resolve_threshold("databricks_sql_kernel::session", default, &dirs),
-            LEVEL_WARN
+            parse_rust_log("hyper,databricks_sql_kernel::session,info"),
+            Some(LEVEL_TRACE)
         );
     }
 
     #[test]
-    fn resolve_threshold_most_specific_wins_order_independent() {
-        // Longest matching prefix wins, independent of order (EnvFilter dedup
-        // is last-writer on a tie, so we replace on `>=`).
-        let dirs = vec![
-            ("databricks".to_owned(), LEVEL_WARN),
-            ("databricks::sql::kernel".to_owned(), LEVEL_DEBUG),
-        ];
+    fn parse_rust_log_takes_max_across_directives() {
+        // Multiple kernel-applicable directives collapse to the most verbose,
+        // order-independent (the callback carries one level). ERROR + TRACE → TRACE.
         assert_eq!(
-            resolve_threshold("databricks::sql::kernel", LEVEL_WARN, &dirs),
-            LEVEL_DEBUG
+            parse_rust_log("databricks::sql::kernel=error,databricks_sql_kernel::reader=trace"),
+            Some(LEVEL_TRACE)
         );
-        let dirs_rev = vec![
-            ("databricks::sql::kernel".to_owned(), LEVEL_DEBUG),
-            ("databricks".to_owned(), LEVEL_WARN),
-        ];
         assert_eq!(
-            resolve_threshold("databricks::sql::kernel", LEVEL_WARN, &dirs_rev),
-            LEVEL_DEBUG
+            parse_rust_log("databricks_sql_kernel::reader=trace,databricks::sql::kernel=error"),
+            Some(LEVEL_TRACE)
         );
-        // A databricks event matched only by the broad directive takes its level,
-        // not the more specific sibling's.
+        // A bare global level is also folded into the max.
         assert_eq!(
-            resolve_threshold("databricks::other", LEVEL_INFO, &dirs),
-            LEVEL_WARN
+            parse_rust_log("warn,databricks::sql::kernel=debug"),
+            Some(LEVEL_DEBUG)
         );
-        // No matching directive → the default.
-        assert_eq!(resolve_threshold("databricks", LEVEL_INFO, &[]), LEVEL_INFO);
     }
 
     #[test]
@@ -1286,31 +886,18 @@ mod tests {
     }
 
     #[test]
-    fn resolve_filter_explicit_level_is_uniform_one_knob() {
-        // An explicit, recognised level wins outright — this is the one-knob
-        // path (Go maps DATABRICKS_LOG_LEVEL and passes it in), independent of
-        // whatever RUST_LOG happens to be, and carries NO per-target directives
-        // (one level applies everywhere). We don't touch the process RUST_LOG
-        // here (that would race other tests); an explicit level short-circuits
-        // before RUST_LOG is ever read.
-        let f = resolve_filter(Some("debug")).expect("recognised level resolves");
-        assert_eq!(f.default_level, LEVEL_DEBUG);
-        assert!(
-            f.directives.is_empty(),
-            "a one-knob explicit level carries no per-target directives"
-        );
-        assert_eq!(
-            resolve_filter(Some("OFF")).unwrap().default_level,
-            LEVEL_OFF
-        );
-        assert_eq!(
-            resolve_filter(Some("Error")).unwrap().default_level,
-            LEVEL_ERROR
-        );
+    fn resolve_level_explicit_level_wins() {
+        // An explicit, recognised level wins outright — the one-knob path (Go
+        // maps DATABRICKS_LOG_LEVEL and passes it in), independent of RUST_LOG.
+        // We don't touch the process RUST_LOG here (that would race other tests);
+        // an explicit level short-circuits before RUST_LOG is ever read.
+        assert_eq!(resolve_level(Some("debug")), Some(LEVEL_DEBUG));
+        assert_eq!(resolve_level(Some("OFF")), Some(LEVEL_OFF));
+        assert_eq!(resolve_level(Some("Error")), Some(LEVEL_ERROR));
         // An unrecognised explicit word falls through (to RUST_LOG, else None).
         assert_eq!(parse_level_word("not-a-level"), None);
         // NULL/absent explicit level defers to RUST_LOG (covered by the
-        // parse_rust_log / resolve_threshold tests).
+        // parse_rust_log tests).
     }
 
     #[test]
