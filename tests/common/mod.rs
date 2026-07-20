@@ -39,8 +39,16 @@ use std::env;
 use std::sync::OnceLock;
 
 /// Connection details loaded once from the JSON file named by
-/// `DATABRICKS_TEST_CONFIG_FILE` (or an empty map when unset/unreadable/invalid).
+/// Connection details from the JSON file named by `DATABRICKS_TEST_CONFIG_FILE`.
 /// Keys: `host`, `http_path`, `access_token`.
+///
+/// The var UNSET (the normal-CI / local case) ⇒ an empty map, so every fixture
+/// falls through to its env var unchanged. But when the var IS set (the
+/// engineer-bot path) and the file is unreadable or malformed, we PANIC with a
+/// specific message rather than silently returning an empty map: otherwise
+/// `live_session` would later panic with the misleading `"DATABRICKS_TOKEN
+/// required"`, as if no config were provided, making a misprovisioned run hard to
+/// diagnose. Var-set-and-file-OK is the success path.
 fn config_file() -> &'static HashMap<String, String> {
     static CONFIG: OnceLock<HashMap<String, String>> = OnceLock::new();
     CONFIG.get_or_init(|| {
@@ -48,11 +56,12 @@ fn config_file() -> &'static HashMap<String, String> {
             Ok(p) if !p.is_empty() => p,
             _ => return HashMap::new(),
         };
-        let contents = match std::fs::read_to_string(&path) {
-            Ok(c) => c,
-            Err(_) => return HashMap::new(),
-        };
-        serde_json::from_str::<HashMap<String, String>>(&contents).unwrap_or_default()
+        let contents = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!("DATABRICKS_TEST_CONFIG_FILE is set to {path:?} but the file could not be read: {e}")
+        });
+        serde_json::from_str::<HashMap<String, String>>(&contents).unwrap_or_else(|e| {
+            panic!("DATABRICKS_TEST_CONFIG_FILE {path:?} is not valid JSON of {{host, http_path, access_token}}: {e}")
+        })
     })
 }
 
