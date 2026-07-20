@@ -34,13 +34,17 @@ context_repos:
       CloudFetch. grep for the class/method the issue names to see how JDBC does
       it, then mirror that behavior in the Rust kernel.
     clone_url: https://github.com/databricks/databricks-jdbc.git
-  - name: adbc-databricks
+  - name: adbc-databricks-csharp
     description: >
-      The Databricks ADBC driver (Rust) — the closest sibling to this kernel: the
-      kernel was seeded from its Rust subtree, so it shares protocol shape, Thrift
-      /SEA request construction, async result streaming, and error/status mapping.
-      Consult it when a decision turns on how the Rust driver already handles a
-      protocol detail (session/statement lifecycle, CloseStatement/cancel
-      sequencing, Arrow/CloudFetch decode, retry/backoff, TLS config). grep for the
-      module/type the issue touches and mirror the established Rust approach.
+      The Databricks ADBC driver (C#) — a mature sibling implementation of the
+      same Databricks SQL / Thrift+SEA protocol this kernel targets. Consult it
+      when a decision turns on how an established driver handles a protocol detail:
+      session/statement lifecycle, CloseStatement/cancel sequencing, Arrow/
+      CloudFetch decode, metadata fan-out, retry/backoff, TLS config, error/status
+      mapping. Driver source is under `csharp/src/`; grep for the class/method your
+      issue touches and mirror that behavior in the Rust kernel. (NOTE: this repo
+      also contains a Rust ADBC driver subtree — ignore it; that driver is being
+      REPLACED by this kernel, so it is not a reference. Use the C# driver under
+      `csharp/`.)
     clone_url: https://github.com/adbc-drivers/databricks.git
+    subpath: csharp/

@@ -47,6 +47,6 @@ Landmarks for this repo:
 - When a finding hinges on whether the change matches Databricks' established
   protocol/metadata/error behavior, you can verify against the reference drivers
   via `fetch_context_repo` (then `grep_context_repo` / `read_context_repo`):
-  `adbc-databricks` (the Rust sibling this kernel was seeded from) and
-  `databricks-jdbc` (the parity ground truth). Cite what the reference does when a
-  finding rests on it.
+  `adbc-databricks-csharp` (the mature C# sibling driver; source under `csharp/`)
+  and `databricks-jdbc` (the parity ground truth). Cite what the reference does
+  when a finding rests on it.

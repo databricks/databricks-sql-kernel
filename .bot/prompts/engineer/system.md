@@ -108,12 +108,13 @@ an established Databricks driver does on the wire, NOT the kernel code you're
 changing (that's the code under suspicion). Two public references are available on
 demand via `fetch_context_repo`, then `grep_context_repo` / `read_context_repo`:
 
-  - **`adbc-databricks`** — the Databricks ADBC driver (Rust), the closest sibling
-    (this kernel was seeded from its Rust subtree). Prefer it first: it shares
-    protocol shape, Thrift/SEA request construction, async result streaming, and
-    error mapping, so its approach usually translates directly. grep for the
-    module/type your issue touches (session/statement lifecycle,
-    CloseStatement/cancel, Arrow/CloudFetch decode, retry, TLS).
+  - **`adbc-databricks-csharp`** — the Databricks ADBC driver (C#), a mature
+    sibling implementation of the same Databricks SQL / Thrift+SEA protocol. Its
+    driver source is under `csharp/src/`; grep for the class/method your issue
+    touches (session/statement lifecycle, CloseStatement/cancel, Arrow/CloudFetch
+    decode, metadata fan-out, retry, TLS) and mirror that behavior in Rust. (That
+    repo also has a Rust ADBC subtree — ignore it; it is being REPLACED by this
+    kernel and is NOT a reference.)
   - **`databricks-jdbc`** — Databricks' official JDBC driver (Java), the canonical
     parity reference when an issue cites "how JDBC does it" (metadata columns/
     ordinals, catalog/schema wildcards, type mapping, status semantics).
