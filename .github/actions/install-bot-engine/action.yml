@@ -62,6 +62,10 @@ runs:
         if [ -z "${JFROG_ACCESS_TOKEN:-}" ]; then
           echo "::error::JFROG_ACCESS_TOKEN not set — run ./.github/actions/setup-jfrog (uv: true) before this composite"; exit 1
         fi
+        # Defensively mask the JFrog token so it can't surface in the job log if a
+        # later step (or npm verbosity / an error dump) echoes the .npmrc contents,
+        # matching the ::add-mask:: treatment the engine token already gets.
+        echo "::add-mask::${JFROG_ACCESS_TOKEN}"
         umask 077
         cat > "${RUNNER_TEMP:-/tmp}/bot-jfrog-npmrc" << EOF
         registry=https://databricks.jfrog.io/artifactory/api/npm/db-npm/
