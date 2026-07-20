@@ -24,6 +24,16 @@ mod common;
 
 use std::io::Write;
 
+// ⚠️ SINGLE-TEST INVARIANT — do NOT add a second `#[test]` to this binary.
+// The test below mutates process-global env (`set_var`/`remove_var` on
+// `DATABRICKS_TOKEN`/`HOST`/`HTTP_PATH`/`TEST_CONFIG_FILE`) and depends on owning
+// the first read that `config_file()`'s `OnceLock` caches. Rust runs a binary's
+// tests on parallel threads by default, so a second test here would race on both
+// the shared env and the one-shot cache and flake. If you need more offline
+// coverage of `tests/common`, add it in a SEPARATE integration-test file (its own
+// binary → its own process → its own env + `OnceLock`), or serialize with
+// `serial_test` before adding one here.
+
 /// End-to-end fallback: with `DATABRICKS_TOKEN` absent from the env (as under the
 /// bot's scrub) but a config file present, `common::env_var("DATABRICKS_TOKEN")`
 /// resolves from the file. This is the only test in this binary, so it owns the
