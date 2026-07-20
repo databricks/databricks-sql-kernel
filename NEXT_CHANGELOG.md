@@ -11,6 +11,24 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
+  HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
+  `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own
+  `RetryWaitMin` / `RetryWaitMax` / `RetryMax` / retry-budget policy authoritative
+  instead of the kernel default; `max_retries=0` disables retries, and
+  `overall_timeout_ms=0` keeps the kernel's default budget (non-zero overrides it).
+  The retry budget is always bounded — a large `max_retries` is still capped by it.
+  Benefits ODBC too. (Consumed by the Go driver via `WithRetries`,
+  databricks/databricks-sql-go#412.)
+- C ABI: client-only `session_conf` key `cloudfetch_max_chunks_in_memory` — carried
+  by the existing `kernel_session_config_set_session_conf()` setter (no new symbol),
+  it bounds how many decompressed CloudFetch chunks the kernel holds in memory at
+  once (peak RSS on large result sets; default 16). Accepts a positive integer;
+  a value above the kernel ceiling (256) is clamped, and a non-numeric / non-positive
+  value is ignored (default preserved) with a warning rather than failing session
+  creation. The key is client-only — it is consumed before session creation and never
+  reaches the SEA wire. Benefits ODBC too.
+
 ### Updated
 
 ### Fixed
