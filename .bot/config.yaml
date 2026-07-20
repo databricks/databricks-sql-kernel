@@ -39,7 +39,12 @@ pr_body_template: |-
 #     (see CLAUDE.md + .github/workflows/pr-checks.yml). The agent runs the suite —
 #     including its own live E2E repro via `cargo test --test <suite> -- --ignored`
 #     — to self-verify its red→green fix. `cargo fmt` / `cargo clippy` let it match
-#     the repo's pre-commit checks before finishing.
+#     the repo's pre-commit checks before finishing. The prompts (and CLAUDE.md)
+#     mandate the toolchain-pinned `cargo +stable fmt --all`, whose argv is
+#     `[cargo, +stable, fmt, ...]` — the `+stable` selector sits in argv[1], so the
+#     `[cargo, +stable, fmt]` prefix is allowlisted alongside plain `[cargo, fmt]`.
+#     `cargo clippy` needs no `+stable` variant (prompts run it on the default
+#     toolchain), so `[cargo, clippy]` covers it.
 #   - `git status` is KEPT: it generates no diff and accepts no `--output`, so it is
 #     a safe way to list changed files. The agent inspects its own work via
 #     read_file / glob / grep (repo-relative, safe_path-contained) plus that list.
@@ -57,6 +62,7 @@ bash_allowlist:
   - [cargo, test]
   - [cargo, build]
   - [cargo, fmt]
+  - [cargo, +stable, fmt]
   - [cargo, clippy]
   - [git, status]
 
