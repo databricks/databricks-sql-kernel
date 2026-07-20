@@ -824,17 +824,42 @@ pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
 /// error. A value above [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to
 /// that ceiling (with a warning) so a fat-fingered value can't drive peak
 /// RSS toward OOM. Matched case-insensitively, consistent with the rest of
-/// the `session_conf` handling.
+/// the `session_conf` handling; if a host sets two spellings that differ only
+/// in case the lexicographically-last one wins deterministically (and all
+/// variants are stripped).
 fn apply_client_result_overrides(config: &mut SessionConfig) {
-    let key = config
+    // Collect EVERY case-insensitive spelling of the key, not just the first
+    // one `HashMap` iteration happens to yield. Two variants that differ only
+    // in case (e.g. `cloudfetch_max_chunks_in_memory` and
+    // `CloudFetch_Max_Chunks_In_Memory`) would otherwise resolve
+    // nondeterministically across runs. We sort the matches and let the
+    // lexicographically-last spelling win — a stable, run-independent rule —
+    // and remove all of them regardless of parse outcome, so no client-only
+    // key survives into `filter_session_conf` / the wire.
+    let mut keys: Vec<String> = config
         .session_conf
         .keys()
-        .find(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS))
-        .cloned();
-    let Some(key) = key else { return };
-    // Remove it regardless of parse outcome: it is a client knob and must
-    // never survive into `filter_session_conf` / the wire.
-    let raw = config.session_conf.remove(&key).unwrap_or_default();
+        .filter(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS))
+        .cloned()
+        .collect();
+    if keys.is_empty() {
+        return;
+    }
+    keys.sort_unstable();
+    if keys.len() > 1 {
+        crate::klog::warn!(
+            variants = keys.len(),
+            "multiple case-variant cloudfetch_max_chunks_in_memory keys set; \
+             applying the lexicographically-last spelling deterministically",
+        );
+    }
+    // Remove every variant; the winner's value drives the override.
+    let mut raw = String::new();
+    for k in &keys {
+        if let Some(v) = config.session_conf.remove(k) {
+            raw = v;
+        }
+    }
     match raw.trim().parse::<usize>() {
         Ok(n) if n > 0 => {
             // Clamp to a sane ceiling: peak RSS scales with this knob, so an
@@ -1126,6 +1151,48 @@ mod retry_config_tests {
         apply_client_result_overrides(&mut cfg);
         assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 8);
         assert!(cfg.session_conf.is_empty());
+    }
+
+    /// Two spellings differing only in case resolve deterministically to the
+    /// lexicographically-last one (not whichever HashMap iteration yields
+    /// first), every variant is stripped, and an unrelated server key survives
+    /// untouched. Guards against both the nondeterministic-winner bug and an
+    /// over-broad removal that would wipe legitimate server SET params.
+    #[test]
+    fn cloudfetch_max_chunks_duplicate_case_variants_are_deterministic() {
+        // "cloudfetch_..." (lowercase 'c') sorts after "CloudFetch_..."
+        // (uppercase 'C') in ASCII, so the lowercase spelling's value (200)
+        // wins regardless of insertion order; 200 clamps to the ceiling.
+        let mut cfg = config_with_session_conf(HashMap::from([
+            (
+                "CloudFetch_Max_Chunks_In_Memory".to_string(),
+                "8".to_string(),
+            ),
+            (
+                "cloudfetch_max_chunks_in_memory".to_string(),
+                "200".to_string(),
+            ),
+            // A benign, allowlisted server param that must NOT be removed.
+            ("ansi_mode".to_string(), "true".to_string()),
+        ]));
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(
+            cfg.result.cloudfetch_max_chunks_in_memory, 200,
+            "the lexicographically-last case variant must win deterministically"
+        );
+        assert!(
+            !cfg.session_conf
+                .keys()
+                .any(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS)),
+            "every case variant of the client knob must be stripped, got {:?}",
+            cfg.session_conf
+        );
+        assert_eq!(
+            cfg.session_conf.get("ansi_mode").map(String::as_str),
+            Some("true"),
+            "an unrelated server param must survive untouched, got {:?}",
+            cfg.session_conf
+        );
     }
 
     /// Absent key ⇒ the ResultConfig default (16) is preserved.
