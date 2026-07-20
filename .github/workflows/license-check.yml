@@ -64,18 +64,23 @@ jobs:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - uses: ./.github/actions/setup-jfrog
         with:
           cargo: "true"
 
-      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659  # v1.17.0
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
 
       - name: Install cargo-deny
-        uses: taiki-e/install-action@2ca9b94c269419b7b0c711c09d0b21c4e1d51145  # v2.83.1
+        uses: taiki-e/install-action@07b4745e0c39a41822af610387492e3e53aa222b # v2.83.4
         with:
-          tool: cargo-deny
+          # Pin the version: an unpinned `tool: cargo-deny` lets
+          # install-action grab whatever's newest, and cargo-deny's CLI
+          # grammar drifts across minor releases (e.g. `--config` moved
+          # to a global flag). Bump deliberately, in step with the
+          # invocation below.
+          tool: cargo-deny@0.20.2
 
       - name: Check licenses, advisories, bans, sources (root workspace)
         # `licenses` is the load-bearing check; `advisories` flags
@@ -90,11 +95,12 @@ jobs:
         # its transitive graph is NOT seen by the root run above. Scan
         # it explicitly against the same deny.toml policy. `--config`
         # points back at the root deny.toml so both workspaces share
-        # one allowlist rather than drifting. `--manifest-path` is a
-        # global cargo-deny flag (before the subcommand); `--config`
-        # is a `check` flag (after it). Both paths are absolute via
+        # one allowlist rather than drifting. Both `--manifest-path`
+        # and `--config` are global cargo-deny flags (before the
+        # `check` subcommand) — recent cargo-deny rejects `--config`
+        # when placed after `check`. Both paths are absolute via
         # $GITHUB_WORKSPACE so the step is immune to any
         # `defaults.run.working-directory` a future edit might add
         # (a relative `--config` would otherwise resolve against the
         # manifest dir and look for napi/deny.toml).
-        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" check --config "$GITHUB_WORKSPACE/deny.toml"
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check

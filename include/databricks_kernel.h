@@ -276,7 +276,17 @@ KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
                                                     uint16_t redirect_port,
                                                     const char* scopes);
 
-/* Add (or overwrite) one server-bound session-conf entry. */
+/* Add (or overwrite) one session-conf entry. Keys are normally server SET
+ * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
+ * reserved keys are instead CLIENT-ONLY: they tune the kernel locally, are
+ * consumed before session creation, and NEVER reach the wire. Client-only keys
+ * (matched case-insensitively):
+ *
+ *   cloudfetch_max_chunks_in_memory  — positive integer; how many decompressed
+ *       CloudFetch chunks the kernel holds in memory at once (bounds peak RSS on
+ *       large result sets; default 16). A value above the kernel ceiling (256) is
+ *       clamped; a non-numeric / non-positive value is ignored (default kept) with
+ *       a warning — a bad tuning value never fails session open. */
 KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* config,
                                                         const char* key,
                                                         const char* value);
@@ -329,6 +339,31 @@ KernelStatusCode kernel_session_config_set_tls_allow_self_signed(KernelSessionCo
 /* Skip the certificate hostname-vs-SNI check. Development / lab only. */
 KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(KernelSessionConfig* config,
                                                                          bool skip);
+
+/* Configure the HTTP retry / backoff policy. `min_wait_ms` / `max_wait_ms`
+ * are the backoff-wait bounds between attempts (the wait is exponential
+ * with jitter, clamped to this range); `max_retries` is the number of
+ * retries AFTER the initial attempt (so at most `max_retries + 1` total
+ * attempts, and `0` disables retries); `overall_timeout_ms` is the cumulative
+ * retry budget across all attempts (`0` keeps the kernel default — pass
+ * non-zero to override it). Lets a host's RetryWaitMin / RetryWaitMax /
+ * RetryMax / retry-timeout surface override the kernel's built-in policy
+ * (default 5 retries, 1s..60s, 900s budget) when this setter is not called.
+ *
+ * The retry budget is ALWAYS bounded — there is no "unlimited" value. A large
+ * `max_retries` is still capped by the (default or overridden) budget: if the
+ * exponential backoff sums past `overall_timeout_ms` the remaining attempts do
+ * not run, so raise `overall_timeout_ms` alongside a large `max_retries` if you
+ * want them all to fire. A non-zero `overall_timeout_ms` smaller than
+ * `min_wait_ms` guarantees ZERO retries (the first backoff already exceeds the
+ * budget); it is accepted but the kernel logs a warning.
+ *
+ * `min_wait_ms == 0` or `max_wait_ms < min_wait_ms` returns InvalidArgument.
+ * Benefits ODBC too. */
+KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* config,
+                                                        uint64_t min_wait_ms, uint64_t max_wait_ms,
+                                                        uint32_t max_retries,
+                                                        uint64_t overall_timeout_ms);
 
 /* Configure a client certificate + private key for mutual TLS (mTLS).
  * BOTH halves are required and passed together: `cert_pem`/`cert_len` is a
