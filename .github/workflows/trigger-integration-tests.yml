@@ -239,7 +239,7 @@ jobs:
       pull-requests: write
     steps:
       - name: Sticky comment about rollout gate
-        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043  # v4.0.0
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9  # v5.0.0
         with:
           issue-number: ${{ github.event.pull_request.number }}
           # Distinct marker from the dispatch-side comment so the
@@ -345,7 +345,7 @@ jobs:
           client-payload: ${{ steps.payload.outputs.json }}
 
       - name: Comment on PR (sticky)
-        uses: peter-evans/create-or-update-comment@71345be0265236311c031f5c7866368bd1eff043  # v4.0.0
+        uses: peter-evans/create-or-update-comment@e8674b075228eee787fea43ef493e45ece1004c9  # v5.0.0
         with:
           issue-number: ${{ github.event.pull_request.number }}
           # Body is a single sticky comment edited in place — avoids
