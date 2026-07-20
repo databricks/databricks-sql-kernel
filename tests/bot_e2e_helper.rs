@@ -63,7 +63,7 @@ fn token_falls_back_to_config_file_when_env_absent() {
         Some("/sql/1.0/x")
     );
 
-    // Env wins over the file: set the token explicitly and a FRESH read prefers it.
+    // Env wins over the file: set the host explicitly and a FRESH read prefers it.
     // (config_file() is cached, but env_var checks the environment first.)
     std::env::set_var("DATABRICKS_HOST", "env-host");
     assert_eq!(
