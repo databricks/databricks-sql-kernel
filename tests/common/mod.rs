@@ -39,8 +39,7 @@ use std::env;
 use std::sync::OnceLock;
 
 /// Connection details loaded once from the JSON file named by
-/// Connection details from the JSON file named by `DATABRICKS_TEST_CONFIG_FILE`.
-/// Keys: `host`, `http_path`, `access_token`.
+/// `DATABRICKS_TEST_CONFIG_FILE`. Keys: `host`, `http_path`, `access_token`.
 ///
 /// The var UNSET (the normal-CI / local case) ⇒ an empty map, so every fixture
 /// falls through to its env var unchanged. But when the var IS set (the
