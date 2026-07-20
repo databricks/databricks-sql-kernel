@@ -110,6 +110,14 @@ jobs:
       - name: Revert Cargo.lock churn (keep only the agent's edits)
         run: git checkout -- Cargo.lock
 
+      # The Python interpreter bot-prelude pip-installs the engine into and the
+      # followup run (`python -m databricks_bot_engine...`) executes on. Pinned so
+      # the install/run doesn't depend on an ambient, unpinned runner `python`.
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.11'
+
       # Shared prelude: mint the engineer-bot token (pushes fixup commits, posts
       # replies) + the engine-scoped token, set up Node, install the engine.
       - name: Bot prelude (tokens + Node + engine install)

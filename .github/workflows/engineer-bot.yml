@@ -83,6 +83,16 @@ jobs:
         with:
           toolchain: stable
 
+      # bot-prelude -> install-bot-engine runs `python -m pip install ...` and the
+      # author/publish/comment steps run `python -m databricks_bot_engine...`, so a
+      # Python interpreter must exist BEFORE bot-prelude. setup-jfrog/setup-rust
+      # provide neither; pin 3.11 to match the sibling bot workflows rather than
+      # depend on an ambient `python` on the runner image.
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.11'
+
       # Warm the dependency cache before the agent runs, so its first `cargo test`
       # doesn't spend the turn budget on a cold ~57-crate fetch/build. `cargo fetch`
       # can rewrite Cargo.lock against the JFrog source; revert that churn (next
