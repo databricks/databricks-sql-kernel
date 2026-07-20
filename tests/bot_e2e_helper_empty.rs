@@ -33,7 +33,14 @@ fn empty_config_field_resolves_to_none() {
     .expect("write temp config");
     let path = f.path().to_str().expect("temp path is utf-8").to_owned();
 
+    // Clear ALL connection vars, not just the token: env_var prefers a non-empty
+    // env value over the config file, so a leftover DATABRICKS_HOST (e.g. from a
+    // developer's `.cargo/config.toml` [env], per CLAUDE.md) would shadow the
+    // file's "h.example" and break the assertion below. Mirror the hermetic setup
+    // in the sibling bot_e2e_helper.rs.
     std::env::remove_var("DATABRICKS_TOKEN");
+    std::env::remove_var("DATABRICKS_HOST");
+    std::env::remove_var("DATABRICKS_HTTP_PATH");
     std::env::set_var("DATABRICKS_TEST_CONFIG_FILE", &path);
 
     // Empty file field is filtered exactly like an empty env var ⇒ None.
