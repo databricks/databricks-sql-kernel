@@ -117,14 +117,11 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
 ///
 /// [`KernelStatusCode`]: crate::c_abi::KernelStatusCode
 /// [`Error`]: crate::kernel_error::Error
-/// Shared preamble for the two `block_on_ffi*` entry shapes: clear the
-/// thread-local last error, reject reentrancy from a Tokio runtime thread, and
-/// fetch the process-wide runtime. On failure the typed [`Error`] is already
-/// stored and the mapped [`KernelStatusCode`] is returned, so the caller just
-/// propagates it. Kept in one place so the load-bearing threading-contract guard
-/// (and its exact message) can't drift between `block_on_ffi` and
-/// `block_on_ffi_cancellable`.
-fn ffi_prepare_runtime() -> Result<&'static tokio::runtime::Runtime, KernelStatusCode> {
+pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
+{
     error::clear_error();
     // Reject reentrancy explicitly: calling `block_on` from within any
     // Tokio runtime would panic. Surface a typed, actionable error rather
@@ -139,19 +136,14 @@ fn ffi_prepare_runtime() -> Result<&'static tokio::runtime::Runtime, KernelStatu
         error::store_error(e);
         return Err(code);
     }
-    runtime().map_err(|e| {
-        let code = KernelStatusCode::from(e.code);
-        error::store_error(e);
-        code
-    })
-}
-
-pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
-where
-    F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
-{
-    let rt = ffi_prepare_runtime()?;
+    let rt = match runtime() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            return Err(code);
+        }
+    };
     // Catch panics so a kernel bug can't unwind across `extern "C"`.
     let result =
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(fut_builder())));
