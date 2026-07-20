@@ -79,18 +79,12 @@ jobs:
           app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
           private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
 
-      - name: Configure bot git identity
-        env:
-          GH_TOKEN: ${{ steps.prelude.outputs.token }}
-          # Derive the identity from the App slug the prelude exposes (the App that
-          # minted the token), so it tracks the actual committing App rather than a
-          # hardcoded login. Matches the engine dogfood's `<slug>[bot]` form.
-          APP_SLUG: ${{ steps.prelude.outputs.app-slug }}
-        run: |
-          set -euo pipefail
-          BOT_USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
-          git config user.name  "${APP_SLUG}[bot]"
-          git config user.email "${BOT_USER_ID}+${APP_SLUG}[bot]@users.noreply.github.com"
+      # NOTE: no git-identity step here. The engine's retrospective
+      # (databricks-bot-engine#139, in the pinned engine SHA) configures the git
+      # user AND DCO sign-off itself from .bot/config.yaml `bot_login_prefix` —
+      # same as the author/followup flows — so the learning commit is authored and
+      # signed as the bot without the workflow doing it. (Before #139 this flow had
+      # to hand-roll the identity; the engine bump removed that need.)
 
       - name: Gather merged-PR context
         env:
