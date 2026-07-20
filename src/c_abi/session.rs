@@ -22,14 +22,12 @@
 //! Transaction methods (autocommit / commit / rollback) are deferred to
 //! v0.1 per `docs/spec-v0.md` addendum A5.
 
-use super::cancel::{kernel_cancel_token_t, token_ref};
-use super::{block_on_ffi_cancellable, KernelStatusCode};
+use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
-use tokio_util::sync::CancellationToken;
 
 /// Opaque session handle. Boxed [`Session`] on the Rust side.
 #[repr(C)]
@@ -97,11 +95,6 @@ pub struct KernelSessionConfig {
     /// Extra HTTP headers sent on every request (accumulated by
     /// `..._set_custom_header`, one `(name, value)` pair per call).
     custom_headers: Vec<(String, String)>,
-    /// CloudFetch toggle (populated by `..._set_cloudfetch_enabled`).
-    /// `None` keeps the kernel default (CloudFetch on); `Some(false)`
-    /// forces the inline-Arrow result path (mirrors JDBC
-    /// `EnableQueryResultDownload=0`).
-    cloudfetch_enabled: Option<bool>,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -169,7 +162,6 @@ pub unsafe extern "C" fn kernel_session_config_new(
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
-        cloudfetch_enabled: None,
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -546,27 +538,6 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
     })
 }
 
-/// Enable or disable CloudFetch (cloud-storage-backed download of large
-/// result sets). Default enabled; `false` forces the inline-Arrow path
-/// for all result sizes — mirrors JDBC `EnableQueryResultDownload=0`. The
-/// kernel sets the `can_cloud_download` session conf internally at
-/// `open()`; callers must NOT set that conf directly via
-/// `set_session_conf` (the server rejects it as not user-settable). Maps
-/// to `ResultConfig::cloudfetch_enabled`.
-///
-/// # Safety
-/// `config` must be a live config handle.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_cloudfetch_enabled(
-    config: *mut KernelSessionConfig,
-    enabled: bool,
-) -> KernelStatusCode {
-    set_on_config(config, |c| {
-        c.cloudfetch_enabled = Some(enabled);
-        Ok(())
-    })
-}
-
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -611,48 +582,6 @@ pub unsafe extern "C" fn kernel_session_open(
     config: *mut KernelSessionConfig,
     out: *mut *mut kernel_session_t,
 ) -> KernelStatusCode {
-    session_open_inner(config, out, None)
-}
-
-/// Open a session, racing the (blocking) connect against `cancel_token` so a
-/// host can bound a slow warehouse cold-start / connect-time network partition
-/// by its own deadline. A **null** `cancel_token` behaves exactly like
-/// [`kernel_session_open`]. If the token fires (or is already fired) before
-/// connect completes, the connect future is dropped — aborting the in-flight
-/// request — and this returns [`KernelStatusCode::Cancelled`]; the config is
-/// still consumed either way.
-///
-/// The `cancel_token` is borrowed, not consumed: the caller still owns it and
-/// must [`kernel_cancel_token_free`](crate::c_abi::cancel::kernel_cancel_token_free)
-/// it after this returns. It is safe to fire the token from another thread
-/// while this call is in flight (that is the intended use).
-///
-/// # Safety
-/// `config` and `out` carry the same contract as [`kernel_session_open`].
-/// `cancel_token`, if non-null, must be a live handle from
-/// [`kernel_cancel_token_new`](crate::c_abi::cancel::kernel_cancel_token_new)
-/// that is not freed until this call returns.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_open_cancellable(
-    config: *mut KernelSessionConfig,
-    out: *mut *mut kernel_session_t,
-    cancel_token: *const kernel_cancel_token_t,
-) -> KernelStatusCode {
-    session_open_inner(config, out, token_ref(cancel_token))
-}
-
-/// Shared body for [`kernel_session_open`] and
-/// [`kernel_session_open_cancellable`]. Owns the "config is consumed on every
-/// path" contract in one place; `token` (None for the plain entry point) is
-/// threaded into `build_session`'s `block_on`.
-///
-/// # Safety
-/// See [`kernel_session_open`]. `token` must outlive the call when `Some`.
-unsafe fn session_open_inner(
-    config: *mut KernelSessionConfig,
-    out: *mut *mut kernel_session_t,
-    token: Option<&CancellationToken>,
-) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
     // The contract is "config is consumed on every path". Reclaim the box
     // up front (when non-null) so it is dropped even on the argument-guard
@@ -673,7 +602,7 @@ unsafe fn session_open_inner(
     }
     let config = config.expect("config is Some (checked above)");
 
-    let session = match build_session(*config, token) {
+    let session = match build_session(*config) {
         Ok(s) => s,
         Err(code) => return code, // error already stored by build_session
     };
@@ -699,15 +628,9 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
 }
 
 /// Translate the C-side config into a [`Session`], driving the async
-/// `Session::open` on the process-wide runtime. When `token` is `Some`, the
-/// connect is raced against it so a fired token drops the connect future
-/// (aborting the in-flight request) and yields `Cancelled` — the connect-side
-/// deadline path. Errors are stored in the thread-local buffer; the returned
-/// `KernelStatusCode` is the mapped code.
-fn build_session(
-    config: KernelSessionConfig,
-    token: Option<&CancellationToken>,
-) -> Result<Session, KernelStatusCode> {
+/// `Session::open` on the process-wide runtime. Errors are stored in the
+/// thread-local buffer; the returned `KernelStatusCode` is the mapped code.
+fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCode> {
     let KernelSessionConfig {
         connection,
         auth,
@@ -715,10 +638,9 @@ fn build_session(
         proxy,
         tls,
         custom_headers,
-        cloudfetch_enabled,
     } = config;
 
-    block_on_ffi_cancellable(token, move || {
+    block_on_ffi(move || {
         Box::pin(async move {
             let connection = connection.ok_or_else(|| {
                 Error::invalid_argument().message(
@@ -805,17 +727,6 @@ fn build_session(
                 });
             }
 
-            // CloudFetch toggle. Only override the result config when the knob
-            // was set, so the kernel's default (CloudFetch on) + all the other
-            // ResultConfig tuning (prefetch windows, JSON rendering) are
-            // preserved otherwise.
-            if let Some(enabled) = cloudfetch_enabled {
-                builder = builder.result(crate::config::ResultConfig {
-                    cloudfetch_enabled: enabled,
-                    ..crate::config::ResultConfig::default()
-                });
-            }
-
             builder.open().await
         })
     })
@@ -861,111 +772,6 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
     session.initiate_delete();
     drop(session);
     KernelStatusCode::Success
-}
-
-/// Close a session and BLOCK until the server-side `DeleteSession` RPC
-/// has been *attempted* to completion, reusing the crate's awaitable
-/// [`Session::close`]. Unlike [`kernel_session_close`] (fire-and-forget),
-/// this waits for the delete round-trip rather than returning before it —
-/// the parity path for a host (Thrift, ODBC) that wants close to behave
-/// like the synchronous `DeleteSession` RPC the direct-Rust and pyo3/napi
-/// consumers get via `Session::close().await`.
-///
-/// IMPORTANT: `Success` means the delete was *attempted*, not that the
-/// server confirmed it. [`Session::close`] delegates to `delete_session`,
-/// which — after exhausting HTTP retries — logs a transient failure and
-/// returns `Ok(())` rather than propagating it (the caller has no useful
-/// recovery path, and the server reclaims the session on idle-timeout). So
-/// a partitioned/failed delete still returns `Success` here (surfaced only
-/// as a kernel `warn!`, visible to a host that installed a log callback);
-/// `Err(code)` is reserved for a null handle, reentrancy, or a panic. This
-/// matches the direct-Rust / pyo3 / napi consumers, whose `Session::close`
-/// swallows the same failure identically.
-///
-/// Consumes the handle exactly like [`kernel_session_close`]: on both
-/// success and failure the session is released, so the caller must not use
-/// or free `session` afterwards. The same teardown ordering applies —
-/// close the session LAST, after every statement / executed handle /
-/// result stream / canceller it produced (see the `databricks_kernel.h`
-/// teardown-ordering contract).
-///
-/// # Safety
-///
-/// `session` must have been returned by [`kernel_session_open`] and not
-/// previously closed. After this call, `session` is invalid; passing it to
-/// any other `kernel_*` function is UB.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_close_blocking(
-    session: *mut kernel_session_t,
-) -> KernelStatusCode {
-    session_close_blocking_inner(session, None)
-}
-
-/// Blocking close, racing the (blocking) `DeleteSession` against `cancel_token`
-/// so a host can bound a wedged / partitioned close by its own deadline instead
-/// of blocking up to the retry ceiling. A **null** `cancel_token` behaves
-/// exactly like [`kernel_session_close_blocking`]. If the token fires (or is
-/// already fired) before the delete completes, this returns
-/// [`KernelStatusCode::Cancelled`].
-///
-/// Consumes the handle on **every** path — success, delete error, AND
-/// `Cancelled`. On cancel the awaited future (which owns the boxed session) is
-/// dropped, so the session is released via its `Drop` (a best-effort
-/// fire-and-forget delete, like [`kernel_session_close`]); the caller must not
-/// use or free `session` afterwards regardless of the return code.
-///
-/// The `cancel_token` is borrowed, not consumed: the caller still owns it and
-/// must [`kernel_cancel_token_free`](crate::c_abi::cancel::kernel_cancel_token_free)
-/// it after this returns. It is safe to fire the token from another thread while
-/// this call is in flight (that is the intended use).
-///
-/// # Safety
-/// `session` carries the same contract as [`kernel_session_close_blocking`].
-/// `cancel_token`, if non-null, must be a live handle from
-/// [`kernel_cancel_token_new`](crate::c_abi::cancel::kernel_cancel_token_new)
-/// that is not freed until this call returns.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_close_blocking_cancellable(
-    session: *mut kernel_session_t,
-    cancel_token: *const kernel_cancel_token_t,
-) -> KernelStatusCode {
-    session_close_blocking_inner(session, token_ref(cancel_token))
-}
-
-/// Shared body for [`kernel_session_close_blocking`] and
-/// [`kernel_session_close_blocking_cancellable`]. Owns the "handle is consumed
-/// on every path" contract in one place; `token` (None for the plain entry
-/// point) is threaded into `Session::close`'s `block_on`.
-///
-/// # Safety
-/// See [`kernel_session_close_blocking`]. `token` must outlive the call when
-/// `Some`.
-unsafe fn session_close_blocking_inner(
-    session: *mut kernel_session_t,
-    token: Option<&CancellationToken>,
-) -> KernelStatusCode {
-    crate::c_abi::error::clear_error();
-    if session.is_null() {
-        crate::c_abi::error::store_error(
-            Error::invalid_argument()
-                .message("kernel_session_close_blocking: session must not be null"),
-        );
-        return KernelStatusCode::InvalidArgument;
-    }
-    // Reclaim the box and await the delete on the process-wide runtime.
-    // `Session::close(self)` consumes the session, so move the boxed value
-    // into the future (mirroring `build_session`'s move of the config).
-    // On error the code is returned and the typed error is already stored;
-    // on a fired token the future is dropped, taking the boxed session with
-    // it (its `Drop` runs the fire-and-forget delete). Either way the box is
-    // released, honouring the consume-on-every-path contract.
-    let session = Box::from_raw(session as *mut Session);
-    match block_on_ffi_cancellable(token, move || {
-        Box::pin(async move { session.close().await })
-    }) {
-        Ok(()) => KernelStatusCode::Success,
-        Err(code) => code,
-    }
 }
 
 /// Report whether a session is still **open** (its server-side delete has
@@ -1257,33 +1063,6 @@ mod tests {
             );
             // No kernel_session_config_free: kernel_session_open already consumed
             // and released `config` on its failure path.
-        }
-    }
-
-    /// The CloudFetch setter records the toggle as `Some(enabled)`; a config
-    /// that never calls it leaves `None` so the kernel default (on) wins. The
-    /// last call wins (set false then true → true).
-    #[test]
-    fn set_cloudfetch_enabled_records_toggle() {
-        unsafe {
-            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
-            assert_eq!(
-                kernel_session_config_new(&mut config),
-                KernelStatusCode::Success
-            );
-            // Default: untouched → None (kernel default applies).
-            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, None);
-            assert_eq!(
-                kernel_session_config_set_cloudfetch_enabled(config, false),
-                KernelStatusCode::Success
-            );
-            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, Some(false));
-            assert_eq!(
-                kernel_session_config_set_cloudfetch_enabled(config, true),
-                KernelStatusCode::Success
-            );
-            assert_eq!(config.as_ref().unwrap().cloudfetch_enabled, Some(true));
-            kernel_session_config_free(config);
         }
     }
 }

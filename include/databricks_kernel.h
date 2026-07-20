@@ -240,24 +240,6 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  * cancels the LATER query. Use one per execute (new before execute, free after
  * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
-/* Cooperative cancel token for the blocking `*_cancellable` entry points:
- * kernel_session_open_cancellable, kernel_result_stream_next_batch_cancellable,
- * and kernel_session_close_blocking_cancellable — i.e. the blocking calls a
- * host issues on the connect / fetch / close lifecycle path. Create one before
- * a blocking call, pass it in, and fire it from ANOTHER thread
- * (kernel_cancel_token_cancel) when the caller's deadline elapses; the blocked
- * call then stops waiting and returns KernelStatusCode_Cancelled. One-shot (a
- * fired token stays fired) — create a fresh token per logical operation. Firing
- * is purely local (no RPC), so it never blocks. See "Cooperative cancellation"
- * below.
- *
- * NOT cancellable (by design, for now): the metadata entry points
- * (kernel_metadata_*) have no `_cancellable` twin — they have no host consumer
- * that needs a caller deadline yet, so the surface isn't added speculatively. A
- * metadata call against a wedged warehouse is still bounded by the transport's
- * request/overall timeouts. Twins can be added the same additive way (route
- * run_metadata through block_on_ffi_cancellable) if a host adopts them. */
-typedef struct kernel_cancel_token_t kernel_cancel_token_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -318,77 +300,6 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
-/* ─── Log callback (reverse-call) ─────────────────────────────────────
- *
- * A host that links the kernel crate directly (pyo3 / napi) bridges the
- * kernel's tracing output into its own logger in-process. A C-ABI consumer
- * can't install a Rust subscriber, so this is the reverse-call path: register
- * a callback the kernel invokes with each `databricks*`-targeted log event, so
- * kernel-internal diagnostics flow into the host's logger instead of only
- * reaching stderr via kernel_init_logging.
- *
- * The callback fires from the kernel's log-drain thread (NOT a query worker),
- * so it MUST be thread-safe. It SHOULD NOT unwind: the kernel contains a panic
- * with catch_unwind (the pointer uses Rust's C-unwind ABI) and poisons the sink
- * rather than aborting, but subsequent logs are then dropped. It MUST NOT call
- * back into any kernel_* entry point — a blocking reentrant call would stall the
- * drain thread (that reentrancy guard only covers query workers). `ctx` is
- * passed back verbatim and must stay valid for the process lifetime; `level` is
- * a `KernelLogLevel` value (1=ERROR..5=TRACE); `target` and `message` are valid
- * only for the call — copy them out. Records are enqueued on a bounded channel
- * and DROPPED on overflow
- * (logs never back-pressure a kernel hot path); the drop count is observable via
- * kernel_logging_stats.
- *
- * The `level` PARAMETER (OFF/ERROR/WARN/INFO/DEBUG/TRACE, case-insensitive, or
- * NULL) sets the forward threshold with the SAME precedence as
- * kernel_init_logging: an explicit recognised level wins, else RUST_LOG (so a
- * host maps its own logger level, e.g. Go's DATABRICKS_LOG_LEVEL). When neither
- * resolves, the current threshold is left UNCHANGED — the warn default on the
- * first call, or the previously-set level on a re-registration.
- *
- * Mutually exclusive with kernel_init_logging (both install the one
- * process-global subscriber). The failure code says whether a retry helps
- * (KernelError.retryable matches, so no message string-matching needed):
- * Internal (retryable=false) if a subscriber was already installed — terminal,
- * install exactly ONE; ResourceExhausted (retryable=true) if the drain thread
- * could not start (EAGAIN/ENOMEM) — a later call retries. A NULL `cb` returns
- * InvalidArgument (no detach in v0). */
-
-/*
- * Severity delivered to a `kernel_log_callback` as its `int level`. Values match
- * the kernel's internal numeric severity (low = more severe). Prefer these
- * symbols over hard-coded 1..5 so a future level insertion (with an ABI bump)
- * surfaces as a build change rather than a silent host-side remap. `Off` (0) is
- * never delivered to a callback — it only appears as a filter threshold meaning
- * "emit nothing".
- */
-typedef enum KernelLogLevel {
-  KernelLogLevel_Off = 0,
-  KernelLogLevel_Error = 1,
-  KernelLogLevel_Warn = 2,
-  KernelLogLevel_Info = 3,
-  KernelLogLevel_Debug = 4,
-  KernelLogLevel_Trace = 5,
-} KernelLogLevel;
-
-typedef void (*kernel_log_callback)(void* ctx, int level, const char* target,
-                                    const char* message);
-KernelStatusCode kernel_set_log_callback(kernel_log_callback cb, void* ctx,
-                                         const char* level);
-
-/* Report the log-callback bridge's health, so a host can distinguish "kernel
- * logs are quiet" from "being dropped / sink died / never installed". Writes
- * each non-NULL out-param (a NULL one is skipped):
- *   - `installed`: true iff kernel logs are CURRENTLY delivering — the callback
- *     won the subscriber AND the sink is not poisoned. A callback that unwinds
- *     poisons the sink (reads false); registering a new callback clears it.
- *   - `dropped`: cumulative records dropped AFTER install (channel full or sink
- *     poisoned). Excludes the spawn-failure case (no channel), where `installed`
- *     reads false and kernel_set_log_callback returned Internal.
- * Never fails; safe to poll at any time. */
-void kernel_logging_stats(bool* installed, uint64_t* dropped);
-
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
  * All optional; defaults are: no explicit proxy (reqwest honours
@@ -432,14 +343,6 @@ KernelStatusCode kernel_session_config_set_tls_client_certificate(KernelSessionC
                                                                   const uint8_t* key_pem,
                                                                   size_t key_len);
 
-/* Enable or disable CloudFetch (cloud-storage-backed download of large result
- * sets). Default enabled; `false` forces the inline-Arrow path for all result
- * sizes (mirrors JDBC EnableQueryResultDownload=0). The kernel sets the
- * `can_cloud_download` session conf internally — do NOT set that conf directly
- * via set_session_conf (the server rejects it as not user-settable). */
-KernelStatusCode kernel_session_config_set_cloudfetch_enabled(KernelSessionConfig* config,
-                                                              bool enabled);
-
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*
@@ -449,51 +352,6 @@ KernelStatusCode kernel_session_config_set_cloudfetch_enabled(KernelSessionConfi
  */
 KernelStatusCode kernel_session_open(KernelSessionConfig* config, kernel_session_t** out);
 KernelStatusCode kernel_session_close(kernel_session_t* session);
-
-/*
- * Close a session and BLOCK until the server-side DeleteSession has been
- * ATTEMPTED to completion. Unlike kernel_session_close (fire-and-forget),
- * this waits for the delete round-trip — the parity path for a host that
- * wants close to behave like the synchronous DeleteSession RPC. NOTE:
- * Success means the delete was attempted, NOT server-confirmed — a transient
- * failure after retries is logged and swallowed (matching the direct-Rust /
- * pyo3 / napi Session::close), so a partitioned delete still returns Success
- * (the server reclaims the session on idle-timeout). CONSUMES `session` like
- * kernel_session_close (released on success and failure alike); the same
- * "close the session LAST" teardown ordering applies.
- */
-KernelStatusCode kernel_session_close_blocking(kernel_session_t* session);
-
-/*
- * Like kernel_session_close_blocking, but races the (blocking) DeleteSession
- * against `cancel_token` so a host can bound a wedged / partitioned close by
- * its own deadline instead of blocking up to the retry ceiling. A NULL
- * `cancel_token` behaves EXACTLY like kernel_session_close_blocking. If the
- * token fires (or is already fired), this returns KernelStatusCode_Cancelled.
- * CONSUMES `session` on EVERY path — success, delete error, AND Cancelled: on
- * cancel the session is released via a best-effort fire-and-forget delete
- * (like kernel_session_close), so the caller must not use or free it after
- * this returns regardless of the code. `cancel_token` is borrowed, not
- * consumed: the caller still owns and must free it after this returns, and may
- * fire it from another thread while this call is in flight.
- */
-KernelStatusCode kernel_session_close_blocking_cancellable(
-    kernel_session_t* session, const kernel_cancel_token_t* cancel_token);
-
-/*
- * Like kernel_session_open, but races the (blocking) connect against
- * `cancel_token` so a host can bound a slow warehouse cold-start or a
- * connect-time network partition by its own deadline. A NULL `cancel_token`
- * behaves EXACTLY like kernel_session_open. If the token fires (or is already
- * fired) before connect completes, the connect future is dropped — aborting
- * the in-flight request — and this returns KernelStatusCode_Cancelled; `config`
- * is CONSUMED on every path regardless. `cancel_token` is borrowed, not
- * consumed: the caller still owns and must free it after this returns, and may
- * fire it from another thread while this call is in flight.
- */
-KernelStatusCode kernel_session_open_cancellable(KernelSessionConfig* config,
-                                                 kernel_session_t** out,
-                                                 const kernel_cancel_token_t* cancel_token);
 
 /* Report whether a session is still OPEN (its delete has not been
  * initiated). Writes true/false to `*out`. LOCAL check only — no server
@@ -658,32 +516,6 @@ KernelStatusCode kernel_statement_canceller_cancel(
 KernelStatusCode kernel_statement_canceller_free(
     kernel_statement_canceller_t* canceller);
 
-/* ─── Cooperative cancellation (blocking-call cancel token) ────────────
- *
- * The statement canceller above cancels a server-side STATEMENT (right for a
- * query still executing). A cancel token cancels a blocking C-ABI CALL itself —
- * connect or a stalled result-stream fetch — neither of which the statement
- * canceller reaches (the server statement is already done; the stall is
- * client-side). It is the generic mechanism a host uses to honour a caller
- * deadline / context on the `*_cancellable` entry points.
- *
- * Usage: create a token, spawn a watcher on the caller's deadline/context, make
- * the blocking `*_cancellable` call on the owning thread, and from the watcher
- * fire kernel_cancel_token_cancel when the deadline elapses. The blocked call
- * drops its in-flight request future and returns KernelStatusCode_Cancelled.
- * Firing is purely local (flip an atomic, wake the waiter) — no RPC, never
- * blocks. The token is ONE-SHOT (a fired token stays fired), so create a fresh
- * one per logical operation. Safe to fire from a different thread than the
- * blocking call (that is the intended use); do NOT free the token until both
- * the blocking call and any in-flight cancel have returned.
- */
-KernelStatusCode kernel_cancel_token_new(kernel_cancel_token_t** out);
-KernelStatusCode kernel_cancel_token_cancel(kernel_cancel_token_t* token);
-/* Report whether the token has been fired (writes true/false to *out). Local
- * atomic read — no RPC, never blocks. Symmetric with kernel_session_is_open. */
-KernelStatusCode kernel_cancel_token_is_cancelled(const kernel_cancel_token_t* token, bool* out);
-KernelStatusCode kernel_cancel_token_free(kernel_cancel_token_t* token);
-
 /* ─── Executed statement (sync) ───────────────────────────────────────*/
 
 /*
@@ -731,32 +563,6 @@ KernelStatusCode kernel_result_stream_get_schema(kernel_result_stream_t* stream,
 KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
-/*
- * Like kernel_result_stream_next_batch, but races the (blocking) wait for the
- * next batch against `cancel_token` so a host can stop waiting on a HUNG
- * CloudFetch chunk (a wedged S3 / pre-signed-URL GET) instead of blocking on it
- * forever. A NULL `cancel_token` behaves EXACTLY like
- * kernel_result_stream_next_batch. If the token fires before the batch is ready,
- * this call unblocks promptly and returns KernelStatusCode_Cancelled; the stream
- * handle stays valid and owned by the caller (close it with
- * kernel_result_stream_close as usual — a cancelled fetch neither consumes nor
- * frees it).
- *
- * NOTE ON SCOPE: cancel here interrupts the CALLER'S WAIT, not the background
- * download. The CloudFetch chunk GET runs on a detached kernel task; firing the
- * token drops only this call's waiter, so the return is prompt but the in-flight
- * download continues to completion or its own read-timeout (~60s) before its
- * in-memory slot is released. Closing the stream after a cancel triggers the
- * provider's own teardown, but does not abort a GET already on the wire either.
- * (The connect-side kernel_session_open_cancellable DOES abort its in-flight
- * request, because create-session runs inline in the raced future.)
- *
- * `cancel_token` is borrowed and safe to fire from another thread while this
- * call is in flight (see kernel_session_open_cancellable).
- */
-KernelStatusCode kernel_result_stream_next_batch_cancellable(
-    kernel_result_stream_t* stream, struct ArrowArray* out_array,
-    struct ArrowSchema* out_schema, const kernel_cancel_token_t* cancel_token);
 KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
 
 /* ─── Metadata ────────────────────────────────────────────────────────

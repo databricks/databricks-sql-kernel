@@ -191,10 +191,6 @@ static void test_proxy_and_tls_setters(void) {
   rc = kernel_session_config_set_tls_client_certificate(config, cert, sizeof(cert) - 1, NULL, 0);
   CHECK(rc == KernelStatusCode_InvalidArgument,
         "set_tls_client_certificate(NULL key) → InvalidArgument");
-
-  /* CloudFetch toggle accepts a bool. */
-  rc = kernel_session_config_set_cloudfetch_enabled(config, false);
-  CHECK(rc == KernelStatusCode_Success, "set_cloudfetch_enabled(false) succeeds");
   kernel_session_config_free(config);
 }
 
@@ -228,49 +224,6 @@ static void test_init_logging(void) {
   /* Second call is a no-op (subscriber already installed) but still Success. */
   rc = kernel_init_logging(NULL, NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
-}
-
-/* kernel_set_log_callback: NULL cb is rejected; a real cb installs (or reports
- * the mutual-exclusion outcome if init_logging already won the one global
- * subscriber). Hermetic — no network, no events forced. The `level` arg is
- * exercised as an explicit "WARN" and NULL to cover both precedence paths. */
-static int g_log_calls = 0;
-static void count_log_cb(void* ctx, int level, const char* target, const char* message) {
-  (void)level;
-  (void)target;
-  (void)message;
-  int* counter = (int*)ctx;
-  if (counter) {
-    (*counter)++;
-  }
-}
-
-static void test_log_callback(void) {
-  KernelStatusCode rc = kernel_set_log_callback(NULL, NULL, NULL);
-  CHECK(rc == KernelStatusCode_InvalidArgument, "set_log_callback(NULL cb) → InvalidArgument");
-
-  /* This runs AFTER test_init_logging, which already won the one process-global
-   * subscriber, so the mutual-exclusion contract is deterministic here: the
-   * callback install must report Internal (not Success, not a silent no-op).
-   * The explicit "WARN" level arg is accepted regardless. */
-  rc = kernel_set_log_callback(count_log_cb, &g_log_calls, "WARN");
-  CHECK(rc == KernelStatusCode_Internal,
-        "set_log_callback after init_logging → Internal (mutual exclusion)");
-
-  /* A NULL level (defer to RUST_LOG / current) is also accepted; same
-   * mutual-exclusion outcome on a refresh. */
-  rc = kernel_set_log_callback(count_log_cb, &g_log_calls, NULL);
-  CHECK(rc == KernelStatusCode_Internal,
-        "set_log_callback(NULL level) after init_logging → Internal");
-
-  /* kernel_logging_stats never fails and honours NULL out-params. init_logging
-   * won the subscriber, so the callback did NOT install. */
-  bool installed = true;
-  uint64_t dropped = 123;
-  kernel_logging_stats(&installed, &dropped);
-  CHECK(!installed, "logging_stats: callback not installed (init_logging won)");
-  kernel_logging_stats(NULL, NULL); /* must not crash on NULL out-params */
-  CHECK(true, "logging_stats(NULL, NULL) is safe");
 }
 
 /* is_open null-guards its args. (The true→false behavior is covered by the
@@ -316,76 +269,6 @@ static void test_executed_null_handle_rejected(void) {
   CHECK(n == -1, "num_modified_rows(NULL exec) → -1");
 }
 
-/* Cancel token: new → cancel → free round-trips; null guards on every entry
- * point return InvalidArgument. (The mid-flight interrupt behaviour is proven
- * by the wiremock integration test, which needs a mock server; this smoke only
- * exercises the lifecycle from C.) */
-static void test_cancel_token_lifecycle(void) {
-  kernel_cancel_token_t* tok = NULL;
-  KernelStatusCode rc = kernel_cancel_token_new(&tok);
-  CHECK(rc == KernelStatusCode_Success, "cancel_token_new succeeds");
-  CHECK(tok != NULL, "cancel_token_new writes a non-null handle");
-
-  bool fired = true;
-  rc = kernel_cancel_token_is_cancelled(tok, &fired);
-  CHECK(rc == KernelStatusCode_Success, "cancel_token_is_cancelled succeeds");
-  CHECK(!fired, "a fresh token reports not-cancelled");
-
-  rc = kernel_cancel_token_cancel(tok);
-  CHECK(rc == KernelStatusCode_Success, "cancel_token_cancel succeeds");
-  rc = kernel_cancel_token_is_cancelled(tok, &fired);
-  CHECK(rc == KernelStatusCode_Success && fired, "is_cancelled reports true after a fire");
-  /* One-shot: a second fire is a no-op but still Success. */
-  rc = kernel_cancel_token_cancel(tok);
-  CHECK(rc == KernelStatusCode_Success, "cancel_token_cancel is idempotent");
-
-  rc = kernel_cancel_token_free(tok);
-  CHECK(rc == KernelStatusCode_Success, "cancel_token_free succeeds");
-
-  CHECK(kernel_cancel_token_new(NULL) == KernelStatusCode_InvalidArgument,
-        "cancel_token_new(NULL) → InvalidArgument");
-  CHECK(kernel_cancel_token_cancel(NULL) == KernelStatusCode_InvalidArgument,
-        "cancel_token_cancel(NULL) → InvalidArgument");
-  CHECK(kernel_cancel_token_is_cancelled(NULL, &fired) == KernelStatusCode_InvalidArgument,
-        "cancel_token_is_cancelled(NULL) → InvalidArgument");
-  CHECK(kernel_cancel_token_free(NULL) == KernelStatusCode_InvalidArgument,
-        "cancel_token_free(NULL) → InvalidArgument");
-}
-
-/* A pre-fired token short-circuits kernel_session_open_cancellable to Cancelled
- * without touching the network, and consumes the config regardless. Hermetic
- * (never dials out — the biased select honours the fired token first). */
-static void test_open_cancellable_prefired(void) {
-  KernelSessionConfig* config = NULL;
-  (void)kernel_session_config_new(&config);
-  (void)kernel_session_config_set_warehouse(config, "https://192.0.2.1", "wh123");
-  (void)kernel_session_config_set_auth_pat(config, "dapi-not-a-real-token");
-
-  kernel_cancel_token_t* tok = NULL;
-  (void)kernel_cancel_token_new(&tok);
-  (void)kernel_cancel_token_cancel(tok); /* fire before the call */
-
-  kernel_session_t* session = NULL;
-  KernelStatusCode rc = kernel_session_open_cancellable(config, &session, tok);
-  CHECK(rc == KernelStatusCode_Cancelled,
-        "open_cancellable with a pre-fired token → Cancelled");
-  CHECK(session == NULL, "session stays null on a cancelled open");
-
-  /* A NULL token behaves like the plain open: same unreachable host, so it
-   * must fail with a NON-Cancelled transport error (proving NULL != cancel). */
-  KernelSessionConfig* config2 = NULL;
-  (void)kernel_session_config_new(&config2);
-  (void)kernel_session_config_set_warehouse(config2, "https://192.0.2.1", "wh123");
-  (void)kernel_session_config_set_auth_pat(config2, "dapi-not-a-real-token");
-  kernel_session_t* session2 = NULL;
-  rc = kernel_session_open_cancellable(config2, &session2, NULL);
-  CHECK(rc != KernelStatusCode_Success && rc != KernelStatusCode_Cancelled,
-        "open_cancellable(NULL token) behaves like plain open (transport error)");
-  CHECK(session2 == NULL, "session stays null on failed open");
-
-  kernel_cancel_token_free(tok);
-}
-
 int main(void) {
   test_abi_version_matches_header();
   test_config_lifecycle();
@@ -397,16 +280,10 @@ int main(void) {
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
   test_init_logging();
-  /* After test_init_logging so it wins the one process-global subscriber; the
-   * callback install then deterministically reports the mutual-exclusion
-   * outcome (Internal). */
-  test_log_callback();
   test_is_open_null_guards();
   test_submit_stub_rejects();
   test_bind_null_handle_rejected();
   test_executed_null_handle_rejected();
-  test_cancel_token_lifecycle();
-  test_open_cancellable_prefired();
 
   if (failures == 0) {
     fprintf(stderr, "\nAll C ABI smoke checks passed.\n");
