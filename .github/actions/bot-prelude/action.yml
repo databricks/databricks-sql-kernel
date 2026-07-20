@@ -42,6 +42,9 @@ outputs:
   token:
     description: 'The minted bot App installation token for THIS repo (post reviews / push fix branches / comment).'
     value: ${{ steps.app-token.outputs.token }}
+  app-slug:
+    description: 'The slug of the bot App the token belongs to (e.g. "peco-engineer-bot"), for deriving a "<slug>[bot]" git identity.'
+    value: ${{ steps.app-token.outputs.app-slug }}
 
 runs:
   using: composite

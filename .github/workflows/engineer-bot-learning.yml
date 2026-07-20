@@ -6,10 +6,13 @@
 # (.claude/knowledge/learning-log.md). Human-gated by design: it NEVER commits the
 # canonical log directly; the entry lands as a reviewable PR.
 #
-# Self-contained job (NOT `uses: databricks/databricks-bot-engine/...`): an external
-# repo can't resolve the internal engine's reusable workflows ("not found"). So the
-# dogfood reusable's steps are inlined here: mint token → checkout default branch →
-# gather PR context → setup-jfrog + Python + install-bot-engine → run retrospective.
+# Own job (NOT `uses: databricks/databricks-bot-engine/...`): an external repo
+# can't resolve the internal engine's reusable workflows ("not found"). It shares
+# the SAME prelude the other bots use — ./.github/actions/bot-prelude (tokens +
+# Node + pinned engine install) — so the engine pin stays single-sourced in
+# bot-prelude's `engine-ref` default (no second SHA to drift). What's unique to
+# this flow stays inline: the default-branch checkout the learning PR is cut from,
+# the bot git identity, and the merged-PR context gather.
 #
 # Opt-in is purely via the `retrospective:` block in .bot/config.yaml + this
 # workflow; absent that block the engine phase is a clean no-op.
@@ -42,26 +45,47 @@ jobs:
       group: engineer-bot-learning-pr-${{ github.event.pull_request.number }}
       cancel-in-progress: false
     steps:
-      - name: Mint engineer-bot App token
-        id: app-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
-        with:
-          app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
-          private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
-
+      # Checkout the default branch (the learning PR is cut from it) FIRST, so the
+      # local `./` composites below resolve. persist-credentials:false — the
+      # retrospective sets its own authenticated push remote (see the run step),
+      # so no token is left in .git/config.
       - name: Checkout default branch (learning PR is cut from it)
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
         with:
           fetch-depth: 0
-          token: ${{ steps.app-token.outputs.token }}
-          persist-credentials: true
+          persist-credentials: false
+
+      # Route pip through the JFrog proxy for the engine install (no cargo — the
+      # retrospective reads the diff, it doesn't build the crate). MUST run before
+      # bot-prelude (install-bot-engine reuses its PIP_INDEX_URL / JFROG_ACCESS_TOKEN).
+      - name: Set up JFrog (pip)
+        uses: ./.github/actions/setup-jfrog
+        with:
+          uv: "true"
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.11'
+
+      # Shared prelude: mint the engineer-bot token (opens the learning PR) + the
+      # engine-scoped token, set up Node, install the pinned engine (PAT-free). The
+      # engine pin comes from bot-prelude's `engine-ref` default — the SINGLE source
+      # of truth for every bot; there is no second SHA in this file to drift.
+      - name: Bot prelude (tokens + Node + engine install)
+        id: prelude
+        uses: ./.github/actions/bot-prelude
+        with:
+          app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
+          private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
 
       - name: Configure bot git identity
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
-          # Derive the login from the App that actually minted the token, so the git
-          # identity can't silently diverge from the credentials passed.
-          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.prelude.outputs.token }}
+          # Derive the identity from the App slug the prelude exposes (the App that
+          # minted the token), so it tracks the actual committing App rather than a
+          # hardcoded login. Matches the engine dogfood's `<slug>[bot]` form.
+          APP_SLUG: ${{ steps.prelude.outputs.app-slug }}
         run: |
           set -euo pipefail
           BOT_USER_ID=$(gh api "/users/${APP_SLUG}[bot]" --jq .id)
@@ -70,7 +94,7 @@ jobs:
 
       - name: Gather merged-PR context
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.prelude.outputs.token }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
@@ -85,59 +109,9 @@ jobs:
               --jq '.[] | "\(.path):\(.line // .original_line) \(.user.login): \(.body)"' || true; } \
             | head -c 32000 > "$GITHUB_WORKSPACE/review_comments.txt"
 
-      # Route pip through the JFrog proxy for the engine install (no cargo — the
-      # retrospective reads the diff, it doesn't build the crate). MUST run before
-      # install-bot-engine (which reuses its PIP_INDEX_URL / JFROG_ACCESS_TOKEN).
-      - name: Set up JFrog (pip)
-        uses: ./.github/actions/setup-jfrog
-        with:
-          uv: "true"
-
-      - name: Setup Python
-        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
-        with:
-          python-version: '3.11'
-
-      - name: Setup Node (for the Claude Code CLI the SDK spawns)
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.4.0
-        with:
-          node-version: '20'
-
-      # Mint the engine-scoped install token + install the engine. (We call
-      # install-bot-engine directly rather than bot-prelude because this job's
-      # this-repo token was already minted above with persist-credentials for the
-      # checkout; bot-prelude would mint a second one and skip the git identity /
-      # context-gather steps this flow needs.)
-      - name: Mint engine-scoped install token
-        id: engine-token
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1  # v3.2.0
-        with:
-          app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
-          private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
-          owner: databricks
-          repositories: databricks-bot-engine
-          permission-contents: read
-
-      - name: Install engine + Claude SDK/CLI
-        uses: ./.github/actions/install-bot-engine
-        with:
-          # ⚠️ DRIFT HAZARD — engine pin duplicated here.
-          # The other four bots get the engine pin from bot-prelude's `engine-ref`
-          # default (the single source of truth). This self-contained learning job
-          # does NOT go through bot-prelude — it calls install-bot-engine directly
-          # (it needs the persist-credentials checkout + git-identity + context-gather
-          # steps bot-prelude doesn't host) — so the SHA is repeated here and CANNOT
-          # read that default. There is no CI check enforcing the two match.
-          # WHEN BUMPING THE ENGINE PIN: update BOTH this literal AND
-          # .github/actions/bot-prelude/action.yml's `engine-ref` default to the
-          # SAME SHA, or this flow silently runs on a stale engine. (Grep the repo
-          # for the old SHA to find both sites.)
-          engine-ref: '5368de773858bef9b2a8bbf3099d08a4132a8487'  # KEEP == bot-prelude engine-ref default
-          engine-token: ${{ steps.engine-token.outputs.token }}
-
       - name: Extract learning + open PR
         env:
-          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          GH_TOKEN: ${{ steps.prelude.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_TITLE: ${{ github.event.pull_request.title }}
@@ -149,7 +123,12 @@ jobs:
           MODEL_ENDPOINT: https://${{ secrets.DATABRICKS_HOST }}/serving-endpoints/anthropic/invocations
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
           RUNNER_TEMP: ${{ runner.temp }}
-        # retrospective.py resolves repo_dir from --repo-dir or cwd; this job's cwd
-        # is $GITHUB_WORKSPACE (the checkout), where .bot/ + the gathered context
-        # files live. Pass it explicitly so it never depends on an unset cwd.
-        run: python -m databricks_bot_engine.engineer_bot.retrospective --repo-dir "$GITHUB_WORKSPACE"
+        # The retrospective pushes the learning branch with a plain `git push
+        # origin` (no in-module set-url), and the checkout ran persist-credentials:
+        # false — so set an authenticated push remote from the minted App token
+        # first, mirroring engineer-bot.yml's publish step. retrospective.py
+        # resolves repo_dir from --repo-dir (cwd = $GITHUB_WORKSPACE otherwise),
+        # where .bot/ + the gathered context files live.
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          python -m databricks_bot_engine.engineer_bot.retrospective --repo-dir "$GITHUB_WORKSPACE"
