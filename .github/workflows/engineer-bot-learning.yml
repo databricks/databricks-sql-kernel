@@ -121,10 +121,18 @@ jobs:
       - name: Install engine + Claude SDK/CLI
         uses: ./.github/actions/install-bot-engine
         with:
-          # Keep in lockstep with bot-prelude's engine-ref default (single source of
-          # truth for the other bots; this flow can't read that default, so it is
-          # pinned here — bump BOTH together).
-          engine-ref: '5368de773858bef9b2a8bbf3099d08a4132a8487'
+          # ⚠️ DRIFT HAZARD — engine pin duplicated here.
+          # The other four bots get the engine pin from bot-prelude's `engine-ref`
+          # default (the single source of truth). This self-contained learning job
+          # does NOT go through bot-prelude — it calls install-bot-engine directly
+          # (it needs the persist-credentials checkout + git-identity + context-gather
+          # steps bot-prelude doesn't host) — so the SHA is repeated here and CANNOT
+          # read that default. There is no CI check enforcing the two match.
+          # WHEN BUMPING THE ENGINE PIN: update BOTH this literal AND
+          # .github/actions/bot-prelude/action.yml's `engine-ref` default to the
+          # SAME SHA, or this flow silently runs on a stale engine. (Grep the repo
+          # for the old SHA to find both sites.)
+          engine-ref: '5368de773858bef9b2a8bbf3099d08a4132a8487'  # KEEP == bot-prelude engine-ref default
           engine-token: ${{ steps.engine-token.outputs.token }}
 
       - name: Extract learning + open PR

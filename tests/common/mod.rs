@@ -68,13 +68,23 @@ fn config_key_for(env_key: &str) -> Option<&'static str> {
 
 /// Read a connection value: the environment wins; if absent (e.g. the token was
 /// stripped by the engine's env scrub), fall back to the config file.
+///
+/// Empty values are filtered on BOTH paths, symmetrically — an empty env var and
+/// an empty JSON field both resolve to `None`. This keeps a blank/misprovisioned
+/// secret (e.g. a `jq`-written `"access_token": ""` from an empty CI secret) from
+/// silently becoming `AuthConfig::Pat { token: "" }` and a confusing server-side
+/// auth failure; instead `live_session` panics with the clear `… required`
+/// message, the same as the env-absent case.
 pub fn env_var(key: &str) -> Option<String> {
     if let Ok(v) = env::var(key) {
         if !v.is_empty() {
             return Some(v);
         }
     }
-    config_key_for(key).and_then(|k| config_file().get(k).cloned())
+    config_key_for(key)
+        .and_then(|k| config_file().get(k))
+        .filter(|v| !v.is_empty())
+        .cloned()
 }
 
 /// Open a `Session` against the live workspace using PAT auth, resolving the
