@@ -38,13 +38,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # `FFI_ArrowSchema`, `to_ffi`) used by the C ABI's result-stream export
 # (`src/ffi/result.rs`) so ODBC / Go consumers can pull result batches
 # across the boundary without re-encoding.
-arrow-array = { version = "57", features = ["ffi"] }
-arrow-buffer = "57"
-arrow-cast = "57"
-arrow-ord = "57"
-arrow-schema = "57"
-arrow-select = "57"
-arrow-ipc = "57"
+arrow-array = { version = "59", features = ["ffi"] }
+arrow-buffer = "59"
+arrow-cast = "59"
+arrow-ord = "59"
+arrow-schema = "59"
+arrow-select = "59"
+arrow-ipc = "59"
 
 # HTTP client and async runtime
 #
