@@ -360,6 +360,14 @@ pub fn init_kernel_logging(
     // Don't let the bridge keep the Node event loop (and thus the process)
     // alive on its own — logs are advisory; a clean exit must not hang on a
     // live `ThreadsafeFunction`.
+    //
+    // napi-rs 3 soft-deprecates `unref` in favour of a weak
+    // (`Weak = true`) `ThreadsafeFunction`, but that const-generic would
+    // have to be threaded through both this argument type and the `SINK`
+    // static that stores it, and the `#[napi]` arg-extraction macro does
+    // not accept the weak form as a parameter type. `unref` is still fully
+    // supported in the 3.x line, so keep it and silence the one warning.
+    #[allow(deprecated)]
     callback.unref(&env)?;
 
     let sink = SINK.get_or_init(|| Mutex::new(None));
