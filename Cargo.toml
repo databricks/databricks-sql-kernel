@@ -38,13 +38,13 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 # `FFI_ArrowSchema`, `to_ffi`) used by the C ABI's result-stream export
 # (`src/ffi/result.rs`) so ODBC / Go consumers can pull result batches
 # across the boundary without re-encoding.
-arrow-array = { version = "57", features = ["ffi"] }
-arrow-buffer = "57"
-arrow-cast = "57"
-arrow-ord = "57"
-arrow-schema = "57"
-arrow-select = "57"
-arrow-ipc = "57"
+arrow-array = { version = "59", features = ["ffi"] }
+arrow-buffer = "59"
+arrow-cast = "59"
+arrow-ord = "59"
+arrow-schema = "59"
+arrow-select = "59"
+arrow-ipc = "59"
 
 # HTTP client and async runtime
 #
@@ -66,18 +66,19 @@ tokio = { version = "1", features = ["full", "sync"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
+hex = "0.4"          # Hex encoding (binary param literals, token cache key)
 
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }
 
 # LZ4 decompression for CloudFetch
-lz4_flex = "0.11"
+lz4_flex = "0.13"
 
 # Random number generation (retry jitter)
-rand = "0.9"
+rand = "0.10"
 
 # Concurrent data structures
-dashmap = "5"
+dashmap = "6"
 
 # Async utilities
 futures = "0.3"
@@ -96,9 +97,9 @@ thiserror = "2"
 # kernel's own `tls-native` / `tls-rustls` feature controls the TLS
 # backend for reqwest, and oauth2 inherits whichever the consumer picks.
 oauth2 = { version = "5", default-features = false, features = ["reqwest"] }  # OAuth 2.0 protocol operations (PKCE, token exchange, client credentials)
-sha2 = "0.10"        # SHA-256 for token cache key generation
+sha2 = "0.11"        # SHA-256 for token cache key generation
 open = "5"           # Browser launch for interactive OAuth flows
-dirs = "5"           # Cross-platform config directory (~/.config/)
+dirs = "6"           # Cross-platform config directory (~/.config/)
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

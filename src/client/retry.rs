@@ -21,7 +21,7 @@
 //! - Cumulative overall timeout
 //! - Per-category configuration with global defaults
 
-use rand::Rng;
+use rand::RngExt;
 use reqwest::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;

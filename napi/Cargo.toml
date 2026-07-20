@@ -50,11 +50,24 @@ publish = false
 # Mirrors the equivalent decision in `pyo3/Cargo.toml`.
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Resolve N-API symbols at runtime via libloading (with no-op stubs when
+# the host doesn't export them) instead of at link time. Enabled only for
+# `cargo test`: napi-rs 3's `napi::error` references N-API symbols
+# (`napi_reference_unref`, …) from a `Drop` impl unconditionally, so the
+# `lib test` executable — which has no Node host — fails to link (and,
+# with undefined-symbol linking, crashes on load). `dyn-symbols` makes
+# those calls fall back to stubs, so the pure-logic Rust unit tests
+# (error envelope, params codec, panic recovery) run hostless. The
+# release cdylib deliberately does NOT enable this: loaded inside Node,
+# it wants the real link-time symbols.
+dyn-symbols = ["napi/dyn-symbols"]
+
 [dependencies]
-# napi-rs v2 line; `napi6` enables N-API 6 surface, `async` enables the
+# napi-rs v3 line; `napi6` enables N-API 6 surface, `async` enables the
 # `#[napi] async fn` glue that drives futures on napi-rs's tokio runtime.
-napi = { version = "2", default-features = false, features = ["napi6", "async"] }
-napi-derive = "2"
+napi = { version = "3", default-features = false, features = ["napi6", "async"] }
+napi-derive = "3"
 
 # Kernel — path dep on the async-public-api branch worktree. Once the
 # kernel is published this becomes a version dep.
@@ -99,9 +112,9 @@ futures = { version = "0.3", default-features = false, features = ["std"] }
 # (`RecordBatch`, `SchemaRef`); `arrow-ipc` is for the `StreamWriter`
 # we use on the encode side. Versions kept in lock-step with the
 # kernel's `arrow-*` deps to avoid two arrow versions in the dep graph.
-arrow-array = "57"
-arrow-schema = "57"
-arrow-ipc = "57"
+arrow-array = "59"
+arrow-schema = "59"
+arrow-ipc = "59"
 
 # Error envelope serialization. Already a kernel transitive dep; the
 # direct declaration is so we can use `serde_json::json!` in
@@ -116,7 +129,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [build-dependencies]
-napi-build = "2"
+napi-build = "2"  # napi-build stays on 2.x; napi-rs 3 build script is compatible
 
 [profile.release]
 lto = true

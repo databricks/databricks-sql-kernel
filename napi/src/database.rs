@@ -90,7 +90,7 @@ const NODE_OAUTH_CLIENT_ID: &str = "databricks-sql-connector";
 /// kernel marks federation as not-yet-implemented and `External` is a
 /// Rust-trait escape hatch with no JS-callback bridge.
 #[napi(string_enum)]
-#[derive(Default)]
+#[derive(Default, Clone, Copy)]
 pub enum AuthMode {
     /// Personal access token (`token`).
     #[default]
