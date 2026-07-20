@@ -90,11 +90,13 @@ jobs:
         # its transitive graph is NOT seen by the root run above. Scan
         # it explicitly against the same deny.toml policy. `--config`
         # points back at the root deny.toml so both workspaces share
-        # one allowlist rather than drifting. `--manifest-path` is a
-        # global cargo-deny flag (before the subcommand); `--config`
-        # is a `check` flag (after it). Both paths are absolute via
-        # $GITHUB_WORKSPACE so the step is immune to any
-        # `defaults.run.working-directory` a future edit might add
-        # (a relative `--config` would otherwise resolve against the
-        # manifest dir and look for napi/deny.toml).
-        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" check --config "$GITHUB_WORKSPACE/deny.toml"
+        # one allowlist rather than drifting. Both `--manifest-path` and
+        # `--config` are GLOBAL cargo-deny flags (before the `check`
+        # subcommand): cargo-deny 0.20 (PR EmbarkStudios/cargo-deny#881)
+        # moved `--config` from a `check` flag to the root, so the old
+        # `check --config …` form now errors with "unexpected argument
+        # '--config'". Both paths are absolute via $GITHUB_WORKSPACE so the
+        # step is immune to any `defaults.run.working-directory` a future
+        # edit might add (a relative `--config` would otherwise resolve
+        # against the manifest dir and look for napi/deny.toml).
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check
