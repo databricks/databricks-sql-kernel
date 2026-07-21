@@ -338,6 +338,14 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
                                                         uint32_t max_retries,
                                                         uint64_t overall_timeout_ms);
 
+/* Whether transaction control is ignored (no-oped). `ignore = true` (the
+ * default) gives IgnoreTransactions=1 semantics: commit / rollback /
+ * autocommit-off become silent no-ops. `ignore = false` enables real
+ * multi-statement transactions (Private Preview; requires catalog-managed
+ * tables server-side). Shared by all drivers (ODBC / Python / Go / Node). */
+KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConfig* config,
+                                                               bool ignore);
+
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*
@@ -359,6 +367,30 @@ KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* o
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
                                               kernel_statement_t** out);
+
+/* ─── Transaction control ─────────────────────────────────────────────
+ *
+ * Transaction control is expressed as session-scoped SQL and shared by all
+ * drivers. When the session was opened with ignore_transactions = true (the
+ * default), these are silent no-ops returning Success. When false (opt-in),
+ * they issue SET AUTOCOMMIT / COMMIT / ROLLBACK on the session; real
+ * multi-statement transactions require catalog-managed tables server-side.
+ * The three mutating calls run SQL and MUST be invoked from a native
+ * (non-async-runtime) thread. */
+
+/* Set autocommit mode. false begins an explicit transaction; true returns to
+ * auto-commit. Issues `SET AUTOCOMMIT = TRUE|FALSE`. No-op when transactions
+ * are ignored. */
+KernelStatusCode kernel_session_set_autocommit(kernel_session_t* session, bool enabled);
+
+/* Read the current autocommit mode into `*out`. Local read — no round-trip. */
+KernelStatusCode kernel_session_get_autocommit(const kernel_session_t* session, bool* out);
+
+/* Commit the current transaction (issues `COMMIT`). No-op when ignored. */
+KernelStatusCode kernel_session_commit(kernel_session_t* session);
+
+/* Roll back the current transaction (issues `ROLLBACK`). No-op when ignored. */
+KernelStatusCode kernel_session_rollback(kernel_session_t* session);
 
 /* ─── Statement ───────────────────────────────────────────────────────*/
 

@@ -19,8 +19,10 @@
 //! `set_auth_u2m`). A host may also drive its own token flow and inject
 //! it via PAT.
 //!
-//! Transaction methods (autocommit / commit / rollback) are deferred to
-//! v0.1 per `docs/spec-v0.md` addendum A5.
+//! Transaction control (autocommit / commit / rollback) is exposed via
+//! `kernel_session_set_autocommit` / `_get_autocommit` / `_commit` /
+//! `_rollback`, gated by `kernel_session_config_set_ignore_transactions`
+//! (default = ignore). Backed by the shared `Session` transaction methods.
 
 use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
@@ -102,6 +104,11 @@ pub struct KernelSessionConfig {
     /// lets a host make its own backoff/attempt policy authoritative (a
     /// JDBC-style `RetryWaitMin` / `RetryWaitMax` / `RetryMax` surface).
     retry: Option<RetrySpec>,
+    /// Whether transaction control is ignored (no-oped). Defaults to `true`
+    /// (matching the reference/JDBC `IgnoreTransactions=1`); a host opts into
+    /// real transactions via `kernel_session_config_set_ignore_transactions`
+    /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
+    ignore_transactions: bool,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -177,6 +184,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
         retry: None,
+        // Default to ignoring transactions, matching IgnoreTransactions=1.
+        ignore_transactions: true,
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -590,6 +599,26 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_skip_hostname_verificatio
     })
 }
 
+/// Set whether transaction control is ignored (no-oped). Pass `true`
+/// (the default) for `IgnoreTransactions=1` semantics — `SQLEndTran` /
+/// commit / rollback / autocommit-off become silent no-ops. Pass `false`
+/// to enable real multi-statement transactions (Private Preview; requires
+/// catalog-managed tables server-side). Maps to
+/// [`DefaultOpts::ignore_transactions`].
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
+    config: *mut KernelSessionConfig,
+    ignore: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.ignore_transactions = ignore;
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -722,6 +751,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         tls,
         custom_headers,
         retry,
+        ignore_transactions,
     } = config;
 
     block_on_ffi(move || {
@@ -769,7 +799,11 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             let mut builder = Session::builder()
                 .connection(connection)
                 .auth(auth)
-                .session_conf(session_conf);
+                .session_conf(session_conf)
+                .defaults(crate::config::DefaultOpts {
+                    ignore_transactions,
+                    ..Default::default()
+                });
 
             // Skip `.http()` when neither headers nor a retry spec was set, so
             // the kernel's full `HttpConfig::default()` applies untouched.
@@ -910,11 +944,109 @@ pub unsafe extern "C" fn kernel_session_new_statement(
     KernelStatusCode::Success
 }
 
-// Deferred to v0.1 (see addendum A5):
-//
-//   pub unsafe extern "C" fn kernel_session_set_autocommit(...) -> KernelStatusCode;
-//   pub unsafe extern "C" fn kernel_session_commit(...) -> KernelStatusCode;
-//   pub unsafe extern "C" fn kernel_session_rollback(...) -> KernelStatusCode;
+/// Set autocommit mode on the session. `enabled = false` begins explicit
+/// transaction mode (subsequent statements run in a transaction until
+/// `kernel_session_commit` / `kernel_session_rollback`); `true` returns to
+/// auto-commit. Issues `SET AUTOCOMMIT = TRUE|FALSE` on the server.
+///
+/// A no-op returning `Success` when the session was configured with
+/// `ignore_transactions = true` (the default). Must be called from a
+/// native (non-async-runtime) thread.
+///
+/// # Safety
+/// `session` must be a live session handle from [`kernel_session_open`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_set_autocommit(
+    session: *mut kernel_session_t,
+    enabled: bool,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument()
+                .message("kernel_session_set_autocommit: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    match block_on_ffi(|| session.set_autocommit(enabled)) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
+}
+
+/// Read the session's current autocommit mode into `*out`. Local read — no
+/// server round-trip.
+///
+/// # Safety
+/// `session` must be a live session handle; `out` must be a writable `bool*`.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_get_autocommit(
+    session: *const kernel_session_t,
+    out: *mut bool,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument()
+                .message("kernel_session_get_autocommit: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    if out.is_null() {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument()
+                .message("kernel_session_get_autocommit: out must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    }
+    std::ptr::write(out, session.autocommit());
+    KernelStatusCode::Success
+}
+
+/// Commit the current transaction (issues `COMMIT`). A no-op returning
+/// `Success` when the session has `ignore_transactions = true`. Must be
+/// called from a native (non-async-runtime) thread.
+///
+/// # Safety
+/// `session` must be a live session handle from [`kernel_session_open`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_commit(session: *mut kernel_session_t) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument().message("kernel_session_commit: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    match block_on_ffi(|| session.commit()) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
+}
+
+/// Roll back the current transaction (issues `ROLLBACK`). A no-op returning
+/// `Success` when the session has `ignore_transactions = true`. Requires
+/// catalog-managed tables server-side for the rollback to take effect. Must
+/// be called from a native (non-async-runtime) thread.
+///
+/// # Safety
+/// `session` must be a live session handle from [`kernel_session_open`].
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_rollback(
+    session: *mut kernel_session_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument().message("kernel_session_rollback: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    match block_on_ffi(|| session.rollback()) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
+}
 
 #[cfg(test)]
 mod tests {
