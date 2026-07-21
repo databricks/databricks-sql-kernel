@@ -36,12 +36,14 @@
 //!
 //! ## Transactions
 //!
-//! Multi-statement transaction methods (`set_autocommit` / `commit` /
-//! `rollback`) are intentionally **omitted** in v0. The Databricks
-//! server-side semantics for autocommit are still being settled, and
-//! we prefer to leave the surface unspecified rather than ship a
-//! signature we may need to reshape. The methods will be added once
-//! the server contract stabilises.
+//! Multi-statement transaction control (`set_autocommit` / `commit` /
+//! `rollback`) is expressed as session-scoped SQL (`SET AUTOCOMMIT`,
+//! `COMMIT`, `ROLLBACK`), mirroring the reference and JDBC drivers, and
+//! is shared by every wrapper via the C ABI. It is gated by
+//! [`DefaultOpts::ignore_transactions`] (default = ignore, matching
+//! `IgnoreTransactions=1`): when ignored, the methods are no-ops; when
+//! enabled, they drive real transactions (a Private Preview feature that
+//! requires catalog-managed tables server-side).
 
 use crate::auth::{
     AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, PersonalAccessToken,
@@ -110,6 +112,24 @@ pub(crate) struct SessionInner {
     /// transient `delete_session` failures don't leak the server-
     /// side session.
     closed: std::sync::atomic::AtomicBool,
+
+    /// Client-tracked autocommit state. `true` (the default) means every
+    /// statement auto-commits at the server; `false` means statements run
+    /// inside an explicit transaction until [`Session::commit`] /
+    /// [`Session::rollback`]. Toggled by [`Session::set_autocommit`], which
+    /// also issues the corresponding `SET AUTOCOMMIT` statement to the
+    /// server. Cached here (rather than round-tripped on every read),
+    /// mirroring the JDBC driver's `DatabricksSession.autoCommit`.
+    autocommit: std::sync::atomic::AtomicBool,
+
+    /// When `true`, transaction-control operations ([`Session::set_autocommit`]
+    /// with `false`, [`Session::commit`], [`Session::rollback`]) are silently
+    /// no-oped — they return `Ok(())` without issuing any server statement.
+    /// Mirrors the reference/JDBC `IgnoreTransactions` connection property
+    /// (default = ignore); drivers pass it through via
+    /// [`DefaultOpts::ignore_transactions`]. Multi-statement transactions are
+    /// a Private Preview feature; setting this `false` opts in.
+    ignore_transactions: bool,
 }
 
 impl SessionInner {
@@ -353,6 +373,10 @@ impl Session {
                 runtime_handle,
                 log_span,
                 closed: std::sync::atomic::AtomicBool::new(false),
+                // Autocommit defaults to on (every statement commits); a
+                // caller opts into explicit transactions via set_autocommit.
+                autocommit: std::sync::atomic::AtomicBool::new(true),
+                ignore_transactions: defaults.ignore_transactions,
             }),
         })
     }
@@ -368,6 +392,92 @@ impl Session {
     /// Metadata operations — flat, per-method (ODBC-shaped).
     pub fn metadata(&self) -> Metadata {
         Metadata::new(Arc::clone(&self.inner))
+    }
+
+    // ─── Transaction control ────────────────────────────────────────────
+    //
+    // Transaction control is expressed as session-scoped SQL, matching the
+    // reference and JDBC drivers: set_autocommit → `SET AUTOCOMMIT`,
+    // commit → `COMMIT`, rollback → `ROLLBACK`. These run on this session
+    // so the server keeps the transaction context across statements.
+    // Autocommit state is client-tracked (cached in SessionInner) rather
+    // than round-tripped on every read. When the session was built with
+    // `ignore_transactions = true` (the default, mirroring
+    // `IgnoreTransactions=1`), these are silent no-ops. Centralising this
+    // here means every C-ABI consumer (ODBC / Python / Go / Node) gets
+    // identical transaction semantics from one implementation.
+
+    /// Current autocommit mode. `true` (default) = each statement commits
+    /// immediately; `false` = statements run in an explicit transaction
+    /// until [`commit`](Self::commit) / [`rollback`](Self::rollback). This
+    /// is a local read (no server round-trip).
+    pub fn autocommit(&self) -> bool {
+        self.inner
+            .autocommit
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Set autocommit mode. Issues `SET AUTOCOMMIT = TRUE|FALSE` on the
+    /// server and, on success, caches the new state. Setting `false`
+    /// begins explicit-transaction mode; setting `true` returns to
+    /// auto-commit (committing any open transaction, per server
+    /// semantics).
+    ///
+    /// No-op returning `Ok(())` when the session has `ignore_transactions`
+    /// set (transactions disabled) — the state is not changed and no
+    /// statement is sent. This mirrors the reference/JDBC behavior under
+    /// `IgnoreTransactions=1`.
+    pub async fn set_autocommit(&self, enabled: bool) -> Result<()> {
+        if self.inner.ignore_transactions {
+            return Ok(());
+        }
+        self.run_txn_statement(if enabled {
+            "SET AUTOCOMMIT = TRUE"
+        } else {
+            "SET AUTOCOMMIT = FALSE"
+        })
+        .await?;
+        self.inner
+            .autocommit
+            .store(enabled, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
+    /// Commit the current transaction by issuing `COMMIT`. No-op returning
+    /// `Ok(())` when `ignore_transactions` is set. On a server with no open
+    /// transaction (e.g. autocommit still on) the server decides the
+    /// outcome; the kernel surfaces any error unchanged.
+    pub async fn commit(&self) -> Result<()> {
+        if self.inner.ignore_transactions {
+            return Ok(());
+        }
+        self.run_txn_statement("COMMIT").await
+    }
+
+    /// Roll back the current transaction by issuing `ROLLBACK`. No-op
+    /// returning `Ok(())` when `ignore_transactions` is set. Requires
+    /// catalog-managed tables server-side for the rollback to take effect.
+    pub async fn rollback(&self) -> Result<()> {
+        if self.inner.ignore_transactions {
+            return Ok(());
+        }
+        self.run_txn_statement("ROLLBACK").await
+    }
+
+    /// Run a transaction-control statement (`SET AUTOCOMMIT` / `COMMIT` /
+    /// `ROLLBACK`) to completion on this session and discard its result.
+    /// These statements return no result set, so we execute and drop the
+    /// executed handle (its `Drop` closes the server statement). Errors
+    /// propagate through the normal `KernelError` taxonomy.
+    async fn run_txn_statement(&self, sql: &'static str) -> Result<()> {
+        let span = self.inner.log_span().clone();
+        async {
+            let mut stmt = self.statement();
+            stmt.spec().sql(sql);
+            stmt.execute().await.map(|_executed| ())
+        }
+        .instrument(span)
+        .await
     }
 
     /// Initiate the fire-and-forget server-side `DeleteSession` now,
@@ -601,6 +711,21 @@ impl SessionBuilder {
     /// override.
     pub fn defaults(mut self, defaults: DefaultOpts) -> Self {
         self.defaults = Some(defaults);
+        self
+    }
+
+    /// Whether transaction control is ignored (no-oped). `true` (the
+    /// default) matches the reference/JDBC `IgnoreTransactions=1`; `false`
+    /// enables real multi-statement transactions (Private Preview).
+    ///
+    /// A convenience over [`Self::defaults`] for the common case of
+    /// toggling only this flag — and the supported way to set it from
+    /// outside the crate, since [`DefaultOpts`] is `#[non_exhaustive]`.
+    /// Merges into any `DefaultOpts` already supplied via `defaults`.
+    pub fn ignore_transactions(mut self, ignore: bool) -> Self {
+        let mut d = self.defaults.take().unwrap_or_default();
+        d.ignore_transactions = ignore;
+        self.defaults = Some(d);
         self
     }
 
@@ -1324,6 +1449,67 @@ mod is_open_tests {
         assert!(
             !session.is_open(),
             "after initiate_delete the session must report not-open"
+        );
+    }
+
+    #[test]
+    fn default_opts_ignore_transactions_defaults_to_true() {
+        // Matches the reference/JDBC IgnoreTransactions=1 default.
+        assert!(DefaultOpts::default().ignore_transactions);
+    }
+
+    /// With ignore_transactions = true (default), the transaction-control
+    /// methods are no-ops: they return Ok WITHOUT issuing any statement.
+    /// The mock server exposes ONLY session create/delete — no statement
+    /// endpoint — so any attempt to run `SET AUTOCOMMIT`/`COMMIT`/`ROLLBACK`
+    /// SQL would fail. Their success here proves the no-op short-circuit.
+    #[tokio::test]
+    async fn transaction_controls_are_noop_when_ignored() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"session_id":"sess-txn","warehouse_id":"test_wh"}"#),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-txn"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+            })
+            // ignore_transactions defaults to true; be explicit for the test.
+            .defaults(DefaultOpts {
+                ignore_transactions: true,
+                ..Default::default()
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        assert!(session.autocommit(), "default autocommit is on");
+        // All three no-op and succeed without hitting a (non-existent)
+        // statement endpoint.
+        session
+            .set_autocommit(false)
+            .await
+            .expect("set_autocommit no-op");
+        session.commit().await.expect("commit no-op");
+        session.rollback().await.expect("rollback no-op");
+        // State unchanged because the set was ignored.
+        assert!(
+            session.autocommit(),
+            "autocommit must stay on when transactions are ignored"
         );
     }
 }

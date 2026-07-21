@@ -6,6 +6,24 @@ under [`pyo3/CHANGELOG.md`](pyo3/CHANGELOG.md) and
 [`napi/CHANGELOG.md`](napi/CHANGELOG.md); they ship on independent
 cadences and may not move in lockstep with the crate.
 
+## [Unreleased]
+
+### Added
+- **Transaction control on `Session`** — `set_autocommit(bool)` /
+  `autocommit()` / `commit()` / `rollback()`, exposed over the C ABI as
+  `kernel_session_set_autocommit` / `_get_autocommit` / `_commit` /
+  `_rollback`. Implemented as session-scoped SQL (`SET AUTOCOMMIT`,
+  `COMMIT`, `ROLLBACK`), mirroring the reference/JDBC drivers, so every
+  wrapper (ODBC / Python / Go / Node) gets identical transaction
+  semantics from one implementation. Gated by the new
+  `DefaultOpts::ignore_transactions` (builder shortcut
+  `SessionBuilder::ignore_transactions`; C ABI
+  `kernel_session_config_set_ignore_transactions`), which defaults to
+  `true` — matching the reference/JDBC `IgnoreTransactions=1`: when set,
+  the control methods are silent no-ops. Set `false` to opt into real
+  multi-statement transactions (Private Preview; requires catalog-managed
+  tables server-side).
+
 ## [v0.2.0] - 2026-06-08
 
 **Beta release of the Databricks SQL Kernel.** Bumps the crate out

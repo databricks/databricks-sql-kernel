@@ -173,10 +173,32 @@ fn parse_org_id(http_path: &str) -> Option<String> {
 /// Optional: per-session defaults applied to statements that don't
 /// override.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct DefaultOpts {
     pub catalog: Option<String>,
     pub schema: Option<String>,
+
+    /// When `true` (the default), transaction-control operations are
+    /// silently no-oped: `Session::set_autocommit(false)`,
+    /// `Session::commit()`, and `Session::rollback()` return `Ok(())`
+    /// without issuing any server statement. Mirrors the reference/JDBC
+    /// `IgnoreTransactions` connection property, whose default is `1`
+    /// (transactions disabled). Set to `false` to opt into real
+    /// multi-statement transactions (a Private Preview feature; requires
+    /// catalog-managed tables server-side).
+    pub ignore_transactions: bool,
+}
+
+impl Default for DefaultOpts {
+    fn default() -> Self {
+        Self {
+            catalog: None,
+            schema: None,
+            // Match the reference/JDBC default of IgnoreTransactions=1:
+            // transaction control is no-oped unless a caller opts in.
+            ignore_transactions: true,
+        }
+    }
 }
 
 // ─── Authentication ─────────────────────────────────────────────────────────
