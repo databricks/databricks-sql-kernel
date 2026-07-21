@@ -1235,3 +1235,52 @@ async fn metadata_succeeded_response_still_closes_statement() {
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     // `_close` verifies expect(1) when it drops at end of scope.
 }
+
+/// Same CLOSED-skip guarantee as
+/// [`metadata_closed_response_skips_close_statement`], but exercised
+/// through `list_tables()` rather than `list_catalogs()`. Unlike
+/// `list_catalogs` (which takes the no-error early-`?` path), the other
+/// metadata methods route the transport result through a
+/// `match { Ok(r) => r, Err(e) => return not_found_or(...) }` before
+/// reaching the shared `close_id` reshape. This test guards that more
+/// common code shape so a future refactor that reorders the
+/// `close_id`/reshape sequence on a `match`-branch method still gets
+/// caught.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_statement_on_match_branch() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t1")]),
+        ("catalogName", vec![Some("main")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    // Inline result with status.state == CLOSED — server already closed it.
+    mount_execute(&server, closed_inline_response_body(&raw)).await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_tables(None, None, None, None)
+            .await
+            .expect("list_tables");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — a redundant close guard would fire now.
+    }
+    // Give any (erroneously) spawned fire-and-forget close a chance to
+    // hit the wire before the scoped mock verifies expect(0) on drop.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // `_no_close` verifies expect(0) when it drops at end of scope.
+}
