@@ -173,6 +173,15 @@ async fn mount_execute_expecting_sql(server: &MockServer, sql_substr: &str, body
         .await;
 }
 
+/// Like [`succeeded_inline_response_body`] but reports
+/// `status.state == CLOSED`. This is the common inline/direct-result
+/// case for metadata `SHOW …` queries: the server auto-closes the
+/// statement and returns `CLOSED`, so the kernel must NOT issue a
+/// follow-up `CloseStatement` (DELETE) on it.
+fn closed_inline_response_body(batch: &RecordBatch) -> String {
+    succeeded_inline_response_body(batch).replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
+}
+
 fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     let fields: Vec<Field> = cols
         .iter()
@@ -1142,4 +1151,87 @@ async fn identifier_validation_propagates_invalid_argument() {
 
     let err = LikePattern::new("with\0nul").expect_err("NUL byte rejected");
     assert_eq!(err.code, ErrorCode::InvalidArgument);
+}
+
+// ─── CloseStatement / status.state==CLOSED handling (issue #168) ───
+
+/// Regression for issue #168: when the `ExecuteStatement` response for a
+/// metadata query already reports `status.state == CLOSED`, the statement
+/// is closed server-side and the kernel must NOT issue a redundant
+/// `DELETE /api/2.0/sql/statements/<id>` (CloseStatement) on it — matching
+/// the regular-query path. Before the fix, the metadata path always
+/// installs a `StatementCloseGuard`, firing the redundant DELETE on stream
+/// drop.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![("catalog", vec![Some("main")])]);
+    // Inline result with status.state == CLOSED — server already closed it.
+    mount_execute(&server, closed_inline_response_body(&raw)).await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — a redundant close guard would fire now.
+    }
+    // Give any (erroneously) spawned fire-and-forget close a chance to
+    // hit the wire before the scoped mock verifies expect(0) on drop.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // `_no_close` verifies expect(0) when it drops at end of scope.
+}
+
+/// Regression-guard for issue #168's fix: when the metadata
+/// `ExecuteStatement` response reports a non-CLOSED terminal state
+/// (`SUCCEEDED`), the server still owns the statement, so the kernel MUST
+/// still issue exactly one `CloseStatement` (DELETE) on stream drop. This
+/// ensures the CLOSED-skip does not over-correct and reintroduce the
+/// server-statement leak that `from_reader_with_close` guards against.
+#[tokio::test]
+async fn metadata_succeeded_response_still_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![("catalog", vec![Some("main")])]);
+    // Inline result with status.state == SUCCEEDED — server still owns it.
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+
+    // Scoped expectation: exactly one DELETE on the statement endpoint.
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — the close guard must fire the DELETE.
+    }
+    // Give the fire-and-forget close a chance to hit the wire before the
+    // scoped mock verifies expect(1) on drop.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    // `_close` verifies expect(1) when it drops at end of scope.
 }
