@@ -1,0 +1,128 @@
+# Engineer Bot — learning (retrospective) extraction.
+#
+# On merge of a PR labelled `extract-learning`, the bot reads the merged PR's diff
+# + review comments, decides whether there's a DURABLE, reusable engineering
+# learning, and — if so — opens a PR appending an entry to this repo's learning log
+# (.claude/knowledge/learning-log.md). Human-gated by design: it NEVER commits the
+# canonical log directly; the entry lands as a reviewable PR.
+#
+# Own job (NOT `uses: databricks/databricks-bot-engine/...`): an external repo
+# can't resolve the internal engine's reusable workflows ("not found"). It shares
+# the SAME prelude the other bots use — ./.github/actions/bot-prelude (tokens +
+# Node + pinned engine install) — so the engine pin stays single-sourced in
+# bot-prelude's `engine-ref` default (no second SHA to drift). What's unique to
+# this flow stays inline: the default-branch checkout the learning PR is cut from,
+# the bot git identity, and the merged-PR context gather.
+#
+# Opt-in is purely via the `retrospective:` block in .bot/config.yaml + this
+# workflow; absent that block the engine phase is a clean no-op.
+name: Engineer Bot — Learning
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write        # open the learning-log PR
+  pull-requests: write
+  id-token: write        # JFrog OIDC exchange for the engine/SDK/CLI install
+
+jobs:
+  learning:
+    # Only on MERGE (not a plain close) of a PR carrying `extract-learning`, and
+    # never on the learning bot's own PR (head ref ai/learning-pr-*) — that would
+    # loop.
+    if: >-
+      github.event.pull_request.merged == true
+      && contains(github.event.pull_request.labels.*.name, 'extract-learning')
+      && !startsWith(github.event.pull_request.head.ref, 'ai/learning-pr-')
+    environment: azure-prod   # DATABRICKS_HOST / DATABRICKS_TOKEN live here
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: engineer-bot-learning-pr-${{ github.event.pull_request.number }}
+      cancel-in-progress: false
+    steps:
+      # Checkout the default branch (the learning PR is cut from it) FIRST, so the
+      # local `./` composites below resolve. persist-credentials:false — the
+      # retrospective sets its own authenticated push remote (see the run step),
+      # so no token is left in .git/config.
+      - name: Checkout default branch (learning PR is cut from it)
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd  # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Route pip through the JFrog proxy for the engine install (no cargo — the
+      # retrospective reads the diff, it doesn't build the crate). MUST run before
+      # bot-prelude (install-bot-engine reuses its PIP_INDEX_URL / JFROG_ACCESS_TOKEN).
+      - name: Set up JFrog (pip)
+        uses: ./.github/actions/setup-jfrog
+        with:
+          uv: "true"
+
+      - name: Setup Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with:
+          python-version: '3.11'
+
+      # Shared prelude: mint the engineer-bot token (opens the learning PR) + the
+      # engine-scoped token, set up Node, install the pinned engine (PAT-free). The
+      # engine pin comes from bot-prelude's `engine-ref` default — the SINGLE source
+      # of truth for every bot; there is no second SHA in this file to drift.
+      - name: Bot prelude (tokens + Node + engine install)
+        id: prelude
+        uses: ./.github/actions/bot-prelude
+        with:
+          app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
+          private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
+
+      # NOTE: no git-identity step here. The engine's retrospective
+      # (databricks-bot-engine#139, in the pinned engine SHA) configures the git
+      # user AND DCO sign-off itself from .bot/config.yaml `bot_login_prefix` —
+      # same as the author/followup flows — so the learning commit is authored and
+      # signed as the bot without the workflow doing it. (Before #139 this flow had
+      # to hand-roll the identity; the engine bump removed that need.)
+
+      - name: Gather merged-PR context
+        env:
+          GH_TOKEN: ${{ steps.prelude.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Write the gathered context into the checkout (the engine's repo_dir /
+          # cwd) under the filenames the .bot/config.yaml `retrospective.context_files`
+          # resolves against repo_dir (`pr_diff.txt`, `review_comments.txt`); the
+          # engine inlines those into the prompt.
+          { gh pr diff "$PR" --repo "$REPO" || true; } \
+            | head -c 32000 > "$GITHUB_WORKSPACE/pr_diff.txt"
+          { gh api --paginate "/repos/$REPO/pulls/$PR/comments" \
+              --jq '.[] | "\(.path):\(.line // .original_line) \(.user.login): \(.body)"' || true; } \
+            | head -c 32000 > "$GITHUB_WORKSPACE/review_comments.txt"
+
+      - name: Extract learning + open PR
+        env:
+          GH_TOKEN: ${{ steps.prelude.outputs.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          # Only the `<workspace>/serving-endpoints/` prefix matters:
+          # sdk_agent.translate_endpoint rewrites this to `.../serving-endpoints/anthropic`
+          # and discards the model path segment. The effective model comes from
+          # .bot/config.yaml `retrospective.model` (or the engine default).
+          MODEL_ENDPOINT: https://${{ secrets.DATABRICKS_HOST }}/serving-endpoints/anthropic/invocations
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          RUNNER_TEMP: ${{ runner.temp }}
+        # The retrospective pushes the learning branch with a plain `git push
+        # origin` (no in-module set-url), and the checkout ran persist-credentials:
+        # false — so set an authenticated push remote from the minted App token
+        # first, mirroring engineer-bot.yml's publish step. retrospective.py
+        # resolves repo_dir from --repo-dir (cwd = $GITHUB_WORKSPACE otherwise),
+        # where .bot/ + the gathered context files live.
+        run: |
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          python -m databricks_bot_engine.engineer_bot.retrospective --repo-dir "$GITHUB_WORKSPACE"

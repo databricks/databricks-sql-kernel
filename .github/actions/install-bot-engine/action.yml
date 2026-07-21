@@ -1,0 +1,124 @@
+# Install databricks-bot-engine (pinned REF) + the Claude Agent SDK/CLI.
+#
+# WHY THIS IS A LOCAL COMPOSITE (not `uses: databricks/databricks-bot-engine/...`):
+# databricks-sql-kernel cannot reference the engine's actions/reusable workflows
+# cross-repo — GitHub fails with "Unable to resolve action ..., not found" (the
+# internal engine repo's Actions aren't consumable from an external repo). So we
+# do NOT `uses:` engine actions. Instead this local action `pip install`s the
+# engine over HTTPS with a token — a plain clone, which an external repo CAN do —
+# inlining what the engine's own install-bot-engine action does in REF mode. Keep
+# in sync with that action at the pinned engine SHA.
+#
+# Auth is PAT-FREE: the caller passes a short-lived, engine-scoped GitHub App
+# installation token as `engine-token` (minted from the bot App creds). It slots
+# into the same git auth path a PAT would; nothing stored/long-lived.
+#
+# EGRESS: the protected runner reaches pypi/npm ONLY through the JFrog proxy. This
+# repo already has `./.github/actions/setup-jfrog`, which the CALLER runs first
+# with `uv: true` — that exports `PIP_INDEX_URL` (pip picks it up globally) and
+# `JFROG_ACCESS_TOKEN` to $GITHUB_ENV. We reuse that token to point npm at the
+# JFrog npm proxy here (setup-jfrog configures cargo + pip, but NOT npm), so we do
+# not re-mint a JFrog token. Requires the caller to run setup-jfrog(uv:true)
+# before this composite.
+name: Install bot engine (local)
+description: pip-install the pinned databricks-bot-engine + Claude Agent SDK/CLI, PAT-free (engine-scoped App token). Reuses setup-jfrog's proxy env.
+
+inputs:
+  engine-ref:
+    description: 'Engine commit SHA (full 40-char) to install.'
+    required: true
+  engine-repo:
+    description: 'owner/name of the engine repo.'
+    required: false
+    default: 'databricks/databricks-bot-engine'
+  engine-token:
+    description: 'Short-lived engine-scoped GitHub App installation token (contents:read). Authenticates the private-engine clone; no stored PAT.'
+    required: true
+  sdk-version:
+    description: 'claude-agent-sdk version. Keep in sync with the engine at the pinned SHA.'
+    required: false
+    default: '0.2.102'
+  cli-version:
+    description: '@anthropic-ai/claude-code version. Keep in sync with the engine at the pinned SHA.'
+    required: false
+    default: '2.1.61'
+
+runs:
+  using: composite
+  steps:
+    - name: Point npm at the JFrog proxy (reusing setup-jfrog's token)
+      shell: bash
+      env:
+        # Set by ./.github/actions/setup-jfrog (run by the caller before this).
+        JFROG_ACCESS_TOKEN: ${{ env.JFROG_ACCESS_TOKEN }}
+      run: |
+        set -euo pipefail
+        # setup-jfrog(uv:true) already exported PIP_INDEX_URL for pip and left a
+        # JFrog access token in $JFROG_ACCESS_TOKEN. It does NOT touch npm, and the
+        # engine install needs `npm install -g @anthropic-ai/claude-code`. Write a
+        # JOB-LOCAL .npmrc (0600) under RUNNER_TEMP pointing at the JFrog npm proxy
+        # and load it via `npm --userconfig` in the install step — NOT ~/.npmrc, so
+        # the embedded credential never leaks into later steps' environment.
+        if [ -z "${JFROG_ACCESS_TOKEN:-}" ]; then
+          echo "::error::JFROG_ACCESS_TOKEN not set — run ./.github/actions/setup-jfrog (uv: true) before this composite"; exit 1
+        fi
+        # Defensively mask the JFrog token so it can't surface in the job log if a
+        # later step (or npm verbosity / an error dump) echoes the .npmrc contents,
+        # matching the ::add-mask:: treatment the engine token already gets.
+        echo "::add-mask::${JFROG_ACCESS_TOKEN}"
+        umask 077
+        cat > "${RUNNER_TEMP:-/tmp}/bot-jfrog-npmrc" << EOF
+        registry=https://databricks.jfrog.io/artifactory/api/npm/db-npm/
+        //databricks.jfrog.io/artifactory/api/npm/db-npm/:_authToken=${JFROG_ACCESS_TOKEN}
+        always-auth=true
+        EOF
+        echo "npm pointed at JFrog proxy (job-local .npmrc)"
+
+    - name: Install engine (pinned REF) + Claude SDK/CLI
+      shell: bash
+      env:
+        ENGINE_REF: ${{ inputs.engine-ref }}
+        ENGINE_REPO: ${{ inputs.engine-repo }}
+        ENGINE_TOKEN: ${{ inputs.engine-token }}
+        SDK_VERSION: ${{ inputs.sdk-version }}
+        CLI_VERSION: ${{ inputs.cli-version }}
+      run: |
+        set -euo pipefail
+        # Supply-chain: require a full 40-char commit SHA (immutable pin). `case`
+        # globs match the whole string, so an embedded newline is rejected too.
+        case "$ENGINE_REF" in
+          *[!0-9a-f]* | "")
+            echo "::error::engine-ref must be a full 40-char commit SHA, got '$ENGINE_REF'"; exit 1 ;;
+        esac
+        if [ "${#ENGINE_REF}" -ne 40 ]; then
+          echo "::error::engine-ref must be a full 40-char commit SHA, got '$ENGINE_REF'"; exit 1
+        fi
+        if [ -z "$ENGINE_TOKEN" ]; then
+          echo "::error::engine-token is required (engine repo is private)"; exit 1
+        fi
+        # Supply the token via a git extraheader, NOT in the URL handed to pip:
+        # pip echoes the requirement spec (incl. any in-URL credential) in normal
+        # and error output where Actions masking is not guaranteed. The header
+        # lives only in a JOB-LOCAL git config for this job. Mask the token + its
+        # base64 form defensively.
+        echo "::add-mask::${ENGINE_TOKEN}"
+        BASIC=$(printf 'x-access-token:%s' "$ENGINE_TOKEN" | base64 | tr -d '\n')
+        echo "::add-mask::${BASIC}"
+        export GIT_CONFIG_GLOBAL="${RUNNER_TEMP:-/tmp}/bot-engine-gitconfig-$$"
+        : > "$GIT_CONFIG_GLOBAL"
+        JFROG_NPMRC_FILE="${RUNNER_TEMP:-/tmp}/bot-jfrog-npmrc"
+        trap 'git config --global --unset-all "http.https://github.com/.extraheader" || true; rm -f "$GIT_CONFIG_GLOBAL" "$JFROG_NPMRC_FILE"' EXIT
+        git config --global "http.https://github.com/.extraheader" "Authorization: Basic ${BASIC}"
+        NPM_ARGS=()
+        if [ -s "$JFROG_NPMRC_FILE" ]; then
+          NPM_ARGS=(--userconfig "$JFROG_NPMRC_FILE")
+        fi
+        # pip reads PIP_INDEX_URL from the env setup-jfrog exported. REF mode
+        # resolves the published engine's deps unpinned + installs the SDK/CLI by
+        # version (a consumer can't see the engine's hash-locked requirements).
+        # SDK_VERSION/CLI_VERSION track the engine at ENGINE_REF.
+        python -m pip install --upgrade pip
+        pip install "databricks-bot-engine @ git+https://github.com/${ENGINE_REPO}@${ENGINE_REF}"
+        pip install "claude-agent-sdk==${SDK_VERSION}"
+        npm install "${NPM_ARGS[@]}" -g "@anthropic-ai/claude-code@${CLI_VERSION}"
+        echo "$(npm prefix -g)/bin" >> "$GITHUB_PATH"

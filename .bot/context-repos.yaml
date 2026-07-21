@@ -1,0 +1,50 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Allowlist of PUBLIC repos the bots may fetch on demand for reference context
+# (loaded by shared.context_repos.load_context_repos; surfaced into the
+# fetch_context_repo tool menu). Cloned LAZILY by fetch_context_repo only when the
+# agent needs them — never vendored, never cloned up front. PUBLIC repos only: the
+# clone is unauthenticated (no token), so keep clone_url a plain HTTPS URL.
+#
+# Why these anchor "correct" for databricks-sql-kernel: the kernel is a
+# ground-up Rust client for the same Databricks SQL / Thrift+SEA protocol these
+# drivers implement. When an issue's RIGHT behavior is uncertain, the ground truth
+# is what an established driver does on the wire, NOT the kernel code being changed
+# (that's the code under suspicion). Consult a reference, then mirror it in Rust.
+context_repos:
+  - name: databricks-jdbc
+    description: >
+      Databricks' official JDBC driver (Java) — the canonical reference for
+      correct Databricks SQL/metadata behavior. Consult it when the RIGHT behavior
+      is uncertain or an issue cites JDBC for parity: metadata
+      (GetColumns/ORDINAL_POSITION, GetTables, catalog/schema wildcards), type
+      mapping, error/status semantics, statement close/cancel sequencing, and
+      CloudFetch. grep for the class/method the issue names to see how JDBC does
+      it, then mirror that behavior in the Rust kernel.
+    clone_url: https://github.com/databricks/databricks-jdbc.git
+  - name: adbc-databricks-csharp
+    description: >
+      The Databricks ADBC driver (C#) — a mature sibling implementation of the
+      same Databricks SQL / Thrift+SEA protocol this kernel targets. Consult it
+      when a decision turns on how an established driver handles a protocol detail:
+      session/statement lifecycle, CloseStatement/cancel sequencing, Arrow/
+      CloudFetch decode, metadata fan-out, retry/backoff, TLS config, error/status
+      mapping. Driver source is under `csharp/src/`; grep for the class/method your
+      issue touches and mirror that behavior in the Rust kernel. (NOTE: this repo
+      also contains a Rust ADBC driver subtree — ignore it; that driver is being
+      REPLACED by this kernel, so it is not a reference. Use the C# driver under
+      `csharp/`.)
+    clone_url: https://github.com/adbc-drivers/databricks.git
+    subpath: csharp/
