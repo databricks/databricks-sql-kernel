@@ -150,5 +150,4 @@ E2E tests requiring a live Databricks connection are marked `#[ignore]` and run 
 - [Databricks SQL Statement Execution API](https://docs.databricks.com/api/workspace/statementexecution)
 - [Apache Arrow Rust](https://docs.rs/arrow/latest/arrow/)
 - `docs/spec-v0.md` — v0 Kernel API spec
-- `docs/connection-parameters.md` — connection / session parameter reference (all bindings)
 - `docs/migration-plan.md` — staged migration plan from ADBC to v0
