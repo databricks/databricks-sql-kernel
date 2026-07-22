@@ -37,15 +37,61 @@ cargo test
 make check    # fmt + clippy + tests
 ```
 
+## Quick start
+
+Open a session with the `SessionBuilder`, then run a statement:
+
+```rust
+use databricks_sql_kernel::{Session, AuthConfig, HttpConfig};
+
+# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+let session = Session::builder()
+    .http_path("my-workspace.databricks.com", "/sql/1.0/warehouses/abc123")
+    .auth(AuthConfig::pat(Some(std::env::var("DATABRICKS_TOKEN")?))?)
+    // optional config groups — omit to accept the defaults below:
+    .http(HttpConfig { pool_max_idle_per_host: 200, ..Default::default() })
+    .open()
+    .await?;
+
+let mut stmt = session.statement();
+stmt.spec().sql("SELECT 1 AS n");
+let mut exec = stmt.execute().await?;
+
+let stream = exec.result_stream_mut();
+while let Some(_batch) = stream.next_batch().await? { /* consume rows */ }
+
+exec.close().await?;
+session.close().await?;
+# Ok(())
+# }
+```
+
+Each builder setter takes one config group. `.http_path(host, path)` is
+shorthand for a `ConnectionConfig`; `.connection(...)`, `.auth(...)`,
+`.defaults(...)`, `.http(...)`, `.proxy(...)`, `.tls(...)`,
+`.result(...)`, `.logging(...)`, `.session_conf(...)`, and
+`.transport(...)` set the rest.
+
 ## Configuration
 
 A session is configured with a `SessionConfig`, assembled from typed
 sub-structs (one per concern) and passed to `Session::open`. Every
 parameter, its meaning, and its default value is listed below, grouped
-by the struct it lives on.
+by the struct it lives on. `ConnectionConfig` and `AuthConfig` are
+**required**; the rest are optional and fall back to the defaults shown.
 
-`ConnectionConfig` and `AuthConfig` are **required**; the rest are
-optional and fall back to the defaults shown.
+| Group | Covers |
+|-------|--------|
+| [`ConnectionConfig`](#connectionconfig--connection-identity-required) | host, warehouse, org id *(required)* |
+| [`AuthConfig`](#authconfig--authentication-required) | PAT / OAuth M2M / OAuth U2M *(required)* |
+| [`DefaultOpts`](#defaultopts--session-defaults-optional) | default catalog / schema, transactions |
+| [`HttpConfig`](#httpconfig--http-client-optional) | timeouts, connection pool, retries, headers |
+| [`ProxyConfig`](#proxyconfig--httphttps-proxy-optional) | HTTP/HTTPS proxy |
+| [`TlsConfig`](#tlsconfig--tls--ssl-optional) | cert validation, custom CA, mTLS |
+| [`ResultConfig`](#resultconfig--result-handling-optional) | CloudFetch tuning, type rendering |
+| [`LoggingConfig`](#loggingconfig--logging-optional) | log filter / file |
+| [`transport`](#transport--wire-protocol-optional) | wire protocol |
+| [`session_conf`](#session_conf--server-side-session-configuration-optional) | server-side SQL / Spark config |
 
 ### `ConnectionConfig` — connection identity (required)
 
