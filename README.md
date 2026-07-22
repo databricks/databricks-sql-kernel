@@ -206,6 +206,23 @@ Dotted `spark.*` confs are matched case-insensitively but sent
 Boolean-valued keys should use the exact strings `"true"` / `"false"`;
 the kernel does not pre-validate values and forwards them as-is.
 
+#### Client-only `session_conf` keys
+
+Some keys carried in the same `session_conf` map are **client-side**
+tuning knobs: the kernel reads them at session creation, applies them to
+the typed config above, and then strips them so they never reach the SEA
+wire (they are deliberately *not* in the allowlist). They exist so C ABI
+(Go / ODBC) consumers can set them through the existing
+`session_conf` entry point without a dedicated symbol.
+
+| Key | Description | Default |
+|-----|-------------|---------|
+| `cloudfetch_max_chunks_in_memory` | Same knob as `ResultConfig::cloudfetch_max_chunks_in_memory` — max decompressed CloudFetch chunks held in memory at once. Matched case-insensitively; parse failures / `0` are ignored (default kept), and values above `256` are clamped (peak RSS scales with this, so the ceiling bounds OOM risk). | `16` |
+
+Compression (LZ4) is **not** a parameter: the kernel detects it from the
+server's result manifest (`result_compression`) and decompresses
+`LZ4_FRAME` payloads automatically.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) and [NOTICE.txt](NOTICE.txt).
