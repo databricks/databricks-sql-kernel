@@ -42,7 +42,7 @@ make check    # fmt + clippy + tests
 Open a session with the `SessionBuilder`, then run a statement:
 
 ```rust
-use databricks_sql_kernel::{Session, AuthConfig, HttpConfig};
+use databricks_sql_kernel::{Session, AuthConfig, HttpConfig, ExecutedStatementHandle};
 
 async fn run() -> Result<(), Box<dyn std::error::Error>> {
 // `HttpConfig` is `#[non_exhaustive]` — construct from the default and
