@@ -44,12 +44,17 @@ Open a session with the `SessionBuilder`, then run a statement:
 ```rust
 use databricks_sql_kernel::{Session, AuthConfig, HttpConfig};
 
-# async fn run() -> Result<(), Box<dyn std::error::Error>> {
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
+// `HttpConfig` is `#[non_exhaustive]` — construct from the default and
+// assign the public fields you want to override:
+let mut http = HttpConfig::default();
+http.pool_max_idle_per_host = 200;
+
 let session = Session::builder()
     .http_path("my-workspace.databricks.com", "/sql/1.0/warehouses/abc123")
     .auth(AuthConfig::pat(Some(std::env::var("DATABRICKS_TOKEN")?))?)
     // optional config groups — omit to accept the defaults below:
-    .http(HttpConfig { pool_max_idle_per_host: 200, ..Default::default() })
+    .http(http)
     .open()
     .await?;
 
@@ -62,8 +67,8 @@ while let Some(_batch) = stream.next_batch().await? { /* consume rows */ }
 
 exec.close().await?;
 session.close().await?;
-# Ok(())
-# }
+    Ok(())
+}
 ```
 
 Each builder setter takes one config group. `.http_path(host, path)` is
