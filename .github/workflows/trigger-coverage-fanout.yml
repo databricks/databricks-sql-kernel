@@ -38,6 +38,21 @@
 # shared group entirely; its own concurrency group below (keyed on the
 # merge commit, `cancel-in-progress: false`) then lets the dispatch always
 # run to completion.
+#
+# ------------------------------------------------------------------
+# Fork-merge assumption (why the fire-and-forget dispatch is safe here)
+# ------------------------------------------------------------------
+# This workflow assumes all merges into `main` originate from INTERNAL
+# branches, never from forks. That assumption matters because the
+# `pull_request` event withholds repository secrets from runs triggered by
+# fork PRs (only a read-only `GITHUB_TOKEN` is passed). If a fork PR were
+# merged while touching `src/`, `secrets.INTEGRATION_TEST_APP_ID` /
+# `INTEGRATION_TEST_PRIVATE_KEY` would be empty, the token-mint step would
+# fail, and — since the dispatch is fire-and-forget (no check, no
+# `if: failure()`) — the coverage fan-out would be silently dropped. The
+# kernel takes contributions on internal branches only, so this path is not
+# exercised; the sibling adbc flow relies on the same internal-branch-only
+# assumption. Revisit this if external/fork contributions are ever accepted.
 
 name: Trigger Coverage Fanout
 

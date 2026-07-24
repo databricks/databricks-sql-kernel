@@ -186,7 +186,7 @@ jobs:
   # =============================================================================
   skip-integration-tests-pr:
     name: Integration tests (auto-pass on PR)
-    if: github.event_name == 'pull_request' && github.event.action != 'labeled' && github.event.action != 'closed'
+    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
