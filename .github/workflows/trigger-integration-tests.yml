@@ -367,9 +367,7 @@ jobs:
           # across re-runs.
           body: |
             <!-- kernel-integration-tests-comment -->
-            **Kernel integration tests triggered** for `${{ github.event.pull_request.head.sha }}`.
-
-            [View status](https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}/checks?check_name=Kernel+Integration+Tests) — the check entry carries the receiver-supplied link to the actual workflow run.
+            Kernel integration tests triggered. [View status](https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number }}/checks?check_name=Kernel+Integration+Tests). Results post back here as the "Kernel Integration Tests" check.
           # `edit-mode: replace` so each new dispatch overwrites the
           # previous status rather than appending — the comment
           # tracks the latest run only.
