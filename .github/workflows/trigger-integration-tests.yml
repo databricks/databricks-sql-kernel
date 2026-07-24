@@ -79,7 +79,7 @@ name: Trigger Integration Tests
 
 on:
   pull_request:
-    types: [opened, synchronize, reopened, labeled, closed]
+    types: [opened, synchronize, reopened, labeled]
   merge_group:
 
 # Concurrency model:
@@ -594,73 +594,3 @@ jobs:
                 summary: 'An error occurred while dispatching kernel integration tests. Check the workflow run logs.'
               }
             });
-
-  # =============================================================================
-  # After merge: trigger the multi-language coverage fan-out.
-  # Fires when a PR lands on main (merge queue or direct merge) and touched
-  # driver source. Dispatches `coverage-fanout` to databricks-driver-test, whose
-  # coverage-fanout-tracker.yml opens a tracking issue and runs the
-  # language-agnostic fan-out (a spec authored from THIS PR's diff, conformed as
-  # tests across every driver) as peco-engineer-bot.
-  # =============================================================================
-  trigger-coverage-fanout:
-    if: |
-      github.event_name == 'pull_request' &&
-      github.event.action == 'closed' &&
-      github.event.pull_request.merged == true &&
-      github.event.pull_request.base.ref == 'main'
-    # Own concurrency group with `cancel-in-progress: false`. This job is
-    # fire-and-forget (no check posted, no `if: failure()` fallback), so a
-    # cancellation would silently drop the coverage fan-out. Sharing the
-    # workflow-level group (keyed on PR number, `cancel-in-progress: true`)
-    # means a stray post-merge `pull_request` event on the same PR number
-    # — a bot label/edit action landing during the token-mint + dispatch
-    # window — could cancel this run. A dedicated group keyed on the merge
-    # commit lets the dispatch always run to completion.
-    concurrency:
-      group: ${{ github.workflow }}-coverage-fanout-${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.number }}
-      cancel-in-progress: false
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: read
-    steps:
-      - name: Check if driver source changed
-        id: changed
-        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7.0.1
-        with:
-          script: |
-            const files = await github.paginate(github.rest.pulls.listFiles, {
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: context.payload.pull_request.number,
-              per_page: 100,
-            });
-            // The whole repo IS the driver. Count a merge as source-affecting when it changes a file under src/.
-            // Docs/CI/test-only merges do not warrant a full multi-language fan-out.
-            const isSource = (f) => f.startsWith('src/');
-            const srcChanged = files.some((f) => isSource(f.filename));
-            console.log(`driver source changed: ${srcChanged}`);
-            core.setOutput('source', srcChanged.toString());
-
-      - name: Generate GitHub App token (databricks-driver-test)
-        if: steps.changed.outputs.source == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1.12.0
-        with:
-          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
-          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
-          owner: databricks
-          repositories: databricks-driver-test
-          permission-contents: write
-
-      - name: Dispatch coverage-fanout
-        if: steps.changed.outputs.source == 'true'
-        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
-        with:
-          token: ${{ steps.app-token.outputs.token }}
-          repository: databricks/databricks-driver-test
-          event-type: coverage-fanout
-          client-payload: '{"reference_repo": "${{ github.repository }}", "pr_number": "${{ github.event.pull_request.number }}", "pr_url": "${{ github.event.pull_request.html_url }}"}'
