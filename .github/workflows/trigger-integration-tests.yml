@@ -609,6 +609,17 @@ jobs:
       github.event.action == 'closed' &&
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == 'main'
+    # Own concurrency group with `cancel-in-progress: false`. This job is
+    # fire-and-forget (no check posted, no `if: failure()` fallback), so a
+    # cancellation would silently drop the coverage fan-out. Sharing the
+    # workflow-level group (keyed on PR number, `cancel-in-progress: true`)
+    # means a stray post-merge `pull_request` event on the same PR number
+    # — a bot label/edit action landing during the token-mint + dispatch
+    # window — could cancel this run. A dedicated group keyed on the merge
+    # commit lets the dispatch always run to completion.
+    concurrency:
+      group: ${{ github.workflow }}-coverage-fanout-${{ github.event.pull_request.merge_commit_sha || github.event.pull_request.number }}
+      cancel-in-progress: false
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
