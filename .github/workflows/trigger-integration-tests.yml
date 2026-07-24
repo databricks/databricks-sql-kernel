@@ -333,6 +333,11 @@ jobs:
               pr_url: pr.html_url,
               pr_title: title,
               pr_author: pr.user.login,
+              // REPLAY-only PR gate: serve committed recordings against the driver
+              // built at this commit — deterministic, credential-free, no live
+              // Dogfood. Overrides the receiver's passthrough default so a PR is
+              // never gated on a slow/fragile live run.
+              proxy_mode: 'replay',
             };
             core.setOutput('json', JSON.stringify(payload));
 
@@ -566,7 +571,8 @@ jobs:
               "pr_repo": "${{ github.repository }}",
               "pr_url": "https://github.com/${{ github.repository }}/pull/${{ steps.extract-pr.outputs.pr_number }}",
               "pr_title": "Merge queue validation",
-              "pr_author": "merge-queue"
+              "pr_author": "merge-queue",
+              "proxy_mode": "replay"
             }
 
       - name: Fail check on dispatch error
