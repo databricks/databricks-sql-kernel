@@ -72,7 +72,7 @@ jobs:
     outputs:
       ready: ${{ steps.check.outputs.ready }}
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: "Check for napi/Cargo.toml"
         id: check
@@ -102,7 +102,7 @@ jobs:
         # All cargo commands run from the napi/ standalone workspace.
         working-directory: napi
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Route cargo through the JFrog crates proxy. The protected
       # runner group blocks direct crates.io, so without this every
