@@ -184,19 +184,41 @@ jobs:
   # so it doesn't block merging. The real run happens in the merge queue
   # (or earlier, when a maintainer adds the label).
   # =============================================================================
+  # CRITICAL: the required `Kernel Integration Tests` check is pinned in the main
+  # ruleset to the driver-test app's integration id (driver-integration-test).
+  # A `github.token` (github-actions) check of the same name is a DIFFERENT check
+  # context and does NOT satisfy the pinned gate — so it must be posted AS that
+  # app, or the required check sits "waiting for status" and PRs stay blocked.
+  #
+  # Internal PRs post the placeholder HERE (self-guarded to head repo == base
+  # repo): they can mint the app token inline, and posting here means it works
+  # from the PR branch immediately. FORK PRs are handled by the companion
+  # `skip-checks-reporter.yml` (workflow_run) — a fork's pull_request run has a
+  # read-only token and no secrets, so it can neither mint the app token nor post
+  # any check inline. The two guards are mutually exclusive (no double-post).
   skip-integration-tests-pr:
     name: Integration tests (auto-pass on PR)
-    if: github.event_name == 'pull_request' && github.event.action != 'labeled'
+    if: |
+      github.event_name == 'pull_request' &&
+      github.event.action != 'labeled' &&
+      github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
-    permissions:
-      checks: write
     steps:
+      - name: Generate GitHub App token (this repo)
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-sql-kernel
+
       - name: Skip Kernel Integration Tests
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
-          github-token: ${{ github.token }}
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.checks.create({
               owner: context.repo.owner,
@@ -287,31 +309,29 @@ jobs:
           app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
           private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
           owner: databricks
-          repositories: databricks-driver-test
-          # Defense-in-depth: scope the minted installation token to
-          # exactly the permission `repository_dispatch` needs. By
-          # default the action mints with the App's full installed
-          # permission set (Contents: Read + Pull requests: Read +
-          # Checks: Write); narrowing to `contents: write` here
-          # ensures a leaked token can only fire dispatches.
+          # databricks-driver-test: repository_dispatch (contents:write).
+          # databricks-sql-kernel: the failure handler below posts the required
+          # `Kernel Integration Tests` check (checks:write) — it must be the
+          # driver-test app, since that check is app-pinned in the ruleset.
+          repositories: |
+            databricks-driver-test
+            databricks-sql-kernel
           permission-contents: write
+          permission-checks: write
 
       # NOTE: no kernel-side `in_progress` placeholder is posted here.
       # The receiver (databricks-sql-kernel-integration-tests.yml in
       # databricks-driver-test) is the SOLE creator of the real
       # "Kernel Integration Tests" check, posting in_progress ->
-      # completed under the integration-test GitHub App. A kernel-side
-      # placeholder posted via `github.token` (the github-actions app)
-      # cannot be updated by the receiver's App — they are distinct
-      # check-runs — so it would orphan as a permanent `in_progress`
-      # and hang the merge queue. This mirrors
-      # databricks/databricks-sql-python's trigger-integration-tests.yml,
-      # which posts no placeholder. Fail-closed on a silent dispatch
-      # drop is preserved by the `if: failure()` step below plus
-      # branch protection treating a missing required check as
-      # blocking; matching the required check by NAME (not pinned to a
-      # specific integration_id) lets either the PR-path auto-pass or
-      # the receiver's result satisfy the gate.
+      # completed under the integration-test GitHub App. The required check is
+      # PINNED to that app's integration_id in the ruleset, so only a check
+      # posted by it satisfies the gate — a `github.token` (github-actions)
+      # placeholder is a different context that would neither satisfy the gate
+      # nor be updatable by the receiver's App, orphaning as a permanent
+      # in_progress and hanging the queue. Fail-closed on a silent dispatch drop
+      # is preserved by the `if: failure()` step below (now posted as the app so
+      # it actually fails the pinned check) plus branch protection treating a
+      # missing required check as blocking.
       - name: Build payload (PR-title-safe via JSON.stringify)
         id: payload
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
@@ -385,7 +405,9 @@ jobs:
         if: failure()
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
-          github-token: ${{ github.token }}
+          # App token — the required check is app-pinned, so a github.token
+          # failure check lands on a different context and wouldn't fail the gate.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.checks.create({
               owner: context.repo.owner,
@@ -427,6 +449,27 @@ jobs:
         with:
           fetch-depth: 0
 
+      # Mint the driver-test App token UNCONDITIONALLY and early. The required
+      # `Kernel Integration Tests` check is pinned to this app's integration id,
+      # so EVERY check this job posts (auto-pass, dispatch-failure) must be
+      # attributed to it — a github.token check lands on a different context and
+      # never satisfies the pinned gate, hanging the queue. Scope covers both
+      # repos: checks:write on databricks-sql-kernel (post the check) and
+      # contents:write on databricks-driver-test (repository_dispatch).
+      # merge_group runs on the base repo with full secret access.
+      - name: Generate GitHub App Token
+        id: app-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: |
+            databricks-sql-kernel
+            databricks-driver-test
+          permission-checks: write
+          permission-contents: write
+
       - name: Check if kernel source files changed
         id: changed
         run: |
@@ -462,7 +505,9 @@ jobs:
         if: steps.changed.outputs.changed != 'true'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
-          github-token: ${{ github.token }}
+          # App token — the pinned required check is only satisfied by a check
+          # posted BY the driver-test app.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.checks.create({
               owner: context.repo.owner,
@@ -489,7 +534,8 @@ jobs:
         if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED != 'true'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
-          github-token: ${{ github.token }}
+          # App token — pinned required check (see the early mint step).
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.checks.create({
               owner: context.repo.owner,
@@ -532,20 +578,6 @@ jobs:
             exit 1
           fi
 
-      - name: Generate GitHub App Token (internal repo)
-        if: steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
-        id: app-token
-        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
-        with:
-          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
-          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
-          owner: databricks
-          repositories: databricks-driver-test
-          # Defense-in-depth: scope the minted installation token to
-          # exactly the permission `repository_dispatch` needs (see
-          # the matching note on the label-trigger path).
-          permission-contents: write
-
       # NOTE: no kernel-side `in_progress` placeholder here either —
       # see the matching note on the label-trigger path above. The
       # receiver owns the real "Kernel Integration Tests" check; a
@@ -577,7 +609,13 @@ jobs:
         if: failure() && steps.changed.outputs.changed == 'true' && vars.INTEGRATION_TESTS_ENABLED == 'true'
         uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
         with:
-          github-token: ${{ github.token }}
+          # App token — a github.token failure check lands on a different context
+          # than the pinned gate, so it would neither fail nor satisfy it (queue
+          # hangs). Posting as the app fails the required check fast. If the mint
+          # itself failed this step can't run, but that case is fail-closed: the
+          # queue's check_response_timeout evicts an entry whose required check
+          # never reports.
+          github-token: ${{ steps.app-token.outputs.token }}
           script: |
             await github.rest.checks.create({
               owner: context.repo.owner,
