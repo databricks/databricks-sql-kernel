@@ -73,30 +73,41 @@ jobs:
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
         with:
           script: |
-            let prs = context.payload.workflow_run.pull_requests || [];
-            let number = prs.length ? prs[0].number : null;
-            if (number === null) {
-              const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+            // Fail OPEN: this step's only job is to SKIP the placeholder for a
+            // confirmed-closed PR. Any uncertainty — no PR resolvable, or a
+            // transient lookup error (403/5xx/network) — must default to posting,
+            // because a dropped placeholder leaves the app-pinned required check
+            // unfulfilled and workflow_run runs are not auto-retried.
+            try {
+              let prs = context.payload.workflow_run.pull_requests || [];
+              let number = prs.length ? prs[0].number : null;
+              if (number === null) {
+                const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: process.env.HEAD_SHA,
+                });
+                number = data.length ? data[0].number : null;
+              }
+              if (number === null) {
+                // No PR resolvable (unexpected) — default to posting so the
+                // required check isn't left unfulfilled.
+                core.setOutput('post', 'true');
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                commit_sha: process.env.HEAD_SHA,
+                pull_number: number,
               });
-              number = data.length ? data[0].number : null;
-            }
-            if (number === null) {
-              // No PR resolvable (unexpected) — default to posting so the
-              // required check isn't left unfulfilled.
+              const isClosed = pr.state === 'closed';
+              console.log(`PR #${number} closed=${isClosed} -> post=${!isClosed}`);
+              core.setOutput('post', (!isClosed).toString());
+            } catch (err) {
+              // Lookup failed — cannot confirm the PR is closed, so fail open.
+              console.log(`PR lookup failed (${err.message}) -> post=true (fail open)`);
               core.setOutput('post', 'true');
-              return;
             }
-            const { data: pr } = await github.rest.pulls.get({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              pull_number: number,
-            });
-            const isClosed = pr.state === 'closed';
-            console.log(`PR #${number} closed=${isClosed} -> post=${!isClosed}`);
-            core.setOutput('post', (!isClosed).toString());
 
       - name: Generate GitHub App token (this repo)
         id: app-token
