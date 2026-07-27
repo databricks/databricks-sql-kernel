@@ -35,6 +35,15 @@ on:
     workflows: ["Trigger Integration Tests"]
     types: [requested]
 
+# Coalesce redundant reporter runs for the same fork head SHA. A fork PR that
+# reopens or gets re-labeled fires `workflow_run(requested)` again on the same
+# head, which would otherwise spawn concurrent runs that each mint an app token
+# and post a duplicate placeholder. Keying on head_sha with cancel-in-progress
+# mirrors the rate-limit rationale of trigger-integration-tests.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
 jobs:
   report-skip:
     # Fork PR-triggered runs only. Internal PRs are posted inline by
