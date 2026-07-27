@@ -302,7 +302,11 @@ jobs:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
     permissions:
-      checks: write
+      # `checks: write` is intentionally NOT granted here: the only
+      # `checks.create` call in this job (the `if: failure()` handler
+      # below) posts under the app token, since the required
+      # `Kernel Integration Tests` check is app-pinned. issues /
+      # pull-requests:write remain for the sticky-comment step.
       issues: write
       pull-requests: write
     steps:
@@ -450,8 +454,12 @@ jobs:
       # actions/checkout gets a token that can't read the repo and
       # fails with "Repository not found" (exit 128) — which only
       # surfaces in the merge queue, the one path that checks out code.
+      #
+      # `checks: write` is intentionally NOT granted: all three
+      # `checks.create` calls in this job (auto-pass, companion-not-
+      # enabled, dispatch-failure) post under the app token, since the
+      # required `Kernel Integration Tests` check is app-pinned.
       contents: read
-      checks: write
     steps:
       - name: Checkout code
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
