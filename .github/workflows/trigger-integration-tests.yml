@@ -205,6 +205,10 @@ jobs:
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
+    # The check is posted with the App token (see below), so GITHUB_TOKEN needs
+    # no scopes. Pin an explicit empty block for least-privilege rather than
+    # inheriting the repo/org default permission set.
+    permissions: {}
     steps:
       - name: Generate GitHub App token (this repo)
         id: app-token
@@ -309,10 +313,15 @@ jobs:
           app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
           private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
           owner: databricks
-          # databricks-driver-test: repository_dispatch (contents:write).
-          # databricks-sql-kernel: the failure handler below posts the required
-          # `Kernel Integration Tests` check (checks:write) — it must be the
-          # driver-test app, since that check is app-pinned in the ruleset.
+          # create-github-app-token mints ONE installation token whose permission
+          # set applies to EVERY listed repo — it cannot scope a permission to a
+          # single repo, so we request the union needed across both:
+          #   - contents:write drives repository_dispatch into databricks-driver-test;
+          #   - checks:write lets the failure handler below post the required
+          #     `Kernel Integration Tests` check on databricks-sql-kernel — it must
+          #     be this app, since that check is app-pinned in the ruleset.
+          # The effective grant on each repo is still bounded by what the app is
+          # actually installed with there.
           repositories: |
             databricks-driver-test
             databricks-sql-kernel
@@ -453,10 +462,15 @@ jobs:
       # `Kernel Integration Tests` check is pinned to this app's integration id,
       # so EVERY check this job posts (auto-pass, dispatch-failure) must be
       # attributed to it — a github.token check lands on a different context and
-      # never satisfies the pinned gate, hanging the queue. Scope covers both
-      # repos: checks:write on databricks-sql-kernel (post the check) and
-      # contents:write on databricks-driver-test (repository_dispatch).
-      # merge_group runs on the base repo with full secret access.
+      # never satisfies the pinned gate, hanging the queue. create-github-app-token
+      # mints ONE installation token whose permission set applies to EVERY listed
+      # repo; it cannot scope a permission to a single repo. We therefore request
+      # the union of what's needed across both: checks:write to post the
+      # `Kernel Integration Tests` check on databricks-sql-kernel, and
+      # contents:write to repository_dispatch into databricks-driver-test. The
+      # effective grant on each repo is still bounded by what the app is actually
+      # installed with there. merge_group runs on the base repo with full secret
+      # access.
       - name: Generate GitHub App Token
         id: app-token
         uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
