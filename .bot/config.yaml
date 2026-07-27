@@ -77,6 +77,10 @@ author:
     issue_url: ISSUE_URL
   context_files:
     - issue_body.txt   # {{issue_body}}
+  # Close the loop: the author phase READS this log (newest-first, capped) into its
+  # system prompt as accumulated lessons, so retrospective learnings actually steer
+  # future fixes. MUST match retrospective.log_path below (write half ↔ read half).
+  knowledge_log: .claude/knowledge/learning-log.md
 
 # Engine orchestration for the author phase. `bug-fix` runs the plan → author_tests
 # → fix pipeline (write a failing test → fix the code → re-run to green) and forces
@@ -85,17 +89,22 @@ author:
 # layout, live-E2E discipline) live in prompts/engineer/system.md, not here.
 flow: bug-fix
 
-# On-merge learning extraction (retrospective flow). Run by engineer-bot-learning.yml
-# via `python -m databricks_bot_engine.engineer_bot.retrospective`: it reads the PR
-# diff + review comments (gathered by the workflow into the context_files below), and
-# if the model finds a durable, reusable learning, opens a PR appending it to
-# log_path. Human-gated — never commits the canonical log directly. Omitting this
-# block makes the retrospective a no-op.
+# Daily-cron learning extraction (retrospective flow). Run by engineer-bot-learning.yml
+# via `python -m databricks_bot_engine.engineer_bot.retrospective`: over an adaptive
+# look-back window the engine ITSELF gathers merged PRs (diff + review comments) AND
+# recent engineer-bot author-run logs, and if the model finds durable learnings opens
+# ONE rolling PR appending a dated section to log_path. Human-gated — never commits the
+# canonical log directly. Omitting this block makes the retrospective a no-op.
+#
+# NOTE: no `context_files` here — the daily-cron engine enumerates its own sources
+# via the GitHub API (there are no workflow-written files to inline). `context_files`
+# is an AUTHOR-phase key only.
 retrospective:
-  system_prompt: prompts/retrospective_system.md
-  log_path: .claude/knowledge/learning-log.md
-  context_files:        # workflow-gathered files the engine inlines into the prompt
-    - pr_diff.txt
-    - review_comments.txt
-  branch_prefix: ai/learning-pr-
+  # No `system_prompt` override: the engine ships the authoritative batch-aware base
+  # (engineer_prompts.RETRO_SYSTEM_PROMPT). The old repo-local override described the
+  # RETIRED single-PR `worth_logging`/`headline` contract, so keeping it would append
+  # stale, schema-contradicting guidance to the base — dropped in favor of the base.
+  log_path: .claude/knowledge/learning-log.md   # MUST match author.knowledge_log above
+  branch_prefix: ai/learning-pr-                 # rolling PR lands on the derived stable branch `ai/learning-pr`
   pr_label: engineer-bot-learning
+  author_workflow: engineer-bot.yml              # Track B: which workflow's author runs to mine
