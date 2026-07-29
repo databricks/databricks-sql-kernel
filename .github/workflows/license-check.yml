@@ -47,6 +47,12 @@ on:
       - "napi/Cargo.lock"
       - ".github/workflows/license-check.yml"
 
+concurrency:
+  # A newer commit makes an older run for the same PR irrelevant.
+  # Main pushes remain distinct and must finish independently.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   # Required for the OIDC token exchange that the
