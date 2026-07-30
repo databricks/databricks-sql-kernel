@@ -102,6 +102,128 @@ async fn list_catalogs_returns_table_cat_column() {
     session.close().await.expect("close");
 }
 
+/// Collect every value of a named Utf8 column across all batches.
+fn string_column_values(batches: &[arrow_array::RecordBatch], name: &str) -> Vec<String> {
+    batches
+        .iter()
+        .flat_map(|rb| {
+            let idx = rb.schema().index_of(name).expect("column present");
+            let arr = rb.column(idx).as_string::<i32>();
+            (0..arr.len())
+                .filter(|&i| !arr.is_null(i))
+                .map(|i| arr.value(i).to_string())
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+/// Regression test for databricks/databricks-odbc#129: `list_tables`
+/// must treat the catalog argument as an ODBC/JDBC LIKE pattern
+/// (`_` / `%`), matching Thrift `TGetTablesReq.catalogName`. The SEA
+/// `SHOW` grammar has no catalog-pattern position, so the kernel lists
+/// across all catalogs and filters `TABLE_CAT` client-side.
+///
+/// Self-adapting: derives a `_`-wildcard pattern from a real catalog on
+/// the live workspace, so it doesn't depend on the issue's specific
+/// `comparator_tests` / `comparator-tests` fixtures existing here.
+#[tokio::test]
+#[ignore]
+async fn list_tables_catalog_wildcard_filters_client_side() {
+    use databricks_sql_kernel::LikePattern;
+
+    let session = live_session().await;
+
+    // Prefer `samples` — a Databricks-managed catalog present on every
+    // UC workspace with a well-populated `information_schema.tables`, so
+    // the wildcard result is non-empty and the assertion has teeth. Fall
+    // back to any ascii catalog if `samples` is somehow absent.
+    let (catalogs, _) = collect(
+        session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs"),
+    )
+    .await;
+    let catalog_names = string_column_values(&catalogs, "TABLE_CAT");
+    let base = catalog_names
+        .iter()
+        .find(|c| *c == "samples")
+        .or_else(|| catalog_names.iter().find(|c| c.len() >= 3 && c.is_ascii()))
+        .cloned()
+        .expect("expected `samples` or some ascii catalog name of length >= 3");
+    // Replace the 2nd char with `_` (single-char wildcard). For
+    // `samples` this yields `s_mples`, which must still match `samples`.
+    let mut chars: Vec<char> = base.chars().collect();
+    chars[1] = '_';
+    let pattern: String = chars.into_iter().collect();
+    let expect_rows = base == "samples";
+
+    let stream = session
+        .metadata()
+        .list_tables(
+            Some(LikePattern::new(&pattern).unwrap()),
+            // Narrow to information_schema to keep the result small and
+            // fast; the catalog wildcard is what we're exercising.
+            Some(LikePattern::new("information_schema").unwrap()),
+            Some(LikePattern::new("tables").unwrap()),
+            None,
+        )
+        .await
+        .expect("list_tables with wildcard catalog");
+    let (batches, rows) = collect(stream).await;
+
+    // With `samples` as the base we KNOW information_schema.tables is
+    // populated, so the wildcard must return rows (proving the filter is
+    // inclusive, not silently dropping everything).
+    if expect_rows {
+        assert!(
+            rows > 0,
+            "wildcard catalog {pattern:?} against samples.information_schema.tables \
+             returned no rows — client-side catalog filter dropped valid rows"
+        );
+    }
+
+    // Every returned row's TABLE_CAT must match the `_` pattern — proves
+    // the client-side catalog filter ran (vs. returning all catalogs).
+    let returned_cats = string_column_values(&batches, "TABLE_CAT");
+    for cat in &returned_cats {
+        assert!(
+            like_matches_underscore(&pattern, cat),
+            "TABLE_CAT {cat:?} does not match wildcard catalog pattern {pattern:?}; \
+             returned catalogs: {returned_cats:?}"
+        );
+    }
+    // The base catalog itself must be represented (it matches its own
+    // `_`-pattern), so the wildcard is inclusive, not just restrictive.
+    // Soft-warn rather than hard-fail if the base catalog happens to
+    // lack an information_schema.tables surface on this workspace.
+    if !returned_cats.iter().any(|c| c.eq_ignore_ascii_case(&base)) {
+        eprintln!(
+            "warning: base catalog {base:?} not present in wildcard result \
+             (pattern {pattern:?}); it may lack information_schema.tables. \
+             returned: {returned_cats:?}"
+        );
+    }
+
+    session.close().await.expect("close");
+}
+
+/// Test-local reference implementation of a case-insensitive LIKE match
+/// with `_` as a single-char wildcard (no `%`). Deliberately independent
+/// of the kernel's matcher so the e2e assertion doesn't just re-run the
+/// code under test.
+fn like_matches_underscore(pattern: &str, candidate: &str) -> bool {
+    let p: Vec<char> = pattern.to_lowercase().chars().collect();
+    let c: Vec<char> = candidate.to_lowercase().chars().collect();
+    if p.len() != c.len() {
+        return false;
+    }
+    p.iter()
+        .zip(c.iter())
+        .all(|(pc, cc)| *pc == '_' || pc == cc)
+}
+
 // Tests in this file target the `samples` catalog rather than `main`.
 // `samples` is a Databricks-managed catalog present on every
 // Unity-Catalog-enabled workspace; `main` is workspace-configurable
@@ -183,7 +305,7 @@ async fn list_tables_returns_jdbc_columns() {
     let stream = session
         .metadata()
         .list_tables(
-            Some(Identifier::new("samples").unwrap()),
+            Some(databricks_sql_kernel::LikePattern::new("samples").unwrap()),
             Some(databricks_sql_kernel::LikePattern::new("information_schema").unwrap()),
             None,
             None,
