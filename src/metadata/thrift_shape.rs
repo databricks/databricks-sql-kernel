@@ -516,17 +516,14 @@ pub(crate) fn reshape_tables(
     // Apply table_types filter, if requested. The JDBC `DatabaseMetaData.
     // getTables(...)` Javadoc specifies that `null` types returns all
     // types, but is silent on what an *explicit empty array* means.
-    // Two interpretations exist in the wild:
-    //   - Empty == null (returns all rows). Convenient, but conflates
-    //     "I didn't filter" with "I asked for nothing".
-    //   - Empty == "filter accepting nothing" (returns zero rows). Literal
-    //     reading of the filter contract.
-    // The Databricks Thrift backend follows the literal reading: zero
-    // rows on `types=[]`. We match Thrift here for cross-backend parity
-    // (verified via the python-comparator). Callers that want "all
-    // types" should pass `None`, not `Some(&[])`.
+    // Per the multi-language conformance spec (METADATA-035) and the C#
+    // ADBC driver, an explicit *empty* array is equivalent to `null`:
+    // it matches ALL table types, not none. Only a `Some` with at least
+    // one entry actually restricts the result set. This mirrors JDBC
+    // #1570 / hiveserver2 #72, which align the same way.
     let filtered = match table_types {
         None => reshaped,
+        Some([]) => reshaped,
         Some(types) => filter_tables_by_type(&reshaped, types)?,
     };
     // Sort to match the JDBC driver's `getTables` row order
@@ -1052,14 +1049,14 @@ mod tests {
     }
 
     #[test]
-    fn tables_empty_types_filter_returns_zero_rows() {
-        // Matches Thrift's behavior: explicit `Some(&[])` is a filter
-        // that accepts no table types, so the result is empty.
-        // `None` (caller didn't pass a type filter at all) is the
-        // separate "all types" path — see `tables_none_types_passes_all`.
+    fn tables_empty_types_matches_all() {
+        // Per the JDBC/ADBC contract (spec METADATA-035), an explicit
+        // empty `table_types` slice is equivalent to `None`: it matches
+        // ALL table types, not none. This is the same result as the
+        // `None` path — see `tables_none_types_passes_all`.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), Some(&[])).unwrap();
-        assert_eq!(out.num_rows(), 0);
+        assert_eq!(out.num_rows(), 3);
     }
 
     #[test]
