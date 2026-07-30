@@ -72,7 +72,7 @@ hex = "0.4"          # Hex encoding (binary param literals, token cache key)
 chrono = { version = "0.4", features = ["serde"] }
 
 # LZ4 decompression for CloudFetch
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 
 # Random number generation (retry jitter)
 rand = "0.10"
