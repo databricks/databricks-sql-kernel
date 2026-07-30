@@ -467,9 +467,12 @@ pub(crate) fn reshape_schemas(
 /// when they're missing.
 ///
 /// `requested_catalog` fills `TABLE_CAT` rows for server responses
-/// that omit it (single-catalog form). `table_types`, when `Some`,
-/// filters rows to those whose `TABLE_TYPE` appears in the slice
-/// (matches JDBC `DatabaseMetaData.getTables` behaviour).
+/// that omit it (single-catalog form). `table_types`, when `Some` with
+/// at least one entry, filters rows to those whose `TABLE_TYPE` appears
+/// in the slice (matches JDBC `DatabaseMetaData.getTables` behaviour).
+/// A `Some(&[])` (explicit empty slice) is treated like `None` and
+/// matches all table types — see the inline note in the filter block
+/// below (METADATA-035 conformance / C# ADBC parity).
 pub(crate) fn reshape_tables(
     batch: &RecordBatch,
     requested_catalog: Option<&str>,
