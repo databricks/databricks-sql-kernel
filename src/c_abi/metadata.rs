@@ -173,8 +173,24 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
     })
 }
 
-/// List tables filtered by catalog (exact), schema / table patterns,
-/// and an optional comma-separated `table_types` filter.
+/// List tables filtered by catalog (**pattern**), schema / table
+/// patterns, and an optional comma-separated `table_types` filter.
+///
+/// The catalog is an ODBC/JDBC LIKE pattern here (`%` / `_`),
+/// matching Thrift's `TGetTablesReq.catalogName` and ODBC `SQLTables`
+/// under the default `SQL_ATTR_METADATA_ID = SQL_FALSE`. A literal
+/// catalog (no wildcards, or `SQL_ATTR_METADATA_ID = SQL_TRUE`
+/// identifier semantics) still works — it takes the fast exact
+/// single-catalog path. See [`Metadata::list_tables`](crate::metadata_v0::Metadata::list_tables).
+///
+/// **Empty-string catalog:** at this C ABI boundary a `NULL` **or an
+/// empty / whitespace-only** `catalog` is normalized to "all catalogs"
+/// (the ODBC convention where drivers pass `""` for "no catalog
+/// filter"). This differs from the Rust / pyo3 / napi surface, where an
+/// empty-string catalog is a valid `LikePattern` meaning "match
+/// nothing" (zero rows). C / ODBC callers who want "match nothing"
+/// should not rely on `""`; the pattern-value distinction only exists
+/// on the typed surfaces.
 ///
 /// # Safety
 /// `session` must be a live session handle; the string args, if
@@ -190,7 +206,7 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
+            let catalog = opt_pattern(catalog, "catalog")?;
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
             // Split the comma-separated table types into a borrowed slice.

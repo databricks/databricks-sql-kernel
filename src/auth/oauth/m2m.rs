@@ -324,6 +324,8 @@ impl AuthProvider for ClientCredentialsProvider {
 mod tests {
     use super::*;
     use crate::client::http::HttpClientConfig;
+    use crate::client::retry::{build_retry_configs, RetryConfig};
+    use std::collections::HashMap;
     use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -522,9 +524,19 @@ mod tests {
             .mount(&mock_server)
             .await;
 
+        // This test covers OIDC error propagation, not retry timing. A
+        // production retry ladder turns the one mocked 500 into more than a
+        // minute of real backoff sleeps.
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
         let http_client = Arc::new(
-            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
-                .expect("Failed to create HTTP client"),
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .expect("Failed to create HTTP client"),
         );
 
         // Provider creation should fail with descriptive error

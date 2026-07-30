@@ -1,0 +1,142 @@
+name: Report Integration Test Skip
+
+# Posts the PR-open "skipped" placeholder for the required
+# `Kernel Integration Tests` check on FORK PRs, as the driver-test GitHub App.
+#
+# Division of labour:
+#   - INTERNAL PRs: the placeholder is posted inline by trigger-integration-tests.yml's
+#     `skip-integration-tests-pr` job (it can mint the app token directly). Posting it
+#     there means it works from the PR branch immediately, without waiting for this
+#     workflow_run file to reach the default branch.
+#   - FORK PRs: a fork's `pull_request` run has a READ-ONLY GITHUB_TOKEN and no secrets,
+#     so it cannot mint the app token or post any check on its own head. This
+#     workflow_run workflow instead runs in THIS (base) repo's context with full secret
+#     access even for fork-triggered runs, so it can post the app-attributed placeholder
+#     on a fork PR's head. This job self-guards to fork runs to avoid double-posting on
+#     internal PRs (which the inline job already covers).
+#
+# Why the app (not github.token): the main ruleset PINS the required
+# `Kernel Integration Tests` check to the driver-test app's integration id. Only a
+# check posted BY that app satisfies the gate — a github.token (github-actions) check
+# of the same name is a different context and does NOT.
+#
+# SECURITY: this workflow runs with secrets in a privileged context. It MUST NOT check
+# out or execute any PR/fork-controlled content. It only calls checks.create with a
+# static body; the sole fork-controlled input is `workflow_run.head_sha`, an opaque
+# commit SHA passed to the API. Do not add `actions/checkout` or a `run:` step that
+# executes repo content here.
+#
+# The real integration suite is unaffected: it runs as the required gate on the
+# `merge_group` commit (and as a label preview on internal PRs), dispatched by
+# trigger-integration-tests.yml. Mirrors databricks-sql-python / databricks-sql-go.
+
+on:
+  workflow_run:
+    workflows: ["Trigger Integration Tests"]
+    types: [requested]
+
+# Coalesce redundant reporter runs for the same fork head SHA. A fork PR that
+# reopens or gets re-labeled fires `workflow_run(requested)` again on the same
+# head, which would otherwise spawn concurrent runs that each mint an app token
+# and post a duplicate placeholder. Keying on head_sha with cancel-in-progress
+# mirrors the rate-limit rationale of trigger-integration-tests.yml.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.workflow_run.head_sha }}
+  cancel-in-progress: true
+
+jobs:
+  report-skip:
+    # Fork PR-triggered runs only. Internal PRs are posted inline by
+    # trigger-integration-tests.yml; the merge_group run posts the real required check.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name != github.event.workflow_run.repository.full_name
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      # This job is fork-only (see the job `if:`), so the placeholder is always
+      # appropriate EXCEPT when the fork PR is already closed. A fork PR's label
+      # preview cannot dispatch the real suite (no secret access), so nothing else
+      # posts the required check for it — keep the placeholder even when labeled.
+      # Skip only closed PRs. Resolve the PR by SHA because a fork's workflow_run
+      # payload has an empty pull_requests array. Read-only lookup (no checkout /
+      # no execution of PR content) — does not weaken the SECURITY note above.
+      - name: Decide whether to post the placeholder
+        id: gate
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          script: |
+            // Fail OPEN: this step's only job is to SKIP the placeholder for a
+            // confirmed-closed PR. Any uncertainty — no PR resolvable, or a
+            // transient lookup error (403/5xx/network) — must default to posting,
+            // because a dropped placeholder leaves the app-pinned required check
+            // unfulfilled and workflow_run runs are not auto-retried.
+            try {
+              let prs = context.payload.workflow_run.pull_requests || [];
+              let number = prs.length ? prs[0].number : null;
+              if (number === null) {
+                const { data } = await github.rest.repos.listPullRequestsAssociatedWithCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: process.env.HEAD_SHA,
+                });
+                number = data.length ? data[0].number : null;
+              }
+              if (number === null) {
+                // No PR resolvable (unexpected) — default to posting so the
+                // required check isn't left unfulfilled.
+                core.setOutput('post', 'true');
+                return;
+              }
+              const { data: pr } = await github.rest.pulls.get({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: number,
+              });
+              const isClosed = pr.state === 'closed';
+              console.log(`PR #${number} closed=${isClosed} -> post=${!isClosed}`);
+              core.setOutput('post', (!isClosed).toString());
+            } catch (err) {
+              // Lookup failed — cannot confirm the PR is closed, so fail open.
+              console.log(`PR lookup failed (${err.message}) -> post=true (fail open)`);
+              core.setOutput('post', 'true');
+            }
+
+      - name: Generate GitHub App token (this repo)
+        id: app-token
+        if: steps.gate.outputs.post == 'true'
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547  # v1.12.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-sql-kernel
+
+      - name: Post skipped Kernel Integration Tests check
+        if: steps.gate.outputs.post == 'true'
+        uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea  # v7.0.1
+        env:
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.checks.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'Kernel Integration Tests',
+              head_sha: process.env.HEAD_SHA,
+              status: 'completed',
+              conclusion: 'success',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Skipped on PR - runs in merge queue',
+                summary: 'Integration tests are skipped on ordinary PR events and run as the required gate in the merge queue. A maintainer can preview them on an internal PR with the `integration-test` label. (Fork PRs cannot dispatch previews — they are exercised by the required merge-queue run.)',
+              },
+            });

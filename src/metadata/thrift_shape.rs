@@ -470,6 +470,12 @@ pub(crate) fn reshape_schemas(
 /// that omit it (single-catalog form). `table_types`, when `Some`,
 /// filters rows to those whose `TABLE_TYPE` appears in the slice
 /// (matches JDBC `DatabaseMetaData.getTables` behaviour).
+///
+/// Catalog *matching* is not done here: a wildcard catalog is resolved
+/// in `list_tables` by enumerating catalogs and issuing one scoped
+/// `SHOW TABLES IN CATALOG <name>` per match, so every batch reaching
+/// this function is already attributed to a known catalog (either the
+/// `catalogName` column or `requested_catalog`).
 pub(crate) fn reshape_tables(
     batch: &RecordBatch,
     requested_catalog: Option<&str>,
@@ -536,6 +542,16 @@ pub(crate) fn reshape_tables(
     // consumers that compare kernel output against the existing
     // Thrift backend see matching row sequence.
     sort_tables(&filtered)
+}
+
+/// Lex-sort a JDBC-shape getTables batch by `TABLE_TYPE, TABLE_CAT,
+/// TABLE_SCHEM, TABLE_NAME` to match JDBC / Thrift row ordering.
+///
+/// Exposed as [`sort_tables_batch`] so the per-catalog fan-out path in
+/// `list_tables` can re-sort the *merged* result across catalogs (each
+/// per-catalog `reshape_tables` sorts only its own rows).
+pub(crate) fn sort_tables_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    sort_tables(batch)
 }
 
 /// Lex-sort a JDBC-shape getTables batch by `TABLE_TYPE, TABLE_CAT,
@@ -1102,6 +1118,114 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(cat_arr.value(0), "c");
+    }
+
+    /// Multi-catalog `SHOW TABLES IN ALL CATALOGS` shape, mirroring the
+    /// issue-#129 repro: two catalogs differing only by `_` vs `-`.
+    fn server_tables_multi_catalog() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("isTemporary", DataType::Boolean, false),
+            Field::new("information", DataType::Utf8, true),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, true),
+            Field::new("remarks", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["s", "s", "s"])),
+                Arc::new(StringArray::from(vec!["t1", "t2", "t3"])),
+                Arc::new(BooleanArray::from(vec![false, false, false])),
+                Arc::new(StringArray::from(vec![Some(""), Some(""), Some("")])),
+                Arc::new(StringArray::from(vec![
+                    "comparator_tests",
+                    "comparator-tests",
+                    "unrelated",
+                ])),
+                Arc::new(StringArray::from(vec!["TABLE", "TABLE", "TABLE"])),
+                Arc::new(StringArray::from(vec![Some(""), Some(""), Some("")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tables_multi_catalog_reshape_preserves_all_rows() {
+        // A cross-catalog `SHOW TABLES IN ALL CATALOGS` response reshapes
+        // all rows and attributes each to its own `catalogName` (catalog
+        // *filtering* is now done by the fan-out in `list_tables`, not
+        // here).
+        let b = server_tables_multi_catalog();
+        let out = reshape_tables(&b, None, None).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let cats = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..out.num_rows()).map(|i| cats.value(i)).collect();
+        assert!(got.contains(&"comparator_tests"));
+        assert!(got.contains(&"comparator-tests"));
+        assert!(got.contains(&"unrelated"));
+    }
+
+    #[test]
+    fn sort_tables_batch_merges_across_catalogs_in_jdbc_order() {
+        // The fan-out concatenates per-catalog batches then re-sorts the
+        // merged set by `TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME`.
+        // Feed rows deliberately out of order and assert the JDBC order.
+        let cat_b = reshape_tables(
+            &single_row_server_table("b_catalog", "s", "t", "TABLE"),
+            Some("b_catalog"),
+            None,
+        )
+        .unwrap();
+        let cat_a = reshape_tables(
+            &single_row_server_table("a_catalog", "s", "t", "TABLE"),
+            Some("a_catalog"),
+            None,
+        )
+        .unwrap();
+        let merged =
+            arrow_select::concat::concat_batches(&GET_TABLES_SCHEMA, &[cat_b, cat_a]).unwrap();
+        let sorted = sort_tables_batch(&merged).unwrap();
+        let cats = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Same TABLE_TYPE, so TABLE_CAT breaks the tie: a_catalog first.
+        assert_eq!(cats.value(0), "a_catalog");
+        assert_eq!(cats.value(1), "b_catalog");
+    }
+
+    /// Single-row `SHOW TABLES IN CATALOG` server shape for fan-out tests.
+    fn single_row_server_table(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        table_type: &str,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("isTemporary", DataType::Boolean, false),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![namespace.to_owned()])),
+                Arc::new(StringArray::from(vec![table.to_owned()])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(StringArray::from(vec![catalog.to_owned()])),
+                Arc::new(StringArray::from(vec![Some(table_type.to_owned())])),
+            ],
+        )
+        .unwrap()
     }
 
     fn server_columns_full() -> RecordBatch {
