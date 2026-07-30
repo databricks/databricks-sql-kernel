@@ -19,15 +19,17 @@
 //! resulting `kernel_error::Error` carries the right `ErrorCode` and
 //! `retryable` flag. This is the §7 follow-up that PR 1 deferred —
 //! `Session::open` is the natural place to drive it because it
-//! exercises the full HTTP path (auth header injection, retry
-//! orchestration, response decoding) end to end.
+//! exercises the full HTTP path (auth header injection, request
+//! dispatch, response decoding) end to end.
 //!
-//! The retry-disabled requests give us a single-shot status check
-//! per status code; the three "retryable" responses (429, 503, 504)
-//! are stubbed to fire enough times to exhaust the auth retry
-//! ceiling so we observe the final error code.
+//! Retries are disabled because these tests verify status mapping, not
+//! retry orchestration (which has dedicated coverage in the HTTP client
+//! tests). This keeps retryable responses from sleeping through the
+//! production backoff ladder before their final error is observable.
 
-use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode, ResultConfig, Session};
+use databricks_sql_kernel::{
+    AuthConfig, ConnectionConfig, ErrorCode, HttpConfig, ResultConfig, Session,
+};
 use wiremock::matchers::{body_partial_json, method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -35,6 +37,9 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 /// Returns the `Result` directly so each test can assert the error
 /// shape.
 async fn open_session_against(server: &MockServer) -> databricks_sql_kernel::Result<Session> {
+    let mut http = HttpConfig::default();
+    http.retry_max_retries = 0;
+
     Session::builder()
         .connection(
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
@@ -43,6 +48,7 @@ async fn open_session_against(server: &MockServer) -> databricks_sql_kernel::Res
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
         })
+        .http(http)
         .open()
         .await
 }
@@ -94,9 +100,6 @@ async fn create_session_404_maps_to_not_found() {
 
 #[tokio::test]
 async fn create_session_429_maps_to_resource_exhausted_retryable() {
-    // 429 is retryable, so the HTTP client will burn through its
-    // retry ceiling before surfacing the error. We stub the same
-    // 429 response on every attempt.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))

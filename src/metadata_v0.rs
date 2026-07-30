@@ -81,17 +81,19 @@
 //! addendum A2 for the rationale.
 
 use crate::kernel_error::{Error, Result};
+use crate::metadata::sql::{LikeMatcher, SqlCommandBuilder};
 use crate::metadata::static_data;
 use crate::metadata::thrift_shape::{
     self, is_object_not_found, ThriftReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
     GET_CROSS_REFERENCE_SCHEMA, GET_PRIMARY_KEYS_SCHEMA, GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
 };
-use crate::reader::EmptyReader;
-use crate::result_stream::ResultStream;
+use crate::reader::{EmptyReader, InMemoryReader};
+use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
+use arrow_array::Array;
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
-use tracing::Instrument;
+use tracing::{debug, Instrument};
 
 /// JDBC's `DatabaseMetaData` contract: metadata methods return an
 /// empty result set for non-existent catalogs / schemas / tables
@@ -354,14 +356,56 @@ impl Metadata {
         .await
     }
 
-    /// Tables filtered by catalog (exact), schema (pattern), table
-    /// (pattern).
+    /// Tables filtered by catalog (**pattern**), schema (pattern),
+    /// table (pattern).
     ///
     /// JDBC `getTables` shape: 10 columns — `TABLE_CAT, TABLE_SCHEM,
     /// TABLE_NAME, TABLE_TYPE, REMARKS, TYPE_CAT, TYPE_SCHEM,
     /// TYPE_NAME, SELF_REFERENCING_COL_NAME, REF_GENERATION`. The
     /// last five have no server-side source and are emitted as nulls
     /// per JDBC spec.
+    ///
+    /// ## Catalog is a LIKE pattern
+    ///
+    /// Unlike every other catalog argument on this surface, `catalog`
+    /// here is a [`LikePattern`], mirroring the Thrift protocol where
+    /// `TGetTablesReq.catalogName` is a `TPatternOrIdentifier` (ODBC
+    /// `SQLTables` treats `CatalogName` as a pattern-value argument
+    /// under the default `SQL_ATTR_METADATA_ID = SQL_FALSE`). Because
+    /// the Databricks SEA `SHOW` grammar has **no catalog-pattern
+    /// position**, the kernel resolves a wildcard catalog by
+    /// enumerate-then-fan-out rather than by scanning every catalog:
+    ///
+    /// - **Wildcard catalog** (`%` / `_` present, unescaped): `SHOW
+    ///   CATALOGS`, filter the catalog *names* with [`LikeMatcher`], then
+    ///   issue one `SHOW TABLES IN CATALOG <name>` per match (schema /
+    ///   table / type pushed down server-side) with bounded parallelism;
+    ///   the per-catalog results are concatenated and re-sorted into the
+    ///   JDBC row order. This is cheaper than `SHOW TABLES IN ALL
+    ///   CATALOGS` for a selective pattern and needs no client-side row
+    ///   filtering (each query is already catalog-scoped).
+    /// - **Literal catalog** (no active wildcards, e.g. `main`, or an
+    ///   escaped `foo\_bar`, or the ODBC `SQL_ATTR_METADATA_ID =
+    ///   SQL_TRUE` identifier case): unescape and scope server-side via
+    ///   `SHOW TABLES IN CATALOG <name>` — the fast exact path.
+    /// - **`None`**: a single `SHOW TABLES IN ALL CATALOGS` — genuinely
+    ///   "every catalog", so no enumeration is needed.
+    /// - **Empty pattern** (`Some("")`): "match nothing" per
+    ///   [`LikePattern`] — returns an empty result with no wire call
+    ///   (the schema/table `LIKE ''` convention, applied to the catalog).
+    ///
+    /// Catalog *names* are matched by [`LikeMatcher`] (a best-effort
+    /// reproduction of the server's `SHOW ... LIKE` matching:
+    /// case-insensitive, anchored), while schema / table patterns are
+    /// matched *server-side* by the per-catalog queries. If Databricks
+    /// `SHOW` matching semantics ever drift from `LikeMatcher`, catalog
+    /// selection could differ from the schema/table dimensions — keep the
+    /// two in sync if server matching changes.
+    ///
+    /// `list_columns` deliberately keeps an exact catalog identifier —
+    /// the Thrift `TGetColumnsReq.catalogName` is a `TIdentifier` that
+    /// "must not contain a search pattern", so catalog wildcarding is a
+    /// `getTables`-only behaviour.
     ///
     /// `table_types`, when `Some(non-empty)`, filters the result to
     /// rows whose `TABLE_TYPE` matches one of the listed strings —
@@ -370,51 +414,297 @@ impl Metadata {
     /// so the filter is applied kernel-side after reshape.
     pub async fn list_tables(
         &self,
-        catalog: Option<Identifier<'_>>,
+        catalog: Option<LikePattern<'_>>,
         schema_pattern: Option<LikePattern<'_>>,
         table_pattern: Option<LikePattern<'_>>,
         table_types: Option<&[&str]>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
-            let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
-            let types_owned: Option<Vec<String>> =
-                table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
-            let raw = match self
-                .session
-                .transport()
-                .list_tables(
-                    self.session.session_id(),
-                    catalog.as_ref().map(|i| i.as_str()),
-                    schema_pattern.as_ref().map(|p| p.as_str()),
-                    table_pattern.as_ref().map(|p| p.as_str()),
-                    table_types,
-                )
-                .await
-            {
-                Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
-            };
-            let stmt_id = raw.statement_id.clone();
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
-                GET_TABLES_SCHEMA.clone(),
-                Box::new(move |b| {
-                    let types_ref: Option<Vec<&str>> = types_owned
-                        .as_ref()
-                        .map(|v| v.iter().map(|s| s.as_str()).collect());
-                    thrift_shape::reshape_tables(b, catalog_str.as_deref(), types_ref.as_deref())
-                }),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
-            )
-            .await
+            // Route the catalog argument. The SEA `SHOW` grammar has no
+            // catalog-pattern position, so a wildcard catalog can't be
+            // scoped server-side. Rather than `SHOW TABLES IN ALL
+            // CATALOGS` (which scans every table in every catalog and
+            // discards non-matches — slow on large workspaces), we
+            // enumerate catalogs, filter their names client-side, and fan
+            // out one scoped `SHOW TABLES IN CATALOG <name>` per match.
+            match catalog.as_ref().map(|p| p.as_str()) {
+                // No catalog filter, or a pattern that matches *every*
+                // catalog (`%`, `%%`, …): genuinely "every catalog". A
+                // single `SHOW TABLES IN ALL CATALOGS` is the right (and
+                // cheapest) query — no enumeration or fan-out. Routing `%`
+                // here (rather than the fan-out arm below) keeps it
+                // semantically identical to `None`: one round trip, and one
+                // inaccessible catalog can't fail the whole call.
+                None => {
+                    self.list_tables_single_catalog(
+                        None,
+                        schema_pattern,
+                        table_pattern,
+                        table_types,
+                    )
+                    .await
+                }
+                Some(pat) if SqlCommandBuilder::pattern_matches_all(pat) => {
+                    self.list_tables_single_catalog(
+                        None,
+                        schema_pattern,
+                        table_pattern,
+                        table_types,
+                    )
+                    .await
+                }
+                // Empty pattern is "match nothing" per `LikePattern`
+                // (mirrors the schema/table `LIKE ''` convention). Emit an
+                // empty result without a wire call.
+                Some("") => {
+                    ResultStream::from_reader(Box::new(EmptyReader::new(GET_TABLES_SCHEMA.clone())))
+                        .await
+                }
+                // A selective wildcard pattern, or a literal the `SHOW`
+                // builder would misread as "all catalogs" (`*`), is
+                // resolved by enumerate-then-fan-out. `LikeMatcher` treats a
+                // literal (no `%` / `_`) as an exact anchored name, so this
+                // arm covers both "match some catalogs" and the `*`-literal
+                // edge with one path. (A match-*all* `%` was already routed
+                // to the single-query path above.)
+                Some(pat)
+                    if SqlCommandBuilder::pattern_has_wildcards(pat)
+                        || SqlCommandBuilder::is_wildcard_or_empty_scope(pat) =>
+                {
+                    self.list_tables_matching_catalogs(
+                        pat,
+                        schema_pattern,
+                        table_pattern,
+                        table_types,
+                    )
+                    .await
+                }
+                // Literal catalog: scope server-side (fast path). Unescape
+                // `\_` / `\%` first so the identifier is the intended name.
+                Some(pat) => {
+                    let literal = SqlCommandBuilder::strip_jdbc_escapes(pat);
+                    self.list_tables_single_catalog(
+                        Some(literal.as_str()),
+                        schema_pattern,
+                        table_pattern,
+                        table_types,
+                    )
+                    .await
+                }
+            }
         }
         .instrument(span)
         .await
+    }
+
+    /// Enumerate catalogs, keep those matching `pattern`
+    /// (case-insensitive ODBC/JDBC LIKE), and fan out one scoped
+    /// `SHOW TABLES IN CATALOG <name>` per match — reproducing Thrift's
+    /// catalog wildcarding without the whole-workspace scan of
+    /// `SHOW TABLES IN ALL CATALOGS`. The per-catalog queries run with
+    /// bounded parallelism; their reshaped rows are concatenated and
+    /// re-sorted into the JDBC row order.
+    async fn list_tables_matching_catalogs(
+        &self,
+        pattern: &str,
+        schema_pattern: Option<LikePattern<'_>>,
+        table_pattern: Option<LikePattern<'_>>,
+        table_types: Option<&[&str]>,
+    ) -> Result<ResultStream> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // 1. Enumerate + filter catalog names client-side.
+        let matcher = LikeMatcher::new(pattern);
+        let mut catalogs = self.list_catalogs().await?;
+        let mut names: Vec<String> = Vec::new();
+        let mut enumerated = 0usize;
+        while let Some(batch) = catalogs.next_batch().await? {
+            let ResultBatch::Arrow(rb) = batch;
+            // GET_CATALOGS_SCHEMA is a single `TABLE_CAT: Utf8` column.
+            let col = rb
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow_array::StringArray>()
+                .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
+            for i in 0..col.len() {
+                enumerated += 1;
+                if !col.is_null(i) && matcher.matches(col.value(i)) {
+                    names.push(col.value(i).to_owned());
+                }
+            }
+        }
+        catalogs.close();
+        // One correlatable line tying the fan-out back to its cause: how
+        // many catalogs a wildcard `list_tables` matched (and will query),
+        // vs how many exist. Lets on-call spot fan-out amplification (a
+        // loose pattern hitting hundreds of catalogs) without counting the
+        // per-query SQL debug lines from the transport.
+        debug!(
+            catalog_pattern = pattern,
+            catalogs_enumerated = enumerated,
+            catalogs_matched = names.len(),
+            "list_tables catalog wildcard fan-out"
+        );
+
+        // No catalog matched → typed empty result, no further wire calls.
+        if names.is_empty() {
+            return ResultStream::from_reader(Box::new(EmptyReader::new(
+                GET_TABLES_SCHEMA.clone(),
+            )))
+            .await;
+        }
+
+        // 2. Fan out `SHOW TABLES IN CATALOG <name>` per match, bounded.
+        // Databricks metadata calls are cheap but the warehouse shouldn't
+        // be hit with an unbounded burst when a loose pattern matches many
+        // catalogs.
+        const MAX_INFLIGHT: usize = 8;
+        let schema_str = schema_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let table_str = table_pattern.as_ref().map(|p| p.as_str().to_owned());
+        let types_owned: Option<Vec<String>> =
+            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
+
+        let mut inflight = FuturesUnordered::new();
+        let mut remaining = names.into_iter();
+        for name in remaining.by_ref().take(MAX_INFLIGHT) {
+            inflight.push(self.fetch_tables_for_catalog(
+                name,
+                schema_str.clone(),
+                table_str.clone(),
+                types_owned.clone(),
+            ));
+        }
+        let mut all_batches: Vec<arrow_array::RecordBatch> = Vec::new();
+        while let Some(result) = inflight.next().await {
+            all_batches.extend(result?);
+            if let Some(name) = remaining.next() {
+                inflight.push(self.fetch_tables_for_catalog(
+                    name,
+                    schema_str.clone(),
+                    table_str.clone(),
+                    types_owned.clone(),
+                ));
+            }
+        }
+
+        // 3. Concatenate + re-sort into the JDBC row order (each
+        // per-catalog batch was sorted only within its own catalog).
+        let merged = if all_batches.is_empty() {
+            None
+        } else {
+            let concatenated =
+                arrow_select::concat::concat_batches(&GET_TABLES_SCHEMA, &all_batches)
+                    .map_err(|e| Error::data_loss().message(format!("merge tables: {e}")))?;
+            Some(thrift_shape::sort_tables_batch(&concatenated)?)
+        };
+        ResultStream::from_reader(Box::new(InMemoryReader::new(
+            GET_TABLES_SCHEMA.clone(),
+            merged.into_iter().collect(),
+        )))
+        .await
+    }
+
+    /// Fetch + reshape `SHOW TABLES IN CATALOG <catalog>` into JDBC-shape
+    /// batches. An object-not-found error (catalog dropped between
+    /// enumeration and this call) collapses to zero rows, matching the
+    /// JDBC empty-result contract. Used by the fan-out path.
+    async fn fetch_tables_for_catalog(
+        &self,
+        catalog: String,
+        schema_pattern: Option<String>,
+        table_pattern: Option<String>,
+        table_types: Option<Vec<String>>,
+    ) -> Result<Vec<arrow_array::RecordBatch>> {
+        let types_ref: Option<Vec<&str>> = table_types
+            .as_ref()
+            .map(|v| v.iter().map(String::as_str).collect());
+        let raw = match self
+            .session
+            .transport()
+            .list_tables(
+                self.session.session_id(),
+                Some(catalog.as_str()),
+                schema_pattern.as_deref(),
+                table_pattern.as_deref(),
+                types_ref.as_deref(),
+            )
+            .await
+        {
+            Ok(r) => r,
+            // Catalog vanished mid-enumeration → contribute no rows.
+            Err(e) if thrift_shape::is_object_not_found(&e) => return Ok(Vec::new()),
+            Err(e) => return Err(e),
+        };
+        // Read + reshape into `out`. Capture the result rather than `?`-ing
+        // out early: the fan-out opens one statement per catalog and
+        // `ExecuteResult` has no Drop-based close, so a mid-stream read
+        // error must still close this statement or it leaks server-side
+        // (unlike the streaming paths, which close via a StatementCloseGuard).
+        let stmt_id = raw.statement_id.clone();
+        let mut reader = raw.reader;
+        let read: Result<Vec<arrow_array::RecordBatch>> = async {
+            let mut out = Vec::new();
+            while let Some(batch) = reader.next_batch().await? {
+                out.push(thrift_shape::reshape_tables(
+                    &batch,
+                    Some(catalog.as_str()),
+                    types_ref.as_deref(),
+                )?);
+            }
+            Ok(out)
+        }
+        .await;
+        // Best-effort close on every exit (success or error).
+        self.session
+            .transport()
+            .close_statement(&stmt_id)
+            .await
+            .ok();
+        read
+    }
+
+    /// `SHOW TABLES IN CATALOG <catalog>` (or `IN ALL CATALOGS` when
+    /// `catalog` is None) as a single lazily-streamed query — the exact
+    /// literal-catalog fast path.
+    async fn list_tables_single_catalog(
+        &self,
+        catalog: Option<&str>,
+        schema_pattern: Option<LikePattern<'_>>,
+        table_pattern: Option<LikePattern<'_>>,
+        table_types: Option<&[&str]>,
+    ) -> Result<ResultStream> {
+        let requested_catalog = catalog.map(|c| c.to_owned());
+        let types_owned: Option<Vec<String>> =
+            table_types.map(|s| s.iter().map(|t| (*t).to_owned()).collect());
+        let raw = match self
+            .session
+            .transport()
+            .list_tables(
+                self.session.session_id(),
+                catalog,
+                schema_pattern.as_ref().map(|p| p.as_str()),
+                table_pattern.as_ref().map(|p| p.as_str()),
+                table_types,
+            )
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
+        };
+        let stmt_id = raw.statement_id.clone();
+        let reshaped = ThriftReshapingReader::new(
+            raw.reader,
+            GET_TABLES_SCHEMA.clone(),
+            Box::new(move |b| {
+                let types_ref: Option<Vec<&str>> = types_owned
+                    .as_ref()
+                    .map(|v| v.iter().map(|s| s.as_str()).collect());
+                thrift_shape::reshape_tables(b, requested_catalog.as_deref(), types_ref.as_deref())
+            }),
+        );
+        ResultStream::from_reader_with_close(Box::new(reshaped), Arc::clone(&self.session), stmt_id)
+            .await
     }
 
     /// Columns of tables matching the filter. Catalog is optional and
