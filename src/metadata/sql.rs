@@ -95,6 +95,59 @@ impl SqlCommandBuilder {
         result
     }
 
+    /// Whether an ODBC/JDBC-style pattern contains an *active* wildcard
+    /// (`%` or `_`) — i.e. one that is not backslash-escaped.
+    ///
+    /// Used by `list_tables` to decide whether a catalog argument needs
+    /// the enumerate-then-fan-out wildcard path (`SHOW CATALOGS`, filter
+    /// names, then `SHOW TABLES IN CATALOG <name>` per match) or can take
+    /// the fast exact single-catalog path. The Databricks `SHOW` grammar
+    /// has no catalog-pattern position, and the SEA backend — unlike
+    /// Thrift's `TGetTablesReq.catalogName` (a `TPatternOrIdentifier`) —
+    /// cannot wildcard the catalog server-side, so the kernel resolves
+    /// the pattern against catalog names client-side.
+    pub fn pattern_has_wildcards(pattern: &str) -> bool {
+        let mut escaped = false;
+        for ch in pattern.chars() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '%' | '_' => return true,
+                _ => {}
+            }
+        }
+        false
+    }
+
+    /// Unescape an ODBC/JDBC pattern into a literal identifier: `\%` →
+    /// `%`, `\_` → `_`, `\\` → `\`. A lone trailing backslash is kept.
+    ///
+    /// Only valid to call on a pattern with no *active* wildcards (see
+    /// [`pattern_has_wildcards`](Self::pattern_has_wildcards)); such a
+    /// pattern denotes an exact catalog name, and the escapes must be
+    /// removed before it goes into a backtick-quoted `IN CATALOG`
+    /// identifier. Mirrors the JDBC driver's `WildcardUtil.stripJdbcEscapes`.
+    pub fn strip_jdbc_escapes(pattern: &str) -> String {
+        let mut result = String::with_capacity(pattern.len());
+        let mut chars = pattern.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                // Consume the escaped char literally; a lone trailing
+                // backslash (no following char) is emitted as-is.
+                match chars.next() {
+                    Some(next) => result.push(next),
+                    None => result.push('\\'),
+                }
+            } else {
+                result.push(ch);
+            }
+        }
+        result
+    }
+
     /// Escape identifier for use in SQL (backtick-quote).
     ///
     /// Use for catalog, schema, table names in SQL statements (e.g., `` `my_catalog` ``).
@@ -107,8 +160,37 @@ impl SqlCommandBuilder {
     fn is_null_or_wildcard(value: &Option<String>) -> bool {
         match value {
             None => true,
-            Some(v) => v.is_empty() || v == "%" || v == "*",
+            Some(v) => Self::is_wildcard_or_empty_scope(v),
         }
+    }
+
+    /// Whether a catalog string would be reinterpreted as "all catalogs"
+    /// (rather than an exact scope) by the `SHOW ... IN [CATALOG] …`
+    /// builder: the empty string, `%`, or `*`.
+    ///
+    /// The caller (`list_tables`) uses this to keep the kernel's
+    /// `pattern_has_wildcards` decision from disagreeing with the
+    /// builder: a literal catalog that lands in this set must be matched
+    /// client-side instead of handed to the server as a scope, else e.g.
+    /// a catalog literally named `*` would silently broaden to every
+    /// catalog. Single source of truth for [`is_null_or_wildcard`].
+    pub fn is_wildcard_or_empty_scope(s: &str) -> bool {
+        s.is_empty() || s == "%" || s == "*"
+    }
+
+    /// Whether a LIKE pattern matches **every** name — i.e. it is one or
+    /// more `%` and nothing else (`%`, `%%`, …). Such a catalog pattern
+    /// is semantically identical to "no catalog filter", so `list_tables`
+    /// routes it to a single `SHOW TABLES IN ALL CATALOGS` rather than
+    /// enumerating catalogs and fanning out one query per match (which
+    /// would be N round trips for what is really "everything", and would
+    /// let one inaccessible catalog fail the whole call).
+    ///
+    /// A lone `_` does *not* match all (it requires exactly one char), and
+    /// `*` is a literal char in ODBC LIKE (not a wildcard), so neither
+    /// qualifies — only runs of `%`.
+    pub fn pattern_matches_all(s: &str) -> bool {
+        !s.is_empty() && s.chars().all(|c| c == '%')
     }
 
     pub fn build_show_catalogs(&self) -> String {
@@ -307,6 +389,93 @@ impl SqlCommandBuilder {
             Self::escape_identifier(schema),
             Self::escape_identifier(table)
         )
+    }
+}
+
+/// A compiled, case-insensitive ODBC/JDBC LIKE matcher (`%` = any
+/// sequence, `_` = any single char, `\` escapes the next char).
+///
+/// The pattern is lowercased and decomposed into `char`s **once** at
+/// construction so a matcher can be reused across many candidates
+/// without re-lowering the invariant pattern per call — the shape
+/// `list_tables` needs when filtering catalog *names* from
+/// `SHOW CATALOGS` before fanning out per-catalog queries.
+///
+/// Matching is anchored (the whole candidate must be consumed) and
+/// case-insensitive, mirroring Databricks `SHOW` matching and the Thrift
+/// server's catalog matching. Operates on Unicode scalar values (not
+/// bytes) so `_` matches exactly one character.
+pub struct LikeMatcher {
+    pattern: Vec<char>,
+}
+
+impl LikeMatcher {
+    /// Compile `pattern` (lowercased for case-insensitive matching).
+    pub fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_lowercase().chars().collect(),
+        }
+    }
+
+    /// Whether `candidate` matches the compiled pattern (case-insensitive,
+    /// anchored: the whole candidate must be consumed).
+    pub fn matches(&self, candidate: &str) -> bool {
+        let cand: Vec<char> = candidate.to_lowercase().chars().collect();
+        Self::match_inner(&self.pattern, &cand)
+    }
+
+    /// Recursive LIKE matcher over `char` slices with backtracking on
+    /// `%`. `pattern` may contain `\`-escaped literals.
+    fn match_inner(pattern: &[char], candidate: &[char]) -> bool {
+        let mut pi = 0;
+        let mut ci = 0;
+        while pi < pattern.len() {
+            match pattern[pi] {
+                '%' => {
+                    // Try to match the remainder at every suffix of
+                    // `candidate` (handles trailing / consecutive `%`).
+                    let rest = &pattern[pi + 1..];
+                    if rest.is_empty() {
+                        return true; // trailing % matches anything
+                    }
+                    for split in ci..=candidate.len() {
+                        if Self::match_inner(rest, &candidate[split..]) {
+                            return true;
+                        }
+                    }
+                    return false;
+                }
+                '_' => {
+                    if ci >= candidate.len() {
+                        return false;
+                    }
+                    pi += 1;
+                    ci += 1;
+                }
+                '\\' => {
+                    // Escaped literal: match the next pattern char exactly.
+                    // A trailing backslash matches a literal backslash.
+                    let lit = if pi + 1 < pattern.len() {
+                        pattern[pi + 1]
+                    } else {
+                        '\\'
+                    };
+                    if ci >= candidate.len() || candidate[ci] != lit {
+                        return false;
+                    }
+                    pi += if pi + 1 < pattern.len() { 2 } else { 1 };
+                    ci += 1;
+                }
+                lit => {
+                    if ci >= candidate.len() || candidate[ci] != lit {
+                        return false;
+                    }
+                    pi += 1;
+                    ci += 1;
+                }
+            }
+        }
+        ci == candidate.len()
     }
 }
 
@@ -694,5 +863,122 @@ mod tests {
     #[test]
     fn test_pattern_single_quote_escaped() {
         assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive("it's"), "it''s");
+    }
+
+    // --- catalog wildcard helpers (list_tables client-side path) ---
+
+    #[test]
+    fn test_pattern_has_wildcards() {
+        assert!(SqlCommandBuilder::pattern_has_wildcards("comp_tests"));
+        assert!(SqlCommandBuilder::pattern_has_wildcards("comp%"));
+        assert!(SqlCommandBuilder::pattern_has_wildcards("%mid_dle%"));
+        assert!(!SqlCommandBuilder::pattern_has_wildcards(
+            "comparator_tests".replace('_', r"\_").as_str()
+        ));
+        assert!(!SqlCommandBuilder::pattern_has_wildcards("plaincatalog"));
+        // Escaped wildcards are literals, not active wildcards.
+        assert!(!SqlCommandBuilder::pattern_has_wildcards(r"comp\_tests"));
+        assert!(!SqlCommandBuilder::pattern_has_wildcards(r"comp\%tests"));
+        // A `%` after an escaped backslash is active again.
+        assert!(SqlCommandBuilder::pattern_has_wildcards(r"comp\\%"));
+    }
+
+    #[test]
+    fn test_strip_jdbc_escapes() {
+        assert_eq!(
+            SqlCommandBuilder::strip_jdbc_escapes(r"comp\_tests"),
+            "comp_tests"
+        );
+        assert_eq!(SqlCommandBuilder::strip_jdbc_escapes(r"a\%b"), "a%b");
+        assert_eq!(SqlCommandBuilder::strip_jdbc_escapes(r"a\\b"), r"a\b");
+        assert_eq!(SqlCommandBuilder::strip_jdbc_escapes("plain"), "plain");
+        // Lone trailing backslash is preserved.
+        assert_eq!(SqlCommandBuilder::strip_jdbc_escapes(r"foo\"), r"foo\");
+    }
+
+    // Terse wrapper for the compiled matcher used across these tests.
+    fn like(pattern: &str, candidate: &str) -> bool {
+        LikeMatcher::new(pattern).matches(candidate)
+    }
+
+    #[test]
+    fn test_like_match_ci_basic() {
+        assert!(like("comparator_tests", "comparator-tests"));
+        assert!(like("comparator_tests", "comparator_tests"));
+        // `_` matches exactly one char, so a two-char gap must not match.
+        assert!(!like("comparator_tests", "comparator--tests"));
+    }
+
+    #[test]
+    fn test_like_match_ci_percent() {
+        assert!(like("comp%", "comparator_tests"));
+        assert!(like("%tests", "comparator_tests"));
+        assert!(like("%para%", "comparator_tests"));
+        assert!(like("%", "anything"));
+        assert!(!like("comp%", "other"));
+    }
+
+    #[test]
+    fn test_like_match_ci_case_insensitive() {
+        assert!(like("MAIN", "main"));
+        assert!(like("Comp%", "comparator"));
+    }
+
+    #[test]
+    fn test_like_match_ci_escaped_literal() {
+        // `\_` matches a literal underscore only, not a hyphen.
+        assert!(like(r"comparator\_tests", "comparator_tests"));
+        assert!(!like(r"comparator\_tests", "comparator-tests"));
+    }
+
+    #[test]
+    fn test_like_match_ci_anchored() {
+        // No implicit wildcards: pattern must match the whole candidate.
+        assert!(!like("comp", "comparator"));
+        assert!(like("comp", "comp"));
+    }
+
+    #[test]
+    fn test_like_match_ci_empty_pattern_matches_only_empty() {
+        // Empty pattern is "match nothing" for any non-empty name, and
+        // matches only the empty string. `list_tables` never reaches the
+        // matcher with `""` (it short-circuits to an empty result), but
+        // the matcher's own contract should still be well-defined.
+        assert!(!like("", "anything"));
+        assert!(like("", ""));
+    }
+
+    #[test]
+    fn test_matcher_reused_across_candidates() {
+        // A single compiled matcher must give consistent results across
+        // many candidates (the catalog-name fan-out reuse path).
+        let m = LikeMatcher::new("comparator_tests");
+        assert!(m.matches("comparator-tests"));
+        assert!(m.matches("comparator_tests"));
+        assert!(!m.matches("unrelated"));
+    }
+
+    #[test]
+    fn test_pattern_matches_all() {
+        // Runs of `%` match everything → single all-catalogs query.
+        assert!(SqlCommandBuilder::pattern_matches_all("%"));
+        assert!(SqlCommandBuilder::pattern_matches_all("%%"));
+        // A lone `_` requires exactly one char, `*` is a literal, and any
+        // anchoring literal narrows — none match all.
+        assert!(!SqlCommandBuilder::pattern_matches_all("_"));
+        assert!(!SqlCommandBuilder::pattern_matches_all("*"));
+        assert!(!SqlCommandBuilder::pattern_matches_all("%a%"));
+        assert!(!SqlCommandBuilder::pattern_matches_all(""));
+    }
+
+    #[test]
+    fn test_is_wildcard_or_empty_scope() {
+        // These are the strings the SHOW builder reinterprets as
+        // "all catalogs"; `list_tables` must route them client-side.
+        assert!(SqlCommandBuilder::is_wildcard_or_empty_scope(""));
+        assert!(SqlCommandBuilder::is_wildcard_or_empty_scope("%"));
+        assert!(SqlCommandBuilder::is_wildcard_or_empty_scope("*"));
+        assert!(!SqlCommandBuilder::is_wildcard_or_empty_scope("main"));
+        assert!(!SqlCommandBuilder::is_wildcard_or_empty_scope("a*b"));
     }
 }
