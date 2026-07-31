@@ -636,6 +636,12 @@ KernelStatusCode kernel_metadata_foreign_keys(kernel_session_t* session, const c
                                               const char* foreign_catalog,
                                               const char* foreign_schema, const char* foreign_table,
                                               kernel_result_stream_t** out);
+/* List the supported table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …).
+ * No filters and no wire call — the set is derived from the session's
+ * transport. Backs ODBC `SQLTables(table_type = SQL_ALL_TABLE_TYPES)`.
+ * The stream carries a single `TABLE_TYPE` column (JDBC getTableTypes). */
+KernelStatusCode kernel_metadata_list_table_types(kernel_session_t* session,
+                                                  kernel_result_stream_t** out);
 
 #ifdef __cplusplus
 }  /* extern "C" */
