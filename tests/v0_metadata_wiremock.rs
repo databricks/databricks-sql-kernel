@@ -182,6 +182,20 @@ fn closed_inline_response_body(batch: &RecordBatch) -> String {
     succeeded_inline_response_body(batch).replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
 }
 
+/// Like [`succeeded_inline_response_body`] but with a caller-chosen
+/// `statement_id` and `status.state`. Used by the wildcard fan-out
+/// CLOSED-skip test, which stubs several statements in one call and must
+/// distinguish the `SHOW CATALOGS` statement from each per-catalog
+/// `SHOW TABLES` statement by id when asserting on DELETEs.
+fn inline_response_body_with(batch: &RecordBatch, statement_id: &str, state: &str) -> String {
+    succeeded_inline_response_body(batch)
+        .replace(
+            r#""statement_id":"stmt-test""#,
+            &format!(r#""statement_id":"{statement_id}""#),
+        )
+        .replace(r#""state":"SUCCEEDED""#, &format!(r#""state":"{state}""#))
+}
+
 fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     let fields: Vec<Field> = cols
         .iter()
@@ -1325,5 +1339,99 @@ async fn metadata_closed_response_skips_close_statement_on_match_branch() {
     // assertion stays reliably able to fail under CI load.
     let closes = wait_for_close_delete(&server, 0, std::time::Duration::from_millis(500)).await;
     assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
+}
+
+/// Same CLOSED-skip guarantee as
+/// [`metadata_closed_response_skips_close_statement`], but for the
+/// wildcard-catalog fan-out path
+/// (`list_tables_matching_catalogs` → `fetch_tables_for_catalog`). That
+/// site does NOT delegate to `from_reader_with_close`; it opens one
+/// statement per catalog, computes `close_id(&raw)` (empty when the
+/// server already reported `CLOSED`), and only fires an explicit
+/// `close_statement()` when the id is non-empty. A wildcard pattern
+/// (`comp_%`) is required to reach it — the other CLOSED-skip tests drive
+/// `list_catalogs()` / `list_tables(None, …)`, which never enter the
+/// fan-out. Stub `SHOW CATALOGS` + a per-catalog `SHOW TABLES` that both
+/// return `state == CLOSED`, and assert zero DELETEs on the per-catalog
+/// statement, so a future refactor of the bespoke `if !stmt_id.is_empty()`
+/// guard that reintroduces the redundant close is caught here.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_on_wildcard_fanout() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    // `SHOW CATALOGS` → one matching catalog, returned CLOSED.
+    let catalogs = string_batch(vec![("catalog", vec![Some("comp_a")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        inline_response_body_with(&catalogs, "stmt-catalogs", "CLOSED"),
+    )
+    .await;
+
+    // Per-catalog `SHOW TABLES IN CATALOG comp_a`, also returned CLOSED so
+    // the fan-out's `close_id` yields an empty id and the explicit
+    // `close_statement()` must be skipped.
+    let tables = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t_a")]),
+        ("catalogName", vec![Some("comp_a")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_a`",
+        inline_response_body_with(&tables, "stmt-tables-comp-a", "CLOSED"),
+    )
+    .await;
+
+    // Scoped expectation: NO DELETE on the per-catalog statement endpoint.
+    // This is the statement with the distinct close logic; the bespoke
+    // guard must not fire a redundant CloseStatement on it.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-tables-comp-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_tables(Some(LikePattern::new("comp_%").unwrap()), None, None, None)
+            .await
+            .expect("list_tables wildcard catalog");
+        let batches = drain_stream(&mut stream).await;
+        // Sanity: the fan-out actually produced the comp_a row (i.e. we
+        // exercised `fetch_tables_for_catalog`, not an empty short-circuit).
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    // Give any (erroneously) spawned fire-and-forget close the full window
+    // to reach the wire, but break early the instant one appears.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let closes = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "DELETE"
+                    && r.url.path() == "/api/2.0/sql/statements/stmt-tables-comp-a"
+            })
+            .count();
+        assert_eq!(
+            closes, 0,
+            "CLOSED per-catalog statement must not trigger CloseStatement"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
