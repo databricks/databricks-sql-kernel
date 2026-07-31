@@ -80,6 +80,7 @@
 //! the `await`); the lifetime never leaks into a stored type. See
 //! addendum A2 for the rationale.
 
+use crate::client::transport::ExecuteResult;
 use crate::kernel_error::{Error, Result};
 use crate::metadata::sql::{LikeMatcher, SqlCommandBuilder};
 use crate::metadata::static_data;
@@ -90,10 +91,30 @@ use crate::metadata::thrift_shape::{
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
+use crate::types::sea::StatementState;
 use arrow_array::Array;
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 use tracing::{debug, Instrument};
+
+/// The statement id to hand to
+/// [`ResultStream::from_reader_with_close`] as the close target.
+///
+/// When the `ExecuteStatement` response already reported
+/// `status.state == Closed`, the server has already cleaned up the
+/// statement server-side, so a follow-up `CloseStatement` DELETE is
+/// redundant (the server returns 404 `STATEMENT_NOT_FOUND`). In that
+/// case return an empty id so `from_reader_with_close` installs no
+/// close guard — mirroring the regular-query path in
+/// `statement/mutable.rs`. Otherwise return the real id so the
+/// server statement is reaped when the stream is dropped.
+fn close_id(raw: &ExecuteResult) -> String {
+    if raw.status.state == StatementState::Closed {
+        String::new()
+    } else {
+        raw.statement_id.clone()
+    }
+}
 
 /// JDBC's `DatabaseMetaData` contract: metadata methods return an
 /// empty result set for non-existent catalogs / schemas / tables
@@ -295,7 +316,7 @@ impl Metadata {
                 .transport()
                 .list_catalogs(self.session.session_id())
                 .await?;
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_CATALOGS_SCHEMA.clone(),
@@ -339,7 +360,7 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
             };
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_SCHEMAS_SCHEMA.clone(),
@@ -641,7 +662,13 @@ impl Metadata {
         // `ExecuteResult` has no Drop-based close, so a mid-stream read
         // error must still close this statement or it leaks server-side
         // (unlike the streaming paths, which close via a StatementCloseGuard).
-        let stmt_id = raw.statement_id.clone();
+        //
+        // `close_id` returns an empty id when the server already reported
+        // `status.state == Closed` (statement reaped server-side); skip the
+        // redundant CloseStatement DELETE in that case, mirroring the
+        // streaming metadata paths and the regular-query path in
+        // `statement/mutable.rs`.
+        let stmt_id = close_id(&raw);
         let mut reader = raw.reader;
         let read: Result<Vec<arrow_array::RecordBatch>> = async {
             let mut out = Vec::new();
@@ -655,12 +682,15 @@ impl Metadata {
             Ok(out)
         }
         .await;
-        // Best-effort close on every exit (success or error).
-        self.session
-            .transport()
-            .close_statement(&stmt_id)
-            .await
-            .ok();
+        // Best-effort close on every exit (success or error), unless the
+        // statement was already closed server-side.
+        if !stmt_id.is_empty() {
+            self.session
+                .transport()
+                .close_statement(&stmt_id)
+                .await
+                .ok();
+        }
         read
     }
 
@@ -692,7 +722,7 @@ impl Metadata {
             Ok(r) => r,
             Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
         };
-        let stmt_id = raw.statement_id.clone();
+        let stmt_id = close_id(&raw);
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_TABLES_SCHEMA.clone(),
@@ -756,7 +786,7 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
             };
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_COLUMNS_SCHEMA.clone(),
@@ -818,7 +848,7 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_PRIMARY_KEYS_SCHEMA.clone(), Err).await,
             };
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_PRIMARY_KEYS_SCHEMA.clone(),
@@ -889,7 +919,7 @@ impl Metadata {
                 Ok(r) => r,
                 Err(e) => return not_found_or(e, GET_CROSS_REFERENCE_SCHEMA.clone(), Err).await,
             };
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_CROSS_REFERENCE_SCHEMA.clone(),
@@ -930,7 +960,7 @@ impl Metadata {
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
                 .await?;
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
         }
@@ -961,7 +991,7 @@ impl Metadata {
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
                 .await?;
-            let stmt_id = raw.statement_id.clone();
+            let stmt_id = close_id(&raw);
             ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
         }
