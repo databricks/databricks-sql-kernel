@@ -340,10 +340,30 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
     })
 }
 
-// PR 7d follow-ups: functions, procedures, type_info, table_types — the
-// kernel `Metadata` exposes these (some synthesised in-memory). Wire them
-// over the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
-// SQLProcedures.
+/// List the table types the workspace supports (`TABLE`, `VIEW`,
+/// `SYSTEM TABLE`, …). No filters and no wire call — the set is derived
+/// from the session's transport (see `Metadata::table_types`). Backs the
+/// ODBC `SQLTables(table_type = SQL_ALL_TABLE_TYPES)` enumeration mode.
+/// The stream carries a single `TABLE_TYPE` column (JDBC `getTableTypes`
+/// shape).
+///
+/// # Safety
+/// `session` must be a live handle from `kernel_session_open`; `out`
+/// must be a valid, writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_list_table_types(
+    session: *mut kernel_session_t,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move { session.metadata().table_types().await })
+    })
+}
+
+// PR 7d follow-ups: functions, procedures, type_info — the kernel
+// `Metadata` exposes these (some synthesised in-memory). Wire them over
+// the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
+// SQLProcedures / SQLPrimaryKeys-adjacent surfaces.
 
 #[cfg(test)]
 mod tests {
