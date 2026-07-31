@@ -231,6 +231,40 @@ fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
     schema.fields().iter().map(|f| f.name().clone()).collect()
 }
 
+/// Poll `server.received_requests()` until `expected` `DELETE`s to the
+/// `stmt-test` statement endpoint are observed, or `timeout` elapses;
+/// returns the final observed count. This replaces a bare `sleep` when
+/// asserting on the fire-and-forget `StatementCloseGuard`: for a positive
+/// expectation it waits only as long as needed (so a close delayed past a
+/// fixed window can't flake the test), and for a negative expectation
+/// (`expected == 0`) it still gives an erroneously-spawned close the full
+/// `timeout` to reach the wire but breaks early the instant one appears, so
+/// the negative assertion stays reliably able to fail under CI load.
+async fn wait_for_close_delete(
+    server: &MockServer,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "DELETE" && r.url.path() == "/api/2.0/sql/statements/stmt-test"
+            })
+            .count();
+        // Positive expectation met, or a spurious DELETE already appeared for a
+        // negative expectation — either way there is nothing more to wait for.
+        if count >= expected.max(1) || tokio::time::Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 // ─── Thrift-shape reshape tests ─────────────────────────────────────
 
 #[tokio::test]
@@ -1190,10 +1224,12 @@ async fn metadata_closed_response_skips_close_statement() {
         let _ = drain_stream(&mut stream).await;
         // stream drops here — a redundant close guard would fire now.
     }
-    // Give any (erroneously) spawned fire-and-forget close a chance to
-    // hit the wire before the scoped mock verifies expect(0) on drop.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    // `_no_close` verifies expect(0) when it drops at end of scope.
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears so the negative
+    // assertion stays reliably able to fail under CI load.
+    let closes = wait_for_close_delete(&server, 0, std::time::Duration::from_millis(500)).await;
+    assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
 
 /// Regression-guard for issue #168's fix: when the metadata
@@ -1230,10 +1266,15 @@ async fn metadata_succeeded_response_still_closes_statement() {
         let _ = drain_stream(&mut stream).await;
         // stream drops here — the close guard must fire the DELETE.
     }
-    // Give the fire-and-forget close a chance to hit the wire before the
-    // scoped mock verifies expect(1) on drop.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    // `_close` verifies expect(1) when it drops at end of scope.
+    // Poll until the fire-and-forget close hits the wire (bounded by a
+    // timeout) rather than assuming it lands within a fixed sleep — a close
+    // delayed under CI load must not flake this positive assertion.
+    let closes = wait_for_close_delete(&server, 1, std::time::Duration::from_millis(2000)).await;
+    assert_eq!(
+        closes, 1,
+        "SUCCEEDED response must trigger exactly one CloseStatement"
+    );
+    // `_close` also verifies expect(1) when it drops at end of scope.
 }
 
 /// Same CLOSED-skip guarantee as
@@ -1279,8 +1320,10 @@ async fn metadata_closed_response_skips_close_statement_on_match_branch() {
         let _ = drain_stream(&mut stream).await;
         // stream drops here — a redundant close guard would fire now.
     }
-    // Give any (erroneously) spawned fire-and-forget close a chance to
-    // hit the wire before the scoped mock verifies expect(0) on drop.
-    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-    // `_no_close` verifies expect(0) when it drops at end of scope.
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears so the negative
+    // assertion stays reliably able to fail under CI load.
+    let closes = wait_for_close_delete(&server, 0, std::time::Duration::from_millis(500)).await;
+    assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
