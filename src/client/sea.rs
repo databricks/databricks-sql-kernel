@@ -37,6 +37,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 
+/// Header telling the server a metadata query may be executed fully
+/// synchronously, letting it answer in the initial response instead of
+/// going through the asynchronous statement machinery.
+///
+/// Sent on every synchronous metadata query, unconditionally. It is
+/// advisory — a server that does not recognise it ignores it — so there is
+/// nothing for a caller to configure.
+const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
+
 /// Internal terminal-outcome for a single SEA statement response.
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
@@ -451,16 +460,36 @@ impl SeaRestTransport {
 
         debug!("Executing statement at {}: {}", url, sql);
 
-        let request = self
+        let mut builder = self
             .http_client
             .inner()
             .request(Method::POST, &url)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .build()
-            .map_err(|e| {
-                Error::invalid_argument().message(format!("Failed to build request: {e}"))
-            })?;
+            .header("Content-Type", "application/json");
+
+        // Signal that a metadata query may be served fully synchronously, so
+        // the server can skip the async statement machinery and answer in the
+        // initial response.
+        //
+        // Sent unconditionally for metadata queries — there is no opt-out knob.
+        // The header is advisory: a server that does not recognise it ignores
+        // it and the query still succeeds through the normal path, so there is
+        // no configuration a caller could need to express. (JDBC exposes an
+        // EnableSeaSyncMetadata property for this; we deliberately don't, since
+        // a flag whose only settings are "faster" and "same but slower" is a
+        // support liability rather than a feature.)
+        //
+        // The synchronous-only condition comes free from `request_type`: the
+        // async path routes through `submit_statement` with
+        // `RequestType::ExecuteStatement`, so `ExecuteMetadataQuery` only ever
+        // reaches here on the synchronous path.
+        if request_type == RequestType::ExecuteMetadataQuery {
+            debug!("Adding {SEA_SYNC_METADATA_HEADER} for synchronous metadata query");
+            builder = builder.header(SEA_SYNC_METADATA_HEADER, "true");
+        }
+
+        let request = builder.json(&request_body).build().map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        })?;
 
         let response = self.http_client.execute(request, request_type).await?;
         let body = response

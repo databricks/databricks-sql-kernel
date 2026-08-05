@@ -346,6 +346,34 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConfig* config,
                                                                bool ignore);
 
+/* Configure the on-disk OAuth token cache for U2M (browser) auth. Mirrors
+ * the EnableTokenCache / TokenCachePassPhrase pair exposed by the reference
+ * ODBC driver and JDBC.
+ *
+ * `enabled = true` (the default) persists the refresh token under
+ * ~/.config/databricks-sql-kernel/oauth/ so the user is not sent through
+ * the browser on every connection. The file is ALWAYS encrypted
+ * (AES-256-CBC, PBKDF2-HMAC-SHA256) — there is no plaintext mode. A
+ * non-NULL `passphrase` keys it; NULL or blank falls back to a
+ * machine-local derived key, matching the reference driver, which caches
+ * with an empty TokenCachePassPhrase. Supplying a passphrase is stronger:
+ * the derived key defends against the cache file being read elsewhere (a
+ * backup, an image layer, a support bundle), not against an attacker who
+ * can already run code as this user.
+ *
+ * `enabled = false` disables DISK PERSISTENCE ONLY; tokens are still
+ * reused and refreshed in memory for the session's lifetime, so this does
+ * not re-trigger the browser flow on every refresh. Use it when the
+ * process must not write credentials to disk at all. `passphrase` is
+ * ignored in that case.
+ *
+ * Only U2M auth touches the cache; PAT and M2M ignore this setting.
+ *
+ * The on-disk format is wire-compatible with the JDBC driver's
+ * EncryptedFileTokenCache (given the same passphrase). */
+KernelStatusCode kernel_session_config_set_token_cache(KernelSessionConfig* config, bool enabled,
+                                                      const char* passphrase);
+
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
 /*
