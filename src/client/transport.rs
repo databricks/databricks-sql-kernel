@@ -46,6 +46,12 @@ pub(crate) struct TransportConfig {
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,
+    /// When `true` (the default), metadata queries carry the
+    /// `x-databricks-sea-can-run-fully-sync` header, telling the server
+    /// the operation may run fully synchronously and letting it skip the
+    /// asynchronous statement machinery. See
+    /// [`crate::config::DefaultOpts::sea_sync_metadata`].
+    pub sea_sync_metadata: bool,
 }
 
 impl Default for TransportConfig {
@@ -53,6 +59,8 @@ impl Default for TransportConfig {
         Self {
             poll_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_millis(500),
+            // Match the JDBC default of EnableSeaSyncMetadata=1.
+            sea_sync_metadata: true,
         }
     }
 }

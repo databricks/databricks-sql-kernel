@@ -37,6 +37,13 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 
+/// Header telling the server a metadata query may be executed fully
+/// synchronously, letting it answer in the initial response instead of
+/// going through the asynchronous statement machinery. Sent only for
+/// synchronous metadata queries; see
+/// [`crate::config::DefaultOpts::sea_sync_metadata`].
+const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
+
 /// Internal terminal-outcome for a single SEA statement response.
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
@@ -451,16 +458,31 @@ impl SeaRestTransport {
 
         debug!("Executing statement at {}: {}", url, sql);
 
-        let request = self
+        let mut builder = self
             .http_client
             .inner()
             .request(Method::POST, &url)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .build()
-            .map_err(|e| {
-                Error::invalid_argument().message(format!("Failed to build request: {e}"))
-            })?;
+            .header("Content-Type", "application/json");
+
+        // Signal that a metadata query may be served fully synchronously, so
+        // the server can skip the async statement machinery and answer in the
+        // initial response. Mirrors the JDBC driver's EnableSeaSyncMetadata
+        // (default on), which gates the same header on the same three
+        // conditions: the flag is enabled, the statement is a metadata query,
+        // and execution is synchronous.
+        //
+        // The async gate is what `request_type` gives us for free: the async
+        // execution path routes through `execute_statement_async` with
+        // `RequestType::ExecuteStatement`, so `ExecuteMetadataQuery` only ever
+        // reaches here on the synchronous path.
+        if self.config.sea_sync_metadata && request_type == RequestType::ExecuteMetadataQuery {
+            debug!("Adding {SEA_SYNC_METADATA_HEADER} for synchronous metadata query");
+            builder = builder.header(SEA_SYNC_METADATA_HEADER, "true");
+        }
+
+        let request = builder.json(&request_body).build().map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        })?;
 
         let response = self.http_client.execute(request, request_type).await?;
         let body = response

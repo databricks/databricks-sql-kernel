@@ -125,7 +125,7 @@ pub mod c_abi;
 // === Public re-exports ===
 pub use config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
-    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
+    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TokenCacheConfig, TransportMode,
 };
 pub use kernel_error::{Error, ErrorCode, Result};
 /// The `tracing` target string stamped on every kernel log event.

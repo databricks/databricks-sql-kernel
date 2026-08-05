@@ -25,7 +25,9 @@
 //! (default = ignore). Backed by the shared `Session` transaction methods.
 
 use super::{block_on_ffi, KernelStatusCode};
-use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
+use crate::config::{
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig, TokenCacheConfig,
+};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
@@ -109,6 +111,18 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
+    /// Whether metadata queries advertise that they may run fully
+    /// synchronously. Defaults to `true` (matching JDBC's
+    /// `EnableSeaSyncMetadata=1`). Maps to
+    /// [`DefaultOpts::sea_sync_metadata`].
+    sea_sync_metadata: bool,
+    /// On-disk U2M token-cache policy (populated by
+    /// `kernel_session_config_set_token_cache`). Defaults to enabled with
+    /// no passphrase; that combination is rejected at
+    /// [`kernel_session_open`] time, but only when U2M auth is actually
+    /// selected — PAT and M2M never touch the cache. See
+    /// [`TokenCacheConfig`].
+    token_cache: TokenCacheConfig,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -186,6 +200,10 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
+        // Match JDBC's EnableSeaSyncMetadata=1.
+        sea_sync_metadata: true,
+        // Match JDBC's EnableTokenCache=1 (passphrase still required).
+        token_cache: TokenCacheConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -619,6 +637,66 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
     })
 }
 
+/// Set whether metadata queries advertise that they may be served fully
+/// synchronously, via the `x-databricks-sea-can-run-fully-sync` header.
+/// Pass `true` (the default) for JDBC's `EnableSeaSyncMetadata=1`
+/// semantics. The header is advisory — a server that does not recognise it
+/// ignores it — so hosts normally leave this alone. Maps to
+/// [`DefaultOpts::sea_sync_metadata`].
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_sea_sync_metadata(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.sea_sync_metadata = enabled;
+        Ok(())
+    })
+}
+
+/// Configure the on-disk OAuth token cache for U2M (browser) auth.
+///
+/// Mirrors the JDBC driver's `EnableTokenCache` / `TokenCachePassPhrase`
+/// pair:
+///
+/// * `enabled = true` (the default) persists the refresh token to
+///   `~/.config/databricks-sql-kernel/oauth/` so the user is not sent
+///   through the browser on every connection. `passphrase` is then
+///   **required** — the cache holds a long-lived credential and is only
+///   ever written encrypted (AES-256-CBC, PBKDF2-HMAC-SHA256), so there is
+///   no plaintext fallback. Passing `enabled = true` with a null or blank
+///   passphrase makes [`kernel_session_open`] fail with
+///   `InvalidArgument`, but only when U2M auth is selected; PAT and M2M
+///   never touch the cache.
+/// * `enabled = false` disables **disk persistence only**. Tokens are
+///   still reused and refreshed in memory for the session's lifetime, so
+///   this does not re-trigger the browser flow on every refresh. Use it
+///   when the process has nowhere safe to keep a passphrase.
+///
+/// `passphrase` is ignored when `enabled` is `false`.
+///
+/// # Safety
+/// `config` must be a live config handle. `passphrase`, if non-null, must
+/// point to a NUL-terminated UTF-8 string valid for the duration of the
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_token_cache(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+    passphrase: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.token_cache = TokenCacheConfig {
+            enabled,
+            passphrase: optional_str(passphrase, "passphrase")?,
+        };
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -752,6 +830,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         retry,
         ignore_transactions,
+        sea_sync_metadata,
+        token_cache,
     } = config;
 
     block_on_ffi(move || {
@@ -793,6 +873,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     scopes.and_then(|s| parse_scopes(&s)),
                     None,
                     None,
+                    Some(token_cache),
                 ),
             };
 
@@ -802,6 +883,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .session_conf(session_conf)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
+                    sea_sync_metadata,
                     ..Default::default()
                 });
 

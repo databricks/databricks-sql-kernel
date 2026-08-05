@@ -22,6 +22,7 @@
 //! - File-based token caching
 
 pub mod cache;
+pub(crate) mod cache_crypto;
 pub mod callback;
 pub mod m2m;
 pub mod oidc;

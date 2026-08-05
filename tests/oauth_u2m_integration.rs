@@ -26,6 +26,15 @@ use std::time::Duration;
 use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+/// Passphrase used to encrypt the on-disk token cache in these tests.
+///
+/// The cache is only ever written encrypted, so every test that seeds it and
+/// then expects the provider to read it back must (a) save under this
+/// passphrase and (b) build the provider via `new_with_full_config` with the
+/// same one. `new_with_config` disables disk caching outright, which would
+/// leave these tests passing while exercising nothing.
+const TEST_CACHE_PASSPHRASE: &str = "integration-test-passphrase";
+
 /// Helper function to mock OIDC discovery endpoint.
 ///
 /// Sets up a wiremock endpoint at `/oidc/.well-known/oauth-authorization-server`
@@ -100,16 +109,19 @@ async fn test_u2m_refresh_token_full_flow() {
         "test-client-id",
         &["all-apis".to_string(), "offline_access".to_string()],
         &cached_token,
+        TEST_CACHE_PASSPHRASE,
     );
 
     // Step 5: Create AuthorizationCodeProvider - should load cached token
-    let provider = AuthorizationCodeProvider::new_with_config(
+    let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         8020,
         Duration::from_secs(120),
+        None,
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create AuthorizationCodeProvider");
@@ -172,15 +184,18 @@ async fn test_u2m_refresh_token_stale_immediate_return() {
         "test-client-id-stale",
         &["all-apis".to_string(), "offline_access".to_string()],
         &stale_token,
+        TEST_CACHE_PASSPHRASE,
     );
 
-    let provider = AuthorizationCodeProvider::new_with_config(
+    let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-stale",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         8021,
         Duration::from_secs(120),
+        None,
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");
@@ -249,15 +264,18 @@ async fn test_u2m_refresh_token_expired_fallback() {
         "test-client-id-expired",
         &["all-apis".to_string(), "offline_access".to_string()],
         &expired_token,
+        TEST_CACHE_PASSPHRASE,
     );
 
-    let mut provider = AuthorizationCodeProvider::new_with_config(
+    let mut provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-expired",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         0,                      // Use port 0 to avoid conflicts
         Duration::from_secs(5), // Short timeout for test
+        None,
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");
@@ -321,15 +339,18 @@ async fn test_u2m_refresh_updates_cache() {
         "test-client-id-cache",
         &["all-apis".to_string(), "offline_access".to_string()],
         &old_token,
+        TEST_CACHE_PASSPHRASE,
     );
 
-    let provider = AuthorizationCodeProvider::new_with_config(
+    let provider = AuthorizationCodeProvider::new_with_full_config(
         &mock_server.uri(),
         "test-client-id-cache",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
         8023,
         Duration::from_secs(120),
+        None,
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");
@@ -346,6 +367,7 @@ async fn test_u2m_refresh_updates_cache() {
         &mock_server.uri(),
         "test-client-id-cache",
         &["all-apis".to_string(), "offline_access".to_string()],
+        TEST_CACHE_PASSPHRASE,
     );
 
     assert!(cached_token.is_some(), "Cache should contain updated token");

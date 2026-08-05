@@ -187,6 +187,19 @@ pub struct DefaultOpts {
     /// multi-statement transactions (a Private Preview feature; requires
     /// catalog-managed tables server-side).
     pub ignore_transactions: bool,
+
+    /// When `true` (the default), metadata queries (`SHOW CATALOGS`,
+    /// `SHOW TABLES`, …) carry the
+    /// `x-databricks-sea-can-run-fully-sync` header, which tells the
+    /// server the operation may be served fully synchronously — it can
+    /// answer in the initial response instead of routing through the
+    /// asynchronous statement machinery. Mirrors the JDBC
+    /// `EnableSeaSyncMetadata` connection property, whose default is `1`.
+    ///
+    /// The header is advisory: a server that does not recognise it
+    /// ignores it and the query still succeeds through the normal path,
+    /// so it is safe to leave enabled. Set to `false` to suppress it.
+    pub sea_sync_metadata: bool,
 }
 
 impl Default for DefaultOpts {
@@ -197,6 +210,81 @@ impl Default for DefaultOpts {
             // Match the reference/JDBC default of IgnoreTransactions=1:
             // transaction control is no-oped unless a caller opts in.
             ignore_transactions: true,
+            // Match the JDBC default of EnableSeaSyncMetadata=1.
+            sea_sync_metadata: true,
+        }
+    }
+}
+
+// ─── Token cache ────────────────────────────────────────────────────────────
+
+/// Policy for the on-disk U2M OAuth token cache.
+///
+/// The cache persists the refresh token so a user is not sent through the
+/// browser flow on every connection. Because a refresh token is a
+/// long-lived credential, the kernel will only write one **encrypted**,
+/// under a caller-supplied passphrase.
+///
+/// This mirrors the JDBC driver's `EnableTokenCache` /
+/// `TokenCachePassPhrase` pair, including the part that surprises people:
+/// caching is **on by default**, and enabling it without a passphrase is a
+/// hard error rather than a silent downgrade to plaintext. Callers that
+/// have nowhere to keep a passphrase should set `enabled: false`
+/// explicitly, which is always valid and needs no passphrase.
+///
+/// | `enabled` | `passphrase` | result |
+/// |---|---|---|
+/// | `true` (default) | set | encrypted cache under `~/.config/databricks-sql-kernel/oauth/` |
+/// | `true` (default) | unset | [`Session::open`](crate::Session::open) fails with `InvalidArgument` |
+/// | `false` | either | no disk reads or writes; in-process token reuse is unaffected |
+///
+/// Disabling the cache stops **disk persistence only**. The in-memory
+/// token store still reuses and refreshes a token for the lifetime of the
+/// session, matching JDBC's `NoOpTokenCache`, so turning this off does not
+/// re-trigger the browser flow on every refresh within one process.
+#[derive(Debug, Clone)]
+pub struct TokenCacheConfig {
+    /// Whether to read and write the on-disk cache. Default `true`,
+    /// matching JDBC's `EnableTokenCache=1`.
+    pub enabled: bool,
+    /// Passphrase for the AES-256 encryption key. Required whenever
+    /// `enabled` is `true`; there is deliberately no default, because a
+    /// built-in constant would be public knowledge and so equivalent to
+    /// storing the refresh token in plaintext.
+    pub passphrase: Option<String>,
+}
+
+impl Default for TokenCacheConfig {
+    fn default() -> Self {
+        Self {
+            // Match the JDBC default of EnableTokenCache=1.
+            enabled: true,
+            passphrase: None,
+        }
+    }
+}
+
+impl TokenCacheConfig {
+    /// Resolve to the passphrase to encrypt with, or `None` when caching
+    /// is disabled.
+    ///
+    /// Returns `InvalidArgument` when caching is enabled but no usable
+    /// passphrase was supplied. An all-whitespace passphrase is rejected
+    /// alongside an absent one: it is almost always an unexpanded config
+    /// placeholder, and accepting it would derive a key from effectively
+    /// nothing while reporting success.
+    pub(crate) fn resolve(&self) -> crate::kernel_error::Result<Option<&str>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        match self.passphrase.as_deref() {
+            Some(p) if !p.trim().is_empty() => Ok(Some(p)),
+            _ => Err(crate::kernel_error::Error::invalid_argument().message(
+                "token cache is enabled but no passphrase was configured. The cache holds a \
+                 long-lived OAuth refresh token and is only ever written encrypted, so a \
+                 passphrase is required. Supply one, or disable the token cache explicitly \
+                 (matching the JDBC driver's EnableTokenCache / TokenCachePassPhrase pair).",
+            )),
         }
     }
 }
@@ -254,6 +342,9 @@ pub enum AuthConfig {
         /// How long to wait for the user to complete the browser
         /// flow before timing out. `None` → 120 seconds.
         callback_timeout: Option<std::time::Duration>,
+        /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`]
+        /// (enabled, which then requires a passphrase — see that type).
+        token_cache: Option<TokenCacheConfig>,
     },
 
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
@@ -331,6 +422,7 @@ impl AuthConfig {
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
+        token_cache: Option<TokenCacheConfig>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -338,6 +430,7 @@ impl AuthConfig {
             scopes,
             token_url_override,
             callback_timeout,
+            token_cache,
         }
     }
 }
@@ -1012,6 +1105,85 @@ pub(crate) fn filter_session_conf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── token cache policy ────────────────────────────────────────
+
+    #[test]
+    fn token_cache_defaults_to_enabled_like_jdbc() {
+        // JDBC's EnableTokenCache defaults to "1". Matching that default is
+        // the whole reason `resolve()` can fail, so pin it.
+        assert!(TokenCacheConfig::default().enabled);
+        assert!(TokenCacheConfig::default().passphrase.is_none());
+    }
+
+    #[test]
+    fn token_cache_enabled_with_passphrase_resolves_to_it() {
+        let cfg = TokenCacheConfig {
+            enabled: true,
+            passphrase: Some("s3cr3t".to_string()),
+        };
+        assert_eq!(cfg.resolve().expect("should resolve"), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn token_cache_enabled_without_passphrase_is_an_error() {
+        // The JDBC-parity behaviour: enabling the cache with no passphrase is
+        // a hard configuration error, NOT a silent downgrade to a plaintext
+        // cache. Callers with nowhere to keep a passphrase must disable it.
+        let err = TokenCacheConfig::default()
+            .resolve()
+            .expect_err("enabled + no passphrase must fail");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        // The message has to say what to do about it, since this fires at
+        // connect time on a config that "looks" fine.
+        let msg = err.to_string();
+        assert!(msg.contains("passphrase"), "unhelpful message: {msg}");
+    }
+
+    #[test]
+    fn token_cache_enabled_with_blank_passphrase_is_an_error() {
+        // An all-whitespace passphrase is almost always an unexpanded config
+        // placeholder. Accepting it would derive a key from nothing while
+        // reporting success.
+        for blank in ["", "   ", "\t\n"] {
+            let cfg = TokenCacheConfig {
+                enabled: true,
+                passphrase: Some(blank.to_string()),
+            };
+            assert!(
+                cfg.resolve().is_err(),
+                "blank passphrase {blank:?} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn token_cache_disabled_resolves_to_none_without_passphrase() {
+        // Disabling must always be valid — it is the documented escape hatch
+        // for processes with no safe place to keep a passphrase.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: None,
+        };
+        assert_eq!(cfg.resolve().expect("disabling is always valid"), None);
+    }
+
+    #[test]
+    fn token_cache_disabled_ignores_a_supplied_passphrase() {
+        // `enabled: false` wins: a leftover passphrase must not silently
+        // re-enable disk persistence.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: Some("ignored".to_string()),
+        };
+        assert_eq!(cfg.resolve().expect("should resolve"), None);
+    }
+
+    #[test]
+    fn sea_sync_metadata_defaults_to_enabled_like_jdbc() {
+        // Mirrors JDBC's EnableSeaSyncMetadata=1.
+        assert!(DefaultOpts::default().sea_sync_metadata);
+    }
 
     // ─── session_conf allowlist ────────────────────────────────────
 
