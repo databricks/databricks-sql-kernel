@@ -35,7 +35,7 @@ type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
     AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ProxyConfig, ResultConfig, Session,
-    TlsConfig, TokenCacheConfig,
+    TlsConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -394,15 +394,11 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 options.oauth_scopes.clone(),
                 None,
                 None,
-                // The Node binding exposes no passphrase option yet, and the
-                // on-disk cache is only ever written encrypted. Disable it
-                // rather than let the kernel's enabled-by-default policy fail
-                // every U2M connection from Node. Surfacing a passphrase
-                // through `options` is what would enable it.
-                Some(TokenCacheConfig {
-                    enabled: false,
-                    passphrase: None,
-                }),
+                // `None` takes the kernel default: on-disk cache enabled,
+                // encrypted under a machine-local derived key since this
+                // binding exposes no passphrase option. Surfacing one through
+                // `options` would strengthen it further.
+                None,
             ))
         }
     }

@@ -56,6 +56,63 @@ const KEY_LEN: usize = 32;
 /// would make previously written cache files undecryptable.
 const PBKDF2_ITERATIONS: u32 = 65_536;
 
+/// Fixed component of the machine-local fallback passphrase. Changing this
+/// invalidates every cache file written without an explicit passphrase
+/// (which degrades to a cache miss and one re-authentication, not an error).
+const DERIVED_PASSPHRASE_TAG: &str = "databricks-sql-kernel/token-cache/v1";
+
+/// Passphrase used when the caller enabled the token cache but supplied no
+/// passphrase of their own.
+///
+/// # Why this exists
+///
+/// The reference ODBC driver ships `EnableTokenCache=1` with an empty
+/// `TokenCachePassPhrase` and still caches, so refusing to cache (or failing
+/// the connection) would break drop-in compatibility. But writing the
+/// refresh token as plaintext is not acceptable either. So we encrypt under
+/// a key derived from machine-local material instead.
+///
+/// # What this actually protects against — and what it does not
+///
+/// Be clear-eyed about this: a key derived from data available on the
+/// machine is **obfuscation against the wrong reader, not defence against a
+/// local attacker.** It protects against:
+///
+/// * the cache file being copied off the box — into a backup, a container
+///   image layer, a support bundle, a synced home directory — and read
+///   somewhere else;
+/// * a different user on the same host reading the bytes (though the
+///   `0o600` file mode in a `0o700` directory is the real control there);
+/// * casual inspection: `cat`-ing the file, or a log/telemetry scraper that
+///   slurps config directories, no longer yields a usable credential.
+///
+/// It does **not** protect against an attacker who can already run code as
+/// this user on this machine: they can derive the same key by construction.
+/// A caller-supplied passphrase is the only thing that defends against
+/// that, which is why the doc on [`crate::config::TokenCacheConfig`] says
+/// supplying one is strictly stronger.
+///
+/// # Composition
+///
+/// The username plus a fixed version tag. Deliberately *not* the hostname:
+/// containers get a fresh random hostname per start, which would silently
+/// make the cache unreadable on every restart — the exact "why do I keep
+/// getting a browser prompt" failure this whole feature exists to avoid.
+/// Deliberately not a random per-install file either: that is a second piece
+/// of state to create, protect, and fail to create, and it would buy nothing
+/// over the file mode we already set.
+pub(crate) fn derived_passphrase() -> String {
+    // No username available (unusual — a daemon with no passwd entry) is not
+    // a failure: fall back to the tag alone. The cache is then readable by
+    // anything that knows the tag, which is no worse than the plaintext this
+    // replaces, and the file mode still applies.
+    let user = std::env::var("USER")
+        .or_else(|_| std::env::var("USERNAME")) // Windows
+        .or_else(|_| std::env::var("LOGNAME"))
+        .unwrap_or_default();
+    format!("{DERIVED_PASSPHRASE_TAG}\u{1f}{user}")
+}
+
 /// Derive the AES key from `passphrase` and a per-file `salt`.
 ///
 /// Returned in a [`Zeroizing`]-style wrapper so the key material is wiped
@@ -141,6 +198,40 @@ mod tests {
     use super::*;
 
     const PASSPHRASE: &str = "correct horse battery staple";
+
+    #[test]
+    fn derived_passphrase_is_deterministic_and_non_empty() {
+        // Determinism is load-bearing: a non-reproducible fallback key means
+        // every process writes a cache the next one cannot read, which shows
+        // up as a browser prompt on every connection — the exact failure the
+        // cache exists to prevent.
+        let a = derived_passphrase();
+        let b = derived_passphrase();
+        assert_eq!(a, b);
+        assert!(!a.trim().is_empty());
+        // Must not degenerate to just the tag with an empty user component,
+        // in the normal case where a username IS available.
+        if std::env::var("USER").is_ok() {
+            assert_ne!(a, format!("{DERIVED_PASSPHRASE_TAG}\u{1f}"));
+        }
+    }
+
+    #[test]
+    fn derived_passphrase_round_trips_a_token() {
+        // The end-to-end property the reference-compatible default depends
+        // on: a cache written with no caller passphrase must be readable back
+        // by the same machine, and must not be plaintext.
+        let plaintext = br#"{"refresh_token":"rt-derived"}"#;
+        let payload = encrypt(plaintext, &derived_passphrase());
+        assert!(!payload.contains("rt-derived"));
+        assert_eq!(
+            decrypt(payload.as_bytes(), &derived_passphrase()).as_deref(),
+            Some(plaintext.as_slice())
+        );
+        // And a different key must not open it, so the fallback is a real key
+        // and not a constant everyone shares.
+        assert_eq!(decrypt(payload.as_bytes(), DERIVED_PASSPHRASE_TAG), None);
+    }
 
     /// Cross-language interop: decrypt a payload produced by the JDBC
     /// driver's own crypto parameters.

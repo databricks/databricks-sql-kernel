@@ -123,11 +123,9 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
             scopes: None,
             token_url_override: None,
             callback_timeout: None,
-            // Disable the on-disk cache. It defaults to enabled, which then
-            // requires a passphrase a test has nowhere meaningful to keep.
-            // Disabling also keeps runs independent: a token cached by an
-            // earlier run would otherwise skip the browser flow this test
-            // exists to exercise.
+            // Disable the on-disk cache to keep runs independent: it defaults
+            // to enabled, so a token cached by an earlier run would skip the
+            // browser flow this test exists to exercise.
             token_cache: Some(databricks_sql_kernel::TokenCacheConfig {
                 enabled: false,
                 passphrase: None,

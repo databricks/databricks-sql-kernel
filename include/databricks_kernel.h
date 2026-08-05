@@ -346,35 +346,31 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConfig* config,
                                                                bool ignore);
 
-/* Whether metadata queries advertise that they may be served fully
- * synchronously, via the `x-databricks-sea-can-run-fully-sync` header.
- * `enabled = true` is the default and matches JDBC's
- * EnableSeaSyncMetadata=1. The header is advisory — a server that does not
- * recognise it ignores it and the query still succeeds — so hosts normally
- * leave this alone. */
-KernelStatusCode kernel_session_config_set_sea_sync_metadata(KernelSessionConfig* config,
-                                                             bool enabled);
-
 /* Configure the on-disk OAuth token cache for U2M (browser) auth. Mirrors
- * JDBC's EnableTokenCache / TokenCachePassPhrase pair.
+ * the EnableTokenCache / TokenCachePassPhrase pair exposed by the reference
+ * ODBC driver and JDBC.
  *
  * `enabled = true` (the default) persists the refresh token under
  * ~/.config/databricks-sql-kernel/oauth/ so the user is not sent through
- * the browser on every connection. `passphrase` is then REQUIRED: the
- * cache holds a long-lived credential and is only ever written encrypted
- * (AES-256-CBC, PBKDF2-HMAC-SHA256), with no plaintext fallback. Enabling
- * the cache with a NULL or blank passphrase makes `kernel_session_open`
- * fail with InvalidArgument — but only when U2M auth is selected, since
- * PAT and M2M never touch the cache.
+ * the browser on every connection. The file is ALWAYS encrypted
+ * (AES-256-CBC, PBKDF2-HMAC-SHA256) — there is no plaintext mode. A
+ * non-NULL `passphrase` keys it; NULL or blank falls back to a
+ * machine-local derived key, matching the reference driver, which caches
+ * with an empty TokenCachePassPhrase. Supplying a passphrase is stronger:
+ * the derived key defends against the cache file being read elsewhere (a
+ * backup, an image layer, a support bundle), not against an attacker who
+ * can already run code as this user.
  *
  * `enabled = false` disables DISK PERSISTENCE ONLY; tokens are still
  * reused and refreshed in memory for the session's lifetime, so this does
  * not re-trigger the browser flow on every refresh. Use it when the
- * process has nowhere safe to keep a passphrase. `passphrase` is ignored
- * in that case.
+ * process must not write credentials to disk at all. `passphrase` is
+ * ignored in that case.
+ *
+ * Only U2M auth touches the cache; PAT and M2M ignore this setting.
  *
  * The on-disk format is wire-compatible with the JDBC driver's
- * EncryptedFileTokenCache. */
+ * EncryptedFileTokenCache (given the same passphrase). */
 KernelStatusCode kernel_session_config_set_token_cache(KernelSessionConfig* config, bool enabled,
                                                       const char* passphrase);
 

@@ -111,17 +111,11 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
-    /// Whether metadata queries advertise that they may run fully
-    /// synchronously. Defaults to `true` (matching JDBC's
-    /// `EnableSeaSyncMetadata=1`). Maps to
-    /// [`DefaultOpts::sea_sync_metadata`].
-    sea_sync_metadata: bool,
     /// On-disk U2M token-cache policy (populated by
     /// `kernel_session_config_set_token_cache`). Defaults to enabled with
-    /// no passphrase; that combination is rejected at
-    /// [`kernel_session_open`] time, but only when U2M auth is actually
-    /// selected — PAT and M2M never touch the cache. See
-    /// [`TokenCacheConfig`].
+    /// no passphrase, in which case the cache is encrypted under a
+    /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
+    /// touch the cache. See [`TokenCacheConfig`].
     token_cache: TokenCacheConfig,
 }
 
@@ -200,9 +194,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
-        // Match JDBC's EnableSeaSyncMetadata=1.
-        sea_sync_metadata: true,
-        // Match JDBC's EnableTokenCache=1 (passphrase still required).
+        // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
@@ -637,46 +629,27 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
     })
 }
 
-/// Set whether metadata queries advertise that they may be served fully
-/// synchronously, via the `x-databricks-sea-can-run-fully-sync` header.
-/// Pass `true` (the default) for JDBC's `EnableSeaSyncMetadata=1`
-/// semantics. The header is advisory — a server that does not recognise it
-/// ignores it — so hosts normally leave this alone. Maps to
-/// [`DefaultOpts::sea_sync_metadata`].
-///
-/// # Safety
-/// `config` must be a live config handle.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_sea_sync_metadata(
-    config: *mut KernelSessionConfig,
-    enabled: bool,
-) -> KernelStatusCode {
-    set_on_config(config, |c| {
-        c.sea_sync_metadata = enabled;
-        Ok(())
-    })
-}
-
 /// Configure the on-disk OAuth token cache for U2M (browser) auth.
 ///
-/// Mirrors the JDBC driver's `EnableTokenCache` / `TokenCachePassPhrase`
-/// pair:
+/// Mirrors the `EnableTokenCache` / `TokenCachePassPhrase` pair exposed by
+/// the reference ODBC driver and JDBC:
 ///
 /// * `enabled = true` (the default) persists the refresh token to
 ///   `~/.config/databricks-sql-kernel/oauth/` so the user is not sent
-///   through the browser on every connection. `passphrase` is then
-///   **required** — the cache holds a long-lived credential and is only
-///   ever written encrypted (AES-256-CBC, PBKDF2-HMAC-SHA256), so there is
-///   no plaintext fallback. Passing `enabled = true` with a null or blank
-///   passphrase makes [`kernel_session_open`] fail with
-///   `InvalidArgument`, but only when U2M auth is selected; PAT and M2M
-///   never touch the cache.
+///   through the browser on every connection. The file is **always
+///   encrypted** (AES-256-CBC, PBKDF2-HMAC-SHA256); there is no plaintext
+///   mode. A non-null `passphrase` keys it; a null or blank one falls back
+///   to a machine-local derived key, matching the reference driver, which
+///   caches with an empty `TokenCachePassPhrase`. Supplying a passphrase is
+///   stronger — see `TokenCacheConfig` for what the fallback does and does
+///   not protect against.
 /// * `enabled = false` disables **disk persistence only**. Tokens are
 ///   still reused and refreshed in memory for the session's lifetime, so
 ///   this does not re-trigger the browser flow on every refresh. Use it
-///   when the process has nowhere safe to keep a passphrase.
+///   when the process must not write credentials to disk at all.
 ///
-/// `passphrase` is ignored when `enabled` is `false`.
+/// `passphrase` is ignored when `enabled` is `false`. Only U2M auth touches
+/// the cache; PAT and M2M ignore this setting entirely.
 ///
 /// # Safety
 /// `config` must be a live config handle. `passphrase`, if non-null, must
@@ -830,7 +803,6 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         retry,
         ignore_transactions,
-        sea_sync_metadata,
         token_cache,
     } = config;
 
@@ -883,7 +855,6 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .session_conf(session_conf)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
-                    sea_sync_metadata,
                     ..Default::default()
                 });
 

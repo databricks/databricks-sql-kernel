@@ -39,9 +39,11 @@ use tokio::runtime::Handle as RuntimeHandle;
 
 /// Header telling the server a metadata query may be executed fully
 /// synchronously, letting it answer in the initial response instead of
-/// going through the asynchronous statement machinery. Sent only for
-/// synchronous metadata queries; see
-/// [`crate::config::DefaultOpts::sea_sync_metadata`].
+/// going through the asynchronous statement machinery.
+///
+/// Sent on every synchronous metadata query, unconditionally. It is
+/// advisory — a server that does not recognise it ignores it — so there is
+/// nothing for a caller to configure.
 const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
 
 /// Internal terminal-outcome for a single SEA statement response.
@@ -466,16 +468,21 @@ impl SeaRestTransport {
 
         // Signal that a metadata query may be served fully synchronously, so
         // the server can skip the async statement machinery and answer in the
-        // initial response. Mirrors the JDBC driver's EnableSeaSyncMetadata
-        // (default on), which gates the same header on the same three
-        // conditions: the flag is enabled, the statement is a metadata query,
-        // and execution is synchronous.
+        // initial response.
         //
-        // The async gate is what `request_type` gives us for free: the async
-        // execution path routes through `execute_statement_async` with
+        // Sent unconditionally for metadata queries — there is no opt-out knob.
+        // The header is advisory: a server that does not recognise it ignores
+        // it and the query still succeeds through the normal path, so there is
+        // no configuration a caller could need to express. (JDBC exposes an
+        // EnableSeaSyncMetadata property for this; we deliberately don't, since
+        // a flag whose only settings are "faster" and "same but slower" is a
+        // support liability rather than a feature.)
+        //
+        // The synchronous-only condition comes free from `request_type`: the
+        // async path routes through `submit_statement` with
         // `RequestType::ExecuteStatement`, so `ExecuteMetadataQuery` only ever
         // reaches here on the synchronous path.
-        if self.config.sea_sync_metadata && request_type == RequestType::ExecuteMetadataQuery {
+        if request_type == RequestType::ExecuteMetadataQuery {
             debug!("Adding {SEA_SYNC_METADATA_HEADER} for synchronous metadata query");
             builder = builder.header(SEA_SYNC_METADATA_HEADER, "true");
         }

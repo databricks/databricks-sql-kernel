@@ -192,10 +192,11 @@ fn build_auth_config_inner(
             // distinct from the napi (Node) binding's, which defaults to
             // its own client.
             //
-            // NOTE: the shared *token cache entry* this once implied no
-            // longer applies — disk caching is disabled below until this
-            // binding can accept an encryption passphrase. The client
-            // identity and cache key are still as described.
+            // Note this does NOT share a token cache *entry* with the
+            // standalone Thrift connector: the kernel writes to its own
+            // `~/.config/databricks-sql-kernel/oauth/` directory, and the
+            // Thrift connector caches U2M tokens in memory only. What is
+            // aligned is the OAuth app identity, not the on-disk cache.
             //
             // When BOTH defaults are in play (caller passed no
             // `client_id` and no `scopes`), also default the scopes to
@@ -220,22 +221,14 @@ fn build_auth_config_inner(
                 scopes,
                 token_url_override: oauth.token_url,
                 callback_timeout: oauth.callback_timeout_secs.map(Duration::from_secs),
-                // The on-disk cache defaults to ENABLED, which then requires an
-                // encryption passphrase (the cached payload holds a long-lived
-                // refresh token and is never written in the clear). This binding
-                // exposes no passphrase option, so leaving the default would fail
-                // every Python U2M connection at connect time. Disable it instead.
-                //
-                // Consequence worth knowing: this drops the cross-connection SSO
-                // reuse the comment above describes — each new session runs the
-                // browser flow rather than picking up a cached refresh token.
-                // In-process reuse is unaffected. Restoring persistence means
-                // surfacing a passphrase through `OAuthParams` (the equivalent of
-                // JDBC's TokenCachePassPhrase).
-                token_cache: Some(databricks_sql_kernel::TokenCacheConfig {
-                    enabled: false,
-                    passphrase: None,
-                }),
+                // `None` takes the kernel default: on-disk cache ENABLED,
+                // encrypted under a machine-local derived key since this
+                // binding exposes no passphrase option. That preserves
+                // cross-connection SSO reuse (the point of the cache) without
+                // ever writing the refresh token in the clear. Surfacing a
+                // passphrase through `OAuthParams` — the equivalent of JDBC's
+                // TokenCachePassPhrase — would strengthen it further.
+                token_cache: None,
             })
         }
         other => Err(format!(
@@ -373,16 +366,13 @@ mod tests {
                 );
                 assert!(token_url_override.is_none());
                 assert!(callback_timeout.is_none());
-                // Disk caching must stay OFF for this binding: the kernel
-                // default is ON, which requires an encryption passphrase this
-                // binding cannot supply, and that would fail every Python U2M
-                // connection at connect time.
+                // Left as `None` so the kernel default applies: on-disk cache
+                // enabled, encrypted under a machine-local derived key. Pinned
+                // because overriding it here would silently drop the
+                // cross-connection SSO reuse the cache exists to provide.
                 assert!(
-                    !token_cache
-                        .expect("token cache policy must be set explicitly")
-                        .enabled,
-                    "Python U2M must disable the on-disk token cache until a \
-                     passphrase can be supplied"
+                    token_cache.is_none(),
+                    "Python U2M should defer to the kernel's token-cache default"
                 );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
