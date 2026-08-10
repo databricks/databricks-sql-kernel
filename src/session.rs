@@ -913,17 +913,27 @@ pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
 /// into the typed [`ResultConfig`], then remove them from `session_conf`
 /// so they cannot leak onto the SEA wire.
 ///
-/// Today this handles only [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`]. A key
-/// that is absent leaves the field at its `ResultConfig` default (16); a
-/// present-but-unparseable or zero value is ignored (default preserved)
-/// with a warning rather than failing session creation — a
-/// best-effort tuning knob should never turn a typo into a connect
-/// error. A value above [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to
-/// that ceiling (with a warning) so a fat-fingered value can't drive peak
-/// RSS toward OOM. Matched case-insensitively, consistent with the rest of
-/// the `session_conf` handling; if a host sets two spellings that differ only
+/// Today this handles only [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`], the
+/// legacy magic-string channel by which a C-ABI host tuned
+/// `cloudfetch_max_chunks_in_memory` before a typed setter existed. A key
+/// that is absent leaves the field untouched; a present-but-unparseable or
+/// zero value is ignored (current value preserved) with a warning rather
+/// than failing session creation — a best-effort tuning knob should never
+/// turn a typo into a connect error. A value above
+/// [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to that ceiling (with a
+/// warning) so a fat-fingered value can't drive peak RSS toward OOM.
+/// Matched case-insensitively, consistent with the rest of the
+/// `session_conf` handling; if a host sets two spellings that differ only
 /// in case the lexicographically-last one wins deterministically (and all
 /// variants are stripped).
+///
+/// **Precedence: the typed setter wins.** The C-ABI
+/// `kernel_session_config_set_result_config` writes
+/// `ResultConfig::cloudfetch_max_chunks_in_memory` directly. This helper
+/// therefore only applies the magic-string value when the field is still
+/// at its default — a host that used the typed setter is never overridden
+/// by a stray string, but the string key is still stripped so it can't
+/// reach the wire.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
     // Collect EVERY case-insensitive spelling of the key, not just the first
     // one `HashMap` iteration happens to yield. Two variants that differ only
@@ -956,6 +966,19 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
         if let Some(v) = config.session_conf.remove(k) {
             raw = v;
         }
+    }
+    // The typed setter takes precedence: if the field has already been moved
+    // off its default (by `kernel_session_config_set_result_config` or a
+    // direct `ResultConfig`), don't let the legacy magic string clobber it.
+    // The key is still stripped above so it never reaches the wire.
+    if config.result.cloudfetch_max_chunks_in_memory
+        != ResultConfig::default().cloudfetch_max_chunks_in_memory
+    {
+        crate::klog::debug!(
+            "ignoring legacy cloudfetch_max_chunks_in_memory session_conf value; \
+             a typed result config already set this knob",
+        );
+        return;
     }
     match raw.trim().parse::<usize>() {
         Ok(n) if n > 0 => {
@@ -1361,6 +1384,31 @@ mod retry_config_tests {
         assert_eq!(
             cfg.result.cloudfetch_max_chunks_in_memory,
             CLOUDFETCH_MAX_CHUNKS_CEILING,
+        );
+    }
+
+    /// The typed setter wins over the legacy magic string: if
+    /// `cloudfetch_max_chunks_in_memory` has already been moved off its
+    /// default (as `kernel_session_config_set_result_config` does), a stray
+    /// magic-string value in session_conf must NOT clobber it — but the key
+    /// is still stripped so it can't reach the wire.
+    #[test]
+    fn typed_result_config_wins_over_legacy_magic_string() {
+        let mut cfg = config_with_session_conf(HashMap::from([(
+            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            "8".to_string(),
+        )]));
+        // Simulate the typed setter having already set a non-default value.
+        let typed = ResultConfig::default().cloudfetch_max_chunks_in_memory + 7;
+        cfg.result.cloudfetch_max_chunks_in_memory = typed;
+        apply_client_result_overrides(&mut cfg);
+        assert_eq!(
+            cfg.result.cloudfetch_max_chunks_in_memory, typed,
+            "typed value must survive; the legacy magic string must not override it"
+        );
+        assert!(
+            cfg.session_conf.is_empty(),
+            "the legacy key must still be stripped so it can't reach the wire"
         );
     }
 

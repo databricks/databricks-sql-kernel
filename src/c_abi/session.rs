@@ -26,7 +26,8 @@
 
 use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{
-    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig, TokenCacheConfig,
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TlsConfig,
+    TokenCacheConfig,
 };
 use crate::kernel_error::Error;
 use crate::session::Session;
@@ -117,6 +118,15 @@ pub struct KernelSessionConfig {
     /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
     /// touch the cache. See [`TokenCacheConfig`].
     token_cache: TokenCacheConfig,
+    /// Client-side result-management knobs (CloudFetch / inline streaming
+    /// tuning, flat-text rendering). Populated by
+    /// `kernel_session_config_set_result_config`,
+    /// `..._set_complex_types_as_json`, and `..._set_intervals_as_string`;
+    /// defaults to [`ResultConfig::default`]. These are **client-side**
+    /// behaviours folded into the kernel's `ResultConfig` at `open()` —
+    /// they never reach the SEA wire (unlike [`Self::session_conf`]). See
+    /// [`ResultConfig`].
+    result: ResultConfig,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -196,6 +206,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         ignore_transactions: true,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
+        // Kernel result defaults (CloudFetch enabled, Arrow-native types).
+        result: ResultConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -670,6 +682,117 @@ pub unsafe extern "C" fn kernel_session_config_set_token_cache(
     })
 }
 
+/// Configure client-side result streaming (CloudFetch + inline tuning).
+///
+/// All four knobs are **client-side** — they tune how the kernel fetches
+/// and buffers results and never reach the SEA wire (contrast
+/// `kernel_session_config_set_session_conf`, which carries server confs).
+///
+/// - `cloudfetch_enabled`: when `false`, every result is served inline
+///   (the execute request uses SEA `disposition = INLINE`), mirroring the
+///   reference JDBC driver's `EnableQueryResultDownload=0`. Default `true`.
+/// - `link_prefetch_window`: number of presigned CloudFetch URLs to
+///   prefetch ahead of the consumer. `0` ⇒ keep the kernel default (10).
+/// - `max_chunks_in_memory`: max decompressed CloudFetch chunks held in
+///   memory at once (bounds parallelism and peak RSS). `0` ⇒ keep the
+///   default (16). Values above the kernel ceiling
+///   ([`CLOUDFETCH_MAX_CHUNKS_CEILING`](crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING),
+///   256) are clamped with a `warn`, since peak RSS scales with this knob.
+/// - `inline_max_chunks_in_memory`: prefetch window for the inline-Arrow
+///   path (used when `cloudfetch_enabled = false`). `0` ⇒ keep the
+///   default (4).
+///
+/// **`0` means "keep the kernel default"** for every `usize` field, so a
+/// host that zero-initialises the argument list only changes
+/// `cloudfetch_enabled`. Maps to [`ResultConfig`].
+///
+/// This is the typed replacement for the legacy
+/// `cloudfetch_max_chunks_in_memory` value that was smuggled through
+/// `kernel_session_config_set_session_conf`. That fallback still works but
+/// this setter takes precedence — see `apply_client_result_overrides` in
+/// `src/session.rs`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_result_config(
+    config: *mut KernelSessionConfig,
+    cloudfetch_enabled: bool,
+    link_prefetch_window: usize,
+    max_chunks_in_memory: usize,
+    inline_max_chunks_in_memory: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.result.cloudfetch_enabled = cloudfetch_enabled;
+        // `0` ⇒ leave the kernel default in place (a host zeroing its
+        // struct must not accidentally clamp prefetch/buffer windows to 0).
+        if link_prefetch_window != 0 {
+            c.result.cloudfetch_link_prefetch_window = link_prefetch_window;
+        }
+        if max_chunks_in_memory != 0 {
+            let clamped = max_chunks_in_memory.min(crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING);
+            if clamped != max_chunks_in_memory {
+                crate::klog::warn!(
+                    requested = max_chunks_in_memory,
+                    ceiling = crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING,
+                    "clamping cloudfetch max_chunks_in_memory to the ceiling \
+                     (peak RSS scales with this knob)",
+                );
+            }
+            c.result.cloudfetch_max_chunks_in_memory = clamped;
+        }
+        if inline_max_chunks_in_memory != 0 {
+            c.result.inline_max_chunks_in_memory = inline_max_chunks_in_memory;
+        }
+        Ok(())
+    })
+}
+
+/// Render complex-typed result columns (`ARRAY` / `MAP` / `STRUCT` /
+/// `VARIANT` / `GEOMETRY` / `GEOGRAPHY`) as JSON-text `Utf8` instead of
+/// Arrow-native nested types. Default `false` (Arrow-native).
+///
+/// Set `true` for flat-text bindings that can't consume Arrow nested
+/// types — mirrors PySQL's `_use_arrow_native_complex_types=False` and the
+/// JDBC driver's `complexDatatypeSupport=false`. Maps to
+/// [`ResultConfig::complex_types_as_json`]. Client-side only; never on the
+/// wire.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_complex_types_as_json(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.result.complex_types_as_json = enabled;
+        Ok(())
+    })
+}
+
+/// Render `INTERVAL` / `DURATION` result columns as canonical Databricks
+/// text (`Utf8`) instead of Arrow interval/duration types. Default
+/// `false`.
+///
+/// Set `true` for bindings that hand Arrow batches to pyarrow's Python
+/// layer, which can't decode Arrow's `month_interval` type. Maps to
+/// [`ResultConfig::intervals_as_string`]. Client-side only; never on the
+/// wire.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_intervals_as_string(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.result.intervals_as_string = enabled;
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -804,6 +927,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         retry,
         ignore_transactions,
         token_cache,
+        result,
     } = config;
 
     block_on_ffi(move || {
@@ -853,6 +977,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .connection(connection)
                 .auth(auth)
                 .session_conf(session_conf)
+                .result(result)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
                     ..Default::default()

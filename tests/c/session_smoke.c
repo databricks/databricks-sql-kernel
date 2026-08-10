@@ -203,6 +203,39 @@ static void test_u2m_and_header_setters(void) {
   kernel_session_config_free(config);
 }
 
+/* Result-config setters accept valid input and null-guard the handle. */
+static void test_result_config_setters(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  /* Full result config: disable CloudFetch, custom windows. */
+  KernelStatusCode rc = kernel_session_config_set_result_config(config, false, 20, 32, 8);
+  CHECK(rc == KernelStatusCode_Success, "set_result_config (explicit) succeeds");
+  /* Zeroed size_t fields => keep kernel defaults; only cloudfetch_enabled changes. */
+  rc = kernel_session_config_set_result_config(config, true, 0, 0, 0);
+  CHECK(rc == KernelStatusCode_Success, "set_result_config (zeros keep defaults) succeeds");
+  /* An absurd max_chunks value is clamped (not rejected) to the ceiling. */
+  rc = kernel_session_config_set_result_config(config, true, 0, 1000000, 0);
+  CHECK(rc == KernelStatusCode_Success, "set_result_config (over-ceiling clamps, not fails)");
+
+  rc = kernel_session_config_set_complex_types_as_json(config, true);
+  CHECK(rc == KernelStatusCode_Success, "set_complex_types_as_json succeeds");
+  rc = kernel_session_config_set_intervals_as_string(config, true);
+  CHECK(rc == KernelStatusCode_Success, "set_intervals_as_string succeeds");
+
+  kernel_session_config_free(config);
+
+  /* Null handle → InvalidArgument, no crash. */
+  rc = kernel_session_config_set_result_config(NULL, false, 0, 0, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_result_config(NULL) → InvalidArgument");
+  rc = kernel_session_config_set_complex_types_as_json(NULL, true);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_complex_types_as_json(NULL) → InvalidArgument");
+  rc = kernel_session_config_set_intervals_as_string(NULL, true);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_intervals_as_string(NULL) → InvalidArgument");
+}
+
 /* kernel_init_logging is idempotent and null-tolerant. */
 static void test_init_logging(void) {
   KernelStatusCode rc = kernel_init_logging("WARN", NULL);
@@ -264,6 +297,7 @@ int main(void) {
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
+  test_result_config_setters();
   test_init_logging();
   test_is_open_null_guards();
   test_submit_stub_rejects();
