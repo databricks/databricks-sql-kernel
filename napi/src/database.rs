@@ -394,6 +394,11 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 options.oauth_scopes.clone(),
                 None,
                 None,
+                // `None` takes the kernel default: on-disk cache enabled,
+                // encrypted under a machine-local derived key since this
+                // binding exposes no passphrase option. Surfacing one through
+                // `options` would strengthen it further.
+                None,
             ))
         }
     }

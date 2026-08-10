@@ -607,8 +607,9 @@ impl StreamingCloudFetchProvider {
             // separate `refetch_link` calls when a burst of chunks
             // expires concurrently.
             let link = {
-                let entry = ctx.chunks.get(&chunk_index);
-                let stored_link = entry.as_ref().and_then(|e| e.link.clone());
+                // Clone the link and release the DashMap guard before any
+                // refresh awaits; refresh_links_batch accesses the same map.
+                let stored_link = ctx.chunks.get(&chunk_index).and_then(|e| e.link.clone());
 
                 match stored_link {
                     Some(link) if !link.is_expired() => link,
@@ -723,9 +724,15 @@ impl StreamingCloudFetchProvider {
             match ctx.downloader.download(&link).await {
                 Ok(batches) => return Ok(batches),
                 Err(e) => {
+                    // Every completed download failure consumes the hard attempt
+                    // budget, even when its link became stale while in flight.
+                    attempts += 1;
+                    if attempts >= ctx.max_retries {
+                        return Err(e);
+                    }
                     // Stale-snapshot detection. Two ways a download
-                    // can fail against an already-stale URL through
-                    // no fault of the retry budget:
+                    // can fail against a URL that became stale while
+                    // the request was in flight:
                     //
                     // 1. **Concurrent refresh** updated the cached
                     //    link while we were `.await`-ing on
@@ -760,7 +767,7 @@ impl StreamingCloudFetchProvider {
                     if was_refreshed_concurrently || attempted_link_now_expired {
                         debug!(
                             "Chunk {} download failed against a link the cache now \
-                             considers stale ({}); not counting against retry budget: {}",
+                             considers stale ({}); refreshing before retry: {}",
                             chunk_index,
                             if was_refreshed_concurrently {
                                 "refreshed concurrently"
@@ -769,16 +776,11 @@ impl StreamingCloudFetchProvider {
                             },
                             e,
                         );
-                        // Don't increment `attempts`; don't sleep.
-                        // Loop body re-reads `entry.link` and picks
-                        // up the fresh URL on the next iteration.
+                        // Don't sleep. The next iteration refreshes or reads the
+                        // latest URL; the failure was charged above.
                         continue;
                     }
 
-                    attempts += 1;
-                    if attempts >= ctx.max_retries {
-                        return Err(e);
-                    }
                     warn!(
                         "Chunk {} download failed (attempt {}/{}): {}, retrying...",
                         chunk_index, attempts, ctx.max_retries, e
@@ -1352,6 +1354,115 @@ mod tests {
             http_headers: HashMap::new(),
             next_chunk_index: Some(chunk_index + 1),
         }
+    }
+
+    #[tokio::test]
+    async fn persistent_download_failure_is_bounded_when_links_expire_in_flight() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::cloudfetch::LINK_EXPIRY_BUFFER_SECS;
+        use crate::types::sea::CompressionCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const RESPONSE_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+        const MAX_DOWNLOAD_ATTEMPTS: u32 = 2;
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk-0.arrow"))
+            .respond_with(ResponseTemplate::new(500).set_delay(RESPONSE_DELAY))
+            .mount(&server)
+            .await;
+
+        // Disable the HTTP client's own retries so this test isolates the
+        // provider-level download budget.
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let downloader = Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ));
+
+        #[derive(Debug)]
+        struct BoundaryRefreshFetcher {
+            url: String,
+            refresh_calls: AtomicUsize,
+        }
+
+        impl BoundaryRefreshFetcher {
+            fn link(&self) -> CloudFetchLink {
+                CloudFetchLink {
+                    url: self.url.clone(),
+                    expiration: chrono::Utc::now()
+                        + chrono::Duration::seconds(LINK_EXPIRY_BUFFER_SECS)
+                        + chrono::Duration::milliseconds(50),
+                    ..create_test_link(0)
+                }
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for BoundaryRefreshFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!()
+            }
+
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!()
+            }
+
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(vec![self.link()])
+            }
+        }
+
+        let fetcher = Arc::new(BoundaryRefreshFetcher {
+            url: format!("{}/chunk-0.arrow", server.uri()),
+            refresh_calls: AtomicUsize::new(0),
+        });
+        let chunks = Arc::new(DashMap::new());
+        chunks.insert(0, entry_with_state(fetcher.link(), ChunkState::Downloading));
+        let ctx = DownloadCtx {
+            downloader,
+            link_fetcher: fetcher,
+            chunks,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            cancel_token: CancellationToken::new(),
+            statement_id: None,
+            max_retries: MAX_DOWNLOAD_ATTEMPTS,
+            retry_delay: std::time::Duration::ZERO,
+        };
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_millis(700),
+            StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+        )
+        .await
+        .expect("persistent failures must exhaust the download attempt budget");
+
+        let error = result.expect_err("persistent HTTP 500 must be terminal");
+        assert!(
+            error.message.contains("HTTP 500"),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            server.received_requests().await.unwrap().len(),
+            MAX_DOWNLOAD_ATTEMPTS as usize,
+            "in-flight link expiry must not bypass the download attempt budget",
+        );
     }
 
     #[test]

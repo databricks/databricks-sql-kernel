@@ -173,8 +173,24 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
     })
 }
 
-/// List tables filtered by catalog (exact), schema / table patterns,
-/// and an optional comma-separated `table_types` filter.
+/// List tables filtered by catalog (**pattern**), schema / table
+/// patterns, and an optional comma-separated `table_types` filter.
+///
+/// The catalog is an ODBC/JDBC LIKE pattern here (`%` / `_`),
+/// matching Thrift's `TGetTablesReq.catalogName` and ODBC `SQLTables`
+/// under the default `SQL_ATTR_METADATA_ID = SQL_FALSE`. A literal
+/// catalog (no wildcards, or `SQL_ATTR_METADATA_ID = SQL_TRUE`
+/// identifier semantics) still works — it takes the fast exact
+/// single-catalog path. See [`Metadata::list_tables`](crate::metadata_v0::Metadata::list_tables).
+///
+/// **Empty-string catalog:** at this C ABI boundary a `NULL` **or an
+/// empty / whitespace-only** `catalog` is normalized to "all catalogs"
+/// (the ODBC convention where drivers pass `""` for "no catalog
+/// filter"). This differs from the Rust / pyo3 / napi surface, where an
+/// empty-string catalog is a valid `LikePattern` meaning "match
+/// nothing" (zero rows). C / ODBC callers who want "match nothing"
+/// should not rely on `""`; the pattern-value distinction only exists
+/// on the typed surfaces.
 ///
 /// # Safety
 /// `session` must be a live session handle; the string args, if
@@ -190,7 +206,7 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
+            let catalog = opt_pattern(catalog, "catalog")?;
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
             // Split the comma-separated table types into a borrowed slice.
@@ -324,10 +340,30 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
     })
 }
 
-// PR 7d follow-ups: functions, procedures, type_info, table_types — the
-// kernel `Metadata` exposes these (some synthesised in-memory). Wire them
-// over the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
-// SQLProcedures.
+/// List the table types the workspace supports (`TABLE`, `VIEW`,
+/// `SYSTEM TABLE`, …). No filters and no wire call — the set is derived
+/// from the session's transport (see `Metadata::table_types`). Backs the
+/// ODBC `SQLTables(table_type = SQL_ALL_TABLE_TYPES)` enumeration mode.
+/// The stream carries a single `TABLE_TYPE` column (JDBC `getTableTypes`
+/// shape).
+///
+/// # Safety
+/// `session` must be a live handle from `kernel_session_open`; `out`
+/// must be a valid, writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_list_table_types(
+    session: *mut kernel_session_t,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move { session.metadata().table_types().await })
+    })
+}
+
+// PR 7d follow-ups: functions, procedures, type_info — the kernel
+// `Metadata` exposes these (some synthesised in-memory). Wire them over
+// the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
+// SQLProcedures / SQLPrimaryKeys-adjacent surfaces.
 
 #[cfg(test)]
 mod tests {

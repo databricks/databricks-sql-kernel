@@ -42,7 +42,7 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -133,12 +133,67 @@ fn succeeded_inline_response_body(batch: &RecordBatch) -> String {
     .to_string()
 }
 
+/// SEA response body for a FAILED statement with the given SQLSTATE +
+/// message — drives the kernel's terminal-error path. A `42704` state
+/// is treated as object-not-found (skipped in the fan-out); anything
+/// else propagates.
+fn failed_response_body(sql_state: &str, message: &str) -> String {
+    json!({
+        "statement_id": "stmt-test",
+        "status": {
+            "state": "FAILED",
+            "error": {
+                "error_code": "BAD_REQUEST",
+                "message": message,
+                "sql_state": sql_state,
+            }
+        },
+    })
+    .to_string()
+}
+
 async fn mount_execute(server: &MockServer, body: String) {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
         .respond_with(ResponseTemplate::new(200).set_body_string(body))
         .mount(server)
         .await;
+}
+
+/// Mount `/statements` so it only responds when the request body (the
+/// SEA statement JSON) contains `sql_substr`. If the kernel emits
+/// different SQL, no stub matches and the call fails — so this asserts
+/// the exact SQL the routing produced.
+async fn mount_execute_expecting_sql(server: &MockServer, sql_substr: &str, body: String) {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(sql_substr))
+        .respond_with(ResponseTemplate::new(200).set_body_string(body))
+        .mount(server)
+        .await;
+}
+
+/// Like [`succeeded_inline_response_body`] but reports
+/// `status.state == CLOSED`. This is the common inline/direct-result
+/// case for metadata `SHOW …` queries: the server auto-closes the
+/// statement and returns `CLOSED`, so the kernel must NOT issue a
+/// follow-up `CloseStatement` (DELETE) on it.
+fn closed_inline_response_body(batch: &RecordBatch) -> String {
+    succeeded_inline_response_body(batch).replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
+}
+
+/// Like [`succeeded_inline_response_body`] but with a caller-chosen
+/// `statement_id` and `status.state`. Used by the wildcard fan-out
+/// CLOSED-skip test, which stubs several statements in one call and must
+/// distinguish the `SHOW CATALOGS` statement from each per-catalog
+/// `SHOW TABLES` statement by id when asserting on DELETEs.
+fn inline_response_body_with(batch: &RecordBatch, statement_id: &str, state: &str) -> String {
+    succeeded_inline_response_body(batch)
+        .replace(
+            r#""statement_id":"stmt-test""#,
+            &format!(r#""statement_id":"{statement_id}""#),
+        )
+        .replace(r#""state":"SUCCEEDED""#, &format!(r#""state":"{state}""#))
 }
 
 fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
@@ -188,6 +243,40 @@ async fn drain_stream(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<R
 
 fn col_names(schema: &arrow_schema::Schema) -> Vec<String> {
     schema.fields().iter().map(|f| f.name().clone()).collect()
+}
+
+/// Poll `server.received_requests()` until `expected` `DELETE`s to the
+/// `stmt-test` statement endpoint are observed, or `timeout` elapses;
+/// returns the final observed count. This replaces a bare `sleep` when
+/// asserting on the fire-and-forget `StatementCloseGuard`: for a positive
+/// expectation it waits only as long as needed (so a close delayed past a
+/// fixed window can't flake the test), and for a negative expectation
+/// (`expected == 0`) it still gives an erroneously-spawned close the full
+/// `timeout` to reach the wire but breaks early the instant one appears, so
+/// the negative assertion stays reliably able to fail under CI load.
+async fn wait_for_close_delete(
+    server: &MockServer,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "DELETE" && r.url.path() == "/api/2.0/sql/statements/stmt-test"
+            })
+            .count();
+        // Positive expectation met, or a spurious DELETE already appeared for a
+        // negative expectation — either way there is nothing more to wait for.
+        if count >= expected.max(1) || tokio::time::Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 // ─── Thrift-shape reshape tests ─────────────────────────────────────
@@ -317,6 +406,364 @@ async fn list_tables_returns_jdbc_columns_with_synthesised_nulls() {
             "{col} should be null"
         );
     }
+}
+
+#[tokio::test]
+async fn list_tables_literal_catalog_emits_in_catalog_unescaped() {
+    // A literal catalog with an escaped underscore (`comp\_tests`) must
+    // route to the fast exact path: `SHOW TABLES IN CATALOG comp_tests`
+    // (unescaped, backtick-quoted), NOT the all-catalogs path. The
+    // body-matched stub only responds if that SQL was emitted.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t1")]),
+        ("catalogName", vec![Some("comp_tests")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_tests`",
+        succeeded_inline_response_body(&raw),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(
+            Some(LikePattern::new(r"comp\_tests").unwrap()),
+            None,
+            None,
+            None,
+        )
+        .await
+        .expect("list_tables literal catalog");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches[0].num_rows(), 1);
+}
+
+#[tokio::test]
+async fn list_tables_wildcard_catalog_fans_out_per_matching_catalog() {
+    // A wildcard catalog (`comp_%`) must NOT scan all catalogs. Instead
+    // it enumerates catalogs (`SHOW CATALOGS`), filters names, and issues
+    // one `SHOW TABLES IN CATALOG <name>` per match. `comp_%` matches
+    // `comp_tests` and `comp-x` (the `_` is one char) but not `other`.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    // `SHOW CATALOGS` → three catalogs (server column is `catalog`).
+    let catalogs = string_batch(vec![(
+        "catalog",
+        vec![Some("comp_tests"), Some("comp-x"), Some("other")],
+    )]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        succeeded_inline_response_body(&catalogs),
+    )
+    .await;
+
+    // Per-catalog `SHOW TABLES IN CATALOG <name>`: one stub per matching
+    // catalog, each returning its own table so we can assert both were
+    // queried and that `other` was not.
+    let tables_comp_tests = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t_ct")]),
+        ("catalogName", vec![Some("comp_tests")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_tests`",
+        succeeded_inline_response_body(&tables_comp_tests),
+    )
+    .await;
+    let tables_comp_x = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t_cx")]),
+        ("catalogName", vec![Some("comp-x")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp-x`",
+        succeeded_inline_response_body(&tables_comp_x),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("comp_%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables wildcard catalog");
+    let batches = drain_stream(&mut stream).await;
+
+    // Rows from both matching catalogs, none from `other`. (If the kernel
+    // had queried `other`, no stub matches `IN CATALOG \`other\`` and the
+    // call would have errored.)
+    let mut cats: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let arr = b.column_by_name("TABLE_CAT").unwrap().as_string::<i32>();
+            (0..arr.len())
+                .map(|i| arr.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    cats.sort();
+    assert_eq!(cats, vec!["comp-x".to_owned(), "comp_tests".to_owned()]);
+}
+
+#[tokio::test]
+async fn list_tables_percent_catalog_uses_single_all_catalogs_query() {
+    // `%` matches every catalog and is semantically identical to `None`,
+    // so it must take the single `SHOW TABLES IN ALL CATALOGS` path, NOT
+    // enumerate + fan out. The stub only matches `IN ALL CATALOGS`; if the
+    // kernel instead issued `SHOW CATALOGS` + per-catalog queries, no stub
+    // would match and the call would fail.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t1")]),
+        ("catalogName", vec![Some("anycat")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN ALL CATALOGS",
+        succeeded_inline_response_body(&raw),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables %% catalog");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+}
+
+#[tokio::test]
+async fn list_tables_wildcard_skips_catalog_dropped_mid_enumeration() {
+    // Resilience contract: a catalog that vanishes between SHOW CATALOGS
+    // and its SHOW TABLES (object-not-found) contributes zero rows rather
+    // than failing the whole call.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let catalogs = string_batch(vec![("catalog", vec![Some("comp_a"), Some("comp_b")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        succeeded_inline_response_body(&catalogs),
+    )
+    .await;
+
+    // comp_a returns a table; comp_b was dropped → 42704 not-found.
+    let tables_a = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t_a")]),
+        ("catalogName", vec![Some("comp_a")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_a`",
+        succeeded_inline_response_body(&tables_a),
+    )
+    .await;
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_b`",
+        failed_response_body("42704", "catalog not found"),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("comp_%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables tolerates a dropped catalog");
+    let batches = drain_stream(&mut stream).await;
+    let cats: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let arr = b.column_by_name("TABLE_CAT").unwrap().as_string::<i32>();
+            (0..arr.len())
+                .map(|i| arr.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    assert_eq!(cats, vec!["comp_a".to_owned()]);
+}
+
+#[tokio::test]
+async fn list_tables_wildcard_propagates_non_not_found_error() {
+    // A real (non-not-found) per-catalog error must abort the whole call —
+    // NOT silently return partial results.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let catalogs = string_batch(vec![("catalog", vec![Some("comp_a")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        succeeded_inline_response_body(&catalogs),
+    )
+    .await;
+    // Permission error (42501), not object-not-found.
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_a`",
+        failed_response_body("42501", "insufficient permissions"),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let result = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("comp_%").unwrap()), None, None, None)
+        .await;
+    match result {
+        Err(e) => assert!(
+            e.message.contains("insufficient permissions")
+                || e.sql_state.as_deref() == Some("42501"),
+            "expected the permission error to propagate, got: {} / {:?}",
+            e.message,
+            e.sql_state
+        ),
+        Ok(mut s) => {
+            // A stream may resolve lazily; draining must surface the error.
+            let err = async {
+                while s.next_batch().await?.is_some() {}
+                Ok::<_, databricks_sql_kernel::Error>(())
+            }
+            .await
+            .expect_err("non-not-found per-catalog error must propagate");
+            assert!(
+                err.message.contains("insufficient permissions")
+                    || err.sql_state.as_deref() == Some("42501")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn list_tables_wildcard_zero_catalogs_match_returns_empty() {
+    // A wildcard pattern that matches no catalog returns a typed empty
+    // result and issues NO per-catalog query (no `IN CATALOG` stub is
+    // mounted, so any such call would fail).
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let catalogs = string_batch(vec![("catalog", vec![Some("main"), Some("other")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        succeeded_inline_response_body(&catalogs),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("zzz%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables zero-match");
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn list_tables_wildcard_fans_out_beyond_inflight_cap() {
+    // >8 matching catalogs exercises the bounded-parallel refill loop: all
+    // N must be queried and their rows returned, not just the first 8.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let names: Vec<String> = (0..12).map(|i| format!("cat_{i:02}")).collect();
+    let name_refs: Vec<Option<&str>> = names.iter().map(|s| Some(s.as_str())).collect();
+    let catalogs = string_batch(vec![("catalog", name_refs)]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        succeeded_inline_response_body(&catalogs),
+    )
+    .await;
+    // One per-catalog stub each, keyed on its exact IN CATALOG SQL.
+    for name in &names {
+        let tables = string_batch(vec![
+            ("namespace", vec![Some("s")]),
+            ("tableName", vec![Some("t")]),
+            ("catalogName", vec![Some(name.as_str())]),
+            ("tableType", vec![Some("TABLE")]),
+        ]);
+        mount_execute_expecting_sql(
+            &server,
+            &format!("IN CATALOG `{name}`"),
+            succeeded_inline_response_body(&tables),
+        )
+        .await;
+    }
+
+    let session = open_session(&server).await;
+    // `cat_%` matches all 12 (but is not a match-all `%`, so it fans out).
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("cat%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables >8 fan-out");
+    let batches = drain_stream(&mut stream).await;
+    let mut cats: Vec<String> = batches
+        .iter()
+        .flat_map(|b| {
+            let arr = b.column_by_name("TABLE_CAT").unwrap().as_string::<i32>();
+            (0..arr.len())
+                .map(|i| arr.value(i).to_owned())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    cats.sort();
+    assert_eq!(cats, names, "all 12 catalogs must be queried and returned");
+}
+
+#[tokio::test]
+async fn list_tables_empty_catalog_matches_nothing_without_wire_call() {
+    // An empty catalog pattern is "match nothing": no `/statements` stub
+    // is mounted, so if the kernel made a wire call the test would hang /
+    // fail. It must instead return an empty result locally.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new("").unwrap()), None, None, None)
+        .await
+        .expect("list_tables empty catalog");
+    // Still the JDBC getTables shape, zero rows.
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    let total: usize = batches.iter().map(|b| b.num_rows()).sum();
+    assert_eq!(total, 0);
 }
 
 #[tokio::test]
@@ -752,4 +1199,239 @@ async fn identifier_validation_propagates_invalid_argument() {
 
     let err = LikePattern::new("with\0nul").expect_err("NUL byte rejected");
     assert_eq!(err.code, ErrorCode::InvalidArgument);
+}
+
+// ─── CloseStatement / status.state==CLOSED handling (issue #168) ───
+
+/// Regression for issue #168: when the `ExecuteStatement` response for a
+/// metadata query already reports `status.state == CLOSED`, the statement
+/// is closed server-side and the kernel must NOT issue a redundant
+/// `DELETE /api/2.0/sql/statements/<id>` (CloseStatement) on it — matching
+/// the regular-query path. Before the fix, the metadata path always
+/// installs a `StatementCloseGuard`, firing the redundant DELETE on stream
+/// drop.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![("catalog", vec![Some("main")])]);
+    // Inline result with status.state == CLOSED — server already closed it.
+    mount_execute(&server, closed_inline_response_body(&raw)).await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — a redundant close guard would fire now.
+    }
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears so the negative
+    // assertion stays reliably able to fail under CI load.
+    let closes = wait_for_close_delete(&server, 0, std::time::Duration::from_millis(500)).await;
+    assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
+}
+
+/// Regression-guard for issue #168's fix: when the metadata
+/// `ExecuteStatement` response reports a non-CLOSED terminal state
+/// (`SUCCEEDED`), the server still owns the statement, so the kernel MUST
+/// still issue exactly one `CloseStatement` (DELETE) on stream drop. This
+/// ensures the CLOSED-skip does not over-correct and reintroduce the
+/// server-statement leak that `from_reader_with_close` guards against.
+#[tokio::test]
+async fn metadata_succeeded_response_still_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![("catalog", vec![Some("main")])]);
+    // Inline result with status.state == SUCCEEDED — server still owns it.
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+
+    // Scoped expectation: exactly one DELETE on the statement endpoint.
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — the close guard must fire the DELETE.
+    }
+    // Poll until the fire-and-forget close hits the wire (bounded by a
+    // timeout) rather than assuming it lands within a fixed sleep — a close
+    // delayed under CI load must not flake this positive assertion.
+    let closes = wait_for_close_delete(&server, 1, std::time::Duration::from_millis(2000)).await;
+    assert_eq!(
+        closes, 1,
+        "SUCCEEDED response must trigger exactly one CloseStatement"
+    );
+    // `_close` also verifies expect(1) when it drops at end of scope.
+}
+
+/// Same CLOSED-skip guarantee as
+/// [`metadata_closed_response_skips_close_statement`], but exercised
+/// through `list_tables()` rather than `list_catalogs()`. Unlike
+/// `list_catalogs` (which takes the no-error early-`?` path), the other
+/// metadata methods route the transport result through a
+/// `match { Ok(r) => r, Err(e) => return not_found_or(...) }` before
+/// reaching the shared `close_id` reshape. This test guards that more
+/// common code shape so a future refactor that reorders the
+/// `close_id`/reshape sequence on a `match`-branch method still gets
+/// caught.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_statement_on_match_branch() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![
+        ("namespace", vec![Some("default")]),
+        ("tableName", vec![Some("t1")]),
+        ("catalogName", vec![Some("main")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    // Inline result with status.state == CLOSED — server already closed it.
+    mount_execute(&server, closed_inline_response_body(&raw)).await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_tables(None, None, None, None)
+            .await
+            .expect("list_tables");
+        let _ = drain_stream(&mut stream).await;
+        // stream drops here — a redundant close guard would fire now.
+    }
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears so the negative
+    // assertion stays reliably able to fail under CI load.
+    let closes = wait_for_close_delete(&server, 0, std::time::Duration::from_millis(500)).await;
+    assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
+}
+
+/// Same CLOSED-skip guarantee as
+/// [`metadata_closed_response_skips_close_statement`], but for the
+/// wildcard-catalog fan-out path
+/// (`list_tables_matching_catalogs` → `fetch_tables_for_catalog`). That
+/// site does NOT delegate to `from_reader_with_close`; it opens one
+/// statement per catalog, computes `close_id(&raw)` (empty when the
+/// server already reported `CLOSED`), and only fires an explicit
+/// `close_statement()` when the id is non-empty. A wildcard pattern
+/// (`comp_%`) is required to reach it — the other CLOSED-skip tests drive
+/// `list_catalogs()` / `list_tables(None, …)`, which never enter the
+/// fan-out. Stub `SHOW CATALOGS` + a per-catalog `SHOW TABLES` that both
+/// return `state == CLOSED`, and assert zero DELETEs on the per-catalog
+/// statement, so a future refactor of the bespoke `if !stmt_id.is_empty()`
+/// guard that reintroduces the redundant close is caught here.
+#[tokio::test]
+async fn metadata_closed_response_skips_close_on_wildcard_fanout() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    // `SHOW CATALOGS` → one matching catalog, returned CLOSED.
+    let catalogs = string_batch(vec![("catalog", vec![Some("comp_a")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW CATALOGS",
+        inline_response_body_with(&catalogs, "stmt-catalogs", "CLOSED"),
+    )
+    .await;
+
+    // Per-catalog `SHOW TABLES IN CATALOG comp_a`, also returned CLOSED so
+    // the fan-out's `close_id` yields an empty id and the explicit
+    // `close_statement()` must be skipped.
+    let tables = string_batch(vec![
+        ("namespace", vec![Some("s")]),
+        ("tableName", vec![Some("t_a")]),
+        ("catalogName", vec![Some("comp_a")]),
+        ("tableType", vec![Some("TABLE")]),
+    ]);
+    mount_execute_expecting_sql(
+        &server,
+        "IN CATALOG `comp_a`",
+        inline_response_body_with(&tables, "stmt-tables-comp-a", "CLOSED"),
+    )
+    .await;
+
+    // Scoped expectation: NO DELETE on the per-catalog statement endpoint.
+    // This is the statement with the distinct close logic; the bespoke
+    // guard must not fire a redundant CloseStatement on it.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-tables-comp-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stream = session
+            .metadata()
+            .list_tables(Some(LikePattern::new("comp_%").unwrap()), None, None, None)
+            .await
+            .expect("list_tables wildcard catalog");
+        let batches = drain_stream(&mut stream).await;
+        // Sanity: the fan-out actually produced the comp_a row (i.e. we
+        // exercised `fetch_tables_for_catalog`, not an empty short-circuit).
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 1);
+    }
+
+    // Give any (erroneously) spawned fire-and-forget close the full window
+    // to reach the wire, but break early the instant one appears.
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        let closes = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| {
+                r.method.as_str() == "DELETE"
+                    && r.url.path() == "/api/2.0/sql/statements/stmt-tables-comp-a"
+            })
+            .count();
+        assert_eq!(
+            closes, 0,
+            "CLOSED per-catalog statement must not trigger CloseStatement"
+        );
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
 }

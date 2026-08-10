@@ -17,7 +17,14 @@
 //! This module provides disk persistence for OAuth tokens across connections.
 //! The cache is separate from the Python SDK cache to avoid compatibility issues.
 //! Cache I/O errors are logged as warnings but never block authentication.
+//!
+//! The payload is **always encrypted** under a caller-supplied passphrase
+//! (see [`super::cache_crypto`]) because it carries a long-lived refresh
+//! token. Whether caching happens at all, and which passphrase is used, is
+//! decided upstream by [`crate::config::TokenCacheConfig`]; reaching this
+//! module already implies caching is enabled and a passphrase was supplied.
 
+use super::cache_crypto;
 use super::token::OAuthToken;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -76,22 +83,34 @@ impl TokenCache {
     /// Returns the cache directory path.
     /// Location: `~/.config/databricks-sql-kernel/oauth/`
     fn cache_dir() -> Option<PathBuf> {
-        dirs::config_dir().map(|mut path| {
-            path.push("databricks-sql-kernel");
-            path.push("oauth");
-            path
-        })
+        Self::cache_dir_under(dirs::config_dir()?)
+    }
+
+    /// Returns the cache directory beneath an explicit config root.
+    ///
+    /// Split out from [`Self::cache_dir`] so tests can point the cache at a
+    /// temp directory without touching `XDG_CONFIG_HOME` — process-global
+    /// env state that would race against tests running in parallel.
+    fn cache_dir_under(config_root: PathBuf) -> Option<PathBuf> {
+        let mut path = config_root;
+        path.push("databricks-sql-kernel");
+        path.push("oauth");
+        Some(path)
     }
 
     /// Returns the full cache file path for the given cache key.
     fn cache_file_path(host: &str, client_id: &str, scopes: &[String]) -> Option<PathBuf> {
-        let cache_key = CacheKey::new(host, client_id, scopes);
-        let filename = cache_key.to_filename();
+        Self::cache_dir().map(|dir| Self::cache_file_path_in(&dir, host, client_id, scopes))
+    }
 
-        Self::cache_dir().map(|mut path| {
-            path.push(filename);
-            path
-        })
+    /// Returns the cache file path for a key inside an explicit directory.
+    fn cache_file_path_in(
+        dir: &std::path::Path,
+        host: &str,
+        client_id: &str,
+        scopes: &[String],
+    ) -> PathBuf {
+        dir.join(CacheKey::new(host, client_id, scopes).to_filename())
     }
 
     /// Loads a cached token if available.
@@ -113,33 +132,59 @@ impl TokenCache {
     /// # Returns
     ///
     /// `Some(OAuthToken)` if a cached token is found, `None` otherwise.
-    pub fn load(host: &str, client_id: &str, scopes: &[String]) -> Option<OAuthToken> {
+    pub fn load(
+        host: &str,
+        client_id: &str,
+        scopes: &[String],
+        passphrase: &str,
+    ) -> Option<OAuthToken> {
         let cache_path = Self::cache_file_path(host, client_id, scopes)?;
+        Self::load_from(&cache_path, passphrase)
+    }
 
+    /// [`Self::load`] against an explicit path, so tests can exercise the
+    /// real decrypt-and-parse logic without depending on the user's config
+    /// directory.
+    fn load_from(cache_path: &std::path::Path, passphrase: &str) -> Option<OAuthToken> {
         // Check if cache file exists
         if !cache_path.exists() {
             crate::klog::debug!("Token cache miss: file does not exist at {:?}", cache_path);
             return None;
         }
 
-        // Read and deserialize the cache file
-        match fs::read_to_string(&cache_path) {
-            Ok(contents) => match serde_json::from_str::<OAuthToken>(&contents) {
-                Ok(token) => {
-                    crate::klog::debug!("Token cache hit: loaded from {:?}", cache_path);
-                    Some(token)
-                }
-                Err(e) => {
-                    crate::klog::warn!(
-                        "Token cache corrupted at {:?}, ignoring: {}",
-                        cache_path,
-                        e
-                    );
-                    None
-                }
-            },
+        // Read and decrypt the cache file
+        let raw = match fs::read(cache_path) {
+            Ok(raw) => raw,
             Err(e) => {
                 crate::klog::warn!("Failed to read token cache at {:?}: {}", cache_path, e);
+                return None;
+            }
+        };
+
+        // A decrypt failure is reported as a miss, not an error: the usual
+        // cause is a passphrase change (or a file written under a different
+        // one), and the recovery — re-authenticate and overwrite — is the
+        // same as for a genuinely absent cache. Logged at WARN because it
+        // also covers a truncated or tampered file, which is worth seeing.
+        let plaintext = match cache_crypto::decrypt(&raw, passphrase) {
+            Some(plaintext) => plaintext,
+            None => {
+                crate::klog::warn!(
+                    "Token cache at {:?} could not be decrypted (wrong passphrase, or the file \
+                     is corrupt); ignoring it and re-authenticating",
+                    cache_path
+                );
+                return None;
+            }
+        };
+
+        match serde_json::from_slice::<OAuthToken>(&plaintext) {
+            Ok(token) => {
+                crate::klog::debug!("Token cache hit: loaded from {:?}", cache_path);
+                Some(token)
+            }
+            Err(e) => {
+                crate::klog::warn!("Token cache corrupted at {:?}, ignoring: {}", cache_path, e);
                 None
             }
         }
@@ -158,7 +203,13 @@ impl TokenCache {
     /// * `client_id` - The OAuth client ID
     /// * `scopes` - The list of OAuth scopes
     /// * `token` - The token to save
-    pub fn save(host: &str, client_id: &str, scopes: &[String], token: &OAuthToken) {
+    pub fn save(
+        host: &str,
+        client_id: &str,
+        scopes: &[String],
+        token: &OAuthToken,
+        passphrase: &str,
+    ) {
         let cache_path = match Self::cache_file_path(host, client_id, scopes) {
             Some(path) => path,
             None => {
@@ -166,7 +217,13 @@ impl TokenCache {
                 return;
             }
         };
+        Self::save_to(&cache_path, token, passphrase);
+    }
 
+    /// [`Self::save`] against an explicit path, so tests can exercise the
+    /// real encrypt-and-write logic (including the permission tightening)
+    /// without writing into the user's config directory.
+    fn save_to(cache_path: &std::path::Path, token: &OAuthToken, passphrase: &str) {
         // Create cache directory if it doesn't exist, with 700 permissions (owner only)
         if let Some(parent) = cache_path.parent() {
             if let Err(e) = fs::create_dir_all(parent) {
@@ -181,14 +238,17 @@ impl TokenCache {
             }
         }
 
-        // Serialize token to JSON
-        let json = match serde_json::to_string_pretty(token) {
+        // Serialize token to JSON, then encrypt. `to_string` rather than
+        // `to_string_pretty`: the bytes are ciphertext, so the pretty-printed
+        // whitespace is unreadable anyway and only pads the payload.
+        let json = match serde_json::to_string(token) {
             Ok(j) => j,
             Err(e) => {
                 crate::klog::warn!("Failed to serialize token for cache: {}", e);
                 return;
             }
         };
+        let json = cache_crypto::encrypt(json.as_bytes(), passphrase);
 
         // Write to a temporary file first, then rename for atomicity
         let temp_path = cache_path.with_extension("tmp");
@@ -220,7 +280,7 @@ impl TokenCache {
         }
 
         // Atomically rename temp file to final cache file
-        if let Err(e) = fs::rename(&temp_path, &cache_path) {
+        if let Err(e) = fs::rename(&temp_path, cache_path) {
             crate::klog::warn!(
                 "Failed to rename temp cache file {:?} to {:?}: {}",
                 temp_path,
@@ -251,6 +311,73 @@ mod tests {
             Some("test-refresh-token".to_string()),
             vec!["all-apis".to_string(), "offline_access".to_string()],
         )
+    }
+
+    /// End-to-end exercise of the REAL save / load pair.
+    ///
+    /// The other tests in this module hand-build the cache file, so none of
+    /// them would notice if `save` stopped encrypting or `load` stopped
+    /// decrypting. This one drives the actual write/read path and asserts on
+    /// the bytes that land on disk.
+    ///
+    /// Uses the path-injecting `save_to` / `load_from` rather than
+    /// redirecting `XDG_CONFIG_HOME`: the env var is process-global, and
+    /// mutating it here raced against the U2M tests that also read the
+    /// cache, failing them only under a full parallel run.
+    #[test]
+    fn save_then_load_roundtrips_and_file_is_encrypted() {
+        const PASSPHRASE: &str = "test-passphrase";
+
+        let temp_dir = TempDir::new().expect("Failed to create temp dir");
+        let cache_dir = TokenCache::cache_dir_under(temp_dir.path().to_path_buf())
+            .expect("cache dir under an explicit root always resolves");
+        let cache_path = TokenCache::cache_file_path_in(
+            &cache_dir,
+            "https://roundtrip.cloud.databricks.com",
+            "client-roundtrip",
+            &["all-apis".to_string()],
+        );
+
+        let token = create_test_token();
+        TokenCache::save_to(&cache_path, &token, PASSPHRASE);
+
+        // 1. The round trip preserves the token.
+        let loaded =
+            TokenCache::load_from(&cache_path, PASSPHRASE).expect("saved token should load back");
+        assert_eq!(loaded.access_token, token.access_token);
+        assert_eq!(loaded.refresh_token, token.refresh_token);
+
+        // 2. The file on disk does NOT contain the tokens in the clear. This
+        //    is the actual security property being added.
+        let on_disk = fs::read(&cache_path).expect("cache file should exist");
+        let as_text = String::from_utf8_lossy(&on_disk);
+        assert!(
+            !as_text.contains("test-refresh-token"),
+            "refresh token must not be readable on disk"
+        );
+        assert!(
+            !as_text.contains("test-access-token"),
+            "access token must not be readable on disk"
+        );
+
+        // 3. A different passphrase must not decrypt it — the file is
+        //    genuinely keyed, not merely obfuscated.
+        assert!(
+            TokenCache::load_from(&cache_path, "wrong-passphrase").is_none(),
+            "load with the wrong passphrase must miss, not succeed"
+        );
+
+        // 4. The cache file is owner-only (0o600): encryption is not an
+        //    excuse to widen the permissions the plaintext version had.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = fs::metadata(&cache_path)
+                .expect("cache file metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "cache file must stay owner-only");
+        }
     }
 
     #[test]
@@ -349,6 +476,7 @@ mod tests {
             "https://nonexistent.cloud.databricks.com",
             "client-999",
             &["all-apis".to_string()],
+            "any-passphrase",
         );
 
         assert!(

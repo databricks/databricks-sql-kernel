@@ -12,10 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# PyO3 sub-crate CI. Path-gated on `pyo3/**` so this workflow
-# only fires when the directory exists (it lands in PR #13). The
-# job is skipped automatically on every PR that doesn't touch
-# the pyo3/ tree.
+# PyO3 sub-crate CI. Path-gated so the matrix runs only when the
+# binding or one of its root Cargo inputs changes.
 
 name: PyO3 Checks
 
@@ -51,36 +49,8 @@ defaults:
     shell: bash
 
 jobs:
-  # Cheap gate job — runs once, no matrix, no toolchain installs.
-  # The matrix `build-and-test` job depends on this and is skipped
-  # entirely (no runner boot, no checkout) when the pyo3/ sub-crate
-  # doesn't exist. This avoids the per-Python-version setup cost on
-  # kernel-only PRs that trigger this workflow via root Cargo.toml
-  # / Cargo.lock changes.
-  precondition:
-    name: "Check pyo3 sub-crate exists"
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-
-      - name: "Check for pyo3/Cargo.toml"
-        id: check
-        run: |
-          if [[ -f "pyo3/Cargo.toml" ]]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::pyo3/ sub-crate does not exist yet — skipping pyo3 build/test matrix. (Workflow fires on root Cargo.toml changes; the pyo3 sub-crate lands in PR #13.)"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          fi
-
   build-and-test:
     name: "PyO3 build + test (Python ${{ matrix.python-version }})"
-    needs: precondition
-    if: needs.precondition.outputs.ready == 'true'
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -96,6 +66,10 @@ jobs:
       DATABRICKS_HTTP_PATH: ${{ secrets.TEST_PECO_WAREHOUSE_HTTP_PATH }}
       DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
       RUST_LOG: databricks_sql_kernel=info
+      RUSTC_WRAPPER: sccache
+      # Select sccache's GitHub Actions backend. Without this, the
+      # protected runner's local cache disappears with the job.
+      SCCACHE_GHA_ENABLED: "true"
     strategy:
       fail-fast: false
       matrix:
@@ -107,24 +81,35 @@ jobs:
         # in pyproject.toml, exercising that path in CI.)
         python-version: ["3.9", "3.10", "3.11", "3.12", "3.13", "3.14"]
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - uses: ./.github/actions/setup-jfrog
         with:
           cargo: "true"
           uv: "true"
 
-      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: ${{ matrix.python-version }}
 
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          # pyo3 is a standalone workspace. The default "." mapping
+          # cached the unused root target/ and root Cargo.lock while
+          # every pyo3/target build remained cold.
+          cache-workspaces: "pyo3 -> target"
+          # PyO3 build-script output is interpreter-specific even though
+          # the published extension uses abi3.
+          cache-key: "py${{ matrix.python-version }}"
+
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       # uv is the Python package manager the kernel pyo3 sub-crate
       # uses for env management. uv itself is installed via
       # astral-sh/setup-uv (SHA-pinned) rather than via
       # `pip install uv` so the bootstrap is also hash-locked.
-      - uses: astral-sh/setup-uv@11f9893b081a58869d3b5fccaea48c9e9e46f990 # v8.3.2
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
         with:
           # Pin uv to a known good version; bump deliberately.
           version: "0.11.14"
@@ -139,12 +124,10 @@ jobs:
         # re-resolves each run within those bounds.
         working-directory: pyo3
         # `--no-install-project` installs only the dependency groups,
-        # NOT the kernel cdylib itself. Without it, `uv sync` runs a
-        # full maturin/cargo RELEASE build of the extension here — and
-        # then the `maturin develop` step below rebuilds it again in
-        # debug, so the kernel compiled twice per matrix Python version
-        # (~5 min each, x5 versions). The Rust extension is built
-        # exactly once, by `maturin develop`.
+        # NOT the kernel cdylib itself. The later `uv run --no-sync`
+        # calls preserve that choice: plain `uv run` would implicitly
+        # sync and build the project before invoking maturin, compiling
+        # the extension twice per matrix entry.
         run: uv sync --group dev --no-install-project
 
       - name: Cargo unit tests (pyo3 crate)
@@ -168,9 +151,12 @@ jobs:
         #
         # maturin's `develop` always targets the active virtualenv's
         # interpreter and (unlike `build`) has no --interpreter flag;
-        # `uv run` already activates the venv `uv sync` created for the
-        # matrix Python version, so the interpreter is selected for us.
-        run: uv run maturin develop
+        # `uv run` activates the venv `uv sync` created for the matrix
+        # Python version, so the interpreter is selected for us.
+        # `--no-sync` is load-bearing: without it uv first installs the
+        # project through its maturin build backend, then this command
+        # asks maturin to build and install it a second time.
+        run: uv run --no-sync maturin develop
 
       - name: pytest (no-network + live tiers)
         working-directory: pyo3
@@ -181,4 +167,6 @@ jobs:
         # repo; on fork PRs without approval, the no-network tier
         # (test_module.py + test_auth.py) runs and the live tier
         # skips cleanly.
-        run: uv run pytest -v
+        # The extension and dependencies are already installed above;
+        # avoid another implicit project sync before starting pytest.
+        run: uv run --no-sync pytest -v

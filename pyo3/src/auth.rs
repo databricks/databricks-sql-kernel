@@ -186,12 +186,17 @@ fn build_auth_config_inner(
             // kernel's bare-Rust fallback (`databricks-cli`). This
             // matches the standalone Thrift connector
             // (`PYSQL_OAUTH_CLIENT_ID` in databricks-sql-python's
-            // auth.py) so a user gets the same OAuth app identity — and
-            // the same SSO token cache entry — whether they use the
-            // Thrift backend or `use_kernel=True`. It also keeps the
-            // kernel's per-{host,client_id,scopes} token cache distinct
-            // from the napi (Node) binding's, which defaults to its own
-            // client.
+            // auth.py) so a user gets the same OAuth app identity whether
+            // they use the Thrift backend or `use_kernel=True`. It also
+            // keeps the kernel's per-{host,client_id,scopes} cache key
+            // distinct from the napi (Node) binding's, which defaults to
+            // its own client.
+            //
+            // Note this does NOT share a token cache *entry* with the
+            // standalone Thrift connector: the kernel writes to its own
+            // `~/.config/databricks-sql-kernel/oauth/` directory, and the
+            // Thrift connector caches U2M tokens in memory only. What is
+            // aligned is the OAuth app identity, not the on-disk cache.
             //
             // When BOTH defaults are in play (caller passed no
             // `client_id` and no `scopes`), also default the scopes to
@@ -216,6 +221,14 @@ fn build_auth_config_inner(
                 scopes,
                 token_url_override: oauth.token_url,
                 callback_timeout: oauth.callback_timeout_secs.map(Duration::from_secs),
+                // `None` takes the kernel default: on-disk cache ENABLED,
+                // encrypted under a machine-local derived key since this
+                // binding exposes no passphrase option. That preserves
+                // cross-connection SSO reuse (the point of the cache) without
+                // ever writing the refresh token in the clear. Surfacing a
+                // passphrase through `OAuthParams` — the equivalent of JDBC's
+                // TokenCachePassPhrase — would strengthen it further.
+                token_cache: None,
             })
         }
         other => Err(format!(
@@ -343,6 +356,7 @@ mod tests {
                 scopes,
                 token_url_override,
                 callback_timeout,
+                token_cache,
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 assert!(redirect_port.is_none());
@@ -352,6 +366,14 @@ mod tests {
                 );
                 assert!(token_url_override.is_none());
                 assert!(callback_timeout.is_none());
+                // Left as `None` so the kernel default applies: on-disk cache
+                // enabled, encrypted under a machine-local derived key. Pinned
+                // because overriding it here would silently drop the
+                // cross-connection SSO reuse the cache exists to provide.
+                assert!(
+                    token_cache.is_none(),
+                    "Python U2M should defer to the kernel's token-cache default"
+                );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

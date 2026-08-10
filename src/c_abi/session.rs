@@ -25,7 +25,9 @@
 //! (default = ignore). Backed by the shared `Session` transaction methods.
 
 use super::{block_on_ffi, KernelStatusCode};
-use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
+use crate::config::{
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig, TokenCacheConfig,
+};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
@@ -109,6 +111,12 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
+    /// On-disk U2M token-cache policy (populated by
+    /// `kernel_session_config_set_token_cache`). Defaults to enabled with
+    /// no passphrase, in which case the cache is encrypted under a
+    /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
+    /// touch the cache. See [`TokenCacheConfig`].
+    token_cache: TokenCacheConfig,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -186,6 +194,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
+        // Match the reference driver's / JDBC's EnableTokenCache=1.
+        token_cache: TokenCacheConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -619,6 +629,47 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
     })
 }
 
+/// Configure the on-disk OAuth token cache for U2M (browser) auth.
+///
+/// Mirrors the `EnableTokenCache` / `TokenCachePassPhrase` pair exposed by
+/// the reference ODBC driver and JDBC:
+///
+/// * `enabled = true` (the default) persists the refresh token to
+///   `~/.config/databricks-sql-kernel/oauth/` so the user is not sent
+///   through the browser on every connection. The file is **always
+///   encrypted** (AES-256-CBC, PBKDF2-HMAC-SHA256); there is no plaintext
+///   mode. A non-null `passphrase` keys it; a null or blank one falls back
+///   to a machine-local derived key, matching the reference driver, which
+///   caches with an empty `TokenCachePassPhrase`. Supplying a passphrase is
+///   stronger — see `TokenCacheConfig` for what the fallback does and does
+///   not protect against.
+/// * `enabled = false` disables **disk persistence only**. Tokens are
+///   still reused and refreshed in memory for the session's lifetime, so
+///   this does not re-trigger the browser flow on every refresh. Use it
+///   when the process must not write credentials to disk at all.
+///
+/// `passphrase` is ignored when `enabled` is `false`. Only U2M auth touches
+/// the cache; PAT and M2M ignore this setting entirely.
+///
+/// # Safety
+/// `config` must be a live config handle. `passphrase`, if non-null, must
+/// point to a NUL-terminated UTF-8 string valid for the duration of the
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_token_cache(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+    passphrase: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.token_cache = TokenCacheConfig {
+            enabled,
+            passphrase: optional_str(passphrase, "passphrase")?,
+        };
+        Ok(())
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -752,6 +803,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         retry,
         ignore_transactions,
+        token_cache,
     } = config;
 
     block_on_ffi(move || {
@@ -793,6 +845,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     scopes.and_then(|s| parse_scopes(&s)),
                     None,
                     None,
+                    Some(token_cache),
                 ),
             };
 

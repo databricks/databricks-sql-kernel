@@ -278,6 +278,7 @@ impl Session {
         //    which in turn needs to be set on the transport via
         //    OnceLock::set. So: construct, wrap in Arc, build factory,
         //    install factory.
+        let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig::default();
         let sea = Arc::new(SeaRestTransport::new(
             http_client.clone(),
@@ -296,7 +297,6 @@ impl Session {
         let transport: Arc<dyn Transport> = sea;
 
         // 4. Mint the session on the server.
-        let defaults = config.defaults.clone().unwrap_or_default();
         debug!(
             host = %host,
             warehouse_id = %warehouse_id,
@@ -1088,6 +1088,7 @@ async fn build_auth_provider(
             scopes,
             token_url_override,
             callback_timeout,
+            token_cache,
         } => {
             let client_id = client_id.as_deref().unwrap_or("databricks-cli");
             let redirect_port = redirect_port.unwrap_or(8020);
@@ -1095,6 +1096,15 @@ async fn build_auth_provider(
                 .clone()
                 .unwrap_or_else(|| vec!["all-apis".to_string(), "offline_access".to_string()]);
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
+            // `Some(passphrase)` enables the on-disk cache, `None` disables
+            // it. When the cache is on but the caller supplied no passphrase,
+            // `resolve` substitutes a machine-local derived one rather than
+            // failing or writing plaintext — see `TokenCacheConfig`.
+            let cache_policy = token_cache
+                .clone()
+                .unwrap_or_default()
+                .resolve()
+                .map(|p| p.into_owned());
             let provider = AuthorizationCodeProvider::new_with_full_config(
                 host,
                 client_id,
@@ -1103,6 +1113,7 @@ async fn build_auth_provider(
                 redirect_port,
                 timeout,
                 token_url_override.clone(),
+                cache_policy,
             )
             .await?;
             Ok(Arc::new(provider))

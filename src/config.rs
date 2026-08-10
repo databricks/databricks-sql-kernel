@@ -201,6 +201,85 @@ impl Default for DefaultOpts {
     }
 }
 
+// ─── Token cache ────────────────────────────────────────────────────────────
+
+/// Policy for the on-disk U2M OAuth token cache.
+///
+/// The cache persists the refresh token so a user is not sent through the
+/// browser flow on every connection. Because a refresh token is a
+/// long-lived credential, the kernel only ever writes one **encrypted** —
+/// there is no plaintext mode.
+///
+/// | `enabled` | `passphrase` | result |
+/// |---|---|---|
+/// | `true` (default) | set | encrypted under the caller's passphrase |
+/// | `true` (default) | unset | encrypted under a machine-local derived key |
+/// | `false` | either | no disk reads or writes |
+///
+/// **Why the middle row is not an error.** The reference ODBC driver ships
+/// `EnableTokenCache=1` with `TokenCachePassPhrase` empty and still
+/// connects, so failing the connection there would break drop-in
+/// compatibility for any DSN that never set a passphrase. (The JDBC driver
+/// *does* fail in that case — `ClientConfigurator` throws "No token cache
+/// passphrase configured" — but for the ODBC surface the reference driver
+/// is the compatibility bar, and its behaviour is also the friendlier of
+/// the two.) A supplied passphrase is still strictly better: see
+/// [`super::auth::oauth::cache_crypto::derived_passphrase`] for exactly what
+/// the fallback key protects against and what it does not.
+///
+/// Disabling the cache stops **disk persistence only**. The in-memory token
+/// store still reuses and refreshes a token for the lifetime of the
+/// session, matching JDBC's `NoOpTokenCache`, so turning this off does not
+/// re-trigger the browser flow on every refresh within one process.
+#[derive(Debug, Clone)]
+pub struct TokenCacheConfig {
+    /// Whether to read and write the on-disk cache. Default `true`,
+    /// matching both the reference ODBC driver's and JDBC's
+    /// `EnableTokenCache=1`.
+    pub enabled: bool,
+    /// Passphrase for the AES-256 encryption key. Optional: when absent (or
+    /// blank) the kernel derives a machine-local key instead, matching the
+    /// reference driver, which caches with an empty `TokenCachePassPhrase`.
+    /// Supplying one is stronger — the cache then cannot be read without a
+    /// secret the machine does not hold.
+    pub passphrase: Option<String>,
+}
+
+impl Default for TokenCacheConfig {
+    fn default() -> Self {
+        Self {
+            // Match the reference driver's / JDBC's EnableTokenCache=1.
+            enabled: true,
+            passphrase: None,
+        }
+    }
+}
+
+impl TokenCacheConfig {
+    /// Resolve to the passphrase to encrypt with, or `None` when disk
+    /// caching is disabled.
+    ///
+    /// A blank passphrase is treated as absent rather than honoured: it is
+    /// almost always an unexpanded config placeholder (`$TOKEN_PASS` that
+    /// never got substituted), and deriving a key from `""` across every
+    /// machine would be materially weaker than the machine-local fallback.
+    ///
+    /// Infallible by design. Enabled-without-passphrase is a supported
+    /// configuration, not an error, so this cannot fail the connection —
+    /// see the type docs for why.
+    pub(crate) fn resolve(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if !self.enabled {
+            return None;
+        }
+        match self.passphrase.as_deref() {
+            Some(p) if !p.trim().is_empty() => Some(std::borrow::Cow::Borrowed(p)),
+            _ => Some(std::borrow::Cow::Owned(
+                crate::auth::oauth::cache_crypto::derived_passphrase(),
+            )),
+        }
+    }
+}
+
 // ─── Authentication ─────────────────────────────────────────────────────────
 
 /// Authentication strategy.
@@ -254,6 +333,9 @@ pub enum AuthConfig {
         /// How long to wait for the user to complete the browser
         /// flow before timing out. `None` → 120 seconds.
         callback_timeout: Option<std::time::Duration>,
+        /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`]
+        /// (enabled, which then requires a passphrase — see that type).
+        token_cache: Option<TokenCacheConfig>,
     },
 
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
@@ -331,6 +413,7 @@ impl AuthConfig {
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
+        token_cache: Option<TokenCacheConfig>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -338,6 +421,7 @@ impl AuthConfig {
             scopes,
             token_url_override,
             callback_timeout,
+            token_cache,
         }
     }
 }
@@ -1012,6 +1096,109 @@ pub(crate) fn filter_session_conf(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ─── token cache policy ────────────────────────────────────────
+
+    #[test]
+    fn token_cache_defaults_to_enabled() {
+        // Both the reference ODBC driver and JDBC default EnableTokenCache
+        // to 1, with no passphrase.
+        assert!(TokenCacheConfig::default().enabled);
+        assert!(TokenCacheConfig::default().passphrase.is_none());
+    }
+
+    #[test]
+    fn token_cache_enabled_with_passphrase_resolves_to_it() {
+        let cfg = TokenCacheConfig {
+            enabled: true,
+            passphrase: Some("s3cr3t".to_string()),
+        };
+        assert_eq!(cfg.resolve().as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn token_cache_enabled_without_passphrase_falls_back_to_derived_key() {
+        // The reference ODBC driver ships EnableTokenCache=1 with an empty
+        // TokenCachePassPhrase and still caches, so this combination must
+        // NOT fail the connection — a DSN that never set a passphrase has to
+        // keep working. It must also not disable caching silently, which
+        // would reintroduce a browser prompt on every connection.
+        let cfg = TokenCacheConfig::default();
+        let passphrase = cfg
+            .resolve()
+            .expect("enabled + no passphrase must still cache");
+        assert!(
+            !passphrase.trim().is_empty(),
+            "fallback passphrase must be non-empty, else the cache would be \
+             encrypted under nothing"
+        );
+    }
+
+    #[test]
+    fn token_cache_blank_passphrase_uses_the_derived_key_not_the_blank() {
+        // An all-whitespace passphrase is almost always an unexpanded config
+        // placeholder. Honouring it literally would key every machine's cache
+        // identically, which is strictly weaker than the machine-local
+        // fallback, so blank must be treated as absent.
+        let derived = TokenCacheConfig::default()
+            .resolve()
+            .expect("default resolves")
+            .into_owned();
+        for blank in ["", "   ", "\t\n"] {
+            let cfg = TokenCacheConfig {
+                enabled: true,
+                passphrase: Some(blank.to_string()),
+            };
+            let resolved = cfg.resolve().expect("blank still caches");
+            assert_ne!(
+                resolved.as_ref(),
+                blank,
+                "blank passphrase {blank:?} must not be used verbatim"
+            );
+            assert_eq!(
+                resolved.as_ref(),
+                derived,
+                "blank passphrase {blank:?} should fall back to the derived key"
+            );
+        }
+    }
+
+    #[test]
+    fn token_cache_derived_key_is_stable_across_calls() {
+        // If the fallback were not deterministic, every process would write a
+        // cache the next one cannot read — a silent browser prompt on every
+        // connection, which is the failure this whole feature avoids.
+        assert_eq!(
+            TokenCacheConfig::default()
+                .resolve()
+                .map(|p| p.into_owned()),
+            TokenCacheConfig::default()
+                .resolve()
+                .map(|p| p.into_owned())
+        );
+    }
+
+    #[test]
+    fn token_cache_disabled_resolves_to_none_without_passphrase() {
+        // Disabling must always be valid — it is the escape hatch for
+        // processes that must not write credentials to disk at all.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: None,
+        };
+        assert_eq!(cfg.resolve(), None);
+    }
+
+    #[test]
+    fn token_cache_disabled_ignores_a_supplied_passphrase() {
+        // `enabled: false` wins: a leftover passphrase must not silently
+        // re-enable disk persistence.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: Some("ignored".to_string()),
+        };
+        assert_eq!(cfg.resolve(), None);
+    }
 
     // ─── session_conf allowlist ────────────────────────────────────
 
