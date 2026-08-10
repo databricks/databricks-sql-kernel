@@ -203,6 +203,40 @@ static void test_u2m_and_header_setters(void) {
   kernel_session_config_free(config);
 }
 
+/* Client-conf setter accepts known keys, clamps, and rejects bad input. */
+static void test_client_conf_setter(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  /* Known keys with valid values. */
+  KernelStatusCode rc =
+      kernel_session_config_set_client_conf(config, "cloudfetch_enabled", "false");
+  CHECK(rc == KernelStatusCode_Success, "set_client_conf cloudfetch_enabled=false succeeds");
+  rc = kernel_session_config_set_client_conf(config, "cloudfetch_max_chunks_in_memory", "32");
+  CHECK(rc == KernelStatusCode_Success, "set_client_conf max_chunks=32 succeeds");
+  rc = kernel_session_config_set_client_conf(config, "complex_types_as_json", "true");
+  CHECK(rc == KernelStatusCode_Success, "set_client_conf complex_types_as_json=true succeeds");
+  /* An absurd max_chunks value is clamped (not rejected) to the ceiling. */
+  rc = kernel_session_config_set_client_conf(config, "cloudfetch_max_chunks_in_memory", "1000000");
+  CHECK(rc == KernelStatusCode_Success, "set_client_conf over-ceiling clamps, not fails");
+
+  /* Unknown key → InvalidArgument. */
+  rc = kernel_session_config_set_client_conf(config, "cloud_fetch_enabled", "false");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(unknown key) → InvalidArgument");
+  /* A server session-conf key is not a client conf → rejected here. */
+  rc = kernel_session_config_set_client_conf(config, "ANSI_MODE", "true");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(server key) → InvalidArgument");
+  /* Unparseable bool → InvalidArgument. */
+  rc = kernel_session_config_set_client_conf(config, "cloudfetch_enabled", "flase");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(bad bool) → InvalidArgument");
+
+  kernel_session_config_free(config);
+
+  /* Null handle / null args → InvalidArgument, no crash. */
+  rc = kernel_session_config_set_client_conf(NULL, "cloudfetch_enabled", "false");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(NULL cfg) → InvalidArgument");
+}
+
 /* kernel_init_logging is idempotent and null-tolerant. */
 static void test_init_logging(void) {
   KernelStatusCode rc = kernel_init_logging("WARN", NULL);
@@ -264,6 +298,7 @@ int main(void) {
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
+  test_client_conf_setter();
   test_init_logging();
   test_is_open_null_guards();
   test_submit_stub_rejects();

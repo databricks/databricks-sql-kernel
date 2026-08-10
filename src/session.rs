@@ -914,99 +914,64 @@ fn build_retry_configs_for_session(
     build_retry_configs(&global, &overrides)
 }
 
-/// Client-only `session_conf` key that tunes how many decompressed
-/// CloudFetch chunks the kernel holds in memory at once (peak RSS on
-/// large result sets). It is a **client** knob, not a server SET
-/// parameter: it is read by [`apply_client_result_overrides`] before
-/// session creation and is deliberately absent from
-/// [`SESSION_CONF_ALLOWLIST`](crate::config), so `filter_session_conf`
-/// drops it and it never reaches the SEA wire. Exposed this way (rather
-/// than as a new C-ABI symbol) so the Go/ODBC consumers can set it
-/// through the existing `set_session_conf` entry point.
-pub(crate) const CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS: &str = "cloudfetch_max_chunks_in_memory";
-
-/// Upper bound applied to a host-supplied
-/// [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`] value. Peak RSS grows roughly
-/// linearly with this knob (each in-memory chunk is tens of MB), so an
-/// unbounded value — a typo like `"1000000"` meant as `"100"`, or a host bug —
-/// risks OOM on large result sets. This ceiling (16× the default of 16, and 8×
-/// the most aggressive value we've measured) is comfortably above any real
-/// tuning yet bounds the blast radius of a fat-fingered value; a request above
-/// it is clamped with a `warn!`, mirroring the retry setter's clamp discipline.
-pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
-
-/// Fold client-only result-management knobs carried in `session_conf`
-/// into the typed [`ResultConfig`], then remove them from `session_conf`
-/// so they cannot leak onto the SEA wire.
+/// Fold any **client-side** result knobs that a host left in `session_conf`
+/// into the typed [`ResultConfig`], then strip them so they can't leak onto
+/// the SEA wire.
 ///
-/// Today this handles only [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`]. A key
-/// that is absent leaves the field at its `ResultConfig` default (16); a
-/// present-but-unparseable or zero value is ignored (default preserved)
-/// with a warning rather than failing session creation — a
-/// best-effort tuning knob should never turn a typo into a connect
-/// error. A value above [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to
-/// that ceiling (with a warning) so a fat-fingered value can't drive peak
-/// RSS toward OOM. Matched case-insensitively, consistent with the rest of
-/// the `session_conf` handling; if a host sets two spellings that differ only
-/// in case the lexicographically-last one wins deterministically (and all
-/// variants are stripped).
+/// This is the legacy / convenience channel: the preferred entry point is
+/// the C ABI's `kernel_session_config_set_client_conf` (which sets
+/// `ResultConfig` directly), but a host that only has a `session_conf`
+/// key/value bag — e.g. one forwarding DSN attributes without sorting them
+/// into client vs. server — can still drop a client knob like
+/// `cloudfetch_max_chunks_in_memory` in there and have it applied. Any key
+/// recognised by [`ResultConfig::apply_client_conf`] (see
+/// [`ClientConfKey`](crate::config::ClientConfKey)) is consumed here;
+/// unrecognised keys are left for [`filter_session_conf`] to handle as
+/// server confs.
+///
+/// **Best-effort, never fatal.** A recognised key with an unparseable value
+/// is logged at `warn` and skipped (the field keeps its current value)
+/// rather than failing session creation — a stray tuning value in the bag
+/// must not turn into a connect error. (The typed `set_client_conf` path
+/// *does* reject bad values, because there the caller asked for that key
+/// explicitly; here the key is ambient in a mixed bag.) Every recognised
+/// key is removed regardless of parse outcome, so no client-only key
+/// survives into `filter_session_conf` / the wire.
+///
+/// Matched case-insensitively. If a host sets two spellings of the same key
+/// differing only in case, the lexicographically-last spelling wins
+/// deterministically and all variants are stripped.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
-    // Collect EVERY case-insensitive spelling of the key, not just the first
-    // one `HashMap` iteration happens to yield. Two variants that differ only
-    // in case (e.g. `cloudfetch_max_chunks_in_memory` and
-    // `CloudFetch_Max_Chunks_In_Memory`) would otherwise resolve
-    // nondeterministically across runs. We sort the matches and let the
-    // lexicographically-last spelling win — a stable, run-independent rule —
-    // and remove all of them regardless of parse outcome, so no client-only
-    // key survives into `filter_session_conf` / the wire.
-    let mut keys: Vec<String> = config
+    use crate::config::ClientConfKey;
+
+    // Recognised client keys currently present in session_conf. A key is
+    // "recognised" iff it parses to a ClientConfKey (case-insensitive).
+    let mut present: Vec<String> = config
         .session_conf
         .keys()
-        .filter(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS))
+        .filter(|k| ClientConfKey::parse(k).is_some())
         .cloned()
         .collect();
-    if keys.is_empty() {
+    if present.is_empty() {
         return;
     }
-    keys.sort_unstable();
-    if keys.len() > 1 {
-        crate::klog::warn!(
-            variants = keys.len(),
-            "multiple case-variant cloudfetch_max_chunks_in_memory keys set; \
-             applying the lexicographically-last spelling deterministically",
-        );
-    }
-    // Remove every variant; the winner's value drives the override.
-    let mut raw = String::new();
-    for k in &keys {
-        if let Some(v) = config.session_conf.remove(k) {
-            raw = v;
-        }
-    }
-    match raw.trim().parse::<usize>() {
-        Ok(n) if n > 0 => {
-            // Clamp to a sane ceiling: peak RSS scales with this knob, so an
-            // absurd value (typo / host bug) would otherwise risk OOM.
-            let clamped = n.min(CLOUDFETCH_MAX_CHUNKS_CEILING);
-            if clamped != n {
-                crate::klog::warn!(
-                    requested = n,
-                    ceiling = CLOUDFETCH_MAX_CHUNKS_CEILING,
-                    "clamping cloudfetch_max_chunks_in_memory to the ceiling \
-                     (peak RSS scales with this knob)",
-                );
-            }
-            config.result.cloudfetch_max_chunks_in_memory = clamped;
-            crate::klog::debug!(
-                max_chunks_in_memory = clamped,
-                "applied client cloudfetch_max_chunks_in_memory override",
-            );
-        }
-        _ => {
+    // Deterministic winner among case-variants: sort so the lexicographically
+    // -last spelling of each key is applied last (and thus wins).
+    present.sort_unstable();
+
+    for spelling in present {
+        let Some(value) = config.session_conf.remove(&spelling) else {
+            continue;
+        };
+        // Best-effort: a bad value in the ambient bag is warned-and-skipped,
+        // never fatal. The key is already removed above so it can't reach the
+        // wire regardless.
+        if let Err(e) = config.result.apply_client_conf(&spelling, &value) {
             crate::klog::warn!(
-                value = %raw,
-                "ignoring invalid cloudfetch_max_chunks_in_memory (want a positive integer); \
-                 keeping the default",
+                key = %spelling,
+                value = %value,
+                error = %e.message,
+                "ignoring invalid client-side result knob in session_conf; keeping current value",
             );
         }
     }
@@ -1290,7 +1255,9 @@ mod retry_config_tests {
     #[test]
     fn cloudfetch_max_chunks_override_applies_and_is_stripped() {
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "4".to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
@@ -1343,9 +1310,9 @@ mod retry_config_tests {
             "the lexicographically-last case variant must win deterministically"
         );
         assert!(
-            !cfg.session_conf
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS)),
+            !cfg.session_conf.keys().any(|k| k.eq_ignore_ascii_case(
+                crate::config::ClientConfKey::CloudfetchMaxChunksInMemory.as_str()
+            )),
             "every case variant of the client knob must be stripped, got {:?}",
             cfg.session_conf
         );
@@ -1374,7 +1341,9 @@ mod retry_config_tests {
     fn cloudfetch_max_chunks_invalid_is_ignored_but_stripped() {
         for bad in ["0", "-1", "abc", ""] {
             let mut cfg = config_with_session_conf(HashMap::from([(
-                CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+                crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                    .as_str()
+                    .to_string(),
                 bad.to_string(),
             )]));
             apply_client_result_overrides(&mut cfg);
@@ -1396,26 +1365,83 @@ mod retry_config_tests {
     fn cloudfetch_max_chunks_above_ceiling_is_clamped() {
         // Well above the ceiling → clamped down.
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "1000000".to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
         assert_eq!(
-            cfg.result.cloudfetch_max_chunks_in_memory, CLOUDFETCH_MAX_CHUNKS_CEILING,
+            cfg.result.cloudfetch_max_chunks_in_memory,
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
             "an absurd value must clamp to the ceiling"
         );
         assert!(cfg.session_conf.is_empty());
 
         // Exactly at the ceiling → unchanged (boundary is inclusive).
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
-            CLOUDFETCH_MAX_CHUNKS_CEILING.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING.to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
         assert_eq!(
             cfg.result.cloudfetch_max_chunks_in_memory,
-            CLOUDFETCH_MAX_CHUNKS_CEILING,
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
         );
+    }
+
+    /// All six client-side result knobs are recognised in session_conf,
+    /// applied to the typed ResultConfig, and stripped so none reach the
+    /// wire. Guards the parity between `ClientConfKey::ALL` and the
+    /// session_conf sweep.
+    #[test]
+    fn all_client_conf_keys_apply_from_session_conf_and_are_stripped() {
+        use crate::config::ClientConfKey as K;
+        let mut cfg = config_with_session_conf(HashMap::from([
+            (
+                K::CloudfetchEnabled.as_str().to_string(),
+                "false".to_string(),
+            ),
+            (
+                K::CloudfetchLinkPrefetchWindow.as_str().to_string(),
+                "7".to_string(),
+            ),
+            (
+                K::CloudfetchMaxChunksInMemory.as_str().to_string(),
+                "9".to_string(),
+            ),
+            (
+                K::InlineMaxChunksInMemory.as_str().to_string(),
+                "3".to_string(),
+            ),
+            (
+                K::ComplexTypesAsJson.as_str().to_string(),
+                "true".to_string(),
+            ),
+            (
+                K::IntervalsAsString.as_str().to_string(),
+                "true".to_string(),
+            ),
+            // A benign server param must survive untouched.
+            ("ansi_mode".to_string(), "true".to_string()),
+        ]));
+        apply_client_result_overrides(&mut cfg);
+        assert!(!cfg.result.cloudfetch_enabled);
+        assert_eq!(cfg.result.cloudfetch_link_prefetch_window, 7);
+        assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 9);
+        assert_eq!(cfg.result.inline_max_chunks_in_memory, 3);
+        assert!(cfg.result.complex_types_as_json);
+        assert!(cfg.result.intervals_as_string);
+        // Every client key stripped; only the server param remains.
+        assert_eq!(
+            cfg.session_conf.get("ansi_mode").map(String::as_str),
+            Some("true"),
+            "server param must survive; got {:?}",
+            cfg.session_conf
+        );
+        assert_eq!(cfg.session_conf.len(), 1, "got {:?}", cfg.session_conf);
     }
 
     /// The client knob is NOT in the server allowlist, so even if it were
@@ -1425,7 +1451,9 @@ mod retry_config_tests {
     #[test]
     fn cloudfetch_max_chunks_key_is_not_server_allowlisted() {
         let filtered = crate::config::filter_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "4".to_string(),
         )]));
         assert!(

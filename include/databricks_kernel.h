@@ -371,8 +371,43 @@ KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConf
  *
  * The on-disk format is wire-compatible with the JDBC driver's
  * EncryptedFileTokenCache (given the same passphrase). */
-KernelStatusCode kernel_session_config_set_token_cache(KernelSessionConfig* config, bool enabled,
-                                                      const char* passphrase);
+KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionConfig* config,
+                                                                  bool enabled,
+                                                                  const char* passphrase);
+
+/* Set one CLIENT-SIDE result knob by name (key = value).
+ *
+ * Counterpart to kernel_session_config_set_session_conf: that one carries
+ * SERVER session confs (ANSI_MODE, TIMEZONE, ...) to the SEA wire; this one
+ * sets CLIENT-SIDE knobs that tune how the kernel fetches, buffers, and
+ * post-processes results and are NEVER sent to the server. The two channels
+ * are deliberately separate (conflating them is what made a client flag
+ * masquerade as a rejected server conf).
+ *
+ * Key/value (rather than one typed setter per knob) so the signature never
+ * changes as new result knobs are added, and so a host that already has DSN
+ * / connection-string attributes can forward them in a loop. Unknown keys
+ * and unparseable values are REJECTED (InvalidArgument + stored error), not
+ * silently ignored.
+ *
+ * Recognised keys (case-insensitive):
+ * - "cloudfetch_enabled" = "true"|"false" — false serves every result
+ *   inline (SEA disposition = INLINE), mirroring JDBC EnableQueryResultDownload=0.
+ * - "cloudfetch_link_prefetch_window" = positive integer.
+ * - "cloudfetch_max_chunks_in_memory" = positive integer (bounds peak RSS;
+ *   values above the kernel ceiling of 256 are clamped with a warning).
+ * - "inline_max_chunks_in_memory" = positive integer (inline-Arrow prefetch
+ *   window, used when cloudfetch_enabled = false).
+ * - "complex_types_as_json" = "true"|"false" — render ARRAY / MAP / STRUCT /
+ *   VARIANT / GEOMETRY / GEOGRAPHY as JSON text (PySQL
+ *   _use_arrow_native_complex_types=False, JDBC complexDatatypeSupport=false).
+ * - "intervals_as_string" = "true"|"false" — render INTERVAL / DURATION as
+ *   canonical Databricks text (for pyarrow-Python bindings).
+ *
+ * A server session-conf key passed here (e.g. "ANSI_MODE") is rejected —
+ * use kernel_session_config_set_session_conf for those. */
+KernelStatusCode kernel_session_config_set_client_conf(KernelSessionConfig* config,
+                                                       const char* key, const char* value);
 
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 

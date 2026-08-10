@@ -915,6 +915,169 @@ impl Default for ResultConfig {
     }
 }
 
+/// Upper bound applied to `cloudfetch_max_chunks_in_memory`. Peak RSS grows
+/// roughly linearly with this knob (each in-memory chunk is tens of MB), so
+/// an unbounded value — a typo like `"1000000"` meant as `"100"`, or a host
+/// bug — risks OOM on large result sets. This ceiling (16× the default of 16,
+/// and 8× the most aggressive value we've measured) is comfortably above any
+/// real tuning yet bounds the blast radius of a fat-fingered value.
+pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
+
+/// A recognised client-side result knob — the typed identity of a
+/// `set_client_conf` key.
+///
+/// The C-ABI boundary (`kernel_session_config_set_client_conf`) is
+/// stringly-typed by design (so the ABI never churns and hosts can forward
+/// DSN attributes), but the string is parsed **once** into this enum via
+/// [`ClientConfKey::parse`] and everything downstream matches on the enum.
+/// The `match` in [`ResultConfig::apply_client_conf`] is exhaustive, so
+/// adding a variant here won't compile until the new knob is handled —
+/// there's no way to silently forget a knob. Each variant maps 1:1 onto a
+/// field of [`ResultConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientConfKey {
+    CloudfetchEnabled,
+    CloudfetchLinkPrefetchWindow,
+    CloudfetchMaxChunksInMemory,
+    InlineMaxChunksInMemory,
+    ComplexTypesAsJson,
+    IntervalsAsString,
+}
+
+impl ClientConfKey {
+    /// Every recognised key, in declaration order. Used for error messages
+    /// and to pin parity with [`ResultConfig`]'s fields in tests.
+    pub(crate) const ALL: &'static [ClientConfKey] = &[
+        Self::CloudfetchEnabled,
+        Self::CloudfetchLinkPrefetchWindow,
+        Self::CloudfetchMaxChunksInMemory,
+        Self::InlineMaxChunksInMemory,
+        Self::ComplexTypesAsJson,
+        Self::IntervalsAsString,
+    ];
+
+    /// The canonical wire spelling of this key.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudfetchEnabled => "cloudfetch_enabled",
+            Self::CloudfetchLinkPrefetchWindow => "cloudfetch_link_prefetch_window",
+            Self::CloudfetchMaxChunksInMemory => "cloudfetch_max_chunks_in_memory",
+            Self::InlineMaxChunksInMemory => "inline_max_chunks_in_memory",
+            Self::ComplexTypesAsJson => "complex_types_as_json",
+            Self::IntervalsAsString => "intervals_as_string",
+        }
+    }
+
+    /// Parse a caller-supplied key string (case-insensitive) into a known
+    /// key, or `None` if it is not a recognised client-conf key.
+    pub(crate) fn parse(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|k| key.eq_ignore_ascii_case(k.as_str()))
+    }
+}
+
+impl ResultConfig {
+    /// Apply one client-side result knob by name, parsing `value` into the
+    /// matching typed field.
+    ///
+    /// This is the single validated entry point behind the C ABI's
+    /// `kernel_session_config_set_client_conf` (and any host that forwards
+    /// DSN / connection-string attributes as key/value pairs). The key is
+    /// resolved via [`ClientConfKey::parse`] (case-insensitive).
+    ///
+    /// Unlike the server `session_conf` map, these knobs are **client-side**
+    /// and never reach the SEA wire — so this deliberately does NOT accept
+    /// server conf keys (`ANSI_MODE`, `TIMEZONE`, …); those go through
+    /// [`filter_session_conf`] instead. Keeping the two channels separate is
+    /// the point (see #226).
+    ///
+    /// # Errors
+    /// Returns `ErrorCode::InvalidArgument` when:
+    /// - `key` is not a recognised client-conf key, or
+    /// - `value` cannot be parsed for that key's type (booleans accept
+    ///   exactly `"true"` / `"false"` case-insensitively; the `usize`
+    ///   windows require a positive integer).
+    ///
+    /// A `cloudfetch_max_chunks_in_memory` above
+    /// [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is **clamped** (with a `warn!`),
+    /// not rejected — a fat-fingered value must not fail the connection, but
+    /// it must not drive peak RSS toward OOM either.
+    pub(crate) fn apply_client_conf(&mut self, key: &str, value: &str) -> crate::Result<()> {
+        let Some(known) = ClientConfKey::parse(key) else {
+            return Err(crate::kernel_error::Error::invalid_argument().message(format!(
+                "unknown client conf key {key:?}; recognised client-side result knobs are {:?}. \
+                 (Server session confs like ANSI_MODE / TIMEZONE go through session_conf, not here.)",
+                ClientConfKey::ALL
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>(),
+            )));
+        };
+
+        // Booleans accept exactly "true"/"false" (case-insensitive). SEA and
+        // the reference drivers use these literal forms; anything else is a
+        // caller error we surface rather than silently coerce.
+        let parse_bool = |v: &str| -> crate::Result<bool> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(
+                    crate::kernel_error::Error::invalid_argument().message(format!(
+                        "client conf '{}' expects \"true\" or \"false\", got {v:?}",
+                        known.as_str(),
+                    )),
+                ),
+            }
+        };
+        let parse_positive_usize = |v: &str| -> crate::Result<usize> {
+            match v.trim().parse::<usize>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => Err(
+                    crate::kernel_error::Error::invalid_argument().message(format!(
+                        "client conf '{}' expects a positive integer, got {v:?}",
+                        known.as_str(),
+                    )),
+                ),
+            }
+        };
+
+        // Exhaustive: adding a ClientConfKey variant forces a new arm here.
+        match known {
+            ClientConfKey::CloudfetchEnabled => {
+                self.cloudfetch_enabled = parse_bool(value)?;
+            }
+            ClientConfKey::CloudfetchLinkPrefetchWindow => {
+                self.cloudfetch_link_prefetch_window = parse_positive_usize(value)?;
+            }
+            ClientConfKey::CloudfetchMaxChunksInMemory => {
+                let n = parse_positive_usize(value)?;
+                let clamped = n.min(CLOUDFETCH_MAX_CHUNKS_CEILING);
+                if clamped != n {
+                    crate::klog::warn!(
+                        requested = n,
+                        ceiling = CLOUDFETCH_MAX_CHUNKS_CEILING,
+                        "clamping cloudfetch_max_chunks_in_memory to the ceiling \
+                         (peak RSS scales with this knob)",
+                    );
+                }
+                self.cloudfetch_max_chunks_in_memory = clamped;
+            }
+            ClientConfKey::InlineMaxChunksInMemory => {
+                self.inline_max_chunks_in_memory = parse_positive_usize(value)?;
+            }
+            ClientConfKey::ComplexTypesAsJson => {
+                self.complex_types_as_json = parse_bool(value)?;
+            }
+            ClientConfKey::IntervalsAsString => {
+                self.intervals_as_string = parse_bool(value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 #[non_exhaustive]

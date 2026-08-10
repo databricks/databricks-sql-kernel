@@ -26,7 +26,8 @@
 
 use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{
-    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig, TokenCacheConfig,
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TlsConfig,
+    TokenCacheConfig,
 };
 use crate::kernel_error::Error;
 use crate::session::Session;
@@ -112,11 +113,19 @@ pub struct KernelSessionConfig {
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
     /// On-disk U2M token-cache policy (populated by
-    /// `kernel_session_config_set_token_cache`). Defaults to enabled with
+    /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
     /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
     /// touch the cache. See [`TokenCacheConfig`].
     token_cache: TokenCacheConfig,
+    /// Client-side result-management knobs (CloudFetch / inline streaming
+    /// tuning, flat-text rendering). Populated by
+    /// `kernel_session_config_set_client_conf`; defaults to
+    /// [`ResultConfig::default`]. These are **client-side** behaviours
+    /// folded into the kernel's `ResultConfig` at `open()` — they never
+    /// reach the SEA wire (unlike [`Self::session_conf`]). See
+    /// [`ResultConfig`].
+    result: ResultConfig,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -196,6 +205,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         ignore_transactions: true,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
+        // Kernel result defaults (CloudFetch enabled, Arrow-native types).
+        result: ResultConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -656,7 +667,7 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
 /// point to a NUL-terminated UTF-8 string valid for the duration of the
 /// call.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_token_cache(
+pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
     config: *mut KernelSessionConfig,
     enabled: bool,
     passphrase: *const c_char,
@@ -667,6 +678,61 @@ pub unsafe extern "C" fn kernel_session_config_set_token_cache(
             passphrase: optional_str(passphrase, "passphrase")?,
         };
         Ok(())
+    })
+}
+
+/// Set one **client-side** result knob by name (`key` = `value`).
+///
+/// This is the client-side counterpart to
+/// `kernel_session_config_set_session_conf`: that one carries **server**
+/// session confs (`ANSI_MODE`, `TIMEZONE`, …) to the SEA wire; this one
+/// sets **client-side** knobs that tune how the kernel fetches, buffers,
+/// and post-processes results and are **never sent to the server**. The two
+/// channels are deliberately separate (see #196 / #226 — conflating them is
+/// what made a client flag masquerade as a rejected server conf).
+///
+/// A key/value shape (rather than one typed setter per knob) is chosen so
+/// the signature never changes as `ResultConfig` grows new knobs, and so a
+/// host that already has DSN / connection-string attributes can forward
+/// them in a loop. Safety is recovered at runtime: an unknown key or an
+/// unparseable value is **rejected** with `InvalidArgument` (and a stored
+/// error naming the problem), not silently ignored.
+///
+/// Recognised keys (matched case-insensitively), mapping to
+/// [`ResultConfig`]:
+/// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
+///   result inline (SEA `disposition = INLINE`), mirroring JDBC's
+///   `EnableQueryResultDownload=0`.
+/// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
+///   prefetched ahead of the consumer.
+/// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed
+///   CloudFetch chunks held at once (bounds peak RSS). Values above the
+///   kernel ceiling (256) are **clamped** with a warning, not rejected.
+/// - `inline_max_chunks_in_memory` = positive integer — inline-Arrow
+///   prefetch window (used when `cloudfetch_enabled = false`).
+/// - `complex_types_as_json` = `"true"` / `"false"` — render `ARRAY` /
+///   `MAP` / `STRUCT` / `VARIANT` / `GEOMETRY` / `GEOGRAPHY` as JSON text
+///   (PySQL `_use_arrow_native_complex_types=False`, JDBC
+///   `complexDatatypeSupport=false`).
+/// - `intervals_as_string` = `"true"` / `"false"` — render `INTERVAL` /
+///   `DURATION` as canonical Databricks text (for pyarrow-Python bindings).
+///
+/// A server session-conf key passed here (e.g. `ANSI_MODE`) is rejected —
+/// use `kernel_session_config_set_session_conf` for those.
+///
+/// # Safety
+/// `config` must be a live config handle; `key` / `value` must be
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_client_conf(
+    config: *mut KernelSessionConfig,
+    key: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        let key = required_str(key, "client_conf key")?;
+        let value = required_str(value, "client_conf value")?;
+        c.result.apply_client_conf(&key, &value)
     })
 }
 
@@ -804,6 +870,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         retry,
         ignore_transactions,
         token_cache,
+        result,
     } = config;
 
     block_on_ffi(move || {
@@ -853,6 +920,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .connection(connection)
                 .auth(auth)
                 .session_conf(session_conf)
+                .result(result)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
                     ..Default::default()
