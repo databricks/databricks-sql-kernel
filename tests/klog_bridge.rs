@@ -42,7 +42,11 @@
 
 use std::sync::{Mutex, OnceLock};
 
-use databricks_sql_kernel::KERNEL_LOG_TARGET;
+use databricks_sql_kernel::{
+    AuthConfig, ConnectionConfig, HttpConfig, LoggingConfig, Session, KERNEL_LOG_TARGET,
+};
+use wiremock::matchers::{method, path};
+use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Captured `(target, rendered_message)` pairs. The message is what
 /// `tracing`'s `log` feature renders — including any structured fields
@@ -131,5 +135,71 @@ fn klog_propagates_correlation_field() {
             && msg.contains("statement_id")),
         "expected a kernel-target record whose rendered message carries \
          the `statement_id` field {stmt:?}; got {got:?}"
+    );
+}
+
+/// GATE REGRESSION (issue #213 follow-up): opening a session with an
+/// UNCONFIGURED `LoggingConfig` must NOT install a `tracing` subscriber,
+/// so the `tracing`→`log` bridge that `pyo3_log` depends on stays live.
+///
+/// `Session::open` now consumes `LoggingConfig` (issue #213), but only
+/// when the caller explicitly set a `filter` or `file`. The pyo3 binding
+/// opens sessions through this same path and never sets logging — if
+/// `open()` installed a subscriber for the empty/default config, it would
+/// suppress the bridge and silently break all kernel logging into Python.
+///
+/// This test proves the gate holds: after a default-logging `open()`, a
+/// kernel-target event still reaches the `log` capture sink (which only
+/// happens while no subscriber is installed). A regression that dropped
+/// the `is_some()` gate would install the `RUST_LOG`/warn default here and
+/// this probe would stop being captured.
+#[tokio::test]
+async fn empty_logging_config_open_does_not_install_subscriber() {
+    install_capture();
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"session_id":"sess-gate-213","warehouse_id":"test_wh"}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut http = HttpConfig::default();
+    http.retry_max_retries = 0;
+
+    // No `.logging(...)` — the default (pyo3-equivalent) case.
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+        })
+        .http(http)
+        .open()
+        .await
+        .expect("Session::open with default logging must succeed");
+    assert_eq!(session.session_id(), "sess-gate-213");
+
+    // Sanity: an explicitly-empty LoggingConfig is the same no-op path.
+    let _empty = LoggingConfig::default();
+
+    // The bridge must still be live: a kernel-target event AFTER open()
+    // still produces a `log::Record` captured by our sink.
+    let probe = "gate-probe-after-open-4d21";
+    tracing::warn!(target: KERNEL_LOG_TARGET, probe = probe, "post-open bridge probe");
+
+    let got = CAPTURED.get().unwrap().lock().unwrap().clone();
+    assert!(
+        got.iter()
+            .any(|(target, msg)| target == KERNEL_LOG_TARGET && msg.contains(probe)),
+        "issue #213 gate: after a default-logging Session::open, the tracing→log bridge must \
+         still be live (no subscriber installed), but the post-open probe {probe:?} was not \
+         captured — Session::open installed a subscriber for an unconfigured LoggingConfig, \
+         which breaks pyo3_log. got {got:?}"
     );
 }
