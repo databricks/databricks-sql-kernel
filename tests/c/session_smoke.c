@@ -167,7 +167,9 @@ static void test_proxy_and_tls_setters(void) {
 
   /* Retry config: a valid range (incl. max_retries=0 to disable, overall
    * timeout 0 = keep default) succeeds; a non-zero overall timeout also
-   * succeeds; a zero min_wait or an inverted range is rejected. */
+   * succeeds; a zero min_wait is rejected; an inverted range (max<min) is a
+   * tuning typo that is corrected (max raised to min) with a warning, not
+   * rejected — a backoff bound must not fail a host's connect. */
   rc = kernel_session_config_set_retry_config(config, 500, 30000, 0, 0);
   CHECK(rc == KernelStatusCode_Success, "set_retry_config (valid, disable, default budget) succeeds");
   rc = kernel_session_config_set_retry_config(config, 500, 30000, 3, 120000);
@@ -175,7 +177,7 @@ static void test_proxy_and_tls_setters(void) {
   rc = kernel_session_config_set_retry_config(config, 0, 1000, 3, 0);
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_retry_config(min=0) → InvalidArgument");
   rc = kernel_session_config_set_retry_config(config, 5000, 1000, 3, 0);
-  CHECK(rc == KernelStatusCode_InvalidArgument, "set_retry_config(max<min) → InvalidArgument");
+  CHECK(rc == KernelStatusCode_Success, "set_retry_config(max<min) corrected, not rejected");
 
   kernel_session_config_free(config);
 }

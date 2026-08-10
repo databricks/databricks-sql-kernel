@@ -393,9 +393,12 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
 /// `min_wait_ms` guarantees zero retries (the first backoff already exceeds the
 /// budget); this is accepted but logged at `warn`.
 ///
-/// `min_wait_ms == 0` and `max_wait_ms < min_wait_ms` are rejected as
-/// `InvalidArgument`. Maps to `HttpConfig::retry_min_wait` /
-/// `retry_max_wait` / `retry_max_retries` / `overall_timeout`.
+/// `min_wait_ms == 0` is rejected as `InvalidArgument` (a zero floor is
+/// genuinely invalid, not a correctable typo). A `max_wait_ms < min_wait_ms`
+/// pair is *corrected* (max raised to min) with a `warn`, rather than rejected —
+/// a backoff bound is a tuning hint and must not fail a host's connect. Maps to
+/// `HttpConfig::retry_min_wait` / `retry_max_wait` / `retry_max_retries` /
+/// `overall_timeout`.
 ///
 /// # Safety
 /// `config` must be a live config handle.
@@ -411,11 +414,24 @@ pub unsafe extern "C" fn kernel_session_config_set_retry_config(
         if min_wait_ms == 0 {
             return Err(Error::invalid_argument().message("retry min_wait_ms must be > 0"));
         }
-        if max_wait_ms < min_wait_ms {
-            return Err(
-                Error::invalid_argument().message("retry max_wait_ms must be >= min_wait_ms")
+        // A `max_wait_ms < min_wait_ms` pair is a tuning typo, not a fatal
+        // config error: correct it (raise max to min) and warn, rather than
+        // rejecting the whole config and failing the host's connect. A backoff
+        // bound is a tuning hint and the ceiling is the driver's own, so this
+        // matches the kernel's clamp-and-warn discipline (see
+        // `build_retry_configs_for_session` / `calculate_backoff`) and the
+        // reference ODBC driver's handling.
+        let max_wait_ms = if max_wait_ms < min_wait_ms {
+            crate::klog::warn!(
+                min_wait_ms,
+                max_wait_ms,
+                "retry max_wait_ms is below min_wait_ms; raising max_wait_ms to \
+                 min_wait_ms (a backoff bound is a tuning hint, not a hard failure)",
             );
-        }
+            min_wait_ms
+        } else {
+            max_wait_ms
+        };
         // A non-zero budget below the first backoff wait guarantees zero
         // retries (the client stops before the first sleep — src/client/http.rs).
         // Accept it (the single attempt is still coherent, and a valid-looking
@@ -1274,27 +1290,47 @@ mod tests {
         }
     }
 
-    /// The retry setter rejects a zero min_wait and a max_wait below min_wait
-    /// with `InvalidArgument` — a degenerate range would otherwise reach the
-    /// HTTP client as nonsense backoff bounds.
+    /// The retry setter rejects a zero min_wait with `InvalidArgument` (a zero
+    /// floor is genuinely invalid), but a `max_wait < min_wait` pair is a tuning
+    /// typo that is CORRECTED (max raised to min) with a warning rather than
+    /// rejected — a backoff bound must not fail a host's connect
+    /// (ERRORRECOV-014).
     #[test]
-    fn set_retry_config_rejects_bad_range() {
+    fn set_retry_config_rejects_zero_min_corrects_bad_range() {
         unsafe {
             let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
             assert_eq!(
                 kernel_session_config_new(&mut config),
                 KernelStatusCode::Success
             );
+
+            // Zero min_wait is still rejected outright.
             assert_eq!(
                 kernel_session_config_set_retry_config(config, 0, 1_000, 3, 0),
                 KernelStatusCode::InvalidArgument
             );
-            assert_eq!(
-                kernel_session_config_set_retry_config(config, 5_000, 1_000, 3, 0),
-                KernelStatusCode::InvalidArgument
-            );
             // A rejected call leaves the config's retry unset.
             assert!(config.as_ref().unwrap().retry.is_none());
+
+            // max_wait (1s) < min_wait (5s): accepted, and max is raised to min.
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 5_000, 1_000, 3, 0),
+                KernelStatusCode::Success
+            );
+            let retry = config
+                .as_ref()
+                .unwrap()
+                .retry
+                .as_ref()
+                .expect("retry spec should be recorded after correction");
+            assert_eq!(retry.min_wait, Duration::from_millis(5_000));
+            assert_eq!(
+                retry.max_wait,
+                Duration::from_millis(5_000),
+                "max_wait should be corrected up to min_wait"
+            );
+            assert_eq!(retry.max_retries, 3);
+
             kernel_session_config_free(config);
         }
     }
