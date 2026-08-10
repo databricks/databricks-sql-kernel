@@ -826,7 +826,7 @@ impl StatementCanceller {
         async {
             // Log both outcomes at the decision point so a host debugging a
             // cancel can tell "raced ahead of the id" (no-op) from "wired to
-            // the wrong handle" in one `RUST_LOG=databricks_sql_kernel=debug`
+            // the wrong handle" in one `RUST_LOG=databricks::sql::kernel=debug`
             // stream — the no-op branch returns before the transport, which
             // is the only other place a cancel is logged.
             let Some(id) = id else {

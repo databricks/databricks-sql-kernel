@@ -26,8 +26,11 @@
 //! ## Usage
 //!
 //! ```bash
-//! # Via environment variable
-//! RUST_LOG=databricks_sql_kernel=debug ./my_app
+//! # Via environment variable. The kernel emits on the `::`-delimited
+//! # target `databricks::sql::kernel`; `EnvFilter` matches by
+//! # `::`-delimited segment prefix, so the underscore crate-name form
+//! # (`databricks_sql_kernel=debug`) would match nothing.
+//! RUST_LOG=databricks::sql::kernel=debug ./my_app
 //! ```
 //!
 //! ## Relationship to the pyo3 / Python path

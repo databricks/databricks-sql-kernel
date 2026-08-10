@@ -1083,11 +1083,24 @@ impl ResultConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
-    /// Log filter, e.g. `databricks_sql_kernel=debug`. If `None`, the
-    /// kernel honors `RUST_LOG` from the environment.
+    /// A full [`tracing_subscriber::EnvFilter`] directive, applied
+    /// **verbatim** on the direct-Rust `Session::open` path.
+    ///
+    /// The kernel emits every event on the target
+    /// [`crate::KERNEL_LOG_TARGET`] = `databricks::sql::kernel`, and
+    /// `EnvFilter` matches by `::`-delimited segment prefix, so the
+    /// directive MUST name that target with `::` separators, e.g.
+    /// `databricks::sql::kernel=debug`. The underscore crate-name form
+    /// (`databricks_sql_kernel=debug`) matches **nothing** — the log file
+    /// is created but stays empty and no error is surfaced. If `None`, the
+    /// kernel honors `RUST_LOG` from the environment (falling back to
+    /// `databricks::sql::kernel=warn`).
     pub filter: Option<String>,
 
-    /// File to write logs to. If `None`, logs go to stderr.
+    /// Destination for logs. If it names an existing directory (or ends
+    /// with a path separator), a `databricks-sql-kernel.log` file is
+    /// created *inside* it; otherwise it is taken as the log file path. If
+    /// `None`, logs go to stderr.
     pub file: Option<PathBuf>,
 }
 
