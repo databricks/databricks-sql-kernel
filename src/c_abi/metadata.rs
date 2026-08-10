@@ -173,6 +173,23 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
     })
 }
 
+/// Split a comma-separated `table_types` CSV into a borrowed slice of
+/// non-empty, trimmed type names.
+///
+/// Empty entries are dropped, so ODBC's "" / whitespace / comma-only
+/// junk (e.g. `""`, `" "`, `",,"`) normalizes to an empty `Vec`. An
+/// empty `Vec` means "all types" (like a NULL arg): the kernel treats
+/// `Some(&[])` the same as `None` (match-all) since #187/#201, so an
+/// empty result needs no collapse to `None` to avoid a match-nothing
+/// bug — the ODBC-specific empty→"all types" convention is preserved
+/// either way.
+fn split_table_types_csv(csv: &str) -> Vec<&str> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
 /// List tables filtered by catalog (**pattern**), schema / table
 /// patterns, and an optional comma-separated `table_types` filter.
 ///
@@ -209,24 +226,8 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
             let catalog = opt_pattern(catalog, "catalog")?;
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
-            // Split the comma-separated table types into a borrowed slice.
-            // An empty / whitespace-only / comma-only CSV must mean
-            // "all types" (like a NULL arg), NOT "match nothing": the
-            // kernel treats Some(&[]) as a filter that rejects every row,
-            // so collapse an empty result back to None.
             let types_csv = opt_str(table_types_csv, "table_types")?;
-            let types_owned: Option<Vec<&str>> = types_csv.and_then(|csv| {
-                let v: Vec<&str> = csv
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            });
+            let types_owned = types_csv.map(split_table_types_csv);
             session
                 .metadata()
                 .list_tables(
@@ -409,5 +410,27 @@ mod tests {
             let real = CString::new("main").unwrap();
             assert!(opt_ident(real.as_ptr(), "catalog").unwrap().is_some());
         }
+    }
+
+    /// ODBC's "" / whitespace / comma-only `table_types` spellings all
+    /// normalize to an empty type list, which `list_tables` treats as
+    /// "all types" (match-all, like a NULL arg) since #187/#201. A
+    /// non-empty CSV parses into its trimmed, non-empty entries.
+    #[test]
+    fn split_table_types_csv_normalizes_empty_and_parses_values() {
+        // Empty / whitespace / comma-only junk → empty list (all types).
+        assert!(split_table_types_csv("").is_empty());
+        assert!(split_table_types_csv("   ").is_empty());
+        assert!(split_table_types_csv(",").is_empty());
+        assert!(split_table_types_csv(",,").is_empty());
+        assert!(split_table_types_csv(" , , ").is_empty());
+
+        // Real values are trimmed; interspersed empties are dropped.
+        assert_eq!(split_table_types_csv("TABLE"), vec!["TABLE"]);
+        assert_eq!(split_table_types_csv("TABLE, VIEW"), vec!["TABLE", "VIEW"]);
+        assert_eq!(
+            split_table_types_csv(" TABLE ,, VIEW ,"),
+            vec!["TABLE", "VIEW"]
+        );
     }
 }
