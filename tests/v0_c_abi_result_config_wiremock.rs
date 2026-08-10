@@ -112,9 +112,10 @@ unsafe fn open_session_c_abi(uri: &str, cloudfetch_enabled: Option<bool>) -> *mu
         KernelStatusCode::Success
     );
     if let Some(cf) = cloudfetch_enabled {
-        // 0s => keep kernel defaults for the window/chunk knobs.
+        // 0s => keep kernel defaults for the window/chunk knobs; the two
+        // flat-text bools stay at their defaults (false).
         assert_eq!(
-            kernel_session_config_set_result_config(config, cf, 0, 0, 0),
+            kernel_session_config_set_result_config(config, cf, 0, 0, 0, false, false),
             KernelStatusCode::Success
         );
     }

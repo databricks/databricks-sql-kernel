@@ -371,14 +371,17 @@ KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConf
  *
  * The on-disk format is wire-compatible with the JDBC driver's
  * EncryptedFileTokenCache (given the same passphrase). */
-KernelStatusCode kernel_session_config_set_token_cache(KernelSessionConfig* config, bool enabled,
-                                                      const char* passphrase);
+KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionConfig* config,
+                                                                  bool enabled,
+                                                                  const char* passphrase);
 
-/* Configure client-side result streaming (CloudFetch + inline tuning).
- * All four knobs are CLIENT-SIDE — they tune how the kernel fetches and
- * buffers results and never reach the SEA wire (unlike
- * kernel_session_config_set_session_conf, which carries server confs).
+/* Configure the client-side result knobs in one call — the full
+ * ResultConfig surface. Every knob here is CLIENT-SIDE: it tunes how the
+ * kernel fetches, buffers, and post-processes results and never reaches the
+ * SEA wire (unlike kernel_session_config_set_session_conf, which carries
+ * server confs).
  *
+ * CloudFetch / inline streaming:
  * - `cloudfetch_enabled`: when false, every result is served inline (the
  *   execute request uses SEA disposition = INLINE), mirroring the reference
  *   JDBC driver's EnableQueryResultDownload=0. Default true.
@@ -390,8 +393,19 @@ KernelStatusCode kernel_session_config_set_token_cache(KernelSessionConfig* conf
  * - `inline_max_chunks_in_memory`: prefetch window for the inline-Arrow
  *   path (used when cloudfetch_enabled = false). 0 => keep the default (4).
  *
+ * Flat-text rendering (for bindings that can't consume Arrow-native types):
+ * - `complex_types_as_json`: render ARRAY / MAP / STRUCT / VARIANT /
+ *   GEOMETRY / GEOGRAPHY columns as JSON-text (UTF-8). Default false.
+ *   Mirrors PySQL _use_arrow_native_complex_types=False, JDBC
+ *   complexDatatypeSupport=false.
+ * - `intervals_as_string`: render INTERVAL / DURATION columns as canonical
+ *   Databricks text (UTF-8). Default false. Set true for bindings handing
+ *   Arrow batches to pyarrow's Python layer (which can't decode Arrow
+ *   month_interval).
+ *
  * 0 means "keep the kernel default" for every size_t field, so a host that
- * zero-initialises the argument list only changes cloudfetch_enabled.
+ * zero-initialises the argument list gets kernel defaults for the windows
+ * and only the bool fields take effect.
  *
  * This is the typed replacement for the legacy cloudfetch_max_chunks_in_memory
  * value previously smuggled through kernel_session_config_set_session_conf;
@@ -400,22 +414,9 @@ KernelStatusCode kernel_session_config_set_result_config(KernelSessionConfig* co
                                                          bool cloudfetch_enabled,
                                                          size_t link_prefetch_window,
                                                          size_t max_chunks_in_memory,
-                                                         size_t inline_max_chunks_in_memory);
-
-/* Render complex-typed result columns (ARRAY / MAP / STRUCT / VARIANT /
- * GEOMETRY / GEOGRAPHY) as JSON-text (UTF-8) instead of Arrow-native nested
- * types. Default false. Set true for flat-text bindings that can't consume
- * Arrow nested types (PySQL _use_arrow_native_complex_types=False, JDBC
- * complexDatatypeSupport=false). Client-side only; never on the wire. */
-KernelStatusCode kernel_session_config_set_complex_types_as_json(KernelSessionConfig* config,
-                                                                 bool enabled);
-
-/* Render INTERVAL / DURATION result columns as canonical Databricks text
- * (UTF-8) instead of Arrow interval/duration types. Default false. Set true
- * for bindings that hand Arrow batches to pyarrow's Python layer (which
- * can't decode Arrow month_interval). Client-side only; never on the wire. */
-KernelStatusCode kernel_session_config_set_intervals_as_string(KernelSessionConfig* config,
-                                                               bool enabled);
+                                                         size_t inline_max_chunks_in_memory,
+                                                         bool complex_types_as_json,
+                                                         bool intervals_as_string);
 
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 

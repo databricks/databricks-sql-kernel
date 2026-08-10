@@ -113,7 +113,7 @@ pub struct KernelSessionConfig {
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
     /// On-disk U2M token-cache policy (populated by
-    /// `kernel_session_config_set_token_cache`). Defaults to enabled with
+    /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
     /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
     /// touch the cache. See [`TokenCacheConfig`].
@@ -668,7 +668,7 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
 /// point to a NUL-terminated UTF-8 string valid for the duration of the
 /// call.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_token_cache(
+pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
     config: *mut KernelSessionConfig,
     enabled: bool,
     passphrase: *const c_char,
@@ -682,12 +682,16 @@ pub unsafe extern "C" fn kernel_session_config_set_token_cache(
     })
 }
 
-/// Configure client-side result streaming (CloudFetch + inline tuning).
+/// Configure the client-side result knobs in one call — the full
+/// [`ResultConfig`] surface.
 ///
-/// All four knobs are **client-side** — they tune how the kernel fetches
-/// and buffers results and never reach the SEA wire (contrast
-/// `kernel_session_config_set_session_conf`, which carries server confs).
+/// Every knob here is **client-side**: it tunes how the kernel fetches,
+/// buffers, and post-processes results and never reaches the SEA wire
+/// (contrast `kernel_session_config_set_session_conf`, which carries
+/// server confs). All six fields of the kernel's `ResultConfig` are set in
+/// one call so a host configures result behaviour atomically.
 ///
+/// CloudFetch / inline streaming:
 /// - `cloudfetch_enabled`: when `false`, every result is served inline
 ///   (the execute request uses SEA `disposition = INLINE`), mirroring the
 ///   reference JDBC driver's `EnableQueryResultDownload=0`. Default `true`.
@@ -702,9 +706,22 @@ pub unsafe extern "C" fn kernel_session_config_set_token_cache(
 ///   path (used when `cloudfetch_enabled = false`). `0` ⇒ keep the
 ///   default (4).
 ///
+/// Flat-text rendering (for bindings that can't consume the Arrow-native
+/// types):
+/// - `complex_types_as_json`: render `ARRAY` / `MAP` / `STRUCT` /
+///   `VARIANT` / `GEOMETRY` / `GEOGRAPHY` columns as JSON-text `Utf8`.
+///   Default `false` (Arrow-native). Mirrors PySQL's
+///   `_use_arrow_native_complex_types=False` and JDBC's
+///   `complexDatatypeSupport=false`.
+/// - `intervals_as_string`: render `INTERVAL` / `DURATION` columns as
+///   canonical Databricks text (`Utf8`). Default `false`. Set `true` for
+///   bindings that hand Arrow batches to pyarrow's Python layer, which
+///   can't decode Arrow's `month_interval` type.
+///
 /// **`0` means "keep the kernel default"** for every `usize` field, so a
-/// host that zero-initialises the argument list only changes
-/// `cloudfetch_enabled`. Maps to [`ResultConfig`].
+/// host that zero-initialises the argument list gets kernel defaults for
+/// the windows and only the `bool` fields take effect. Maps to
+/// [`ResultConfig`].
 ///
 /// This is the typed replacement for the legacy
 /// `cloudfetch_max_chunks_in_memory` value that was smuggled through
@@ -721,6 +738,8 @@ pub unsafe extern "C" fn kernel_session_config_set_result_config(
     link_prefetch_window: usize,
     max_chunks_in_memory: usize,
     inline_max_chunks_in_memory: usize,
+    complex_types_as_json: bool,
+    intervals_as_string: bool,
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
         c.result.cloudfetch_enabled = cloudfetch_enabled;
@@ -744,51 +763,8 @@ pub unsafe extern "C" fn kernel_session_config_set_result_config(
         if inline_max_chunks_in_memory != 0 {
             c.result.inline_max_chunks_in_memory = inline_max_chunks_in_memory;
         }
-        Ok(())
-    })
-}
-
-/// Render complex-typed result columns (`ARRAY` / `MAP` / `STRUCT` /
-/// `VARIANT` / `GEOMETRY` / `GEOGRAPHY`) as JSON-text `Utf8` instead of
-/// Arrow-native nested types. Default `false` (Arrow-native).
-///
-/// Set `true` for flat-text bindings that can't consume Arrow nested
-/// types — mirrors PySQL's `_use_arrow_native_complex_types=False` and the
-/// JDBC driver's `complexDatatypeSupport=false`. Maps to
-/// [`ResultConfig::complex_types_as_json`]. Client-side only; never on the
-/// wire.
-///
-/// # Safety
-/// `config` must be a live config handle.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_complex_types_as_json(
-    config: *mut KernelSessionConfig,
-    enabled: bool,
-) -> KernelStatusCode {
-    set_on_config(config, |c| {
-        c.result.complex_types_as_json = enabled;
-        Ok(())
-    })
-}
-
-/// Render `INTERVAL` / `DURATION` result columns as canonical Databricks
-/// text (`Utf8`) instead of Arrow interval/duration types. Default
-/// `false`.
-///
-/// Set `true` for bindings that hand Arrow batches to pyarrow's Python
-/// layer, which can't decode Arrow's `month_interval` type. Maps to
-/// [`ResultConfig::intervals_as_string`]. Client-side only; never on the
-/// wire.
-///
-/// # Safety
-/// `config` must be a live config handle.
-#[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_intervals_as_string(
-    config: *mut KernelSessionConfig,
-    enabled: bool,
-) -> KernelStatusCode {
-    set_on_config(config, |c| {
-        c.result.intervals_as_string = enabled;
+        c.result.complex_types_as_json = complex_types_as_json;
+        c.result.intervals_as_string = intervals_as_string;
         Ok(())
     })
 }
