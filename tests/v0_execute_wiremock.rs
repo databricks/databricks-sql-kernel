@@ -26,8 +26,8 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, Session,
-    TypedValue,
+    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig,
+    Session, TypedValue,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -48,6 +48,41 @@ async fn open_session(server: &MockServer) -> Session {
         .open()
         .await
         .expect("Session::open should succeed")
+}
+
+/// Open a session with a custom [`ResultConfig`]. Used by the
+/// disposition tests below to drive `cloudfetch_enabled`.
+async fn open_session_with_result(server: &MockServer, result: ResultConfig) -> Session {
+    Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+        })
+        .result(result)
+        .open()
+        .await
+        .expect("Session::open should succeed")
+}
+
+/// Read the `disposition` sent on the recorded POST /statements request.
+async fn recorded_execute_disposition(server: &MockServer) -> String {
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available");
+    let exec = recorded
+        .iter()
+        .find(|r| r.url.path() == "/api/2.0/sql/statements" && r.method.as_str() == "POST")
+        .expect("a POST /statements request was made");
+    let body: serde_json::Value =
+        serde_json::from_slice(&exec.body).expect("execute body must be valid JSON");
+    body.get("disposition")
+        .and_then(|v| v.as_str())
+        .expect("execute request must carry a disposition")
+        .to_string()
 }
 
 async fn mount_create_session(server: &MockServer) {
@@ -293,6 +328,68 @@ async fn execute_succeeded_inline_returns_one_row() {
         1
     );
     exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_with_cloudfetch_enabled_sends_inline_or_external_links_disposition() {
+    // Default (cloudfetch_enabled=true): the ExecuteStatement disposition
+    // must be INLINE_OR_EXTERNAL_LINKS so the server may return CloudFetch
+    // external links.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-cf-on", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let mut exec = stmt.execute().await.expect("execute");
+    drain(exec.result_stream_mut()).await;
+    exec.close().await.expect("close");
+
+    assert_eq!(
+        recorded_execute_disposition(&server).await,
+        "INLINE_OR_EXTERNAL_LINKS",
+    );
+}
+
+#[tokio::test]
+async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
+    // Regression test for issue #196. With cloudfetch_enabled=false the
+    // ExecuteStatement disposition must be INLINE — this is how the kernel
+    // (like the JDBC / Thrift reference drivers) disables cloud-fetch on
+    // SEA, NOT via a `can_cloud_download` session conf (which SEA rejects
+    // at ExecuteStatement with CONFIG_NOT_AVAILABLE). The server then
+    // serves results inline and the statement succeeds.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = int64_batch("n", vec![7]);
+    mount_execute(&server, succeeded_inline_body("stmt-cf-off", &batch)).await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let mut exec = stmt
+        .execute()
+        .await
+        .expect("execute must succeed inline with cloudfetch disabled");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        7
+    );
+    exec.close().await.expect("close");
+
+    assert_eq!(recorded_execute_disposition(&server).await, "INLINE");
 }
 
 #[tokio::test]

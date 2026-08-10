@@ -46,6 +46,26 @@ pub(crate) struct TransportConfig {
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,
+    /// Whether CloudFetch (cloud-storage-backed result download via
+    /// external links) is enabled for this session.
+    ///
+    /// This is a **connection-level** setting — like the reference JDBC
+    /// driver's `EnableQueryResultDownload`, it is read once at session
+    /// open and applied to every `ExecuteStatement`, not toggled per
+    /// statement. It selects the SEA `disposition` sent on each execute:
+    /// `true` → `INLINE_OR_EXTERNAL_LINKS` (results may come back as
+    /// external CloudFetch links), `false` → `INLINE` (the server serves
+    /// every result inline, regardless of size).
+    ///
+    /// **Why this is `disposition`, not a session conf.** SEA has no
+    /// `CAN_CLOUD_DOWNLOAD` session conf — sending one is accepted at
+    /// `CreateSession` but rejected at the first `ExecuteStatement` with
+    /// `CONFIG_NOT_AVAILABLE` (see issue #196). Both the JDBC and Thrift
+    /// reference drivers control cloud-fetch per request (SEA
+    /// `disposition` / Thrift `canDownloadResult`), never via session
+    /// conf; this mirrors JDBC's SEA path
+    /// (`DatabricksSdkClient.getRequest`).
+    pub cloudfetch_enabled: bool,
 }
 
 impl Default for TransportConfig {
@@ -53,6 +73,8 @@ impl Default for TransportConfig {
         Self {
             poll_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_millis(500),
+            // Mirror `ResultConfig::default().cloudfetch_enabled`.
+            cloudfetch_enabled: true,
         }
     }
 }
@@ -342,10 +364,10 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// `row_offset`).
     ///
     /// Used by the inline-Arrow streaming path that lights up when
-    /// `ResultConfig.cloudfetch_enabled == false` (i.e. SEA's
-    /// `can_cloud_download=false` session conf). The server-side
-    /// response for this path carries Arrow IPC bytes inline in
-    /// `attachment` rather than emitting `external_links`.
+    /// `ResultConfig.cloudfetch_enabled == false` (i.e. the execute
+    /// request was sent with SEA `disposition = INLINE`). The
+    /// server-side response for this path carries Arrow IPC bytes inline
+    /// in `attachment` rather than emitting `external_links`.
     ///
     /// Per the bounded SEA API contract for OSS drivers:
     /// - `chunk_index` is derived from the *previous* chunk's

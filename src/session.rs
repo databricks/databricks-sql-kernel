@@ -279,7 +279,15 @@ impl Session {
         //    OnceLock::set. So: construct, wrap in Arc, build factory,
         //    install factory.
         let defaults = config.defaults.clone().unwrap_or_default();
-        let transport_config = TransportConfig::default();
+        let transport_config = TransportConfig {
+            // Thread the connection-level CloudFetch toggle onto the
+            // transport so every ExecuteStatement picks the right SEA
+            // disposition (INLINE_OR_EXTERNAL_LINKS vs INLINE). This is
+            // how cloud-fetch is disabled on SEA — see TransportConfig
+            // and issue #196; there is no CAN_CLOUD_DOWNLOAD session conf.
+            cloudfetch_enabled: config.result.cloudfetch_enabled,
+            ..TransportConfig::default()
+        };
         let sea = Arc::new(SeaRestTransport::new(
             http_client.clone(),
             host.clone(),
@@ -303,54 +311,18 @@ impl Session {
             "creating session"
         );
 
-        // When CloudFetch is disabled at the kernel layer, advertise this
-        // capability to SEA via the `can_cloud_download` session conf.
-        // Per the SEA inline-Arrow design (go/inline-arrow-sea, DD1), this
-        // tells the server to fall back to the inline-Arrow path for all
-        // result sizes instead of attempting cloud-fetch and erroring at
-        // fetch time.
-        //
-        // Don't clobber an explicit non-empty user value — if the caller
-        // wired `can_cloud_download` directly via `session_conf` for any
-        // reason (e.g., to force inline-Arrow even with CloudFetch enabled
-        // at the kernel layer), their value wins.
-        //
-        // **Case-insensitive key match** because SEA session-conf keys
-        // are historically case-insensitive on the wire; without this, a
-        // stray `"Can_Cloud_Download"` from the user would coexist with
-        // the kernel's canonical-cased `"can_cloud_download"` and we'd
-        // ship both keys (potentially with different values) — server
-        // would pick one non-deterministically.
-        //
-        // **Empty-string user values are purged**: an empty value is
-        // ambiguous (server behaviour undefined) and the kernel prefers
-        // to inject its canonical `"false"` instead of shipping the
-        // ambiguous empty. Purge-then-insert guarantees the wire body
-        // carries at most one `can_cloud_download` key regardless of
-        // case-variants the caller supplied.
-        let mut session_conf = config.session_conf.clone();
-        if !config.result.cloudfetch_enabled {
-            let has_nonempty_user_value = session_conf
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
-            crate::klog::debug!(
-                cloudfetch_enabled = false,
-                user_value_present = has_nonempty_user_value,
-                "evaluating can_cloud_download injection",
-            );
-            if !has_nonempty_user_value {
-                // Drop every case-variant (including empty-value ones)
-                // before inserting the canonical key so we can't ship
-                // duplicates that differ only in case.
-                session_conf.retain(|k, _| !k.eq_ignore_ascii_case("can_cloud_download"));
-                session_conf.insert("can_cloud_download".to_string(), "false".to_string());
-            }
-        }
+        // CloudFetch-disable is expressed per-statement via the SEA
+        // `disposition` (threaded onto `TransportConfig` above), NOT via a
+        // session conf: SEA has no `CAN_CLOUD_DOWNLOAD` conf — sending one
+        // is accepted at CreateSession but rejected at the first
+        // ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue #196). So the
+        // user's `session_conf` flows to CreateSession untouched; the
+        // kernel synthesises nothing here.
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                crate::config::filter_session_conf(session_conf),
+                crate::config::filter_session_conf(config.session_conf.clone()),
             )
             .await?;
 
