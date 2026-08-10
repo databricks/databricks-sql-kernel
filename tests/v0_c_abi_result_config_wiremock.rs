@@ -28,9 +28,10 @@
 use std::ffi::CString;
 
 use databricks_sql_kernel::c_abi::session::{
-    kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
-    kernel_session_config_set_http_path, kernel_session_config_set_result_config,
-    kernel_session_new_statement, kernel_session_open, kernel_session_t, KernelSessionConfig,
+    kernel_session_close, kernel_session_config_free, kernel_session_config_new,
+    kernel_session_config_set_auth_pat, kernel_session_config_set_client_conf,
+    kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
+    kernel_session_t, KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_statement_close, kernel_executed_statement_t, kernel_statement_execute,
@@ -112,10 +113,12 @@ unsafe fn open_session_c_abi(uri: &str, cloudfetch_enabled: Option<bool>) -> *mu
         KernelStatusCode::Success
     );
     if let Some(cf) = cloudfetch_enabled {
-        // 0s => keep kernel defaults for the window/chunk knobs; the two
-        // flat-text bools stay at their defaults (false).
+        // Set the one client knob under test by name via the generic
+        // client-conf setter; other knobs keep their kernel defaults.
+        let key = CString::new("cloudfetch_enabled").unwrap();
+        let value = CString::new(if cf { "true" } else { "false" }).unwrap();
         assert_eq!(
-            kernel_session_config_set_result_config(config, cf, 0, 0, 0, false, false),
+            kernel_session_config_set_client_conf(config, key.as_ptr(), value.as_ptr()),
             KernelStatusCode::Success
         );
     }
@@ -176,17 +179,17 @@ fn recorded_execute_disposition(cloudfetch_enabled: Option<bool>) -> String {
 }
 
 #[test]
-fn c_abi_set_result_config_disabled_sends_inline_disposition() {
-    // The headline: a C-ABI host that disables CloudFetch via the typed
-    // setter gets SEA `disposition = INLINE` on the wire — proving the
-    // typed result config reaches the execute path (previously unreachable
-    // from the C ABI). Mirrors the Rust-crate coverage in
-    // tests/v0_execute_wiremock.rs.
+fn c_abi_client_conf_cloudfetch_disabled_sends_inline_disposition() {
+    // The headline: a C-ABI host that disables CloudFetch via
+    // set_client_conf("cloudfetch_enabled","false") gets SEA
+    // `disposition = INLINE` on the wire — proving the client-conf channel
+    // reaches the execute path (previously unreachable from the C ABI).
+    // Mirrors the Rust-crate coverage in tests/v0_execute_wiremock.rs.
     assert_eq!(recorded_execute_disposition(Some(false)), "INLINE");
 }
 
 #[test]
-fn c_abi_set_result_config_enabled_sends_inline_or_external_links_disposition() {
+fn c_abi_client_conf_cloudfetch_enabled_sends_inline_or_external_links_disposition() {
     assert_eq!(
         recorded_execute_disposition(Some(true)),
         "INLINE_OR_EXTERNAL_LINKS"
@@ -195,9 +198,57 @@ fn c_abi_set_result_config_enabled_sends_inline_or_external_links_disposition() 
 
 #[test]
 fn c_abi_default_result_config_sends_inline_or_external_links_disposition() {
-    // No set_result_config call at all → kernel default (CloudFetch on).
+    // No set_client_conf call at all → kernel default (CloudFetch on).
     assert_eq!(
         recorded_execute_disposition(None),
         "INLINE_OR_EXTERNAL_LINKS"
     );
+}
+
+#[test]
+fn c_abi_set_client_conf_rejects_unknown_key_and_bad_value() {
+    use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
+    unsafe {
+        let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_config_new(&mut config),
+            KernelStatusCode::Success
+        );
+
+        // Unknown client key → InvalidArgument (not silently ignored).
+        let bad_key = CString::new("cloud_fetch_enabled").unwrap(); // typo
+        let val = CString::new("false").unwrap();
+        assert_eq!(
+            kernel_session_config_set_client_conf(config, bad_key.as_ptr(), val.as_ptr()),
+            KernelStatusCode::InvalidArgument
+        );
+
+        // A server session-conf key is NOT a client conf → rejected here
+        // (it belongs on set_session_conf). This is the channel separation.
+        let server_key = CString::new("ANSI_MODE").unwrap();
+        let server_val = CString::new("true").unwrap();
+        assert_eq!(
+            kernel_session_config_set_client_conf(config, server_key.as_ptr(), server_val.as_ptr()),
+            KernelStatusCode::InvalidArgument
+        );
+
+        // Unparseable value for a known bool key → InvalidArgument.
+        let key = CString::new("cloudfetch_enabled").unwrap();
+        let bad_val = CString::new("flase").unwrap(); // typo
+        assert_eq!(
+            kernel_session_config_set_client_conf(config, key.as_ptr(), bad_val.as_ptr()),
+            KernelStatusCode::InvalidArgument
+        );
+        let mut err = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(
+            kernel_get_last_error(err.as_mut_ptr()),
+            "an error must be stored after a rejected client conf"
+        );
+        assert_eq!(
+            err.assume_init().code,
+            KernelStatusCode::InvalidArgument as i32
+        );
+
+        kernel_session_config_free(config);
+    }
 }

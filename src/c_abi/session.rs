@@ -682,90 +682,58 @@ pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
     })
 }
 
-/// Configure the client-side result knobs in one call — the full
-/// [`ResultConfig`] surface.
+/// Set one **client-side** result knob by name (`key` = `value`).
 ///
-/// Every knob here is **client-side**: it tunes how the kernel fetches,
-/// buffers, and post-processes results and never reaches the SEA wire
-/// (contrast `kernel_session_config_set_session_conf`, which carries
-/// server confs). All six fields of the kernel's `ResultConfig` are set in
-/// one call so a host configures result behaviour atomically.
+/// This is the client-side counterpart to
+/// `kernel_session_config_set_session_conf`: that one carries **server**
+/// session confs (`ANSI_MODE`, `TIMEZONE`, …) to the SEA wire; this one
+/// sets **client-side** knobs that tune how the kernel fetches, buffers,
+/// and post-processes results and are **never sent to the server**. The two
+/// channels are deliberately separate (see #196 / #226 — conflating them is
+/// what made a client flag masquerade as a rejected server conf).
 ///
-/// CloudFetch / inline streaming:
-/// - `cloudfetch_enabled`: when `false`, every result is served inline
-///   (the execute request uses SEA `disposition = INLINE`), mirroring the
-///   reference JDBC driver's `EnableQueryResultDownload=0`. Default `true`.
-/// - `link_prefetch_window`: number of presigned CloudFetch URLs to
-///   prefetch ahead of the consumer. `0` ⇒ keep the kernel default (10).
-/// - `max_chunks_in_memory`: max decompressed CloudFetch chunks held in
-///   memory at once (bounds parallelism and peak RSS). `0` ⇒ keep the
-///   default (16). Values above the kernel ceiling
-///   ([`CLOUDFETCH_MAX_CHUNKS_CEILING`](crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING),
-///   256) are clamped with a `warn`, since peak RSS scales with this knob.
-/// - `inline_max_chunks_in_memory`: prefetch window for the inline-Arrow
-///   path (used when `cloudfetch_enabled = false`). `0` ⇒ keep the
-///   default (4).
+/// A key/value shape (rather than one typed setter per knob) is chosen so
+/// the signature never changes as `ResultConfig` grows new knobs, and so a
+/// host that already has DSN / connection-string attributes can forward
+/// them in a loop. Safety is recovered at runtime: an unknown key or an
+/// unparseable value is **rejected** with `InvalidArgument` (and a stored
+/// error naming the problem), not silently ignored.
 ///
-/// Flat-text rendering (for bindings that can't consume the Arrow-native
-/// types):
-/// - `complex_types_as_json`: render `ARRAY` / `MAP` / `STRUCT` /
-///   `VARIANT` / `GEOMETRY` / `GEOGRAPHY` columns as JSON-text `Utf8`.
-///   Default `false` (Arrow-native). Mirrors PySQL's
-///   `_use_arrow_native_complex_types=False` and JDBC's
-///   `complexDatatypeSupport=false`.
-/// - `intervals_as_string`: render `INTERVAL` / `DURATION` columns as
-///   canonical Databricks text (`Utf8`). Default `false`. Set `true` for
-///   bindings that hand Arrow batches to pyarrow's Python layer, which
-///   can't decode Arrow's `month_interval` type.
+/// Recognised keys (matched case-insensitively), mapping to
+/// [`ResultConfig`]:
+/// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
+///   result inline (SEA `disposition = INLINE`), mirroring JDBC's
+///   `EnableQueryResultDownload=0`.
+/// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
+///   prefetched ahead of the consumer.
+/// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed
+///   CloudFetch chunks held at once (bounds peak RSS). Values above the
+///   kernel ceiling (256) are **clamped** with a warning, not rejected.
+/// - `inline_max_chunks_in_memory` = positive integer — inline-Arrow
+///   prefetch window (used when `cloudfetch_enabled = false`).
+/// - `complex_types_as_json` = `"true"` / `"false"` — render `ARRAY` /
+///   `MAP` / `STRUCT` / `VARIANT` / `GEOMETRY` / `GEOGRAPHY` as JSON text
+///   (PySQL `_use_arrow_native_complex_types=False`, JDBC
+///   `complexDatatypeSupport=false`).
+/// - `intervals_as_string` = `"true"` / `"false"` — render `INTERVAL` /
+///   `DURATION` as canonical Databricks text (for pyarrow-Python bindings).
 ///
-/// **`0` means "keep the kernel default"** for every `usize` field, so a
-/// host that zero-initialises the argument list gets kernel defaults for
-/// the windows and only the `bool` fields take effect. Maps to
-/// [`ResultConfig`].
-///
-/// This is the typed replacement for the legacy
-/// `cloudfetch_max_chunks_in_memory` value that was smuggled through
-/// `kernel_session_config_set_session_conf`. That fallback still works but
-/// this setter takes precedence — see `apply_client_result_overrides` in
-/// `src/session.rs`.
+/// A server session-conf key passed here (e.g. `ANSI_MODE`) is rejected —
+/// use `kernel_session_config_set_session_conf` for those.
 ///
 /// # Safety
-/// `config` must be a live config handle.
+/// `config` must be a live config handle; `key` / `value` must be
+/// NUL-terminated C strings.
 #[no_mangle]
-pub unsafe extern "C" fn kernel_session_config_set_result_config(
+pub unsafe extern "C" fn kernel_session_config_set_client_conf(
     config: *mut KernelSessionConfig,
-    cloudfetch_enabled: bool,
-    link_prefetch_window: usize,
-    max_chunks_in_memory: usize,
-    inline_max_chunks_in_memory: usize,
-    complex_types_as_json: bool,
-    intervals_as_string: bool,
+    key: *const c_char,
+    value: *const c_char,
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
-        c.result.cloudfetch_enabled = cloudfetch_enabled;
-        // `0` ⇒ leave the kernel default in place (a host zeroing its
-        // struct must not accidentally clamp prefetch/buffer windows to 0).
-        if link_prefetch_window != 0 {
-            c.result.cloudfetch_link_prefetch_window = link_prefetch_window;
-        }
-        if max_chunks_in_memory != 0 {
-            let clamped = max_chunks_in_memory.min(crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING);
-            if clamped != max_chunks_in_memory {
-                crate::klog::warn!(
-                    requested = max_chunks_in_memory,
-                    ceiling = crate::session::CLOUDFETCH_MAX_CHUNKS_CEILING,
-                    "clamping cloudfetch max_chunks_in_memory to the ceiling \
-                     (peak RSS scales with this knob)",
-                );
-            }
-            c.result.cloudfetch_max_chunks_in_memory = clamped;
-        }
-        if inline_max_chunks_in_memory != 0 {
-            c.result.inline_max_chunks_in_memory = inline_max_chunks_in_memory;
-        }
-        c.result.complex_types_as_json = complex_types_as_json;
-        c.result.intervals_as_string = intervals_as_string;
-        Ok(())
+        let key = required_str(key, "client_conf key")?;
+        let value = required_str(value, "client_conf value")?;
+        c.result.apply_client_conf(&key, &value)
     })
 }
 

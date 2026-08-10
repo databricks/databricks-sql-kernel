@@ -375,48 +375,39 @@ KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionC
                                                                   bool enabled,
                                                                   const char* passphrase);
 
-/* Configure the client-side result knobs in one call — the full
- * ResultConfig surface. Every knob here is CLIENT-SIDE: it tunes how the
- * kernel fetches, buffers, and post-processes results and never reaches the
- * SEA wire (unlike kernel_session_config_set_session_conf, which carries
- * server confs).
+/* Set one CLIENT-SIDE result knob by name (key = value).
  *
- * CloudFetch / inline streaming:
- * - `cloudfetch_enabled`: when false, every result is served inline (the
- *   execute request uses SEA disposition = INLINE), mirroring the reference
- *   JDBC driver's EnableQueryResultDownload=0. Default true.
- * - `link_prefetch_window`: presigned CloudFetch URLs prefetched ahead of
- *   the consumer. 0 => keep the kernel default (10).
- * - `max_chunks_in_memory`: max decompressed CloudFetch chunks held in
- *   memory at once (bounds parallelism and peak RSS). 0 => keep the default
- *   (16). Values above the kernel ceiling (256) are clamped with a warning.
- * - `inline_max_chunks_in_memory`: prefetch window for the inline-Arrow
- *   path (used when cloudfetch_enabled = false). 0 => keep the default (4).
+ * Counterpart to kernel_session_config_set_session_conf: that one carries
+ * SERVER session confs (ANSI_MODE, TIMEZONE, ...) to the SEA wire; this one
+ * sets CLIENT-SIDE knobs that tune how the kernel fetches, buffers, and
+ * post-processes results and are NEVER sent to the server. The two channels
+ * are deliberately separate (conflating them is what made a client flag
+ * masquerade as a rejected server conf).
  *
- * Flat-text rendering (for bindings that can't consume Arrow-native types):
- * - `complex_types_as_json`: render ARRAY / MAP / STRUCT / VARIANT /
- *   GEOMETRY / GEOGRAPHY columns as JSON-text (UTF-8). Default false.
- *   Mirrors PySQL _use_arrow_native_complex_types=False, JDBC
- *   complexDatatypeSupport=false.
- * - `intervals_as_string`: render INTERVAL / DURATION columns as canonical
- *   Databricks text (UTF-8). Default false. Set true for bindings handing
- *   Arrow batches to pyarrow's Python layer (which can't decode Arrow
- *   month_interval).
+ * Key/value (rather than one typed setter per knob) so the signature never
+ * changes as new result knobs are added, and so a host that already has DSN
+ * / connection-string attributes can forward them in a loop. Unknown keys
+ * and unparseable values are REJECTED (InvalidArgument + stored error), not
+ * silently ignored.
  *
- * 0 means "keep the kernel default" for every size_t field, so a host that
- * zero-initialises the argument list gets kernel defaults for the windows
- * and only the bool fields take effect.
+ * Recognised keys (case-insensitive):
+ * - "cloudfetch_enabled" = "true"|"false" — false serves every result
+ *   inline (SEA disposition = INLINE), mirroring JDBC EnableQueryResultDownload=0.
+ * - "cloudfetch_link_prefetch_window" = positive integer.
+ * - "cloudfetch_max_chunks_in_memory" = positive integer (bounds peak RSS;
+ *   values above the kernel ceiling of 256 are clamped with a warning).
+ * - "inline_max_chunks_in_memory" = positive integer (inline-Arrow prefetch
+ *   window, used when cloudfetch_enabled = false).
+ * - "complex_types_as_json" = "true"|"false" — render ARRAY / MAP / STRUCT /
+ *   VARIANT / GEOMETRY / GEOGRAPHY as JSON text (PySQL
+ *   _use_arrow_native_complex_types=False, JDBC complexDatatypeSupport=false).
+ * - "intervals_as_string" = "true"|"false" — render INTERVAL / DURATION as
+ *   canonical Databricks text (for pyarrow-Python bindings).
  *
- * This is the typed replacement for the legacy cloudfetch_max_chunks_in_memory
- * value previously smuggled through kernel_session_config_set_session_conf;
- * that fallback still works but this setter takes precedence. */
-KernelStatusCode kernel_session_config_set_result_config(KernelSessionConfig* config,
-                                                         bool cloudfetch_enabled,
-                                                         size_t link_prefetch_window,
-                                                         size_t max_chunks_in_memory,
-                                                         size_t inline_max_chunks_in_memory,
-                                                         bool complex_types_as_json,
-                                                         bool intervals_as_string);
+ * A server session-conf key passed here (e.g. "ANSI_MODE") is rejected —
+ * use kernel_session_config_set_session_conf for those. */
+KernelStatusCode kernel_session_config_set_client_conf(KernelSessionConfig* config,
+                                                       const char* key, const char* value);
 
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
