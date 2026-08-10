@@ -866,6 +866,20 @@ fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
 /// calls must not inherit a generous `overall_timeout` (e.g. 900s) or
 /// they'd hang for many minutes on an unreachable IdP. This matches the
 /// legacy ADBC behaviour and is intentionally not user-overridable.
+///
+/// The `CloudFetch` category is capped to **no HTTP-level retries** for
+/// the same reason: chunk downloads already sit inside the CloudFetch
+/// provider's own retry loop (`CloudFetchConfig::max_retries`, default 5).
+/// If the inner HTTP client also inherited the global budget (default 5
+/// retries / 900s `overall_timeout`) the two budgets would **multiply** —
+/// a permanently-failing chunk gets attempted ~30 times with escalating
+/// backoff and blocks the consumer well past three minutes instead of
+/// surfacing a bounded terminal error (databricks-odbc#144 / #226: the
+/// `SQLFetch` drain hung 186s, over the 180s conformance bound). Making
+/// the provider loop the single retry authority keeps a persistent
+/// failure terminal in bounded time; one-shot transient recovery
+/// (CLOUDFETCH-010/011) still works via the provider loop. Fixed, like
+/// `Auth` — and not user-overridable.
 fn build_retry_configs_for_session(
     config: &SessionConfig,
 ) -> std::collections::HashMap<RequestCategory, RetryConfig> {
@@ -882,6 +896,18 @@ fn build_retry_configs_for_session(
         RetryConfigOverrides {
             overall_timeout: Some(Duration::from_secs(30)),
             max_retries: Some(3),
+            ..Default::default()
+        },
+    );
+    // Let the CloudFetch provider loop be the single retry authority for a
+    // chunk download (see the doc comment above): no HTTP-level retries, and
+    // a tight wall-clock bound so a stuck download can't inherit the global
+    // 900s `overall_timeout`.
+    overrides.insert(
+        RequestCategory::CloudFetch,
+        RetryConfigOverrides {
+            overall_timeout: Some(Duration::from_secs(20)),
+            max_retries: Some(0),
             ..Default::default()
         },
     );
@@ -1134,18 +1160,46 @@ mod retry_config_tests {
         };
         let configs = build_retry_configs_for_session(&config_with_http(http));
 
-        // SEA + CloudFetch inherit the user-tuned global config.
-        for cat in [RequestCategory::Sea, RequestCategory::CloudFetch] {
-            let c = &configs[&cat];
-            assert_eq!(c.min_wait, Duration::from_secs(3), "{cat:?} min_wait");
-            assert_eq!(c.max_wait, Duration::from_secs(90), "{cat:?} max_wait");
-            assert_eq!(c.max_retries, 7, "{cat:?} max_retries");
-            assert_eq!(
-                c.overall_timeout,
-                Duration::from_secs(600),
-                "{cat:?} overall_timeout"
-            );
-        }
+        // SEA inherits the user-tuned global config. (CloudFetch does NOT —
+        // it keeps a fixed no-HTTP-retry override; see
+        // `cloudfetch_override_stays_fixed_regardless_of_user_knobs`.)
+        let c = &configs[&RequestCategory::Sea];
+        assert_eq!(c.min_wait, Duration::from_secs(3), "Sea min_wait");
+        assert_eq!(c.max_wait, Duration::from_secs(90), "Sea max_wait");
+        assert_eq!(c.max_retries, 7, "Sea max_retries");
+        assert_eq!(
+            c.overall_timeout,
+            Duration::from_secs(600),
+            "Sea overall_timeout"
+        );
+    }
+
+    #[test]
+    fn cloudfetch_override_stays_fixed_regardless_of_user_knobs() {
+        // CloudFetch chunk downloads nest inside the provider's own retry loop
+        // (`CloudFetchConfig::max_retries`). The inner HTTP client must NOT add
+        // a second retry budget on top — otherwise the two multiply and a
+        // permanently-failing chunk blocks the consumer well past the
+        // conformance bound (databricks-odbc#144 / #226). So — like Auth — the
+        // CloudFetch category keeps a fixed override no matter how generous the
+        // user's global retry knobs are: zero HTTP-level retries, tight
+        // wall-clock bound.
+        let http = HttpConfig {
+            retry_max_retries: 99,
+            overall_timeout: Duration::from_secs(3600),
+            ..HttpConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_http(http));
+        let cf = &configs[&RequestCategory::CloudFetch];
+        assert_eq!(
+            cf.max_retries, 0,
+            "CloudFetch must not retry at the HTTP layer"
+        );
+        assert_eq!(
+            cf.overall_timeout,
+            Duration::from_secs(20),
+            "CloudFetch keeps its tight wall-clock bound"
+        );
     }
 
     #[test]
