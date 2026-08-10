@@ -271,6 +271,52 @@ fn arrow_value_to_string(array: &dyn Array, index: usize) -> Result<String> {
     }
 }
 
+/// The significant-digit count (precision) and fractional-digit count
+/// (scale) a canonical decimal literal actually carries — the kernel's
+/// equivalent of `BigDecimal.precision()` / `BigDecimal.scale()`.
+///
+/// Used to decide whether a caller's *declared* `DECIMAL(precision,
+/// scale)` target can represent the bound value losslessly. An
+/// under-specified declared scale (e.g. `scale: 0` for `"123.45"`, or a
+/// declared scale narrower than the value's) must never override the
+/// value's own form — the server would round the extra digits away.
+/// Matches the reference drivers' bind path (ODBC PR #167; JDBC's SEA
+/// `getDecimalTypeString`, which derives the wire `DECIMAL(p,s)` straight
+/// from the `BigDecimal`).
+///
+/// `value` is a canonical decimal literal as accepted by
+/// `validate_decimal_literal`: an optional sign, an integer part, an
+/// optional `.frac` part, and an optional `[eE][+-]?digits` exponent.
+/// Returns `None` when the string carries an exponent (scientific
+/// notation like `"1E-7"`), because the true scale then depends on
+/// arbitrary-magnitude exponent arithmetic the kernel deliberately
+/// avoids — the caller keeps the declared shape for those, exactly as
+/// before.
+fn decimal_value_precision_scale(value: &str) -> Option<(u8, i8)> {
+    let mantissa = value.strip_prefix(['+', '-']).unwrap_or(value);
+    // Scientific notation: leave the declared shape untouched (see doc).
+    if mantissa.contains(['e', 'E']) {
+        return None;
+    }
+    let (int_part, frac_part) = match mantissa.split_once('.') {
+        Some((i, f)) => (i, f),
+        None => (mantissa, ""),
+    };
+    let scale = frac_part.len();
+    // Significant digits = integer digits + fractional digits, but a
+    // leading-zero-only integer part (`0.05`) contributes no significant
+    // integer digit while the fraction still needs `scale` digits of
+    // precision. Databricks requires `precision >= scale`, so floor
+    // precision at `scale` (mirrors JDBC's `precision < scale` guard).
+    let int_significant = int_part.trim_start_matches('0').len();
+    let precision = (int_significant + scale).max(scale).max(1);
+    // The kernel's DECIMAL bind range is precision 1..=38, scale 0..=38.
+    if precision > 38 || scale > 38 {
+        return None;
+    }
+    Some((precision as u8, scale as i8))
+}
+
 /// Format a Decimal128 raw value with the given scale.
 fn format_decimal128(raw: i128, scale: i8) -> String {
     if scale <= 0 {
@@ -368,7 +414,28 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
             // round the fractional digits away — observed against
             // Dogfood with `value="-123.45"` defaulting to
             // `"-123.00"`. JDBC sends the same form.
-            ok(format!("DECIMAL({precision},{scale})"), Some(value.clone()))
+            //
+            // But the *declared* scale must never truncate the value:
+            // an under-specified target (`scale: 0` for `"123.45"`, or a
+            // declared scale narrower than the value's own) would round
+            // fractional digits away on the server. When the value's own
+            // form needs more scale than declared, ride the wire with the
+            // value-derived `DECIMAL(p,s)` instead so nothing is lost —
+            // matching the reference drivers (ODBC PR #167 keeps the
+            // lossless value-derived type for a scale-less target; JDBC's
+            // SEA path derives `DECIMAL(p,s)` straight from the
+            // `BigDecimal`). PARAMQUERY-021 / -023.
+            let (p, s) = match decimal_value_precision_scale(value) {
+                // The declared scale is too small to hold the value's
+                // fractional digits: derive the shape from the value
+                // itself, exactly as JDBC's `getDecimalTypeString` does.
+                Some((val_p, val_s)) if val_s > *scale => (val_p, val_s),
+                // Declared scale already represents the value (or the
+                // value is scientific notation we don't rescale): keep
+                // the caller's declared shape verbatim.
+                _ => (*precision, *scale),
+            };
+            ok(format!("DECIMAL({p},{s})"), Some(value.clone()))
         }
         TypedValue::Date(d) => ok("DATE", Some(d.format("%Y-%m-%d").to_string())),
         TypedValue::Timestamp(ts) => ok(
@@ -992,6 +1059,91 @@ mod tests {
         .unwrap();
         assert_eq!(p.param_type, "DECIMAL(10,2)");
         assert_eq!(p.value.as_deref(), Some("-123.45"));
+    }
+
+    #[test]
+    fn typed_value_decimal_scale_less_target_keeps_value_scale() {
+        // PARAMQUERY-023 / -021: an under-specified declared target
+        // (`scale: 0`) whose value carries real fractional digits must
+        // NOT ride the wire as `DECIMAL(p,0)` — the server would round
+        // `123.45` to `123`. The reference drivers (ODBC PR #167, JDBC's
+        // SEA `getDecimalTypeString`) never let an under-specified
+        // declared scale override the value's own lossless form; the
+        // kernel derives the scale from the value string instead.
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Decimal {
+                value: "123.45".into(),
+                precision: 10,
+                scale: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "DECIMAL(5,2)");
+        assert_eq!(p.value.as_deref(), Some("123.45"));
+    }
+
+    #[test]
+    fn decimal_value_precision_scale_derives_shape() {
+        // (value, expected (precision, scale))
+        assert_eq!(decimal_value_precision_scale("123.45"), Some((5, 2)));
+        assert_eq!(decimal_value_precision_scale("-123.45"), Some((5, 2)));
+        assert_eq!(decimal_value_precision_scale("123.4567"), Some((7, 4)));
+        // No fractional part → scale 0.
+        assert_eq!(decimal_value_precision_scale("123"), Some((3, 0)));
+        assert_eq!(decimal_value_precision_scale("0"), Some((1, 0)));
+        // Leading-zero integer part contributes no significant digit, but
+        // precision must stay >= scale (Databricks constraint).
+        assert_eq!(decimal_value_precision_scale("0.05"), Some((2, 2)));
+        assert_eq!(decimal_value_precision_scale("-0.001"), Some((3, 3)));
+        // Scientific notation is left to the declared shape.
+        assert_eq!(decimal_value_precision_scale("1E-7"), None);
+        assert_eq!(decimal_value_precision_scale("1e+2"), None);
+        // Over the DECIMAL(38) bind range → keep declared shape.
+        let thirty_nine_frac = format!("0.{}", "1".repeat(39));
+        assert_eq!(decimal_value_precision_scale(&thirty_nine_frac), None);
+    }
+
+    #[test]
+    fn typed_value_decimal_declared_scale_sufficient_is_unchanged() {
+        // Declared scale >= value's own scale: the caller's shape rides
+        // verbatim (no surprise re-derivation). Covers the exact-fit case
+        // and the declared-wider-than-value case.
+        for (value, decl_p, decl_s, expected) in [
+            ("123.45", 10u8, 2i8, "DECIMAL(10,2)"), // exact
+            ("123.4", 10, 4, "DECIMAL(10,4)"),      // declared wider
+            ("123", 10, 0, "DECIMAL(10,0)"),        // integer, scale 0 OK
+        ] {
+            let p = typed_value_to_sea_parameter(
+                1,
+                &TypedValue::Decimal {
+                    value: value.into(),
+                    precision: decl_p,
+                    scale: decl_s,
+                },
+            )
+            .unwrap();
+            assert_eq!(p.param_type, expected, "value {value}");
+            assert_eq!(p.value.as_deref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn typed_value_decimal_narrower_scale_widens_to_value_scale() {
+        // PARAMQUERY-021: a declared scale SMALLER than the value's own
+        // (`scale: 2` for `123.4567`) must not re-scale/round the value
+        // to `123.46`. The value's own scale wins so no digit is lost.
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Decimal {
+                value: "123.4567".into(),
+                precision: 10,
+                scale: 2,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "DECIMAL(7,4)");
+        assert_eq!(p.value.as_deref(), Some("123.4567"));
     }
 
     #[test]
