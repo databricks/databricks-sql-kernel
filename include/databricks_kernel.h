@@ -663,13 +663,14 @@ KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
  * identifier args are exact.
  *
  * NULL string args mean "unfiltered" for the list_* calls (catalogs /
- * schemas / tables / columns). The key/constraint calls are stricter:
+ * schemas / tables / columns). The key/constraint calls differ:
  * `kernel_metadata_primary_keys` requires a non-NULL catalog, schema, AND
- * table (Databricks SHOW KEYS must target a fully-qualified table), and
- * `kernel_metadata_foreign_keys` requires the full foreign_* (referencing)
- * triple while the parent_* (referenced) triple is optional. Passing NULL
- * for a required identifier returns `KernelStatusCode_InvalidArgument`
- * with an explanatory last error (see each function's comment).
+ * table (Databricks SHOW KEYS must target a fully-qualified table), while
+ * `kernel_metadata_foreign_keys` keys off the foreign (referencing) table
+ * — a NULL foreign_table returns an empty result (0 rows, no wire call),
+ * not an error. Passing NULL for a required identifier returns
+ * `KernelStatusCode_InvalidArgument` with an explanatory last error (see
+ * each function's comment).
  */
 KernelStatusCode kernel_metadata_list_catalogs(kernel_session_t* session,
                                                kernel_result_stream_t** out);
@@ -690,10 +691,13 @@ KernelStatusCode kernel_metadata_list_columns(kernel_session_t* session, const c
 KernelStatusCode kernel_metadata_primary_keys(kernel_session_t* session, const char* catalog,
                                               const char* schema, const char* table,
                                               kernel_result_stream_t** out);
-/* The foreign_* (referencing) triple is REQUIRED (all non-NULL); the
- * parent_* (referenced) triple is optional and filters the referenced
- * side. NULL for any foreign_* arg returns
- * `KernelStatusCode_InvalidArgument`. */
+/* Keys off the foreign (referencing) table. A NULL foreign_table means
+ * "nothing to look up" and returns an empty result (0 rows, no wire
+ * call) — this is the ODBC "primary-keys only" SQLForeignKeys form. When
+ * a foreign_table IS given, foreign_catalog and foreign_schema are then
+ * required (they scope SHOW FOREIGN KEYS) and a NULL there returns
+ * `KernelStatusCode_InvalidArgument`. The parent_* (referenced) triple
+ * is optional and filters the referenced side. */
 KernelStatusCode kernel_metadata_foreign_keys(kernel_session_t* session, const char* parent_catalog,
                                               const char* parent_schema, const char* parent_table,
                                               const char* foreign_catalog,

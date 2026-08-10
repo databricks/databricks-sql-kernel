@@ -401,7 +401,9 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     async fn list_catalogs(&self, session_id: &str) -> Result<ExecuteResult>;
 
     /// List schemas, optionally filtered by catalog and pattern.
-    /// When catalog is None or wildcard, uses "SHOW SCHEMAS IN ALL CATALOGS".
+    /// `catalog = None` emits "SHOW SCHEMAS IN ALL CATALOGS"; a `Some`
+    /// catalog is scoped verbatim (a literal `%` / `*` / `""` matches no
+    /// real catalog → 0 rows, not "all catalogs").
     async fn list_schemas(
         &self,
         session_id: &str,
@@ -410,7 +412,11 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     ) -> Result<ExecuteResult>;
 
     /// List tables, optionally filtered.
-    /// When catalog is None or wildcard, uses "SHOW TABLES IN ALL CATALOGS".
+    /// `catalog = None` emits "SHOW TABLES IN ALL CATALOGS"; a `Some`
+    /// catalog is scoped verbatim (a literal `%` / `*` / `""` matches no
+    /// real catalog → 0 rows, not "all catalogs"). The higher-level
+    /// `Metadata::list_tables` resolves real catalog wildcards before
+    /// this point.
     async fn list_tables(
         &self,
         session_id: &str,

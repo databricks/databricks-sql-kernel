@@ -867,12 +867,23 @@ impl Metadata {
 
     /// Foreign-key relationships. Both parent and foreign sides are
     /// exact identifiers — ODBC SQLForeignKeys does not support
-    /// patterns. The **foreign side** must be fully specified
-    /// (catalog + schema + table); the parent side is optional and
-    /// matches "any parent" when omitted, matching the underlying
-    /// `SHOW FOREIGN KEYS IN TABLE` semantics. Wrappers that want to
-    /// query by parent only should resolve to a foreign-side filter
-    /// before calling.
+    /// patterns. The parent side is optional and matches "any parent"
+    /// when omitted, matching the underlying `SHOW FOREIGN KEYS IN
+    /// TABLE` semantics. Wrappers that want to query by parent only
+    /// should resolve to a foreign-side filter before calling.
+    ///
+    /// ## Unspecified foreign table → empty result
+    ///
+    /// A `None` `foreign_table` means "no foreign table to look up", so
+    /// the call returns an **empty result set** (0 rows, correct JDBC
+    /// shape) and issues **no** server statement — never an error. This
+    /// mirrors the JDBC SEA `listCrossReferences` contract (which keys
+    /// solely off the foreign table) and covers the ODBC "primary-keys
+    /// only" call form (`SQLForeignKeys` with the FK table left NULL) as
+    /// well as the both-tables-NULL case. Only when a `foreign_table`
+    /// *is* supplied are `foreign_catalog` / `foreign_schema` required —
+    /// the `SHOW FOREIGN KEYS IN CATALOG … IN SCHEMA … IN TABLE …`
+    /// grammar needs all three to scope the lookup.
     ///
     /// Server shape: same as [`primary_keys`](Self::primary_keys) —
     /// `SHOW FOREIGN KEYS` shares its result schema with `SHOW KEYS`.
@@ -893,14 +904,26 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
+            // Unspecified foreign table → "nothing to look up": empty
+            // result, no wire call (JDBC SEA `listCrossReferences`
+            // contract; also the ODBC PK-only `SQLForeignKeys` form and
+            // the both-tables-NULL case). Handled before the
+            // catalog/schema requirements so a null foreign table never
+            // surfaces as an argument error.
+            let Some(foreign_table) = foreign_table else {
+                return ResultStream::from_reader(Box::new(EmptyReader::new(
+                    GET_CROSS_REFERENCE_SCHEMA.clone(),
+                )))
+                .await;
+            };
+            // A foreign table *is* specified, so its catalog and schema
+            // are required to scope the `SHOW FOREIGN KEYS IN CATALOG …
+            // IN SCHEMA … IN TABLE …` lookup.
             let foreign_catalog = foreign_catalog.ok_or_else(|| {
                 Error::invalid_argument().message("foreign_keys requires foreign_catalog")
             })?;
             let foreign_schema = foreign_schema.ok_or_else(|| {
                 Error::invalid_argument().message("foreign_keys requires foreign_schema")
-            })?;
-            let foreign_table = foreign_table.ok_or_else(|| {
-                Error::invalid_argument().message("foreign_keys requires foreign_table")
             })?;
             let raw = match self
                 .session

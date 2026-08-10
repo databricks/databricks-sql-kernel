@@ -299,9 +299,17 @@ pub unsafe extern "C" fn kernel_metadata_primary_keys(
 
 /// Foreign keys. Mirrors ODBC `SQLForeignKeys`: the `parent_*` triple is
 /// the referenced (primary-key) table, the `foreign_*` triple the
-/// referencing table. The kernel requires the `foreign_*` triple (the
-/// referencing table) to be fully specified; the `parent_*` triple is
-/// optional and filters the referenced side.
+/// referencing table. The `parent_*` triple is optional and filters the
+/// referenced side.
+///
+/// A NULL `foreign_table` means "no referencing table to look up": the
+/// call returns an **empty result** (0 rows, no server statement) rather
+/// than `InvalidArgument`. This matches the JDBC SEA
+/// `listCrossReferences` contract and the ODBC "primary-keys only"
+/// `SQLForeignKeys` form (FK table left NULL). Only when a
+/// `foreign_table` *is* supplied are `foreign_catalog` / `foreign_schema`
+/// required (they scope the `SHOW FOREIGN KEYS` lookup); a NULL there
+/// returns `InvalidArgument`.
 ///
 /// # Safety
 /// `session` must be a live session handle; the identifier args, if

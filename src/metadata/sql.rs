@@ -156,24 +156,25 @@ impl SqlCommandBuilder {
         format!("`{}`", name.replace('`', "``"))
     }
 
-    /// Returns true if the value is None, empty, or a wildcard ("%" or "*").
-    fn is_null_or_wildcard(value: &Option<String>) -> bool {
-        match value {
-            None => true,
-            Some(v) => Self::is_wildcard_or_empty_scope(v),
-        }
-    }
-
-    /// Whether a catalog string would be reinterpreted as "all catalogs"
-    /// (rather than an exact scope) by the `SHOW ... IN [CATALOG] …`
-    /// builder: the empty string, `%`, or `*`.
+    /// Whether a catalog string, if handed to the `SHOW ... IN [CATALOG]
+    /// …` builder as an exact scope, would instead be silently
+    /// reinterpreted by the Databricks server as "all catalogs": the
+    /// empty string, `%`, or `*`.
     ///
     /// The caller (`list_tables`) uses this to keep the kernel's
-    /// `pattern_has_wildcards` decision from disagreeing with the
-    /// builder: a literal catalog that lands in this set must be matched
-    /// client-side instead of handed to the server as a scope, else e.g.
-    /// a catalog literally named `*` would silently broaden to every
-    /// catalog. Single source of truth for [`is_null_or_wildcard`].
+    /// `pattern_has_wildcards` decision from disagreeing with the server:
+    /// a literal catalog that lands in this set must be matched
+    /// client-side (enumerate-then-fan-out) instead of handed to the
+    /// server as a scope, else e.g. a catalog literally named `*` would
+    /// silently broaden to every catalog.
+    ///
+    /// Note this is *not* consulted by [`build_show_schemas`](Self::build_show_schemas)
+    /// / [`build_show_tables`](Self::build_show_tables): those broaden to
+    /// "all catalogs" only when the catalog is `None`, so a literal `%` /
+    /// `*` / `""` that reaches them (e.g. an escaped `\%` unescaped to a
+    /// literal `%`, or an exact `Identifier`) is scoped verbatim and
+    /// matches nothing — matching JDBC's 0-row contract for a literal
+    /// catalog that names no catalog.
     pub fn is_wildcard_or_empty_scope(s: &str) -> bool {
         s.is_empty() || s == "%" || s == "*"
     }
@@ -198,13 +199,17 @@ impl SqlCommandBuilder {
     }
 
     pub fn build_show_schemas(&self) -> String {
-        let mut sql = if Self::is_null_or_wildcard(&self.catalog) {
-            "SHOW SCHEMAS IN ALL CATALOGS".to_string()
-        } else {
-            format!(
-                "SHOW SCHEMAS IN {}",
-                Self::escape_identifier(self.catalog.as_ref().unwrap())
-            )
+        // Broaden to "all catalogs" only when no catalog is scoped
+        // (`None`). A `Some(name)` is an exact literal to scope on — even
+        // when `name` is `%`, `*`, or `""` (a literal catalog matching no
+        // real catalog), which must yield 0 rows, not every catalog.
+        // Mirrors `build_show_columns`'s `Option`-based decision; the
+        // caller resolves any real wildcards before this point.
+        let mut sql = match self.catalog {
+            None => "SHOW SCHEMAS IN ALL CATALOGS".to_string(),
+            Some(ref catalog) => {
+                format!("SHOW SCHEMAS IN {}", Self::escape_identifier(catalog))
+            }
         };
 
         if let Some(ref pattern) = self.schema_pattern {
@@ -215,13 +220,18 @@ impl SqlCommandBuilder {
     }
 
     pub fn build_show_tables(&self) -> String {
-        let mut sql = if Self::is_null_or_wildcard(&self.catalog) {
-            "SHOW TABLES IN ALL CATALOGS".to_string()
-        } else {
-            format!(
-                "SHOW TABLES IN CATALOG {}",
-                Self::escape_identifier(self.catalog.as_ref().unwrap())
-            )
+        // Broaden to "all catalogs" only when no catalog is scoped
+        // (`None`); see `build_show_schemas` for why a literal `%` / `*`
+        // / `""` catalog is scoped verbatim (0 rows) rather than
+        // broadened.
+        let mut sql = match self.catalog {
+            None => "SHOW TABLES IN ALL CATALOGS".to_string(),
+            Some(ref catalog) => {
+                format!(
+                    "SHOW TABLES IN CATALOG {}",
+                    Self::escape_identifier(catalog)
+                )
+            }
         };
 
         if let Some(ref pattern) = self.schema_pattern {
@@ -512,27 +522,44 @@ mod tests {
     }
 
     #[test]
-    fn test_show_schemas_wildcard_catalog() {
+    fn test_show_schemas_literal_percent_catalog_scopes_verbatim() {
+        // A `Some("%")` reaching the builder is a *literal* catalog named
+        // `%` (the caller resolves real wildcards before this point), so
+        // it is scoped verbatim — matching no real catalog and yielding 0
+        // rows — rather than broadened to "all catalogs". Regression guard
+        // for the METADATA-036/037 catalog-wildcard conformance fix.
         let sql = SqlCommandBuilder::new()
             .with_catalog(Some("%"))
             .build_show_schemas();
-        assert_eq!(sql, "SHOW SCHEMAS IN ALL CATALOGS");
+        assert_eq!(sql, "SHOW SCHEMAS IN `%`");
     }
 
     #[test]
-    fn test_show_schemas_empty_catalog() {
+    fn test_show_schemas_empty_catalog_scopes_verbatim() {
+        // Likewise a literal empty-string catalog scopes to `` (0 rows),
+        // not "all catalogs". Only `None` means "all catalogs".
         let sql = SqlCommandBuilder::new()
             .with_catalog(Some(""))
             .build_show_schemas();
-        assert_eq!(sql, "SHOW SCHEMAS IN ALL CATALOGS");
+        assert_eq!(sql, "SHOW SCHEMAS IN ``");
     }
 
     #[test]
-    fn test_show_schemas_star_wildcard() {
+    fn test_show_schemas_star_catalog_scopes_verbatim() {
         let sql = SqlCommandBuilder::new()
             .with_catalog(Some("*"))
             .build_show_schemas();
-        assert_eq!(sql, "SHOW SCHEMAS IN ALL CATALOGS");
+        assert_eq!(sql, "SHOW SCHEMAS IN `*`");
+    }
+
+    #[test]
+    fn test_show_tables_literal_percent_catalog_scopes_verbatim() {
+        // Same contract as `build_show_schemas`: a literal `%` catalog is
+        // scoped verbatim (0 rows), not broadened to all catalogs.
+        let sql = SqlCommandBuilder::new()
+            .with_catalog(Some("%"))
+            .build_show_tables();
+        assert_eq!(sql, "SHOW TABLES IN CATALOG `%`");
     }
 
     #[test]
