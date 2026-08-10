@@ -23,7 +23,7 @@
 
 mod common;
 
-use databricks_sql_kernel::{Identifier, LikePattern, ResultBatch, ResultStream};
+use databricks_sql_kernel::{LikePattern, ResultBatch, ResultStream};
 
 async fn count_rows(mut stream: ResultStream) -> usize {
     let mut rows = 0;
@@ -44,7 +44,7 @@ async fn empty_table_types_matches_all_like_none() {
     // `samples.information_schema` is a UC-managed schema present in every
     // workspace and exposes many objects (a mix of views), so both the
     // `None` and `Some(&[])` calls should return a positive, equal count.
-    let catalog = || Some(Identifier::new("samples").unwrap());
+    let catalog = || Some(LikePattern::new("samples").unwrap());
     let schema = || Some(LikePattern::new("information_schema").unwrap());
 
     let none_rows = count_rows(
