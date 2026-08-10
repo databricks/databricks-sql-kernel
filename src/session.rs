@@ -247,6 +247,23 @@ impl Session {
             ))
         })?;
 
+        // Install the tracing subscriber from the caller's LoggingConfig.
+        // This is the direct-Rust counterpart to the C ABI's
+        // `kernel_init_logging`: without it, a caller's `logging(...)` is
+        // accepted and stored but never consumed, so a configured log
+        // destination silently produces nothing (issue #213). Idempotent and
+        // process-wide (`OnceLock`): the first Session::open (or
+        // `kernel_init_logging`) in the process installs the subscriber and
+        // later calls are no-ops. The return value only signals whether the
+        // requested destination was fully honoured; a `false` here (log file
+        // unopenable, or a subscriber already installed by pyo3 / the host)
+        // is a logging degradation, not a reason to fail `open()`, so it is
+        // deliberately not propagated as an error.
+        let _ = crate::logging::init_logging(&crate::logging::LogConfig {
+            filter: config.logging.filter.clone(),
+            file: config.logging.file.clone(),
+        });
+
         // Fold client-only result knobs (e.g. cloudfetch_max_chunks_in_memory)
         // carried in session_conf into the typed ResultConfig and strip them
         // from session_conf, before either the reader factory reads

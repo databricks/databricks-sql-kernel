@@ -483,14 +483,27 @@ pub unsafe extern "C" fn kernel_init_logging(
     // `level` is best-effort: a non-UTF-8 or unrecognized value falls back
     // to RUST_LOG / the default, so treat a bad level as absent.
     let level = optional_str(level, "log level").ok().flatten();
+    // Level "OFF" means "do not install a subscriber", but that is still an
+    // intentional, successful outcome. `init_logging` no longer special-cases
+    // it (it works on full EnvFilter directives), so honour OFF here before
+    // touching the file path.
+    if level
+        .as_deref()
+        .is_some_and(|l| l.eq_ignore_ascii_case("off"))
+    {
+        return KernelStatusCode::Success;
+    }
+    // The C ABI takes a BARE level; expand it to the full directive the
+    // shared installer expects (targeting the kernel's own log target).
+    let filter = level.as_deref().map(crate::logging::filter_from_level);
     // `file_path` is NOT best-effort: a non-UTF-8 path is a real error (the
     // caller asked us to write there and we can't), so surface it rather
     // than silently dropping the path and reporting Success.
     let file = match optional_str(file_path, "log file path") {
-        Ok(f) => f,
+        Ok(f) => f.map(std::path::PathBuf::from),
         Err(e) => return crate::c_abi::error::store_and_code(e),
     };
-    if crate::logging::init_logging(&crate::logging::LogConfig { level, file }) {
+    if crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
         KernelStatusCode::Success
     } else {
         crate::c_abi::error::store_and_code(Error::new(
