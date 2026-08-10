@@ -287,29 +287,35 @@ fn arrow_value_to_string(array: &dyn Array, index: usize) -> Result<String> {
 /// `value` is a canonical decimal literal as accepted by
 /// `validate_decimal_literal`: an optional sign, an integer part, an
 /// optional `.frac` part, and an optional `[eE][+-]?digits` exponent.
-/// Returns `None` when the string carries an exponent (scientific
-/// notation like `"1E-7"`), because the true scale then depends on
-/// arbitrary-magnitude exponent arithmetic the kernel deliberately
-/// avoids — the caller keeps the declared shape for those, exactly as
-/// before.
+/// Scientific notation (`"1E-7"`, from e.g. Python's
+/// `str(Decimal("0.0000001"))`) is normalised to its plain-decimal
+/// scale so it, too, is protected from an under-specified declared
+/// target. Returns `None` only when the value is out of the kernel's
+/// `DECIMAL(38)` bind range or its exponent is not a plain `i32` — the
+/// caller then keeps the declared shape unchanged.
 fn decimal_value_precision_scale(value: &str) -> Option<(u8, i8)> {
-    let mantissa = value.strip_prefix(['+', '-']).unwrap_or(value);
-    // Scientific notation: leave the declared shape untouched (see doc).
-    if mantissa.contains(['e', 'E']) {
-        return None;
-    }
+    let unsigned = value.strip_prefix(['+', '-']).unwrap_or(value);
+    // Split off an optional exponent so the mantissa is plain `int[.frac]`.
+    let (mantissa, exponent) = match unsigned.split_once(['e', 'E']) {
+        Some((m, e)) => (m, e.parse::<i32>().ok()?),
+        None => (unsigned, 0),
+    };
     let (int_part, frac_part) = match mantissa.split_once('.') {
         Some((i, f)) => (i, f),
         None => (mantissa, ""),
     };
-    let scale = frac_part.len();
-    // Significant digits = integer digits + fractional digits, but a
-    // leading-zero-only integer part (`0.05`) contributes no significant
-    // integer digit while the fraction still needs `scale` digits of
-    // precision. Databricks requires `precision >= scale`, so floor
-    // precision at `scale` (mirrors JDBC's `precision < scale` guard).
-    let int_significant = int_part.trim_start_matches('0').len();
-    let precision = (int_significant + scale).max(scale).max(1);
+    // Fractional digits as written, then shifted by the exponent: a
+    // negative exponent adds scale (`1E-7` → 7), a positive one consumes
+    // it (`1.5E+3` → 0). Scale can't go below 0.
+    let written_scale = frac_part.len() as i64;
+    let scale = (written_scale - exponent as i64).max(0);
+    // Significant digits of the mantissa: a leading-zero-only integer
+    // part (`0.05`) contributes no significant integer digit while the
+    // fraction still needs `scale` digits of precision. Databricks
+    // requires `precision >= scale`, so floor precision at `scale`
+    // (mirrors JDBC's `precision < scale` guard). Also floor at 1.
+    let mantissa_significant = (int_part.trim_start_matches('0').len() + frac_part.len()) as i64;
+    let precision = mantissa_significant.max(scale).max(1);
     // The kernel's DECIMAL bind range is precision 1..=38, scale 0..=38.
     if precision > 38 || scale > 38 {
         return None;
@@ -431,8 +437,8 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
                 // itself, exactly as JDBC's `getDecimalTypeString` does.
                 Some((val_p, val_s)) if val_s > *scale => (val_p, val_s),
                 // Declared scale already represents the value (or the
-                // value is scientific notation we don't rescale): keep
-                // the caller's declared shape verbatim.
+                // value is out of the DECIMAL(38) bind range): keep the
+                // caller's declared shape verbatim.
                 _ => (*precision, *scale),
             };
             ok(format!("DECIMAL({p},{s})"), Some(value.clone()))
@@ -1096,12 +1102,16 @@ mod tests {
         // precision must stay >= scale (Databricks constraint).
         assert_eq!(decimal_value_precision_scale("0.05"), Some((2, 2)));
         assert_eq!(decimal_value_precision_scale("-0.001"), Some((3, 3)));
-        // Scientific notation is left to the declared shape.
-        assert_eq!(decimal_value_precision_scale("1E-7"), None);
-        assert_eq!(decimal_value_precision_scale("1e+2"), None);
+        // Scientific notation is normalised to its plain-decimal scale:
+        // a negative exponent adds scale, a positive one consumes it.
+        assert_eq!(decimal_value_precision_scale("1E-7"), Some((7, 7)));
+        assert_eq!(decimal_value_precision_scale("1.5E-3"), Some((4, 4)));
+        assert_eq!(decimal_value_precision_scale("1e+2"), Some((1, 0)));
+        assert_eq!(decimal_value_precision_scale("1.5E+3"), Some((2, 0)));
         // Over the DECIMAL(38) bind range → keep declared shape.
         let thirty_nine_frac = format!("0.{}", "1".repeat(39));
         assert_eq!(decimal_value_precision_scale(&thirty_nine_frac), None);
+        assert_eq!(decimal_value_precision_scale("1E-39"), None);
     }
 
     #[test]
@@ -1144,6 +1154,25 @@ mod tests {
         .unwrap();
         assert_eq!(p.param_type, "DECIMAL(7,4)");
         assert_eq!(p.value.as_deref(), Some("123.4567"));
+    }
+
+    #[test]
+    fn typed_value_decimal_scientific_notation_stays_lossless() {
+        // A scientific-notation value (Python's `str(Decimal("0.0000001"))`
+        // is `"1E-7"`) bound with a scale-0 target must not truncate: the
+        // normalised scale (7) drives a `DECIMAL(7,7)` wire type. The value
+        // rides the wire in its original notation, which the server accepts.
+        let p = typed_value_to_sea_parameter(
+            1,
+            &TypedValue::Decimal {
+                value: "1E-7".into(),
+                precision: 10,
+                scale: 0,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.param_type, "DECIMAL(7,7)");
+        assert_eq!(p.value.as_deref(), Some("1E-7"));
     }
 
     #[test]
