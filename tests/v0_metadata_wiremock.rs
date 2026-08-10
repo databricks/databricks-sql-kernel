@@ -346,6 +346,69 @@ async fn list_schemas_returns_jdbc_columns_with_synthesised_catalog() {
 }
 
 #[tokio::test]
+async fn list_schemas_literal_percent_catalog_scopes_verbatim_and_empties() {
+    // Conformance (METADATA-036/037): a *literal* catalog named `%`
+    // (an exact `Identifier`, not a wildcard — the v0 schemas surface
+    // takes an `Identifier`) must scope to that catalog and match
+    // nothing, NOT broaden to "all catalogs". The stub only matches
+    // `SHOW SCHEMAS IN \`%\``; if the kernel emitted `IN ALL CATALOGS`
+    // no stub would match and the call would fail. The server answers
+    // CATALOG_NOT_FOUND, which the kernel maps to an empty result.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW SCHEMAS IN `%`",
+        failed_response_body("42704", "CATALOG_NOT_FOUND: no catalog named `%`"),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_schemas(Some(Identifier::new("%").unwrap()), None)
+        .await
+        .expect("list_schemas literal % catalog maps not-found to empty");
+    // Still the JDBC getSchemas shape, zero rows.
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_SCHEM");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn list_tables_escaped_percent_catalog_scopes_verbatim_and_empties() {
+    // Conformance (METADATA-037, escaping ON): an *escaped* catalog
+    // pattern `\%` denotes a literal catalog named `%`. It has no active
+    // wildcards, so `list_tables` takes the fast exact path, unescapes to
+    // `%`, and must scope `SHOW TABLES IN CATALOG \`%\`` — NOT broaden to
+    // "all catalogs". (Contrast `list_tables_percent_catalog_uses_single_
+    // all_catalogs_query`, where an *unescaped* `%` is genuinely
+    // match-all.) The server's not-found maps to an empty result.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    mount_execute_expecting_sql(
+        &server,
+        "SHOW TABLES IN CATALOG `%`",
+        failed_response_body("42704", "CATALOG_NOT_FOUND: no catalog named `%`"),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_tables(Some(LikePattern::new(r"\%").unwrap()), None, None, None)
+        .await
+        .expect("list_tables escaped % catalog maps not-found to empty");
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
 async fn list_tables_returns_jdbc_columns_with_synthesised_nulls() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
@@ -1127,6 +1190,84 @@ async fn foreign_keys_reshaped_to_jdbc_columns() {
     assert!(b.column_by_name("UPDATE_RULE").unwrap().is_null(0));
     assert!(b.column_by_name("DELETE_RULE").unwrap().is_null(0));
     assert!(b.column_by_name("PK_NAME").unwrap().is_null(0));
+}
+
+#[tokio::test]
+async fn foreign_keys_null_foreign_table_returns_empty_without_wire_call() {
+    // Conformance (METADATA-037): the PK (parent) side is fully
+    // specified but the FK (foreign) table is None. Per the JDBC SEA
+    // `listCrossReferences` contract, an unspecified foreign table is
+    // "nothing to look up" → empty result, and NO `SHOW FOREIGN KEYS`
+    // (no `/statements` call). No `/statements` stub is mounted, so a
+    // wire call would fail the test.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .foreign_keys(
+            Some(Identifier::new("main").unwrap()),   // parent_catalog
+            Some(Identifier::new("d").unwrap()),      // parent_schema
+            Some(Identifier::new("parent").unwrap()), // parent_table (PK side set)
+            Some(Identifier::new("main").unwrap()),   // foreign_catalog
+            Some(Identifier::new("d").unwrap()),      // foreign_schema
+            None,                                     // foreign_table = None → empty
+        )
+        .await
+        .expect("foreign_keys null foreign table must not error");
+
+    // Correct JDBC getCrossReference shape, zero rows.
+    assert_eq!(col_names(&stream.schema())[0], "PKTABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    // No ExecuteStatement was issued.
+    let calls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/2.0/sql/statements")
+        .count();
+    assert_eq!(calls, 0, "no SHOW FOREIGN KEYS should be issued");
+}
+
+#[tokio::test]
+async fn foreign_keys_both_tables_null_returns_empty_without_wire_call() {
+    // Conformance (METADATA-038): both parent and foreign tables are
+    // None. On SEA this follows the JDBC SEA `listCrossReferences`
+    // contract (keys off the foreign table only) → empty result, no
+    // wire call — rather than Thrift's both-tables-null 42000 rejection.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .foreign_keys(
+            None,                                   // parent_catalog
+            None,                                   // parent_schema
+            None,                                   // parent_table
+            Some(Identifier::new("main").unwrap()), // foreign_catalog
+            Some(Identifier::new("d").unwrap()),    // foreign_schema
+            None,                                   // foreign_table = None
+        )
+        .await
+        .expect("foreign_keys both tables null must not error");
+
+    assert_eq!(col_names(&stream.schema())[0], "PKTABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+    let calls = server
+        .received_requests()
+        .await
+        .unwrap()
+        .iter()
+        .filter(|r| r.url.path() == "/api/2.0/sql/statements")
+        .count();
+    assert_eq!(calls, 0, "no SHOW FOREIGN KEYS should be issued");
 }
 
 #[tokio::test]

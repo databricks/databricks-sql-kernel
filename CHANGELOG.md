@@ -24,6 +24,27 @@ cadences and may not move in lockstep with the crate.
   multi-statement transactions (Private Preview; requires catalog-managed
   tables server-side).
 
+### Fixed
+- **Metadata conformance (catalog match-all wildcard)** — a *literal*
+  catalog `%`, `*`, or `""` reaching `Metadata::list_schemas` /
+  `list_tables` is now scoped verbatim (`SHOW … IN [CATALOG] \`%\``) and
+  matches nothing (0 rows), instead of being silently broadened to
+  `SHOW … IN ALL CATALOGS`. Only a `None` catalog means "all catalogs";
+  `list_columns` already behaved this way. This makes an escaped `\%`
+  catalog (wildcard-escaping ON) and an exact `Identifier("%")` return
+  the correct empty result, matching the reference driver. An *unescaped*
+  `%` `LikePattern` on `list_tables` is still match-all (one
+  `SHOW TABLES IN ALL CATALOGS`), and the C ABI's NULL/`""` → "all
+  catalogs" convention is unchanged. Fixes #202, #221.
+- **Metadata conformance (`foreign_keys` unspecified foreign table)** —
+  `Metadata::foreign_keys` with a `None` `foreign_table` now returns an
+  empty result (0 rows, no `SHOW FOREIGN KEYS` issued) instead of an
+  `InvalidArgument` error, matching the JDBC SEA `listCrossReferences`
+  contract and the ODBC primary-keys-only `SQLForeignKeys` form (covers
+  both the parent-set and both-tables-null cases). `foreign_catalog` /
+  `foreign_schema` remain required only when a `foreign_table` is
+  supplied. Fixes #212 (METADATA-037/038).
+
 ## [v0.2.0] - 2026-06-08
 
 **Beta release of the Databricks SQL Kernel.** Bumps the crate out
