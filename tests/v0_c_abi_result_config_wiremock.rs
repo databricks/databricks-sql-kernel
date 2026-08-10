@@ -12,18 +12,18 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! C-ABI wiremock tests for the typed result-config surface
-//! (`kernel_session_config_set_result_config`).
+//! C-ABI wiremock tests for the client-side result-config surface
+//! (`kernel_session_config_set_client_conf`).
 //!
-//! These prove the typed client-side knobs actually reach the wire /
-//! kernel behaviour through the C ABI — closing the gap where the C ABI
+//! These prove the client-side knobs actually reach the wire / kernel
+//! behaviour through the C ABI — closing the gap where the C ABI
 //! previously could not reach `ResultConfig` at all (only the legacy
 //! `cloudfetch_max_chunks_in_memory` magic string). The headline check:
-//! opening a session with `cloudfetch_enabled = false` via the typed
-//! setter makes every `ExecuteStatement` carry SEA `disposition = INLINE`
-//! (see #196 for why that, not a `can_cloud_download` session conf, is the
-//! correct mechanism), while the default carries
-//! `INLINE_OR_EXTERNAL_LINKS`.
+//! opening a session with `cloudfetch_enabled = false` via
+//! `set_client_conf` makes every `ExecuteStatement` carry SEA
+//! `disposition = INLINE` (see #196 for why that, not a
+//! `can_cloud_download` session conf, is the correct mechanism), while the
+//! default carries `INLINE_OR_EXTERNAL_LINKS`.
 
 use std::ffi::CString;
 
@@ -90,7 +90,7 @@ async fn mount_execute(server: &MockServer) {
         .await;
 }
 
-/// Open a session over the C ABI, applying `set_result_config` first when
+/// Open a session over the C ABI, applying `set_client_conf` first when
 /// `cloudfetch_enabled` is `Some`. Returns the raw handle (caller closes).
 ///
 /// # Safety

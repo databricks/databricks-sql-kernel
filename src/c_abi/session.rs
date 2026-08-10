@@ -120,11 +120,10 @@ pub struct KernelSessionConfig {
     token_cache: TokenCacheConfig,
     /// Client-side result-management knobs (CloudFetch / inline streaming
     /// tuning, flat-text rendering). Populated by
-    /// `kernel_session_config_set_result_config`,
-    /// `..._set_complex_types_as_json`, and `..._set_intervals_as_string`;
-    /// defaults to [`ResultConfig::default`]. These are **client-side**
-    /// behaviours folded into the kernel's `ResultConfig` at `open()` —
-    /// they never reach the SEA wire (unlike [`Self::session_conf`]). See
+    /// `kernel_session_config_set_client_conf`; defaults to
+    /// [`ResultConfig::default`]. These are **client-side** behaviours
+    /// folded into the kernel's `ResultConfig` at `open()` — they never
+    /// reach the SEA wire (unlike [`Self::session_conf`]). See
     /// [`ResultConfig`].
     result: ResultConfig,
 }
