@@ -1161,3 +1161,96 @@ async fn execute_succeeded_inline_still_closes_statement() {
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
 }
+
+// ─── Synchronous close ordering on drain (issue #170) ───
+
+/// Regression for issue #170: the auto-close-on-drain path must close the
+/// server statement **synchronously** — the `DELETE /statements/<id>` must
+/// already be on the wire by the time `ExecutedStatement::next_batch()`
+/// returns `Ok(None)` (end of stream). A detached fire-and-forget close
+/// (`runtime.spawn`) is NOT ordered w.r.t. the caller's next request on the
+/// same session, which is the non-deterministic wire ordering #170 reports.
+///
+/// The assertion reads `received_requests()` **immediately** after drain,
+/// with no sleep: only a synchronous, awaited close guarantees the DELETE
+/// is already recorded at that point. A spawned close may or may not have
+/// run yet, so this reliably fails against the fire-and-forget drain path
+/// and passes once the drain awaits the close.
+#[tokio::test]
+async fn drain_closes_statement_synchronously_before_returning() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    // SUCCEEDED (not CLOSED) so a close genuinely must fire — the server
+    // still owns the statement.
+    mount_execute(&server, succeeded_inline_body("stmt-sync", &batch)).await;
+    mount_close_any_statement(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let mut exec = stmt.execute().await.expect("execute");
+
+    // Drain to end-of-stream via next_batch(), which fires the auto-close.
+    // The final call returns Ok(None) only after the drain-close completes
+    // when it is synchronous.
+    while exec.next_batch().await.expect("next_batch").is_some() {}
+
+    // No sleep: assert the DELETE is ALREADY on the wire. This is the
+    // synchronous-ordering guarantee — a fire-and-forget spawn need not have
+    // executed yet at this point.
+    let delete_path = "/api/2.0/sql/statements/stmt-sync";
+    let deletes = server
+        .received_requests()
+        .await
+        .expect("received_requests")
+        .iter()
+        .filter(|r| r.method == wiremock::http::Method::DELETE && r.url.path() == delete_path)
+        .count();
+    assert_eq!(
+        deletes, 1,
+        "drain must close the statement synchronously — the DELETE must be on \
+         the wire before next_batch() returns None (issue #170)"
+    );
+}
+
+/// Companion to [`drain_closes_statement_synchronously_before_returning`]:
+/// when the statement already reported `state=CLOSED`, drain must STILL fire
+/// no close at all (issue #168 guarantee preserved by the #170 sync-close
+/// change — a synchronous close must not resurrect the redundant DELETE the
+/// CLOSED short-circuit suppresses).
+#[tokio::test]
+async fn drain_of_closed_statement_fires_no_close_even_when_synchronous() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, closed_inline_body("stmt-sync-closed", &batch)).await;
+
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-sync-closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute");
+        while exec.next_batch().await.expect("next_batch").is_some() {}
+    }
+
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-sync-closed",
+        0,
+        std::time::Duration::from_millis(500),
+    )
+    .await;
+    assert_eq!(closes, 0, "CLOSED statement must never fire CloseStatement");
+}

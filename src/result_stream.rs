@@ -486,12 +486,42 @@ pub struct ResultStream {
     close_guard: Option<StatementCloseGuard>,
 }
 
-/// Fire-and-forget `CloseStatement`-on-Drop for a server statement that
-/// no other handle owns (the metadata path). Mirrors the
-/// `ExecutedStatement` Drop cleanup, scoped to the bare-stream case.
+/// `CloseStatement` cleanup for a server statement that no other handle
+/// owns (the metadata path). Mirrors the `ExecutedStatement` cleanup,
+/// scoped to the bare-stream case.
+///
+/// Preferred path: the owning [`ResultStream`] calls
+/// [`close_now`](Self::close_now) **synchronously** when its `next_batch`
+/// drains to end-of-stream, so the `DELETE /statements/<id>` is ordered
+/// before the caller's next request (issue #170). `close_now` empties
+/// `statement_id`, which disarms the `Drop` backstop below. The `Drop`
+/// stays fire-and-forget for the not-fully-drained case (abandoned
+/// metadata stream), where there is no `.await` to hang the close on.
 struct StatementCloseGuard {
     session: Arc<SessionInner>,
     statement_id: String,
+}
+
+impl StatementCloseGuard {
+    /// Synchronously close the statement and disarm the `Drop` backstop.
+    /// A wire failure is logged and swallowed — the metadata result is
+    /// already delivered and the server reclaims the handle at session
+    /// expiry. Idempotent: a second call (or a `Drop` after this) sees an
+    /// empty id and no-ops.
+    async fn close_now(&mut self) {
+        let stmt_id = std::mem::take(&mut self.statement_id);
+        if stmt_id.is_empty() {
+            return;
+        }
+        if let Err(e) = self.session.transport().close_statement(&stmt_id).await {
+            crate::klog::warn!(
+                "synchronous close_statement for metadata stream {} failed: {} \
+                 (server reclaims on session close)",
+                stmt_id,
+                e
+            );
+        }
+    }
 }
 
 impl Drop for StatementCloseGuard {
@@ -617,6 +647,16 @@ impl ResultStream {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
+                // Metadata path (`close_guard` is `Some`): close the
+                // server statement synchronously now that the stream is
+                // drained, so the `DELETE` is ordered before the caller's
+                // next request rather than racing it on a spawned task
+                // (issue #170). The data path leaves `close_guard` `None`
+                // — there the owning `ExecutedStatement` handles the
+                // close. `close_now` disarms the `Drop` backstop.
+                if let Some(guard) = self.close_guard.as_mut() {
+                    guard.close_now().await;
+                }
                 Ok(None)
             }
         }

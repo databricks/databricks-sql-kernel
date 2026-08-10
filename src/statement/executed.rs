@@ -115,11 +115,24 @@ impl ExecutedStatement {
     /// when the stream is exhausted**.
     ///
     /// Identical to `result_stream_mut().next_batch()` except that the
-    /// first time it observes end-of-stream (`Ok(None)`), it spawns a
-    /// fire-and-forget `CloseStatement` (guarded by the shared `closed`
-    /// flag, so `Drop` / explicit `close()` never double-fire).
+    /// first time it observes end-of-stream (`Ok(None)`), it closes the
+    /// server statement **synchronously** — awaiting the `CloseStatement`
+    /// before returning `Ok(None)` — guarded by the shared `closed` flag
+    /// so `Drop` / explicit `close()` never double-fire.
     ///
-    /// Why this matters: for a large CloudFetch result whose chunk
+    /// Why synchronous (issue #170): a detached fire-and-forget close
+    /// (`runtime.spawn`) is not ordered w.r.t. the caller's next request
+    /// on the same session, so the `DELETE /statements/<id>` races the
+    /// next `ExecuteStatement` — non-deterministic wire ordering that
+    /// breaks ordered replay/proxy tooling. Awaiting here lands the
+    /// close on the wire before the drain returns, so the next request
+    /// the caller issues is naturally ordered after it (matching C# ADBC
+    /// and databricks-jdbc, which close synchronously at result-set
+    /// close). The true `Drop`-without-drain fallback stays
+    /// fire-and-forget ([`Self::spawn_close_if_open`]) — `Drop` can't
+    /// `.await`.
+    ///
+    /// Why close here at all: for a large CloudFetch result whose chunk
     /// *links* are paginated (`all_fetched=false`), the reader fetches
     /// later links lazily via `get_result_chunks` against the live
     /// server statement *during consumption*. Closing the statement
@@ -129,6 +142,14 @@ impl ExecutedStatement {
     /// every lazy link fetch has already completed — so the close is
     /// always safe, and the connector no longer needs to close the
     /// statement on the sync path at all.
+    ///
+    /// A close failure at drain is intentionally swallowed (logged, not
+    /// returned): the drained result is already fully delivered, the
+    /// server reclaims the handle at session expiry, and surfacing a
+    /// cleanup error as an end-of-stream error would be a spurious
+    /// failure on an otherwise-successful fetch. The `closed` flag is
+    /// still flipped (see [`Self::close_if_open`]), so `Drop` does not
+    /// re-attempt.
     ///
     /// Bindings should call this instead of
     /// `result_stream_mut().next_batch()` so the auto-close fires.
@@ -146,15 +167,48 @@ impl ExecutedStatement {
             return Ok(self.result_stream.current());
         }
         // End-of-stream: every lazy link fetch has completed, so the
-        // server statement is safe to close.
-        self.spawn_close_if_open();
+        // server statement is safe to close. Await it so the DELETE is
+        // ordered before the caller's next request (issue #170).
+        self.close_if_open().await;
         Ok(None)
     }
 
+    /// Close the server statement **synchronously** (awaiting the
+    /// `CloseStatement`) unless it is already closed (`closed` flag).
+    /// The auto-close-on-drain path ([`Self::next_batch`]) uses this so
+    /// the DELETE is ordered w.r.t. the caller's next request. The
+    /// `swap` claims the close so `Drop` / explicit `close()` skip it.
+    ///
+    /// A wire failure is logged and swallowed (not returned): the drain
+    /// has already delivered the full result, and the server reclaims
+    /// the handle at session expiry. The `closed` flag stays set so
+    /// `Drop` does not re-fire — accepting a rare leaked handle over a
+    /// duplicate close on every drain.
+    async fn close_if_open(&self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Err(e) = self
+            .session
+            .transport()
+            .close_statement(&self.statement_id)
+            .await
+        {
+            warn!(
+                statement_id = %self.statement_id,
+                error = %e,
+                "auto-close on drain failed; server-side resource reclaimed \
+                 when the session closes"
+            );
+        }
+    }
+
     /// Spawn a fire-and-forget `CloseStatement` unless the statement is
-    /// already closed (`closed` flag). Shared by [`Self::next_batch`]'s
-    /// auto-close-on-drain and `Drop`. The `swap` makes whichever fires
-    /// first win; the other observes `closed=true` and skips.
+    /// already closed (`closed` flag). Used **only** by `Drop`, which
+    /// can't `.await` — the drain path closes synchronously via
+    /// [`Self::close_if_open`]. The `swap` makes whichever of `Drop` /
+    /// drain / explicit `close()` fires first win; the others observe
+    /// `closed=true` and skip.
     fn spawn_close_if_open(&self) {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;

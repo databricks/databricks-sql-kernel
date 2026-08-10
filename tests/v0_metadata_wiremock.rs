@@ -1435,3 +1435,57 @@ async fn metadata_closed_response_skips_close_on_wildcard_fanout() {
     }
     // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
+
+// ─── Synchronous close ordering on drain (issue #170) ───
+
+/// Regression for issue #170 on the metadata path: draining a metadata
+/// `ResultStream` to end-of-stream must close the server statement
+/// **synchronously** — the `DELETE /statements/<id>` must already be on
+/// the wire by the time `next_batch()` returns `None`, not raced on a
+/// detached `runtime.spawn`. Asserted with no sleep: only a synchronous,
+/// awaited close guarantees the DELETE is recorded at that point.
+///
+/// Uses a SUCCEEDED response so a close genuinely fires (the CLOSED path
+/// is already covered by `metadata_closed_response_skips_close_statement`).
+#[tokio::test]
+async fn metadata_drain_closes_statement_synchronously() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let raw = string_batch(vec![("catalog", vec![Some("main")])]);
+    mount_execute(&server, succeeded_inline_response_body(&raw)).await;
+    // Stub the DELETE so it doesn't 404 (kept unscoped; the assertion
+    // reads received_requests directly).
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-test"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_catalogs()
+        .await
+        .expect("list_catalogs");
+    // Drain to end-of-stream. The final next_batch() returning None must
+    // have already awaited the CloseStatement (issue #170).
+    let _ = drain_stream(&mut stream).await;
+
+    // No sleep: the DELETE must ALREADY be on the wire.
+    let deletes = server
+        .received_requests()
+        .await
+        .expect("received_requests")
+        .iter()
+        .filter(|r| {
+            r.method.as_str() == "DELETE" && r.url.path() == "/api/2.0/sql/statements/stmt-test"
+        })
+        .count();
+    assert_eq!(
+        deletes, 1,
+        "metadata drain must close the statement synchronously — the DELETE \
+         must be on the wire before next_batch() returns None (issue #170)"
+    );
+}
