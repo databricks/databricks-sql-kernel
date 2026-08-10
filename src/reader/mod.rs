@@ -1056,9 +1056,10 @@ mod tests {
             &DataType::Interval(arrow_schema::IntervalUnit::DayTime),
             "INTERVAL DAY TO SECOND must map to IntervalUnit::DayTime"
         );
-        // VOID must surface as `Null`, not as Utf8 — Thrift's surface for
-        // a `CAST(NULL AS VOID)` column carries a null type.
-        assert_eq!(schema.field(2).data_type(), &DataType::Null);
+        // VOID surfaces as `Utf8` — the server reports untyped NULL / VOID
+        // as STRING, so an empty-result VOID column reports the same type
+        // as a `CAST(NULL AS STRING)` sibling (issue #203, DATATYPE-041).
+        assert_eq!(schema.field(2).data_type(), &DataType::Utf8);
     }
 
     #[test]
