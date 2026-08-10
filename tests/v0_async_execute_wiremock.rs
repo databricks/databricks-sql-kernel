@@ -237,6 +237,45 @@ fn closed_body(statement_id: &str) -> String {
     .to_string()
 }
 
+/// Like [`succeeded_inline_body`] but reports `status.state == CLOSED`.
+/// A statement that auto-closed server-side can surface `CLOSED` (with
+/// inline results) from a polled `GetStatementStatus` on the async path;
+/// the kernel must NOT then issue a redundant `CloseStatement` (DELETE)
+/// on it. See issue #168.
+fn closed_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+    succeeded_inline_body(statement_id, batch)
+        .replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
+}
+
+/// Poll `server.received_requests()` until `expected` `DELETE`s to the
+/// given statement endpoint are observed, or `timeout` elapses; returns
+/// the final observed count. Mirrors the sync suite's helper: a negative
+/// expectation (`expected == 0`) still gives an erroneously-spawned close
+/// the full window to reach the wire but breaks early the instant one
+/// appears, so the negative assertion stays reliably able to fail.
+async fn wait_for_close_delete(
+    server: &MockServer,
+    statement_id: &str,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    let delete_path = format!("/api/2.0/sql/statements/{statement_id}");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::DELETE && r.url.path() == delete_path)
+            .count();
+        if count >= expected.max(1) || tokio::time::Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
 /// Mount a single `GetStatementStatus` (GET) response for `attach`'s
 /// seeding call.
 async fn mount_status_once(server: &MockServer, statement_id: &str, body: String) {
@@ -1208,4 +1247,131 @@ async fn attached_handle_cancel_errors() {
         .expect_err("canceller from an attached handle must error");
     assert_eq!(cerr.code, ErrorCode::InvalidArgument, "got: {cerr:?}");
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+}
+
+// ─── CloseStatement / status.state==CLOSED handling (issue #168) ───
+
+/// Regression for issue #168 on the ASYNC path: when `await_result()`
+/// polls and observes a terminal `status.state == CLOSED` (a statement
+/// that auto-closed server-side), the statement is already closed
+/// server-side and the kernel must NOT issue a redundant
+/// `DELETE /api/2.0/sql/statements/<id>` (CloseStatement) on the handle's
+/// `close()` / drop — matching the sync `execute()` path.
+///
+/// The submit path starts the shared `closed` flag `false` (correct:
+/// `wait_timeout=0s` can't return CLOSED on submit), but reaching CLOSED
+/// via a later poll must flip it so the fire-and-forget close is skipped.
+#[tokio::test]
+async fn await_result_closed_status_skips_close_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![7]);
+    mount_submit(&server, pending_body("stmt-async-closed")).await;
+    // await_result polls RUNNING → CLOSED (with inline results). The final
+    // CLOSED body is also served to materialise_result's own status GET.
+    mount_status_sequence(
+        &server,
+        "stmt-async-closed",
+        vec![
+            running_body("stmt-async-closed"),
+            closed_inline_body("stmt-async-closed", &batch),
+        ],
+    )
+    .await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-async-closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 7 AS n");
+        let async_exec = stmt.submit().await.expect("submit");
+        let mut stream = async_exec.await_result().await.expect("await_result");
+        let batches = drain(&mut stream).await;
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            7
+        );
+        // An explicit close() on a CLOSED statement must also be a no-op.
+        async_exec.close().await.expect("close");
+        // async_exec (and stmt) drop here — a redundant close guard fires now.
+    }
+
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears.
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-async-closed",
+        0,
+        std::time::Duration::from_millis(500),
+    )
+    .await;
+    assert_eq!(closes, 0, "CLOSED status must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
+}
+
+/// Regression-guard for the async CLOSED-skip fix: a SUCCEEDED async
+/// result must STILL fire exactly one `CloseStatement` on close/drop —
+/// the server still owns the statement. Guards against over-correcting
+/// the CLOSED-skip into a server-statement leak.
+#[tokio::test]
+async fn await_result_succeeded_status_still_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![7]);
+    mount_submit(&server, pending_body("stmt-async-succ")).await;
+    mount_status_sequence(
+        &server,
+        "stmt-async-succ",
+        vec![
+            running_body("stmt-async-succ"),
+            succeeded_inline_body("stmt-async-succ", &batch),
+        ],
+    )
+    .await;
+
+    // Scoped expectation: exactly one DELETE on the statement endpoint.
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-async-succ"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 7 AS n");
+        let async_exec = stmt.submit().await.expect("submit");
+        let mut stream = async_exec.await_result().await.expect("await_result");
+        let _ = drain(&mut stream).await;
+        async_exec.close().await.expect("close");
+        // async_exec drops here — the close guard must fire the DELETE.
+    }
+
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-async-succ",
+        1,
+        std::time::Duration::from_millis(2000),
+    )
+    .await;
+    assert_eq!(
+        closes, 1,
+        "SUCCEEDED status must trigger exactly one CloseStatement"
+    );
+    // `_close` also verifies expect(1) when it drops at end of scope.
 }
