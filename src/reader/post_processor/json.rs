@@ -163,25 +163,21 @@ pub(crate) fn append_json(
                     .value_as_datetime(index),
             };
             let dt = dt.unwrap_or(chrono::DateTime::UNIX_EPOCH.naive_utc());
-            // Render at the Arrow column's native subsecond precision
-            // so we don't silently truncate microseconds/nanoseconds —
-            // matches JDBC's `DatabricksArray.toString()` chain, which
-            // honours the underlying type's precision.
+            // A TIMESTAMP leaf read through the text surface must be
+            // spelled as the session-timezone wall clock, exactly like
+            // a top-level TIMESTAMP-to-text (conformance case
+            // COMPLEX-016): a space separator (no 'T'), no 'Z'/offset
+            // suffix, and trailing-zero fractional seconds stripped —
+            // whole seconds carry no fraction at all
+            // (`2025-01-24 07:07:41`), a fractional value keeps only its
+            // significant digits (`2024-01-15 12:30:45.123456`).
             //
-            // TIMESTAMP carries a tz on the Arrow side; TIMESTAMP_NTZ
-            // does not. Match Thrift: tz'd → trailing 'Z', NTZ → no
-            // offset suffix.
-            let base = match unit {
-                TimeUnit::Second => dt.format("%Y-%m-%dT%H:%M:%S").to_string(),
-                TimeUnit::Millisecond => dt.format("%Y-%m-%dT%H:%M:%S%.3f").to_string(),
-                TimeUnit::Microsecond => dt.format("%Y-%m-%dT%H:%M:%S%.6f").to_string(),
-                TimeUnit::Nanosecond => dt.format("%Y-%m-%dT%H:%M:%S%.9f").to_string(),
-            };
-            let s = if tz.is_some() {
-                format!("{base}Z")
-            } else {
-                base
-            };
+            // chrono's `%.f` already omits the point for a zero
+            // fraction and trims trailing zeros otherwise, which is
+            // precisely the wall-clock spelling; the Arrow `tz` is not
+            // rendered (the instant is already the wall clock).
+            let _ = tz;
+            let s = dt.format("%Y-%m-%d %H:%M:%S%.f").to_string();
             append_quoted(out, &s);
         }
         DataType::Interval(_) => {
@@ -402,9 +398,71 @@ fn append_float(out: &mut String, v: f64) {
         out.push_str("null");
         return;
     }
-    // Rust's `{}` formatter for f64 uses the shortest round-trippable
-    // representation, matching Java's `Double.toString`.
-    write!(out, "{v}").unwrap();
+    out.push_str(&java_double_to_string(v));
+}
+
+/// Format an `f64` the way the JVM's `Double.toString` does.
+///
+/// This is the reference spelling for a DOUBLE leaf read through the
+/// text surface (conformance case COMPLEX-015): a *forced* fractional
+/// part (`100` → `100.0`), a capital `E` for scientific notation, and
+/// an unsigned, unpadded exponent (`1e21` → `1.0E21`, `1e-4` →
+/// `1.0E-4`). Java switches to scientific notation when the decimal
+/// exponent is `>= 7` or `< -3`, and uses plain decimal otherwise —
+/// distinct from Rust's `{}`, which prints the shortest round-trippable
+/// form with neither the forced fraction nor the capital-E layout
+/// (`100`, `0.0001`, a 22-digit integer for `1e21`).
+///
+/// Both Java and Rust pick the same *shortest round-trippable* digit
+/// string; only the surrounding layout differs. So we lean on Rust's
+/// `{:e}` (shortest scientific form: `d.dddde±XX`) for the digits and
+/// exponent, then re-lay them out under Java's rules.
+fn java_double_to_string(v: f64) -> String {
+    if v == 0.0 {
+        // Preserve the sign of negative zero, matching `Double.toString`.
+        return if v.is_sign_negative() {
+            "-0.0".to_string()
+        } else {
+            "0.0".to_string()
+        };
+    }
+
+    let sign = if v < 0.0 { "-" } else { "" };
+
+    // `{:e}` gives the shortest round-trip mantissa and a base-10
+    // exponent, e.g. 3.2033798725730455e8, 1e21, 1e-4, -2.5e0.
+    let sci = format!("{:e}", v.abs());
+    let (mantissa, exp): (&str, i32) = match sci.split_once('e') {
+        Some((m, e)) => (m, e.parse().expect("`{:e}` always emits an exponent")),
+        None => (sci.as_str(), 0),
+    };
+    // Mantissa is `d` or `d.ddd`; collect the significant digits.
+    let digits: String = mantissa.chars().filter(|c| *c != '.').collect();
+
+    // Java uses scientific notation when the decimal exponent is
+    // `>= 7` or `< -3`, plain decimal otherwise.
+    if !(-3..7).contains(&exp) {
+        // Scientific: first digit, '.', remaining digits (forced `.0`
+        // when only one significant digit), 'E', unsigned/unpadded exp.
+        let first = &digits[..1];
+        let rest = &digits[1..];
+        let frac = if rest.is_empty() { "0" } else { rest };
+        format!("{sign}{first}.{frac}E{exp}")
+    } else if exp >= 0 {
+        // Plain decimal, point after `exp + 1` digits.
+        let point = (exp + 1) as usize;
+        if digits.len() <= point {
+            // Integer value: pad with zeros and force a `.0` fraction.
+            let zeros = "0".repeat(point - digits.len());
+            format!("{sign}{digits}{zeros}.0")
+        } else {
+            format!("{sign}{}.{}", &digits[..point], &digits[point..])
+        }
+    } else {
+        // -3 <= exp < 0: leading `0.`, then `-exp - 1` zeros, then digits.
+        let zeros = "0".repeat((-exp - 1) as usize);
+        format!("{sign}0.{zeros}{digits}")
+    }
 }
 
 fn format_decimal128(raw: i128, scale: i8) -> String {
@@ -781,22 +839,23 @@ mod tests {
     fn timestamp_microsecond_precision_preserved() {
         let arr = arrow_array::TimestampMicrosecondArray::from(vec![1_705_314_600_123_456_i64]);
         let field = field_of(DataType::Timestamp(TimeUnit::Microsecond, None));
-        // 2024-01-15T10:30:00.123456 (NTZ → no Z).
-        assert_eq!(render(&arr, 0, &field), "\"2024-01-15T10:30:00.123456\"");
+        // Wall-clock spelling: space separator, no 'T', no 'Z', and the
+        // microsecond precision preserved (COMPLEX-016).
+        assert_eq!(render(&arr, 0, &field), "\"2024-01-15 10:30:00.123456\"");
     }
 
     #[test]
-    fn timestamp_nanosecond_with_tz_keeps_nine_digits_and_z() {
+    fn timestamp_nanosecond_with_tz_keeps_nine_digits_no_z() {
         let arr = arrow_array::TimestampNanosecondArray::from(vec![1_705_314_600_123_456_789_i64])
             .with_timezone("UTC");
         let field = field_of(DataType::Timestamp(
             TimeUnit::Nanosecond,
             Some("UTC".into()),
         ));
-        assert_eq!(
-            render(&arr, 0, &field),
-            "\"2024-01-15T10:30:00.123456789Z\""
-        );
+        // Nanosecond precision preserved; a tz on the Arrow side does
+        // NOT add a 'Z' — the leaf is spelled as the wall clock, the
+        // same as the top-level TIMESTAMP-to-text path (COMPLEX-016).
+        assert_eq!(render(&arr, 0, &field), "\"2024-01-15 10:30:00.123456789\"");
     }
 
     #[test]
@@ -831,6 +890,92 @@ mod tests {
             render(&arr, 0, &field),
             "{\"NaN\":1,\"Infinity\":2,\"-Infinity\":3}"
         );
+    }
+
+    #[test]
+    fn nested_double_leaf_uses_java_double_layout() {
+        // COMPLEX-015 (conformance): a DOUBLE leaf inside a complex
+        // type, read through the JSON-text surface, must be spelled
+        // with the reference forced-fraction / capital-'E' /
+        // unsigned-unpadded-exponent layout — the same one the JVM's
+        // `Double.toString` produces and the ODBC issue #197 alignment
+        // pinned as the shared spec. The array carries the boundary
+        // set from the spec's contract.
+        let arr = arrow_array::Float64Array::from(vec![
+            3.2033798725730455E8, // sci
+            1.0E-4,               // small
+            100.0,                // whole
+            1.0E21,               // big
+            1.0E-7,               // tiny
+            1.0,
+            -2.5,
+            1.0E7,
+            9999999.0,
+            0.001,
+            1.0E100,
+        ]);
+        let field = field_of(DataType::Float64);
+        let expected = [
+            "3.2033798725730455E8",
+            "1.0E-4",
+            "100.0",
+            "1.0E21",
+            "1.0E-7",
+            "1.0",
+            "-2.5",
+            "1.0E7",
+            "9999999.0",
+            "0.001",
+            "1.0E100",
+        ];
+        for (i, want) in expected.iter().enumerate() {
+            assert_eq!(render(&arr, i, &field), *want, "leaf index {i}");
+        }
+    }
+
+    #[test]
+    fn java_double_layout_switch_boundaries() {
+        // Pin the plain-decimal ↔ scientific switch (exp >= 7 or
+        // < -3), the sign, and negative zero — cross-checked against
+        // the JVM's `Double.toString`.
+        let cases = [
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (123.456, "123.456"),
+            (9999999.0, "9999999.0"), // exp 6 → plain
+            (1.0E7, "1.0E7"),         // exp 7 → scientific
+            (12345678.0, "1.2345678E7"),
+            (0.001, "0.001"), // exp -3 → plain
+            (1.0E-4, "1.0E-4"),
+            (-2.5, "-2.5"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(java_double_to_string(v), want, "value {v}");
+        }
+    }
+
+    #[test]
+    fn nested_timestamp_leaf_uses_wall_clock_spelling() {
+        // COMPLEX-016 (conformance): a TIMESTAMP leaf inside a complex
+        // type, read through the JSON-text surface, must be spelled as
+        // the session-timezone wall clock — space separator, no 'T', no
+        // 'Z', trailing-zero fractional seconds stripped — matching the
+        // top-level TIMESTAMP-to-text spelling (ODBC issue #197
+        // alignment). Whole seconds carry no fraction at all.
+        //
+        // 2025-01-24 07:07:41 UTC = 1_737_702_461 s.
+        let whole = arrow_array::TimestampMicrosecondArray::from(vec![1_737_702_461_000_000_i64])
+            .with_timezone("UTC");
+        let field = field_of(DataType::Timestamp(
+            TimeUnit::Microsecond,
+            Some("UTC".into()),
+        ));
+        assert_eq!(render(&whole, 0, &field), "\"2025-01-24 07:07:41\"");
+
+        // 2024-01-15 12:30:45.123456 UTC — non-zero micros kept.
+        let frac = arrow_array::TimestampMicrosecondArray::from(vec![1_705_321_845_123_456_i64])
+            .with_timezone("UTC");
+        assert_eq!(render(&frac, 0, &field), "\"2024-01-15 12:30:45.123456\"");
     }
 
     #[test]
