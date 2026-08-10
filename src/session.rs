@@ -883,9 +883,27 @@ fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
 fn build_retry_configs_for_session(
     config: &SessionConfig,
 ) -> std::collections::HashMap<RequestCategory, RetryConfig> {
+    // A tuning typo where `retry_max_wait < retry_min_wait` is CORRECTED, not
+    // fatal: raise max to min and warn once here (the single per-session build
+    // point), rather than letting it reach `calculate_backoff` — where an
+    // uncorrected pair would otherwise panic `Duration::clamp`. Mirrors the
+    // clamp-and-warn discipline `apply_client_result_overrides` uses for
+    // `cloudfetch_max_chunks_in_memory`.
+    let min_wait = config.http.retry_min_wait;
+    let mut max_wait = config.http.retry_max_wait;
+    if max_wait < min_wait {
+        crate::klog::warn!(
+            retry_min_wait = ?min_wait,
+            retry_max_wait = ?max_wait,
+            "retry_max_wait is below retry_min_wait; raising retry_max_wait to \
+             retry_min_wait (a backoff bound is a tuning hint, not a hard failure)",
+        );
+        max_wait = min_wait;
+    }
+
     let global = RetryConfig {
-        min_wait: config.http.retry_min_wait,
-        max_wait: config.http.retry_max_wait,
+        min_wait,
+        max_wait,
         max_retries: config.http.retry_max_retries,
         overall_timeout: config.http.overall_timeout,
         ..RetryConfig::default()

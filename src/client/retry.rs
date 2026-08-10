@@ -304,13 +304,22 @@ pub fn calculate_backoff(
     attempt: u32,
     retry_after_header: Option<&str>,
 ) -> Duration {
+    // Effective ceiling: never below the floor. A misconfigured
+    // `max_wait < min_wait` (a tuning typo, e.g. via `Session::builder().http()`)
+    // would otherwise make `Duration::clamp` panic (`Ord::clamp` asserts
+    // `min <= max`) on the first retry. Correct the pair by raising max to min
+    // rather than aborting the caller's task; the one-time warning is emitted
+    // where the per-session `RetryConfig` is built (see `session.rs`), not on
+    // this per-retry hot path.
+    let max_wait = config.max_wait.max(config.min_wait);
+
     let base_wait = if let Some(wait) = retry_after_header.and_then(parse_retry_after) {
         // Clamp Retry-After to [min_wait, max_wait]
-        wait.clamp(config.min_wait, config.max_wait)
+        wait.clamp(config.min_wait, max_wait)
     } else {
         // Exponential backoff: min_wait * 2^attempt (per spec)
         let exp = config.min_wait.saturating_mul(2u32.saturating_pow(attempt));
-        exp.min(config.max_wait)
+        exp.min(max_wait)
     };
 
     // Proportional jitter: random 5-25% of base_wait, minimum 50ms.
@@ -675,6 +684,35 @@ mod tests {
         // Retry-After: 120 should be clamped down to max_wait (10s) + 25% = 12500ms
         let backoff = calculate_backoff(&config, 1, Some("120"));
         assert!(backoff <= Duration::from_millis(12_500));
+    }
+
+    #[test]
+    fn test_calculate_backoff_max_below_min_does_not_panic() {
+        // ERRORRECOV-014: a tuning typo where max_wait < min_wait must be
+        // CORRECTED, not fatal. `Duration`'s `Ord::clamp` panics
+        // (`assertion failed: min <= max`) when min > max, so the backoff must
+        // treat the effective ceiling as `max_wait.max(min_wait)` — i.e. raise
+        // max up to min. The bound stays a tuning hint; a typo must never abort
+        // the caller's task the first time a transient 503 fires.
+        let config = RetryConfig {
+            min_wait: Duration::from_secs(3),
+            max_wait: Duration::from_secs(1), // deliberately below min
+            ..Default::default()
+        };
+
+        // Retry-After path: 5s clamps to [3s, effective-max=3s] = 3s + jitter.
+        let backoff = calculate_backoff(&config, 1, Some("5"));
+        assert!(
+            backoff >= Duration::from_secs(3),
+            "Retry-After backoff {backoff:?} should be >= min_wait (3s)"
+        );
+
+        // Exponential path: base 3s*2 capped to effective-max 3s + jitter.
+        let backoff = calculate_backoff(&config, 1, None);
+        assert!(
+            backoff >= Duration::from_secs(3),
+            "exponential backoff {backoff:?} should be >= min_wait (3s)"
+        );
     }
 
     #[test]
