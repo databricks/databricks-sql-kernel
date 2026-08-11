@@ -203,8 +203,9 @@ impl FederationProvider {
             })?;
 
         // No auth header: the request authenticates via the `assertion`, not
-        // the kernel bearer. `AuthTokenRequest` gives it the Auth-category
-        // retry ladder (backoff on 408/502/503/504 + timeouts).
+        // the kernel bearer. `AuthTokenRequest` is idempotent, so the
+        // Auth-category ladder retries with backoff on all 5xx / 429 / 408 and
+        // timeouts — everything except the fixed non-retryable 4xx set.
         let response = self
             .http_client
             .execute_without_auth(request, RequestType::AuthTokenRequest)
