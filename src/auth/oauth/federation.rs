@@ -61,10 +61,8 @@ use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::util::runtime::block_on_in_runtime;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
-use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
-use tokio::runtime::Handle as RuntimeHandle;
+use std::sync::{Arc, RwLock};
+use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 
 const TOKEN_EXCHANGE_PATH: &str = "/oidc/v1/token";
 const GRANT_TYPE_JWT_BEARER: &str = "urn:ietf:params:oauth:grant-type:jwt-bearer";
@@ -109,12 +107,21 @@ pub struct FederationProvider {
     /// Runtime handle captured at construction so the sync `get_auth_header`
     /// can drive the async exchange (see [`block_on_in_runtime`]).
     runtime_handle: RuntimeHandle,
-    /// Exchanged tokens keyed by a hash of the *source* token, so a rotated
-    /// upstream credential is exchanged fresh and an expired exchanged token
-    /// is re-exchanged.
-    cache: RwLock<HashMap<String, OAuthToken>>,
-    /// Serializes concurrent exchanges (double-checked against `cache`).
-    exchange_lock: Mutex<()>,
+    /// The most recent exchange result, as `(source_token, exchanged)`. A
+    /// provider tracks exactly one active source token at a time, so a single
+    /// slot suffices: when the upstream credential rotates the slot is replaced
+    /// (keyed on the source token), and an expired exchanged token is
+    /// re-exchanged. Holding the source token lets a cache-hit compare directly
+    /// without hashing on the hot path.
+    cache: RwLock<Option<CacheEntry>>,
+}
+
+/// A cached exchange outcome: the source token it was derived from, and the
+/// resulting in-house token.
+#[derive(Debug)]
+struct CacheEntry {
+    source_token: String,
+    exchanged: OAuthToken,
 }
 
 impl FederationProvider {
@@ -139,8 +146,7 @@ impl FederationProvider {
             identity_federation_client_id,
             http_client,
             runtime_handle: RuntimeHandle::current(),
-            cache: RwLock::new(HashMap::new()),
-            exchange_lock: Mutex::new(()),
+            cache: RwLock::new(None),
         })
     }
 
@@ -206,60 +212,85 @@ impl FederationProvider {
 
     /// Resolves the token to use: the cached/exchanged in-house token on
     /// success, or `source_token` unchanged on any failure.
+    ///
+    /// No lock is held across the network call. A cache hit for the current
+    /// source token returns under a short read lock; a miss performs the
+    /// exchange lock-free (so a degraded `/oidc/v1/token` can never block other
+    /// callers or park the tokio worker pool), then takes a brief write lock
+    /// only to store the result. Concurrent first-use callers may each run an
+    /// exchange — those calls are idempotent and the redundancy is bounded by
+    /// how many threads race the cold start; the single cache slot collapses to
+    /// the last writer. The Auth-category retry budget (see
+    /// `build_retry_configs_for_session`: 30s / 3 retries, not the global
+    /// ladder) bounds each exchange's own latency.
     fn exchanged_or_original(&self, source_token: &str) -> String {
-        let key = cache_key(source_token);
-
         // Fast path: a fresh cached exchange for this exact source token.
         if let Ok(cache) = self.cache.read() {
-            if let Some(tok) = cache.get(&key) {
-                if !tok.is_expired() {
-                    return tok.access_token.clone();
+            if let Some(entry) = cache.as_ref() {
+                if entry.source_token == source_token && !entry.exchanged.is_expired() {
+                    return entry.exchanged.access_token.clone();
                 }
             }
         }
 
-        // Slow path: serialize so concurrent callers don't all hit the
-        // endpoint, then double-check the cache.
-        let _guard = self.exchange_lock.lock().unwrap_or_else(|e| e.into_inner());
-        if let Ok(cache) = self.cache.read() {
-            if let Some(tok) = cache.get(&key) {
-                if !tok.is_expired() {
-                    return tok.access_token.clone();
-                }
-            }
+        // The exchange bridges sync→async via `block_on_in_runtime`, which
+        // uses `block_in_place` when a runtime is current — that panics on a
+        // *current-thread* runtime. Every shipped consumer (pyo3, napi, the C
+        // ABI) drives the kernel on a multi-thread runtime, but a caller on a
+        // current-thread runtime would otherwise crash here. Detect that case
+        // and fall back to the original token rather than panicking — the same
+        // non-breaking posture as an exchange failure.
+        if matches!(
+            self.runtime_handle.runtime_flavor(),
+            RuntimeFlavor::CurrentThread
+        ) {
+            warn!(
+                "Token federation: skipping exchange on a current-thread runtime \
+                 (cannot block safely); using original token"
+            );
+            return source_token.to_string();
         }
 
+        // Miss (empty, rotated source, or expired): exchange WITHOUT holding
+        // any lock, then store the outcome.
         match block_on_in_runtime(&self.runtime_handle, self.exchange(source_token)) {
             Ok(token) => {
                 let access_token = token.access_token.clone();
-                if let Ok(mut cache) = self.cache.write() {
-                    cache.insert(key, token);
-                }
+                self.store(source_token, token);
                 debug!("Token federation: exchanged foreign-issuer token for in-house token");
                 access_token
             }
             Err(e) => {
                 // Non-breaking fallback: use the original token. Cache the
-                // original (short-lived) under the same key so a burst of
-                // requests doesn't hammer the endpoint after a failure.
+                // original (short-lived) so a burst of requests with the same
+                // source doesn't hammer the endpoint after a failure.
                 warn!(
                     "Token federation: exchange failed, falling back to original token: {}",
                     e
                 );
-                if let Ok(mut cache) = self.cache.write() {
-                    cache.insert(
-                        key,
-                        OAuthToken::new(
-                            source_token.to_string(),
-                            "Bearer".to_string(),
-                            60,
-                            None,
-                            vec![],
-                        ),
-                    );
-                }
+                self.store(
+                    source_token,
+                    OAuthToken::new(
+                        source_token.to_string(),
+                        "Bearer".to_string(),
+                        60,
+                        None,
+                        vec![],
+                    ),
+                );
                 source_token.to_string()
             }
+        }
+    }
+
+    /// Replace the single cache slot with the outcome for `source_token`.
+    /// A brief write lock; never held across a network call.
+    fn store(&self, source_token: &str, exchanged: OAuthToken) {
+        if let Ok(mut cache) = self.cache.write() {
+            *cache = Some(CacheEntry {
+                source_token: source_token.to_string(),
+                exchanged,
+            });
         }
     }
 }
@@ -286,14 +317,6 @@ impl AuthProvider for FederationProvider {
             _ => Ok(header),
         }
     }
-}
-
-/// SHA-256 hex digest of a token, used as the cache key so raw tokens are not
-/// held as map keys.
-fn cache_key(token: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(token.as_bytes());
-    hex::encode(hasher.finalize())
 }
 
 /// Extracts the bare `host[:port]` from a URL-ish string, lowercased. Accepts
@@ -373,8 +396,7 @@ mod tests {
             identity_federation_client_id: None,
             http_client,
             runtime_handle: RuntimeHandle::current(),
-            cache: RwLock::new(HashMap::new()),
-            exchange_lock: Mutex::new(()),
+            cache: RwLock::new(None),
         }
     }
 

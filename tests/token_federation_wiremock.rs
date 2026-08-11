@@ -21,6 +21,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -50,6 +51,27 @@ fn jwt_with_issuer(iss: &str) -> String {
 fn no_retry_http_client() -> Arc<DatabricksHttpClient> {
     let retry = RetryConfig {
         max_retries: 0,
+        ..RetryConfig::default()
+    };
+    Arc::new(
+        DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            build_retry_configs(&retry, &HashMap::new()),
+        )
+        .expect("http client"),
+    )
+}
+
+/// HTTP client with a small-but-real retry budget: enough retries that a
+/// failing endpoint takes measurable wall-time per exchange, but bounded so a
+/// test finishes quickly. Used to prove that a degraded `/oidc/v1/token` does
+/// not serialize concurrent callers behind a shared lock.
+fn bounded_retry_http_client() -> Arc<DatabricksHttpClient> {
+    let retry = RetryConfig {
+        min_wait: Duration::from_millis(200),
+        max_wait: Duration::from_millis(200),
+        max_retries: 2, // 3 attempts total
+        overall_timeout: Duration::from_secs(5),
         ..RetryConfig::default()
     };
     Arc::new(
@@ -285,4 +307,100 @@ async fn exchanged_token_is_cached_across_calls() {
     for _ in 0..3 {
         assert_eq!(provider.get_auth_header().unwrap(), "Bearer cached-token");
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn representative_databricks_issuer_passes_through() {
+    // Non-circular version of the same-host case: use a realistic in-house
+    // Databricks issuer (`https://<workspace-host>/oidc`) and a matching
+    // workspace host that is NOT the mock URI, proving the host comparison —
+    // scheme + `/oidc` path stripped — treats a real Databricks-issued token
+    // as in-house and skips the exchange.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oidc/v1/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(exchange_response("unused")))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let workspace = "https://adb-5484724900402942.2.azuredatabricks.net";
+    let inner_token = jwt_with_issuer(&format!("{workspace}/oidc"));
+
+    let provider = FederationProvider::new(
+        inner_bearing(&inner_token),
+        workspace,
+        None,
+        no_retry_http_client(),
+    )
+    .await
+    .expect("provider");
+
+    // Same host (modulo scheme + `/oidc`) ⇒ pass through unchanged, no HTTP.
+    assert_eq!(
+        provider.get_auth_header().unwrap(),
+        format!("Bearer {inner_token}")
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn degraded_endpoint_does_not_serialize_concurrent_callers() {
+    // With retries ENABLED and the exchange endpoint always failing, each
+    // exchange spends ~real backoff time (2 retries × 200ms ≈ 0.4s+). Fire
+    // many concurrent callers: because the resolver holds no lock across the
+    // network call, they run their exchanges in parallel and every call still
+    // returns (falling back to the original token). Total wall-time must stay
+    // close to a single exchange's budget, NOT N × it — which is what a lock
+    // held across the retry ladder would produce.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oidc/v1/token"))
+        .respond_with(ResponseTemplate::new(503))
+        .mount(&server)
+        .await;
+
+    let inner_token = jwt_with_issuer("https://external-idp.example.com");
+    let provider = Arc::new(
+        FederationProvider::new(
+            inner_bearing(&inner_token),
+            &server.uri(),
+            None,
+            bounded_retry_http_client(),
+        )
+        .await
+        .expect("provider"),
+    );
+
+    // Spawn concurrent callers on separate OS threads (get_auth_header is sync
+    // and blocks the thread), each entering the runtime context.
+    const N: usize = 8;
+    let handle = tokio::runtime::Handle::current();
+    let start = Instant::now();
+    let mut threads = Vec::with_capacity(N);
+    for _ in 0..N {
+        let p = provider.clone();
+        let h = handle.clone();
+        threads.push(std::thread::spawn(move || {
+            let _guard = h.enter();
+            p.get_auth_header()
+        }));
+    }
+    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let elapsed = start.elapsed();
+
+    // All calls succeed via the non-breaking fallback (original token).
+    for r in &results {
+        assert_eq!(r.as_deref().unwrap(), format!("Bearer {inner_token}"));
+    }
+
+    // A single exchange's budget is ~0.4s (2 × 200ms) plus overhead. If callers
+    // serialized behind a shared lock across the retry ladder, 8 of them would
+    // take 8× that (~3.2s+). Assert well under that serialized floor — generous
+    // enough to avoid CI flakiness while still failing a serialized regression.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "concurrent exchanges took {elapsed:?}; expected them to run in parallel \
+         (a lock held across the retry ladder would serialize to ~N× a single \
+         exchange)"
+    );
 }
