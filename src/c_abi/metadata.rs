@@ -369,10 +369,93 @@ pub unsafe extern "C" fn kernel_metadata_list_table_types(
     })
 }
 
-// PR 7d follow-ups: functions, procedures, type_info — the kernel
-// `Metadata` exposes these (some synthesised in-memory). Wire them over
-// the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
-// SQLProcedures / SQLPrimaryKeys-adjacent surfaces.
+/// List procedures filtered by catalog (exact) and schema / procedure
+/// name patterns. Mirrors JDBC `getProcedures` / ODBC `SQLProcedures`.
+/// Result columns are the JDBC-canonical `getProcedures` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_procedures(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
+            session
+                .metadata()
+                .procedures(catalog, schema_pattern, procedure_pattern)
+                .await
+        })
+    })
+}
+
+/// List functions filtered by catalog (exact) and schema / function
+/// name patterns. Mirrors JDBC `getFunctions`. Result columns are the
+/// JDBC-canonical `getFunctions` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_functions(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    function_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let function_pattern = opt_pattern(function_pattern, "function_pattern")?;
+            session
+                .metadata()
+                .functions(catalog, schema_pattern, function_pattern)
+                .await
+        })
+    })
+}
+
+/// List procedure parameter / return columns filtered by catalog
+/// (exact) and schema / procedure / column name patterns. Mirrors JDBC
+/// `getProcedureColumns` / ODBC `SQLProcedureColumns` (procedures only —
+/// function arguments are excluded). Result columns are the
+/// JDBC-canonical `getProcedureColumns` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_procedure_columns(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    column_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
+            let column_pattern = opt_pattern(column_pattern, "column_pattern")?;
+            session
+                .metadata()
+                .procedure_columns(catalog, schema_pattern, procedure_pattern, column_pattern)
+                .await
+        })
+    })
+}
 
 #[cfg(test)]
 mod tests {

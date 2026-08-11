@@ -86,7 +86,8 @@ use crate::metadata::sql::{LikeMatcher, SqlCommandBuilder};
 use crate::metadata::static_data;
 use crate::metadata::thrift_shape::{
     self, is_object_not_found, ThriftReshapingReader, GET_CATALOGS_SCHEMA, GET_COLUMNS_SCHEMA,
-    GET_CROSS_REFERENCE_SCHEMA, GET_PRIMARY_KEYS_SCHEMA, GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
+    GET_CROSS_REFERENCE_SCHEMA, GET_FUNCTIONS_SCHEMA, GET_PRIMARY_KEYS_SCHEMA,
+    GET_PROCEDURES_SCHEMA, GET_PROCEDURE_COLUMNS_SCHEMA, GET_SCHEMAS_SCHEMA, GET_TABLES_SCHEMA,
 };
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
@@ -964,7 +965,8 @@ impl Metadata {
     ///
     /// Server shape (`SELECT ... FROM information_schema.routines`):
     /// `routine_catalog, routine_schema, routine_name, comment,
-    /// specific_name`.
+    /// specific_name`. Reshaped kernel-side into the JDBC `getFunctions`
+    /// column set by [`thrift_shape::reshape_functions`].
     pub async fn functions(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -973,7 +975,7 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
-            let raw = self
+            let raw = match self
                 .session
                 .transport()
                 .list_functions(
@@ -982,10 +984,23 @@ impl Metadata {
                     schema_pattern.as_ref().map(|p| p.as_str()),
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
-                .await?;
-            let stmt_id = close_id(&raw);
-            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_FUNCTIONS_SCHEMA.clone(), Err).await,
+            };
+            let stmt_id = close_id(&raw);
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_FUNCTIONS_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_functions),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await
@@ -994,8 +1009,9 @@ impl Metadata {
     /// Procedures visible to the session. Catalog is exact; schema /
     /// name are patterns.
     ///
-    /// Server shape: same columns as
-    /// [`functions`](Self::functions).
+    /// Server shape: same columns as [`functions`](Self::functions).
+    /// Reshaped kernel-side into the JDBC `getProcedures` column set by
+    /// [`thrift_shape::reshape_procedures`].
     pub async fn procedures(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -1004,7 +1020,7 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
-            let raw = self
+            let raw = match self
                 .session
                 .transport()
                 .list_procedures(
@@ -1013,10 +1029,72 @@ impl Metadata {
                     schema_pattern.as_ref().map(|p| p.as_str()),
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
-                .await?;
-            let stmt_id = close_id(&raw);
-            ResultStream::from_reader_with_close(raw.reader, Arc::clone(&self.session), stmt_id)
                 .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_PROCEDURES_SCHEMA.clone(), Err).await,
+            };
+            let stmt_id = close_id(&raw);
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_PROCEDURES_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_procedures),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
+        }
+        .instrument(span)
+        .await
+    }
+
+    /// Procedure parameter / return columns. Catalog is exact; schema /
+    /// procedure / column are patterns. Mirrors JDBC
+    /// `getProcedureColumns` (procedures only — function arguments are
+    /// excluded by the `routine_type = 'PROCEDURE'` JOIN in the SQL
+    /// builder). Server shape is the raw `information_schema.parameters`
+    /// projection; reshaped kernel-side into the JDBC
+    /// `getProcedureColumns` column set by
+    /// [`thrift_shape::reshape_procedure_columns`].
+    pub async fn procedure_columns(
+        &self,
+        catalog: Option<Identifier<'_>>,
+        schema_pattern: Option<LikePattern<'_>>,
+        procedure_pattern: Option<LikePattern<'_>>,
+        column_pattern: Option<LikePattern<'_>>,
+    ) -> Result<ResultStream> {
+        let span = self.session.log_span().clone();
+        async {
+            let raw = match self
+                .session
+                .transport()
+                .list_procedure_columns(
+                    self.session.session_id(),
+                    catalog.as_ref().map(|i| i.as_str()),
+                    schema_pattern.as_ref().map(|p| p.as_str()),
+                    procedure_pattern.as_ref().map(|p| p.as_str()),
+                    column_pattern.as_ref().map(|p| p.as_str()),
+                )
+                .await
+            {
+                Ok(r) => r,
+                Err(e) => return not_found_or(e, GET_PROCEDURE_COLUMNS_SCHEMA.clone(), Err).await,
+            };
+            let stmt_id = close_id(&raw);
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
+                GET_PROCEDURE_COLUMNS_SCHEMA.clone(),
+                Box::new(thrift_shape::reshape_procedure_columns),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
+            )
+            .await
         }
         .instrument(span)
         .await

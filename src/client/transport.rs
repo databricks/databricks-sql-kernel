@@ -465,6 +465,24 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         function_pattern: Option<&str>,
     ) -> Result<ExecuteResult>;
 
+    /// List procedure parameter / return columns, optionally filtered by
+    /// catalog, schema pattern, procedure name pattern, and column name
+    /// pattern.
+    ///
+    /// Uses `information_schema.parameters` JOINed to
+    /// `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`
+    /// (function arguments excluded, matching JDBC `getProcedureColumns`).
+    /// When catalog is None, queries `system.information_schema`
+    /// (cross-catalog). When catalog is empty string, returns empty result.
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+        column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
     /// List primary-key columns for the given table. Catalog, schema,
     /// and table are required (Databricks `SHOW KEYS` requires full
     /// qualification).
