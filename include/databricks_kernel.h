@@ -283,6 +283,16 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
+/* The C ABI version this library implements. A consumer that loads the
+ * kernel as a shared library (.so/.dylib/.dll) at run time should call this
+ * right after loading and refuse to proceed if the value differs from the
+ * version it was built against — turning an ABI mismatch (a wrong or stale
+ * shared library) into a clear error instead of silent memory corruption.
+ * Bumped on every breaking C ABI change (added/removed/renumbered function,
+ * changed struct layout or signature). Not the crate semver — tracks only
+ * the C ABI shape. Starts at 1. Takes no pointers; always safe to call. */
+uint32_t kernel_abi_version(void);
+
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
  * All optional; defaults are: no explicit proxy (reqwest honours

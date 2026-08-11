@@ -531,6 +531,31 @@ pub unsafe extern "C" fn kernel_init_logging(
     }
 }
 
+/// The C ABI version this shared library implements. A consumer that loads the
+/// kernel as a shared library (`.so`/`.dylib`/`.dll`) at run time should call
+/// this immediately after `dlopen` and refuse to proceed if the value does not
+/// match the version it was built against — turning an ABI mismatch (a wrong or
+/// stale library dropped next to the binary) into a clear, actionable error
+/// instead of silent memory corruption or a crash.
+///
+/// This matters most while the C ABI is pre-1.0: per this crate's own docs the
+/// struct layouts and function set "may change freely" until v1.0, so a
+/// statically-linked consumer is protected by the compiler but a dynamically
+/// linked one needs a runtime check. Bump this on every breaking C ABI change
+/// (added/removed/renumbered function, changed struct layout or signature).
+/// It is intentionally NOT the crate's semver — it tracks only the C ABI shape.
+///
+/// # Safety
+/// None — takes no pointers and reads no shared state.
+#[no_mangle]
+pub extern "C" fn kernel_abi_version() -> u32 {
+    KERNEL_C_ABI_VERSION
+}
+
+/// Current C ABI version. See `kernel_abi_version`. Start at 1; increment on any
+/// breaking change to the C ABI (databricks_kernel.h).
+pub const KERNEL_C_ABI_VERSION: u32 = 1;
+
 /// Add (or overwrite) one server-bound session-conf entry. Unknown keys
 /// are filtered against the kernel allowlist at `open()` time, matching
 /// the Rust-crate path.
