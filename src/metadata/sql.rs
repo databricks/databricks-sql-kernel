@@ -409,10 +409,14 @@ impl SqlCommandBuilder {
         column_pattern: Option<&str>,
     ) -> String {
         let prefix = Self::resolve_catalog_prefix(catalog);
+        // numeric_precision_radix is intentionally NOT selected: RADIX is derived
+        // from the type name in reshape_procedure_columns (information_schema's
+        // radix is inconsistent for integers), so fetching it would be a dead
+        // column.
         let mut sql = format!(
             "SELECT p.specific_catalog, p.specific_schema, p.specific_name, \
              p.parameter_name, p.parameter_mode, p.is_result, p.data_type, \
-             p.numeric_precision, p.numeric_precision_radix, p.numeric_scale, \
+             p.numeric_precision, p.numeric_scale, \
              p.character_octet_length, p.ordinal_position, p.comment \
              FROM {prefix}.information_schema.parameters p \
              JOIN {prefix}.information_schema.routines r \

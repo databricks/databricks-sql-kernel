@@ -264,10 +264,16 @@ pub(crate) static GET_PROCEDURE_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::
         Field::new("PROCEDURE_CAT", DataType::Utf8, true),
         Field::new("PROCEDURE_SCHEM", DataType::Utf8, true),
         Field::new("PROCEDURE_NAME", DataType::Utf8, false),
-        Field::new("COLUMN_NAME", DataType::Utf8, false),
+        // JDBC spec types COLUMN_NAME / TYPE_NAME non-null, but
+        // information_schema.parameters can carry a NULL parameter_name (the
+        // return-value row, is_result='YES', and unnamed/positional params), so
+        // declare them nullable — otherwise a NULL there fails RecordBatch::try_new
+        // (data_loss) and drops the whole result. Matches the defensive nullable
+        // declarations of GET_COLUMNS_SCHEMA / GET_PRIMARY_KEYS_SCHEMA above.
+        Field::new("COLUMN_NAME", DataType::Utf8, true),
         Field::new("COLUMN_TYPE", DataType::Int16, false),
         Field::new("DATA_TYPE", DataType::Int32, false),
-        Field::new("TYPE_NAME", DataType::Utf8, false),
+        Field::new("TYPE_NAME", DataType::Utf8, true),
         Field::new("PRECISION", DataType::Int32, true),
         Field::new("LENGTH", DataType::Int32, true),
         Field::new("SCALE", DataType::Int16, true),
@@ -840,6 +846,12 @@ pub(crate) fn reshape_functions(batch: &RecordBatch) -> Result<RecordBatch> {
     let function_name = utf8_column(batch, "routine_name")?;
     let remarks = utf8_column(batch, "comment")?;
     let specific_name = utf8_column(batch, "specific_name")?;
+    // FUNCTION_TYPE is reported functionNoTable(1) for every row. Databricks
+    // supports table-valued functions, which JDBC would report as
+    // functionReturnsTable(2), but build_get_functions does not select a column
+    // that distinguishes scalar from table functions, so the reshape cannot tell
+    // them apart. Known parity gap; distinguishing TVFs would require selecting
+    // additional information_schema.routines columns in the builder.
     let function_type = Arc::new(Int16Array::from(vec![Some(1_i16); n])) as ArrayRef;
     RecordBatch::try_new(
         GET_FUNCTIONS_SCHEMA.clone(),
@@ -1950,7 +1962,9 @@ mod tests {
             Field::new("ordinal_position", DataType::Utf8, true),
             Field::new("comment", DataType::Utf8, true),
         ]));
-        // Row 0: IN INT param; Row 1: OUT DECIMAL(10,2); Row 2: INOUT; Row 3: return.
+        // Row 0: IN INT param; Row 1: OUT DECIMAL(10,2); Row 2: INOUT; Row 3:
+        // return value (is_result='YES') with a NULL parameter_name — exercises
+        // the nullable COLUMN_NAME path (a non-nullable schema would fail here).
         RecordBatch::try_new(
             schema,
             vec![
@@ -1961,7 +1975,7 @@ mod tests {
                     Some("a"),
                     Some("b"),
                     Some("c"),
-                    Some("r"),
+                    None,
                 ])),
                 Arc::new(StringArray::from(vec![
                     Some("IN"),
@@ -2032,6 +2046,19 @@ mod tests {
         assert_eq!(
             (0..4).map(|i| ct.value(i)).collect::<Vec<_>>(),
             vec![1, 4, 2, 5]
+        );
+
+        // COLUMN_NAME is nullable: the return-value row (row 3) has a NULL
+        // parameter_name and reshaping must produce a null cell, not error.
+        let col_name = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(!col_name.is_null(0));
+        assert!(
+            col_name.is_null(3),
+            "NULL parameter_name must pass through as a null COLUMN_NAME"
         );
 
         // DATA_TYPE from data_type name: INT → java.sql.Types.INTEGER (4).
