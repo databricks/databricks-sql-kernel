@@ -159,27 +159,45 @@ A provider tracks exactly **one active source token** at a time, so the cache is
 
 - Keying on the source token means that when the inner credential rotates (M2M /
   U2M refresh produces a new bearer), the slot is replaced and the new token is
-  exchanged fresh — the same fix ADBC made in PR #46.
+  exchanged fresh.
 - Storing an `OAuthToken` (which carries `is_expired()`) means an expired
   *exchanged* token is also re-exchanged.
 - A single slot (vs. a map) can't leak: rotated / expired entries are overwritten,
   not accumulated. And holding the source token verbatim lets a cache hit compare
   it directly, with no per-request hashing on the hot path.
 
-We do **not** reuse `TokenStore` here: it manages a single credential's lifecycle
-keyed by its own expiry and has no notion of "the upstream source token changed."
+**No lock is ever held across the network call, and concurrent misses coalesce
+single-flight.** A cache hit returns under a brief read lock. On a miss, callers
+elect a leader via a lock-free `AtomicBool` (`compare_exchange`): the winner runs
+the exchange with **no lock held** and publishes the outcome to the slot; the
+losers sleep-poll the slot (1 ms cadence) until the leader clears the flag, then
+read the published result. An RAII guard clears the flag on drop, so a leader that
+panics can't leave followers spinning.
 
-**No lock is held across the network call.** A cache hit returns under a brief read
-lock. On a miss, the exchange runs **lock-free**, and only the store of the result
-takes a brief write lock. This is deliberate: `get_auth_header` is synchronous and
-runs on a tokio worker, so holding a `std::sync::Mutex` across the blocking
-`block_on_in_runtime(exchange)` would park that worker for the whole retry budget
-and, under contention, could starve the runtime — the concern ADBC sidesteps with
-an `async` `SemaphoreSlim`. Since the exchange is idempotent, letting concurrent
-cold-start callers each run one (bounded by how many race the first use, collapsing
-to the last writer) is cheaper than serializing them behind a lock. Each exchange's
-own latency is bounded by the **Auth-category retry budget** (30s / 3 retries — see
-`build_retry_configs_for_session`), not the global ladder.
+This is deliberately modeled on the kernel's own `TokenStore` refresh coordination
+(`AtomicBool` leader election + sleep-poll followers), giving parity with that
+in-repo convention and with the Go driver's `CachedTokenProvider`. Two reasons the
+single-flight matters here specifically:
+
+- `get_auth_header` is synchronous and runs on a tokio worker; holding a
+  `std::sync::Mutex` across `block_on_in_runtime(exchange)` would park that worker
+  for the whole retry budget. Coalescing keeps only **one** caller in the runtime
+  per exchange (the leader), so N concurrent misses don't each enter
+  `block_in_place`.
+- On a rotated / expired token a busy shared session can miss on many threads at
+  once. For **SP-wide WIF** each exchange mints a *distinct* server token, so
+  letting them race would mint N tokens and orphan N−1. Coalescing keeps it to one.
+
+We adapt `TokenStore`'s pattern in two ways it doesn't cover: the follower checks
+the published entry is for **its** source token (if the upstream credential rotated
+mid-wait, it falls back rather than returning another token's result), and the
+leader **always publishes an outcome** — on failure it stores the original token
+(short TTL) so followers read the same non-breaking fallback instead of spinning to
+a timeout. On any exchange failure every caller uses the original token (spec:
+"continue with the existing JWT token instead of throwing"). The leader's latency
+is bounded by the **Auth-category retry budget** (30s / 3 retries — see
+`build_retry_configs_for_session`), not the global ladder; followers additionally
+cap their wait so a wedged leader can't hang them indefinitely.
 
 ---
 
@@ -214,6 +232,7 @@ pub struct FederationProvider {
     http_client: Arc<DatabricksHttpClient>,
     runtime_handle: tokio::runtime::Handle,
     cache: RwLock<Option<CacheEntry>>,  // single slot: (source_token, exchanged)
+    exchanging: AtomicBool,             // single-flight leader election
 }
 
 impl FederationProvider {
@@ -235,14 +254,20 @@ impl FederationProvider {
    cached exchange.
 3. Foreign issuer → under a read lock, if the cache slot holds a non-expired entry
    for this exact source token, return it.
-4. Miss (empty / rotated source / expired) → run
-   `block_on_in_runtime(&self.runtime_handle, self.exchange(source))` **holding no
-   lock**, then take a brief write lock to store the result. (Guarded first: if the
-   captured runtime is current-thread, skip the exchange and fall back — see below.)
-5. **Success** → store `(source, OAuthToken)` (from `expires_in`), return
+4. Miss (empty / rotated source / expired) → (current-thread runtime guard first —
+   see below) then coalesce single-flight on `exchanging`:
+   - **Leader** (won `compare_exchange(false → true)`): re-check the cache, then run
+     `block_on_in_runtime(&self.runtime_handle, self.exchange(source))` **holding no
+     lock**, take a brief write lock to publish the outcome, and drop the RAII guard
+     that clears the flag.
+   - **Follower** (lost the election): sleep-poll (1 ms) until the flag clears, then
+     return the published entry if it is for *this* source token, else fall back to
+     the original token.
+5. **Leader success** → store `(source, OAuthToken)` (from `expires_in`), return
    `Bearer <new token>`.
-   **Failure** → log at `warn!`, store the original token (short TTL) to avoid
-   retry storms, and **return the original `header`** (spec's non-breaking
+   **Leader failure** → log at `warn!`, store the original token (short TTL) so
+   followers and subsequent callers read the same fallback instead of re-hitting a
+   failing endpoint, and **return the original `header`** (spec's non-breaking
    fallback). The error is never surfaced to the caller.
 
 `block_on_in_runtime` uses `block_in_place`, which panics on a **current-thread**
@@ -321,9 +346,8 @@ Each binding stages its own changelog entry (`pyo3/NEXT_CHANGELOG.md`,
 
 New integration test file `tests/token_federation_wiremock.rs`, using `wiremock`
 0.6 with `#[tokio::test(flavor = "multi_thread")]`. Most cases build the HTTP
-client with `max_retries = 0` to avoid real backoff sleeps; the concurrency case
-deliberately enables a small bounded retry budget to exercise the no-lock-across-
-network behaviour.
+client with `max_retries = 0` to avoid real backoff sleeps; the degraded-endpoint
+concurrency case enables a small bounded retry budget.
 
 | Case | Setup | Assertion |
 | --- | --- | --- |
@@ -336,7 +360,8 @@ network behaviour.
 | Exchange 500 → fallback | mock → 500 | no error; original token used |
 | Cached across calls | same source token | exactly one exchange, then cache hits |
 | Representative Databricks issuer | realistic `adb-….azuredatabricks.net/oidc` issuer vs. matching workspace host (not the mock URI) | `.expect(0)`; pass-through (non-circular same-host check) |
-| Degraded endpoint doesn't serialize | always-503 endpoint, retries enabled, 8 concurrent callers | all fall back to original; total wall-time bounded (parallel, not N× a single exchange) — guards the H1 lock fix |
+| Concurrent cold callers coalesce | 10 concurrent callers miss simultaneously; success endpoint | mock `.expect(1)` — exactly one exchange; all callers get the shared token (single-flight parity check) |
+| Degraded endpoint fallback | always-503 endpoint, retries enabled, 8 concurrent callers | all fall back to original token, no error; leader-bounded wait |
 
 Unit tests inline in `jwt.rs` (iss extraction, missing iss, malformed/2-part
 input, base64url padding) and `federation.rs` (host comparison, param selection).
@@ -352,11 +377,11 @@ that the field is present on the `ConnectionOptions` boundary struct.
 
 - **vs ADBC:** identical wire contract and blocking + cached model. Kernel-specific
   differences are the sync-trait-over-async bridge (`block_on_in_runtime`) instead
-  of an HTTP `DelegatingHandler`, expiry-aware cache entries, and a single cache
-  slot with no lock held across the network call (ADBC serializes cold-start
-  exchanges behind an `async` `SemaphoreSlim`; the kernel instead lets idempotent
-  concurrent exchanges race and keeps the last, to avoid parking tokio workers on a
-  sync mutex).
+  of an HTTP `DelegatingHandler`; a single expiry-aware cache slot rather than
+  ADBC's insert-only `ConcurrentDictionary` (which never evicts); and single-flight
+  coalescing (`AtomicBool` leader election + sleep-poll followers, mirroring the
+  kernel's own `TokenStore` and Go's `CachedTokenProvider`) with no lock held across
+  the network — where ADBC uses an `async SemaphoreSlim` held across the call.
 - **vs JDBC:** deliberately does *not* copy JDBC's off-spec
   `token-exchange` / `subject_token` / `client_id` parameters; follows the spec's
   `jwt-bearer` / `assertion` / `identity_federation_client_id`.
