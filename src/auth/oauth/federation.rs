@@ -61,7 +61,9 @@ use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::util::runtime::block_on_in_runtime;
 use serde::Deserialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 
 const TOKEN_EXCHANGE_PATH: &str = "/oidc/v1/token";
@@ -114,7 +116,18 @@ pub struct FederationProvider {
     /// re-exchanged. Holding the source token lets a cache-hit compare directly
     /// without hashing on the hot path.
     cache: RwLock<Option<CacheEntry>>,
+    /// Single-flight leader-election flag. When a cache miss needs an exchange,
+    /// exactly one caller flips this `false → true` and performs the network
+    /// call; the others poll [`Self::cache`] until it clears (see
+    /// `exchanged_or_original`). Mirrors the kernel's `TokenStore` refresh
+    /// coordination so concurrent callers on a rotated / expired token don't
+    /// each mint a distinct server token (which SP-wide WIF would otherwise do).
+    exchanging: AtomicBool,
 }
+
+/// How long a follower sleeps between polls while the leader runs the exchange.
+/// Matches `TokenStore`'s 1ms refresh-wait cadence.
+const FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(1);
 
 /// A cached exchange outcome: the source token it was derived from, and the
 /// resulting in-house token.
@@ -147,6 +160,7 @@ impl FederationProvider {
             http_client,
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
+            exchanging: AtomicBool::new(false),
         })
     }
 
@@ -213,28 +227,25 @@ impl FederationProvider {
     /// Resolves the token to use: the cached/exchanged in-house token on
     /// success, or `source_token` unchanged on any failure.
     ///
-    /// No lock is held across the network call. A cache hit for the current
-    /// source token returns under a short read lock; a miss performs the
-    /// exchange lock-free (so a degraded `/oidc/v1/token` can never block other
-    /// callers or park the tokio worker pool), then takes a brief write lock
-    /// only to store the result. Concurrent first-use callers may each run an
-    /// exchange — those calls are idempotent and the redundancy is bounded by
-    /// how many threads race the cold start; the single cache slot collapses to
-    /// the last writer. The Auth-category retry budget (see
-    /// `build_retry_configs_for_session`: 30s / 3 retries, not the global
-    /// ladder) bounds each exchange's own latency.
+    /// **No lock is ever held across the network call.** A cache hit returns
+    /// under a short read lock. On a miss, callers coalesce single-flight
+    /// (mirroring the kernel's `TokenStore`): exactly one *leader* wins a
+    /// lock-free `AtomicBool` election and runs the exchange, publishing the
+    /// outcome to the cache slot; *followers* sleep-poll the slot until the
+    /// leader clears the flag, then read the published result. This matters
+    /// because on a rotated / expired token a busy session can miss on many
+    /// threads at once, and for SP-wide WIF each redundant exchange would mint a
+    /// *distinct* server token — coalescing keeps it to one. The Auth-category
+    /// retry budget (see `build_retry_configs_for_session`: 30s / 3 retries, not
+    /// the global ladder) bounds the leader's latency.
     fn exchanged_or_original(&self, source_token: &str) -> String {
         // Fast path: a fresh cached exchange for this exact source token.
-        if let Ok(cache) = self.cache.read() {
-            if let Some(entry) = cache.as_ref() {
-                if entry.source_token == source_token && !entry.exchanged.is_expired() {
-                    return entry.exchanged.access_token.clone();
-                }
-            }
+        if let Some(hit) = self.cached_for(source_token) {
+            return hit;
         }
 
-        // The exchange bridges sync→async via `block_on_in_runtime`, which
-        // uses `block_in_place` when a runtime is current — that panics on a
+        // The exchange bridges sync→async via `block_on_in_runtime`, which uses
+        // `block_in_place` when a runtime is current — that panics on a
         // *current-thread* runtime. Every shipped consumer (pyo3, napi, the C
         // ABI) drives the kernel on a multi-thread runtime, but a caller on a
         // current-thread runtime would otherwise crash here. Detect that case
@@ -251,8 +262,36 @@ impl FederationProvider {
             return source_token.to_string();
         }
 
-        // Miss (empty, rotated source, or expired): exchange WITHOUT holding
-        // any lock, then store the outcome.
+        // Single-flight election. Winner performs the exchange; losers wait.
+        if self
+            .exchanging
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            // Leader. RAII guard clears the flag even if the exchange panics,
+            // so followers can never spin forever.
+            let _guard = ExchangeGuard {
+                exchanging: &self.exchanging,
+            };
+            self.lead_exchange(source_token)
+        } else {
+            // Follower: wait for the leader to publish, then read the result.
+            self.follow_exchange(source_token)
+        }
+    }
+
+    /// Leader path: run the exchange (no lock held) and publish the outcome.
+    /// On failure, publish the original token so followers read the same
+    /// non-breaking fallback (spec: continue with the existing token rather
+    /// than throwing).
+    fn lead_exchange(&self, source_token: &str) -> String {
+        // Re-check under the flag: a leader that just cleared the flag may have
+        // published a result for this exact source token between our miss and
+        // our election win.
+        if let Some(hit) = self.cached_for(source_token) {
+            return hit;
+        }
+
         match block_on_in_runtime(&self.runtime_handle, self.exchange(source_token)) {
             Ok(token) => {
                 let access_token = token.access_token.clone();
@@ -261,26 +300,66 @@ impl FederationProvider {
                 access_token
             }
             Err(e) => {
-                // Non-breaking fallback: use the original token. Cache the
-                // original (short-lived) so a burst of requests with the same
-                // source doesn't hammer the endpoint after a failure.
                 warn!(
                     "Token federation: exchange failed, falling back to original token: {}",
                     e
                 );
-                self.store(
-                    source_token,
-                    OAuthToken::new(
-                        source_token.to_string(),
-                        "Bearer".to_string(),
-                        60,
-                        None,
-                        vec![],
-                    ),
-                );
+                // Publish the original (short-lived) so a burst with the same
+                // source doesn't hammer the endpoint, and so followers read the
+                // same fallback rather than spinning to their timeout.
+                self.store(source_token, Self::fallback_token(source_token));
                 source_token.to_string()
             }
         }
+    }
+
+    /// Follower path: poll until the leader clears the flag, then return the
+    /// published result for our source token. If the slot ends up holding a
+    /// *different* source token (the upstream credential rotated while we
+    /// waited) or nothing usable, fall back to the original token rather than
+    /// returning someone else's — correctness over a marginal extra exchange.
+    fn follow_exchange(&self, source_token: &str) -> String {
+        // Bound the wait so a wedged leader can't hang a follower indefinitely;
+        // the leader's own latency is capped by the Auth retry budget (~30s),
+        // so a comfortably larger ceiling only trips on a genuine stall.
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        while self.exchanging.load(Ordering::SeqCst) {
+            if std::time::Instant::now() >= deadline {
+                warn!(
+                    "Token federation: timed out waiting for in-flight exchange; \
+                     using original token"
+                );
+                return source_token.to_string();
+            }
+            std::thread::sleep(FOLLOWER_POLL_INTERVAL);
+        }
+        // Leader has finished. Use its published result if it is for our source
+        // token; otherwise fall back (don't start a fresh exchange from a
+        // follower — keeps this path simple and still non-breaking).
+        self.cached_for(source_token)
+            .unwrap_or_else(|| source_token.to_string())
+    }
+
+    /// Returns the cached access token if the slot holds a non-expired entry
+    /// for `source_token`, else `None`. A brief read lock, no network.
+    fn cached_for(&self, source_token: &str) -> Option<String> {
+        let cache = self.cache.read().ok()?;
+        let entry = cache.as_ref()?;
+        (entry.source_token == source_token && !entry.exchanged.is_expired())
+            .then(|| entry.exchanged.access_token.clone())
+    }
+
+    /// The short-lived fallback entry: the original token wrapped so followers
+    /// and subsequent callers reuse it briefly instead of re-hitting a failing
+    /// endpoint on every request.
+    fn fallback_token(source_token: &str) -> OAuthToken {
+        OAuthToken::new(
+            source_token.to_string(),
+            "Bearer".to_string(),
+            60,
+            None,
+            vec![],
+        )
     }
 
     /// Replace the single cache slot with the outcome for `source_token`.
@@ -292,6 +371,19 @@ impl FederationProvider {
                 exchanged,
             });
         }
+    }
+}
+
+/// RAII guard that clears the single-flight flag on drop, so a leader that
+/// panics or early-returns can't leave followers polling forever. Mirrors
+/// `TokenStore`'s `RefreshGuard`.
+struct ExchangeGuard<'a> {
+    exchanging: &'a AtomicBool,
+}
+
+impl Drop for ExchangeGuard<'_> {
+    fn drop(&mut self) {
+        self.exchanging.store(false, Ordering::SeqCst);
     }
 }
 
@@ -397,6 +489,7 @@ mod tests {
             http_client,
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
+            exchanging: AtomicBool::new(false),
         }
     }
 

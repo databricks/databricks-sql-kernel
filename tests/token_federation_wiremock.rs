@@ -343,15 +343,69 @@ async fn representative_databricks_issuer_passes_through() {
     );
 }
 
+/// Spawn `n` concurrent `get_auth_header` callers on separate OS threads, each
+/// entering the runtime context (get_auth_header is sync and blocks its thread).
+/// Returns each caller's result.
+fn concurrent_auth_headers(
+    provider: Arc<FederationProvider>,
+    n: usize,
+) -> Vec<databricks_sql_kernel::Result<String>> {
+    let handle = tokio::runtime::Handle::current();
+    let threads: Vec<_> = (0..n)
+        .map(|_| {
+            let p = provider.clone();
+            let h = handle.clone();
+            std::thread::spawn(move || {
+                let _guard = h.enter();
+                p.get_auth_header()
+            })
+        })
+        .collect();
+    threads.into_iter().map(|t| t.join().unwrap()).collect()
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn degraded_endpoint_does_not_serialize_concurrent_callers() {
-    // With retries ENABLED and the exchange endpoint always failing, each
-    // exchange spends ~real backoff time (2 retries × 200ms ≈ 0.4s+). Fire
-    // many concurrent callers: because the resolver holds no lock across the
-    // network call, they run their exchanges in parallel and every call still
-    // returns (falling back to the original token). Total wall-time must stay
-    // close to a single exchange's budget, NOT N × it — which is what a lock
-    // held across the retry ladder would produce.
+async fn concurrent_cold_callers_coalesce_to_one_exchange() {
+    // The real single-flight parity check (mirrors the M2M provider's
+    // `test_m2m_concurrent_token_fetch` and Go's federation concurrency test):
+    // N callers miss the cache simultaneously, but exactly ONE exchange hits
+    // the endpoint — the rest wait for the leader and read its published token.
+    // `.expect(1)` is what fails a regression that let every caller race; a
+    // wall-time bound would pass even if all N stampeded.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/oidc/v1/token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(exchange_response("shared-token")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let provider = Arc::new(
+        FederationProvider::new(
+            inner_bearing(&jwt_with_issuer("https://external-idp.example.com")),
+            &server.uri(),
+            None,
+            no_retry_http_client(),
+        )
+        .await
+        .expect("provider"),
+    );
+
+    let results = concurrent_auth_headers(provider, 10);
+
+    // Every caller gets the single exchanged token.
+    for r in &results {
+        assert_eq!(r.as_deref().unwrap(), "Bearer shared-token");
+    }
+    // The `.expect(1)` on the mock verifies only one exchange occurred.
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn degraded_endpoint_falls_back_for_all_concurrent_callers() {
+    // With retries ENABLED and the endpoint always failing, the single-flight
+    // leader exhausts its bounded retry budget and publishes the original-token
+    // fallback; followers read it. Every concurrent caller still returns the
+    // original token (non-breaking), and no caller surfaces an error.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/oidc/v1/token"))
@@ -371,36 +425,20 @@ async fn degraded_endpoint_does_not_serialize_concurrent_callers() {
         .expect("provider"),
     );
 
-    // Spawn concurrent callers on separate OS threads (get_auth_header is sync
-    // and blocks the thread), each entering the runtime context.
-    const N: usize = 8;
-    let handle = tokio::runtime::Handle::current();
     let start = Instant::now();
-    let mut threads = Vec::with_capacity(N);
-    for _ in 0..N {
-        let p = provider.clone();
-        let h = handle.clone();
-        threads.push(std::thread::spawn(move || {
-            let _guard = h.enter();
-            p.get_auth_header()
-        }));
-    }
-    let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+    let results = concurrent_auth_headers(provider, 8);
     let elapsed = start.elapsed();
 
-    // All calls succeed via the non-breaking fallback (original token).
     for r in &results {
         assert_eq!(r.as_deref().unwrap(), format!("Bearer {inner_token}"));
     }
-
-    // A single exchange's budget is ~0.4s (2 × 200ms) plus overhead. If callers
-    // serialized behind a shared lock across the retry ladder, 8 of them would
-    // take 8× that (~3.2s+). Assert well under that serialized floor — generous
-    // enough to avoid CI flakiness while still failing a serialized regression.
+    // Coalesced: only the leader spends the retry budget (~0.4s); followers
+    // sleep-poll and return as soon as it publishes. A generous bound catches a
+    // regression where every caller ran the full failing ladder in parallel and
+    // still guards against accidental serialization.
     assert!(
         elapsed < Duration::from_secs(2),
-        "concurrent exchanges took {elapsed:?}; expected them to run in parallel \
-         (a lock held across the retry ladder would serialize to ~N× a single \
-         exchange)"
+        "concurrent degraded-endpoint calls took {elapsed:?}; expected the leader \
+         to bound the wait and followers to read its fallback"
     );
 }
