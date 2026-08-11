@@ -73,6 +73,14 @@ impl Session {
     /// OAuth is kernel-owned: the kernel acquires and transparently
     /// refreshes tokens itself.
     ///
+    /// `identity_federation_client_id` is optional and enables SP-wide
+    /// Workload Identity Federation for mandatory OIDC token exchange:
+    /// when the authenticated token is issued by a party other than the
+    /// target workspace, the kernel exchanges it for an in-house
+    /// Databricks token, sending this client id. Omit it for BYOT /
+    /// account-wide WIF. It is not a feature toggle — the exchange is
+    /// always attempted, gated only by the token's issuer.
+    ///
     /// TLS: all knobs are optional relaxations / additions on top of
     /// the secure default (validate system trust store, verify chain
     /// + hostname). `tls_ca_cert` adds a PEM CA bundle (bytes);
@@ -118,6 +126,7 @@ impl Session {
         token_url=None,
         redirect_port=None,
         oauth_callback_timeout_secs=None,
+        identity_federation_client_id=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
         tls_skip_hostname_verify=false,
@@ -147,6 +156,7 @@ impl Session {
         token_url: Option<String>,
         redirect_port: Option<u16>,
         oauth_callback_timeout_secs: Option<u64>,
+        identity_federation_client_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
         tls_skip_hostname_verify: bool,
@@ -288,6 +298,9 @@ impl Session {
             let mut builder = KSession::builder()
                 .http_path(host, http_path)
                 .auth(auth_config);
+            if let Some(client_id) = identity_federation_client_id {
+                builder = builder.identity_federation_client_id(client_id);
+            }
             if let Some(tls) = tls_config {
                 builder = builder.tls(tls);
             }

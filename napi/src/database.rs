@@ -178,6 +178,15 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["all-apis", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
+    /// SP-wide Workload Identity Federation client id for mandatory OIDC
+    /// token exchange. Optional. When the authenticated token is issued by
+    /// a party other than the target workspace, the kernel exchanges it for
+    /// an in-house Databricks token; setting this sends
+    /// `identity_federation_client_id` (SP-wide WIF). Omitted ⇒ BYOT /
+    /// account-wide WIF. Not a feature toggle — the exchange is always
+    /// attempted, gated only by the token's issuer. Maps onto the kernel
+    /// [`SessionBuilder::identity_federation_client_id`].
+    pub identity_federation_client_id: Option<String>,
     /// Default catalog for statements executed on this session.
     /// Routed through the kernel's `DefaultOpts` and onto the SEA
     /// `CreateSession.catalog` wire field.
@@ -544,6 +553,11 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         let mut builder = Session::builder()
             .http_path(options.host_name, options.http_path)
             .auth(auth_config);
+        // SP-wide WIF client id for mandatory token exchange. Unset ⇒
+        // BYOT / account-wide WIF (the builder default).
+        if let Some(client_id) = options.identity_federation_client_id {
+            builder = builder.identity_federation_client_id(client_id);
+        }
         // Only wire `DefaultOpts` when at least one of catalog / schema
         // was provided; otherwise leave the config's `defaults` field
         // `None` so the kernel can distinguish "no defaults" from
@@ -616,6 +630,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
+            identity_federation_client_id: None,
             catalog: None,
             schema: None,
             session_conf: None,
@@ -751,6 +766,23 @@ mod tests {
         o.auth_mode = Some(AuthMode::OAuthU2m);
         o.oauth_client_id = Some(String::new());
         assert_invalid_arg(build_auth_config(&o).unwrap_err(), "oauthClientId");
+    }
+
+    #[test]
+    fn identity_federation_client_id_is_on_the_options_boundary() {
+        // The SP-wide WIF selector must be reachable on the JS boundary
+        // struct (a regression that dropped the field would fail to compile
+        // this). Defaults to absent (BYOT / account-wide WIF); accepts a
+        // value. It is forwarded to the builder in `open_session`, which
+        // needs a live connection, so this asserts the boundary surface
+        // rather than the network path.
+        let mut o = base();
+        assert!(o.identity_federation_client_id.is_none());
+        o.identity_federation_client_id = Some("sp-client-abc".to_owned());
+        assert_eq!(
+            o.identity_federation_client_id.as_deref(),
+            Some("sp-client-abc")
+        );
     }
 
     #[test]

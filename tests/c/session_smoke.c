@@ -205,6 +205,21 @@ static void test_u2m_and_header_setters(void) {
   kernel_session_config_free(config);
 }
 
+/* SP-wide WIF setter: a valid client id succeeds; NULL → InvalidArgument. */
+static void test_identity_federation_client_id_setter(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  KernelStatusCode rc =
+      kernel_session_config_set_identity_federation_client_id(config, "sp-client-abc");
+  CHECK(rc == KernelStatusCode_Success, "set_identity_federation_client_id succeeds");
+  rc = kernel_session_config_set_identity_federation_client_id(config, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_identity_federation_client_id(NULL) → InvalidArgument");
+
+  kernel_session_config_free(config);
+}
+
 /* Client-conf setter accepts known keys, clamps, and rejects bad input. */
 static void test_client_conf_setter(void) {
   KernelSessionConfig* config = NULL;
@@ -300,6 +315,7 @@ int main(void) {
   test_setter_null_arg_rejected();
   test_proxy_and_tls_setters();
   test_u2m_and_header_setters();
+  test_identity_federation_client_id_setter();
   test_client_conf_setter();
   test_init_logging();
   test_is_open_null_guards();

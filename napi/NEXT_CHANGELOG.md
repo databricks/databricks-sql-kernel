@@ -14,6 +14,13 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions`: new optional `identityFederationClientId` field — selects
+  SP-wide Workload Identity Federation for mandatory OIDC token exchange. When the
+  authenticated token is issued by a party other than the target workspace, the
+  kernel exchanges it for an in-house Databricks token, sending this client id.
+  Omit for BYOT / account-wide WIF. Not a feature toggle — the exchange is always
+  attempted, gated only by the token's issuer.
+
 ### Updated
 
 ### Fixed

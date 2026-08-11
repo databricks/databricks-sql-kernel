@@ -13,6 +13,13 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(...)`: new optional `identity_federation_client_id` keyword — selects
+  SP-wide Workload Identity Federation for mandatory OIDC token exchange. When
+  the authenticated token is issued by a party other than the target workspace,
+  the kernel exchanges it for an in-house Databricks token; this value is sent as
+  `identity_federation_client_id`. Omit for BYOT / account-wide WIF. Not a feature
+  toggle — the exchange is always attempted, gated only by the token's issuer.
+
 ### Updated
 
 ### Fixed

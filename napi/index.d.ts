@@ -206,6 +206,16 @@ export interface ConnectionOptions {
    */
   oauthScopes?: Array<string>
   /**
+   * SP-wide Workload Identity Federation client id for mandatory OIDC
+   * token exchange. Optional. When the authenticated token is issued by
+   * a party other than the target workspace, the kernel exchanges it for
+   * an in-house Databricks token; setting this sends
+   * `identity_federation_client_id` (SP-wide WIF). Omitted ⇒ BYOT /
+   * account-wide WIF. Not a feature toggle — the exchange is always
+   * attempted, gated only by the token's issuer.
+   */
+  identityFederationClientId?: string
+  /**
    * Default catalog for statements executed on this session.
    * Routed through the kernel's `DefaultOpts` and onto the SEA
    * `CreateSession.catalog` wire field.

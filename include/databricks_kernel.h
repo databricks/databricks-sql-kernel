@@ -346,6 +346,18 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConfig* config,
                                                                bool ignore);
 
+/* SP-wide Workload Identity Federation client id for mandatory OIDC token
+ * exchange. Optional. When the authenticated token is issued by a party other
+ * than the target workspace, the kernel exchanges it for an in-house
+ * Databricks token; setting this makes that exchange send
+ * `identity_federation_client_id` (SP-wide WIF). Unset takes the BYOT /
+ * account-wide WIF path (`return_original_token_if_authenticated=true`). Not a
+ * feature toggle — the exchange is always attempted, gated only by the token's
+ * issuer. `client_id` must be non-NULL. Shared by all drivers (ODBC / Go). */
+KernelStatusCode
+kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* config,
+                                                        const char* client_id);
+
 /* Configure the on-disk OAuth token cache for U2M (browser) auth. Mirrors
  * the EnableTokenCache / TokenCachePassPhrase pair exposed by the reference
  * ODBC driver and JDBC.

@@ -112,6 +112,12 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
+    /// SP-wide Workload Identity Federation client id for mandatory OIDC token
+    /// exchange (populated by
+    /// `kernel_session_config_set_identity_federation_client_id`). `None` ⇒
+    /// BYOT / account-wide WIF. Maps to
+    /// [`SessionConfig::identity_federation_client_id`].
+    identity_federation_client_id: Option<String>,
     /// On-disk U2M token-cache policy (populated by
     /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
@@ -203,6 +209,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
+        // No SP-wide WIF client id by default (BYOT / account-wide WIF).
+        identity_federation_client_id: None,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
@@ -669,6 +677,31 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
     })
 }
 
+/// Set the SP-wide Workload Identity Federation client id for mandatory OIDC
+/// token exchange.
+///
+/// Optional. When the authenticated token is issued by a party other than the
+/// target workspace, the kernel exchanges it for an in-house Databricks token;
+/// setting this makes that exchange send `identity_federation_client_id` (the
+/// SP-wide WIF scenario). Leaving it unset takes the BYOT / account-wide WIF
+/// path (`return_original_token_if_authenticated=true`). It is not a feature
+/// toggle — the exchange is always attempted, gated only by the token's issuer.
+/// Maps to [`SessionConfig::identity_federation_client_id`].
+///
+/// # Safety
+/// `config` must be a live config handle; `client_id` must be a NUL-terminated
+/// C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_identity_federation_client_id(
+    config: *mut KernelSessionConfig,
+    client_id: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.identity_federation_client_id = Some(required_str(client_id, "client_id")?);
+        Ok(())
+    })
+}
+
 /// Configure the on-disk OAuth token cache for U2M (browser) auth.
 ///
 /// Mirrors the `EnableTokenCache` / `TokenCachePassPhrase` pair exposed by
@@ -900,6 +933,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         ignore_transactions,
         token_cache,
         result,
+        identity_federation_client_id,
     } = config;
 
     block_on_ffi(move || {
@@ -954,6 +988,12 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     ignore_transactions,
                     ..Default::default()
                 });
+
+            // SP-wide WIF client id for mandatory token exchange. Unset ⇒
+            // BYOT / account-wide WIF (the builder default).
+            if let Some(client_id) = identity_federation_client_id {
+                builder = builder.identity_federation_client_id(client_id);
+            }
 
             // Skip `.http()` when neither headers nor a retry spec was set, so
             // the kernel's full `HttpConfig::default()` applies untouched.
@@ -1470,6 +1510,43 @@ mod tests {
                 "the requested attempts are recorded as-is"
             );
             assert_eq!(r.overall_timeout, Some(Duration::from_millis(5_000)));
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The SP-wide WIF setter records the client id on the config, and a NULL
+    /// pointer is rejected with `InvalidArgument` (matching the other required
+    /// C-string setters). Unset stays `None` (BYOT / account-wide WIF).
+    #[test]
+    fn set_identity_federation_client_id_records_and_rejects_null() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            // Default: unset.
+            assert_eq!(config.as_ref().unwrap().identity_federation_client_id, None);
+            // NULL client_id → InvalidArgument, leaves the field unset.
+            assert_eq!(
+                kernel_session_config_set_identity_federation_client_id(config, std::ptr::null()),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(config.as_ref().unwrap().identity_federation_client_id, None);
+            // A valid client id is recorded verbatim.
+            let client_id = CString::new("sp-client-abc").unwrap();
+            assert_eq!(
+                kernel_session_config_set_identity_federation_client_id(config, client_id.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config
+                    .as_ref()
+                    .unwrap()
+                    .identity_federation_client_id
+                    .as_deref(),
+                Some("sp-client-abc")
+            );
             kernel_session_config_free(config);
         }
     }

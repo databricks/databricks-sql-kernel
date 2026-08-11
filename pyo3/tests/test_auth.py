@@ -59,3 +59,28 @@ def test_unknown_auth_type_raises_value_error():
             auth_type="something-else",
             access_token="x",
         )
+
+
+def test_identity_federation_client_id_is_accepted_kwarg():
+    # The SP-wide WIF selector is a recognized keyword (not a TypeError):
+    # paired with missing auth it reaches the pre-network auth rejection,
+    # which proves the signature accepts it without opening a connection.
+    with pytest.raises(ValueError, match="access_token"):
+        k.Session(
+            host="x.databricks.com",
+            http_path="/sql/1.0/warehouses/abc",
+            identity_federation_client_id="sp-client-abc",
+        )
+
+
+def test_unknown_kwarg_raises_type_error():
+    # Guards the test above: a genuinely unknown kwarg is a TypeError, so
+    # the ValueError in the test above really does mean the kwarg was
+    # accepted by the signature.
+    with pytest.raises(TypeError):
+        k.Session(
+            host="x.databricks.com",
+            http_path="/sql/1.0/warehouses/abc",
+            access_token="x",
+            not_a_real_kwarg="nope",
+        )
