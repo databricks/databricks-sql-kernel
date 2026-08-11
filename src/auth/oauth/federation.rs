@@ -53,7 +53,7 @@
 //! ```
 
 use crate::auth::oauth::jwt;
-use crate::auth::oauth::token::OAuthToken;
+use crate::auth::oauth::token::{OAuthToken, EXPIRY_BUFFER_SECONDS};
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
 use crate::client::retry::RequestType;
@@ -127,6 +127,9 @@ pub struct FederationProvider {
 /// How long a follower sleeps between polls while the leader runs the exchange.
 /// Matches `TokenStore`'s 1ms refresh-wait cadence.
 const FOLLOWER_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+/// Delay before retrying a failed exchange for the same source token.
+const FAILED_EXCHANGE_RETRY_DELAY_SECONDS: i64 = 60;
 
 /// A cached exchange outcome: the source token it was derived from, and the
 /// resulting in-house token.
@@ -355,14 +358,13 @@ impl FederationProvider {
             .then(|| entry.exchanged.access_token.clone())
     }
 
-    /// The short-lived fallback entry: the original token wrapped so followers
-    /// and subsequent callers reuse it briefly instead of re-hitting a failing
-    /// endpoint on every request.
+    /// Cache the original token until the next failed-exchange retry. Add the
+    /// OAuth expiry buffer so it does not shorten the configured retry delay.
     fn fallback_token(source_token: &str) -> OAuthToken {
         OAuthToken::new(
             source_token.to_string(),
             "Bearer".to_string(),
-            60,
+            FAILED_EXCHANGE_RETRY_DELAY_SECONDS + EXPIRY_BUFFER_SECONDS,
             None,
             vec![],
         )
@@ -483,6 +485,19 @@ mod tests {
             host_of("https://ADB-123.Azuredatabricks.NET/oidc").as_deref(),
             Some("adb-123.azuredatabricks.net")
         );
+    }
+
+    #[test]
+    fn fallback_cache_retries_after_configured_delay() {
+        let before = chrono::Utc::now();
+        let fallback = FederationProvider::fallback_token("source-token");
+        let after = chrono::Utc::now();
+        let retry_at = fallback.expires_at - chrono::Duration::seconds(EXPIRY_BUFFER_SECONDS);
+
+        assert!(
+            retry_at >= before + chrono::Duration::seconds(FAILED_EXCHANGE_RETRY_DELAY_SECONDS)
+        );
+        assert!(retry_at <= after + chrono::Duration::seconds(FAILED_EXCHANGE_RETRY_DELAY_SECONDS));
     }
 
     /// A provider stub whose `get_auth_header` returns a canned value.
