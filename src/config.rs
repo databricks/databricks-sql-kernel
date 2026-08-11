@@ -1144,6 +1144,18 @@ pub struct SessionConfig {
     /// Required: how to authenticate.
     pub auth: AuthConfig,
 
+    /// SP-wide Workload Identity Federation client id, for mandatory OIDC
+    /// token exchange (BYOT federation). When the authenticated token was
+    /// issued by a party other than this workspace, the kernel exchanges it
+    /// for an in-house Databricks token at `<host>/oidc/v1/token`; this value,
+    /// when set, is sent as `identity_federation_client_id` (SP-wide WIF).
+    /// `None` → BYOT / account-wide WIF, where
+    /// `return_original_token_if_authenticated=true` is sent instead. The
+    /// exchange itself is always attempted (gated only by the token's issuer),
+    /// and falls back to the original token on failure, so this field is not a
+    /// feature toggle. See `auth::oauth::federation`.
+    pub identity_federation_client_id: Option<String>,
+
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate
     /// the *client-side* knobs; this map carries everything else.
