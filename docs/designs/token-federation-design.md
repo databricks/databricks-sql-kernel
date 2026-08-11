@@ -284,10 +284,11 @@ rather than panicking.
   `return_original_token_if_authenticated=true`.
 - Run through `http_client.execute_without_auth(req, RequestType::AuthTokenRequest)`
   — **without auth** because the request carries its own `assertion`, not the
-  kernel bearer (the same pattern OIDC discovery uses). Using
-  `RequestType::AuthTokenRequest` gives it the Auth-category retry ladder:
-  exponential backoff on 408/502/503/504 and timeouts — exactly the spec's retry
-  requirement.
+  kernel bearer (the same pattern OIDC discovery uses). `AuthTokenRequest` is
+  classified *idempotent*, so the Auth-category ladder retries with exponential
+  backoff on all 5xx / 429 / 408 and on timeouts — everything except the fixed
+  non-retryable 4xx set (`400,401,403,404,405,409,410,411,412,413,414,415,416`).
+  This covers the spec's retry requirement.
 - Parse `{access_token, token_type, expires_in}` → `OAuthToken::new(...)`.
 
 ### `src/auth/oauth/mod.rs`, `src/auth/mod.rs`
