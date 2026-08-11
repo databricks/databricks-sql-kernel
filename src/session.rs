@@ -46,7 +46,8 @@
 //! requires catalog-managed tables server-side).
 
 use crate::auth::{
-    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, PersonalAccessToken,
+    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
+    PersonalAccessToken,
 };
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
@@ -304,8 +305,13 @@ impl Session {
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
-        let auth_provider: Arc<dyn AuthProvider> =
-            build_auth_provider(&config.auth, &host, http_client.clone()).await?;
+        let auth_provider: Arc<dyn AuthProvider> = build_auth_provider(
+            &config.auth,
+            &host,
+            config.identity_federation_client_id.clone(),
+            http_client.clone(),
+        )
+        .await?;
         http_client.set_auth_provider(auth_provider);
 
         // 3. Transport. Two-phase: SeaRestTransport needs an
@@ -653,6 +659,7 @@ impl Session {
 pub struct SessionBuilder {
     connection: Option<ConnectionConfig>,
     auth: Option<AuthConfig>,
+    identity_federation_client_id: Option<String>,
     defaults: Option<DefaultOpts>,
     http: Option<HttpConfig>,
     proxy: Option<ProxyConfig>,
@@ -711,6 +718,14 @@ impl SessionBuilder {
     /// Required: how to authenticate.
     pub fn auth(mut self, auth: AuthConfig) -> Self {
         self.auth = Some(auth);
+        self
+    }
+
+    /// SP-wide Workload Identity Federation client id for mandatory OIDC
+    /// token exchange (BYOT federation). Optional: leave unset for BYOT /
+    /// account-wide WIF. See [`SessionConfig::identity_federation_client_id`].
+    pub fn identity_federation_client_id(mut self, client_id: impl Into<String>) -> Self {
+        self.identity_federation_client_id = Some(client_id.into());
         self
     }
 
@@ -827,6 +842,7 @@ impl SessionBuilder {
             connection,
             defaults: self.defaults,
             auth,
+            identity_federation_client_id: self.identity_federation_client_id,
             session_conf: self.session_conf,
             http: self.http.unwrap_or_default(),
             proxy: self.proxy,
@@ -1062,6 +1078,24 @@ fn result_to_post_process_options(
 async fn build_auth_provider(
     auth: &AuthConfig,
     host: &str,
+    identity_federation_client_id: Option<String>,
+    http_client: Arc<DatabricksHttpClient>,
+) -> Result<Arc<dyn AuthProvider>> {
+    // Build the base provider for the configured auth flow, then wrap it with
+    // mandatory OIDC token exchange (BYOT federation). The wrapper is a no-op
+    // for non-JWT and same-host-issuer tokens, so it is safe to apply
+    // unconditionally across PAT / M2M / U2M. See `auth::oauth::federation`.
+    let base = build_base_auth_provider(auth, host, http_client.clone()).await?;
+    let provider =
+        FederationProvider::new(base, host, identity_federation_client_id, http_client).await?;
+    Ok(Arc::new(provider))
+}
+
+/// Constructs the underlying credential provider for the configured auth flow,
+/// before token-federation wrapping.
+async fn build_base_auth_provider(
+    auth: &AuthConfig,
+    host: &str,
     http_client: Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
     match auth {
@@ -1156,6 +1190,7 @@ mod retry_config_tests {
             auth: AuthConfig::Pat {
                 token: "dapi-test".to_string(),
             },
+            identity_federation_client_id: None,
             session_conf: Default::default(),
             http,
             proxy: None,

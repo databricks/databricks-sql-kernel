@@ -24,6 +24,8 @@
 pub mod cache;
 pub(crate) mod cache_crypto;
 pub mod callback;
+pub mod federation;
+pub(crate) mod jwt;
 pub mod m2m;
 pub mod oidc;
 pub mod token;
@@ -33,6 +35,7 @@ pub mod u2m;
 // Re-export the main types
 pub use cache::TokenCache;
 pub use callback::CallbackServer;
+pub use federation::FederationProvider;
 pub use m2m::ClientCredentialsProvider;
 pub use oidc::OidcEndpoints;
 pub use token::OAuthToken;
