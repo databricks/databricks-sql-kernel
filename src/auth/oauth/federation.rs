@@ -276,8 +276,14 @@ impl FederationProvider {
             };
             self.lead_exchange(source_token)
         } else {
-            // Follower: wait for the leader to publish, then read the result.
-            self.follow_exchange(source_token)
+            // Follower: the wait is synchronous, so tell tokio to move other
+            // tasks off this worker while the leader publishes its result.
+            match RuntimeHandle::try_current() {
+                Ok(handle) if matches!(handle.runtime_flavor(), RuntimeFlavor::MultiThread) => {
+                    tokio::task::block_in_place(|| self.follow_exchange(source_token))
+                }
+                _ => self.follow_exchange(source_token),
+            }
         }
     }
 
@@ -421,9 +427,9 @@ impl AuthProvider for FederationProvider {
 /// we only need the authority component for a host comparison.
 fn host_of(url: &str) -> Option<String> {
     // Strip scheme if present.
-    let after_scheme = match url.find("://") {
-        Some(idx) => &url[idx + 3..],
-        None => url,
+    let (scheme, after_scheme) = match url.find("://") {
+        Some(idx) => (&url[..idx], &url[idx + 3..]),
+        None => ("https", url),
     };
     // Authority ends at the first '/', '?', or '#'.
     let authority = after_scheme
@@ -432,6 +438,13 @@ fn host_of(url: &str) -> Option<String> {
         .unwrap_or(after_scheme);
     // Drop userinfo if present (`user:pass@host`).
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host_port = if scheme.eq_ignore_ascii_case("https") {
+        host_port.strip_suffix(":443").unwrap_or(host_port)
+    } else if scheme.eq_ignore_ascii_case("http") {
+        host_port.strip_suffix(":80").unwrap_or(host_port)
+    } else {
+        host_port
+    };
     if host_port.is_empty() {
         None
     } else {
@@ -455,9 +468,29 @@ mod tests {
         );
         assert_eq!(
             host_of("https://host.example.com:443/path?q=1").as_deref(),
-            Some("host.example.com:443")
+            Some("host.example.com")
         );
         assert_eq!(host_of("").as_deref(), None);
+    }
+
+    #[test]
+    fn host_of_normalizes_only_default_ports() {
+        assert_eq!(
+            host_of("http://host.example.com:80").as_deref(),
+            Some("host.example.com")
+        );
+        assert_eq!(
+            host_of("host.example.com:443").as_deref(),
+            Some("host.example.com")
+        );
+        assert_eq!(
+            host_of("https://host.example.com:8443").as_deref(),
+            Some("host.example.com:8443")
+        );
+        assert_eq!(
+            host_of("http://host.example.com:443").as_deref(),
+            Some("host.example.com:443")
+        );
     }
 
     #[test]
@@ -501,6 +534,15 @@ mod tests {
     async fn issuer_same_host_is_not_foreign() {
         let p = provider_for("https://ws.cloud.databricks.com", "Bearer x");
         assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com/oidc"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn issuer_same_host_ignores_explicit_default_port() {
+        let p = provider_for("https://ws.cloud.databricks.com:443", "Bearer x");
+        assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com/oidc"));
+
+        let p = provider_for("https://ws.cloud.databricks.com", "Bearer x");
+        assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com:443/oidc"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
