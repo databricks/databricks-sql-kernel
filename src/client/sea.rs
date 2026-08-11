@@ -1313,6 +1313,30 @@ impl Transport for SeaRestTransport {
         .await
     }
 
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+        column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_get_procedure_columns(
+            catalog,
+            schema_pattern,
+            procedure_pattern,
+            column_pattern,
+        );
+        debug!("list_procedure_columns: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
     async fn list_primary_keys(
         &self,
         session_id: &str,

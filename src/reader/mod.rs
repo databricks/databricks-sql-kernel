@@ -1550,6 +1550,16 @@ mod tests {
         ) -> Result<ExecuteResult> {
             unreachable!()
         }
+        async fn list_procedure_columns(
+            &self,
+            _: &str,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+            _: Option<&str>,
+        ) -> Result<ExecuteResult> {
+            unreachable!()
+        }
         async fn list_primary_keys(
             &self,
             _: &str,

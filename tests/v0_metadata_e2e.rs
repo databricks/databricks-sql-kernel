@@ -521,24 +521,100 @@ async fn foreign_keys_returns_jdbc_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn functions_returns_information_schema_routine_columns() {
+async fn functions_returns_jdbc_columns() {
     let session = live_session().await;
-    let res = session.metadata().functions(None, None, None).await;
-    match res {
-        Ok(stream) => {
-            let names = col_names(&stream.schema());
-            for required in ["routine_catalog", "routine_schema", "routine_name"] {
-                assert!(
-                    names.iter().any(|n| n == required),
-                    "expected '{required}' in {names:?}"
-                );
-            }
-            let _ = collect(stream).await;
-        }
-        Err(e) => {
-            eprintln!("functions E2E got SqlError (often expected): {}", e.message);
-        }
-    }
+    // Reshaped kernel-side into the JDBC getFunctions column set
+    // (the raw information_schema.routines columns are renamed by
+    // reshape_functions).
+    let stream = session
+        .metadata()
+        .functions(None, None, None)
+        .await
+        .expect("functions");
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "FUNCTION_CAT",
+            "FUNCTION_SCHEM",
+            "FUNCTION_NAME",
+            "REMARKS",
+            "FUNCTION_TYPE",
+            "SPECIFIC_NAME",
+        ]
+    );
+    let _ = collect(stream).await;
+
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore]
+async fn procedures_returns_jdbc_columns() {
+    let session = live_session().await;
+    // Reshaped kernel-side into the JDBC getProcedures column set
+    // (reshape_procedures).
+    let stream = session
+        .metadata()
+        .procedures(None, None, None)
+        .await
+        .expect("procedures");
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "PROCEDURE_CAT",
+            "PROCEDURE_SCHEM",
+            "PROCEDURE_NAME",
+            "RESERVED1",
+            "RESERVED2",
+            "RESERVED3",
+            "REMARKS",
+            "PROCEDURE_TYPE",
+            "SPECIFIC_NAME",
+        ]
+    );
+    let _ = collect(stream).await;
+
+    session.close().await.expect("close");
+}
+
+#[tokio::test]
+#[ignore]
+async fn procedure_columns_returns_jdbc_columns() {
+    let session = live_session().await;
+    // Reshaped kernel-side into the JDBC getProcedureColumns column set
+    // (reshape_procedure_columns). Backed by information_schema.parameters
+    // JOINed to routines (procedures only).
+    let stream = session
+        .metadata()
+        .procedure_columns(None, None, None, None)
+        .await
+        .expect("procedure_columns");
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "PROCEDURE_CAT",
+            "PROCEDURE_SCHEM",
+            "PROCEDURE_NAME",
+            "COLUMN_NAME",
+            "COLUMN_TYPE",
+            "DATA_TYPE",
+            "TYPE_NAME",
+            "PRECISION",
+            "LENGTH",
+            "SCALE",
+            "RADIX",
+            "NULLABLE",
+            "REMARKS",
+            "COLUMN_DEF",
+            "SQL_DATA_TYPE",
+            "SQL_DATETIME_SUB",
+            "CHAR_OCTET_LENGTH",
+            "ORDINAL_POSITION",
+            "IS_NULLABLE",
+            "SPECIFIC_NAME",
+        ]
+    );
+    let _ = collect(stream).await;
 
     session.close().await.expect("close");
 }

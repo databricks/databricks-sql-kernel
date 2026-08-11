@@ -709,6 +709,33 @@ KernelStatusCode kernel_metadata_foreign_keys(kernel_session_t* session, const c
  * The stream carries a single `TABLE_TYPE` column (JDBC getTableTypes). */
 KernelStatusCode kernel_metadata_list_table_types(kernel_session_t* session,
                                                   kernel_result_stream_t** out);
+/* List stored procedures. `catalog` is an exact identifier (NULL →
+ * cross-catalog via system.information_schema); `schema_pattern` and
+ * `procedure_pattern` are SQL LIKE patterns (NULL → unfiltered). Backs
+ * ODBC `SQLProcedures` / JDBC `getProcedures`; the stream carries the
+ * JDBC getProcedures columns. */
+KernelStatusCode kernel_metadata_procedures(kernel_session_t* session, const char* catalog,
+                                            const char* schema_pattern,
+                                            const char* procedure_pattern,
+                                            kernel_result_stream_t** out);
+/* List functions. Same argument semantics as
+ * `kernel_metadata_procedures`. Backs JDBC `getFunctions`; the stream
+ * carries the JDBC getFunctions columns. */
+KernelStatusCode kernel_metadata_functions(kernel_session_t* session, const char* catalog,
+                                           const char* schema_pattern,
+                                           const char* function_pattern,
+                                           kernel_result_stream_t** out);
+/* List stored-procedure parameter / return columns (procedures only —
+ * function arguments are excluded). `catalog` is an exact identifier
+ * (NULL → cross-catalog); `schema_pattern` / `procedure_pattern` /
+ * `column_pattern` are SQL LIKE patterns (NULL → unfiltered). Backs ODBC
+ * `SQLProcedureColumns` / JDBC `getProcedureColumns`; the stream carries
+ * the JDBC getProcedureColumns columns. */
+KernelStatusCode kernel_metadata_procedure_columns(kernel_session_t* session, const char* catalog,
+                                                   const char* schema_pattern,
+                                                   const char* procedure_pattern,
+                                                   const char* column_pattern,
+                                                   kernel_result_stream_t** out);
 
 #ifdef __cplusplus
 }  /* extern "C" */
