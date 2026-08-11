@@ -923,7 +923,31 @@ pub(crate) fn reshape_procedure_columns(batch: &RecordBatch) -> Result<RecordBat
 
     let precision = int32_column(batch, "numeric_precision")?;
     let scale = int16_column(batch, "numeric_scale")?;
-    let radix = int16_column(batch, "numeric_precision_radix")?;
+    // RADIX is derived from the type, not passed through from
+    // `information_schema.numeric_precision_radix`: that column is
+    // inconsistent for integers (it reports 2 for some INT parameters and
+    // NULL for others). JDBC `getProcedureColumns` reports RADIX only for
+    // types where it is meaningful — 10 for exact decimals, 2 for the
+    // approximate (FLOAT / REAL / DOUBLE) types — and NULL otherwise
+    // (integers included), matching the reference driver.
+    let radix = Arc::new(Int16Array::from(match type_name_strs {
+        Some(s) => (0..n)
+            .map(|i| {
+                if s.is_null(i) {
+                    return None;
+                }
+                let t = s.value(i).to_ascii_uppercase();
+                // Strip any parameterisation, e.g. "DECIMAL(10,2)" → "DECIMAL".
+                let base = t.split(['(', ' ']).next().unwrap_or(&t);
+                match base {
+                    "DECIMAL" | "DEC" | "NUMERIC" => Some(10),
+                    "FLOAT" | "REAL" | "DOUBLE" => Some(2),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<Option<i16>>>(),
+        None => vec![None; n],
+    })) as ArrayRef;
     let char_octet_length = int32_column(batch, "character_octet_length")?;
     let ordinal_position = int32_column(batch, "ordinal_position")?;
     let remarks = utf8_column(batch, "comment")?;
@@ -2023,12 +2047,27 @@ mod tests {
         assert_eq!(tn.value(0), "INT");
         assert_eq!(tn.value(1), "DECIMAL");
 
-        // DECIMAL row passes precision/scale/radix through.
+        // PRECISION / SCALE pass information_schema through (NULL for the
+        // INT row, 10 / 2 for the DECIMAL row).
         let prec = out.column(7).as_any().downcast_ref::<Int32Array>().unwrap();
         assert!(prec.is_null(0));
         assert_eq!(prec.value(1), 10);
         let scale = out.column(9).as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(scale.value(1), 2);
+
+        // RADIX is derived from the type, not passed through: NULL for
+        // integers (even though the fixture supplies numeric_precision_radix=2
+        // for the INT row), 10 for DECIMAL.
+        let radix = out
+            .column(10)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert!(
+            radix.is_null(0),
+            "INT radix must be NULL, not passed through"
+        );
+        assert_eq!(radix.value(1), 10);
 
         // NULLABLE is procedureNullableUnknown (2) for every row.
         let nul = out
