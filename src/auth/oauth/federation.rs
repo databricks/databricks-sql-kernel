@@ -97,8 +97,7 @@ pub struct FederationProvider {
     inner: Arc<dyn AuthProvider>,
     /// Full token-exchange endpoint URL: `{host}/oidc/v1/token`.
     token_endpoint: String,
-    /// The workspace host (bare `host[:port]`) used to decide whether an
-    /// issuer is in-house.
+    /// The workspace hostname used to decide whether an issuer is in-house.
     workspace_host: String,
     /// SP-wide Workload Identity Federation client id. `None` → BYOT /
     /// account-wide WIF, where the exchange sends
@@ -418,38 +417,23 @@ impl AuthProvider for FederationProvider {
     }
 }
 
-/// Extracts the bare `host[:port]` from a URL-ish string, lowercased. Accepts
-/// values with or without a scheme (JWT `iss` claims and workspace hosts both
-/// occur in both forms). Returns `None` if no host can be found.
-///
-/// Avoids pulling in a URL-parsing dependency: the kernel already normalizes
-/// hosts with plain string ops (see `ConnectionConfig::normalise_host`), and
-/// we only need the authority component for a host comparison.
+/// Extracts the hostname from a URL-ish string, lowercased and without its
+/// port. Accepts values with or without a scheme and returns `None` if no host
+/// can be found.
 fn host_of(url: &str) -> Option<String> {
-    // Strip scheme if present.
-    let (scheme, after_scheme) = match url.find("://") {
-        Some(idx) => (&url[..idx], &url[idx + 3..]),
-        None => ("https", url),
-    };
-    // Authority ends at the first '/', '?', or '#'.
-    let authority = after_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(after_scheme);
-    // Drop userinfo if present (`user:pass@host`).
-    let host_port = authority.rsplit('@').next().unwrap_or(authority);
-    let host_port = if scheme.eq_ignore_ascii_case("https") {
-        host_port.strip_suffix(":443").unwrap_or(host_port)
-    } else if scheme.eq_ignore_ascii_case("http") {
-        host_port.strip_suffix(":80").unwrap_or(host_port)
+    let normalized;
+    let url = if url.contains("://") {
+        url
     } else {
-        host_port
+        normalized = format!("https://{url}");
+        &normalized
     };
-    if host_port.is_empty() {
-        None
-    } else {
-        Some(host_port.to_ascii_lowercase())
-    }
+
+    reqwest::Url::parse(url)
+        .ok()?
+        .host_str()
+        .filter(|host| !host.is_empty())
+        .map(str::to_ascii_lowercase)
 }
 
 #[cfg(test)]
@@ -474,7 +458,7 @@ mod tests {
     }
 
     #[test]
-    fn host_of_normalizes_only_default_ports() {
+    fn host_of_ignores_ports() {
         assert_eq!(
             host_of("http://host.example.com:80").as_deref(),
             Some("host.example.com")
@@ -485,11 +469,11 @@ mod tests {
         );
         assert_eq!(
             host_of("https://host.example.com:8443").as_deref(),
-            Some("host.example.com:8443")
+            Some("host.example.com")
         );
         assert_eq!(
             host_of("http://host.example.com:443").as_deref(),
-            Some("host.example.com:443")
+            Some("host.example.com")
         );
     }
 
@@ -537,12 +521,12 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn issuer_same_host_ignores_explicit_default_port() {
+    async fn issuer_same_host_ignores_port() {
         let p = provider_for("https://ws.cloud.databricks.com:443", "Bearer x");
         assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com/oidc"));
 
         let p = provider_for("https://ws.cloud.databricks.com", "Bearer x");
-        assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com:443/oidc"));
+        assert!(!p.issuer_is_foreign("https://ws.cloud.databricks.com:8443/oidc"));
     }
 
     #[tokio::test(flavor = "multi_thread")]
