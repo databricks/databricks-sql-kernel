@@ -216,6 +216,30 @@ impl std::fmt::Debug for StreamingCloudFetchProvider {
     }
 }
 
+/// Spawn a download future on `runtime_handle` and await its `JoinHandle`,
+/// converting a task panic (`JoinError`) into an ordinary error.
+///
+/// tokio turns a panic inside a spawned task into a `JoinError`, but only if the
+/// handle is awaited. A detached (fire-and-forget) download task that panics is
+/// silently swallowed — its chunk then stays `Downloading` forever and the whole
+/// stream wedges (PECOBLR-4026). Routing every chunk download through this helper
+/// guarantees a panic surfaces as a failed chunk instead of an indefinite hang.
+async fn join_download_task<F>(
+    runtime_handle: &tokio::runtime::Handle,
+    fut: F,
+) -> Result<Vec<RecordBatch>>
+where
+    F: std::future::Future<Output = Result<Vec<RecordBatch>>> + Send + 'static,
+{
+    match runtime_handle.spawn(fut).await {
+        Ok(result) => result,
+        Err(join_err) => {
+            error!("CloudFetch download task panicked: {}", join_err);
+            Err(Error::io().message(format!("download task panicked: {}", join_err)))
+        }
+    }
+}
+
 impl StreamingCloudFetchProvider {
     /// Create a new provider.
     ///
@@ -549,16 +573,10 @@ impl StreamingCloudFetchProvider {
             // download error lets the reader fail cleanly instead of hanging.
             let rt = self.runtime_handle.clone();
             self.runtime_handle.spawn(async move {
-                let download =
-                    rt.spawn(async move { Self::download_chunk_with_retry(chunk_index, &ctx).await });
-                let result = match download.await {
-                    Ok(r) => r,
-                    Err(join_err) => {
-                        error!("Download task for chunk {} panicked: {}", chunk_index, join_err);
-                        Err(Error::io()
-                            .message(format!("download task panicked: {}", join_err)))
-                    }
-                };
+                let result = join_download_task(&rt, async move {
+                    Self::download_chunk_with_retry(chunk_index, &ctx).await
+                })
+                .await;
 
                 match result {
                     Ok(batches) => {
@@ -1372,6 +1390,24 @@ mod tests {
             http_headers: HashMap::new(),
             next_chunk_index: Some(chunk_index + 1),
         }
+    }
+
+    /// Regression (PECOBLR-4026): a panicking download task must surface as an
+    /// error rather than being silently swallowed — a swallowed panic leaves the
+    /// chunk stuck `Downloading` and wedges the stream forever. Verifies
+    /// `join_download_task` converts a task panic into an error.
+    #[tokio::test]
+    async fn panicking_download_task_surfaces_as_error() {
+        let handle = tokio::runtime::Handle::current();
+        let result = join_download_task(&handle, async {
+            panic!("simulated download-task panic");
+        })
+        .await;
+        let err = result.expect_err("a panicking download task must yield an error, not Ok");
+        assert!(
+            err.to_string().contains("download task panicked"),
+            "error should identify a panicked download task, got: {err}"
+        );
     }
 
     #[tokio::test]
