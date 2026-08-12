@@ -539,8 +539,26 @@ impl StreamingCloudFetchProvider {
             let chunks = self.chunks.clone();
             let batch_merge_target_rows = self.config.batch_merge_target_rows;
 
+            // Run the download on its own task and AWAIT its JoinHandle here.
+            // tokio turns a panic inside a spawned task into a `JoinError` — but
+            // only if the handle is awaited. The prior fire-and-forget spawn dropped
+            // the handle, so a panic in the download/decompress path (e.g. the
+            // twox-hash overflow in LZ4 block-checksum verification — PECOBLR-4026)
+            // was silently swallowed, leaving the chunk stuck in `Downloading`
+            // forever and wedging the whole stream. Surfacing the panic as a
+            // download error lets the reader fail cleanly instead of hanging.
+            let rt = self.runtime_handle.clone();
             self.runtime_handle.spawn(async move {
-                let result = Self::download_chunk_with_retry(chunk_index, &ctx).await;
+                let download =
+                    rt.spawn(async move { Self::download_chunk_with_retry(chunk_index, &ctx).await });
+                let result = match download.await {
+                    Ok(r) => r,
+                    Err(join_err) => {
+                        error!("Download task for chunk {} panicked: {}", chunk_index, join_err);
+                        Err(Error::io()
+                            .message(format!("download task panicked: {}", join_err)))
+                    }
+                };
 
                 match result {
                     Ok(batches) => {
