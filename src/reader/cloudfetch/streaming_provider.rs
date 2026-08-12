@@ -224,6 +224,14 @@ impl std::fmt::Debug for StreamingCloudFetchProvider {
 /// silently swallowed — its chunk then stays `Downloading` forever and the whole
 /// stream wedges (PECOBLR-4026). Routing every chunk download through this helper
 /// guarantees a panic surfaces as a failed chunk instead of an indefinite hang.
+///
+/// Note: this spawns a second (inner) task and awaits its handle, so each chunk
+/// download uses two tasks — the outer scheduling task and this inner one. That
+/// decouples the download from the outer task: if the outer task were aborted
+/// mid-`await`, the inner download would keep running detached. This is not a leak
+/// today because nothing `abort()`s these tasks — cancellation is cooperative via
+/// `cancel_token`, checked inside `download_chunk_with_retry`. The extra task is
+/// the price of capturing a `JoinError`; keep this invariant if adding `abort()`.
 async fn join_download_task<F>(
     runtime_handle: &tokio::runtime::Handle,
     fut: F,
