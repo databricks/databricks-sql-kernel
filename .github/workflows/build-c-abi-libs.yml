@@ -1,0 +1,318 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Builds the C-ABI static library (libdatabricks_sql_kernel.a) for every
+# supported OS/arch on a NATIVE runner, checksums each one, and uploads them as
+# workflow artifacts + release assets. This is the producer half of the Go
+# driver's committed-per-platform distribution (see databricks-sql-go PR: the
+# nested `internal/backend/kernel/kernellib/<platform>` modules).
+#
+# After building, a `publish-to-driver` job PUSHES the compiled archives into the
+# public Go driver repo and opens a sync PR there (PUSH model). This keeps the
+# only cross-repo credential — a token with PR-write on the PUBLIC driver — inside
+# this PRIVATE kernel repo, so no credential that could read this repo's SOURCE
+# ever lives in the public driver. Only the compiled .a crosses the boundary
+# (public-safe by design), never the source. A kernel opt-in `go get` build then
+# links a committed archive with no Rust toolchain and no `make kernel-lib` step.
+#
+# Why native runners (not cross-compilation): `cargo build` here uses the host
+# target (no `--target`), matching how the kernel is built and tested elsewhere.
+# Each archive is produced on its real OS/arch so the emitted machine code, the
+# system C++ runtime it expects, and the object-file format are all correct —
+# cross-toolchains are error-prone for a Rust staticlib with C++ transitive deps
+# (BoringSSL etc.). One job per platform, one archive out.
+#
+# Triggered by:
+#   1. Pushing a `v*` git tag — the canonical release path (same trigger as
+#      cargo-publish.yml, so a kernel release produces both the crate and the
+#      C-ABI archives in lockstep).
+#   2. Manual `workflow_dispatch` — for ad-hoc archive builds / re-runs.
+#
+# Build flags mirror the Go driver's build/kernel-lib.sh source build exactly:
+#   cargo build --release --locked --no-default-features --features tls-rustls
+# so the CI-produced archive is byte-for-byte the same shape the driver expects
+# (pure-Rust TLS, no default features).
+
+name: Build C-ABI Libraries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      upload_release:
+        description: "Attach archives to the GitHub release for the triggering tag"
+        required: false
+        default: "false"
+
+concurrency:
+  # One archive-build run per ref; a newer push supersedes an in-flight build.
+  group: ${{ github.repository }}-build-c-abi-libs-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  # OIDC token exchange for the .github/actions/setup-jfrog composite (cargo
+  # dependency proxy). See go/hardened-gha.
+  id-token: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: "C-ABI ${{ matrix.platform }}"
+    runs-on: ${{ matrix.runs-on }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `platform` is the Go GOOS_GOARCH tag the driver's nested modules key
+          # off (internal/backend/kernel/kernellib/<platform>). `runs-on` picks a
+          # NATIVE runner for that OS/arch so no cross-toolchain is involved.
+          - platform: darwin_arm64
+            runs-on: macos-14          # Apple Silicon
+            archive: libdatabricks_sql_kernel.a
+          - platform: darwin_amd64
+            runs-on: macos-13          # Intel
+            archive: libdatabricks_sql_kernel.a
+          - platform: linux_amd64
+            runs-on: ubuntu-latest
+            archive: libdatabricks_sql_kernel.a
+          - platform: linux_arm64
+            runs-on: ubuntu-24.04-arm  # native ARM runner (no cross)
+            archive: libdatabricks_sql_kernel.a
+          - platform: windows_amd64
+            runs-on: windows-latest
+            archive: databricks_sql_kernel.lib  # MSVC toolchain names it .lib
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+
+      - name: Configure JFrog Artifactory access (cargo proxy)
+        uses: ./.github/actions/setup-jfrog
+        with:
+          cargo: "true"
+
+      - name: Set up Rust toolchain
+        uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+
+      # Build the staticlib with the SAME flags as the Go driver's
+      # build/kernel-lib.sh source build. No `--target`: host-native build on a
+      # matching native runner. The root Cargo.toml already declares
+      # crate-type = ["lib", "cdylib", "staticlib"], so `staticlib` emits the .a
+      # (or .lib on MSVC) under target/release/.
+      - name: Build C-ABI static library
+        run: |
+          cargo build --release --locked --no-default-features --features tls-rustls
+
+      # macOS only: the archive itself has no install_name (that is a dylib
+      # concept), so nothing to rewrite for the STATIC lib. This step is a
+      # placeholder marker documenting that the static path needs no
+      # relocatability fix-up — unlike the dynamic .dylib path, which would need
+      # `install_name_tool -id @rpath/...`. Kept as an explicit no-op so a future
+      # dynamic variant has an obvious home.
+      - name: (static) no install_name fix-up needed
+        if: startsWith(matrix.platform, 'darwin')
+        run: echo "static .a carries no install_name; nothing to relocate"
+
+      # Stage the produced archive under a per-platform directory that mirrors
+      # the driver's nested-module layout, plus a SHA-256 the driver verifies
+      # before committing/using it.
+      - name: Stage archive + checksum
+        run: |
+          set -euo pipefail
+          OUT="dist/${{ matrix.platform }}"
+          mkdir -p "$OUT"
+          SRC="target/release/${{ matrix.archive }}"
+          if [ ! -f "$SRC" ]; then
+            echo "::error::expected archive not found at $SRC"
+            ls -la target/release/ || true
+            exit 1
+          fi
+          cp "$SRC" "$OUT/${{ matrix.archive }}"
+          # Also emit the C header alongside so the driver can commit a matching
+          # header at the same revision. The header is generated into include/.
+          if [ -f include/databricks_kernel.h ]; then
+            cp include/databricks_kernel.h "$OUT/databricks_kernel.h"
+          fi
+          # Portable SHA-256 (shasum on macOS, sha256sum on Linux; certutil Win).
+          cd "$OUT"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          elif command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
+          else
+            certutil -hashfile "${{ matrix.archive }}" SHA256 | sed -n 2p > "${{ matrix.archive }}.sha256"
+          fi
+          echo "staged:"; ls -la
+          echo "size: $(wc -c < "${{ matrix.archive }}") bytes"
+
+      - name: Upload archive artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: kernel-c-abi-${{ matrix.platform }}
+          path: dist/${{ matrix.platform }}/
+          if-no-files-found: error
+          retention-days: 14
+
+      # On a tag build (or when explicitly requested), attach the archive to the
+      # GitHub release for that tag, so the Go driver's sync workflow can pull a
+      # signed, immutable asset by tag rather than a transient CI artifact.
+      - name: Attach to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.upload_release == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          TAG="${GITHUB_REF_NAME}"
+          cd "dist/${{ matrix.platform }}"
+          # Namespace the asset by platform so all five archives coexist on one
+          # release without name clashes.
+          ASSET="libdatabricks_sql_kernel-${{ matrix.platform }}.a"
+          cp "${{ matrix.archive }}" "$ASSET"
+          gh release upload "$TAG" \
+            "$ASSET" "${{ matrix.archive }}.sha256" \
+            --repo "$GITHUB_REPOSITORY" --clobber
+
+  # ── Push the freshly-built archives into the PUBLIC Go driver repo ──────────
+  #
+  # PUSH model (not pull): this PRIVATE kernel repo pushes the compiled archives
+  # to the public databricks-sql-go repo and opens a PR there. The only
+  # credential involved is DRIVER_PR_TOKEN, which needs write/PR scope on the
+  # PUBLIC driver repo ONLY — no credential that can read this private kernel's
+  # SOURCE ever leaves this repo. (The alternative, having the public driver pull
+  # from here, would require giving the public repo a token with Contents:read on
+  # this private repo — i.e. source-read access sitting in a public repo. The
+  # push direction avoids that entirely.)
+  #
+  # What crosses the boundary is only the compiled .a (public-safe by design),
+  # never the source.
+  publish-to-driver:
+    name: Publish archives to Go driver
+    needs: build
+    # Only on a real release tag (skip ad-hoc dispatch runs unless explicitly
+    # asked to attach a release, which implies a deliberate publish).
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    env:
+      DRIVER_REPO: databricks/databricks-sql-go
+      KERNEL_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download all platform archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: kernel-c-abi-*
+          path: archives
+          # Each artifact keeps its own subdir (archives/kernel-c-abi-<platform>/).
+          merge-multiple: false
+
+      # Check out the PUBLIC driver repo using a token scoped to that repo only.
+      # DRIVER_PR_TOKEN is a fine-grained PAT / GitHub App token with
+      # Contents:write + Pull requests:write on databricks-sql-go, stored as a
+      # secret in THIS kernel repo. It has NO access to this kernel repo's source.
+      - name: Check out Go driver
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: ${{ env.DRIVER_REPO }}
+          token: ${{ secrets.DRIVER_PR_TOKEN }}
+          path: driver
+          fetch-depth: 1
+
+      - name: Place archives into nested modules + verify checksums
+        run: |
+          set -euo pipefail
+          cd driver
+          shopt -s nullglob
+          placed=0
+          for dir in ../archives/kernel-c-abi-*; do
+            plat="$(basename "$dir" | sed 's/^kernel-c-abi-//')"
+            dest="internal/backend/kernel/kernellib/$plat"
+            if [ ! -d "$dest" ]; then
+              echo "::warning::driver has no nested module for $plat ($dest); skipping"
+              continue
+            fi
+            # The build job may name the archive .a (unix) or .lib (windows);
+            # normalize to the module's build-time name libdatabricks_sql_kernel.a.
+            src="$(ls "$dir"/libdatabricks_sql_kernel.a "$dir"/databricks_sql_kernel.lib 2>/dev/null | head -1 || true)"
+            sha="$(ls "$dir"/*.sha256 2>/dev/null | head -1 || true)"
+            if [ -z "$src" ]; then
+              echo "::error::no archive found in $dir"; exit 1
+            fi
+            if [ -n "$sha" ]; then
+              want="$(awk '{print $1}' "$sha")"
+              got="$(sha256sum "$src" | awk '{print $1}')"
+              [ "$want" = "$got" ] || { echo "::error::checksum mismatch for $plat"; exit 1; }
+              echo "$plat checksum OK ($got)"
+            fi
+            cp "$src" "$dest/libdatabricks_sql_kernel.a"
+            placed=$((placed+1))
+          done
+          echo "placed $placed platform archive(s)"
+          # Refresh the committed C header (platform-independent) from any artifact.
+          hdr="$(ls ../archives/kernel-c-abi-*/databricks_kernel.h 2>/dev/null | head -1 || true)"
+          if [ -n "$hdr" ]; then
+            cp "$hdr" internal/backend/kernel/include/databricks_kernel.h
+            echo "header refreshed"
+          fi
+
+      - name: Update KERNEL_REV pin
+        run: |
+          set -euo pipefail
+          cd driver
+          # ${{ github.sha }} is this kernel repo's commit for the release tag.
+          echo "${{ github.sha }}" > KERNEL_REV
+          echo "KERNEL_REV -> ${{ github.sha }}"
+
+      - name: Open sync PR on the driver
+        env:
+          GH_TOKEN: ${{ secrets.DRIVER_PR_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd driver
+          branch="sync/kernel-${KERNEL_TAG}"
+          git config user.name  "databricks-ci"
+          git config user.email "ci@databricks.com"
+          git checkout -b "$branch"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "no changes — driver already at ${KERNEL_TAG}"; exit 0
+          fi
+          {
+            printf 'kernel: sync committed C-ABI libs to %s\n\n' "$KERNEL_TAG"
+            printf 'Pushed by the kernel repo build-c-abi-libs workflow: rebuilt the\n'
+            printf 'per-platform libdatabricks_sql_kernel.a archives on native runners,\n'
+            printf 'verified checksums, and updated the committed nested-module binaries\n'
+            printf '+ KERNEL_REV.\n\n'
+            printf 'Co-authored-by: Isaac\n'
+          } > /tmp/commit_msg.txt
+          {
+            printf 'Automated push of committed per-platform kernel archives to `%s`.\n\n' "$KERNEL_TAG"
+            printf 'Built on native runners in the kernel repo, checksum-verified, and\n'
+            printf 'placed into the nested modules. `KERNEL_REV` moved to the tag commit.\n\n'
+            printf 'Per-platform link + E2E verification runs in each platform CI on this PR.\n\n'
+            printf 'This pull request and its description were written by Isaac.\n'
+          } > /tmp/pr_body.txt
+          git commit -F /tmp/commit_msg.txt
+          git push -u origin "$branch" --force
+          gh pr create --repo "$DRIVER_REPO" \
+            --title "kernel: sync committed C-ABI libs to ${KERNEL_TAG}" \
+            --body-file /tmp/pr_body.txt \
+            --base main --head "$branch" || echo "PR may already exist"
