@@ -165,7 +165,7 @@ fn build_auth_config_inner(
         "oauth-u2m" => {
             // Browser flow: every field is optional and `None` lets the
             // kernel apply its defaults (client_id "databricks-sql-connector",
-            // redirect_port 8020, scopes ["all-apis", "offline_access"],
+            // redirect_port 8030, scopes ["sql", "offline_access"],
             // callback timeout 120s). But a *present-yet-degenerate*
             // value is a footgun the kernel can't distinguish from an
             // intentional setting, so reject those here:
