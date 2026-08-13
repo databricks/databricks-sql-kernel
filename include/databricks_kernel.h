@@ -239,9 +239,9 @@ KernelStatusCode kernel_session_config_set_auth_m2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     const char* client_secret);
 /* OAuth U2M (user-to-machine: authorization code + PKCE, browser flow).
- * All args optional: `client_id` NULL → public `databricks-cli` client;
- * `redirect_port` 0 → kernel default (8020); `scopes` (comma-separated)
- * NULL → kernel default (`all-apis`,`offline_access`; `offline_access`
+ * All args optional: `client_id` NULL → `databricks-sql-connector` client;
+ * `redirect_port` 0 → kernel default (8030); `scopes` (comma-separated)
+ * NULL → kernel default (`sql`,`offline_access`; `offline_access`
  * yields a cached, auto-refreshed refresh token). INTERACTIVE: opening the
  * session starts a localhost listener and opens the user's browser. */
 KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,

@@ -341,7 +341,7 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
     set_on_config(config, |c| {
         c.auth = Some(AuthSpec::OAuthU2M {
             client_id: optional_str(client_id, "client_id")?,
-            // 0 is the "unset" sentinel → kernel default (8020).
+            // 0 is the "unset" sentinel → kernel default (8030).
             redirect_port: (redirect_port != 0).then_some(redirect_port),
             scopes: optional_str(scopes, "scopes")?,
         });
