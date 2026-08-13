@@ -91,7 +91,6 @@ fn default_expires_in() -> i64 {
 
 /// An [`AuthProvider`] decorator that performs mandatory token exchange for
 /// foreign-issuer JWTs. See the [module docs](self).
-#[derive(Debug)]
 pub struct FederationProvider {
     /// The wrapped provider that yields the source token.
     inner: Arc<dyn AuthProvider>,
@@ -135,10 +134,35 @@ const FAILED_EXCHANGE_RETRY_DELAY_SECONDS: i64 = 60;
 
 /// A cached exchange outcome: the source token it was derived from, and the
 /// resulting in-house token.
-#[derive(Debug)]
 struct CacheEntry {
     source_token: String,
     exchanged: OAuthToken,
+}
+
+impl std::fmt::Debug for CacheEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CacheEntry")
+            .field("source_token", &"<redacted>")
+            .field("exchanged", &"<redacted>")
+            .finish()
+    }
+}
+
+impl std::fmt::Debug for FederationProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FederationProvider")
+            .field("inner", &"<redacted>")
+            .field("token_endpoint", &self.token_endpoint)
+            .field("workspace_host", &self.workspace_host)
+            .field(
+                "identity_federation_client_id",
+                &self.identity_federation_client_id,
+            )
+            .field("http_client", &"<weak>")
+            .field("cache", &"<redacted>")
+            .field("exchanging", &self.exchanging.load(Ordering::Relaxed))
+            .finish()
+    }
 }
 
 impl FederationProvider {
@@ -591,5 +615,50 @@ mod tests {
 
         assert!(weak_http_client.upgrade().is_none());
         assert!(weak_provider.upgrade().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn debug_redacts_all_credentials() {
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(Default::default()).expect("http client"),
+        );
+        let provider = FederationProvider::new(
+            Arc::new(StubProvider("Bearer inner-provider-secret".to_string())),
+            "https://ws.cloud.databricks.com",
+            Some("federation-client-id".to_string()),
+            &http_client,
+        )
+        .await
+        .expect("provider");
+        provider.store(
+            "source-jwt-secret",
+            OAuthToken::new(
+                "exchanged-token-secret".to_string(),
+                "Bearer".to_string(),
+                3600,
+                Some("refresh-token-secret".to_string()),
+                vec!["sql".to_string()],
+            ),
+        );
+
+        let provider_debug = format!("{provider:?}");
+        let cache_debug = format!("{:?}", provider.cache.read().unwrap().as_ref().unwrap());
+        for secret in [
+            "inner-provider-secret",
+            "source-jwt-secret",
+            "exchanged-token-secret",
+            "refresh-token-secret",
+        ] {
+            assert!(
+                !provider_debug.contains(secret),
+                "secret leaked: {provider_debug}"
+            );
+            assert!(
+                !cache_debug.contains(secret),
+                "secret leaked: {cache_debug}"
+            );
+        }
+        assert!(provider_debug.contains("<redacted>"));
+        assert!(cache_debug.contains("<redacted>"));
     }
 }
