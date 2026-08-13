@@ -159,7 +159,7 @@ export interface ProxyInput {
  * - `Pat` — `token` required.
  * - `OAuthM2m` — `oauthClientId` + `oauthClientSecret` required.
  * - `OAuthU2m` — `oauthClientId` / `oauthRedirectPort` optional
- *   (defaults to the `databricks-sql-connector` client on port 8020).
+ *   (defaults to the `databricks-sql-connector` client on port 8030).
  *
  * Catalog / schema / sessionConf are applied once at session creation
  * and remain in effect for every statement run on the resulting
@@ -197,12 +197,12 @@ export interface ConnectionOptions {
   oauthClientSecret?: string
   /**
    * Localhost callback port for the [`AuthMode::OAuthU2m`] browser
-   * flow. Omitted ⇒ kernel default (8020).
+   * flow. Omitted ⇒ kernel default (8030).
    */
   oauthRedirectPort?: number
   /**
    * OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
-   * (`["all-apis"]` for M2M; `["all-apis", "offline_access"]` for U2M).
+   * (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
    */
   oauthScopes?: Array<string>
   /**

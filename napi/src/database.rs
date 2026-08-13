@@ -121,7 +121,7 @@ pub struct ProxyInput {
 /// - `Pat` — `token` required.
 /// - `OAuthM2m` — `oauthClientId` + `oauthClientSecret` required.
 /// - `OAuthU2m` — `oauthClientId` / `oauthRedirectPort` optional
-///   (defaults to the `databricks-sql-connector` client on port 8020).
+///   (defaults to the `databricks-sql-connector` client on port 8030).
 ///
 /// Catalog / schema / sessionConf are applied once at session creation
 /// and remain in effect for every statement run on the resulting
