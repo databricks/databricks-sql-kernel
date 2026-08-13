@@ -100,6 +100,20 @@ const PYSQL_OAUTH_CLIENT_ID: &str = "databricks-sql-python";
 /// honoured verbatim.
 const PYSQL_OAUTH_SCOPES: &[&str] = &["sql", "offline_access"];
 
+/// Default U2M redirect port for the **Python** binding.
+///
+/// The kernel's intrinsic default is `8030` — the port registered for its
+/// default `databricks-sql-connector` app. But the Python binding overrides
+/// the client to `databricks-sql-python`, whose registered redirect port is
+/// `8020` (the standalone connector's `PYSQL_OAUTH_REDIRECT_PORT_RANGE` starts
+/// at 8020). `client_id`, `scopes`, and `redirect_port` are a coupled bundle —
+/// overriding the client without pinning its port would inherit the kernel's
+/// `8030` and fail the browser redirect with `redirect_uri_mismatch`.
+///
+/// Only applied when the caller relies on the default `client_id`; a caller
+/// supplying their own `client_id` owns the matching port too.
+const PYSQL_OAUTH_REDIRECT_PORT: u16 = 8020;
+
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
 /// constructor accepts.
 ///
@@ -215,9 +229,17 @@ fn build_auth_config_inner(
                 }
                 None => None,
             };
+            // Pin the databricks-sql-python app's own redirect port when
+            // relying on the default client_id — the kernel default (8030) is
+            // for the databricks-sql-connector app and would mismatch.
+            let redirect_port = match oauth.redirect_port {
+                Some(p) => Some(p),
+                None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
+                None => None,
+            };
             Ok(AuthConfig::OAuthU2M {
                 client_id,
-                redirect_port: oauth.redirect_port,
+                redirect_port,
                 scopes,
                 token_url_override: oauth.token_url,
                 callback_timeout: oauth.callback_timeout_secs.map(Duration::from_secs),
@@ -359,7 +381,9 @@ mod tests {
                 token_cache,
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
-                assert!(redirect_port.is_none());
+                // Python bundle pins its own app's registered port (8020),
+                // NOT the kernel default 8030 (databricks-sql-connector).
+                assert_eq!(redirect_port, Some(8020));
                 assert_eq!(
                     scopes,
                     Some(vec!["sql".to_string(), "offline_access".to_string()])
@@ -392,13 +416,17 @@ mod tests {
         .unwrap();
         match cfg {
             AuthConfig::OAuthU2M {
-                client_id, scopes, ..
+                client_id,
+                scopes,
+                redirect_port,
+                ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("my-custom-app"));
-                // Custom client_id without scopes: don't override the
-                // kernel's default scopes — a custom client may
-                // legitimately request `all-apis` (or anything else).
+                // Custom client_id without scopes/port: don't pin the Python
+                // bundle's defaults — a custom app owns its own scopes and
+                // redirect port, so both defer to the kernel (None).
                 assert!(scopes.is_none());
+                assert!(redirect_port.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

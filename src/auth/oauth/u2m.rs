@@ -54,8 +54,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 
-/// Default callback server port for OAuth redirects.
-const DEFAULT_CALLBACK_PORT: u16 = 8020;
+/// Default callback server port for OAuth redirects. Matches the redirect
+/// URI registered for the kernel's default U2M OAuth app
+/// (`databricks-sql-connector`, `http://localhost:8030`).
+const DEFAULT_CALLBACK_PORT: u16 = 8030;
 
 /// Default timeout for waiting for the OAuth callback.
 const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);

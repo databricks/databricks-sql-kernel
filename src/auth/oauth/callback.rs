@@ -158,7 +158,8 @@ impl CallbackServer {
     ///
     /// This URI should be used when constructing the OAuth authorization URL.
     /// The format is `http://localhost:{port}` (matching the redirect URI
-    /// registered for the `databricks-cli` OAuth application).
+    /// registered for the kernel's default U2M OAuth application,
+    /// `databricks-sql-connector`, at `http://localhost:8030`).
     pub fn redirect_uri(&self) -> String {
         format!("http://localhost:{}", self.port)
     }
