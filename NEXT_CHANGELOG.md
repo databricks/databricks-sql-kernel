@@ -35,10 +35,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   using it, transparently across PAT / M2M / U2M. Gated by the token's `iss` claim
   (non-JWT and same-host tokens pass through with no HTTP call) and falls back to the
   original token if the exchange fails, so existing flows are unaffected. New optional
-  `SessionConfig::identity_federation_client_id` (and matching
-  `SessionBuilder::identity_federation_client_id`) selects SP-wide WIF; unset means
-  BYOT / account-wide WIF. Follows the ADBC wire contract
-  (`grant_type=jwt-bearer`, `assertion`, `scope=sql`).
+  `identity_federation_client_id` fields on the PAT, M2M, and U2M `AuthConfig`
+  variants select SP-wide WIF; unset means BYOT / account-wide WIF. Follows the
+  ADBC wire contract (`grant_type=jwt-bearer`, `assertion`, `scope=sql`).
 
 ### Updated
 

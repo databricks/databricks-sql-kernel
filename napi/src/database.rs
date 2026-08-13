@@ -355,11 +355,12 @@ pub struct ConnectionOptions {
 /// session.
 fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
     match options.auth_mode.unwrap_or_default() {
-        AuthMode::Pat => AuthConfig::pat(options.token.clone()).map_err(napi_err_from_kernel),
+        AuthMode::Pat => AuthConfig::pat(options.token.clone(), None).map_err(napi_err_from_kernel),
         AuthMode::OAuthM2m => AuthConfig::oauth_m2m(
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
+            None,
             None,
         )
         .map_err(napi_err_from_kernel),
@@ -398,6 +399,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 // encrypted under a machine-local derived key since this
                 // binding exposes no passphrase option. Surfacing one through
                 // `options` would strengthen it further.
+                None,
                 None,
             ))
         }

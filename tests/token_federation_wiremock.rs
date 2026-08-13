@@ -29,7 +29,8 @@ use databricks_sql_kernel::auth::oauth::FederationProvider;
 use databricks_sql_kernel::auth::{AuthProvider, PersonalAccessToken};
 use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
 use databricks_sql_kernel::client::retry::{build_retry_configs, RetryConfig};
-use wiremock::matchers::{body_string_contains, method, path};
+use databricks_sql_kernel::{AuthConfig, ConnectionConfig, HttpConfig, Session};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// Builds a JWT-shaped `header.payload.signature` string whose payload carries
@@ -206,6 +207,49 @@ async fn sp_wide_wif_sends_identity_federation_client_id() {
     .expect("provider");
 
     assert_eq!(provider.get_auth_header().unwrap(), "Bearer wif-token");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn auth_config_federation_client_id_reaches_exchange() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path("/oidc/v1/token"))
+        .and(body_string_contains(
+            "identity_federation_client_id=my-sp-client-id",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(exchange_response("wif-token")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .and(header("authorization", "Bearer wif-token"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "session_id": "session-id",
+            "warehouse_id": "warehouse-id",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut http = HttpConfig::default();
+    http.retry_max_retries = 0;
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/warehouse-id")
+                .unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: jwt_with_issuer("https://external-idp.example.com"),
+            identity_federation_client_id: Some("my-sp-client-id".to_string()),
+        })
+        .http(http)
+        .open()
+        .await
+        .unwrap();
+
+    assert_eq!(session.session_id(), "session-id");
 }
 
 #[tokio::test(flavor = "multi_thread")]

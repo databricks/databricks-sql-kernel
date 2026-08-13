@@ -56,7 +56,10 @@
 //!         "https://my-workspace.databricks.com",
 //!         "abc123",
 //!     ))
-//!     .auth(AuthConfig::Pat { token: "dapi...".into() })
+//!     .auth(AuthConfig::Pat {
+//!         token: "dapi...".into(),
+//!         identity_federation_client_id: None,
+//!     })
 //!     .open()
 //!     .await?;
 //!

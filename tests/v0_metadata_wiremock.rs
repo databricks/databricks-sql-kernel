@@ -55,6 +55,7 @@ async fn open_session(server: &MockServer) -> Session {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .open()
         .await

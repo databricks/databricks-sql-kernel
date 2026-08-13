@@ -131,7 +131,10 @@ fn build_auth_config_inner(
             if token.is_empty() {
                 return Err("access_token must not be empty".to_owned());
             }
-            Ok(AuthConfig::Pat { token })
+            Ok(AuthConfig::Pat {
+                token,
+                identity_federation_client_id: None,
+            })
         }
         "oauth-m2m" => {
             // Client credentials grant: both halves are mandatory.
@@ -145,6 +148,7 @@ fn build_auth_config_inner(
                 client_secret,
                 scopes: oauth.scopes,
                 token_url_override: oauth.token_url,
+                identity_federation_client_id: None,
             })
         }
         "oauth-u2m" => {
@@ -229,6 +233,7 @@ fn build_auth_config_inner(
                 // passphrase through `OAuthParams` — the equivalent of JDBC's
                 // TokenCachePassPhrase — would strengthen it further.
                 token_cache: None,
+                identity_federation_client_id: None,
             })
         }
         other => Err(format!(
@@ -264,7 +269,7 @@ mod tests {
     fn pat_builds() {
         let cfg =
             build_auth_config_inner("pat", Some("dapi123".into()), OAuthParams::default()).unwrap();
-        assert!(matches!(cfg, AuthConfig::Pat { token } if token == "dapi123"));
+        assert!(matches!(cfg, AuthConfig::Pat { token, .. } if token == "dapi123"));
     }
 
     #[test]
@@ -327,11 +332,13 @@ mod tests {
                 client_secret,
                 scopes,
                 token_url_override,
+                identity_federation_client_id,
             } => {
                 assert_eq!(client_id, "id");
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
                 assert_eq!(token_url_override.as_deref(), Some("https://example/token"));
+                assert!(identity_federation_client_id.is_none());
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
@@ -357,6 +364,7 @@ mod tests {
                 token_url_override,
                 callback_timeout,
                 token_cache,
+                identity_federation_client_id,
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 assert!(redirect_port.is_none());
@@ -374,6 +382,7 @@ mod tests {
                     token_cache.is_none(),
                     "Python U2M should defer to the kernel's token-cache default"
                 );
+                assert!(identity_federation_client_id.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

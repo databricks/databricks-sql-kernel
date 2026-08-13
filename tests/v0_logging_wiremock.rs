@@ -85,6 +85,7 @@ async fn logging_config_file_destination_is_written() {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .http(http)
         .logging(logging)
@@ -122,6 +123,7 @@ async fn logging_config_file_destination_is_written() {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .http(http2)
         .logging(logging2)

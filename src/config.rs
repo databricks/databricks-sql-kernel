@@ -297,7 +297,12 @@ impl TokenCacheConfig {
 #[non_exhaustive]
 pub enum AuthConfig {
     /// Personal access token (`dapi…`).
-    Pat { token: String },
+    Pat {
+        token: String,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
+    },
 
     /// OAuth 2.0 machine-to-machine (client credentials grant).
     /// Used for service-principal authentication.
@@ -309,6 +314,9 @@ pub enum AuthConfig {
         /// Token endpoint override. `None` → discover via OIDC at
         /// `<host>/.well-known/oauth-authorization-server`.
         token_url_override: Option<String>,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
     },
 
     /// OAuth 2.0 user-to-machine (authorization code + PKCE, browser
@@ -336,6 +344,9 @@ pub enum AuthConfig {
         /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`]
         /// (enabled, which then requires a passphrase — see that type).
         token_cache: Option<TokenCacheConfig>,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
     },
 
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
@@ -367,9 +378,15 @@ impl AuthConfig {
     /// required-field check lives here so every wrapper rejects a
     /// missing/empty token identically (`ErrorCode::InvalidArgument`)
     /// instead of each re-implementing it at the binding boundary.
-    pub fn pat(token: Option<String>) -> crate::Result<Self> {
+    pub fn pat(
+        token: Option<String>,
+        identity_federation_client_id: Option<String>,
+    ) -> crate::Result<Self> {
         match token {
-            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat { token }),
+            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat {
+                token,
+                identity_federation_client_id,
+            }),
             _ => Err(crate::kernel_error::Error::invalid_argument()
                 .message("PAT auth requires a non-empty access token")),
         }
@@ -384,6 +401,7 @@ impl AuthConfig {
         client_secret: Option<String>,
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
+        identity_federation_client_id: Option<String>,
     ) -> crate::Result<Self> {
         let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
             crate::kernel_error::Error::invalid_argument()
@@ -398,6 +416,7 @@ impl AuthConfig {
             client_secret,
             scopes,
             token_url_override,
+            identity_federation_client_id,
         })
     }
 
@@ -414,6 +433,7 @@ impl AuthConfig {
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
         token_cache: Option<TokenCacheConfig>,
+        identity_federation_client_id: Option<String>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -422,6 +442,26 @@ impl AuthConfig {
             token_url_override,
             callback_timeout,
             token_cache,
+            identity_federation_client_id,
+        }
+    }
+
+    /// SP-wide federation client id attached to the selected base auth flow.
+    pub(crate) fn identity_federation_client_id(&self) -> Option<&str> {
+        match self {
+            Self::Pat {
+                identity_federation_client_id,
+                ..
+            }
+            | Self::OAuthM2M {
+                identity_federation_client_id,
+                ..
+            }
+            | Self::OAuthU2M {
+                identity_federation_client_id,
+                ..
+            } => identity_federation_client_id.as_deref(),
+            Self::OAuthFederation { .. } | Self::External(_) => None,
         }
     }
 }
@@ -447,25 +487,47 @@ pub trait TokenProvider: Send + Sync {
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pat { .. } => f.write_str("Pat { token: <redacted> }"),
+            Self::Pat {
+                identity_federation_client_id,
+                ..
+            } => f
+                .debug_struct("Pat")
+                .field("token", &"<redacted>")
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
+                .finish(),
             Self::OAuthM2M {
-                client_id, scopes, ..
+                client_id,
+                scopes,
+                identity_federation_client_id,
+                ..
             } => f
                 .debug_struct("OAuthM2M")
                 .field("client_id", client_id)
                 .field("client_secret", &"<redacted>")
                 .field("scopes", scopes)
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
                 .finish(),
             Self::OAuthU2M {
                 client_id,
                 redirect_port,
                 scopes,
+                identity_federation_client_id,
                 ..
             } => f
                 .debug_struct("OAuthU2M")
                 .field("client_id", client_id)
                 .field("redirect_port", redirect_port)
                 .field("scopes", scopes)
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
                 .finish(),
             Self::OAuthFederation {
                 subject_token_type,
@@ -1144,18 +1206,6 @@ pub struct SessionConfig {
     /// Required: how to authenticate.
     pub auth: AuthConfig,
 
-    /// SP-wide Workload Identity Federation client id, for mandatory OIDC
-    /// token exchange (BYOT federation). When the authenticated token was
-    /// issued by a party other than this workspace, the kernel exchanges it
-    /// for an in-house Databricks token at `<host>/oidc/v1/token`; this value,
-    /// when set, is sent as `identity_federation_client_id` (SP-wide WIF).
-    /// `None` → BYOT / account-wide WIF, where
-    /// `return_original_token_if_authenticated=true` is sent instead. The
-    /// exchange itself is always attempted (gated only by the token's issuer),
-    /// and falls back to the original token on failure, so this field is not a
-    /// feature toggle. See `auth::oauth::federation`.
-    pub identity_federation_client_id: Option<String>,
-
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate
     /// the *client-side* knobs; this map carries everything else.
@@ -1509,42 +1559,70 @@ mod tests {
 
     #[test]
     fn pat_rejects_missing_or_empty_token() {
-        let err = AuthConfig::pat(None).unwrap_err();
+        let err = AuthConfig::pat(None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("non-empty access token"));
 
-        let err = AuthConfig::pat(Some(String::new())).unwrap_err();
+        let err = AuthConfig::pat(Some(String::new()), None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
     }
 
     #[test]
     fn pat_accepts_non_empty_token() {
-        match AuthConfig::pat(Some("dapi-x".to_string())).unwrap() {
-            AuthConfig::Pat { token } => assert_eq!(token, "dapi-x"),
+        match AuthConfig::pat(
+            Some("dapi-x".to_string()),
+            Some("federation-client".to_string()),
+        )
+        .unwrap()
+        {
+            AuthConfig::Pat {
+                token,
+                identity_federation_client_id,
+            } => {
+                assert_eq!(token, "dapi-x");
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
+            }
             other => panic!("expected Pat, got {other:?}"),
         }
     }
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_id() {
-        let err = AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None).unwrap_err();
+        let err =
+            AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
 
-        let err = AuthConfig::oauth_m2m(Some(String::new()), Some("sec".to_string()), None, None)
-            .unwrap_err();
+        let err = AuthConfig::oauth_m2m(
+            Some(String::new()),
+            Some("sec".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
     }
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_secret() {
-        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None).unwrap_err();
+        let err =
+            AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
 
-        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), Some(String::new()), None, None)
-            .unwrap_err();
+        let err = AuthConfig::oauth_m2m(
+            Some("cid".to_string()),
+            Some(String::new()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
     }
@@ -1556,6 +1634,7 @@ mod tests {
             Some("sec".to_string()),
             Some(vec!["all-apis".to_string()]),
             None,
+            Some("federation-client".to_string()),
         )
         .unwrap()
         {
@@ -1564,14 +1643,48 @@ mod tests {
                 client_secret,
                 scopes,
                 token_url_override,
+                identity_federation_client_id,
             } => {
                 assert_eq!(client_id, "cid");
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
                 assert!(token_url_override.is_none());
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oauth_u2m_carries_identity_federation_client_id() {
+        let auth = AuthConfig::oauth_u2m(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("federation-client".to_string()),
+        );
+
+        assert_eq!(
+            auth.identity_federation_client_id(),
+            Some("federation-client")
+        );
+    }
+
+    #[test]
+    fn oauth_federation_has_no_mandatory_federation_client_id() {
+        let auth = AuthConfig::OAuthFederation {
+            subject_token: "subject-token".to_string(),
+            subject_token_type: "urn:ietf:params:oauth:token-type:jwt".to_string(),
+            audience: "audience".to_string(),
+        };
+
+        assert_eq!(auth.identity_federation_client_id(), None);
     }
 
     // ─── ConnectionConfig parsing ──────────────────────────────────
@@ -1688,6 +1801,7 @@ mod tests {
     fn debug_pat_redacts_token() {
         let c = AuthConfig::Pat {
             token: "dapi_secret".to_string(),
+            identity_federation_client_id: None,
         };
         let s = format!("{c:?}");
         assert!(!s.contains("dapi_secret"), "token leaked: {s}");
@@ -1701,6 +1815,7 @@ mod tests {
             client_secret: "supersecret".to_string(),
             scopes: None,
             token_url_override: None,
+            identity_federation_client_id: None,
         };
         let s = format!("{c:?}");
         assert!(!s.contains("supersecret"), "secret leaked: {s}");
