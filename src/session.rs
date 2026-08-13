@@ -46,7 +46,8 @@
 //! requires catalog-managed tables server-side).
 
 use crate::auth::{
-    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, PersonalAccessToken,
+    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
+    PersonalAccessToken,
 };
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
@@ -1097,8 +1098,30 @@ async fn build_auth_provider(
     host: &str,
     http_client: Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
+    // Build the base provider for the configured auth flow, then wrap it with
+    // mandatory OIDC token exchange (BYOT federation). The wrapper is a no-op
+    // for non-JWT and same-host-issuer tokens, so it is safe to apply
+    // unconditionally across PAT / M2M / U2M. See `auth::oauth::federation`.
+    let base = build_base_auth_provider(auth, host, http_client.clone()).await?;
+    let provider = FederationProvider::new(
+        base,
+        host,
+        auth.identity_federation_client_id().map(str::to_owned),
+        &http_client,
+    )
+    .await?;
+    Ok(Arc::new(provider))
+}
+
+/// Constructs the underlying credential provider for the configured auth flow,
+/// before token-federation wrapping.
+async fn build_base_auth_provider(
+    auth: &AuthConfig,
+    host: &str,
+    http_client: Arc<DatabricksHttpClient>,
+) -> Result<Arc<dyn AuthProvider>> {
     match auth {
-        AuthConfig::Pat { token } => {
+        AuthConfig::Pat { token, .. } => {
             if token.is_empty() {
                 return Err(
                     Error::invalid_argument().message("AuthConfig::Pat token must not be empty")
@@ -1111,6 +1134,7 @@ async fn build_auth_provider(
             client_secret,
             scopes,
             token_url_override,
+            ..
         } => {
             if client_id.is_empty() || client_secret.is_empty() {
                 return Err(Error::invalid_argument().message(
@@ -1138,6 +1162,7 @@ async fn build_auth_provider(
             token_url_override,
             callback_timeout,
             token_cache,
+            ..
         } => {
             // Fill the coupled kernel default bundle for any unset field
             // (databricks-sql-connector / sql offline_access / 8030). Consumers
@@ -1218,6 +1243,7 @@ mod retry_config_tests {
             defaults: None,
             auth: AuthConfig::Pat {
                 token: "dapi-test".to_string(),
+                identity_federation_client_id: None,
             },
             session_conf: Default::default(),
             http,
@@ -1617,6 +1643,7 @@ mod is_open_tests {
             )
             .auth(AuthConfig::Pat {
                 token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
             })
             .open()
             .await
@@ -1668,6 +1695,7 @@ mod is_open_tests {
             )
             .auth(AuthConfig::Pat {
                 token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
             })
             // ignore_transactions defaults to true; be explicit for the test.
             .defaults(DefaultOpts {

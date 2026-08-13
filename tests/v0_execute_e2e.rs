@@ -39,7 +39,10 @@ async fn live_session() -> Session {
 
     Session::builder()
         .http_path(host, path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("Session::open against live workspace")
@@ -862,7 +865,10 @@ async fn live_session_with_complex_json(complex_types_as_json: bool) -> Session 
 
     Session::builder()
         .http_path(host, path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .result(result)
         .open()
         .await

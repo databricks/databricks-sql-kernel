@@ -131,7 +131,8 @@ provider construction is split into `build_auth_provider` (which wraps) and
 `build_base_auth_provider` (which matches the auth flow):
 
 ```
-build_auth_provider(auth, host, identity_federation_client_id, http_client)
+build_auth_provider(auth, host, http_client)
+  ├── identity_federation_client_id = auth.identity_federation_client_id()
   ├── base = build_base_auth_provider(auth, host, http_client)
   │            └── match auth { Pat | OAuthM2M | OAuthU2M => existing construction }
   └── FederationProvider::new(base, host, identity_federation_client_id, http_client)
@@ -192,11 +193,11 @@ We adapt `TokenStore`'s pattern in two ways it doesn't cover: the follower check
 the published entry is for **its** source token (if the upstream credential rotated
 mid-wait, it falls back rather than returning another token's result), and the
 leader **always publishes an outcome** — on failure it stores the original token
-(short TTL) so followers read the same non-breaking fallback instead of spinning to
-a timeout. On any exchange failure every caller uses the original token (spec:
-"continue with the existing JWT token instead of throwing"). The leader's latency
-is bounded by the **Auth-category retry budget** (30s / 3 retries — see
-`build_retry_configs_for_session`), not the global ladder; followers additionally
+with a 60-second retry delay so followers read the same non-breaking fallback
+instead of spinning to a timeout. On any exchange failure every caller uses the
+original token (spec: "continue with the existing JWT token instead of throwing").
+The leader's latency is bounded by the **Auth-category retry budget** (30s / 3
+retries — see `build_retry_configs_for_session`), not the global ladder; followers additionally
 cap their wait so a wedged leader can't hang them indefinitely.
 
 ---
@@ -229,7 +230,7 @@ pub struct FederationProvider {
     token_endpoint: String,        // {host}/oidc/v1/token, built directly
     workspace_host: String,        // normalized host, for iss-host comparison
     identity_federation_client_id: Option<String>,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: Weak<DatabricksHttpClient>,
     runtime_handle: tokio::runtime::Handle,
     cache: RwLock<Option<CacheEntry>>,  // single slot: (source_token, exchanged)
     exchanging: AtomicBool,             // single-flight leader election
@@ -240,10 +241,14 @@ impl FederationProvider {
         inner: Arc<dyn AuthProvider>,
         host: &str,
         identity_federation_client_id: Option<String>,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> Result<Self>;
 }
 ```
+
+The HTTP client owns the installed auth provider, so the federation wrapper
+retains only a weak client reference and does not introduce a cycle for PAT
+sessions.
 
 `get_auth_header()` logic:
 
@@ -265,10 +270,10 @@ impl FederationProvider {
      the original token.
 5. **Leader success** → store `(source, OAuthToken)` (from `expires_in`), return
    `Bearer <new token>`.
-   **Leader failure** → log at `warn!`, store the original token (short TTL) so
-   followers and subsequent callers read the same fallback instead of re-hitting a
-   failing endpoint, and **return the original `header`** (spec's non-breaking
-   fallback). The error is never surfaced to the caller.
+   **Leader failure** → log at `warn!`, store the original token with a 60-second
+   retry delay so followers and subsequent callers read the same fallback instead
+   of re-hitting a failing endpoint, and **return the original `header`** (spec's
+   non-breaking fallback). The error is never surfaced to the caller.
 
 `block_on_in_runtime` uses `block_in_place`, which panics on a **current-thread**
 runtime. Every shipped consumer (pyo3, napi, C ABI) drives the kernel on a
@@ -297,24 +302,26 @@ Add `pub mod jwt;` and `pub mod federation;`; re-export `FederationProvider`.
 
 ### `src/config.rs`
 
-One caller-facing field (no wrapper struct, no `enabled`):
+The supported base-auth variants each carry the optional federation selector:
 
 ```rust
-/// SP-wide Workload Identity Federation client id. `None` → BYOT /
-/// account-wide WIF, where the exchange sends
-/// `return_original_token_if_authenticated=true` instead.
-pub identity_federation_client_id: Option<String>,
+AuthConfig::Pat { token, identity_federation_client_id }
+AuthConfig::OAuthM2M { ..., identity_federation_client_id }
+AuthConfig::OAuthU2M { ..., identity_federation_client_id }
 ```
 
-Placed on `SessionConfig` (top level, since it applies across PAT/M2M/U2M) and
-threaded through the builder.
+`None` selects BYOT / account-wide WIF, where the exchange sends
+`return_original_token_if_authenticated=true`. The reserved
+`AuthConfig::OAuthFederation` variant is unchanged: it represents a separate,
+caller-supplied RFC 8693 flow and is not this mandatory decorator.
 
 ### `src/session.rs`
 
 Split provider construction into `build_auth_provider` (wraps) and
 `build_base_auth_provider` (matches the auth flow), as shown in
-[Integration point](#integration-point). `SessionBuilder` gains an
-`identity_federation_client_id(...)` setter, threaded onto `SessionConfig`.
+[Integration point](#integration-point). `build_auth_provider` reads the
+federation client id from the selected `AuthConfig` variant before wrapping the
+base provider.
 
 ### `src/kernel_error.rs`
 
@@ -322,20 +329,19 @@ No new variant. Exchange failures use existing `Error::unauthenticated()` /
 `Error::network_error()` for the `warn!` log only; they are swallowed into the
 fallback and never returned.
 
-### Bindings — exposing `identity_federation_client_id` on every boundary
+### Bindings — follow-up work
 
 The exchange itself works through all consumers unchanged (it is gated by the
-token issuer, not config), but the SP-wide WIF *selector* must be reachable from
-each surface, or Python / Node / ODBC / Go / C callers can only ever take the
-BYOT / account-wide WIF branch. It is threaded through:
+token issuer, not config). This core change leaves the bindings passing `None`;
+a follow-up will expose the SP-wide WIF selector on each surface:
 
-- **C ABI** (`src/c_abi/session.rs`, consumed by ODBC and Go): new
+- **C ABI** (`src/c_abi/session.rs`, consumed by ODBC and Go): add a
   `kernel_session_config_set_identity_federation_client_id()` setter, stored on
-  `KernelSessionConfig` and forwarded to the builder; declared in
+  `KernelSessionConfig` and attached to the selected `AuthConfig`; declared in
   `include/databricks_kernel.h` (hand-written header).
-- **pyo3** (`pyo3/src/session.rs`): new optional `identity_federation_client_id`
-  keyword on `Session(...)`.
-- **napi** (`napi/src/database.rs`): new optional `identityFederationClientId`
+- **pyo3** (`pyo3/src/session.rs`): add an optional
+  `identity_federation_client_id` keyword on `Session(...)`.
+- **napi** (`napi/src/database.rs`): add an optional `identityFederationClientId`
   field on `ConnectionOptions`; the generated `napi/index.d.ts` is updated by hand.
 
 Each binding stages its own changelog entry (`pyo3/NEXT_CHANGELOG.md`,

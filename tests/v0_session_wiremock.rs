@@ -47,6 +47,7 @@ async fn open_session_against(server: &MockServer) -> databricks_sql_kernel::Res
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .http(http)
         .open()
@@ -231,7 +232,10 @@ async fn missing_auth_returns_invalid_argument() {
 async fn malformed_http_path_surfaces_at_open() {
     let err = Session::builder()
         .http_path("https://h", "/not/a/sql/path")
-        .auth(AuthConfig::Pat { token: "x".into() })
+        .auth(AuthConfig::Pat {
+            token: "x".into(),
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect_err("malformed http_path must fail at open()");
@@ -258,7 +262,10 @@ async fn connection_setter_clears_prior_http_path_parse_error() {
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
                 .expect("override path"),
         )
-        .auth(AuthConfig::Pat { token: "x".into() })
+        .auth(AuthConfig::Pat {
+            token: "x".into(),
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("override should win — open() must succeed");
@@ -281,7 +288,10 @@ async fn http_path_setter_clears_prior_parse_error_on_success() {
     let session = Session::builder()
         .http_path("https://h", "/garbage")
         .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
-        .auth(AuthConfig::Pat { token: "x".into() })
+        .auth(AuthConfig::Pat {
+            token: "x".into(),
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("recovery http_path call should clear the sentinel");
@@ -335,6 +345,7 @@ async fn open_session_with_result_cfg(
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .result(result)
         .open()
@@ -429,6 +440,7 @@ async fn create_session_drops_user_supplied_can_cloud_download() {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .session_conf(session_conf)
         .open()
