@@ -177,17 +177,39 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
 /// non-empty, trimmed type names.
 ///
 /// Empty entries are dropped, so ODBC's "" / whitespace / comma-only
-/// junk (e.g. `""`, `" "`, `",,"`) normalizes to an empty `Vec`. An
-/// empty `Vec` means "all types" (like a NULL arg): the kernel treats
-/// `Some(&[])` the same as `None` (match-all) since #187/#201, so an
-/// empty result needs no collapse to `None` to avoid a match-nothing
-/// bug — the ODBC-specific empty→"all types" convention is preserved
-/// either way.
+/// junk (e.g. `""`, `" "`, `",,"`) normalizes to an empty `Vec`. The
+/// caller MUST collapse an empty `Vec` to `None` before calling
+/// `list_tables`: since hiveserver2 #83 the kernel treats an explicit
+/// `Some(&[])` as match-NONE (zero rows), so passing the empty vec
+/// straight through would turn ODBC's empty→"all types" convention
+/// into a match-nothing bug. See the `.filter(|t| !t.is_empty())` at
+/// the call site.
 fn split_table_types_csv(csv: &str) -> Vec<&str> {
     csv.split(',')
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Map an optional ODBC `table_types` CSV to the kernel's typed filter:
+/// `Some(non-empty types)` to restrict, or `None` to match all types.
+///
+/// ODBC's `SQLTables` treats an empty `TableType` argument as "type not
+/// used to restrict the search" — i.e. all types — and has no way to
+/// express a non-null *empty* type list distinctly (which is why
+/// driver-test's METADATA-035 skips ODBC). So a `None` CSV (null arg) OR
+/// a CSV that splits to zero real types (`""` / `"  "` / `",,"`) both
+/// mean match-all → `None`.
+///
+/// This collapse is load-bearing: since hiveserver2 #83 the kernel treats
+/// an explicit `Some(&[])` as match-NONE (zero rows), so passing the empty
+/// vec straight through would turn ODBC's empty→"all types" convention
+/// into a match-nothing bug. (It restores the guard #223 removed — safe to
+/// drop only while `Some(&[])` == `None`, which #83 reversed.) Only a CSV
+/// with at least one real type reaches `list_tables` as a `Some`.
+fn parse_table_types_filter(csv: Option<&str>) -> Option<Vec<&str>> {
+    csv.map(split_table_types_csv)
+        .filter(|types| !types.is_empty())
 }
 
 /// List tables filtered by catalog (**pattern**), schema / table
@@ -227,7 +249,7 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
             let types_csv = opt_str(table_types_csv, "table_types")?;
-            let types_owned = types_csv.map(split_table_types_csv);
+            let types_owned = parse_table_types_filter(types_csv);
             session
                 .metadata()
                 .list_tables(
@@ -504,9 +526,10 @@ mod tests {
     }
 
     /// ODBC's "" / whitespace / comma-only `table_types` spellings all
-    /// normalize to an empty type list, which `list_tables` treats as
-    /// "all types" (match-all, like a NULL arg) since #187/#201. A
-    /// non-empty CSV parses into its trimmed, non-empty entries.
+    /// normalize to an empty type list. The `list_tables` call site then
+    /// collapses that empty list to `None` (match-all, like a NULL arg),
+    /// since after hiveserver2 #83 an explicit `Some(&[])` means match-NONE.
+    /// A non-empty CSV parses into its trimmed, non-empty entries.
     #[test]
     fn split_table_types_csv_normalizes_empty_and_parses_values() {
         // Empty / whitespace / comma-only junk → empty list (all types).
@@ -522,6 +545,33 @@ mod tests {
         assert_eq!(
             split_table_types_csv(" TABLE ,, VIEW ,"),
             vec!["TABLE", "VIEW"]
+        );
+    }
+
+    /// The empty→`None` collapse at the C-ABI boundary: a null arg AND any
+    /// CSV that splits to zero real types both map to `None` (ODBC
+    /// empty→"all types"), while a CSV with real types maps to `Some`.
+    /// Locks the guard so it isn't dropped again — after hiveserver2 #83 a
+    /// `Some(&[])` reaching the kernel means match-NONE, so an empty ODBC
+    /// `TableType` must NOT reach `list_tables` as `Some(&[])`.
+    #[test]
+    fn parse_table_types_filter_collapses_empty_to_none() {
+        // Null arg (ODBC NULL TableType) → None (all types).
+        assert_eq!(parse_table_types_filter(None), None);
+
+        // Empty / whitespace / comma-only junk → None (all types), NOT
+        // Some(&[]) (which the kernel would treat as match-none).
+        assert_eq!(parse_table_types_filter(Some("")), None);
+        assert_eq!(parse_table_types_filter(Some("   ")), None);
+        assert_eq!(parse_table_types_filter(Some(",")), None);
+        assert_eq!(parse_table_types_filter(Some(",,")), None);
+        assert_eq!(parse_table_types_filter(Some(" , , ")), None);
+
+        // At least one real type → Some(trimmed, non-empty entries).
+        assert_eq!(parse_table_types_filter(Some("TABLE")), Some(vec!["TABLE"]));
+        assert_eq!(
+            parse_table_types_filter(Some(" TABLE ,, VIEW ,")),
+            Some(vec!["TABLE", "VIEW"])
         );
     }
 }
