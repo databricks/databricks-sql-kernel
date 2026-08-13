@@ -1074,7 +1074,7 @@ async fn build_auth_provider(
         base,
         host,
         auth.identity_federation_client_id().map(str::to_owned),
-        http_client,
+        &http_client,
     )
     .await?;
     Ok(Arc::new(provider))

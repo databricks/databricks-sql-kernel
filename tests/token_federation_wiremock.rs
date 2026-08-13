@@ -114,13 +114,14 @@ async fn foreign_issuer_is_exchanged() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&jwt_with_issuer(
             "https://login.microsoftonline.com/tenant/v2.0",
         )),
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -147,11 +148,12 @@ async fn same_host_issuer_passes_through() {
     let issuer = format!("{}/oidc", server.uri());
     let inner_token = jwt_with_issuer(&issuer);
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&inner_token),
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -170,11 +172,12 @@ async fn non_jwt_pat_passes_through() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing("dapiabc123def456"), // opaque PAT, not a JWT
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -197,11 +200,12 @@ async fn sp_wide_wif_sends_identity_federation_client_id() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&jwt_with_issuer("https://external-idp.example.com")),
         &server.uri(),
         Some("my-sp-client-id".to_string()),
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -266,11 +270,12 @@ async fn byot_sends_return_original_token_flag() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&jwt_with_issuer("https://external-idp.example.com")),
         &server.uri(),
         None, // no client id → BYOT / account-wide WIF
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -289,11 +294,12 @@ async fn exchange_http_401_falls_back_to_original() {
         .await;
 
     let inner_token = jwt_with_issuer("https://external-idp.example.com");
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&inner_token),
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -314,11 +320,12 @@ async fn exchange_http_500_falls_back_to_original() {
         .await;
 
     let inner_token = jwt_with_issuer("https://external-idp.example.com");
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&inner_token),
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -339,11 +346,12 @@ async fn exchanged_token_is_cached_across_calls() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = FederationProvider::new(
         inner_bearing(&jwt_with_issuer("https://external-idp.example.com")),
         &server.uri(),
         None,
-        no_retry_http_client(),
+        &http_client,
     )
     .await
     .expect("provider");
@@ -371,14 +379,11 @@ async fn representative_databricks_issuer_passes_through() {
     let workspace = "https://adb-5484724900402942.2.azuredatabricks.net";
     let inner_token = jwt_with_issuer(&format!("{workspace}/oidc"));
 
-    let provider = FederationProvider::new(
-        inner_bearing(&inner_token),
-        workspace,
-        None,
-        no_retry_http_client(),
-    )
-    .await
-    .expect("provider");
+    let http_client = no_retry_http_client();
+    let provider =
+        FederationProvider::new(inner_bearing(&inner_token), workspace, None, &http_client)
+            .await
+            .expect("provider");
 
     // Same host (modulo scheme + `/oidc`) ⇒ pass through unchanged, no HTTP.
     assert_eq!(
@@ -424,12 +429,13 @@ async fn concurrent_cold_callers_coalesce_to_one_exchange() {
         .mount(&server)
         .await;
 
+    let http_client = no_retry_http_client();
     let provider = Arc::new(
         FederationProvider::new(
             inner_bearing(&jwt_with_issuer("https://external-idp.example.com")),
             &server.uri(),
             None,
-            no_retry_http_client(),
+            &http_client,
         )
         .await
         .expect("provider"),
@@ -458,12 +464,13 @@ async fn degraded_endpoint_falls_back_for_all_concurrent_callers() {
         .await;
 
     let inner_token = jwt_with_issuer("https://external-idp.example.com");
+    let http_client = bounded_retry_http_client();
     let provider = Arc::new(
         FederationProvider::new(
             inner_bearing(&inner_token),
             &server.uri(),
             None,
-            bounded_retry_http_client(),
+            &http_client,
         )
         .await
         .expect("provider"),

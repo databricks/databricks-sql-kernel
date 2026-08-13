@@ -230,7 +230,7 @@ pub struct FederationProvider {
     token_endpoint: String,        // {host}/oidc/v1/token, built directly
     workspace_host: String,        // normalized host, for iss-host comparison
     identity_federation_client_id: Option<String>,
-    http_client: Arc<DatabricksHttpClient>,
+    http_client: Weak<DatabricksHttpClient>,
     runtime_handle: tokio::runtime::Handle,
     cache: RwLock<Option<CacheEntry>>,  // single slot: (source_token, exchanged)
     exchanging: AtomicBool,             // single-flight leader election
@@ -241,10 +241,14 @@ impl FederationProvider {
         inner: Arc<dyn AuthProvider>,
         host: &str,
         identity_federation_client_id: Option<String>,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> Result<Self>;
 }
 ```
+
+The HTTP client owns the installed auth provider, so the federation wrapper
+retains only a weak client reference and does not introduce a cycle for PAT
+sessions.
 
 `get_auth_header()` logic:
 

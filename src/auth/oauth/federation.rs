@@ -62,7 +62,7 @@ use crate::klog::{debug, warn};
 use crate::util::runtime::block_on_in_runtime;
 use serde::Deserialize;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, Weak};
 use std::time::Duration;
 use tokio::runtime::{Handle as RuntimeHandle, RuntimeFlavor};
 
@@ -103,8 +103,10 @@ pub struct FederationProvider {
     /// account-wide WIF, where the exchange sends
     /// `return_original_token_if_authenticated=true` instead.
     identity_federation_client_id: Option<String>,
-    /// Shared HTTP client used for the exchange request.
-    http_client: Arc<DatabricksHttpClient>,
+    /// Shared HTTP client used for the exchange request. Weak because the
+    /// client owns this provider after two-phase auth initialization, avoiding
+    /// a new ownership cycle for PAT sessions.
+    http_client: Weak<DatabricksHttpClient>,
     /// Runtime handle captured at construction so the sync `get_auth_header`
     /// can drive the async exchange (see [`block_on_in_runtime`]).
     runtime_handle: RuntimeHandle,
@@ -146,12 +148,14 @@ impl FederationProvider {
     /// `https://my-workspace.cloud.databricks.com`); it is used to build the
     /// exchange endpoint and to recognize in-house issuers. `async` so it can
     /// capture the current tokio runtime handle, matching the other OAuth
-    /// providers.
+    /// providers. The caller must retain `http_client`; the provider stores a
+    /// weak reference so the PAT wrapper does not introduce a cycle after the
+    /// client installs the provider.
     pub async fn new(
         inner: Arc<dyn AuthProvider>,
         host: &str,
         identity_federation_client_id: Option<String>,
-        http_client: Arc<DatabricksHttpClient>,
+        http_client: &Arc<DatabricksHttpClient>,
     ) -> Result<Self> {
         let host = host.trim_end_matches('/');
         Ok(Self {
@@ -159,7 +163,7 @@ impl FederationProvider {
             token_endpoint: format!("{host}{TOKEN_EXCHANGE_PATH}"),
             workspace_host: host_of(host).unwrap_or_default(),
             identity_federation_client_id,
-            http_client,
+            http_client: Arc::downgrade(http_client),
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
             exchanging: AtomicBool::new(false),
@@ -179,6 +183,9 @@ impl FederationProvider {
     /// Performs the token exchange and returns the in-house token. Errors here
     /// are turned into the pass-through fallback by the caller.
     async fn exchange(&self, source_token: &str) -> Result<OAuthToken> {
+        let http_client = self.http_client.upgrade().ok_or_else(|| {
+            Error::invalid_state().message("Token federation HTTP client is no longer available")
+        })?;
         let mut form: Vec<(&str, &str)> = vec![
             ("grant_type", GRANT_TYPE_JWT_BEARER),
             ("assertion", source_token),
@@ -192,8 +199,7 @@ impl FederationProvider {
             None => form.push(("return_original_token_if_authenticated", "true")),
         }
 
-        let request = self
-            .http_client
+        let request = http_client
             .inner()
             .post(&self.token_endpoint)
             .header("Accept", "*/*")
@@ -208,8 +214,7 @@ impl FederationProvider {
         // the kernel bearer. `AuthTokenRequest` is idempotent, so the
         // Auth-category ladder retries with backoff on all 5xx / 429 / 408 and
         // timeouts — everything except the fixed non-retryable 4xx set.
-        let response = self
-            .http_client
+        let response = http_client
             .execute_without_auth(request, RequestType::AuthTokenRequest)
             .await?;
 
@@ -519,7 +524,7 @@ mod tests {
             token_endpoint: format!("{host}{TOKEN_EXCHANGE_PATH}"),
             workspace_host: host_of(host).unwrap_or_default(),
             identity_federation_client_id: None,
-            http_client,
+            http_client: Arc::downgrade(&http_client),
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
             exchanging: AtomicBool::new(false),
@@ -561,5 +566,30 @@ mod tests {
         // `dapi…` is not a JWT → no issuer → pass through, no HTTP call.
         let p = provider_for("https://ws.cloud.databricks.com", "Bearer dapiabc123");
         assert_eq!(p.get_auth_header().unwrap(), "Bearer dapiabc123");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn pat_wrapper_does_not_retain_http_client() {
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(Default::default()).expect("http client"),
+        );
+        let weak_http_client = Arc::downgrade(&http_client);
+        let provider = Arc::new(
+            FederationProvider::new(
+                Arc::new(StubProvider("Bearer dapiabc123".to_string())),
+                "https://ws.cloud.databricks.com",
+                None,
+                &http_client,
+            )
+            .await
+            .expect("provider"),
+        );
+        let weak_provider = Arc::downgrade(&provider);
+        http_client.set_auth_provider(provider);
+
+        drop(http_client);
+
+        assert!(weak_http_client.upgrade().is_none());
+        assert!(weak_provider.upgrade().is_none());
     }
 }
