@@ -16,7 +16,7 @@
 //!
 //! This module implements a lightweight HTTP server that listens on localhost
 //! for OAuth redirect callbacks from the browser. The server:
-//! - Binds to a configurable port (default 8020)
+//! - Binds to a configurable port (default 8030)
 //! - Validates the state parameter for CSRF protection
 //! - Extracts the authorization code from query parameters
 //! - Returns a simple HTML page to the browser
@@ -74,8 +74,8 @@ enum CallbackResult {
 /// use std::time::Duration;
 ///
 /// # async fn example() -> databricks_sql_kernel::Result<()> {
-/// // Start callback server on port 8020
-/// let server = CallbackServer::new(8020).await?;
+/// // Start callback server on port 8030
+/// let server = CallbackServer::new(8030).await?;
 /// let redirect_uri = server.redirect_uri();
 /// println!("Redirect URI: {}", redirect_uri);
 ///
@@ -112,7 +112,7 @@ impl CallbackServer {
     ///
     /// # Arguments
     ///
-    /// * `port` - Port number to listen on (typically 8020)
+    /// * `port` - Port number to listen on (typically 8030)
     ///
     /// # Returns
     ///
@@ -158,7 +158,8 @@ impl CallbackServer {
     ///
     /// This URI should be used when constructing the OAuth authorization URL.
     /// The format is `http://localhost:{port}` (matching the redirect URI
-    /// registered for the `databricks-cli` OAuth application).
+    /// registered for the kernel's default U2M OAuth application,
+    /// `databricks-sql-connector`, at `http://localhost:8030`).
     pub fn redirect_uri(&self) -> String {
         format!("http://localhost:{}", self.port)
     }

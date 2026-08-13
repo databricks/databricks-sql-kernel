@@ -289,9 +289,9 @@ impl TokenCacheConfig {
 ///
 /// Optional fields default to sensible values when set to `None`:
 /// - OAuth scopes default to `["all-apis"]` for M2M and
-///   `["all-apis", "offline_access"]` for U2M.
-/// - U2M `redirect_port` defaults to `8020`.
-/// - U2M `client_id` defaults to `"databricks-cli"`.
+///   `["sql", "offline_access"]` for U2M.
+/// - U2M `redirect_port` defaults to `8030`.
+/// - U2M `client_id` defaults to `"databricks-sql-connector"`.
 /// - `token_url_override` defaults to OIDC discovery against the
 ///   workspace host.
 #[non_exhaustive]
@@ -317,13 +317,14 @@ pub enum AuthConfig {
     /// authorize endpoint, and exchanges the returned code for a
     /// token.
     OAuthU2M {
-        /// OAuth client ID. `None` → `"databricks-cli"` (the public
-        /// CLI client registered on every workspace).
+        /// OAuth client ID. `None` → `"databricks-sql-connector"` (the
+        /// default OAuth app, shared by the Node and Go drivers).
         client_id: Option<String>,
         /// Localhost port for the OAuth callback listener. `None` →
-        /// `8020`.
+        /// `8030` (the redirect port registered for
+        /// `databricks-sql-connector`).
         redirect_port: Option<u16>,
-        /// OAuth scopes. `None` → `["all-apis", "offline_access"]`
+        /// OAuth scopes. `None` → `["sql", "offline_access"]`
         /// (the `offline_access` scope is required to receive a
         /// refresh token, which the kernel caches and refreshes
         /// transparently).
@@ -402,8 +403,8 @@ impl AuthConfig {
     }
 
     /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
-    /// U2M fields are optional — the kernel fills `databricks-cli` /
-    /// port 8020 / default scopes when omitted — so this performs no
+    /// U2M fields are optional — the kernel fills `databricks-sql-connector` /
+    /// port 8030 / `sql offline_access` when omitted — so this performs no
     /// validation and exists for symmetry with [`AuthConfig::pat`] /
     /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
     /// uniformly.

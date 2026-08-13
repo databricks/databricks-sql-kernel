@@ -1057,6 +1057,39 @@ fn result_to_post_process_options(
     }
 }
 
+/// Kernel default U2M OAuth client id. The default `{client_id, scopes,
+/// redirect_port}` form one coupled bundle (each OAuth app is registered with
+/// its own redirect URI): the `databricks-sql-connector` app, shared by the
+/// Node and Go drivers. See PECOBLR-4039.
+const DEFAULT_U2M_CLIENT_ID: &str = "databricks-sql-connector";
+/// Redirect port registered for [`DEFAULT_U2M_CLIENT_ID`].
+const DEFAULT_U2M_REDIRECT_PORT: u16 = 8030;
+
+/// Scopes registered for [`DEFAULT_U2M_CLIENT_ID`] (`sql offline_access`).
+fn default_u2m_scopes() -> Vec<String> {
+    vec!["sql".to_string(), "offline_access".to_string()]
+}
+
+/// Fill the kernel default U2M bundle for any field the caller left unset.
+///
+/// Extracted from [`build_auth_provider`] so the defaulting is unit-testable
+/// without OIDC discovery. Because the bundle is coupled, a caller overriding
+/// `client_id` for a different OAuth app must also supply the matching
+/// `redirect_port` (and usually `scopes`).
+fn resolve_u2m_bundle(
+    client_id: Option<&str>,
+    redirect_port: Option<u16>,
+    scopes: Option<&[String]>,
+) -> (String, u16, Vec<String>) {
+    (
+        client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
+        redirect_port.unwrap_or(DEFAULT_U2M_REDIRECT_PORT),
+        scopes
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(default_u2m_scopes),
+    )
+}
+
 /// Build the auth provider for a given [`AuthConfig`]. `host` is the
 /// workspace URL — used for OIDC discovery on M2M / U2M flows.
 async fn build_auth_provider(
@@ -1106,11 +1139,11 @@ async fn build_auth_provider(
             callback_timeout,
             token_cache,
         } => {
-            let client_id = client_id.as_deref().unwrap_or("databricks-cli");
-            let redirect_port = redirect_port.unwrap_or(8020);
-            let scopes = scopes
-                .clone()
-                .unwrap_or_else(|| vec!["all-apis".to_string(), "offline_access".to_string()]);
+            // Fill the coupled kernel default bundle for any unset field
+            // (databricks-sql-connector / sql offline_access / 8030). Consumers
+            // using a different app override the whole bundle. See PECOBLR-4039.
+            let (client_id, redirect_port, scopes) =
+                resolve_u2m_bundle(client_id.as_deref(), *redirect_port, scopes.as_deref());
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
             // `Some(passphrase)` enables the on-disk cache, `None` disables
             // it. When the cache is on but the caller supplied no passphrase,
@@ -1123,7 +1156,7 @@ async fn build_auth_provider(
                 .map(|p| p.into_owned());
             let provider = AuthorizationCodeProvider::new_with_full_config(
                 host,
-                client_id,
+                &client_id,
                 http_client,
                 scopes,
                 redirect_port,
@@ -1138,6 +1171,36 @@ async fn build_auth_provider(
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
             .message("AuthConfig::External is reserved; v0 wires PAT + OAuthM2M + OAuthU2M only")),
+    }
+}
+
+#[cfg(test)]
+mod u2m_default_tests {
+    use super::*;
+
+    #[test]
+    fn u2m_default_bundle_is_connector_sql_8030() {
+        // Caller omits everything → kernel default databricks-sql-connector
+        // app bundle (PECOBLR-4039).
+        let (client_id, port, scopes) = resolve_u2m_bundle(None, None, None);
+        assert_eq!(client_id, "databricks-sql-connector");
+        assert_eq!(port, 8030);
+        assert_eq!(
+            scopes,
+            vec!["sql".to_string(), "offline_access".to_string()]
+        );
+    }
+
+    #[test]
+    fn u2m_bundle_honours_caller_overrides() {
+        // A consumer overriding for a different OAuth app supplies the whole
+        // coupled bundle; each field is threaded through verbatim.
+        let custom = vec!["all-apis".to_string()];
+        let (client_id, port, scopes) =
+            resolve_u2m_bundle(Some("databricks-sql-python"), Some(8020), Some(&custom));
+        assert_eq!(client_id, "databricks-sql-python");
+        assert_eq!(port, 8020);
+        assert_eq!(scopes, custom);
     }
 }
 

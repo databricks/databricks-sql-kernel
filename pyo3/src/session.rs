@@ -369,7 +369,11 @@ impl Session {
             target: crate::logging::PYO3_LOG_TARGET,
             "Session.attach_async_statement: re-attaching by id (GIL released)"
         );
-        let exec = run_kernel!(py, runtime, inner.session.attach_async_statement(statement_id))?;
+        let exec = run_kernel!(
+            py,
+            runtime,
+            inner.session.attach_async_statement(statement_id)
+        )?;
         Ok(ExecutedAsyncStatement::new(exec, runtime))
     }
 
