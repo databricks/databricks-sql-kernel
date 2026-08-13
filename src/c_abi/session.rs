@@ -926,11 +926,11 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             };
 
             let auth = match auth {
-                AuthSpec::Pat { token } => AuthConfig::pat(Some(token), None)?,
+                AuthSpec::Pat { token } => AuthConfig::pat(Some(token))?,
                 AuthSpec::OAuthM2M {
                     client_id,
                     client_secret,
-                } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None, None)?,
+                } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None)?,
                 AuthSpec::OAuthU2M {
                     client_id,
                     redirect_port,
@@ -942,7 +942,6 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     None,
                     None,
                     Some(token_cache),
-                    None,
                 ),
             };
 

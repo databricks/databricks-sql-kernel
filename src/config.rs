@@ -378,14 +378,11 @@ impl AuthConfig {
     /// required-field check lives here so every wrapper rejects a
     /// missing/empty token identically (`ErrorCode::InvalidArgument`)
     /// instead of each re-implementing it at the binding boundary.
-    pub fn pat(
-        token: Option<String>,
-        identity_federation_client_id: Option<String>,
-    ) -> crate::Result<Self> {
+    pub fn pat(token: Option<String>) -> crate::Result<Self> {
         match token {
             Some(token) if !token.is_empty() => Ok(AuthConfig::Pat {
                 token,
-                identity_federation_client_id,
+                identity_federation_client_id: None,
             }),
             _ => Err(crate::kernel_error::Error::invalid_argument()
                 .message("PAT auth requires a non-empty access token")),
@@ -401,7 +398,6 @@ impl AuthConfig {
         client_secret: Option<String>,
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
-        identity_federation_client_id: Option<String>,
     ) -> crate::Result<Self> {
         let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
             crate::kernel_error::Error::invalid_argument()
@@ -416,7 +412,7 @@ impl AuthConfig {
             client_secret,
             scopes,
             token_url_override,
-            identity_federation_client_id,
+            identity_federation_client_id: None,
         })
     }
 
@@ -433,7 +429,6 @@ impl AuthConfig {
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
         token_cache: Option<TokenCacheConfig>,
-        identity_federation_client_id: Option<String>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -442,7 +437,7 @@ impl AuthConfig {
             token_url_override,
             callback_timeout,
             token_cache,
-            identity_federation_client_id,
+            identity_federation_client_id: None,
         }
     }
 
@@ -1559,31 +1554,23 @@ mod tests {
 
     #[test]
     fn pat_rejects_missing_or_empty_token() {
-        let err = AuthConfig::pat(None, None).unwrap_err();
+        let err = AuthConfig::pat(None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("non-empty access token"));
 
-        let err = AuthConfig::pat(Some(String::new()), None).unwrap_err();
+        let err = AuthConfig::pat(Some(String::new())).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
     }
 
     #[test]
     fn pat_accepts_non_empty_token() {
-        match AuthConfig::pat(
-            Some("dapi-x".to_string()),
-            Some("federation-client".to_string()),
-        )
-        .unwrap()
-        {
+        match AuthConfig::pat(Some("dapi-x".to_string())).unwrap() {
             AuthConfig::Pat {
                 token,
                 identity_federation_client_id,
             } => {
                 assert_eq!(token, "dapi-x");
-                assert_eq!(
-                    identity_federation_client_id.as_deref(),
-                    Some("federation-client")
-                );
+                assert!(identity_federation_client_id.is_none());
             }
             other => panic!("expected Pat, got {other:?}"),
         }
@@ -1591,38 +1578,24 @@ mod tests {
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_id() {
-        let err =
-            AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None, None).unwrap_err();
+        let err = AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
 
-        let err = AuthConfig::oauth_m2m(
-            Some(String::new()),
-            Some("sec".to_string()),
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
+        let err = AuthConfig::oauth_m2m(Some(String::new()), Some("sec".to_string()), None, None)
+            .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
     }
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_secret() {
-        let err =
-            AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None, None).unwrap_err();
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
 
-        let err = AuthConfig::oauth_m2m(
-            Some("cid".to_string()),
-            Some(String::new()),
-            None,
-            None,
-            None,
-        )
-        .unwrap_err();
+        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), Some(String::new()), None, None)
+            .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
     }
@@ -1634,7 +1607,6 @@ mod tests {
             Some("sec".to_string()),
             Some(vec!["all-apis".to_string()]),
             None,
-            Some("federation-client".to_string()),
         )
         .unwrap()
         {
@@ -1649,31 +1621,50 @@ mod tests {
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
                 assert!(token_url_override.is_none());
-                assert_eq!(
-                    identity_federation_client_id.as_deref(),
-                    Some("federation-client")
-                );
+                assert!(identity_federation_client_id.is_none());
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
     }
 
     #[test]
-    fn oauth_u2m_carries_identity_federation_client_id() {
-        let auth = AuthConfig::oauth_u2m(
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some("federation-client".to_string()),
-        );
+    fn oauth_u2m_defaults_identity_federation_client_id() {
+        let auth = AuthConfig::oauth_u2m(None, None, None, None, None, None);
 
-        assert_eq!(
-            auth.identity_federation_client_id(),
-            Some("federation-client")
-        );
+        assert_eq!(auth.identity_federation_client_id(), None);
+    }
+
+    #[test]
+    fn auth_variants_carry_identity_federation_client_id() {
+        let auths = [
+            AuthConfig::Pat {
+                token: "token".to_string(),
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+            AuthConfig::OAuthM2M {
+                client_id: "cid".to_string(),
+                client_secret: "secret".to_string(),
+                scopes: None,
+                token_url_override: None,
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+            AuthConfig::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: None,
+                token_url_override: None,
+                callback_timeout: None,
+                token_cache: None,
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+        ];
+
+        for auth in auths {
+            assert_eq!(
+                auth.identity_federation_client_id(),
+                Some("federation-client")
+            );
+        }
     }
 
     #[test]
