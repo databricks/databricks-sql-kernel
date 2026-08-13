@@ -73,6 +73,10 @@ impl Session {
     /// OAuth is kernel-owned: the kernel acquires and transparently
     /// refreshes tokens itself.
     ///
+    /// `identity_federation_client_id` selects SP-wide Workload Identity
+    /// Federation during mandatory token exchange. Omit it for BYOT /
+    /// account-wide WIF.
+    ///
     /// TLS: all knobs are optional relaxations / additions on top of
     /// the secure default (validate system trust store, verify chain
     /// + hostname). `tls_ca_cert` adds a PEM CA bundle (bytes);
@@ -118,6 +122,7 @@ impl Session {
         token_url=None,
         redirect_port=None,
         oauth_callback_timeout_secs=None,
+        identity_federation_client_id=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
         tls_skip_hostname_verify=false,
@@ -147,6 +152,7 @@ impl Session {
         token_url: Option<String>,
         redirect_port: Option<u16>,
         oauth_callback_timeout_secs: Option<u64>,
+        identity_federation_client_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
         tls_skip_hostname_verify: bool,
@@ -193,6 +199,7 @@ impl Session {
             token_url,
             redirect_port,
             callback_timeout_secs: oauth_callback_timeout_secs,
+            identity_federation_client_id,
         };
         let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;
 

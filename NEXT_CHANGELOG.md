@@ -38,6 +38,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `identity_federation_client_id` fields on the PAT, M2M, and U2M `AuthConfig`
   variants select SP-wide WIF; unset means BYOT / account-wide WIF. Follows the
   ADBC wire contract (`grant_type=jwt-bearer`, `assertion`, `scope=sql`).
+- Auth constructors now accept the optional federation client id directly;
+  the C ABI exposes it through
+  `kernel_session_config_set_identity_federation_client_id()`.
 
 ### Updated
 

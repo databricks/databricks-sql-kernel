@@ -249,6 +249,12 @@ KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
                                                     uint16_t redirect_port,
                                                     const char* scopes);
 
+/* Optional SP-wide Workload Identity Federation client id used by mandatory
+ * token exchange. Unset selects BYOT / account-wide WIF. */
+KernelStatusCode
+kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* config,
+                                                        const char* client_id);
+
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
  * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
  * reserved keys are instead CLIENT-ONLY: they tune the kernel locally, are
