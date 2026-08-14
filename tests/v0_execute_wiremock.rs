@@ -26,8 +26,8 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, Session,
-    TypedValue,
+    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig,
+    Session, TypedValue,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -44,10 +44,47 @@ async fn open_session(server: &MockServer) -> Session {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .open()
         .await
         .expect("Session::open should succeed")
+}
+
+/// Open a session with a custom [`ResultConfig`]. Used by the
+/// disposition tests below to drive `cloudfetch_enabled`.
+async fn open_session_with_result(server: &MockServer, result: ResultConfig) -> Session {
+    Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .open()
+        .await
+        .expect("Session::open should succeed")
+}
+
+/// Read the `disposition` sent on the recorded POST /statements request.
+async fn recorded_execute_disposition(server: &MockServer) -> String {
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available");
+    let exec = recorded
+        .iter()
+        .find(|r| r.url.path() == "/api/2.0/sql/statements" && r.method.as_str() == "POST")
+        .expect("a POST /statements request was made");
+    let body: serde_json::Value =
+        serde_json::from_slice(&exec.body).expect("execute body must be valid JSON");
+    body.get("disposition")
+        .and_then(|v| v.as_str())
+        .expect("execute request must carry a disposition")
+        .to_string()
 }
 
 async fn mount_create_session(server: &MockServer) {
@@ -140,12 +177,53 @@ fn succeeded_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
     .to_string()
 }
 
+/// Like [`succeeded_inline_body`] but reports `status.state == CLOSED`.
+/// This is the inline direct-result fast path (a quick `SELECT 1` where
+/// the kernel omits `wait_timeout`): the server auto-closes the statement
+/// and returns `CLOSED`, so the kernel must NOT issue a follow-up
+/// `CloseStatement` (DELETE) on it. See issue #168 (CLOUDFETCH-013).
+fn closed_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+    succeeded_inline_body(statement_id, batch)
+        .replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
+}
+
 fn running_body(statement_id: &str) -> String {
     json!({
         "statement_id": statement_id,
         "status": { "state": "RUNNING" },
     })
     .to_string()
+}
+
+/// Poll `server.received_requests()` until `expected` `DELETE`s to the
+/// given statement endpoint are observed, or `timeout` elapses; returns
+/// the final observed count. Mirrors the metadata suite's helper: for a
+/// positive expectation it waits only as long as needed, and for a
+/// negative expectation (`expected == 0`) it still gives an
+/// erroneously-spawned close the full `timeout` to reach the wire but
+/// breaks early the instant one appears, so the negative assertion stays
+/// reliably able to fail under CI load.
+async fn wait_for_close_delete(
+    server: &MockServer,
+    statement_id: &str,
+    expected: usize,
+    timeout: std::time::Duration,
+) -> usize {
+    let delete_path = format!("/api/2.0/sql/statements/{statement_id}");
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        let count = server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|r| r.method == wiremock::http::Method::DELETE && r.url.path() == delete_path)
+            .count();
+        if count >= expected.max(1) || tokio::time::Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
@@ -252,6 +330,68 @@ async fn execute_succeeded_inline_returns_one_row() {
         1
     );
     exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_with_cloudfetch_enabled_sends_inline_or_external_links_disposition() {
+    // Default (cloudfetch_enabled=true): the ExecuteStatement disposition
+    // must be INLINE_OR_EXTERNAL_LINKS so the server may return CloudFetch
+    // external links.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-cf-on", &batch)).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let mut exec = stmt.execute().await.expect("execute");
+    drain(exec.result_stream_mut()).await;
+    exec.close().await.expect("close");
+
+    assert_eq!(
+        recorded_execute_disposition(&server).await,
+        "INLINE_OR_EXTERNAL_LINKS",
+    );
+}
+
+#[tokio::test]
+async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
+    // Regression test for issue #196. With cloudfetch_enabled=false the
+    // ExecuteStatement disposition must be INLINE — this is how the kernel
+    // (like the JDBC / Thrift reference drivers) disables cloud-fetch on
+    // SEA, NOT via a `can_cloud_download` session conf (which SEA rejects
+    // at ExecuteStatement with CONFIG_NOT_AVAILABLE). The server then
+    // serves results inline and the statement succeeds.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = int64_batch("n", vec![7]);
+    mount_execute(&server, succeeded_inline_body("stmt-cf-off", &batch)).await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let mut exec = stmt
+        .execute()
+        .await
+        .expect("execute must succeed inline with cloudfetch disabled");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        7
+    );
+    exec.close().await.expect("close");
+
+    assert_eq!(recorded_execute_disposition(&server).await, "INLINE");
 }
 
 #[tokio::test]
@@ -1016,4 +1156,107 @@ async fn execute_cloudfetch_chunk0_failure_closes_statement() {
             .map(|r| format!("{} {}", r.method, r.url.path()))
             .collect::<Vec<_>>(),
     );
+}
+
+// ─── CloseStatement / status.state==CLOSED handling (issue #168) ───
+
+/// Regression for issue #168 (extended by CLOUDFETCH-013): when the
+/// `ExecuteStatement` response for a *regular* query already reports
+/// `status.state == CLOSED` (a `SELECT 1` delivered inline via direct
+/// results, where the server auto-closes and returns `CLOSED`), the
+/// statement is closed server-side and the kernel must NOT issue a
+/// redundant `DELETE /api/2.0/sql/statements/<id>` (CloseStatement) on
+/// `ExecutedStatement::close()` or on drop. Mirrors the metadata suite's
+/// `metadata_closed_response_skips_close_statement`.
+#[tokio::test]
+async fn execute_closed_inline_skips_close_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    // Inline result with status.state == CLOSED — server already closed it.
+    mount_execute(&server, closed_inline_body("stmt-closed", &batch)).await;
+
+    // Scoped expectation: NO DELETE on the statement endpoint.
+    let _no_close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-closed"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute");
+        let batches = drain(exec.result_stream_mut()).await;
+        assert_eq!(batches.len(), 1);
+        // An explicit close() on a CLOSED statement must also be a no-op.
+        exec.close().await.expect("close");
+        // exec (and stmt) drop here — a redundant close guard would fire now.
+    }
+
+    // Give any (erroneously) spawned fire-and-forget close the full window to
+    // reach the wire, but break early the instant one appears so the negative
+    // assertion stays reliably able to fail under CI load.
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-closed",
+        0,
+        std::time::Duration::from_millis(500),
+    )
+    .await;
+    assert_eq!(closes, 0, "CLOSED response must not trigger CloseStatement");
+    // `_no_close` also verifies expect(0) when it drops at end of scope.
+}
+
+/// Regression-guard for issue #168's fix on the regular-query path: when
+/// the `ExecuteStatement` response reports a non-CLOSED terminal state
+/// (`SUCCEEDED`), the server still owns the statement, so the kernel MUST
+/// still issue exactly one `CloseStatement` (DELETE) on close/drop. Ensures
+/// the CLOSED-skip does not over-correct and leak a live server statement.
+#[tokio::test]
+async fn execute_succeeded_inline_still_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    // Inline result with status.state == SUCCEEDED — server still owns it.
+    mount_execute(&server, succeeded_inline_body("stmt-succeeded", &batch)).await;
+
+    // Scoped expectation: exactly one DELETE on the statement endpoint.
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-succeeded"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute");
+        let _ = drain(exec.result_stream_mut()).await;
+        exec.close().await.expect("close");
+        // exec drops here — the close guard must fire the DELETE.
+    }
+
+    // Poll until the fire-and-forget close hits the wire (bounded by a
+    // timeout) rather than assuming it lands within a fixed sleep.
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-succeeded",
+        1,
+        std::time::Duration::from_millis(2000),
+    )
+    .await;
+    assert_eq!(
+        closes, 1,
+        "SUCCEEDED response must trigger exactly one CloseStatement"
+    );
+    // `_close` also verifies expect(1) when it drops at end of scope.
 }

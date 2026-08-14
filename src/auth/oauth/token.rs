@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 /// Expiry buffer: tokens are considered expired when remaining TTL < 40 seconds.
 /// This 40s buffer matches the Python SDK and accounts for clock skew and network latency.
 /// Azure rejects tokens within 30s of expiry, so 40s provides a safe margin.
-const EXPIRY_BUFFER_SECONDS: i64 = 40;
+pub(super) const EXPIRY_BUFFER_SECONDS: i64 = 40;
 
 /// Maximum stale threshold: 20 minutes.
 /// The stale threshold is min(initial_TTL * 0.5, 20 minutes).

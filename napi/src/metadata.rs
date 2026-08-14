@@ -152,7 +152,17 @@ impl Connection {
         .await
     }
 
-    /// Tables filtered by catalog (exact), schema (pattern), table (pattern).
+    /// Tables filtered by catalog (**pattern**), schema (pattern), table
+    /// (pattern).
+    ///
+    /// The catalog is an ODBC/JDBC LIKE pattern (`%` / `_`), matching
+    /// Thrift `getTables`: a wildcard catalog matches multiple catalogs;
+    /// a literal name (or an escaped `\_` / `\%`) takes the fast exact
+    /// path. `undefined`/omitted catalog means "all catalogs", while an
+    /// **empty string** means "match nothing" (zero rows) — pass
+    /// `undefined`, not `""`, for all catalogs. The catalog pattern is
+    /// validated (whitespace-only / NUL / >255 bytes are rejected with an
+    /// error).
     ///
     /// JDBC `getTables` shape: 10 columns. `tableTypes`, when provided,
     /// filters rows by `TABLE_TYPE` kernel-side.
@@ -172,7 +182,7 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = Identifier::from_opt(&catalog)?;
+                let cat = LikePattern::from_opt(&catalog)?;
                 let sch = LikePattern::from_opt(&schema_pattern)?;
                 let tbl = LikePattern::from_opt(&table_pattern)?;
                 let types_owned: Option<Vec<&str>> = table_types

@@ -29,6 +29,12 @@
 //!
 //! U2M tokens include a `refresh_token` that can be used to obtain new access tokens
 //! without re-launching the browser, until the refresh token itself expires.
+//!
+//! Steps 1 and 4 are skipped entirely when the on-disk cache is disabled
+//! (see [`crate::config::TokenCacheConfig`]); the in-memory token store
+//! still handles reuse and refresh for the lifetime of the session. When
+//! the cache IS enabled the payload is always encrypted under the
+//! configured passphrase, because it carries that long-lived refresh token.
 
 use crate::auth::oauth::cache::TokenCache;
 use crate::auth::oauth::callback::CallbackServer;
@@ -48,11 +54,33 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 
-/// Default callback server port for OAuth redirects.
-const DEFAULT_CALLBACK_PORT: u16 = 8020;
+/// Default callback server port for OAuth redirects. Matches the redirect
+/// URI registered for the kernel's default U2M OAuth app
+/// (`databricks-sql-connector`, `http://localhost:8030`).
+const DEFAULT_CALLBACK_PORT: u16 = 8030;
 
 /// Default timeout for waiting for the OAuth callback.
 const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Persist `token` to the on-disk cache, or do nothing when disk caching
+/// is disabled (`passphrase` is `None`).
+///
+/// Exists so the two save sites in the token-acquisition flow (post-refresh
+/// and post-browser-flow) cannot drift apart, in particular so neither can
+/// accidentally write an unencrypted token or write one when the user asked
+/// for no cache at all.
+fn save_to_cache(
+    passphrase: Option<&str>,
+    host: &str,
+    client_id: &str,
+    scopes: &[String],
+    token: &OAuthToken,
+) {
+    match passphrase {
+        Some(passphrase) => TokenCache::save(host, client_id, scopes, token, passphrase),
+        None => crate::klog::debug!("Token cache disabled; not persisting token to disk"),
+    }
+}
 
 /// OAuth provider for U2M (User-to-Machine) authentication.
 ///
@@ -114,6 +142,12 @@ pub struct AuthorizationCodeProvider {
     callback_timeout: Duration,
     /// Whether to open browser automatically (set to false in tests)
     open_browser: bool,
+    /// Passphrase for the on-disk token cache, or `None` when disk
+    /// caching is disabled. `Some` implies the cache is enabled: the
+    /// enabled-without-passphrase combination is rejected upstream in
+    /// [`crate::config::TokenCacheConfig::resolve`], so this field carries
+    /// both the "should I cache?" and "with what key?" decisions.
+    cache_passphrase: Option<String>,
     /// Tokio runtime handle captured from the constructing context;
     /// used to drive the async token exchange from the sync
     /// `get_auth_header` trait method safely whether or not the
@@ -125,12 +159,14 @@ pub struct AuthorizationCodeProvider {
 impl AuthorizationCodeProvider {
     /// Creates a new U2M authentication provider.
     ///
-    /// Discovers the OIDC endpoints and attempts to load a cached token from disk.
-    /// If a cached token with a valid refresh_token is found, it's stored in TokenStore
-    /// and will be refreshed automatically when stale/expired.
+    /// Discovers the OIDC endpoints. The first call to `get_auth_header()`
+    /// launches the browser flow; the resulting token is then held in memory
+    /// and refreshed automatically when stale/expired.
     ///
-    /// If no cached token exists or the refresh_token is expired, the first call to
-    /// `get_auth_header()` will launch the browser flow.
+    /// The on-disk token cache is **disabled** here — persisting a refresh
+    /// token requires an encryption passphrase, which this signature cannot
+    /// accept. Use [`Self::new_with_full_config`] (as
+    /// [`Session::open`](crate::Session::open) does) to enable it.
     ///
     /// # Arguments
     ///
@@ -165,11 +201,17 @@ impl AuthorizationCodeProvider {
         client_id: &str,
         http_client: Arc<DatabricksHttpClient>,
     ) -> Result<Self> {
+        // Scopes must match the app registered for `DEFAULT_CALLBACK_PORT`
+        // (8030 → `databricks-sql-connector`, whose redirect URI is registered
+        // for `sql offline_access`). Keeping these coherent means the `new()`
+        // default bundle describes one OAuth app, not two. Callers wiring a
+        // different app must use `new_with_config` and override the whole
+        // coupled {scopes, port} bundle. See PECOBLR-4039.
         Self::new_with_config(
             host,
             client_id,
             http_client,
-            vec!["all-apis".to_string(), "offline_access".to_string()],
+            vec!["sql".to_string(), "offline_access".to_string()],
             DEFAULT_CALLBACK_PORT,
             DEFAULT_CALLBACK_TIMEOUT,
         )
@@ -180,6 +222,10 @@ impl AuthorizationCodeProvider {
     ///
     /// This is useful for testing or when specific scopes/ports are required.
     /// Most users should use `new()` which provides sensible defaults.
+    ///
+    /// The on-disk token cache is **disabled** for providers built this way:
+    /// encrypting it requires a passphrase, and this signature has no way to
+    /// accept one. Use [`Self::new_with_full_config`] to enable it.
     pub async fn new_with_config(
         host: &str,
         client_id: &str,
@@ -196,6 +242,7 @@ impl AuthorizationCodeProvider {
             callback_port,
             callback_timeout,
             None, // No token_endpoint override
+            None, // On-disk cache disabled: no passphrase available here
         )
         .await
     }
@@ -204,6 +251,13 @@ impl AuthorizationCodeProvider {
     ///
     /// This is used by Database when a custom token endpoint is configured.
     /// Most users should use `new()` or `new_with_config()` which use OIDC discovery.
+    ///
+    /// `cache_passphrase` is `Some` to enable the encrypted on-disk token
+    /// cache and `None` to disable it; the enabled-but-passphraseless case is
+    /// rejected upstream by [`crate::config::TokenCacheConfig::resolve`].
+    // The "full config" constructor is a flat parameter list by design — it is
+    // the single place every U2M knob is threaded in from `Session::open`.
+    #[allow(clippy::too_many_arguments)]
     pub async fn new_with_full_config(
         host: &str,
         client_id: &str,
@@ -212,6 +266,7 @@ impl AuthorizationCodeProvider {
         callback_port: u16,
         callback_timeout: Duration,
         token_endpoint_override: Option<String>,
+        cache_passphrase: Option<String>,
     ) -> Result<Self> {
         // Discover OIDC endpoints (unless token_endpoint is overridden, we still need auth endpoint)
         let endpoints = OidcEndpoints::discover(host, &http_client).await?;
@@ -222,8 +277,13 @@ impl AuthorizationCodeProvider {
         // Create token store
         let token_store = TokenStore::new();
 
-        // Try loading cached token
-        if let Some(cached_token) = TokenCache::load(host, client_id, &scopes) {
+        // Try loading cached token. A `None` passphrase means the on-disk
+        // cache is disabled, so the file is never even read — the in-memory
+        // TokenStore above still reuses and refreshes within this process.
+        if let Some(cached_token) = cache_passphrase
+            .as_deref()
+            .and_then(|passphrase| TokenCache::load(host, client_id, &scopes, passphrase))
+        {
             // Check if the cached token has a refresh token
             if cached_token.refresh_token.is_some() {
                 crate::klog::debug!("Loaded cached token with refresh_token for U2M flow");
@@ -251,6 +311,7 @@ impl AuthorizationCodeProvider {
             callback_port,
             callback_timeout,
             open_browser: true,
+            cache_passphrase,
             // `new_with_full_config` is `async`, so we're guaranteed
             // to be inside a tokio runtime here. Capture that handle
             // so `get_auth_header` can dispatch correctly later via
@@ -302,6 +363,7 @@ impl AuthProvider for AuthorizationCodeProvider {
         let callback_timeout = self.callback_timeout;
         let open_browser = self.open_browser;
         let http_client = self.http_client.clone();
+        let cache_passphrase = self.cache_passphrase.clone();
 
         // Get or refresh token via TokenStore
         let runtime_handle = self.runtime_handle.clone();
@@ -312,8 +374,12 @@ impl AuthProvider for AuthorizationCodeProvider {
             // inside a runtime, direct `block_on` otherwise. See
             // `crate::util::runtime`.
             block_on_in_runtime(&runtime_handle, async {
-                    // Try loading from cache first
-                    if let Some(cached_token) = TokenCache::load(&host, &client_id, &scopes) {
+                    // Try loading from cache first (skipped entirely when
+                    // on-disk caching is disabled).
+                    if let Some(cached_token) = cache_passphrase
+                        .as_deref()
+                        .and_then(|p| TokenCache::load(&host, &client_id, &scopes, p))
+                    {
                         if let Some(ref refresh_token_str) = cached_token.refresh_token {
                             // Try refreshing the token
                             crate::klog::debug!("Attempting to refresh token via refresh_token");
@@ -371,8 +437,14 @@ impl AuthProvider for AuthorizationCodeProvider {
                                         scopes_result,
                                     );
 
-                                    // Save to cache
-                                    TokenCache::save(&host, &client_id, &scopes, &token);
+                                    // Save to cache (no-op when disabled)
+                                    save_to_cache(
+                                        cache_passphrase.as_deref(),
+                                        &host,
+                                        &client_id,
+                                        &scopes,
+                                        &token,
+                                    );
                                     return Ok(token);
                                 }
                                 Err(e) => {
@@ -492,8 +564,14 @@ impl AuthProvider for AuthorizationCodeProvider {
                         scopes_result,
                     );
 
-                    // Save to cache
-                    TokenCache::save(&host, &client_id, &scopes, &token);
+                    // Save to cache (no-op when disabled)
+                    save_to_cache(
+                        cache_passphrase.as_deref(),
+                        &host,
+                        &client_id,
+                        &scopes,
+                        &token,
+                    );
 
                     Ok(token)
             })
@@ -510,6 +588,14 @@ mod tests {
     use crate::client::http::HttpClientConfig;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// Passphrase used by the cache-backed tests below. These tests seed the
+    /// on-disk cache and then assert the provider picks it up, so they must
+    /// build the provider with disk caching ENABLED (via
+    /// `new_with_full_config`) and with the same passphrase used to write —
+    /// otherwise the load silently misses and the test would pass while
+    /// proving nothing.
+    const TEST_CACHE_PASSPHRASE: &str = "unit-test-passphrase";
 
     /// Helper to mock OIDC discovery response
     async fn mock_oidc_discovery(mock_server: &MockServer) {
@@ -563,16 +649,19 @@ mod tests {
             "test-client-id",
             &["all-apis".to_string(), "offline_access".to_string()],
             &cached_token,
+            TEST_CACHE_PASSPHRASE,
         );
 
         // Create provider - should load cached token
-        let provider = AuthorizationCodeProvider::new_with_config(
+        let provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             8020,
             Duration::from_secs(120),
+            None,
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");
@@ -613,16 +702,19 @@ mod tests {
             "test-client-id",
             &["all-apis".to_string(), "offline_access".to_string()],
             &cached_token,
+            TEST_CACHE_PASSPHRASE,
         );
 
         // Create provider - should load cached token
-        let provider = AuthorizationCodeProvider::new_with_config(
+        let provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             8020,
             Duration::from_secs(120),
+            None,
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");
@@ -676,16 +768,22 @@ mod tests {
             "test-client-id",
             &["all-apis".to_string(), "offline_access".to_string()],
             &cached_token,
+            TEST_CACHE_PASSPHRASE,
         );
 
-        // Create provider with browser opening suppressed
-        let mut provider = AuthorizationCodeProvider::new_with_config(
+        // Create provider with browser opening suppressed. Must use
+        // `new_with_full_config` so the on-disk cache seeded above is
+        // actually read — `new_with_config` disables it, and the refresh
+        // attempt this test asserts on would never be made.
+        let mut provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
             0,                      // Use port 0 to avoid conflicts
             Duration::from_secs(5), // Short timeout for test
+            None,
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");

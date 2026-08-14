@@ -106,9 +106,9 @@ impl AuthConfig {
             }
             AuthType::OAuthU2m => {
                 // U2M flow has no required fields - all parameters have defaults:
-                // - client_id defaults to "databricks-cli"
-                // - scopes defaults to "all-apis offline_access"
-                // - redirect_port defaults to 8020
+                // - client_id defaults to "databricks-sql-connector"
+                // - scopes defaults to "sql offline_access"
+                // - redirect_port defaults to 8030
             }
         }
 

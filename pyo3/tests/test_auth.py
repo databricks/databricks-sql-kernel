@@ -59,3 +59,12 @@ def test_unknown_auth_type_raises_value_error():
             auth_type="something-else",
             access_token="x",
         )
+
+
+def test_identity_federation_client_id_is_accepted_kwarg():
+    with pytest.raises(ValueError, match="access_token"):
+        k.Session(
+            host="x.databricks.com",
+            http_path="/sql/1.0/warehouses/abc",
+            identity_federation_client_id="federation-client",
+        )

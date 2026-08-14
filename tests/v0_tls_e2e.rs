@@ -92,11 +92,15 @@ fn live_auth() -> AuthConfig {
             client_secret,
             scopes: None,
             token_url_override: None,
+            identity_federation_client_id: None,
         }
     } else {
         let token = env_var("DATABRICKS_TOKEN")
             .expect("need DATABRICKS_TEST_CLIENT_ID/SECRET (OAuth M2M) or DATABRICKS_TOKEN (PAT)");
-        AuthConfig::Pat { token }
+        AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        }
     }
 }
 

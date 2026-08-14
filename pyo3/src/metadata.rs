@@ -94,10 +94,16 @@ impl Metadata {
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
-    /// Tables filtered by catalog (exact), schema (pattern), table
-    /// (pattern). `table_types` is advisory — Databricks does not
-    /// honour it server-side; wrappers filter the returned
-    /// `tableType` column themselves.
+    /// Tables filtered by catalog (**pattern**), schema (pattern),
+    /// table (pattern). The catalog is an ODBC/JDBC LIKE pattern
+    /// (`%` / `_`), matching Thrift `getTables`; a literal catalog name
+    /// still works and takes the fast exact path. `catalog=None`
+    /// (the default) means "all catalogs", while `catalog=""` means
+    /// "match nothing" (zero rows) — pass `None`, not `""`, for all
+    /// catalogs. The catalog pattern is validated (whitespace-only / NUL
+    /// / >255 bytes raise `InvalidArgument`). `table_types` is advisory —
+    /// Databricks does not honour it server-side; wrappers filter the
+    /// returned `tableType` column themselves.
     #[pyo3(signature = (*, catalog=None, schema_pattern=None, table_pattern=None, table_types=None))]
     fn list_tables(
         &self,
@@ -108,7 +114,7 @@ impl Metadata {
         table_types: Option<Vec<String>>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = Identifier::from_opt(&catalog)?;
+            let cat = LikePattern::from_opt(&catalog)?;
             let sch = LikePattern::from_opt(&schema_pattern)?;
             let tbl = LikePattern::from_opt(&table_pattern)?;
             let types_owned: Option<Vec<&str>> = table_types

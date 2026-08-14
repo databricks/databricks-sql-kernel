@@ -173,8 +173,63 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
     })
 }
 
-/// List tables filtered by catalog (exact), schema / table patterns,
-/// and an optional comma-separated `table_types` filter.
+/// Split a comma-separated `table_types` CSV into a borrowed slice of
+/// non-empty, trimmed type names.
+///
+/// Empty entries are dropped, so ODBC's "" / whitespace / comma-only
+/// junk (e.g. `""`, `" "`, `",,"`) normalizes to an empty `Vec`. The
+/// caller MUST collapse an empty `Vec` to `None` before calling
+/// `list_tables`: since hiveserver2 #83 the kernel treats an explicit
+/// `Some(&[])` as match-NONE (zero rows), so passing the empty vec
+/// straight through would turn ODBC's empty→"all types" convention
+/// into a match-nothing bug. See the `.filter(|t| !t.is_empty())` at
+/// the call site.
+fn split_table_types_csv(csv: &str) -> Vec<&str> {
+    csv.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect()
+}
+
+/// Map an optional ODBC `table_types` CSV to the kernel's typed filter:
+/// `Some(non-empty types)` to restrict, or `None` to match all types.
+///
+/// ODBC's `SQLTables` treats an empty `TableType` argument as "type not
+/// used to restrict the search" — i.e. all types — and has no way to
+/// express a non-null *empty* type list distinctly (which is why
+/// driver-test's METADATA-035 skips ODBC). So a `None` CSV (null arg) OR
+/// a CSV that splits to zero real types (`""` / `"  "` / `",,"`) both
+/// mean match-all → `None`.
+///
+/// This collapse is load-bearing: since hiveserver2 #83 the kernel treats
+/// an explicit `Some(&[])` as match-NONE (zero rows), so passing the empty
+/// vec straight through would turn ODBC's empty→"all types" convention
+/// into a match-nothing bug. (It restores the guard #223 removed — safe to
+/// drop only while `Some(&[])` == `None`, which #83 reversed.) Only a CSV
+/// with at least one real type reaches `list_tables` as a `Some`.
+fn parse_table_types_filter(csv: Option<&str>) -> Option<Vec<&str>> {
+    csv.map(split_table_types_csv)
+        .filter(|types| !types.is_empty())
+}
+
+/// List tables filtered by catalog (**pattern**), schema / table
+/// patterns, and an optional comma-separated `table_types` filter.
+///
+/// The catalog is an ODBC/JDBC LIKE pattern here (`%` / `_`),
+/// matching Thrift's `TGetTablesReq.catalogName` and ODBC `SQLTables`
+/// under the default `SQL_ATTR_METADATA_ID = SQL_FALSE`. A literal
+/// catalog (no wildcards, or `SQL_ATTR_METADATA_ID = SQL_TRUE`
+/// identifier semantics) still works — it takes the fast exact
+/// single-catalog path. See [`Metadata::list_tables`](crate::metadata_v0::Metadata::list_tables).
+///
+/// **Empty-string catalog:** at this C ABI boundary a `NULL` **or an
+/// empty / whitespace-only** `catalog` is normalized to "all catalogs"
+/// (the ODBC convention where drivers pass `""` for "no catalog
+/// filter"). This differs from the Rust / pyo3 / napi surface, where an
+/// empty-string catalog is a valid `LikePattern` meaning "match
+/// nothing" (zero rows). C / ODBC callers who want "match nothing"
+/// should not rely on `""`; the pattern-value distinction only exists
+/// on the typed surfaces.
 ///
 /// # Safety
 /// `session` must be a live session handle; the string args, if
@@ -190,27 +245,11 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
+            let catalog = opt_pattern(catalog, "catalog")?;
             let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
             let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
-            // Split the comma-separated table types into a borrowed slice.
-            // An empty / whitespace-only / comma-only CSV must mean
-            // "all types" (like a NULL arg), NOT "match nothing": the
-            // kernel treats Some(&[]) as a filter that rejects every row,
-            // so collapse an empty result back to None.
             let types_csv = opt_str(table_types_csv, "table_types")?;
-            let types_owned: Option<Vec<&str>> = types_csv.and_then(|csv| {
-                let v: Vec<&str> = csv
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .collect();
-                if v.is_empty() {
-                    None
-                } else {
-                    Some(v)
-                }
-            });
+            let types_owned = parse_table_types_filter(types_csv);
             session
                 .metadata()
                 .list_tables(
@@ -282,9 +321,17 @@ pub unsafe extern "C" fn kernel_metadata_primary_keys(
 
 /// Foreign keys. Mirrors ODBC `SQLForeignKeys`: the `parent_*` triple is
 /// the referenced (primary-key) table, the `foreign_*` triple the
-/// referencing table. The kernel requires the `foreign_*` triple (the
-/// referencing table) to be fully specified; the `parent_*` triple is
-/// optional and filters the referenced side.
+/// referencing table. The `parent_*` triple is optional and filters the
+/// referenced side.
+///
+/// A NULL `foreign_table` means "no referencing table to look up": the
+/// call returns an **empty result** (0 rows, no server statement) rather
+/// than `InvalidArgument`. This matches the JDBC SEA
+/// `listCrossReferences` contract and the ODBC "primary-keys only"
+/// `SQLForeignKeys` form (FK table left NULL). Only when a
+/// `foreign_table` *is* supplied are `foreign_catalog` / `foreign_schema`
+/// required (they scope the `SHOW FOREIGN KEYS` lookup); a NULL there
+/// returns `InvalidArgument`.
 ///
 /// # Safety
 /// `session` must be a live session handle; the identifier args, if
@@ -324,10 +371,113 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
     })
 }
 
-// PR 7d follow-ups: functions, procedures, type_info, table_types — the
-// kernel `Metadata` exposes these (some synthesised in-memory). Wire them
-// over the C ABI when an ODBC / Go consumer needs SQLGetTypeInfo /
-// SQLProcedures.
+/// List the table types the workspace supports (`TABLE`, `VIEW`,
+/// `SYSTEM TABLE`, …). No filters and no wire call — the set is derived
+/// from the session's transport (see `Metadata::table_types`). Backs the
+/// ODBC `SQLTables(table_type = SQL_ALL_TABLE_TYPES)` enumeration mode.
+/// The stream carries a single `TABLE_TYPE` column (JDBC `getTableTypes`
+/// shape).
+///
+/// # Safety
+/// `session` must be a live handle from `kernel_session_open`; `out`
+/// must be a valid, writable pointer.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_list_table_types(
+    session: *mut kernel_session_t,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move { session.metadata().table_types().await })
+    })
+}
+
+/// List procedures filtered by catalog (exact) and schema / procedure
+/// name patterns. Mirrors JDBC `getProcedures` / ODBC `SQLProcedures`.
+/// Result columns are the JDBC-canonical `getProcedures` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_procedures(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
+            session
+                .metadata()
+                .procedures(catalog, schema_pattern, procedure_pattern)
+                .await
+        })
+    })
+}
+
+/// List functions filtered by catalog (exact) and schema / function
+/// name patterns. Mirrors JDBC `getFunctions`. Result columns are the
+/// JDBC-canonical `getFunctions` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_functions(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    function_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let function_pattern = opt_pattern(function_pattern, "function_pattern")?;
+            session
+                .metadata()
+                .functions(catalog, schema_pattern, function_pattern)
+                .await
+        })
+    })
+}
+
+/// List procedure parameter / return columns filtered by catalog
+/// (exact) and schema / procedure / column name patterns. Mirrors JDBC
+/// `getProcedureColumns` / ODBC `SQLProcedureColumns` (procedures only —
+/// function arguments are excluded). Result columns are the
+/// JDBC-canonical `getProcedureColumns` set.
+///
+/// # Safety
+/// `session` must be a live session handle; the string args, if
+/// non-null, must be NUL-terminated C strings; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_metadata_procedure_columns(
+    session: *mut kernel_session_t,
+    catalog: *const c_char,
+    schema_pattern: *const c_char,
+    procedure_pattern: *const c_char,
+    column_pattern: *const c_char,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    run_metadata(session, out, |session| {
+        Box::pin(async move {
+            let catalog = opt_ident(catalog, "catalog")?;
+            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
+            let column_pattern = opt_pattern(column_pattern, "column_pattern")?;
+            session
+                .metadata()
+                .procedure_columns(catalog, schema_pattern, procedure_pattern, column_pattern)
+                .await
+        })
+    })
+}
 
 #[cfg(test)]
 mod tests {
@@ -373,5 +523,55 @@ mod tests {
             let real = CString::new("main").unwrap();
             assert!(opt_ident(real.as_ptr(), "catalog").unwrap().is_some());
         }
+    }
+
+    /// ODBC's "" / whitespace / comma-only `table_types` spellings all
+    /// normalize to an empty type list. The `list_tables` call site then
+    /// collapses that empty list to `None` (match-all, like a NULL arg),
+    /// since after hiveserver2 #83 an explicit `Some(&[])` means match-NONE.
+    /// A non-empty CSV parses into its trimmed, non-empty entries.
+    #[test]
+    fn split_table_types_csv_normalizes_empty_and_parses_values() {
+        // Empty / whitespace / comma-only junk → empty list (all types).
+        assert!(split_table_types_csv("").is_empty());
+        assert!(split_table_types_csv("   ").is_empty());
+        assert!(split_table_types_csv(",").is_empty());
+        assert!(split_table_types_csv(",,").is_empty());
+        assert!(split_table_types_csv(" , , ").is_empty());
+
+        // Real values are trimmed; interspersed empties are dropped.
+        assert_eq!(split_table_types_csv("TABLE"), vec!["TABLE"]);
+        assert_eq!(split_table_types_csv("TABLE, VIEW"), vec!["TABLE", "VIEW"]);
+        assert_eq!(
+            split_table_types_csv(" TABLE ,, VIEW ,"),
+            vec!["TABLE", "VIEW"]
+        );
+    }
+
+    /// The empty→`None` collapse at the C-ABI boundary: a null arg AND any
+    /// CSV that splits to zero real types both map to `None` (ODBC
+    /// empty→"all types"), while a CSV with real types maps to `Some`.
+    /// Locks the guard so it isn't dropped again — after hiveserver2 #83 a
+    /// `Some(&[])` reaching the kernel means match-NONE, so an empty ODBC
+    /// `TableType` must NOT reach `list_tables` as `Some(&[])`.
+    #[test]
+    fn parse_table_types_filter_collapses_empty_to_none() {
+        // Null arg (ODBC NULL TableType) → None (all types).
+        assert_eq!(parse_table_types_filter(None), None);
+
+        // Empty / whitespace / comma-only junk → None (all types), NOT
+        // Some(&[]) (which the kernel would treat as match-none).
+        assert_eq!(parse_table_types_filter(Some("")), None);
+        assert_eq!(parse_table_types_filter(Some("   ")), None);
+        assert_eq!(parse_table_types_filter(Some(",")), None);
+        assert_eq!(parse_table_types_filter(Some(",,")), None);
+        assert_eq!(parse_table_types_filter(Some(" , , ")), None);
+
+        // At least one real type → Some(trimmed, non-empty entries).
+        assert_eq!(parse_table_types_filter(Some("TABLE")), Some(vec!["TABLE"]));
+        assert_eq!(
+            parse_table_types_filter(Some(" TABLE ,, VIEW ,")),
+            Some(vec!["TABLE", "VIEW"])
+        );
     }
 }

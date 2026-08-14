@@ -49,45 +49,16 @@ concurrency:
 
 permissions:
   contents: read
-# `id-token: write` is NOT granted workflow-wide: the `precondition`
-# job only checks out and inspects the tree, so least-privilege keeps
-# it on the single job that needs it (`check-and-test`, below).
+# `id-token: write` is scoped to the single job that exchanges an OIDC
+# token for JFrog access.
 
 defaults:
   run:
     shell: bash
 
 jobs:
-  # Cheap gate job — runs once, no toolchain installs. The check-and-test
-  # job depends on this and is skipped (no runner boot beyond the
-  # precondition runner itself) when the napi/ sub-crate doesn't
-  # exist. Avoids wasted setup cost on kernel-only PRs that trigger
-  # this workflow via root Cargo.toml changes before the napi crate
-  # has merged.
-  precondition:
-    name: "Check napi sub-crate exists"
-    runs-on:
-      group: databricks-protected-runner-group
-      labels: linux-ubuntu-latest
-    outputs:
-      ready: ${{ steps.check.outputs.ready }}
-    steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-
-      - name: "Check for napi/Cargo.toml"
-        id: check
-        run: |
-          if [[ -f "napi/Cargo.toml" ]]; then
-            echo "ready=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "::notice::napi/ sub-crate does not exist yet — skipping napi checks. (Workflow may fire on root Cargo.toml changes before the napi crate has merged.)"
-            echo "ready=false" >> "$GITHUB_OUTPUT"
-          fi
-
   check-and-test:
     name: "napi fmt + clippy + test"
-    needs: precondition
-    if: needs.precondition.outputs.ready == 'true'
     # Scoped here (not workflow-wide): `id-token: write` is only needed
     # for the OIDC token exchange in `.github/actions/setup-jfrog` that
     # authenticates against the JFrog cargo proxy. See go/hardened-gha.
@@ -97,12 +68,15 @@ jobs:
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+      SCCACHE_GHA_ENABLED: "true"
     defaults:
       run:
         # All cargo commands run from the napi/ standalone workspace.
         working-directory: napi
     steps:
-      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       # Route cargo through the JFrog crates proxy. The protected
       # runner group blocks direct crates.io, so without this every
@@ -116,6 +90,12 @@ jobs:
       - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
         with:
           components: rustfmt, clippy
+          # napi is a standalone workspace; cache its actual target and
+          # lockfile instead of the unused repository-root target.
+          cache-workspaces: "napi -> target"
+
+      - name: Setup sccache
+        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
       - name: cargo fmt --all -- --check
         run: cargo fmt --all -- --check

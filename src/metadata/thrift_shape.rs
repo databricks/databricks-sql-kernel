@@ -57,7 +57,7 @@
 use crate::kernel_error::{Error, Result};
 use crate::metadata::type_mapping::databricks_type_to_xdbc;
 use crate::reader::ResultReader;
-use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int16Array, Int32Array, RecordBatch, StringArray};
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use std::sync::{Arc, LazyLock};
 
@@ -214,6 +214,79 @@ pub(crate) static GET_CROSS_REFERENCE_SCHEMA: LazyLock<SchemaRef> = LazyLock::ne
         Field::new("FK_NAME", DataType::Utf8, true),
         Field::new("PK_NAME", DataType::Utf8, true),
         Field::new("DEFERRABILITY", DataType::Int16, true),
+    ]))
+});
+
+/// JDBC `getProcedures` — 9 columns. Matches
+/// `java.sql.DatabaseMetaData.getProcedures`. Columns 4-6 are reserved
+/// by the JDBC spec ("reserved for future use") and emitted as null.
+/// `PROCEDURE_TYPE` is `SMALLINT` (Int16) per the spec.
+pub(crate) static GET_PROCEDURES_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("PROCEDURE_CAT", DataType::Utf8, true),
+        Field::new("PROCEDURE_SCHEM", DataType::Utf8, true),
+        Field::new("PROCEDURE_NAME", DataType::Utf8, false),
+        // JDBC "reserved for future use" columns (4, 5, 6).
+        Field::new("RESERVED1", DataType::Utf8, true),
+        Field::new("RESERVED2", DataType::Utf8, true),
+        Field::new("RESERVED3", DataType::Utf8, true),
+        Field::new("REMARKS", DataType::Utf8, true),
+        Field::new("PROCEDURE_TYPE", DataType::Int16, true),
+        Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+    ]))
+});
+
+/// JDBC `getFunctions` — 6 columns. Matches
+/// `java.sql.DatabaseMetaData.getFunctions`. `FUNCTION_TYPE` is
+/// `SMALLINT` (Int16) per the spec.
+pub(crate) static GET_FUNCTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("FUNCTION_CAT", DataType::Utf8, true),
+        Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
+        Field::new("FUNCTION_NAME", DataType::Utf8, false),
+        Field::new("REMARKS", DataType::Utf8, true),
+        Field::new("FUNCTION_TYPE", DataType::Int16, true),
+        Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+    ]))
+});
+
+/// JDBC `getProcedureColumns` — 20 columns. Matches
+/// `java.sql.DatabaseMetaData.getProcedureColumns`. `COLUMN_TYPE`,
+/// `SCALE`, and `RADIX` are `SMALLINT` (Int16); `DATA_TYPE`,
+/// `PRECISION`, `LENGTH`, `NULLABLE`, `SQL_DATA_TYPE`,
+/// `SQL_DATETIME_SUB`, `CHAR_OCTET_LENGTH`, and `ORDINAL_POSITION` are
+/// `INTEGER` (Int32), per the JDBC spec. `LENGTH`, `SQL_DATA_TYPE`,
+/// `SQL_DATETIME_SUB`, and `CHAR_OCTET_LENGTH` have no
+/// `information_schema.parameters` source and are emitted as null; the
+/// ODBC driver derives its equivalents from the other columns.
+pub(crate) static GET_PROCEDURE_COLUMNS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
+    Arc::new(Schema::new(vec![
+        Field::new("PROCEDURE_CAT", DataType::Utf8, true),
+        Field::new("PROCEDURE_SCHEM", DataType::Utf8, true),
+        Field::new("PROCEDURE_NAME", DataType::Utf8, false),
+        // JDBC spec types COLUMN_NAME / TYPE_NAME non-null, but
+        // information_schema.parameters can carry a NULL parameter_name (the
+        // return-value row, is_result='YES', and unnamed/positional params), so
+        // declare them nullable — otherwise a NULL there fails RecordBatch::try_new
+        // (data_loss) and drops the whole result. Matches the defensive nullable
+        // declarations of GET_COLUMNS_SCHEMA / GET_PRIMARY_KEYS_SCHEMA above.
+        Field::new("COLUMN_NAME", DataType::Utf8, true),
+        Field::new("COLUMN_TYPE", DataType::Int16, false),
+        Field::new("DATA_TYPE", DataType::Int32, false),
+        Field::new("TYPE_NAME", DataType::Utf8, true),
+        Field::new("PRECISION", DataType::Int32, true),
+        Field::new("LENGTH", DataType::Int32, true),
+        Field::new("SCALE", DataType::Int16, true),
+        Field::new("RADIX", DataType::Int16, true),
+        Field::new("NULLABLE", DataType::Int32, false),
+        Field::new("REMARKS", DataType::Utf8, true),
+        Field::new("COLUMN_DEF", DataType::Utf8, true),
+        Field::new("SQL_DATA_TYPE", DataType::Int32, true),
+        Field::new("SQL_DATETIME_SUB", DataType::Int32, true),
+        Field::new("CHAR_OCTET_LENGTH", DataType::Int32, true),
+        Field::new("ORDINAL_POSITION", DataType::Int32, false),
+        Field::new("IS_NULLABLE", DataType::Utf8, true),
+        Field::new("SPECIFIC_NAME", DataType::Utf8, true),
     ]))
 });
 
@@ -467,9 +540,19 @@ pub(crate) fn reshape_schemas(
 /// when they're missing.
 ///
 /// `requested_catalog` fills `TABLE_CAT` rows for server responses
-/// that omit it (single-catalog form). `table_types`, when `Some`,
-/// filters rows to those whose `TABLE_TYPE` appears in the slice
-/// (matches JDBC `DatabaseMetaData.getTables` behaviour).
+/// that omit it (single-catalog form). `table_types`, when `Some` with
+/// at least one entry, filters rows to those whose `TABLE_TYPE` appears
+/// in the slice (matches JDBC `DatabaseMetaData.getTables` behaviour).
+/// A `Some(&[])` (explicit empty slice) matches NO table types and
+/// yields an empty result — it is NOT treated like `None`. See the
+/// inline note in the filter block below (METADATA-035 conformance /
+/// hiveserver2 #83, which reversed the earlier empty==null reading).
+///
+/// Catalog *matching* is not done here: a wildcard catalog is resolved
+/// in `list_tables` by enumerating catalogs and issuing one scoped
+/// `SHOW TABLES IN CATALOG <name>` per match, so every batch reaching
+/// this function is already attributed to a known catalog (either the
+/// `catalogName` column or `requested_catalog`).
 pub(crate) fn reshape_tables(
     batch: &RecordBatch,
     requested_catalog: Option<&str>,
@@ -516,15 +599,15 @@ pub(crate) fn reshape_tables(
     // Apply table_types filter, if requested. The JDBC `DatabaseMetaData.
     // getTables(...)` Javadoc specifies that `null` types returns all
     // types, but is silent on what an *explicit empty array* means.
-    // Two interpretations exist in the wild:
-    //   - Empty == null (returns all rows). Convenient, but conflates
-    //     "I didn't filter" with "I asked for nothing".
-    //   - Empty == "filter accepting nothing" (returns zero rows). Literal
-    //     reading of the filter contract.
-    // The Databricks Thrift backend follows the literal reading: zero
-    // rows on `types=[]`. We match Thrift here for cross-backend parity
-    // (verified via the python-comparator). Callers that want "all
-    // types" should pass `None`, not `Some(&[])`.
+    // Per the multi-language conformance spec (METADATA-035) and the C#
+    // ADBC / JDBC drivers, an explicit *empty* array matches NO table
+    // types — the result is empty, NOT equivalent to `null`. Only `None`
+    // means "all types". This mirrors hiveserver2 #83, which reversed the
+    // earlier #72 reading (empty == null) after establishing that
+    // databricks-jdbc's `listTables` has always short-circuited an empty
+    // array to "return nothing". An empty `Some(&[])` therefore flows
+    // through `filter_tables_by_type`, whose `types.iter().any(..)` is
+    // `false` for every row → an empty (correctly-typed) batch.
     let filtered = match table_types {
         None => reshaped,
         Some(types) => filter_tables_by_type(&reshaped, types)?,
@@ -536,6 +619,16 @@ pub(crate) fn reshape_tables(
     // consumers that compare kernel output against the existing
     // Thrift backend see matching row sequence.
     sort_tables(&filtered)
+}
+
+/// Lex-sort a JDBC-shape getTables batch by `TABLE_TYPE, TABLE_CAT,
+/// TABLE_SCHEM, TABLE_NAME` to match JDBC / Thrift row ordering.
+///
+/// Exposed as [`sort_tables_batch`] so the per-catalog fan-out path in
+/// `list_tables` can re-sort the *merged* result across catalogs (each
+/// per-catalog `reshape_tables` sorts only its own rows).
+pub(crate) fn sort_tables_batch(batch: &RecordBatch) -> Result<RecordBatch> {
+    sort_tables(batch)
 }
 
 /// Lex-sort a JDBC-shape getTables batch by `TABLE_TYPE, TABLE_CAT,
@@ -709,6 +802,203 @@ pub(crate) fn reshape_columns(
         ],
     )
     .map_err(|e| Error::data_loss().message(format!("reshape columns: {e}")))
+}
+
+/// Reshape the `build_get_procedures` result
+/// (`routine_catalog, routine_schema, routine_name, comment, specific_name`)
+/// into the JDBC `getProcedures` shape.
+///
+/// Columns 4-6 (`RESERVED*`) are spec-reserved and emitted null.
+/// `PROCEDURE_TYPE` is constant `procedureNoResult` (1) — Databricks stored
+/// procedures do not return a result set through this metadata call. (JDBC:
+/// `procedureResultUnknown`=0, `procedureNoResult`=1, `procedureReturnsResult`=2.)
+pub(crate) fn reshape_procedures(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let procedure_cat = utf8_column(batch, "routine_catalog")?;
+    let procedure_schem = utf8_column(batch, "routine_schema")?;
+    let procedure_name = utf8_column(batch, "routine_name")?;
+    let remarks = utf8_column(batch, "comment")?;
+    let specific_name = utf8_column(batch, "specific_name")?;
+    let procedure_type = Arc::new(Int16Array::from(vec![Some(1_i16); n])) as ArrayRef;
+    RecordBatch::try_new(
+        GET_PROCEDURES_SCHEMA.clone(),
+        vec![
+            procedure_cat,
+            procedure_schem,
+            procedure_name,
+            null_utf8(n), // RESERVED1
+            null_utf8(n), // RESERVED2
+            null_utf8(n), // RESERVED3
+            remarks,
+            procedure_type,
+            specific_name,
+        ],
+    )
+    .map_err(|e| Error::data_loss().message(format!("reshape procedures: {e}")))
+}
+
+/// Reshape the `build_get_functions` result (same server columns as
+/// `build_get_procedures`) into the JDBC `getFunctions` shape.
+///
+/// `FUNCTION_TYPE` is constant `functionNoTable` (1) — Databricks functions
+/// are scalar / return a value, not a table. (JDBC: `functionResultUnknown`=0,
+/// `functionNoTable`=1, `functionReturnsTable`=2.)
+pub(crate) fn reshape_functions(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let function_cat = utf8_column(batch, "routine_catalog")?;
+    let function_schem = utf8_column(batch, "routine_schema")?;
+    let function_name = utf8_column(batch, "routine_name")?;
+    let remarks = utf8_column(batch, "comment")?;
+    let specific_name = utf8_column(batch, "specific_name")?;
+    // FUNCTION_TYPE is reported functionNoTable(1) for every row. Databricks
+    // supports table-valued functions, which JDBC would report as
+    // functionReturnsTable(2), but build_get_functions does not select a column
+    // that distinguishes scalar from table functions, so the reshape cannot tell
+    // them apart. Known parity gap; distinguishing TVFs would require selecting
+    // additional information_schema.routines columns in the builder.
+    let function_type = Arc::new(Int16Array::from(vec![Some(1_i16); n])) as ArrayRef;
+    RecordBatch::try_new(
+        GET_FUNCTIONS_SCHEMA.clone(),
+        vec![
+            function_cat,
+            function_schem,
+            function_name,
+            remarks,
+            function_type,
+            specific_name,
+        ],
+    )
+    .map_err(|e| Error::data_loss().message(format!("reshape functions: {e}")))
+}
+
+/// Reshape the `build_get_procedure_columns` result (raw
+/// `information_schema.parameters` columns) into the JDBC
+/// `getProcedureColumns` shape.
+///
+/// - `COLUMN_TYPE` is derived from `parameter_mode` / `is_result`:
+///   `IN`→procedureColumnIn(1), `INOUT`→procedureColumnInOut(2),
+///   `OUT`→procedureColumnOut(4), a return value (`is_result = 'YES'`)→
+///   procedureColumnReturn(5), else procedureColumnUnknown(0).
+/// - `DATA_TYPE` is the JDBC type code from `databricks_type_to_xdbc(data_type)`
+///   (the same per-row mapper `getColumns` uses); `TYPE_NAME` is the raw
+///   `data_type` string.
+/// - `PRECISION` / `SCALE` / `RADIX` / `CHAR_OCTET_LENGTH` pass the
+///   `information_schema` numeric metadata through (they arrive as strings and
+///   are cast). `NULLABLE` is constant `procedureNullableUnknown` (2) —
+///   `information_schema.parameters` carries no nullability for parameters.
+/// - `LENGTH` / `SQL_DATA_TYPE` / `SQL_DATETIME_SUB` / `COLUMN_DEF` have no
+///   source and are null; the ODBC driver derives its own equivalents.
+/// - `IS_NULLABLE` is the empty-string "unknown" sentinel.
+pub(crate) fn reshape_procedure_columns(batch: &RecordBatch) -> Result<RecordBatch> {
+    let n = batch.num_rows();
+    let procedure_cat = utf8_column(batch, "specific_catalog")?;
+    let procedure_schem = utf8_column(batch, "specific_schema")?;
+    let procedure_name = utf8_column(batch, "specific_name")?;
+    let column_name = utf8_column(batch, "parameter_name")?;
+    let specific_name = utf8_column(batch, "specific_name")?;
+
+    // COLUMN_TYPE from parameter_mode / is_result.
+    let mode_arr = utf8_column(batch, "parameter_mode")?;
+    let modes = mode_arr.as_any().downcast_ref::<StringArray>();
+    let is_result_arr = utf8_column(batch, "is_result")?;
+    let is_results = is_result_arr.as_any().downcast_ref::<StringArray>();
+    let column_type = Arc::new(Int16Array::from(
+        (0..n)
+            .map(|i| {
+                let is_return = is_results
+                    .map(|a| !a.is_null(i) && a.value(i).eq_ignore_ascii_case("YES"))
+                    .unwrap_or(false);
+                if is_return {
+                    return 5_i16; // procedureColumnReturn
+                }
+                match modes.map(|a| if a.is_null(i) { "" } else { a.value(i) }) {
+                    Some("IN") => 1,    // procedureColumnIn
+                    Some("INOUT") => 2, // procedureColumnInOut
+                    Some("OUT") => 4,   // procedureColumnOut
+                    _ => 0,             // procedureColumnUnknown
+                }
+            })
+            .collect::<Vec<_>>(),
+    )) as ArrayRef;
+
+    // DATA_TYPE from the data_type name; TYPE_NAME is the raw string.
+    let type_name_arr = utf8_column(batch, "data_type")?;
+    let type_name_strs = type_name_arr.as_any().downcast_ref::<StringArray>();
+    let data_type = Arc::new(Int32Array::from(match type_name_strs {
+        Some(s) => (0..n)
+            .map(|i| {
+                if s.is_null(i) {
+                    1111 // java.sql.Types.OTHER
+                } else {
+                    databricks_type_to_xdbc(s.value(i)) as i32
+                }
+            })
+            .collect::<Vec<_>>(),
+        None => vec![1111_i32; n],
+    })) as ArrayRef;
+
+    let precision = int32_column(batch, "numeric_precision")?;
+    let scale = int16_column(batch, "numeric_scale")?;
+    // RADIX is derived from the type, not passed through from
+    // `information_schema.numeric_precision_radix`: that column is
+    // inconsistent for integers (it reports 2 for some INT parameters and
+    // NULL for others). JDBC `getProcedureColumns` reports RADIX only for
+    // types where it is meaningful — 10 for exact decimals, 2 for the
+    // approximate (FLOAT / REAL / DOUBLE) types — and NULL otherwise
+    // (integers included), matching the reference driver.
+    let radix = Arc::new(Int16Array::from(match type_name_strs {
+        Some(s) => (0..n)
+            .map(|i| {
+                if s.is_null(i) {
+                    return None;
+                }
+                let t = s.value(i).to_ascii_uppercase();
+                // Strip any parameterisation, e.g. "DECIMAL(10,2)" → "DECIMAL".
+                let base = t.split(['(', ' ']).next().unwrap_or(&t);
+                match base {
+                    "DECIMAL" | "DEC" | "NUMERIC" => Some(10),
+                    "FLOAT" | "REAL" | "DOUBLE" => Some(2),
+                    _ => None,
+                }
+            })
+            .collect::<Vec<Option<i16>>>(),
+        None => vec![None; n],
+    })) as ArrayRef;
+    let char_octet_length = int32_column(batch, "character_octet_length")?;
+    let ordinal_position = int32_column(batch, "ordinal_position")?;
+    let remarks = utf8_column(batch, "comment")?;
+    // NULLABLE: procedureNullableUnknown (2) — information_schema.parameters
+    // does not expose parameter nullability.
+    let nullable = Arc::new(Int32Array::from(vec![2_i32; n])) as ArrayRef;
+    // IS_NULLABLE: JDBC allows "" for unknown.
+    let is_nullable = Arc::new(StringArray::from(vec![Some(""); n])) as ArrayRef;
+
+    RecordBatch::try_new(
+        GET_PROCEDURE_COLUMNS_SCHEMA.clone(),
+        vec![
+            procedure_cat,
+            procedure_schem,
+            procedure_name,
+            column_name,
+            column_type,
+            data_type,
+            type_name_arr,
+            precision,
+            null_int32(n), // LENGTH (no information_schema source)
+            scale,
+            radix,
+            nullable,
+            remarks,
+            null_utf8(n),  // COLUMN_DEF
+            null_int32(n), // SQL_DATA_TYPE
+            null_int32(n), // SQL_DATETIME_SUB
+            char_octet_length,
+            ordinal_position,
+            is_nullable,
+            specific_name,
+        ],
+    )
+    .map_err(|e| Error::data_loss().message(format!("reshape procedure_columns: {e}")))
 }
 
 /// Filter a JDBC-shape getTables batch by `TABLE_TYPE`. Used to apply
@@ -1052,11 +1342,11 @@ mod tests {
     }
 
     #[test]
-    fn tables_empty_types_filter_returns_zero_rows() {
-        // Matches Thrift's behavior: explicit `Some(&[])` is a filter
-        // that accepts no table types, so the result is empty.
-        // `None` (caller didn't pass a type filter at all) is the
-        // separate "all types" path — see `tables_none_types_passes_all`.
+    fn tables_empty_types_matches_none() {
+        // Per the JDBC/ADBC contract (spec METADATA-035 / hiveserver2 #83),
+        // an explicit empty `table_types` slice matches NO table types —
+        // the result is empty, NOT equivalent to `None`. Contrast with
+        // `tables_none_types_passes_all`, where `None` returns all rows.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), Some(&[])).unwrap();
         assert_eq!(out.num_rows(), 0);
@@ -1065,8 +1355,8 @@ mod tests {
     #[test]
     fn tables_none_types_passes_all() {
         // The all-types path — distinct from the explicit-empty path
-        // above. Locks the contract so future refactors don't quietly
-        // re-merge the two.
+        // above (which now matches none). Locks the contract so future
+        // refactors don't quietly re-merge the two.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), None).unwrap();
         assert_eq!(out.num_rows(), 3);
@@ -1102,6 +1392,114 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(cat_arr.value(0), "c");
+    }
+
+    /// Multi-catalog `SHOW TABLES IN ALL CATALOGS` shape, mirroring the
+    /// issue-#129 repro: two catalogs differing only by `_` vs `-`.
+    fn server_tables_multi_catalog() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("isTemporary", DataType::Boolean, false),
+            Field::new("information", DataType::Utf8, true),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, true),
+            Field::new("remarks", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec!["s", "s", "s"])),
+                Arc::new(StringArray::from(vec!["t1", "t2", "t3"])),
+                Arc::new(BooleanArray::from(vec![false, false, false])),
+                Arc::new(StringArray::from(vec![Some(""), Some(""), Some("")])),
+                Arc::new(StringArray::from(vec![
+                    "comparator_tests",
+                    "comparator-tests",
+                    "unrelated",
+                ])),
+                Arc::new(StringArray::from(vec!["TABLE", "TABLE", "TABLE"])),
+                Arc::new(StringArray::from(vec![Some(""), Some(""), Some("")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn tables_multi_catalog_reshape_preserves_all_rows() {
+        // A cross-catalog `SHOW TABLES IN ALL CATALOGS` response reshapes
+        // all rows and attributes each to its own `catalogName` (catalog
+        // *filtering* is now done by the fan-out in `list_tables`, not
+        // here).
+        let b = server_tables_multi_catalog();
+        let out = reshape_tables(&b, None, None).unwrap();
+        assert_eq!(out.num_rows(), 3);
+        let cats = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let got: Vec<&str> = (0..out.num_rows()).map(|i| cats.value(i)).collect();
+        assert!(got.contains(&"comparator_tests"));
+        assert!(got.contains(&"comparator-tests"));
+        assert!(got.contains(&"unrelated"));
+    }
+
+    #[test]
+    fn sort_tables_batch_merges_across_catalogs_in_jdbc_order() {
+        // The fan-out concatenates per-catalog batches then re-sorts the
+        // merged set by `TABLE_TYPE, TABLE_CAT, TABLE_SCHEM, TABLE_NAME`.
+        // Feed rows deliberately out of order and assert the JDBC order.
+        let cat_b = reshape_tables(
+            &single_row_server_table("b_catalog", "s", "t", "TABLE"),
+            Some("b_catalog"),
+            None,
+        )
+        .unwrap();
+        let cat_a = reshape_tables(
+            &single_row_server_table("a_catalog", "s", "t", "TABLE"),
+            Some("a_catalog"),
+            None,
+        )
+        .unwrap();
+        let merged =
+            arrow_select::concat::concat_batches(&GET_TABLES_SCHEMA, &[cat_b, cat_a]).unwrap();
+        let sorted = sort_tables_batch(&merged).unwrap();
+        let cats = sorted
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        // Same TABLE_TYPE, so TABLE_CAT breaks the tie: a_catalog first.
+        assert_eq!(cats.value(0), "a_catalog");
+        assert_eq!(cats.value(1), "b_catalog");
+    }
+
+    /// Single-row `SHOW TABLES IN CATALOG` server shape for fan-out tests.
+    fn single_row_server_table(
+        catalog: &str,
+        namespace: &str,
+        table: &str,
+        table_type: &str,
+    ) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("isTemporary", DataType::Boolean, false),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![namespace.to_owned()])),
+                Arc::new(StringArray::from(vec![table.to_owned()])),
+                Arc::new(BooleanArray::from(vec![false])),
+                Arc::new(StringArray::from(vec![catalog.to_owned()])),
+                Arc::new(StringArray::from(vec![Some(table_type.to_owned())])),
+            ],
+        )
+        .unwrap()
     }
 
     fn server_columns_full() -> RecordBatch {
@@ -1471,5 +1869,254 @@ mod tests {
         let batch = tables_with_types(&["TABLE", "VIEW"]);
         let out = filter_tables_by_type(&batch, &["MANAGED"]).unwrap();
         assert_eq!(out.num_rows(), 0);
+    }
+
+    // ─── procedures / functions / procedure-columns reshape ───────────
+
+    /// One-row `build_get_procedures` / `build_get_functions` server shape.
+    fn server_routine_row(comment: Option<&str>) -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("routine_catalog", DataType::Utf8, true),
+            Field::new("routine_schema", DataType::Utf8, true),
+            Field::new("routine_name", DataType::Utf8, false),
+            Field::new("comment", DataType::Utf8, true),
+            Field::new("specific_name", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("main")])),
+                Arc::new(StringArray::from(vec![Some("sales")])),
+                Arc::new(StringArray::from(vec![Some("sp_report")])),
+                Arc::new(StringArray::from(vec![comment])),
+                Arc::new(StringArray::from(vec![Some("sp_report")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn col_names(batch: &RecordBatch) -> Vec<String> {
+        batch
+            .schema()
+            .fields()
+            .iter()
+            .map(|f| f.name().clone())
+            .collect()
+    }
+
+    #[test]
+    fn reshape_procedures_produces_jdbc_get_procedures_shape() {
+        let out = reshape_procedures(&server_routine_row(Some("nightly report"))).unwrap();
+        assert_eq!(
+            col_names(&out),
+            vec![
+                "PROCEDURE_CAT",
+                "PROCEDURE_SCHEM",
+                "PROCEDURE_NAME",
+                "RESERVED1",
+                "RESERVED2",
+                "RESERVED3",
+                "REMARKS",
+                "PROCEDURE_TYPE",
+                "SPECIFIC_NAME",
+            ]
+        );
+        assert_eq!(out.num_rows(), 1);
+        // Reserved columns are null.
+        assert!(out.column(3).is_null(0));
+        // PROCEDURE_TYPE = procedureNoResult (1).
+        let ptype = out.column(7).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(ptype.value(0), 1);
+    }
+
+    #[test]
+    fn reshape_functions_produces_jdbc_get_functions_shape() {
+        let out = reshape_functions(&server_routine_row(None)).unwrap();
+        assert_eq!(
+            col_names(&out),
+            vec![
+                "FUNCTION_CAT",
+                "FUNCTION_SCHEM",
+                "FUNCTION_NAME",
+                "REMARKS",
+                "FUNCTION_TYPE",
+                "SPECIFIC_NAME",
+            ]
+        );
+        // FUNCTION_TYPE = functionNoTable (1).
+        let ftype = out.column(4).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(ftype.value(0), 1);
+    }
+
+    /// `build_get_procedure_columns` raw server shape (information_schema
+    /// numeric metadata arrives as strings over the wire).
+    fn server_parameter_rows() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("specific_catalog", DataType::Utf8, true),
+            Field::new("specific_schema", DataType::Utf8, true),
+            Field::new("specific_name", DataType::Utf8, false),
+            Field::new("parameter_name", DataType::Utf8, true),
+            Field::new("parameter_mode", DataType::Utf8, true),
+            Field::new("is_result", DataType::Utf8, true),
+            Field::new("data_type", DataType::Utf8, true),
+            Field::new("numeric_precision", DataType::Utf8, true),
+            Field::new("numeric_precision_radix", DataType::Utf8, true),
+            Field::new("numeric_scale", DataType::Utf8, true),
+            Field::new("character_octet_length", DataType::Utf8, true),
+            Field::new("ordinal_position", DataType::Utf8, true),
+            Field::new("comment", DataType::Utf8, true),
+        ]));
+        // Row 0: IN INT param; Row 1: OUT DECIMAL(10,2); Row 2: INOUT; Row 3:
+        // return value (is_result='YES') with a NULL parameter_name — exercises
+        // the nullable COLUMN_NAME path (a non-nullable schema would fail here).
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("main"); 4])),
+                Arc::new(StringArray::from(vec![Some("sales"); 4])),
+                Arc::new(StringArray::from(vec![Some("sp_report"); 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("b"),
+                    Some("c"),
+                    None,
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("IN"),
+                    Some("OUT"),
+                    Some("INOUT"),
+                    Some("OUT"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("NO"),
+                    Some("NO"),
+                    Some("NO"),
+                    Some("YES"),
+                ])),
+                Arc::new(StringArray::from(vec![
+                    Some("INT"),
+                    Some("DECIMAL"),
+                    Some("INT"),
+                    Some("INT"),
+                ])),
+                Arc::new(StringArray::from(vec![None, Some("10"), None, None])),
+                Arc::new(StringArray::from(vec![None, Some("10"), None, None])),
+                Arc::new(StringArray::from(vec![None, Some("2"), None, None])),
+                Arc::new(StringArray::from(vec![None::<&str>; 4])),
+                Arc::new(StringArray::from(vec![
+                    Some("0"),
+                    Some("1"),
+                    Some("2"),
+                    Some("3"),
+                ])),
+                Arc::new(StringArray::from(vec![None::<&str>; 4])),
+            ],
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn reshape_procedure_columns_produces_jdbc_shape_and_mapping() {
+        let out = reshape_procedure_columns(&server_parameter_rows()).unwrap();
+        assert_eq!(
+            col_names(&out),
+            vec![
+                "PROCEDURE_CAT",
+                "PROCEDURE_SCHEM",
+                "PROCEDURE_NAME",
+                "COLUMN_NAME",
+                "COLUMN_TYPE",
+                "DATA_TYPE",
+                "TYPE_NAME",
+                "PRECISION",
+                "LENGTH",
+                "SCALE",
+                "RADIX",
+                "NULLABLE",
+                "REMARKS",
+                "COLUMN_DEF",
+                "SQL_DATA_TYPE",
+                "SQL_DATETIME_SUB",
+                "CHAR_OCTET_LENGTH",
+                "ORDINAL_POSITION",
+                "IS_NULLABLE",
+                "SPECIFIC_NAME",
+            ]
+        );
+        assert_eq!(out.num_rows(), 4);
+
+        // COLUMN_TYPE: IN=1, OUT=4, INOUT=2, return(is_result=YES)=5.
+        let ct = out.column(4).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(
+            (0..4).map(|i| ct.value(i)).collect::<Vec<_>>(),
+            vec![1, 4, 2, 5]
+        );
+
+        // COLUMN_NAME is nullable: the return-value row (row 3) has a NULL
+        // parameter_name and reshaping must produce a null cell, not error.
+        let col_name = out
+            .column(3)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(!col_name.is_null(0));
+        assert!(
+            col_name.is_null(3),
+            "NULL parameter_name must pass through as a null COLUMN_NAME"
+        );
+
+        // DATA_TYPE from data_type name: INT → java.sql.Types.INTEGER (4).
+        let dt = out.column(5).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(dt.value(0), 4);
+
+        // TYPE_NAME preserves the raw data_type string.
+        let tn = out
+            .column(6)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(tn.value(0), "INT");
+        assert_eq!(tn.value(1), "DECIMAL");
+
+        // PRECISION / SCALE pass information_schema through (NULL for the
+        // INT row, 10 / 2 for the DECIMAL row).
+        let prec = out.column(7).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert!(prec.is_null(0));
+        assert_eq!(prec.value(1), 10);
+        let scale = out.column(9).as_any().downcast_ref::<Int16Array>().unwrap();
+        assert_eq!(scale.value(1), 2);
+
+        // RADIX is derived from the type, not passed through: NULL for
+        // integers (even though the fixture supplies numeric_precision_radix=2
+        // for the INT row), 10 for DECIMAL.
+        let radix = out
+            .column(10)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        assert!(
+            radix.is_null(0),
+            "INT radix must be NULL, not passed through"
+        );
+        assert_eq!(radix.value(1), 10);
+
+        // NULLABLE is procedureNullableUnknown (2) for every row.
+        let nul = out
+            .column(11)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(nul.value(0), 2);
+
+        // ORDINAL_POSITION passes information_schema (0-based) through.
+        let ord = out
+            .column(17)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(
+            (0..4).map(|i| ord.value(i)).collect::<Vec<_>>(),
+            vec![0, 1, 2, 3]
+        );
     }
 }

@@ -44,7 +44,8 @@
 //! target is set via [`KERNEL_LOG_TARGET`] at the span site (see
 //! `session.rs`).
 //!
-//! A `klog_targets_match` test in this module guards against drift.
+//! The `tests/klog_bridge.rs` integration test guards against drift in
+//! the emitted target (and structured-field propagation).
 
 /// The single target string every kernel event carries.
 ///
@@ -54,8 +55,9 @@
 /// chance of the two drifting apart. `pyo3_log` maps it to the Python
 /// logger `databricks.sql.kernel` via its `::` -> `.` rule. This string
 /// is an effectively-permanent public contract (customers configure
-/// logging by this name); guarded by drift tests in this module, in
-/// `pyo3/src/logging.rs`, and in the connector's `test_logging.py`.
+/// logging by this name); guarded by drift tests in
+/// `tests/klog_bridge.rs`, in `pyo3/src/logging.rs`, and in the
+/// connector's `test_logging.py`.
 pub const KERNEL_LOG_TARGET: &str = "databricks::sql::kernel";
 
 // The macros are defined with `klog_`-prefixed names and re-exported
@@ -100,103 +102,12 @@ pub(crate) use {
     klog_warn as warn,
 };
 
-#[cfg(test)]
-mod tests {
-    use std::sync::{Mutex, OnceLock};
-
-    /// Captured `(target, rendered_message)` pairs. The message is what
-    /// `tracing`'s `log` feature renders — including any structured
-    /// fields appended as `key="value"` — so we can assert field
-    /// propagation, not just the target.
-    static CAPTURED: OnceLock<Mutex<Vec<(String, String)>>> = OnceLock::new();
-
-    struct Capture;
-    impl log::Log for Capture {
-        fn enabled(&self, _: &log::Metadata) -> bool {
-            true
-        }
-        fn log(&self, record: &log::Record) {
-            CAPTURED
-                .get_or_init(|| Mutex::new(Vec::new()))
-                .lock()
-                .unwrap()
-                .push((record.target().to_owned(), record.args().to_string()));
-        }
-        fn flush(&self) {}
-    }
-
-    /// The kernel is built with `tracing`'s `log` feature and installs no
-    /// `Subscriber` in tests, so each `klog::*` event also emits a
-    /// `log::Record`. Assert the record target is exactly the contract
-    /// string — this is the value `pyo3_log` turns into the
-    /// `databricks.sql.kernel` Python logger. If a future change routes
-    /// kernel logs through a different target, this fails loudly.
-    ///
-    /// CONSTRAINT: this test installs a process-global `log` logger via
-    /// `set_boxed_logger`. There must be at most ONE such test per test
-    /// binary — `log` allows only one global logger, and a second
-    /// `set_boxed_logger` from a sibling test would no-op (its `Err` is
-    /// ignored), so whichever test runs first wins and the other would
-    /// silently capture into the wrong sink. If another global-logger
-    /// test is ever added to this crate's unit-test binary, move one of
-    /// them to an integration test (separate binary) or gate behind a
-    /// shared `Once`. Today this is the only one.
-    #[test]
-    fn klog_emits_contract_target() {
-        CAPTURED.get_or_init(|| Mutex::new(Vec::new()));
-        // Ignore error: tolerate a logger already set in this binary
-        // (see the CONSTRAINT note above — only one such test exists).
-        let _ = log::set_boxed_logger(Box::new(Capture));
-        log::set_max_level(log::LevelFilter::Trace);
-
-        crate::klog::warn!("probe message");
-        crate::klog::debug!(field = 1, "probe with field");
-
-        let got = CAPTURED.get().unwrap().lock().unwrap().clone();
-        assert!(
-            got.iter().any(|(t, _)| t == super::KERNEL_LOG_TARGET),
-            "expected a record with target {:?}, got {:?}",
-            super::KERNEL_LOG_TARGET,
-            got
-        );
-        assert_eq!(super::KERNEL_LOG_TARGET, "databricks::sql::kernel");
-    }
-
-    /// Guards correlation-field propagation: a `klog::*` call with a
-    /// structured field (e.g. `statement_id = …`) must carry that field
-    /// through `tracing`'s `log` feature into the `log::Record` — this is
-    /// what lets a customer correlate interleaved kernel logs to a
-    /// statement/session in a multi-session deployment.
-    ///
-    /// The `tracing`→`log` bridge does NOT propagate enclosing *span*
-    /// fields, only the event's own fields, so reader/factory call sites
-    /// pass `statement_id` as an explicit event field rather than relying
-    /// on the session span. This test pins that mechanism: if the bridge
-    /// behaviour changed (fields stop rendering) or a refactor dropped
-    /// the field, the rendered message would no longer contain it.
-    ///
-    /// Shares the single global logger with `klog_emits_contract_target`
-    /// (see the CONSTRAINT note above) — both read from `CAPTURED`, which
-    /// accumulates across tests in this binary, so this asserts on the
-    /// presence of *its own* distinctive record rather than on counts.
-    #[test]
-    fn klog_propagates_correlation_field() {
-        CAPTURED.get_or_init(|| Mutex::new(Vec::new()));
-        let _ = log::set_boxed_logger(Box::new(Capture));
-        log::set_max_level(log::LevelFilter::Trace);
-
-        let stmt = "stmt-correlation-probe-7f3a";
-        crate::klog::debug!(statement_id = stmt, "creating reader: {} bytes", 42);
-
-        let got = CAPTURED.get().unwrap().lock().unwrap().clone();
-        // The field renders into the message as `statement_id="…"`.
-        assert!(
-            got.iter()
-                .any(|(target, msg)| target == super::KERNEL_LOG_TARGET
-                    && msg.contains(stmt)
-                    && msg.contains("statement_id")),
-            "expected a kernel-target record whose rendered message carries \
-             the `statement_id` field {stmt:?}; got {got:?}"
-        );
-    }
-}
+// The `tracing`→`log` bridge contract for kernel log events (the target
+// `pyo3_log` maps to `databricks.sql.kernel`, and structured-field
+// propagation) is verified in the `tests/klog_bridge.rs` integration test.
+// It cannot live here: those assertions require that NO `tracing`
+// subscriber is installed in the process, but this crate's unit-test
+// binary now installs one whenever a test opens a session
+// (`Session::open` → `logging::init_logging`, issue #213), which suppresses
+// the `log` bridge. A dedicated integration-test binary that opens no
+// session keeps the bridge intact.

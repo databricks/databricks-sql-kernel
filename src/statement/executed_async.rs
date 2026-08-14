@@ -542,6 +542,19 @@ impl ExecutedAsyncStatement {
             .await?
         {
             Some(result) => {
+                // If the server already auto-closed the statement
+                // (`state == Closed`), pre-set the shared `closed` flag so
+                // this handle's `close()` / `Drop` — and `invalidate_prior`
+                // on the parent `Statement`'s next execute — skip the
+                // redundant `CloseStatement` DELETE (the server returns 404
+                // STATEMENT_NOT_FOUND on it). Mirrors the sync `execute()`
+                // path's `already_closed` short-circuit (issue #168). This
+                // covers both `await_result()` and `fetch_result()`, which
+                // funnel through here. `Succeeded` leaves the statement
+                // server-side, so the flag stays as-is and the close fires.
+                if result.status.state == crate::types::sea::StatementState::Closed {
+                    self.closed.store(true, Ordering::Release);
+                }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once

@@ -56,7 +56,10 @@
 //!         "https://my-workspace.databricks.com",
 //!         "abc123",
 //!     ))
-//!     .auth(AuthConfig::Pat { token: "dapi...".into() })
+//!     .auth(AuthConfig::Pat {
+//!         token: "dapi...".into(),
+//!         identity_federation_client_id: None,
+//!     })
 //!     .open()
 //!     .await?;
 //!
@@ -125,7 +128,7 @@ pub mod c_abi;
 // === Public re-exports ===
 pub use config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
-    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
+    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TokenCacheConfig, TransportMode,
 };
 pub use kernel_error::{Error, ErrorCode, Result};
 /// The `tracing` target string stamped on every kernel log event.

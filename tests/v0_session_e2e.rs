@@ -53,7 +53,10 @@ async fn open_with_pat_against_live_warehouse() {
 
     let session = Session::builder()
         .http_path(host, http_path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("Session::open should succeed against the live warehouse");
@@ -94,6 +97,7 @@ async fn open_with_oauth_m2m_against_live_warehouse() {
             client_secret,
             scopes: None,
             token_url_override: None,
+            identity_federation_client_id: None,
         })
         .open()
         .await
@@ -123,6 +127,14 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
             scopes: None,
             token_url_override: None,
             callback_timeout: None,
+            // Disable the on-disk cache to keep runs independent: it defaults
+            // to enabled, so a token cached by an earlier run would skip the
+            // browser flow this test exists to exercise.
+            token_cache: Some(databricks_sql_kernel::TokenCacheConfig {
+                enabled: false,
+                passphrase: None,
+            }),
+            identity_federation_client_id: None,
         })
         .open()
         .await
@@ -143,7 +155,10 @@ async fn open_drop_does_not_panic() {
 
     let session = Session::builder()
         .http_path(host, http_path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("open");

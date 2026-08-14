@@ -46,7 +46,8 @@
 //! requires catalog-managed tables server-side).
 
 use crate::auth::{
-    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, PersonalAccessToken,
+    AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
+    PersonalAccessToken,
 };
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
@@ -247,6 +248,41 @@ impl Session {
             ))
         })?;
 
+        // Install the tracing subscriber from the caller's LoggingConfig —
+        // but ONLY when they explicitly configured a filter or a
+        // destination. This is the direct-Rust counterpart to the C ABI's
+        // `kernel_init_logging`: without it, a caller's `logging(...)` is
+        // accepted and stored but never consumed, so a configured log
+        // destination silently produces nothing (issue #213).
+        //
+        // The `is_some()` gate is load-bearing, NOT an optimisation. The
+        // pyo3 binding opens sessions through this same path and NEVER sets
+        // a `LoggingConfig`; it relies on the `tracing`→`log` bridge (the
+        // crate's `tracing/log` feature) so `pyo3_log` can forward records
+        // into Python's `logging`. Installing ANY subscriber here — even the
+        // `RUST_LOG`/warn default an empty config would fall through to —
+        // suppresses that bridge and breaks all kernel logging into Python.
+        // So an unconfigured `LoggingConfig` must remain a true no-op,
+        // preserving the "direct-Rust vs pyo3 are mutually exclusive"
+        // invariant documented in `src/logging.rs`. It also keeps a C ABI
+        // `kernel_init_logging(OFF, …)` — which intentionally installs
+        // nothing — from being overridden by a stray `warn` subscriber on
+        // the next `Session::open`.
+        //
+        // Idempotent and process-wide (`OnceLock`): the first configured
+        // install (here or via `kernel_init_logging`) wins; later calls are
+        // no-ops. The return value only signals whether the requested
+        // destination was fully honoured; a `false` (log file unopenable, or
+        // a subscriber already installed by the host) is a logging
+        // degradation, not a reason to fail `open()`, so it is not
+        // propagated as an error.
+        if config.logging.filter.is_some() || config.logging.file.is_some() {
+            let _ = crate::logging::init_logging(&crate::logging::LogConfig {
+                filter: config.logging.filter.clone(),
+                file: config.logging.file.clone(),
+            });
+        }
+
         // Fold client-only result knobs (e.g. cloudfetch_max_chunks_in_memory)
         // carried in session_conf into the typed ResultConfig and strip them
         // from session_conf, before either the reader factory reads
@@ -278,7 +314,16 @@ impl Session {
         //    which in turn needs to be set on the transport via
         //    OnceLock::set. So: construct, wrap in Arc, build factory,
         //    install factory.
-        let transport_config = TransportConfig::default();
+        let defaults = config.defaults.clone().unwrap_or_default();
+        let transport_config = TransportConfig {
+            // Thread the connection-level CloudFetch toggle onto the
+            // transport so every ExecuteStatement picks the right SEA
+            // disposition (INLINE_OR_EXTERNAL_LINKS vs INLINE). This is
+            // how cloud-fetch is disabled on SEA — see TransportConfig
+            // and issue #196; there is no CAN_CLOUD_DOWNLOAD session conf.
+            cloudfetch_enabled: config.result.cloudfetch_enabled,
+            ..TransportConfig::default()
+        };
         let sea = Arc::new(SeaRestTransport::new(
             http_client.clone(),
             host.clone(),
@@ -296,61 +341,24 @@ impl Session {
         let transport: Arc<dyn Transport> = sea;
 
         // 4. Mint the session on the server.
-        let defaults = config.defaults.clone().unwrap_or_default();
         debug!(
             host = %host,
             warehouse_id = %warehouse_id,
             "creating session"
         );
 
-        // When CloudFetch is disabled at the kernel layer, advertise this
-        // capability to SEA via the `can_cloud_download` session conf.
-        // Per the SEA inline-Arrow design (go/inline-arrow-sea, DD1), this
-        // tells the server to fall back to the inline-Arrow path for all
-        // result sizes instead of attempting cloud-fetch and erroring at
-        // fetch time.
-        //
-        // Don't clobber an explicit non-empty user value — if the caller
-        // wired `can_cloud_download` directly via `session_conf` for any
-        // reason (e.g., to force inline-Arrow even with CloudFetch enabled
-        // at the kernel layer), their value wins.
-        //
-        // **Case-insensitive key match** because SEA session-conf keys
-        // are historically case-insensitive on the wire; without this, a
-        // stray `"Can_Cloud_Download"` from the user would coexist with
-        // the kernel's canonical-cased `"can_cloud_download"` and we'd
-        // ship both keys (potentially with different values) — server
-        // would pick one non-deterministically.
-        //
-        // **Empty-string user values are purged**: an empty value is
-        // ambiguous (server behaviour undefined) and the kernel prefers
-        // to inject its canonical `"false"` instead of shipping the
-        // ambiguous empty. Purge-then-insert guarantees the wire body
-        // carries at most one `can_cloud_download` key regardless of
-        // case-variants the caller supplied.
-        let mut session_conf = config.session_conf.clone();
-        if !config.result.cloudfetch_enabled {
-            let has_nonempty_user_value = session_conf
-                .iter()
-                .any(|(k, v)| k.eq_ignore_ascii_case("can_cloud_download") && !v.is_empty());
-            crate::klog::debug!(
-                cloudfetch_enabled = false,
-                user_value_present = has_nonempty_user_value,
-                "evaluating can_cloud_download injection",
-            );
-            if !has_nonempty_user_value {
-                // Drop every case-variant (including empty-value ones)
-                // before inserting the canonical key so we can't ship
-                // duplicates that differ only in case.
-                session_conf.retain(|k, _| !k.eq_ignore_ascii_case("can_cloud_download"));
-                session_conf.insert("can_cloud_download".to_string(), "false".to_string());
-            }
-        }
+        // CloudFetch-disable is expressed per-statement via the SEA
+        // `disposition` (threaded onto `TransportConfig` above), NOT via a
+        // session conf: SEA has no `CAN_CLOUD_DOWNLOAD` conf — sending one
+        // is accepted at CreateSession but rejected at the first
+        // ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue #196). So the
+        // user's `session_conf` flows to CreateSession untouched; the
+        // kernel synthesises nothing here.
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                crate::config::filter_session_conf(session_conf),
+                crate::config::filter_session_conf(config.session_conf.clone()),
             )
             .await?;
 
@@ -894,12 +902,44 @@ fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
 /// calls must not inherit a generous `overall_timeout` (e.g. 900s) or
 /// they'd hang for many minutes on an unreachable IdP. This matches the
 /// legacy ADBC behaviour and is intentionally not user-overridable.
+///
+/// The `CloudFetch` category is capped to **no HTTP-level retries** for
+/// the same reason: chunk downloads already sit inside the CloudFetch
+/// provider's own retry loop (`CloudFetchConfig::max_retries`, default 5).
+/// If the inner HTTP client also inherited the global budget (default 5
+/// retries / 900s `overall_timeout`) the two budgets would **multiply** —
+/// a permanently-failing chunk gets attempted ~30 times with escalating
+/// backoff and blocks the consumer well past three minutes instead of
+/// surfacing a bounded terminal error (databricks-odbc#144 / #226: the
+/// `SQLFetch` drain hung 186s, over the 180s conformance bound). Making
+/// the provider loop the single retry authority keeps a persistent
+/// failure terminal in bounded time; one-shot transient recovery
+/// (CLOUDFETCH-010/011) still works via the provider loop. Fixed, like
+/// `Auth` — and not user-overridable.
 fn build_retry_configs_for_session(
     config: &SessionConfig,
 ) -> std::collections::HashMap<RequestCategory, RetryConfig> {
+    // A tuning typo where `retry_max_wait < retry_min_wait` is CORRECTED, not
+    // fatal: raise max to min and warn once here (the single per-session build
+    // point), rather than letting it reach `calculate_backoff` — where an
+    // uncorrected pair would otherwise panic `Duration::clamp`. Mirrors the
+    // clamp-and-warn discipline `apply_client_result_overrides` uses for
+    // `cloudfetch_max_chunks_in_memory`.
+    let min_wait = config.http.retry_min_wait;
+    let mut max_wait = config.http.retry_max_wait;
+    if max_wait < min_wait {
+        crate::klog::warn!(
+            retry_min_wait = ?min_wait,
+            retry_max_wait = ?max_wait,
+            "retry_max_wait is below retry_min_wait; raising retry_max_wait to \
+             retry_min_wait (a backoff bound is a tuning hint, not a hard failure)",
+        );
+        max_wait = min_wait;
+    }
+
     let global = RetryConfig {
-        min_wait: config.http.retry_min_wait,
-        max_wait: config.http.retry_max_wait,
+        min_wait,
+        max_wait,
         max_retries: config.http.retry_max_retries,
         overall_timeout: config.http.overall_timeout,
         ..RetryConfig::default()
@@ -913,102 +953,79 @@ fn build_retry_configs_for_session(
             ..Default::default()
         },
     );
+    // Let the CloudFetch provider loop be the single retry authority for a
+    // chunk download (see the doc comment above): no HTTP-level retries, and
+    // a tight wall-clock bound so a stuck download can't inherit the global
+    // 900s `overall_timeout`.
+    overrides.insert(
+        RequestCategory::CloudFetch,
+        RetryConfigOverrides {
+            overall_timeout: Some(Duration::from_secs(20)),
+            max_retries: Some(0),
+            ..Default::default()
+        },
+    );
     build_retry_configs(&global, &overrides)
 }
 
-/// Client-only `session_conf` key that tunes how many decompressed
-/// CloudFetch chunks the kernel holds in memory at once (peak RSS on
-/// large result sets). It is a **client** knob, not a server SET
-/// parameter: it is read by [`apply_client_result_overrides`] before
-/// session creation and is deliberately absent from
-/// [`SESSION_CONF_ALLOWLIST`](crate::config), so `filter_session_conf`
-/// drops it and it never reaches the SEA wire. Exposed this way (rather
-/// than as a new C-ABI symbol) so the Go/ODBC consumers can set it
-/// through the existing `set_session_conf` entry point.
-pub(crate) const CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS: &str = "cloudfetch_max_chunks_in_memory";
-
-/// Upper bound applied to a host-supplied
-/// [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`] value. Peak RSS grows roughly
-/// linearly with this knob (each in-memory chunk is tens of MB), so an
-/// unbounded value — a typo like `"1000000"` meant as `"100"`, or a host bug —
-/// risks OOM on large result sets. This ceiling (16× the default of 16, and 8×
-/// the most aggressive value we've measured) is comfortably above any real
-/// tuning yet bounds the blast radius of a fat-fingered value; a request above
-/// it is clamped with a `warn!`, mirroring the retry setter's clamp discipline.
-pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
-
-/// Fold client-only result-management knobs carried in `session_conf`
-/// into the typed [`ResultConfig`], then remove them from `session_conf`
-/// so they cannot leak onto the SEA wire.
+/// Fold any **client-side** result knobs that a host left in `session_conf`
+/// into the typed [`ResultConfig`], then strip them so they can't leak onto
+/// the SEA wire.
 ///
-/// Today this handles only [`CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS`]. A key
-/// that is absent leaves the field at its `ResultConfig` default (16); a
-/// present-but-unparseable or zero value is ignored (default preserved)
-/// with a warning rather than failing session creation — a
-/// best-effort tuning knob should never turn a typo into a connect
-/// error. A value above [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is clamped to
-/// that ceiling (with a warning) so a fat-fingered value can't drive peak
-/// RSS toward OOM. Matched case-insensitively, consistent with the rest of
-/// the `session_conf` handling; if a host sets two spellings that differ only
-/// in case the lexicographically-last one wins deterministically (and all
-/// variants are stripped).
+/// This is the legacy / convenience channel: the preferred entry point is
+/// the C ABI's `kernel_session_config_set_client_conf` (which sets
+/// `ResultConfig` directly), but a host that only has a `session_conf`
+/// key/value bag — e.g. one forwarding DSN attributes without sorting them
+/// into client vs. server — can still drop a client knob like
+/// `cloudfetch_max_chunks_in_memory` in there and have it applied. Any key
+/// recognised by [`ResultConfig::apply_client_conf`] (see
+/// [`ClientConfKey`](crate::config::ClientConfKey)) is consumed here;
+/// unrecognised keys are left for [`filter_session_conf`] to handle as
+/// server confs.
+///
+/// **Best-effort, never fatal.** A recognised key with an unparseable value
+/// is logged at `warn` and skipped (the field keeps its current value)
+/// rather than failing session creation — a stray tuning value in the bag
+/// must not turn into a connect error. (The typed `set_client_conf` path
+/// *does* reject bad values, because there the caller asked for that key
+/// explicitly; here the key is ambient in a mixed bag.) Every recognised
+/// key is removed regardless of parse outcome, so no client-only key
+/// survives into `filter_session_conf` / the wire.
+///
+/// Matched case-insensitively. If a host sets two spellings of the same key
+/// differing only in case, the lexicographically-last spelling wins
+/// deterministically and all variants are stripped.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
-    // Collect EVERY case-insensitive spelling of the key, not just the first
-    // one `HashMap` iteration happens to yield. Two variants that differ only
-    // in case (e.g. `cloudfetch_max_chunks_in_memory` and
-    // `CloudFetch_Max_Chunks_In_Memory`) would otherwise resolve
-    // nondeterministically across runs. We sort the matches and let the
-    // lexicographically-last spelling win — a stable, run-independent rule —
-    // and remove all of them regardless of parse outcome, so no client-only
-    // key survives into `filter_session_conf` / the wire.
-    let mut keys: Vec<String> = config
+    use crate::config::ClientConfKey;
+
+    // Recognised client keys currently present in session_conf. A key is
+    // "recognised" iff it parses to a ClientConfKey (case-insensitive).
+    let mut present: Vec<String> = config
         .session_conf
         .keys()
-        .filter(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS))
+        .filter(|k| ClientConfKey::parse(k).is_some())
         .cloned()
         .collect();
-    if keys.is_empty() {
+    if present.is_empty() {
         return;
     }
-    keys.sort_unstable();
-    if keys.len() > 1 {
-        crate::klog::warn!(
-            variants = keys.len(),
-            "multiple case-variant cloudfetch_max_chunks_in_memory keys set; \
-             applying the lexicographically-last spelling deterministically",
-        );
-    }
-    // Remove every variant; the winner's value drives the override.
-    let mut raw = String::new();
-    for k in &keys {
-        if let Some(v) = config.session_conf.remove(k) {
-            raw = v;
-        }
-    }
-    match raw.trim().parse::<usize>() {
-        Ok(n) if n > 0 => {
-            // Clamp to a sane ceiling: peak RSS scales with this knob, so an
-            // absurd value (typo / host bug) would otherwise risk OOM.
-            let clamped = n.min(CLOUDFETCH_MAX_CHUNKS_CEILING);
-            if clamped != n {
-                crate::klog::warn!(
-                    requested = n,
-                    ceiling = CLOUDFETCH_MAX_CHUNKS_CEILING,
-                    "clamping cloudfetch_max_chunks_in_memory to the ceiling \
-                     (peak RSS scales with this knob)",
-                );
-            }
-            config.result.cloudfetch_max_chunks_in_memory = clamped;
-            crate::klog::debug!(
-                max_chunks_in_memory = clamped,
-                "applied client cloudfetch_max_chunks_in_memory override",
-            );
-        }
-        _ => {
+    // Deterministic winner among case-variants: sort so the lexicographically
+    // -last spelling of each key is applied last (and thus wins).
+    present.sort_unstable();
+
+    for spelling in present {
+        let Some(value) = config.session_conf.remove(&spelling) else {
+            continue;
+        };
+        // Best-effort: a bad value in the ambient bag is warned-and-skipped,
+        // never fatal. The key is already removed above so it can't reach the
+        // wire regardless.
+        if let Err(e) = config.result.apply_client_conf(&spelling, &value) {
             crate::klog::warn!(
-                value = %raw,
-                "ignoring invalid cloudfetch_max_chunks_in_memory (want a positive integer); \
-                 keeping the default",
+                key = %spelling,
+                value = %value,
+                error = %e.message,
+                "ignoring invalid client-side result knob in session_conf; keeping current value",
             );
         }
     }
@@ -1041,6 +1058,39 @@ fn result_to_post_process_options(
     }
 }
 
+/// Kernel default U2M OAuth client id. The default `{client_id, scopes,
+/// redirect_port}` form one coupled bundle (each OAuth app is registered with
+/// its own redirect URI): the `databricks-sql-connector` app, shared by the
+/// Node and Go drivers. See PECOBLR-4039.
+const DEFAULT_U2M_CLIENT_ID: &str = "databricks-sql-connector";
+/// Redirect port registered for [`DEFAULT_U2M_CLIENT_ID`].
+const DEFAULT_U2M_REDIRECT_PORT: u16 = 8030;
+
+/// Scopes registered for [`DEFAULT_U2M_CLIENT_ID`] (`sql offline_access`).
+fn default_u2m_scopes() -> Vec<String> {
+    vec!["sql".to_string(), "offline_access".to_string()]
+}
+
+/// Fill the kernel default U2M bundle for any field the caller left unset.
+///
+/// Extracted from [`build_auth_provider`] so the defaulting is unit-testable
+/// without OIDC discovery. Because the bundle is coupled, a caller overriding
+/// `client_id` for a different OAuth app must also supply the matching
+/// `redirect_port` (and usually `scopes`).
+fn resolve_u2m_bundle(
+    client_id: Option<&str>,
+    redirect_port: Option<u16>,
+    scopes: Option<&[String]>,
+) -> (String, u16, Vec<String>) {
+    (
+        client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
+        redirect_port.unwrap_or(DEFAULT_U2M_REDIRECT_PORT),
+        scopes
+            .map(<[String]>::to_vec)
+            .unwrap_or_else(default_u2m_scopes),
+    )
+}
+
 /// Build the auth provider for a given [`AuthConfig`]. `host` is the
 /// workspace URL — used for OIDC discovery on M2M / U2M flows.
 async fn build_auth_provider(
@@ -1048,8 +1098,30 @@ async fn build_auth_provider(
     host: &str,
     http_client: Arc<DatabricksHttpClient>,
 ) -> Result<Arc<dyn AuthProvider>> {
+    // Build the base provider for the configured auth flow, then wrap it with
+    // mandatory OIDC token exchange (BYOT federation). The wrapper is a no-op
+    // for non-JWT and same-host-issuer tokens, so it is safe to apply
+    // unconditionally across PAT / M2M / U2M. See `auth::oauth::federation`.
+    let base = build_base_auth_provider(auth, host, http_client.clone()).await?;
+    let provider = FederationProvider::new(
+        base,
+        host,
+        auth.identity_federation_client_id().map(str::to_owned),
+        &http_client,
+    )
+    .await?;
+    Ok(Arc::new(provider))
+}
+
+/// Constructs the underlying credential provider for the configured auth flow,
+/// before token-federation wrapping.
+async fn build_base_auth_provider(
+    auth: &AuthConfig,
+    host: &str,
+    http_client: Arc<DatabricksHttpClient>,
+) -> Result<Arc<dyn AuthProvider>> {
     match auth {
-        AuthConfig::Pat { token } => {
+        AuthConfig::Pat { token, .. } => {
             if token.is_empty() {
                 return Err(
                     Error::invalid_argument().message("AuthConfig::Pat token must not be empty")
@@ -1062,6 +1134,7 @@ async fn build_auth_provider(
             client_secret,
             scopes,
             token_url_override,
+            ..
         } => {
             if client_id.is_empty() || client_secret.is_empty() {
                 return Err(Error::invalid_argument().message(
@@ -1088,21 +1161,33 @@ async fn build_auth_provider(
             scopes,
             token_url_override,
             callback_timeout,
+            token_cache,
+            ..
         } => {
-            let client_id = client_id.as_deref().unwrap_or("databricks-cli");
-            let redirect_port = redirect_port.unwrap_or(8020);
-            let scopes = scopes
-                .clone()
-                .unwrap_or_else(|| vec!["all-apis".to_string(), "offline_access".to_string()]);
+            // Fill the coupled kernel default bundle for any unset field
+            // (databricks-sql-connector / sql offline_access / 8030). Consumers
+            // using a different app override the whole bundle. See PECOBLR-4039.
+            let (client_id, redirect_port, scopes) =
+                resolve_u2m_bundle(client_id.as_deref(), *redirect_port, scopes.as_deref());
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
+            // `Some(passphrase)` enables the on-disk cache, `None` disables
+            // it. When the cache is on but the caller supplied no passphrase,
+            // `resolve` substitutes a machine-local derived one rather than
+            // failing or writing plaintext — see `TokenCacheConfig`.
+            let cache_policy = token_cache
+                .clone()
+                .unwrap_or_default()
+                .resolve()
+                .map(|p| p.into_owned());
             let provider = AuthorizationCodeProvider::new_with_full_config(
                 host,
-                client_id,
+                &client_id,
                 http_client,
                 scopes,
                 redirect_port,
                 timeout,
                 token_url_override.clone(),
+                cache_policy,
             )
             .await?;
             Ok(Arc::new(provider))
@@ -1111,6 +1196,36 @@ async fn build_auth_provider(
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
             .message("AuthConfig::External is reserved; v0 wires PAT + OAuthM2M + OAuthU2M only")),
+    }
+}
+
+#[cfg(test)]
+mod u2m_default_tests {
+    use super::*;
+
+    #[test]
+    fn u2m_default_bundle_is_connector_sql_8030() {
+        // Caller omits everything → kernel default databricks-sql-connector
+        // app bundle (PECOBLR-4039).
+        let (client_id, port, scopes) = resolve_u2m_bundle(None, None, None);
+        assert_eq!(client_id, "databricks-sql-connector");
+        assert_eq!(port, 8030);
+        assert_eq!(
+            scopes,
+            vec!["sql".to_string(), "offline_access".to_string()]
+        );
+    }
+
+    #[test]
+    fn u2m_bundle_honours_caller_overrides() {
+        // A consumer overriding for a different OAuth app supplies the whole
+        // coupled bundle; each field is threaded through verbatim.
+        let custom = vec!["all-apis".to_string()];
+        let (client_id, port, scopes) =
+            resolve_u2m_bundle(Some("databricks-sql-python"), Some(8020), Some(&custom));
+        assert_eq!(client_id, "databricks-sql-python");
+        assert_eq!(port, 8020);
+        assert_eq!(scopes, custom);
     }
 }
 
@@ -1128,6 +1243,7 @@ mod retry_config_tests {
             defaults: None,
             auth: AuthConfig::Pat {
                 token: "dapi-test".to_string(),
+                identity_federation_client_id: None,
             },
             session_conf: Default::default(),
             http,
@@ -1151,18 +1267,46 @@ mod retry_config_tests {
         };
         let configs = build_retry_configs_for_session(&config_with_http(http));
 
-        // SEA + CloudFetch inherit the user-tuned global config.
-        for cat in [RequestCategory::Sea, RequestCategory::CloudFetch] {
-            let c = &configs[&cat];
-            assert_eq!(c.min_wait, Duration::from_secs(3), "{cat:?} min_wait");
-            assert_eq!(c.max_wait, Duration::from_secs(90), "{cat:?} max_wait");
-            assert_eq!(c.max_retries, 7, "{cat:?} max_retries");
-            assert_eq!(
-                c.overall_timeout,
-                Duration::from_secs(600),
-                "{cat:?} overall_timeout"
-            );
-        }
+        // SEA inherits the user-tuned global config. (CloudFetch does NOT —
+        // it keeps a fixed no-HTTP-retry override; see
+        // `cloudfetch_override_stays_fixed_regardless_of_user_knobs`.)
+        let c = &configs[&RequestCategory::Sea];
+        assert_eq!(c.min_wait, Duration::from_secs(3), "Sea min_wait");
+        assert_eq!(c.max_wait, Duration::from_secs(90), "Sea max_wait");
+        assert_eq!(c.max_retries, 7, "Sea max_retries");
+        assert_eq!(
+            c.overall_timeout,
+            Duration::from_secs(600),
+            "Sea overall_timeout"
+        );
+    }
+
+    #[test]
+    fn cloudfetch_override_stays_fixed_regardless_of_user_knobs() {
+        // CloudFetch chunk downloads nest inside the provider's own retry loop
+        // (`CloudFetchConfig::max_retries`). The inner HTTP client must NOT add
+        // a second retry budget on top — otherwise the two multiply and a
+        // permanently-failing chunk blocks the consumer well past the
+        // conformance bound (databricks-odbc#144 / #226). So — like Auth — the
+        // CloudFetch category keeps a fixed override no matter how generous the
+        // user's global retry knobs are: zero HTTP-level retries, tight
+        // wall-clock bound.
+        let http = HttpConfig {
+            retry_max_retries: 99,
+            overall_timeout: Duration::from_secs(3600),
+            ..HttpConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_http(http));
+        let cf = &configs[&RequestCategory::CloudFetch];
+        assert_eq!(
+            cf.max_retries, 0,
+            "CloudFetch must not retry at the HTTP layer"
+        );
+        assert_eq!(
+            cf.overall_timeout,
+            Duration::from_secs(20),
+            "CloudFetch keeps its tight wall-clock bound"
+        );
     }
 
     #[test]
@@ -1253,7 +1397,9 @@ mod retry_config_tests {
     #[test]
     fn cloudfetch_max_chunks_override_applies_and_is_stripped() {
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "4".to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
@@ -1306,9 +1452,9 @@ mod retry_config_tests {
             "the lexicographically-last case variant must win deterministically"
         );
         assert!(
-            !cfg.session_conf
-                .keys()
-                .any(|k| k.eq_ignore_ascii_case(CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS)),
+            !cfg.session_conf.keys().any(|k| k.eq_ignore_ascii_case(
+                crate::config::ClientConfKey::CloudfetchMaxChunksInMemory.as_str()
+            )),
             "every case variant of the client knob must be stripped, got {:?}",
             cfg.session_conf
         );
@@ -1337,7 +1483,9 @@ mod retry_config_tests {
     fn cloudfetch_max_chunks_invalid_is_ignored_but_stripped() {
         for bad in ["0", "-1", "abc", ""] {
             let mut cfg = config_with_session_conf(HashMap::from([(
-                CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+                crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                    .as_str()
+                    .to_string(),
                 bad.to_string(),
             )]));
             apply_client_result_overrides(&mut cfg);
@@ -1359,26 +1507,83 @@ mod retry_config_tests {
     fn cloudfetch_max_chunks_above_ceiling_is_clamped() {
         // Well above the ceiling → clamped down.
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "1000000".to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
         assert_eq!(
-            cfg.result.cloudfetch_max_chunks_in_memory, CLOUDFETCH_MAX_CHUNKS_CEILING,
+            cfg.result.cloudfetch_max_chunks_in_memory,
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
             "an absurd value must clamp to the ceiling"
         );
         assert!(cfg.session_conf.is_empty());
 
         // Exactly at the ceiling → unchanged (boundary is inclusive).
         let mut cfg = config_with_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
-            CLOUDFETCH_MAX_CHUNKS_CEILING.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING.to_string(),
         )]));
         apply_client_result_overrides(&mut cfg);
         assert_eq!(
             cfg.result.cloudfetch_max_chunks_in_memory,
-            CLOUDFETCH_MAX_CHUNKS_CEILING,
+            crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
         );
+    }
+
+    /// All six client-side result knobs are recognised in session_conf,
+    /// applied to the typed ResultConfig, and stripped so none reach the
+    /// wire. Guards the parity between `ClientConfKey::ALL` and the
+    /// session_conf sweep.
+    #[test]
+    fn all_client_conf_keys_apply_from_session_conf_and_are_stripped() {
+        use crate::config::ClientConfKey as K;
+        let mut cfg = config_with_session_conf(HashMap::from([
+            (
+                K::CloudfetchEnabled.as_str().to_string(),
+                "false".to_string(),
+            ),
+            (
+                K::CloudfetchLinkPrefetchWindow.as_str().to_string(),
+                "7".to_string(),
+            ),
+            (
+                K::CloudfetchMaxChunksInMemory.as_str().to_string(),
+                "9".to_string(),
+            ),
+            (
+                K::InlineMaxChunksInMemory.as_str().to_string(),
+                "3".to_string(),
+            ),
+            (
+                K::ComplexTypesAsJson.as_str().to_string(),
+                "true".to_string(),
+            ),
+            (
+                K::IntervalsAsString.as_str().to_string(),
+                "true".to_string(),
+            ),
+            // A benign server param must survive untouched.
+            ("ansi_mode".to_string(), "true".to_string()),
+        ]));
+        apply_client_result_overrides(&mut cfg);
+        assert!(!cfg.result.cloudfetch_enabled);
+        assert_eq!(cfg.result.cloudfetch_link_prefetch_window, 7);
+        assert_eq!(cfg.result.cloudfetch_max_chunks_in_memory, 9);
+        assert_eq!(cfg.result.inline_max_chunks_in_memory, 3);
+        assert!(cfg.result.complex_types_as_json);
+        assert!(cfg.result.intervals_as_string);
+        // Every client key stripped; only the server param remains.
+        assert_eq!(
+            cfg.session_conf.get("ansi_mode").map(String::as_str),
+            Some("true"),
+            "server param must survive; got {:?}",
+            cfg.session_conf
+        );
+        assert_eq!(cfg.session_conf.len(), 1, "got {:?}", cfg.session_conf);
     }
 
     /// The client knob is NOT in the server allowlist, so even if it were
@@ -1388,7 +1593,9 @@ mod retry_config_tests {
     #[test]
     fn cloudfetch_max_chunks_key_is_not_server_allowlisted() {
         let filtered = crate::config::filter_session_conf(HashMap::from([(
-            CLIENT_CONF_CLOUDFETCH_MAX_CHUNKS.to_string(),
+            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
+                .as_str()
+                .to_string(),
             "4".to_string(),
         )]));
         assert!(
@@ -1436,6 +1643,7 @@ mod is_open_tests {
             )
             .auth(AuthConfig::Pat {
                 token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
             })
             .open()
             .await
@@ -1487,6 +1695,7 @@ mod is_open_tests {
             )
             .auth(AuthConfig::Pat {
                 token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
             })
             // ignore_transactions defaults to true; be explicit for the test.
             .defaults(DefaultOpts {
