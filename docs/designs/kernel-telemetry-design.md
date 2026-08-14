@@ -549,7 +549,14 @@ failures, and circuit-breaker-open states as non-fatal.
 
 ## Rollout Plan
 
-### Phase 1: Proto And Model Alignment
+Each phase should be independently deliverable and testable. Avoid landing a
+large telemetry framework that cannot be exercised until later phases. The early
+phases should produce real events through the same queue/exporter path that
+later statement and metadata telemetry use.
+
+### Phase 1: Model And Serialization Contract
+
+Deliverable:
 
 - Add Rust models for the ADBC-compatible telemetry envelope:
 `TelemetryFrontendLog`, `FrontendLogContext`, `FrontendLogEntry`,
@@ -557,39 +564,73 @@ failures, and circuit-breaker-open states as non-fatal.
 - Decide whether to generate Rust from
 `~/databricks/csharp/src/Telemetry/Proto/sql_driver_telemetry.proto` or keep
 serde models aligned to the same field names.
-- Add proto/JSON alignment tests equivalent to ADBC's
-`TelemetryProtoAlignmentTests`.
-- Verify snake_case backend field names and endpoint request shape:
-`TelemetryRequest { upload_time, proto_logs }`.
+- Add a test-only `TelemetryExporter` trait and in-memory capturing exporter so
+later phases can be tested without live telemetry service access.
 
-### Phase 2: Core Connection Telemetry
+Acceptance tests:
+
+- Proto/JSON alignment tests equivalent to ADBC's
+`TelemetryProtoAlignmentTests`.
+- Serialization preserves expected snake_case field names.
+- `TelemetryRequest { upload_time, proto_logs }` matches the backend request
+shape.
+
+### Phase 2: Connection Telemetry End-To-End
+
+Deliverable:
 
 - Replace `src/telemetry/mod.rs` with `ConnectionTelemetry`,
 `NoOpConnectionTelemetry`, `TelemetrySessionContext`, config parsing,
-event-building helpers, and test exporter injection.
+event-building helpers, `TelemetryClient`, and test exporter injection.
 - Expand `TelemetryConfig` in `src/config.rs` with ADBC-compatible defaults.
 - Add `TelemetryRuntime` to `SessionInner`.
 - Wire `Session::open` to create connection telemetry after `create_session`
 returns, using no-op fallback on disabled telemetry, invalid config, or
 initialization failure.
-- Wire `Session::close` to emit delete-session telemetry and then perform a
-bounded flush.
+- Emit create-session and delete-session operation events.
+- Wire `Session::close` to enqueue delete-session telemetry and perform a
+bounded flush through the same exporter path that production will use.
+- Implement the minimal export pipeline required for this slice: in-memory
+queue, batch-size flush, close-time flush, single-flush coordination, and
+fail-open error swallowing. Defer timer flush, host-scoped sharing, feature
+flags, and circuit breaker.
 
-### Phase 3: Observer Boundary And Statement Context
+Acceptance tests:
+
+- With telemetry disabled, `Session::open` and `Session::close` use no-op
+telemetry and emit nothing.
+- With telemetry enabled and a capturing exporter, opening and closing a mocked
+session emits create-session and delete-session events.
+- Close flushes pending connection events.
+- Exporter failure does not change the result of `Session::open` or
+`Session::close`.
+
+### Phase 3: Statement Execution Telemetry End-To-End
+
+Deliverable:
 
 - Add `StatementOperationObserver`, `TelemetryObserver`, `NoOpObserver`, and
-optionally `SafeObserver`.
-- Add `StatementTelemetryContext` with the ADBC field set: statement id,
+`StatementTelemetryContext`.
+- Add the ADBC field set needed for a statement terminal event: statement id,
 statement type, operation type, result format, compression, retry count,
 internal-call flag, poll count/latency, first-batch latency, consumption
 latency, chunk metrics, and sanitized error info.
 - Instrument `Statement::execute`, `submit`, and `execute_direct` using
 observer lifecycle calls.
-- Instrument `ExecutedStatementHandle::cancel` and `close` using discrete
-operation telemetry.
+- Instrument statement operation failures before a result stream is returned.
 - Ensure observer finalization is idempotent.
 
+Acceptance tests:
+
+- `SELECT 1` through a mocked transport emits one statement event.
+- A failing SQL statement emits one error event with error category and no SQL
+text or parameter values.
+- Async submit/poll/await records poll count and latency in the terminal event.
+- Repeated close/drop/finalize paths enqueue at most one terminal event.
+
 ### Phase 4: ResultStream And CloudFetch Metrics
+
+Deliverable:
 
 - Add optional observer ownership to `ResultStream`.
 - Record first-batch-ready and consumed latencies from `ResultStream::next_batch`
@@ -599,7 +640,17 @@ observer, matching ADBC's `OnChunksDownloaded` path.
 - Decide how `OwnedBatchIter` preserves observer finalization; it should not
 bypass result consumption telemetry.
 
+Acceptance tests:
+
+- Multi-batch result consumption records row count, batch count, first-batch
+latency, and consumption latency.
+- CloudFetch chunk metrics merge into the statement terminal event.
+- Dropping an unexhausted result stream finalizes best-effort without blocking.
+- `OwnedBatchIter` preserves exactly-once finalization.
+
 ### Phase 5: Metadata Lifecycle
+
+Deliverable:
 
 - Mirror ADBC's `ExecuteWithMetadataTelemetry` pattern in Rust.
 - Instrument every `Metadata::*` method with `statement_type = Metadata` and the
@@ -607,19 +658,68 @@ corresponding operation type.
 - Attach the observer to metadata-owned bare `ResultStream`s so finalization
 happens on exhaustion/drop/error.
 
-### Phase 6: Export Pipeline
+Acceptance tests:
+
+- Each metadata method maps to the expected operation type.
+- A successful metadata call emits one terminal metadata event.
+- A failed metadata call emits sanitized error telemetry.
+- Metadata result streams finalize exactly once on exhaustion or drop.
+
+### Phase 6: Production Export Pipeline
+
+Deliverable:
 
 - Implement host-scoped `TelemetryClientManager` with reference counting.
-- Implement `TelemetryClient` with a concurrent queue, approximate queue count,
-batch-size flush, timer flush, close-time flush, single-flush coordination,
-and fail-open behavior, matching ADBC.
+- Complete `TelemetryClient` with timer flush in addition to batch-size and
+close-time flush.
 - Implement `DatabricksTelemetryExporter` for `/telemetry-ext` and
 `/telemetry-unauth`.
 - Implement retry with `max_retries` / `retry_delay`.
+- Keep circuit breaker out of this phase; basic retry plus fail-open behavior is
+enough to make the exporter independently shippable.
+
+Acceptance tests:
+
+- `TelemetryClientManager` shares clients per host and releases on last close.
+- Export client batches on size, interval, and close.
+- Export retries follow `max_retries` / `retry_delay`.
+- Telemetry service failures are swallowed and do not affect kernel operations.
+
+### Phase 7: Binding Wiring
+
+Deliverable:
+
+- C ABI: expose telemetry config fields in the session-open config.
+- PyO3/napi: map user-facing options to `TelemetryConfig`.
+- Keep binding-specific telemetry collection out of scope unless a binding has
+operations that never enter the kernel.
+
+Acceptance tests:
+
+- C ABI can enable/disable telemetry and configure batching/export knobs.
+- PyO3/napi can enable/disable telemetry without changing existing session
+behavior.
+- Binding tests can inject or observe captured telemetry without calling the
+live telemetry service.
+
+### Phase 8: Circuit Breaker Hardening
+
+Deliverable:
+
 - Implement per-host circuit breaker with ADBC-compatible threshold/timeout
 semantics.
+- Wrap the production exporter in `CircuitBreakerTelemetryExporter`.
+- Expose circuit-breaker config through `TelemetryConfig`.
 
-### Phase 7: Feature Flags
+Acceptance tests:
+
+- Circuit breaker opens after repeated export failures.
+- While open, telemetry is dropped/fails open without attempting export.
+- After timeout, the breaker allows a probe and closes on success.
+
+### Phase 9: Feature Flags
+
+Deliverable:
 
 - Add `FeatureFlagCache` / `FeatureFlagContext` equivalents.
 - Cache all feature flags per host.
@@ -629,12 +729,14 @@ semantics.
 is cold, warm it in the background unless product requirements demand a
 blocking first fetch.
 
-### Phase 8: Binding Wiring
+Acceptance tests:
 
-- C ABI: expose telemetry config fields in the session-open config.
-- PyO3/napi: map user-facing options to `TelemetryConfig`.
-- Keep binding-specific telemetry collection out of scope unless a binding has
-operations that never enter the kernel.
+- Local configuration wins over remote flags.
+- Cache uses server TTL and negative TTL on failure.
+- Feature flag fetch failure falls back to local config/defaults and does not
+fail session open.
+- New sessions observe refreshed cached values without mutating existing
+session telemetry config.
 
 ## Testing Strategy
 
