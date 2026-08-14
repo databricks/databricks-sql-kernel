@@ -53,7 +53,10 @@ async fn open_with_pat_against_live_warehouse() {
 
     let session = Session::builder()
         .http_path(host, http_path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("Session::open should succeed against the live warehouse");
@@ -94,6 +97,7 @@ async fn open_with_oauth_m2m_against_live_warehouse() {
             client_secret,
             scopes: None,
             token_url_override: None,
+            identity_federation_client_id: None,
         })
         .open()
         .await
@@ -130,6 +134,7 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
                 enabled: false,
                 passphrase: None,
             }),
+            identity_federation_client_id: None,
         })
         .open()
         .await
@@ -150,7 +155,10 @@ async fn open_drop_does_not_panic() {
 
     let session = Session::builder()
         .http_path(host, http_path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("open");

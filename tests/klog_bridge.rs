@@ -178,6 +178,7 @@ async fn empty_logging_config_open_does_not_install_subscriber() {
         )
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
         })
         .http(http)
         .open()

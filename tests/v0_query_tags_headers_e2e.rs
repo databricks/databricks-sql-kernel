@@ -62,7 +62,10 @@ async fn live_session() -> Session {
     let (host, path, token) = host_path_token();
     Session::builder()
         .http_path(host, path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .open()
         .await
         .expect("Session::open against live workspace")
@@ -81,7 +84,10 @@ async fn live_session_with_headers(headers: Vec<(String, String)>) -> Session {
     http.custom_headers = headers;
     Session::builder()
         .http_path(host, path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .http(http)
         .open()
         .await

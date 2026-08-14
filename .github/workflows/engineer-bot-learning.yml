@@ -1,49 +1,76 @@
-# Engineer Bot — learning (retrospective) extraction.
+# Engineer Bot — learning (retrospective) extraction, DAILY.
 #
-# On merge of a PR labelled `extract-learning`, the bot reads the merged PR's diff
-# + review comments, decides whether there's a DURABLE, reusable engineering
-# learning, and — if so — opens a PR appending an entry to this repo's learning log
+# Once a day the bot sweeps every PR merged in an adaptive look-back window (plus
+# engineer-bot author runs in that window), decides whether there is a DURABLE,
+# reusable engineering learning, and — if so — opens/updates a single rolling PR
+# appending a dated section to this repo's learning log
 # (.claude/knowledge/learning-log.md). Human-gated by design: it NEVER commits the
 # canonical log directly; the entry lands as a reviewable PR.
+#
+# The window is an ISO adaptive cursor: `since` defaults to the start time of the
+# last successful run, falling back to `--window-hours` (24) on the first run or
+# when the Actions API is unavailable. A failed or missed run does NOT advance the
+# cursor, so the next run automatically widens to cover the gap — no per-PR label
+# or per-merge trigger needed. (This REPLACES the old per-PR `extract-learning`
+# on-merge model: the engine now gathers each PR's diff/comments itself over the
+# window, so there is no manual context-gather step and no `context_files`.)
 #
 # Own job (NOT `uses: databricks/databricks-bot-engine/...`): an external repo
 # can't resolve the internal engine's reusable workflows ("not found"). It shares
 # the SAME prelude the other bots use — ./.github/actions/bot-prelude (tokens +
 # Node + pinned engine install) — so the engine pin stays single-sourced in
 # bot-prelude's `engine-ref` default (no second SHA to drift). What's unique to
-# this flow stays inline: the default-branch checkout the learning PR is cut from,
-# the bot git identity, and the merged-PR context gather.
+# this flow stays inline: the default-branch checkout the learning PR is cut from
+# and the authenticated push remote.
 #
 # Opt-in is purely via the `retrospective:` block in .bot/config.yaml + this
 # workflow; absent that block the engine phase is a clean no-op.
 name: Engineer Bot — Learning
 
 on:
-  pull_request:
-    types: [closed]
+  schedule:
+    # 07:17 UTC daily — off-peak, off-:00 minute (GitHub delays/drops on-the-hour
+    # crons). Scheduled runs fire only on the default branch.
+    - cron: "17 7 * * *"
+  workflow_dispatch:
+    inputs:
+      # Manual-recovery knobs surfaced by the retrospective's failure messages: a
+      # wedged flow (CatchUpBacklogError / CursorReadError) is recovered by
+      # re-dispatching with a recent `since`.
+      since:
+        description: 'ISO lower bound to bound (shorten) the window and recover a wedged flow. Empty = adaptive cursor.'
+        type: string
+        default: ''
+      window-hours:
+        # STRING, not number: a `type: number` dispatch input fails the whole run
+        # at startup when the workflow also triggers on `schedule`. argparse
+        # coerces it to int downstream (retrospective.py, `type=int`), so string is
+        # correct here (mirrors the engine's own learning-cron workflow).
+        description: 'Fallback look-back window (hours) used only when there is no prior successful run.'
+        type: string
+        default: '24'
 
 permissions:
   contents: write        # open the learning-log PR
   pull-requests: write
+  actions: read          # Track B lists author runs + downloads their logs via the
+                         # App token; without actions:read that step 403s and fails
+                         # the whole run (no permission escape hatch).
   id-token: write        # JFrog OIDC exchange for the engine/SDK/CLI install
+
+concurrency:
+  # Fixed key (no PR number — this is schedule/dispatch driven). cancel-in-progress
+  # false so a manual recovery dispatch doesn't kill an in-flight scheduled run.
+  group: engineer-bot-learning-cron
+  cancel-in-progress: false
 
 jobs:
   learning:
-    # Only on MERGE (not a plain close) of a PR carrying `extract-learning`, and
-    # never on the learning bot's own PR (head ref ai/learning-pr-*) — that would
-    # loop.
-    if: >-
-      github.event.pull_request.merged == true
-      && contains(github.event.pull_request.labels.*.name, 'extract-learning')
-      && !startsWith(github.event.pull_request.head.ref, 'ai/learning-pr-')
     environment: azure-prod   # DATABRICKS_HOST / DATABRICKS_TOKEN live here
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
     timeout-minutes: 20
-    concurrency:
-      group: engineer-bot-learning-pr-${{ github.event.pull_request.number }}
-      cancel-in-progress: false
     steps:
       # Checkout the default branch (the learning PR is cut from it) FIRST, so the
       # local `./` composites below resolve. persist-credentials:false — the
@@ -79,50 +106,37 @@ jobs:
           app-id: ${{ secrets.ENGINEER_BOT_APP_ID }}
           private-key: ${{ secrets.ENGINEER_BOT_APP_PRIVATE_KEY }}
 
-      # NOTE: no git-identity step here. The engine's retrospective
-      # (databricks-bot-engine#139, in the pinned engine SHA) configures the git
-      # user AND DCO sign-off itself from .bot/config.yaml `bot_login_prefix` —
+      # NOTE: no git-identity step here. The engine's retrospective configures the
+      # git user AND DCO sign-off itself from .bot/config.yaml `bot_login_prefix` —
       # same as the author/followup flows — so the learning commit is authored and
-      # signed as the bot without the workflow doing it. (Before #139 this flow had
-      # to hand-roll the identity; the engine bump removed that need.)
+      # signed as the bot without the workflow doing it.
 
-      - name: Gather merged-PR context
-        env:
-          GH_TOKEN: ${{ steps.prelude.outputs.token }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-        run: |
-          set -euo pipefail
-          # Write the gathered context into the checkout (the engine's repo_dir /
-          # cwd) under the filenames the .bot/config.yaml `retrospective.context_files`
-          # resolves against repo_dir (`pr_diff.txt`, `review_comments.txt`); the
-          # engine inlines those into the prompt.
-          { gh pr diff "$PR" --repo "$REPO" || true; } \
-            | head -c 32000 > "$GITHUB_WORKSPACE/pr_diff.txt"
-          { gh api --paginate "/repos/$REPO/pulls/$PR/comments" \
-              --jq '.[] | "\(.path):\(.line // .original_line) \(.user.login): \(.body)"' || true; } \
-            | head -c 32000 > "$GITHUB_WORKSPACE/review_comments.txt"
-
-      - name: Extract learning + open PR
+      - name: Extract daily learnings + open/update PR
         env:
           GH_TOKEN: ${{ steps.prelude.outputs.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_TITLE: ${{ github.event.pull_request.title }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          # Only the `<workspace>/serving-endpoints/` prefix matters:
-          # sdk_agent.translate_endpoint rewrites this to `.../serving-endpoints/anthropic`
-          # and discards the model path segment. The effective model comes from
-          # .bot/config.yaml `retrospective.model` (or the engine default).
-          MODEL_ENDPOINT: https://${{ secrets.DATABRICKS_HOST }}/serving-endpoints/anthropic/invocations
+          # Use the concrete `.../serving-endpoints/<model>/invocations` form (same
+          # as reviewer-bot.yml / engineer-bot.yml). sdk_agent.translate_endpoint
+          # strips it to the `.../serving-endpoints/anthropic` base the CLI needs.
+          # Do NOT use `.../serving-endpoints/anthropic/invocations` here: that hits
+          # translate_endpoint's already-v2 early-return, which keeps the trailing
+          # `invocations`, so the CLI appends `/v1/messages` →
+          # `.../anthropic/invocations/v1/messages` → HTTP 400 (unsupported path).
+          # The effective model is set by the engine default (no retrospective.model).
+          MODEL_ENDPOINT: https://${{ secrets.DATABRICKS_HOST }}/serving-endpoints/databricks-claude-opus-4-8/invocations
           DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          WINDOW_HOURS: ${{ inputs.window-hours || '24' }}
+          SINCE: ${{ inputs.since || '' }}
           RUNNER_TEMP: ${{ runner.temp }}
         # The retrospective pushes the learning branch with a plain `git push
         # origin` (no in-module set-url), and the checkout ran persist-credentials:
         # false — so set an authenticated push remote from the minted App token
         # first, mirroring engineer-bot.yml's publish step. retrospective.py
         # resolves repo_dir from --repo-dir (cwd = $GITHUB_WORKSPACE otherwise),
-        # where .bot/ + the gathered context files live.
+        # where .bot/ lives.
         run: |
+          set -euo pipefail
           git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
-          python -m databricks_bot_engine.engineer_bot.retrospective --repo-dir "$GITHUB_WORKSPACE"
+          args=(--repo-dir "$GITHUB_WORKSPACE" --window-hours "$WINDOW_HOURS")
+          [ -n "$SINCE" ] && args+=(--since "$SINCE")
+          python -m databricks_bot_engine.engineer_bot.retrospective "${args[@]}"

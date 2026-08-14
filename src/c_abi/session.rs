@@ -66,13 +66,13 @@ enum AuthSpec {
         client_secret: String,
     },
     /// OAuth user-to-machine (authorization code + PKCE, browser flow).
-    /// All fields optional — the kernel fills `databricks-cli` /
-    /// port 8020 / default scopes when omitted.
+    /// All fields optional — the kernel fills `databricks-sql-connector` /
+    /// port 8030 / `sql offline_access` when omitted.
     OAuthU2M {
         client_id: Option<String>,
         redirect_port: Option<u16>,
         /// Comma-separated scopes (split at build time). `None` ⇒ kernel
-        /// default (`all-apis`, `offline_access`).
+        /// default (`sql`, `offline_access`).
         scopes: Option<String>,
     },
 }
@@ -318,8 +318,8 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_m2m(
 /// setters — the last one called wins.
 ///
 /// All args are optional (pass NULL to omit): `client_id` defaults to the
-/// public `databricks-cli` client, `redirect_port` to 8020, and `scopes`
-/// (a comma-separated list) to the kernel default (`all-apis`,
+/// `databricks-sql-connector` client, `redirect_port` to 8030, and `scopes`
+/// (a comma-separated list) to the kernel default (`sql`,
 /// `offline_access`). `offline_access` yields a refresh token, which the
 /// kernel caches and refreshes transparently.
 ///
@@ -341,7 +341,7 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
     set_on_config(config, |c| {
         c.auth = Some(AuthSpec::OAuthU2M {
             client_id: optional_str(client_id, "client_id")?,
-            // 0 is the "unset" sentinel → kernel default (8020).
+            // 0 is the "unset" sentinel → kernel default (8030).
             redirect_port: (redirect_port != 0).then_some(redirect_port),
             scopes: optional_str(scopes, "scopes")?,
         });

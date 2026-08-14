@@ -44,7 +44,10 @@ async fn live_session(ignore_transactions: bool) -> Session {
 
     Session::builder()
         .http_path(host, path)
-        .auth(AuthConfig::Pat { token })
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
         .ignore_transactions(ignore_transactions)
         .open()
         .await

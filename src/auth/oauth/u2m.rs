@@ -54,8 +54,10 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::runtime::Handle as RuntimeHandle;
 
-/// Default callback server port for OAuth redirects.
-const DEFAULT_CALLBACK_PORT: u16 = 8020;
+/// Default callback server port for OAuth redirects. Matches the redirect
+/// URI registered for the kernel's default U2M OAuth app
+/// (`databricks-sql-connector`, `http://localhost:8030`).
+const DEFAULT_CALLBACK_PORT: u16 = 8030;
 
 /// Default timeout for waiting for the OAuth callback.
 const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
@@ -199,11 +201,17 @@ impl AuthorizationCodeProvider {
         client_id: &str,
         http_client: Arc<DatabricksHttpClient>,
     ) -> Result<Self> {
+        // Scopes must match the app registered for `DEFAULT_CALLBACK_PORT`
+        // (8030 → `databricks-sql-connector`, whose redirect URI is registered
+        // for `sql offline_access`). Keeping these coherent means the `new()`
+        // default bundle describes one OAuth app, not two. Callers wiring a
+        // different app must use `new_with_config` and override the whole
+        // coupled {scopes, port} bundle. See PECOBLR-4039.
         Self::new_with_config(
             host,
             client_id,
             http_client,
-            vec!["all-apis".to_string(), "offline_access".to_string()],
+            vec!["sql".to_string(), "offline_access".to_string()],
             DEFAULT_CALLBACK_PORT,
             DEFAULT_CALLBACK_TIMEOUT,
         )
