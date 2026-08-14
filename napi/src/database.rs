@@ -157,6 +157,9 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
+    /// SP-wide Workload Identity Federation client id used during mandatory
+    /// token exchange. Omitted selects BYOT / account-wide WIF.
+    pub identity_federation_client_id: Option<String>,
     /// Default catalog for statements executed on this session.
     /// Routed through the kernel's `DefaultOpts` and onto the SEA
     /// `CreateSession.catalog` wire field.
@@ -334,12 +337,17 @@ pub struct ConnectionOptions {
 /// session.
 fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
     match options.auth_mode.unwrap_or_default() {
-        AuthMode::Pat => AuthConfig::pat(options.token.clone()).map_err(napi_err_from_kernel),
+        AuthMode::Pat => AuthConfig::pat(
+            options.token.clone(),
+            options.identity_federation_client_id.clone(),
+        )
+        .map_err(napi_err_from_kernel),
         AuthMode::OAuthM2m => AuthConfig::oauth_m2m(
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
             None,
+            options.identity_federation_client_id.clone(),
         )
         .map_err(napi_err_from_kernel),
         // napi injects no client_id/scope default: it rides the kernel's
@@ -369,6 +377,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 // binding exposes no passphrase option. Surfacing one through
                 // `options` would strengthen it further.
                 None,
+                options.identity_federation_client_id.clone(),
             ))
         }
     }
@@ -586,6 +595,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
+            identity_federation_client_id: None,
             catalog: None,
             schema: None,
             session_conf: None,
@@ -654,6 +664,24 @@ mod tests {
     }
 
     #[test]
+    fn federation_client_id_reaches_auth_config() {
+        let mut o = base();
+        o.token = Some("dapi-xxx".to_owned());
+        o.identity_federation_client_id = Some("federation-client".to_owned());
+
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::Pat {
+                identity_federation_client_id,
+                ..
+            } => assert_eq!(
+                identity_federation_client_id.as_deref(),
+                Some("federation-client")
+            ),
+            other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn m2m_requires_client_id_and_secret() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthM2m);
@@ -662,16 +690,22 @@ mod tests {
         assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_secret");
         o.oauth_client_secret = Some("sec".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        o.identity_federation_client_id = Some("federation-client".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2M {
                 client_id,
                 client_secret,
                 scopes,
+                identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(client_id, "cid");
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
@@ -701,14 +735,20 @@ mod tests {
         // Explicit overrides thread through.
         o.oauth_client_id = Some("custom-cli".to_owned());
         o.oauth_redirect_port = Some(9000);
+        o.identity_federation_client_id = Some("federation-client".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_port,
+                identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("custom-cli"));
                 assert_eq!(redirect_port, Some(9000));
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

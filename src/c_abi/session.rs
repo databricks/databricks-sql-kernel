@@ -112,6 +112,8 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
+    /// SP-wide WIF client id applied to the selected auth mode.
+    identity_federation_client_id: Option<String>,
     /// On-disk U2M token-cache policy (populated by
     /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
@@ -203,6 +205,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
+        identity_federation_client_id: None,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
@@ -345,6 +348,22 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
             redirect_port: (redirect_port != 0).then_some(redirect_port),
             scopes: optional_str(scopes, "scopes")?,
         });
+        Ok(())
+    })
+}
+
+/// Set the optional SP-wide Workload Identity Federation client id used by
+/// mandatory token exchange. Leaving it unset selects BYOT / account-wide WIF.
+///
+/// # Safety
+/// `config` must be live and `client_id` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_identity_federation_client_id(
+    config: *mut KernelSessionConfig,
+    client_id: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.identity_federation_client_id = Some(required_str(client_id, "client_id")?);
         Ok(())
     })
 }
@@ -898,6 +917,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         retry,
         ignore_transactions,
+        identity_federation_client_id,
         token_cache,
         result,
     } = config;
@@ -926,11 +946,19 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             };
 
             let auth = match auth {
-                AuthSpec::Pat { token } => AuthConfig::pat(Some(token))?,
+                AuthSpec::Pat { token } => {
+                    AuthConfig::pat(Some(token), identity_federation_client_id)?
+                }
                 AuthSpec::OAuthM2M {
                     client_id,
                     client_secret,
-                } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None)?,
+                } => AuthConfig::oauth_m2m(
+                    Some(client_id),
+                    Some(client_secret),
+                    None,
+                    None,
+                    identity_federation_client_id,
+                )?,
                 AuthSpec::OAuthU2M {
                     client_id,
                     redirect_port,
@@ -942,6 +970,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     None,
                     None,
                     Some(token_cache),
+                    identity_federation_client_id,
                 ),
             };
 
@@ -1470,6 +1499,31 @@ mod tests {
                 "the requested attempts are recorded as-is"
             );
             assert_eq!(r.overall_timeout, Some(Duration::from_millis(5_000)));
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_identity_federation_client_id_records_value() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let client_id = CString::new("federation-client").unwrap();
+            assert_eq!(
+                kernel_session_config_set_identity_federation_client_id(config, client_id.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config
+                    .as_ref()
+                    .unwrap()
+                    .identity_federation_client_id
+                    .as_deref(),
+                Some("federation-client")
+            );
             kernel_session_config_free(config);
         }
     }

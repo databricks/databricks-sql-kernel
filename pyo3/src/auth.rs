@@ -52,6 +52,7 @@ pub(crate) struct OAuthParams {
     pub token_url: Option<String>,
     pub redirect_port: Option<u16>,
     pub callback_timeout_secs: Option<u64>,
+    pub identity_federation_client_id: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -144,10 +145,8 @@ fn build_auth_config_inner(
             if token.is_empty() {
                 return Err("access_token must not be empty".to_owned());
             }
-            Ok(AuthConfig::Pat {
-                token,
-                identity_federation_client_id: None,
-            })
+            AuthConfig::pat(Some(token), oauth.identity_federation_client_id)
+                .map_err(|err| err.to_string())
         }
         "oauth-m2m" => {
             // Client credentials grant: both halves are mandatory.
@@ -156,13 +155,14 @@ fn build_auth_config_inner(
                 oauth.client_secret,
                 "auth_type='oauth-m2m' requires client_secret",
             )?;
-            Ok(AuthConfig::OAuthM2M {
-                client_id,
-                client_secret,
-                scopes: oauth.scopes,
-                token_url_override: oauth.token_url,
-                identity_federation_client_id: None,
-            })
+            AuthConfig::oauth_m2m(
+                Some(client_id),
+                Some(client_secret),
+                oauth.scopes,
+                oauth.token_url,
+                oauth.identity_federation_client_id,
+            )
+            .map_err(|err| err.to_string())
         }
         "oauth-u2m" => {
             // Browser flow: every field is optional and `None` lets the
@@ -240,12 +240,12 @@ fn build_auth_config_inner(
                 None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
                 None => None,
             };
-            Ok(AuthConfig::OAuthU2M {
+            Ok(AuthConfig::oauth_u2m(
                 client_id,
                 redirect_port,
                 scopes,
-                token_url_override: oauth.token_url,
-                callback_timeout: oauth.callback_timeout_secs.map(Duration::from_secs),
+                oauth.token_url,
+                oauth.callback_timeout_secs.map(Duration::from_secs),
                 // `None` takes the kernel default: on-disk cache ENABLED,
                 // encrypted under a machine-local derived key since this
                 // binding exposes no passphrase option. That preserves
@@ -253,9 +253,9 @@ fn build_auth_config_inner(
                 // ever writing the refresh token in the clear. Surfacing a
                 // passphrase through `OAuthParams` — the equivalent of JDBC's
                 // TokenCachePassPhrase — would strengthen it further.
-                token_cache: None,
-                identity_federation_client_id: None,
-            })
+                None,
+                oauth.identity_federation_client_id,
+            ))
         }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', 'oauth-u2m'"
@@ -288,9 +288,22 @@ mod tests {
 
     #[test]
     fn pat_builds() {
-        let cfg =
-            build_auth_config_inner("pat", Some("dapi123".into()), OAuthParams::default()).unwrap();
-        assert!(matches!(cfg, AuthConfig::Pat { token, .. } if token == "dapi123"));
+        let cfg = build_auth_config_inner(
+            "pat",
+            Some("dapi123".into()),
+            OAuthParams {
+                identity_federation_client_id: Some("federation-client".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            cfg,
+            AuthConfig::Pat {
+                token,
+                identity_federation_client_id: Some(client_id),
+            } if token == "dapi123" && client_id == "federation-client"
+        ));
     }
 
     #[test]
@@ -343,6 +356,7 @@ mod tests {
                 client_secret: Some("sec".into()),
                 scopes: Some(vec!["all-apis".into()]),
                 token_url: Some("https://example/token".into()),
+                identity_federation_client_id: Some("federation-client".into()),
                 ..Default::default()
             },
         )
@@ -359,7 +373,10 @@ mod tests {
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
                 assert_eq!(token_url_override.as_deref(), Some("https://example/token"));
-                assert!(identity_federation_client_id.is_none());
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
@@ -471,6 +488,7 @@ mod tests {
             OAuthParams {
                 redirect_port: Some(9999),
                 callback_timeout_secs: Some(300),
+                identity_federation_client_id: Some("federation-client".into()),
                 ..Default::default()
             },
         )
@@ -479,10 +497,15 @@ mod tests {
             AuthConfig::OAuthU2M {
                 redirect_port,
                 callback_timeout,
+                identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(redirect_port, Some(9999));
                 assert_eq!(callback_timeout, Some(Duration::from_secs(300)));
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

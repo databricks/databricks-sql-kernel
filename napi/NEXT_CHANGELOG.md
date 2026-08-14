@@ -14,6 +14,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions.identityFederationClientId` selects SP-wide Workload
+  Identity Federation during mandatory token exchange.
+
 ### Updated
 
 ### Fixed

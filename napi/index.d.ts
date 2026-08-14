@@ -206,6 +206,11 @@ export interface ConnectionOptions {
    */
   oauthScopes?: Array<string>
   /**
+   * SP-wide Workload Identity Federation client id used during mandatory
+   * token exchange. Omitted selects BYOT / account-wide WIF.
+   */
+  identityFederationClientId?: string
+  /**
    * Default catalog for statements executed on this session.
    * Routed through the kernel's `DefaultOpts` and onto the SEA
    * `CreateSession.catalog` wire field.
