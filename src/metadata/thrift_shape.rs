@@ -543,9 +543,10 @@ pub(crate) fn reshape_schemas(
 /// that omit it (single-catalog form). `table_types`, when `Some` with
 /// at least one entry, filters rows to those whose `TABLE_TYPE` appears
 /// in the slice (matches JDBC `DatabaseMetaData.getTables` behaviour).
-/// A `Some(&[])` (explicit empty slice) is treated like `None` and
-/// matches all table types — see the inline note in the filter block
-/// below (METADATA-035 conformance / C# ADBC parity).
+/// A `Some(&[])` (explicit empty slice) matches NO table types and
+/// yields an empty result — it is NOT treated like `None`. See the
+/// inline note in the filter block below (METADATA-035 conformance /
+/// hiveserver2 #83, which reversed the earlier empty==null reading).
 ///
 /// Catalog *matching* is not done here: a wildcard catalog is resolved
 /// in `list_tables` by enumerating catalogs and issuing one scoped
@@ -599,13 +600,16 @@ pub(crate) fn reshape_tables(
     // getTables(...)` Javadoc specifies that `null` types returns all
     // types, but is silent on what an *explicit empty array* means.
     // Per the multi-language conformance spec (METADATA-035) and the C#
-    // ADBC driver, an explicit *empty* array is equivalent to `null`:
-    // it matches ALL table types, not none. Only a `Some` with at least
-    // one entry actually restricts the result set. This mirrors JDBC
-    // #1570 / hiveserver2 #72, which align the same way.
+    // ADBC / JDBC drivers, an explicit *empty* array matches NO table
+    // types — the result is empty, NOT equivalent to `null`. Only `None`
+    // means "all types". This mirrors hiveserver2 #83, which reversed the
+    // earlier #72 reading (empty == null) after establishing that
+    // databricks-jdbc's `listTables` has always short-circuited an empty
+    // array to "return nothing". An empty `Some(&[])` therefore flows
+    // through `filter_tables_by_type`, whose `types.iter().any(..)` is
+    // `false` for every row → an empty (correctly-typed) batch.
     let filtered = match table_types {
         None => reshaped,
-        Some([]) => reshaped,
         Some(types) => filter_tables_by_type(&reshaped, types)?,
     };
     // Sort to match the JDBC driver's `getTables` row order
@@ -1338,21 +1342,21 @@ mod tests {
     }
 
     #[test]
-    fn tables_empty_types_matches_all() {
-        // Per the JDBC/ADBC contract (spec METADATA-035), an explicit
-        // empty `table_types` slice is equivalent to `None`: it matches
-        // ALL table types, not none. This is the same result as the
-        // `None` path — see `tables_none_types_passes_all`.
+    fn tables_empty_types_matches_none() {
+        // Per the JDBC/ADBC contract (spec METADATA-035 / hiveserver2 #83),
+        // an explicit empty `table_types` slice matches NO table types —
+        // the result is empty, NOT equivalent to `None`. Contrast with
+        // `tables_none_types_passes_all`, where `None` returns all rows.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), Some(&[])).unwrap();
-        assert_eq!(out.num_rows(), 3);
+        assert_eq!(out.num_rows(), 0);
     }
 
     #[test]
     fn tables_none_types_passes_all() {
         // The all-types path — distinct from the explicit-empty path
-        // above. Locks the contract so future refactors don't quietly
-        // re-merge the two.
+        // above (which now matches none). Locks the contract so future
+        // refactors don't quietly re-merge the two.
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), None).unwrap();
         assert_eq!(out.num_rows(), 3);
