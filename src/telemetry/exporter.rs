@@ -12,9 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::models::TelemetryRequest;
+use super::models::{TelemetryFrontendLog, TelemetryRequest};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 
 pub(crate) type TelemetryExportResult = Result<(), TelemetryExportError>;
 
@@ -31,4 +32,21 @@ pub(crate) trait TelemetryExporter: Send + Sync {
         &'a self,
         request: TelemetryRequest,
     ) -> Pin<Box<dyn Future<Output = TelemetryExportResult> + Send + 'a>>;
+}
+
+pub(super) async fn export_batch(
+    exporter: Arc<dyn TelemetryExporter>,
+    batch: Vec<TelemetryFrontendLog>,
+) {
+    let request = match TelemetryRequest::from_logs(&batch) {
+        Ok(request) => request,
+        Err(e) => {
+            tracing::debug!(error = %e, "failed to serialize telemetry batch");
+            return;
+        }
+    };
+
+    if let Err(e) = exporter.export(request).await {
+        tracing::debug!(error = %e, "failed to export telemetry batch");
+    }
 }

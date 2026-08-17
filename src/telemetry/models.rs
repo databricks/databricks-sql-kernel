@@ -260,7 +260,7 @@ pub(crate) struct SqlExecutionEvent {
     pub java_uses_patched_arrow: Option<bool>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct OperationDetail {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub n_operation_status_calls: Option<i32>,
