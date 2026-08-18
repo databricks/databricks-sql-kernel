@@ -155,10 +155,6 @@ pub struct ServiceError {
     pub error_code: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
-    /// SQL state code from legacy error envelopes. Newer SEA responses
-    /// report this on [`StatementStatus::sql_state`].
-    #[serde(default)]
-    pub sql_state: Option<String>,
 }
 
 /// Manifest describing the result set structure.
@@ -617,14 +613,6 @@ mod tests {
 
         let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
         assert_eq!(response.status.sql_state.as_deref(), Some("57KD0"));
-        assert_eq!(
-            response
-                .status
-                .error
-                .as_ref()
-                .and_then(|error| error.sql_state.as_deref()),
-            None
-        );
     }
 
     #[test]

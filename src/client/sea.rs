@@ -339,8 +339,7 @@ impl SeaRestTransport {
                     .with_query_id(&response.statement_id);
 
                 // Reyden and newer DBSQL responses report SQLSTATE on
-                // status.sql_state. Legacy nested-error and message
-                // forms remain supported by the helper's fallbacks.
+                // status.sql_state. Message parsing remains as a fallback.
                 if let Some(s) = crate::kernel_error::extract_sqlstate_from_status(&response.status)
                 {
                     error = error.with_sql_state(s);
@@ -1448,7 +1447,6 @@ mod tests {
                         "[INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME] ... SQLSTATE: 22023"
                             .to_string(),
                     ),
-                    sql_state: None,
                 }),
                 sql_state: None,
                 num_modified_rows: None,

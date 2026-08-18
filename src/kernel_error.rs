@@ -683,8 +683,8 @@ pub(crate) fn carry_extended_status(
 /// Extract the SQLSTATE from a SEA statement status.
 ///
 /// SEA's canonical field is `status.sql_state` (used by Reyden and
-/// newer DBSQL responses). Retain the legacy nested-error field and
-/// message parsing as fallbacks for older deployments.
+/// newer DBSQL responses). Retain message parsing as a fallback for
+/// responses that only include SQLSTATE in their display text.
 pub(crate) fn extract_sqlstate_from_status(
     status: &crate::types::sea::StatementStatus,
 ) -> Option<String> {
@@ -693,14 +693,6 @@ pub(crate) fn extract_sqlstate_from_status(
         .as_ref()
         .filter(|s| s.len() == 5)
         .cloned()
-        .or_else(|| {
-            status
-                .error
-                .as_ref()
-                .and_then(|error| error.sql_state.as_ref())
-                .filter(|s| s.len() == 5)
-                .cloned()
-        })
         .or_else(|| {
             status
                 .error
@@ -876,6 +868,22 @@ mod tests {
             extract_sqlstate_from_status(&status).as_deref(),
             Some("57KD0")
         );
+    }
+
+    #[test]
+    fn extract_sqlstate_from_status_ignores_nested_error_field() {
+        let status: crate::types::sea::StatementStatus = serde_json::from_str(
+            r#"{
+                "state": "FAILED",
+                "error": {
+                    "message": "table not found",
+                    "sql_state": "42P01"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(extract_sqlstate_from_status(&status), None);
     }
 
     #[test]
