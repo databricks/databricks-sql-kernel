@@ -1109,14 +1109,10 @@ pub struct LoggingConfig {
 /// Telemetry collection and export settings.
 ///
 /// Telemetry is disabled by default. When enabled, the kernel records
-/// driver operation metrics intended for export through the Databricks
-/// SQL driver telemetry envelope.
-///
-/// **Note:** production export is not yet wired in this release. Setting
-/// `enabled: true` currently activates the collection path but exports to
-/// a no-op sink (no data leaves the process); the real exporter lands in a
-/// later PR. Telemetry failures are fail-open: export errors are logged at
-/// trace/debug level and never change user operation results.
+/// driver operation metrics and exports them through the Databricks SQL
+/// driver telemetry envelope. Telemetry failures are fail-open: export
+/// errors are logged at trace/debug level and never change user operation
+/// results.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {
@@ -1127,12 +1123,7 @@ pub struct TelemetryConfig {
     pub batch_size: usize,
 
     /// Maximum time an explicit session close should wait for the final
-    /// telemetry flush. `Drop` never waits — and because the `Drop`
-    /// teardown path does not call into the telemetry runtime at all,
-    /// connection telemetry (CREATE/DELETE_SESSION) is exported only for
-    /// sessions closed via an explicit `Session::close`. A session that is
-    /// dropped rather than closed discards its buffered CREATE_SESSION and
-    /// emits no DELETE_SESSION.
+    /// telemetry flush. `Drop` never waits.
     pub close_flush_timeout: Duration,
 
     #[cfg(test)]

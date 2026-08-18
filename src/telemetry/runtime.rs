@@ -50,36 +50,16 @@ impl TelemetryRuntime {
         }
 
         let Some(exporter) = test_or_noop_exporter(config) else {
-            tracing::debug!(
-                "telemetry: enabled in config but no exporter is wired in this build; \
-                 collection is a no-op and no data will be exported"
-            );
             return Self::disabled();
-        };
-
-        // `0` is the "unknown workspace" sentinel (see `TelemetryFrontendLog::workspace_id`),
-        // matching the sibling drivers' convention for the `workspaceId` proto field. Both the
-        // unset and unparseable cases fall back to it; downstream aggregation treats `0` as unknown.
-        let workspace_id = match connection.org_id.as_deref() {
-            None => {
-                tracing::debug!(
-                    "telemetry: connection.org_id is unset; defaulting workspace_id to 0"
-                );
-                0
-            }
-            Some(org_id) => org_id.parse::<i64>().unwrap_or_else(|e| {
-                tracing::debug!(
-                    org_id,
-                    error = %e,
-                    "telemetry: failed to parse connection.org_id as i64; defaulting workspace_id to 0"
-                );
-                0
-            }),
         };
 
         let session = Arc::new(TelemetrySessionContext {
             session_id,
-            workspace_id,
+            workspace_id: connection
+                .org_id
+                .as_deref()
+                .and_then(|org_id| org_id.parse::<i64>().ok())
+                .unwrap_or_default(),
             system_configuration: build_system_configuration(),
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
@@ -245,38 +225,14 @@ fn build_system_configuration() -> DriverSystemConfiguration {
         client_app_name: None,
         locale_name: std::env::var("LANG").ok().filter(|s| !s.is_empty()),
         char_set_encoding: Some("UTF-8".to_string()),
-        // Use only the basename of argv[0]: the full path frequently embeds a
-        // username or other host-specific/PII-ish information that should not
-        // leave the process in telemetry.
-        process_name: process_name(),
+        process_name: std::env::args().next(),
     }
-}
-
-/// Returns the file-name (basename) component of `argv[0]`, dropping any
-/// leading directory path so host-specific/PII-ish path segments are not
-/// exported. Falls back to the raw `argv[0]` if it has no file-name component.
-fn process_name() -> Option<String> {
-    // Use `args_os()` rather than `args()`: the latter panics during iteration
-    // if `argv[0]` is not valid Unicode, which would break the fail-open
-    // telemetry contract (telemetry must never change user operation results).
-    let arg0 = std::env::args_os().next()?;
-    let basename = std::path::Path::new(&arg0)
-        .file_name()
-        .unwrap_or(arg0.as_os_str());
-    Some(basename.to_string_lossy().into_owned())
 }
 
 fn build_connection_params(
     connection: &ConnectionConfig,
     auth: &AuthConfig,
 ) -> DriverConnectionParameters {
-    // `http_path` is reconstructed from `warehouse_id` (the config parses/normalises
-    // the incoming path down to the id, so the canonical `/sql/1.0/warehouses/{id}`
-    // form is reproduced here). `mode`, `enable_arrow`, `enable_direct_results`, and
-    // `auto_commit` are fixed invariants of this kernel rather than placeholders: it
-    // only speaks SEA, always fetches Arrow results with direct results enabled, and
-    // exposes no autocommit-off path. Revisit these if the kernel ever gains a
-    // configurable transport or session mode.
     DriverConnectionParameters {
         http_path: Some(format!("/sql/1.0/warehouses/{}", connection.warehouse_id)),
         mode: Some(DriverMode::Sea),
@@ -327,13 +283,7 @@ fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
 fn sanitize_error(error: &KernelError) -> DriverErrorInfo {
     DriverErrorInfo {
         error_name: Some(error.code.slug().to_string()),
-        // We deliberately do NOT emit a stack trace here: sibling drivers
-        // (e.g. ADBC) omit trace data for security reasons, and the kernel has
-        // no trace to surface at this layer. A SQLSTATE code is not a stack
-        // trace, so we leave this `None` rather than overloading the field with
-        // semantically-wrong data that downstream telemetry consumers would
-        // misinterpret.
-        stack_trace: None,
+        stack_trace: error.sql_state.clone(),
     }
 }
 

@@ -37,12 +37,6 @@ impl TelemetryRequest {
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub(crate) struct TelemetryFrontendLog {
-    /// Databricks workspace id. `0` is the sentinel for "unknown" — used when
-    /// `connection.org_id` is unset or fails to parse as `i64`. This matches the
-    /// sibling drivers' convention for the `workspaceId` proto field (e.g. the
-    /// Databricks ADBC C# driver defaults `WorkspaceId` to `0` when unknown), so
-    /// downstream aggregation should treat `0` as "unknown" rather than an actual
-    /// workspace.
     pub workspace_id: i64,
     pub frontend_log_event_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
