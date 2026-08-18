@@ -1101,22 +1101,12 @@ fn resolve_u2m_bundle(
     // must be a registered redirect URI of the chosen OAuth app — the
     // {client_id, ports, scopes} bundle stays coupled. Single-port bindings
     // forward a one-element list.
-    let resolved_client_id = client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID);
     let ports = match redirect_ports {
         Some(ports) if !ports.is_empty() => ports.to_vec(),
-        // The contiguous 8030–8034 fallback window is only safe for
-        // `DEFAULT_U2M_CLIENT_ID`, whose in-house OAuth drops the loopback port
-        // when matching redirect URIs (RFC 8252 §7.3 — see
-        // `DEFAULT_U2M_REDIRECT_PORTS`). A custom OAuth app registers static
-        // redirect URIs, so a fallback port it did not register would not match;
-        // default such callers to the single canonical port (binds 8030 or
-        // fails), matching the pre-multi-port behaviour. Custom apps that want
-        // busy-port fallback must supply their own registered `redirect_ports`.
-        _ if resolved_client_id == DEFAULT_U2M_CLIENT_ID => DEFAULT_U2M_REDIRECT_PORTS.to_vec(),
-        _ => vec![DEFAULT_U2M_REDIRECT_PORTS[0]],
+        _ => DEFAULT_U2M_REDIRECT_PORTS.to_vec(),
     };
     (
-        resolved_client_id.to_string(),
+        client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
         ports,
         scopes
             .map(<[String]>::to_vec)
@@ -1286,22 +1276,6 @@ mod u2m_default_tests {
         assert_eq!(ports_empty, default);
         let (_, ports_none, _) = resolve_u2m_bundle(None, None, None);
         assert_eq!(ports_none, default);
-    }
-
-    #[test]
-    fn u2m_bundle_custom_client_without_ports_uses_single_canonical_port() {
-        // The 8030–8034 fallback window is only safe for the default client
-        // (RFC 8252 §7.3 loopback-port normalization). A custom OAuth app with
-        // no ports must NOT get fallback candidates it never registered — it
-        // falls back to the single canonical 8030 (bind-or-fail), matching the
-        // pre-multi-port behaviour. Both None and an empty list behave this way.
-        let (client_id, ports_none, _) =
-            resolve_u2m_bundle(Some("databricks-sql-python"), None, None);
-        assert_eq!(client_id, "databricks-sql-python");
-        assert_eq!(ports_none, vec![8030]);
-        let (_, ports_empty, _) =
-            resolve_u2m_bundle(Some("databricks-sql-python"), Some(&[]), None);
-        assert_eq!(ports_empty, vec![8030]);
     }
 }
 
