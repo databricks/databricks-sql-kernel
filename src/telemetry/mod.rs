@@ -12,16 +12,27 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Telemetry model and serialization support.
+//! Telemetry model, collection, and export support.
 //!
 //! These types mirror the SQL driver telemetry envelope used by the ADBC and
-//! JDBC drivers. Phase 1 intentionally stops at model/serialization boundaries;
-//! later phases add lifecycle observers and production export.
+//! JDBC drivers. The module is split by responsibility so later phases can add
+//! statement, result-stream, metadata, and production exporter code without
+//! growing a single catch-all file.
 
 #![allow(dead_code)]
 
+mod client;
 mod exporter;
 mod models;
+mod runtime;
 
 #[cfg(test)]
 pub(crate) mod test_support;
+
+#[cfg(test)]
+pub(crate) use exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExporter};
+pub use models::DriverSystemConfiguration;
+pub(crate) use models::OperationType;
+#[cfg(test)]
+pub(crate) use models::TelemetryRequest;
+pub(crate) use runtime::TelemetryRuntime;

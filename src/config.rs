@@ -54,6 +54,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::telemetry::DriverSystemConfiguration;
+
 // ─── Connection identity ────────────────────────────────────────────────────
 
 /// Required: identifies the workspace and warehouse to connect to.
@@ -1185,11 +1187,68 @@ pub struct LoggingConfig {
 
 // ─── Telemetry (reserved) ───────────────────────────────────────────────────
 
-/// Reserved for v0.1. Fields land once the telemetry exporter contract
-/// is finalised.
+/// Telemetry collection and export settings.
+///
+/// Telemetry is disabled by default. When enabled, the kernel records
+/// driver operation metrics and exports them through the Databricks SQL
+/// driver telemetry envelope. Telemetry failures are fail-open: export
+/// errors are logged at trace/debug level and never change user operation
+/// results.
 #[non_exhaustive]
-#[derive(Debug, Clone, Default)]
-pub struct TelemetryConfig {}
+#[derive(Clone)]
+pub struct TelemetryConfig {
+    /// Whether telemetry collection is enabled.
+    pub enabled: bool,
+
+    /// Number of telemetry events to buffer before triggering a flush.
+    pub batch_size: usize,
+
+    /// Maximum time an explicit session close should wait for the final
+    /// telemetry flush. `Drop` never waits.
+    pub close_flush_timeout: Duration,
+
+    #[cfg(test)]
+    pub(crate) exporter: Option<std::sync::Arc<dyn crate::telemetry::TelemetryExporter>>,
+}
+
+impl std::fmt::Debug for TelemetryConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut debug = f.debug_struct("TelemetryConfig");
+        debug
+            .field("enabled", &self.enabled)
+            .field("batch_size", &self.batch_size)
+            .field("close_flush_timeout", &self.close_flush_timeout);
+        #[cfg(test)]
+        debug.field(
+            "exporter",
+            &self.exporter.as_ref().map(|_| "<telemetry exporter>"),
+        );
+        debug.finish()
+    }
+}
+
+impl Default for TelemetryConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            batch_size: 200,
+            close_flush_timeout: Duration::from_secs(5),
+            #[cfg(test)]
+            exporter: None,
+        }
+    }
+}
+
+impl TelemetryConfig {
+    #[cfg(test)]
+    pub(crate) fn with_exporter(
+        mut self,
+        exporter: std::sync::Arc<dyn crate::telemetry::TelemetryExporter>,
+    ) -> Self {
+        self.exporter = Some(exporter);
+        self
+    }
+}
 
 // ─── Transport mode ─────────────────────────────────────────────────────────
 
@@ -1222,6 +1281,11 @@ pub struct SessionConfig {
 
     /// Required: how to authenticate.
     pub auth: AuthConfig,
+
+    /// Client-provided driver/runtime identity. Telemetry uses this for
+    /// `DriverSystemConfiguration`, filling any missing fields with
+    /// kernel defaults at session-open time.
+    pub driver_system_configuration: Option<DriverSystemConfiguration>,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate
