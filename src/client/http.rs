@@ -28,6 +28,7 @@ use crate::client::retry::{
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
+use crate::types::sea::ServiceError;
 use reqwest::{Client, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -35,11 +36,11 @@ use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
 /// Build an `Error` for a transport-level non-2xx HTTP response, parsing
-/// the Databricks error envelope out of the response body when present.
+/// the SEA error envelope out of the response body when present.
 ///
-/// A transport-level failure may return either a bare
-/// `{"error_code", "message", "sql_state"}` or an `{"error": {...}}`
-/// wrapper. Mirrors the statement-level path
+/// The SEA REST API returns a JSON error body — either a bare
+/// `{"error_code", "message", "sql_state"}` ([`ServiceError`]) or a
+/// `{"error": {...}}` wrapper. Mirrors the statement-level path
 /// (`sea.rs terminal_outcome`) so transport-level failures surface the
 /// structured `error_code` / `sql_state` instead of only the raw body
 /// stuffed into the message. Falls back to `context` (the raw body) as
@@ -49,26 +50,16 @@ use tokio::time::sleep;
 /// detail) folded into the message so existing diagnostics are preserved.
 fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error {
     #[derive(serde::Deserialize)]
-    struct HttpServiceError {
-        #[serde(default)]
-        error_code: Option<String>,
-        #[serde(default)]
-        message: Option<String>,
-        #[serde(default)]
-        sql_state: Option<String>,
-    }
-
-    #[derive(serde::Deserialize)]
     struct ErrorWrapper {
-        error: HttpServiceError,
+        error: ServiceError,
     }
     // Parse the body once into a `Value`, then try both envelope shapes
-    // off it (bare error, then the `{"error": ...}` wrapper) —
+    // off it (bare `ServiceError`, then the `{"error": ...}` wrapper) —
     // avoids re-walking the raw string twice.
-    let svc: Option<HttpServiceError> = serde_json::from_str::<serde_json::Value>(body)
+    let svc: Option<ServiceError> = serde_json::from_str::<serde_json::Value>(body)
         .ok()
         .and_then(|v| {
-            serde_json::from_value::<HttpServiceError>(v.clone())
+            serde_json::from_value::<ServiceError>(v.clone())
                 .ok()
                 .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
                 .or_else(|| {

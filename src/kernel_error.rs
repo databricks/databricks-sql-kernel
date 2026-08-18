@@ -871,19 +871,21 @@ mod tests {
     }
 
     #[test]
-    fn extract_sqlstate_from_status_ignores_nested_error_field() {
+    fn extract_sqlstate_from_status_falls_back_to_error_message() {
         let status: crate::types::sea::StatementStatus = serde_json::from_str(
             r#"{
                 "state": "FAILED",
                 "error": {
-                    "message": "table not found",
-                    "sql_state": "42P01"
+                    "message": "table not found. SQLSTATE: 42P01"
                 }
             }"#,
         )
         .unwrap();
 
-        assert_eq!(extract_sqlstate_from_status(&status), None);
+        assert_eq!(
+            extract_sqlstate_from_status(&status).as_deref(),
+            Some("42P01")
+        );
     }
 
     #[test]

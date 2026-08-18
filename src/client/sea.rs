@@ -1447,6 +1447,7 @@ mod tests {
                         "[INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME] ... SQLSTATE: 22023"
                             .to_string(),
                     ),
+                    sql_state: None,
                 }),
                 sql_state: None,
                 num_modified_rows: None,
