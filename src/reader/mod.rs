@@ -1607,6 +1607,7 @@ mod tests {
         StatementStatus {
             state: StatementState::Succeeded,
             error: None::<ServiceError>,
+            sql_state: None,
             num_modified_rows: None,
             display_message: None,
             diagnostic_info: None,

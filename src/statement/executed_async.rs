@@ -145,16 +145,11 @@ impl StatementStatus {
                 let mut error = Error::sql_error()
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);
+                if let Some(s) = crate::kernel_error::extract_sqlstate_from_status(&response.status)
+                {
+                    error = error.with_sql_state(s);
+                }
                 if let Some(err) = service_error {
-                    let sqlstate = err
-                        .sql_state
-                        .as_ref()
-                        .filter(|s| s.len() == 5)
-                        .cloned()
-                        .or_else(|| crate::kernel_error::extract_sqlstate_from_message(&error_msg));
-                    if let Some(s) = sqlstate {
-                        error = error.with_sql_state(s);
-                    }
                     if let Some(ec) = err.error_code.as_deref().filter(|s| !s.is_empty()) {
                         error = error.with_error_code(ec);
                     }
