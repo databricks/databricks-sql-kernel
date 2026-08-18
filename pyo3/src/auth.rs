@@ -223,6 +223,18 @@ fn build_auth_config_inner(
                             .to_owned(),
                     );
                 }
+                // Both knobs set is ambiguous: downstream `redirect_ports` wins
+                // and `redirect_port` is silently dropped. Reject it up front
+                // (mirroring the degenerate-shape rejections above) so the
+                // caller doesn't set 9000 and get a range that never honors it.
+                if oauth.redirect_port.is_some() {
+                    return Err(
+                        "auth_type='oauth-u2m' set either redirect_port or redirect_ports, \
+                         not both (redirect_ports would take precedence and redirect_port \
+                         would be ignored)"
+                            .to_owned(),
+                    );
+                }
             }
             // Default the U2M OAuth client to the Python connector's
             // own registered client (`databricks-sql-python`), NOT the
@@ -513,6 +525,21 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("non-zero"), "got: {err}");
+    }
+
+    #[test]
+    fn u2m_both_redirect_port_and_ports_rejected() {
+        let err = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                redirect_port: Some(9000),
+                redirect_ports: Some(vec![8020, 8021]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("not both"), "got: {err}");
     }
 
     #[test]
