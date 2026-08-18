@@ -187,9 +187,16 @@ wire (they are deliberately *not* in the allowlist). They exist so C ABI
 (Go / ODBC) consumers can set them through the existing
 `session_conf` entry point without a dedicated symbol.
 
+Each key mirrors a field of [`ResultConfig`](#resultconfig--result-handling-optional) and is matched **case-insensitively**. Boolean keys accept exactly `"true"` / `"false"` (case-insensitive); the integer window keys require a positive integer. An unrecognised value is rejected with `InvalidArgument` at session creation.
+
 | Key | Description | Default |
 |-----|-------------|---------|
-| `cloudfetch_max_chunks_in_memory` | Same knob as `ResultConfig::cloudfetch_max_chunks_in_memory` — max decompressed CloudFetch chunks held in memory at once. Matched case-insensitively; parse failures / `0` are ignored (default kept), and values above `256` are clamped (peak RSS scales with this, so the ceiling bounds OOM risk). | `16` |
+| `cloudfetch_enabled` | Same knob as `ResultConfig::cloudfetch_enabled` — opt into CloudFetch (`false` forces the inline-Arrow path). | `true` |
+| `cloudfetch_link_prefetch_window` | Same knob as `ResultConfig::cloudfetch_link_prefetch_window` — number of presigned URLs to prefetch ahead of the consumer. | `10` |
+| `cloudfetch_max_chunks_in_memory` | Same knob as `ResultConfig::cloudfetch_max_chunks_in_memory` — max decompressed CloudFetch chunks held in memory at once. Values above `256` are clamped (with a warning) rather than rejected (peak RSS scales with this, so the ceiling bounds OOM risk). | `16` |
+| `inline_max_chunks_in_memory` | Same knob as `ResultConfig::inline_max_chunks_in_memory` — prefetch window for the inline-Arrow path. `1` disables prefetching. | `4` |
+| `complex_types_as_json` | Same knob as `ResultConfig::complex_types_as_json` — render complex columns as compact JSON strings instead of native Arrow nested types. | `false` |
+| `intervals_as_string` | Same knob as `ResultConfig::intervals_as_string` — render `INTERVAL` / `DURATION` columns as canonical Databricks text instead of native Arrow interval types. | `false` |
 
 Compression (LZ4) is **not** a parameter: the kernel detects it from the
 server's result manifest (`result_compression`) and decompresses
