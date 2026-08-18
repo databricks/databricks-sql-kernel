@@ -261,6 +261,66 @@ export interface ConnectionOptions {
    */
   sessionConf?: Record<string, string>
   /**
+   * Driver name reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  driverName?: string
+  /**
+   * Driver version reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  driverVersion?: string
+  /**
+   * Runtime name reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  runtimeName?: string
+  /**
+   * Runtime version reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  runtimeVersion?: string
+  /**
+   * Runtime vendor reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  runtimeVendor?: string
+  /**
+   * Operating system name reported in telemetry system configuration.
+   * Omitted ⇒ kernel default.
+   */
+  osName?: string
+  /**
+   * Operating system version reported in telemetry system configuration.
+   * Omitted ⇒ kernel default.
+   */
+  osVersion?: string
+  /**
+   * Operating system architecture reported in telemetry system
+   * configuration. Omitted ⇒ kernel default.
+   */
+  osArch?: string
+  /**
+   * Client application name reported in telemetry system configuration.
+   * Omitted ⇒ absent unless the kernel can infer a default.
+   */
+  clientAppName?: string
+  /**
+   * Locale name reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  localeName?: string
+  /**
+   * Character-set encoding reported in telemetry system configuration.
+   * Omitted ⇒ kernel default.
+   */
+  charSetEncoding?: string
+  /**
+   * Process name reported in telemetry system configuration. Omitted ⇒
+   * kernel default.
+   */
+  processName?: string
+  /**
    * Maximum number of pooled HTTP connections per host. Routes
    * through the kernel's [`HttpConfig::pool_max_idle_per_host`].
    * Tunes the underlying `reqwest` connection pool — higher values
@@ -416,6 +476,33 @@ export interface ConnectionOptions {
    * [`HttpConfig::overall_timeout`].
    */
   retryOverallTimeoutSecs?: number
+  /**
+   * Enable kernel telemetry export. Omitted / `false` keeps telemetry
+   * disabled. When enabled, the kernel records operation telemetry below the
+   * binding layer and exports through the Databricks SQL driver telemetry
+   * endpoint.
+   */
+  telemetryEnabled?: boolean
+  /**
+   * Number of telemetry events buffered before a flush. Omitted ⇒ kernel
+   * default. Must be greater than zero when supplied.
+   */
+  telemetryBatchSize?: number
+  /**
+   * Periodic telemetry flush interval in milliseconds. Omitted ⇒ kernel
+   * default. Must be greater than zero when supplied.
+   */
+  telemetryFlushIntervalMs?: number
+  /** Maximum telemetry export retries. `0` disables telemetry export retries. */
+  telemetryMaxRetries?: number
+  /** Fixed telemetry retry delay in milliseconds. `0` means immediate retry. */
+  telemetryRetryDelayMs?: number
+  /**
+   * Maximum time explicit close waits for telemetry final flush, in
+   * milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
+   * supplied.
+   */
+  telemetryCloseFlushTimeoutMs?: number
   /**
    * Programmatic HTTP/HTTPS proxy ([`ProxyInput`]) to route all kernel
    * traffic through. Carries the proxy `url`, optional basic-auth
