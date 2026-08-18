@@ -1455,6 +1455,7 @@ mod tests {
             http_client,
             CompressionCodec::None,
             0.1,
+            std::time::Duration::from_secs(300),
         ));
 
         #[derive(Debug)]

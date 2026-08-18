@@ -28,7 +28,7 @@ use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use reqwest::Method;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Downloads Arrow data from cloud storage presigned URLs.
 ///
@@ -42,6 +42,7 @@ pub struct ChunkDownloader {
     http_client: Arc<DatabricksHttpClient>,
     compression: CompressionCodec,
     speed_threshold_mbps: f64,
+    download_timeout: Duration,
 }
 
 impl ChunkDownloader {
@@ -51,15 +52,20 @@ impl ChunkDownloader {
     /// * `http_client` - HTTP client for making requests
     /// * `compression` - Compression codec used by the server
     /// * `speed_threshold_mbps` - Log warning if speed falls below this (MB/s)
+    /// * `download_timeout` - Per-chunk download deadline (HTTP GET + body
+    ///   read); a stall that exceeds it fails with a retriable timeout rather
+    ///   than hanging.
     pub fn new(
         http_client: Arc<DatabricksHttpClient>,
         compression: CompressionCodec,
         speed_threshold_mbps: f64,
+        download_timeout: Duration,
     ) -> Self {
         Self {
             http_client,
             compression,
             speed_threshold_mbps,
+            download_timeout,
         }
     }
 
@@ -89,17 +95,35 @@ impl ChunkDownloader {
             .build()
             .map_err(|e| Error::io().message(format!("Failed to build download request: {}", e)))?;
 
-        // Execute without auth (presigned URLs have their own auth)
-        let response = self
-            .http_client
-            .execute_without_auth(request, RequestType::CloudFetchDownload)
-            .await?;
+        // Bound the whole HTTP GET + body read with a per-chunk deadline so a
+        // stalled cloud-storage response fails with a retriable timeout rather
+        // than hanging the result stream. reqwest's client-level timeout only
+        // covers `execute()` (the header phase); the separately-awaited
+        // `response.bytes()` below is where a wedged blob read would otherwise
+        // block indefinitely (the reyden nightly hang). Mirrors the ADBC C#
+        // driver's per-download deadline.
+        let download_fut = async {
+            // Execute without auth (presigned URLs have their own auth)
+            let response = self
+                .http_client
+                .execute_without_auth(request, RequestType::CloudFetchDownload)
+                .await?;
 
-        // Read response body
-        let bytes = response
-            .bytes()
-            .await
-            .map_err(|e| Error::io().message(format!("Failed to read download response: {}", e)))?;
+            // Read response body
+            response.bytes().await.map_err(|e| {
+                Error::io().message(format!("Failed to read download response: {}", e))
+            })
+        };
+
+        let bytes = match tokio::time::timeout(self.download_timeout, download_fut).await {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(Error::timeout().message(format!(
+                    "CloudFetch chunk {} download exceeded {:?} timeout (url {})",
+                    link.chunk_index, self.download_timeout, link.url
+                )));
+            }
+        };
 
         let elapsed = start.elapsed();
         let size_mb = bytes.len() as f64 / 1024.0 / 1024.0;
@@ -221,9 +245,68 @@ mod tests {
         );
         let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
         http_client.set_auth_provider(auth);
-        let downloader = ChunkDownloader::new(http_client, CompressionCodec::None, 0.1);
+        let downloader = ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+            Duration::from_secs(300),
+        );
 
         assert_eq!(downloader.speed_threshold_mbps, 0.1);
+    }
+
+    /// A stalled cloud-storage response must fail with a timeout within the
+    /// configured per-chunk `download_timeout`, not hang. Regression for the
+    /// reyden nightly where a fault-injected CloudFetch stall wedged
+    /// `response.bytes()` for ~52 min until the CI job cap killed it.
+    #[tokio::test]
+    async fn download_times_out_when_response_stalls() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // Respond far later than the downloader's per-chunk timeout,
+        // simulating a wedged blob read.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk0"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
+            .mount(&server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap(),
+        );
+        http_client.set_auth_provider(Arc::new(PersonalAccessToken::new("test-token".to_string())));
+
+        // Tiny per-chunk timeout so the test resolves quickly.
+        let downloader = ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+            Duration::from_millis(200),
+        );
+
+        let link = CloudFetchLink {
+            url: format!("{}/chunk0", server.uri()),
+            ..create_test_link()
+        };
+
+        let start = Instant::now();
+        let result = downloader.download(&link).await;
+        let elapsed = start.elapsed();
+
+        assert!(result.is_err(), "a stalled download must error, not hang");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "download must give up near its 200ms timeout, took {:?}",
+            elapsed
+        );
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().to_lowercase().contains("timeout")
+                || err.to_string().to_lowercase().contains("timed out"),
+            "error should indicate a timeout, got: {err}"
+        );
     }
 
     // Note: Full download tests require mocking the HTTP layer

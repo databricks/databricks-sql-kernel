@@ -33,6 +33,18 @@ pub const LINK_EXPIRY_BUFFER_SECS: i64 = 30;
 /// Used as a fallback when `chunk_ready_timeout` is not configured.
 pub const DEFAULT_CHUNK_READY_TIMEOUT_SECS: u64 = 30;
 
+/// Default per-chunk download timeout (in seconds).
+///
+/// Bounds a single CloudFetch chunk download (HTTP GET + body read) so a
+/// stalled cloud-storage response fails with a retriable timeout instead of
+/// hanging the whole result stream. Without it, `response.bytes()` on a
+/// wedged connection blocks indefinitely — see the reyden nightly hang. Set
+/// to 5 minutes to match the ADBC C# driver's default download timeout; the
+/// Python (Thrift) driver uses a 60s between-bytes read timeout for the same
+/// purpose. This is a total per-attempt deadline (not idle-based), so a
+/// genuinely large chunk must complete within it.
+pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
+
 /// Configuration for CloudFetch streaming.
 #[derive(Debug, Clone)]
 pub struct CloudFetchConfig {
@@ -46,6 +58,10 @@ pub struct CloudFetchConfig {
     pub retry_delay: Duration,
     /// Timeout for waiting for a chunk to be ready.
     pub chunk_ready_timeout: Option<Duration>,
+    /// Per-chunk download timeout (HTTP GET + body read). A stalled download
+    /// that exceeds this fails with a retriable timeout rather than hanging.
+    /// Defaults to [`DEFAULT_DOWNLOAD_TIMEOUT_SECS`].
+    pub download_timeout: Duration,
     /// Log warning if download speed falls below this threshold (MB/s).
     pub speed_threshold_mbps: f64,
     /// Whether CloudFetch is enabled.
@@ -72,6 +88,7 @@ impl Default for CloudFetchConfig {
             max_retries: 5,
             retry_delay: Duration::from_millis(1500),
             chunk_ready_timeout: Some(Duration::from_secs(30)),
+            download_timeout: Duration::from_secs(DEFAULT_DOWNLOAD_TIMEOUT_SECS),
             speed_threshold_mbps: 0.1,
             enabled: true,
             batch_merge_target_rows: 0,

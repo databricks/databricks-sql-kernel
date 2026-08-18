@@ -463,6 +463,7 @@ impl ResultReaderFactory {
             self.http_client.clone(),
             compression,
             self.config.speed_threshold_mbps,
+            self.config.download_timeout,
         ));
 
         let provider = StreamingCloudFetchProvider::new(
