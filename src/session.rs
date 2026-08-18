@@ -1063,8 +1063,22 @@ fn result_to_post_process_options(
 /// its own redirect URI): the `databricks-sql-connector` app, shared by the
 /// Node and Go drivers. See PECOBLR-4039.
 const DEFAULT_U2M_CLIENT_ID: &str = "databricks-sql-connector";
-/// Redirect port registered for [`DEFAULT_U2M_CLIENT_ID`].
-const DEFAULT_U2M_REDIRECT_PORT: u16 = 8030;
+/// Default candidate redirect ports for [`DEFAULT_U2M_CLIENT_ID`], tried in
+/// order — the kernel binds the first free one, so a bare-default consumer
+/// (Node, Go, ODBC, bare Rust) gets busy-port fallback when 8030 is occupied
+/// (a stale prior listener, or a second concurrent U2M connection), instead of
+/// failing outright.
+///
+/// Why a contiguous 8030–8034 window is safe even though only 8030 is the
+/// "canonical" registered port: [`DEFAULT_U2M_CLIENT_ID`] authenticates via
+/// Databricks in-house OAuth, which normalizes loopback redirect URIs by
+/// **dropping the port before comparison** (RFC 8252 §7.3 — "an exact match is
+/// required except for the port component"). So every `http://localhost:{port}`
+/// is accepted for this client regardless of the specific port, and no
+/// per-port app registration is needed. (Validated live: :8030, plus arbitrary
+/// ports, all complete the flow.) The first port is the canonical 8030 so the
+/// common case is unchanged.
+const DEFAULT_U2M_REDIRECT_PORTS: [u16; 5] = [8030, 8031, 8032, 8033, 8034];
 
 /// Scopes registered for [`DEFAULT_U2M_CLIENT_ID`] (`sql offline_access`).
 fn default_u2m_scopes() -> Vec<String> {
@@ -1089,7 +1103,7 @@ fn resolve_u2m_bundle(
     // forward a one-element list.
     let ports = match redirect_ports {
         Some(ports) if !ports.is_empty() => ports.to_vec(),
-        _ => vec![DEFAULT_U2M_REDIRECT_PORT],
+        _ => DEFAULT_U2M_REDIRECT_PORTS.to_vec(),
     };
     (
         client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
@@ -1220,10 +1234,11 @@ mod u2m_default_tests {
     #[test]
     fn u2m_default_bundle_is_connector_sql_8030() {
         // Caller omits everything → kernel default databricks-sql-connector
-        // app bundle (PECOBLR-4039). No port range → single default port.
+        // app bundle (PECOBLR-4039), with the full default candidate-port
+        // window so bare-default consumers get busy-port fallback too.
         let (client_id, ports, scopes) = resolve_u2m_bundle(None, None, None);
         assert_eq!(client_id, "databricks-sql-connector");
-        assert_eq!(ports, vec![8030]);
+        assert_eq!(ports, vec![8030, 8031, 8032, 8033, 8034]);
         assert_eq!(
             scopes,
             vec!["sql".to_string(), "offline_access".to_string()]
@@ -1253,11 +1268,13 @@ mod u2m_default_tests {
 
     #[test]
     fn u2m_bundle_empty_or_none_ports_use_default() {
-        // Both an empty list and None fall back to the kernel default port.
+        // Both an empty list and None fall back to the kernel default port
+        // window (first is the canonical 8030; the rest are fallback candidates).
+        let default = vec![8030, 8031, 8032, 8033, 8034];
         let (_, ports_empty, _) = resolve_u2m_bundle(None, Some(&[]), None);
-        assert_eq!(ports_empty, vec![8030]);
+        assert_eq!(ports_empty, default);
         let (_, ports_none, _) = resolve_u2m_bundle(None, None, None);
-        assert_eq!(ports_none, vec![8030]);
+        assert_eq!(ports_none, default);
     }
 }
 
