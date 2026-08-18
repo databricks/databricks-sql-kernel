@@ -52,6 +52,15 @@ impl TelemetryClient {
         };
 
         if let Some(batch) = batch {
+            // `tokio::spawn` panics if called outside a Tokio runtime. The
+            // trait method reaching this code (`ConnectionTelemetry::emit_operation`)
+            // is synchronous and carries no runtime precondition, so a future
+            // caller from a non-async context must not be able to panic here —
+            // telemetry must never change user operation results. Fail open by
+            // dropping the batch when no runtime is available.
+            if tokio::runtime::Handle::try_current().is_err() {
+                return;
+            }
             let exporter = Arc::clone(&self.exporter);
             let handle = tokio::spawn(async move {
                 export_batch(exporter, batch).await;
