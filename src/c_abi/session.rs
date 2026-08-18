@@ -25,7 +25,10 @@
 //! (default = ignore). Backed by the shared `Session` transaction methods.
 
 use super::{block_on_ffi, KernelStatusCode};
-use crate::config::{AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, TlsConfig};
+use crate::config::{
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TlsConfig,
+    TokenCacheConfig,
+};
 use crate::kernel_error::Error;
 use crate::session::Session;
 use std::collections::HashMap;
@@ -63,13 +66,13 @@ enum AuthSpec {
         client_secret: String,
     },
     /// OAuth user-to-machine (authorization code + PKCE, browser flow).
-    /// All fields optional — the kernel fills `databricks-cli` /
-    /// port 8020 / default scopes when omitted.
+    /// All fields optional — the kernel fills `databricks-sql-connector` /
+    /// port 8030 / `sql offline_access` when omitted.
     OAuthU2M {
         client_id: Option<String>,
         redirect_port: Option<u16>,
         /// Comma-separated scopes (split at build time). `None` ⇒ kernel
-        /// default (`all-apis`, `offline_access`).
+        /// default (`sql`, `offline_access`).
         scopes: Option<String>,
     },
 }
@@ -109,6 +112,22 @@ pub struct KernelSessionConfig {
     /// real transactions via `kernel_session_config_set_ignore_transactions`
     /// with `false`. Maps to [`DefaultOpts::ignore_transactions`].
     ignore_transactions: bool,
+    /// SP-wide WIF client id applied to the selected auth mode.
+    identity_federation_client_id: Option<String>,
+    /// On-disk U2M token-cache policy (populated by
+    /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
+    /// no passphrase, in which case the cache is encrypted under a
+    /// machine-local derived key. Only U2M auth reads it — PAT and M2M never
+    /// touch the cache. See [`TokenCacheConfig`].
+    token_cache: TokenCacheConfig,
+    /// Client-side result-management knobs (CloudFetch / inline streaming
+    /// tuning, flat-text rendering). Populated by
+    /// `kernel_session_config_set_client_conf`; defaults to
+    /// [`ResultConfig::default`]. These are **client-side** behaviours
+    /// folded into the kernel's `ResultConfig` at `open()` — they never
+    /// reach the SEA wire (unlike [`Self::session_conf`]). See
+    /// [`ResultConfig`].
+    result: ResultConfig,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -186,6 +205,11 @@ pub unsafe extern "C" fn kernel_session_config_new(
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
+        identity_federation_client_id: None,
+        // Match the reference driver's / JDBC's EnableTokenCache=1.
+        token_cache: TokenCacheConfig::default(),
+        // Kernel result defaults (CloudFetch enabled, Arrow-native types).
+        result: ResultConfig::default(),
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -297,8 +321,8 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_m2m(
 /// setters — the last one called wins.
 ///
 /// All args are optional (pass NULL to omit): `client_id` defaults to the
-/// public `databricks-cli` client, `redirect_port` to 8020, and `scopes`
-/// (a comma-separated list) to the kernel default (`all-apis`,
+/// `databricks-sql-connector` client, `redirect_port` to 8030, and `scopes`
+/// (a comma-separated list) to the kernel default (`sql`,
 /// `offline_access`). `offline_access` yields a refresh token, which the
 /// kernel caches and refreshes transparently.
 ///
@@ -320,10 +344,26 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
     set_on_config(config, |c| {
         c.auth = Some(AuthSpec::OAuthU2M {
             client_id: optional_str(client_id, "client_id")?,
-            // 0 is the "unset" sentinel → kernel default (8020).
+            // 0 is the "unset" sentinel → kernel default (8030).
             redirect_port: (redirect_port != 0).then_some(redirect_port),
             scopes: optional_str(scopes, "scopes")?,
         });
+        Ok(())
+    })
+}
+
+/// Set the optional SP-wide Workload Identity Federation client id used by
+/// mandatory token exchange. Leaving it unset selects BYOT / account-wide WIF.
+///
+/// # Safety
+/// `config` must be live and `client_id` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_identity_federation_client_id(
+    config: *mut KernelSessionConfig,
+    client_id: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.identity_federation_client_id = Some(required_str(client_id, "client_id")?);
         Ok(())
     })
 }
@@ -372,9 +412,12 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
 /// `min_wait_ms` guarantees zero retries (the first backoff already exceeds the
 /// budget); this is accepted but logged at `warn`.
 ///
-/// `min_wait_ms == 0` and `max_wait_ms < min_wait_ms` are rejected as
-/// `InvalidArgument`. Maps to `HttpConfig::retry_min_wait` /
-/// `retry_max_wait` / `retry_max_retries` / `overall_timeout`.
+/// `min_wait_ms == 0` is rejected as `InvalidArgument` (a zero floor is
+/// genuinely invalid, not a correctable typo). A `max_wait_ms < min_wait_ms`
+/// pair is *corrected* (max raised to min) with a `warn`, rather than rejected —
+/// a backoff bound is a tuning hint and must not fail a host's connect. Maps to
+/// `HttpConfig::retry_min_wait` / `retry_max_wait` / `retry_max_retries` /
+/// `overall_timeout`.
 ///
 /// # Safety
 /// `config` must be a live config handle.
@@ -390,11 +433,24 @@ pub unsafe extern "C" fn kernel_session_config_set_retry_config(
         if min_wait_ms == 0 {
             return Err(Error::invalid_argument().message("retry min_wait_ms must be > 0"));
         }
-        if max_wait_ms < min_wait_ms {
-            return Err(
-                Error::invalid_argument().message("retry max_wait_ms must be >= min_wait_ms")
+        // A `max_wait_ms < min_wait_ms` pair is a tuning typo, not a fatal
+        // config error: correct it (raise max to min) and warn, rather than
+        // rejecting the whole config and failing the host's connect. A backoff
+        // bound is a tuning hint and the ceiling is the driver's own, so this
+        // matches the kernel's clamp-and-warn discipline (see
+        // `build_retry_configs_for_session` / `calculate_backoff`) and the
+        // reference ODBC driver's handling.
+        let max_wait_ms = if max_wait_ms < min_wait_ms {
+            crate::klog::warn!(
+                min_wait_ms,
+                max_wait_ms,
+                "retry max_wait_ms is below min_wait_ms; raising max_wait_ms to \
+                 min_wait_ms (a backoff bound is a tuning hint, not a hard failure)",
             );
-        }
+            min_wait_ms
+        } else {
+            max_wait_ms
+        };
         // A non-zero budget below the first backoff wait guarantees zero
         // retries (the client stops before the first sleep — src/client/http.rs).
         // Accept it (the single attempt is still coherent, and a valid-looking
@@ -462,14 +518,27 @@ pub unsafe extern "C" fn kernel_init_logging(
     // `level` is best-effort: a non-UTF-8 or unrecognized value falls back
     // to RUST_LOG / the default, so treat a bad level as absent.
     let level = optional_str(level, "log level").ok().flatten();
+    // Level "OFF" means "do not install a subscriber", but that is still an
+    // intentional, successful outcome. `init_logging` no longer special-cases
+    // it (it works on full EnvFilter directives), so honour OFF here before
+    // touching the file path.
+    if level
+        .as_deref()
+        .is_some_and(|l| l.eq_ignore_ascii_case("off"))
+    {
+        return KernelStatusCode::Success;
+    }
+    // The C ABI takes a BARE level; expand it to the full directive the
+    // shared installer expects (targeting the kernel's own log target).
+    let filter = level.as_deref().map(crate::logging::filter_from_level);
     // `file_path` is NOT best-effort: a non-UTF-8 path is a real error (the
     // caller asked us to write there and we can't), so surface it rather
     // than silently dropping the path and reporting Success.
     let file = match optional_str(file_path, "log file path") {
-        Ok(f) => f,
+        Ok(f) => f.map(std::path::PathBuf::from),
         Err(e) => return crate::c_abi::error::store_and_code(e),
     };
-    if crate::logging::init_logging(&crate::logging::LogConfig { level, file }) {
+    if crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
         KernelStatusCode::Success
     } else {
         crate::c_abi::error::store_and_code(Error::new(
@@ -619,6 +688,102 @@ pub unsafe extern "C" fn kernel_session_config_set_ignore_transactions(
     })
 }
 
+/// Configure the on-disk OAuth token cache for U2M (browser) auth.
+///
+/// Mirrors the `EnableTokenCache` / `TokenCachePassPhrase` pair exposed by
+/// the reference ODBC driver and JDBC:
+///
+/// * `enabled = true` (the default) persists the refresh token to
+///   `~/.config/databricks-sql-kernel/oauth/` so the user is not sent
+///   through the browser on every connection. The file is **always
+///   encrypted** (AES-256-CBC, PBKDF2-HMAC-SHA256); there is no plaintext
+///   mode. A non-null `passphrase` keys it; a null or blank one falls back
+///   to a machine-local derived key, matching the reference driver, which
+///   caches with an empty `TokenCachePassPhrase`. Supplying a passphrase is
+///   stronger — see `TokenCacheConfig` for what the fallback does and does
+///   not protect against.
+/// * `enabled = false` disables **disk persistence only**. Tokens are
+///   still reused and refreshed in memory for the session's lifetime, so
+///   this does not re-trigger the browser flow on every refresh. Use it
+///   when the process must not write credentials to disk at all.
+///
+/// `passphrase` is ignored when `enabled` is `false`. Only U2M auth touches
+/// the cache; PAT and M2M ignore this setting entirely.
+///
+/// # Safety
+/// `config` must be a live config handle. `passphrase`, if non-null, must
+/// point to a NUL-terminated UTF-8 string valid for the duration of the
+/// call.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+    passphrase: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.token_cache = TokenCacheConfig {
+            enabled,
+            passphrase: optional_str(passphrase, "passphrase")?,
+        };
+        Ok(())
+    })
+}
+
+/// Set one **client-side** result knob by name (`key` = `value`).
+///
+/// This is the client-side counterpart to
+/// `kernel_session_config_set_session_conf`: that one carries **server**
+/// session confs (`ANSI_MODE`, `TIMEZONE`, …) to the SEA wire; this one
+/// sets **client-side** knobs that tune how the kernel fetches, buffers,
+/// and post-processes results and are **never sent to the server**. The two
+/// channels are deliberately separate (see #196 / #226 — conflating them is
+/// what made a client flag masquerade as a rejected server conf).
+///
+/// A key/value shape (rather than one typed setter per knob) is chosen so
+/// the signature never changes as `ResultConfig` grows new knobs, and so a
+/// host that already has DSN / connection-string attributes can forward
+/// them in a loop. Safety is recovered at runtime: an unknown key or an
+/// unparseable value is **rejected** with `InvalidArgument` (and a stored
+/// error naming the problem), not silently ignored.
+///
+/// Recognised keys (matched case-insensitively), mapping to
+/// [`ResultConfig`]:
+/// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
+///   result inline (SEA `disposition = INLINE`), mirroring JDBC's
+///   `EnableQueryResultDownload=0`.
+/// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
+///   prefetched ahead of the consumer.
+/// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed
+///   CloudFetch chunks held at once (bounds peak RSS). Values above the
+///   kernel ceiling (256) are **clamped** with a warning, not rejected.
+/// - `inline_max_chunks_in_memory` = positive integer — inline-Arrow
+///   prefetch window (used when `cloudfetch_enabled = false`).
+/// - `complex_types_as_json` = `"true"` / `"false"` — render `ARRAY` /
+///   `MAP` / `STRUCT` / `VARIANT` / `GEOMETRY` / `GEOGRAPHY` as JSON text
+///   (PySQL `_use_arrow_native_complex_types=False`, JDBC
+///   `complexDatatypeSupport=false`).
+/// - `intervals_as_string` = `"true"` / `"false"` — render `INTERVAL` /
+///   `DURATION` as canonical Databricks text (for pyarrow-Python bindings).
+///
+/// A server session-conf key passed here (e.g. `ANSI_MODE`) is rejected —
+/// use `kernel_session_config_set_session_conf` for those.
+///
+/// # Safety
+/// `config` must be a live config handle; `key` / `value` must be
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_client_conf(
+    config: *mut KernelSessionConfig,
+    key: *const c_char,
+    value: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        let key = required_str(key, "client_conf key")?;
+        let value = required_str(value, "client_conf value")?;
+        c.result.apply_client_conf(&key, &value)
+    })
+}
+
 /// Shared body for the config setters: null-check the handle, clear the
 /// thread-local error, run `f` against the borrowed config, and store
 /// any error.
@@ -752,6 +917,9 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         custom_headers,
         retry,
         ignore_transactions,
+        identity_federation_client_id,
+        token_cache,
+        result,
     } = config;
 
     block_on_ffi(move || {
@@ -778,11 +946,19 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             };
 
             let auth = match auth {
-                AuthSpec::Pat { token } => AuthConfig::pat(Some(token))?,
+                AuthSpec::Pat { token } => {
+                    AuthConfig::pat(Some(token), identity_federation_client_id)?
+                }
                 AuthSpec::OAuthM2M {
                     client_id,
                     client_secret,
-                } => AuthConfig::oauth_m2m(Some(client_id), Some(client_secret), None, None)?,
+                } => AuthConfig::oauth_m2m(
+                    Some(client_id),
+                    Some(client_secret),
+                    None,
+                    None,
+                    identity_federation_client_id,
+                )?,
                 AuthSpec::OAuthU2M {
                     client_id,
                     redirect_port,
@@ -793,6 +969,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     scopes.and_then(|s| parse_scopes(&s)),
                     None,
                     None,
+                    Some(token_cache),
+                    identity_federation_client_id,
                 ),
             };
 
@@ -800,6 +978,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .connection(connection)
                 .auth(auth)
                 .session_conf(session_conf)
+                .result(result)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
                     ..Default::default()
@@ -1153,27 +1332,47 @@ mod tests {
         }
     }
 
-    /// The retry setter rejects a zero min_wait and a max_wait below min_wait
-    /// with `InvalidArgument` — a degenerate range would otherwise reach the
-    /// HTTP client as nonsense backoff bounds.
+    /// The retry setter rejects a zero min_wait with `InvalidArgument` (a zero
+    /// floor is genuinely invalid), but a `max_wait < min_wait` pair is a tuning
+    /// typo that is CORRECTED (max raised to min) with a warning rather than
+    /// rejected — a backoff bound must not fail a host's connect
+    /// (ERRORRECOV-014).
     #[test]
-    fn set_retry_config_rejects_bad_range() {
+    fn set_retry_config_rejects_zero_min_corrects_bad_range() {
         unsafe {
             let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
             assert_eq!(
                 kernel_session_config_new(&mut config),
                 KernelStatusCode::Success
             );
+
+            // Zero min_wait is still rejected outright.
             assert_eq!(
                 kernel_session_config_set_retry_config(config, 0, 1_000, 3, 0),
                 KernelStatusCode::InvalidArgument
             );
-            assert_eq!(
-                kernel_session_config_set_retry_config(config, 5_000, 1_000, 3, 0),
-                KernelStatusCode::InvalidArgument
-            );
             // A rejected call leaves the config's retry unset.
             assert!(config.as_ref().unwrap().retry.is_none());
+
+            // max_wait (1s) < min_wait (5s): accepted, and max is raised to min.
+            assert_eq!(
+                kernel_session_config_set_retry_config(config, 5_000, 1_000, 3, 0),
+                KernelStatusCode::Success
+            );
+            let retry = config
+                .as_ref()
+                .unwrap()
+                .retry
+                .as_ref()
+                .expect("retry spec should be recorded after correction");
+            assert_eq!(retry.min_wait, Duration::from_millis(5_000));
+            assert_eq!(
+                retry.max_wait,
+                Duration::from_millis(5_000),
+                "max_wait should be corrected up to min_wait"
+            );
+            assert_eq!(retry.max_retries, 3);
+
             kernel_session_config_free(config);
         }
     }
@@ -1300,6 +1499,31 @@ mod tests {
                 "the requested attempts are recorded as-is"
             );
             assert_eq!(r.overall_timeout, Some(Duration::from_millis(5_000)));
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_identity_federation_client_id_records_value() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let client_id = CString::new("federation-client").unwrap();
+            assert_eq!(
+                kernel_session_config_set_identity_federation_client_id(config, client_id.as_ptr()),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config
+                    .as_ref()
+                    .unwrap()
+                    .identity_federation_client_id
+                    .as_deref(),
+                Some("federation-client")
+            );
             kernel_session_config_free(config);
         }
     }

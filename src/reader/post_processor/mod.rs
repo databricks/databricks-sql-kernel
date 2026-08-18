@@ -119,6 +119,7 @@ impl ResultPostProcessor {
         //    at most one transform.
         let mut json_columns: Vec<usize> = Vec::new();
         let mut interval_columns: Vec<usize> = Vec::new();
+        let mut null_columns: Vec<usize> = Vec::new();
         let mut new_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
         let mut schema_changed = false;
         for (i, field) in augmented_schema.fields().iter().enumerate() {
@@ -131,6 +132,22 @@ impl ResultPostProcessor {
                 schema_changed = true;
             } else if options.intervals_as_string && is_interval_or_duration_type(dt) {
                 interval_columns.push(i);
+                let metadata = field.metadata().clone();
+                new_fields
+                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
+                schema_changed = true;
+            } else if matches!(dt, DataType::Null) {
+                // Untyped NULL (`SELECT NULL` / VOID) arrives as an Arrow
+                // `Null`-typed column, but the server reports it as STRING
+                // (the manifest carries `type_name=NULL`/`type_text=VOID`,
+                // whose canonical Arrow surface is Utf8) and the Thrift /
+                // JDBC reference exposes it as STRING — identically to a
+                // `CAST(NULL AS STRING)` sibling in the same query. Surface
+                // the server type: rewrite the column to an all-null `Utf8`.
+                // Always on (not option-gated); `DataType::Null` never
+                // carries values, so this is lossless. See issue #203
+                // (DATATYPE-041).
+                null_columns.push(i);
                 let metadata = field.metadata().clone();
                 new_fields
                     .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
@@ -162,7 +179,8 @@ impl ResultPostProcessor {
         //    primitives and emits new Utf8 arrays for the rewritten
         //    columns.
         let needs_rebuild = !schemas_field_equal(&inner_schema, &output_schema);
-        let has_rewrites = !json_columns.is_empty() || !interval_columns.is_empty();
+        let has_rewrites =
+            !json_columns.is_empty() || !interval_columns.is_empty() || !null_columns.is_empty();
         let transform: Option<BatchTransform> = if !needs_rebuild && !has_rewrites {
             None
         } else if !has_rewrites {
@@ -186,6 +204,7 @@ impl ResultPostProcessor {
             let augmented = augmented_schema.clone();
             let json_cols: Vec<usize> = json_columns;
             let interval_cols: Vec<usize> = interval_columns;
+            let null_cols: Vec<usize> = null_columns;
             Some(Box::new(move |batch: &RecordBatch| {
                 build_rewritten_batch(
                     batch,
@@ -193,6 +212,7 @@ impl ResultPostProcessor {
                     &target_schema,
                     &json_cols,
                     &interval_cols,
+                    &null_cols,
                 )
             }))
         };
@@ -242,25 +262,31 @@ fn schemas_field_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
 
 /// Build a `RecordBatch` whose primitive columns are reprojected
 /// from `batch`, complex columns (indexed by `json_cols`) are replaced
-/// with `Utf8` arrays of compact JSON text, and interval / duration
+/// with `Utf8` arrays of compact JSON text, interval / duration
 /// columns (indexed by `interval_cols`) are replaced with `Utf8`
-/// arrays of canonical Databricks interval text.
+/// arrays of canonical Databricks interval text, and untyped-NULL
+/// columns (indexed by `null_cols`) are replaced with all-null `Utf8`
+/// arrays (the server-reported STRING type — see issue #203).
 ///
-/// `json_cols` and `interval_cols` are assumed to be sorted in
-/// ascending order (the constructor walks the schema linearly) and
-/// disjoint (`is_complex_type` returns false for intervals).
+/// `json_cols`, `interval_cols`, and `null_cols` are assumed to be
+/// sorted in ascending order (the constructor walks the schema
+/// linearly) and pairwise disjoint (`is_complex_type` returns false
+/// for intervals; a `Null`-typed column is neither complex nor
+/// interval).
 fn build_rewritten_batch(
     batch: &RecordBatch,
     augmented: &SchemaRef,
     output: &SchemaRef,
     json_cols: &[usize],
     interval_cols: &[usize],
+    null_cols: &[usize],
 ) -> Result<RecordBatch> {
     let num_rows = batch.num_rows();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
 
     let mut next_json_idx = 0;
     let mut next_interval_idx = 0;
+    let mut next_null_idx = 0;
     for (col_idx, column) in batch.columns().iter().enumerate() {
         let is_json = json_cols
             .get(next_json_idx)
@@ -268,6 +294,10 @@ fn build_rewritten_batch(
             .is_some_and(|target| target == col_idx);
         let is_interval = interval_cols
             .get(next_interval_idx)
+            .copied()
+            .is_some_and(|target| target == col_idx);
+        let is_null_col = null_cols
+            .get(next_null_idx)
             .copied()
             .is_some_and(|target| target == col_idx);
         if is_json {
@@ -318,6 +348,12 @@ fn build_rewritten_batch(
                 builder.append_value(&s);
             }
             columns.push(Arc::new(builder.finish()));
+        } else if is_null_col {
+            next_null_idx += 1;
+            // `DataType::Null` carries no values, so every row is null:
+            // emit an all-null `Utf8` array of the same length. Matches
+            // the server-reported STRING type for untyped NULL / VOID.
+            columns.push(arrow_array::new_null_array(&DataType::Utf8, num_rows));
         } else {
             columns.push(column.clone());
         }
@@ -476,6 +512,91 @@ mod tests {
                 .value(0),
             "abc"
         );
+    }
+
+    #[tokio::test]
+    async fn untyped_null_column_rewritten_to_utf8() {
+        // Regression for issue #203 (DATATYPE-041): an untyped NULL
+        // (`SELECT NULL` / VOID) arrives as an Arrow `Null`-typed column;
+        // the post-processor must surface the server-reported STRING type
+        // as an all-null `Utf8` column — always on, no option needed.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("untyped_null", DataType::Null, true),
+            Field::new("typed_null_string", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(arrow_array::NullArray::new(1)) as _,
+                Arc::new(StringArray::from(vec![None::<&str>])) as _,
+            ],
+        )
+        .unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+
+        // Default options (no complex/interval rewrite): the Null→Utf8
+        // coercion is unconditional.
+        let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
+            .await
+            .unwrap();
+
+        // Both the advertised schema and the yielded batch report Utf8 for
+        // the untyped-NULL column, identical to the CAST(NULL AS STRING)
+        // sibling.
+        let advertised = pp.schema().await.unwrap();
+        assert_eq!(advertised.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(advertised.field(1).data_type(), &DataType::Utf8);
+        assert_eq!(
+            advertised.field(0).data_type(),
+            advertised.field(1).data_type()
+        );
+
+        let out = pp.next_batch().await.unwrap().unwrap();
+        assert_eq!(out.schema().field(0).data_type(), &DataType::Utf8);
+        assert_eq!(out.num_rows(), 1);
+        // The value is still NULL in the rewritten column.
+        let col = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("untyped_null rewritten to StringArray");
+        assert_eq!(col.len(), 1);
+        assert!(col.is_null(0));
+    }
+
+    #[tokio::test]
+    async fn untyped_null_carries_manifest_metadata_and_real_name() {
+        // The Null→Utf8 rewrite must compose with manifest augmentation:
+        // the rewritten field keeps the manifest's real name and the
+        // server-reported `databricks.type_name`/`type_text` (NULL/VOID).
+        let positional = Arc::new(Schema::new(vec![Field::new("col_0", DataType::Null, true)]));
+        let batch = RecordBatch::try_new(
+            positional,
+            vec![Arc::new(arrow_array::NullArray::new(2)) as _],
+        )
+        .unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![column_info("untyped_null", "NULL", "VOID", 0)]);
+
+        let mut pp =
+            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
+                .await
+                .unwrap();
+
+        let out = pp.next_batch().await.unwrap().unwrap();
+        let field = out.schema().field(0).clone();
+        assert_eq!(field.name(), "untyped_null");
+        assert_eq!(field.data_type(), &DataType::Utf8);
+        assert_eq!(
+            field.metadata().get(metadata_keys::TYPE_NAME),
+            Some(&"NULL".to_string())
+        );
+        assert_eq!(
+            field.metadata().get(metadata_keys::TYPE_TEXT),
+            Some(&"VOID".to_string())
+        );
+        assert_eq!(out.num_rows(), 2);
+        assert!(out.column(0).is_null(0) && out.column(0).is_null(1));
     }
 
     #[tokio::test]

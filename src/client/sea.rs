@@ -37,6 +37,15 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 
+/// Header telling the server a metadata query may be executed fully
+/// synchronously, letting it answer in the initial response instead of
+/// going through the asynchronous statement machinery.
+///
+/// Sent on every synchronous metadata query, unconditionally. It is
+/// advisory — a server that does not recognise it ignores it — so there is
+/// nothing for a caller to configure.
+const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
+
 /// Internal terminal-outcome for a single SEA statement response.
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
@@ -430,16 +439,37 @@ impl SeaRestTransport {
     ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements", self.base_url());
 
+        // Select the result disposition per statement from the
+        // connection-level CloudFetch setting, mirroring the reference
+        // JDBC driver's SEA path (`DatabricksSdkClient.getRequest`:
+        // `cloudFetch ? INLINE_OR_EXTERNAL_LINKS : INLINE`). This is the
+        // authoritative mechanism for disabling cloud-fetch on SEA —
+        // there is NO `CAN_CLOUD_DOWNLOAD` session conf (the server
+        // rejects it at ExecuteStatement with `CONFIG_NOT_AVAILABLE`,
+        // issue #196).
+        //
+        // `INLINE`: the server serves every result inline (Arrow bytes in
+        // the response `attachment`), regardless of size. `format` stays
+        // `ARROW_STREAM` — the kernel's inline reader consumes Arrow IPC
+        // from the attachment (the SEA inline-Arrow path), so unlike JDBC
+        // we keep Arrow rather than switching to `JSON_ARRAY`.
+        //
+        // `INLINE_OR_EXTERNAL_LINKS` (the CloudFetch-enabled default): not
+        // a public API disposition but enables returning all chunk links
+        // in a single response (requires the JDBC user agent). Once
+        // EXTERNAL_LINKS supports multi-link responses, switch back to it.
+        let disposition = if self.config.cloudfetch_enabled {
+            "INLINE_OR_EXTERNAL_LINKS"
+        } else {
+            "INLINE"
+        };
         let request_body = ExecuteStatementRequest {
             warehouse_id: self.warehouse_id.clone(),
             statement: sql.to_string(),
             session_id: Some(session_id.to_string()),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
-            // TODO: INLINE_OR_EXTERNAL_LINKS is not a public API disposition but enables
-            // returning all chunk links in a single response (requires JDBC user agent).
-            // Once EXTERNAL_LINKS supports multi-link responses, switch back to it.
-            disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
+            disposition: disposition.to_string(),
             format: "ARROW_STREAM".to_string(),
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
@@ -451,16 +481,36 @@ impl SeaRestTransport {
 
         debug!("Executing statement at {}: {}", url, sql);
 
-        let request = self
+        let mut builder = self
             .http_client
             .inner()
             .request(Method::POST, &url)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .build()
-            .map_err(|e| {
-                Error::invalid_argument().message(format!("Failed to build request: {e}"))
-            })?;
+            .header("Content-Type", "application/json");
+
+        // Signal that a metadata query may be served fully synchronously, so
+        // the server can skip the async statement machinery and answer in the
+        // initial response.
+        //
+        // Sent unconditionally for metadata queries — there is no opt-out knob.
+        // The header is advisory: a server that does not recognise it ignores
+        // it and the query still succeeds through the normal path, so there is
+        // no configuration a caller could need to express. (JDBC exposes an
+        // EnableSeaSyncMetadata property for this; we deliberately don't, since
+        // a flag whose only settings are "faster" and "same but slower" is a
+        // support liability rather than a feature.)
+        //
+        // The synchronous-only condition comes free from `request_type`: the
+        // async path routes through `submit_statement` with
+        // `RequestType::ExecuteStatement`, so `ExecuteMetadataQuery` only ever
+        // reaches here on the synchronous path.
+        if request_type == RequestType::ExecuteMetadataQuery {
+            debug!("Adding {SEA_SYNC_METADATA_HEADER} for synchronous metadata query");
+            builder = builder.header(SEA_SYNC_METADATA_HEADER, "true");
+        }
+
+        let request = builder.json(&request_body).build().map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        })?;
 
         let response = self.http_client.execute(request, request_type).await?;
         let body = response
@@ -1023,12 +1073,13 @@ impl Transport for SeaRestTransport {
         // Inline-Arrow path: bytes must be present in `attachment`.
         // If the server returned an external_links response on what
         // we expected to be the inline path, surface a clear error
-        // (probably the session conf didn't take effect server-side).
+        // (probably the `disposition = INLINE` on the execute request
+        // didn't take effect server-side).
         let bytes = chunks_response.attachment.ok_or_else(|| {
             Error::data_loss().message(format!(
                 "Inline chunk {} response missing `attachment` field — \
-                 server may have ignored the can_cloud_download session \
-                 conf and returned a CloudFetch response. Body: {}",
+                 server may have ignored the INLINE disposition and \
+                 returned a CloudFetch response. Body: {}",
                 chunk_index, body
             ))
         })?;
@@ -1253,6 +1304,30 @@ impl Transport for SeaRestTransport {
     ) -> Result<ExecuteResult> {
         let sql = SqlCommandBuilder::build_get_functions(catalog, schema_pattern, function_pattern);
         debug!("list_functions: {}", sql);
+        self.execute_and_read(
+            session_id,
+            &sql,
+            &ExecuteParams::default(),
+            RequestType::ExecuteMetadataQuery,
+        )
+        .await
+    }
+
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+        column_pattern: Option<&str>,
+    ) -> Result<ExecuteResult> {
+        let sql = SqlCommandBuilder::build_get_procedure_columns(
+            catalog,
+            schema_pattern,
+            procedure_pattern,
+            column_pattern,
+        );
+        debug!("list_procedure_columns: {}", sql);
         self.execute_and_read(
             session_id,
             &sql,

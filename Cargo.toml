@@ -72,7 +72,7 @@ hex = "0.4"          # Hex encoding (binary param literals, token cache key)
 chrono = { version = "0.4", features = ["serde"] }
 
 # LZ4 decompression for CloudFetch
-lz4_flex = "0.13"
+lz4_flex = "0.14"
 
 # Random number generation (retry jitter)
 rand = "0.10"
@@ -100,6 +100,18 @@ oauth2 = { version = "5", default-features = false, features = ["reqwest"] }  # 
 sha2 = "0.11"        # SHA-256 for token cache key generation
 open = "5"           # Browser launch for interactive OAuth flows
 dirs = "6"           # Cross-platform config directory (~/.config/)
+
+# Token-cache encryption at rest. The cached OAuth payload holds a
+# long-lived refresh token, so it is encrypted with AES-256-CBC under a
+# PBKDF2-HMAC-SHA256 key derived from a caller-supplied passphrase. The
+# parameters mirror the JDBC driver's EncryptedFileTokenCache so both
+# drivers give the same file the same protection. All four are RustCrypto
+# crates, dual Apache-2.0/MIT (both already allow-listed in deny.toml).
+aes = { version = "0.9.2", features = ["zeroize"] }                              # AES-256 block cipher
+cbc = { version = "0.2.1", features = ["alloc", "block-padding", "zeroize"] }    # CBC mode + PKCS#7 padding
+pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }   # Passphrase-based key derivation
+hmac = "0.13.0"                                                                  # PRF backing PBKDF2
+zeroize = "1.9"                                                                  # Wipe derived key material on drop
 
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

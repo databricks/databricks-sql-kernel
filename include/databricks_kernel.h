@@ -239,15 +239,21 @@ KernelStatusCode kernel_session_config_set_auth_m2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     const char* client_secret);
 /* OAuth U2M (user-to-machine: authorization code + PKCE, browser flow).
- * All args optional: `client_id` NULL → public `databricks-cli` client;
- * `redirect_port` 0 → kernel default (8020); `scopes` (comma-separated)
- * NULL → kernel default (`all-apis`,`offline_access`; `offline_access`
+ * All args optional: `client_id` NULL → `databricks-sql-connector` client;
+ * `redirect_port` 0 → kernel default (8030); `scopes` (comma-separated)
+ * NULL → kernel default (`sql`,`offline_access`; `offline_access`
  * yields a cached, auto-refreshed refresh token). INTERACTIVE: opening the
  * session starts a localhost listener and opens the user's browser. */
 KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     uint16_t redirect_port,
                                                     const char* scopes);
+
+/* Optional SP-wide Workload Identity Federation client id used by mandatory
+ * token exchange. Unset selects BYOT / account-wide WIF. */
+KernelStatusCode
+kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* config,
+                                                        const char* client_id);
 
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
  * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
@@ -345,6 +351,69 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
  * tables server-side). Shared by all drivers (ODBC / Python / Go / Node). */
 KernelStatusCode kernel_session_config_set_ignore_transactions(KernelSessionConfig* config,
                                                                bool ignore);
+
+/* Configure the on-disk OAuth token cache for U2M (browser) auth. Mirrors
+ * the EnableTokenCache / TokenCachePassPhrase pair exposed by the reference
+ * ODBC driver and JDBC.
+ *
+ * `enabled = true` (the default) persists the refresh token under
+ * ~/.config/databricks-sql-kernel/oauth/ so the user is not sent through
+ * the browser on every connection. The file is ALWAYS encrypted
+ * (AES-256-CBC, PBKDF2-HMAC-SHA256) — there is no plaintext mode. A
+ * non-NULL `passphrase` keys it; NULL or blank falls back to a
+ * machine-local derived key, matching the reference driver, which caches
+ * with an empty TokenCachePassPhrase. Supplying a passphrase is stronger:
+ * the derived key defends against the cache file being read elsewhere (a
+ * backup, an image layer, a support bundle), not against an attacker who
+ * can already run code as this user.
+ *
+ * `enabled = false` disables DISK PERSISTENCE ONLY; tokens are still
+ * reused and refreshed in memory for the session's lifetime, so this does
+ * not re-trigger the browser flow on every refresh. Use it when the
+ * process must not write credentials to disk at all. `passphrase` is
+ * ignored in that case.
+ *
+ * Only U2M auth touches the cache; PAT and M2M ignore this setting.
+ *
+ * The on-disk format is wire-compatible with the JDBC driver's
+ * EncryptedFileTokenCache (given the same passphrase). */
+KernelStatusCode kernel_session_config_set_u2m_token_cache_config(KernelSessionConfig* config,
+                                                                  bool enabled,
+                                                                  const char* passphrase);
+
+/* Set one CLIENT-SIDE result knob by name (key = value).
+ *
+ * Counterpart to kernel_session_config_set_session_conf: that one carries
+ * SERVER session confs (ANSI_MODE, TIMEZONE, ...) to the SEA wire; this one
+ * sets CLIENT-SIDE knobs that tune how the kernel fetches, buffers, and
+ * post-processes results and are NEVER sent to the server. The two channels
+ * are deliberately separate (conflating them is what made a client flag
+ * masquerade as a rejected server conf).
+ *
+ * Key/value (rather than one typed setter per knob) so the signature never
+ * changes as new result knobs are added, and so a host that already has DSN
+ * / connection-string attributes can forward them in a loop. Unknown keys
+ * and unparseable values are REJECTED (InvalidArgument + stored error), not
+ * silently ignored.
+ *
+ * Recognised keys (case-insensitive):
+ * - "cloudfetch_enabled" = "true"|"false" — false serves every result
+ *   inline (SEA disposition = INLINE), mirroring JDBC EnableQueryResultDownload=0.
+ * - "cloudfetch_link_prefetch_window" = positive integer.
+ * - "cloudfetch_max_chunks_in_memory" = positive integer (bounds peak RSS;
+ *   values above the kernel ceiling of 256 are clamped with a warning).
+ * - "inline_max_chunks_in_memory" = positive integer (inline-Arrow prefetch
+ *   window, used when cloudfetch_enabled = false).
+ * - "complex_types_as_json" = "true"|"false" — render ARRAY / MAP / STRUCT /
+ *   VARIANT / GEOMETRY / GEOGRAPHY as JSON text (PySQL
+ *   _use_arrow_native_complex_types=False, JDBC complexDatatypeSupport=false).
+ * - "intervals_as_string" = "true"|"false" — render INTERVAL / DURATION as
+ *   canonical Databricks text (for pyarrow-Python bindings).
+ *
+ * A server session-conf key passed here (e.g. "ANSI_MODE") is rejected —
+ * use kernel_session_config_set_session_conf for those. */
+KernelStatusCode kernel_session_config_set_client_conf(KernelSessionConfig* config,
+                                                       const char* key, const char* value);
 
 /* ─── Session lifecycle ───────────────────────────────────────────────*/
 
@@ -600,13 +669,14 @@ KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
  * identifier args are exact.
  *
  * NULL string args mean "unfiltered" for the list_* calls (catalogs /
- * schemas / tables / columns). The key/constraint calls are stricter:
+ * schemas / tables / columns). The key/constraint calls differ:
  * `kernel_metadata_primary_keys` requires a non-NULL catalog, schema, AND
- * table (Databricks SHOW KEYS must target a fully-qualified table), and
- * `kernel_metadata_foreign_keys` requires the full foreign_* (referencing)
- * triple while the parent_* (referenced) triple is optional. Passing NULL
- * for a required identifier returns `KernelStatusCode_InvalidArgument`
- * with an explanatory last error (see each function's comment).
+ * table (Databricks SHOW KEYS must target a fully-qualified table), while
+ * `kernel_metadata_foreign_keys` keys off the foreign (referencing) table
+ * — a NULL foreign_table returns an empty result (0 rows, no wire call),
+ * not an error. Passing NULL for a required identifier returns
+ * `KernelStatusCode_InvalidArgument` with an explanatory last error (see
+ * each function's comment).
  */
 KernelStatusCode kernel_metadata_list_catalogs(kernel_session_t* session,
                                                kernel_result_stream_t** out);
@@ -627,15 +697,51 @@ KernelStatusCode kernel_metadata_list_columns(kernel_session_t* session, const c
 KernelStatusCode kernel_metadata_primary_keys(kernel_session_t* session, const char* catalog,
                                               const char* schema, const char* table,
                                               kernel_result_stream_t** out);
-/* The foreign_* (referencing) triple is REQUIRED (all non-NULL); the
- * parent_* (referenced) triple is optional and filters the referenced
- * side. NULL for any foreign_* arg returns
- * `KernelStatusCode_InvalidArgument`. */
+/* Keys off the foreign (referencing) table. A NULL foreign_table means
+ * "nothing to look up" and returns an empty result (0 rows, no wire
+ * call) — this is the ODBC "primary-keys only" SQLForeignKeys form. When
+ * a foreign_table IS given, foreign_catalog and foreign_schema are then
+ * required (they scope SHOW FOREIGN KEYS) and a NULL there returns
+ * `KernelStatusCode_InvalidArgument`. The parent_* (referenced) triple
+ * is optional and filters the referenced side. */
 KernelStatusCode kernel_metadata_foreign_keys(kernel_session_t* session, const char* parent_catalog,
                                               const char* parent_schema, const char* parent_table,
                                               const char* foreign_catalog,
                                               const char* foreign_schema, const char* foreign_table,
                                               kernel_result_stream_t** out);
+/* List the supported table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …).
+ * No filters and no wire call — the set is derived from the session's
+ * transport. Backs ODBC `SQLTables(table_type = SQL_ALL_TABLE_TYPES)`.
+ * The stream carries a single `TABLE_TYPE` column (JDBC getTableTypes). */
+KernelStatusCode kernel_metadata_list_table_types(kernel_session_t* session,
+                                                  kernel_result_stream_t** out);
+/* List stored procedures. `catalog` is an exact identifier (NULL →
+ * cross-catalog via system.information_schema); `schema_pattern` and
+ * `procedure_pattern` are SQL LIKE patterns (NULL → unfiltered). Backs
+ * ODBC `SQLProcedures` / JDBC `getProcedures`; the stream carries the
+ * JDBC getProcedures columns. */
+KernelStatusCode kernel_metadata_procedures(kernel_session_t* session, const char* catalog,
+                                            const char* schema_pattern,
+                                            const char* procedure_pattern,
+                                            kernel_result_stream_t** out);
+/* List functions. Same argument semantics as
+ * `kernel_metadata_procedures`. Backs JDBC `getFunctions`; the stream
+ * carries the JDBC getFunctions columns. */
+KernelStatusCode kernel_metadata_functions(kernel_session_t* session, const char* catalog,
+                                           const char* schema_pattern,
+                                           const char* function_pattern,
+                                           kernel_result_stream_t** out);
+/* List stored-procedure parameter / return columns (procedures only —
+ * function arguments are excluded). `catalog` is an exact identifier
+ * (NULL → cross-catalog); `schema_pattern` / `procedure_pattern` /
+ * `column_pattern` are SQL LIKE patterns (NULL → unfiltered). Backs ODBC
+ * `SQLProcedureColumns` / JDBC `getProcedureColumns`; the stream carries
+ * the JDBC getProcedureColumns columns. */
+KernelStatusCode kernel_metadata_procedure_columns(kernel_session_t* session, const char* catalog,
+                                                   const char* schema_pattern,
+                                                   const char* procedure_pattern,
+                                                   const char* column_pattern,
+                                                   kernel_result_stream_t** out);
 
 #ifdef __cplusplus
 }  /* extern "C" */

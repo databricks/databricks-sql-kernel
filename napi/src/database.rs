@@ -59,27 +59,6 @@ use crate::error::napi_err_from_kernel;
 use crate::runtime;
 use crate::util::guarded;
 
-/// Default U2M OAuth client id for the **Node** binding.
-///
-/// Matches the standalone Node driver's
-/// `DatabricksOAuthManager.defaultClientId` (`databricks-sql-connector`)
-/// rather than the kernel's bare-Rust fallback (`databricks-cli`), for
-/// two reasons:
-///
-/// 1. **OAuth app identity** — the napi path registers as the same
-///    OAuth app the standalone Node driver does, so admin-side consent
-///    screens / SSO policies attribute it consistently.
-/// 2. **Per-binding cache-key isolation** — the kernel's U2M token
-///    cache is keyed on `{host, client_id, scopes}`; a distinct client
-///    id keeps the napi cache from colliding with the pyo3 (Python,
-///    `databricks-sql-python`) binding's.
-///
-/// This does NOT share a token-cache *entry* with databricks-sql-nodejs
-/// — the kernel writes to its own `~/.config/databricks-sql-kernel/
-/// oauth/` directory. The alignment is of the OAuth app identity, not
-/// the on-disk cache.
-const NODE_OAUTH_CLIENT_ID: &str = "databricks-sql-connector";
-
 /// Authentication mode selector crossing the napi boundary. The string
 /// literals are what napi-rs emits from this `#[napi(string_enum)]` — the
 /// NodeJS SEA adapter (`KernelAuth`) matches them verbatim (`'Pat'`,
@@ -142,7 +121,7 @@ pub struct ProxyInput {
 /// - `Pat` — `token` required.
 /// - `OAuthM2m` — `oauthClientId` + `oauthClientSecret` required.
 /// - `OAuthU2m` — `oauthClientId` / `oauthRedirectPort` optional
-///   (defaults to the `databricks-sql-connector` client on port 8020).
+///   (defaults to the `databricks-sql-connector` client on port 8030).
 ///
 /// Catalog / schema / sessionConf are applied once at session creation
 /// and remain in effect for every statement run on the resulting
@@ -173,11 +152,14 @@ pub struct ConnectionOptions {
     /// OAuth client secret. Required for [`AuthMode::OAuthM2m`].
     pub oauth_client_secret: Option<String>,
     /// Localhost callback port for the [`AuthMode::OAuthU2m`] browser
-    /// flow. Omitted ⇒ kernel default (8020).
+    /// flow. Omitted ⇒ kernel default (8030).
     pub oauth_redirect_port: Option<u16>,
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
-    /// (`["all-apis"]` for M2M; `["all-apis", "offline_access"]` for U2M).
+    /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
+    /// SP-wide Workload Identity Federation client id used during mandatory
+    /// token exchange. Omitted selects BYOT / account-wide WIF.
+    pub identity_federation_client_id: Option<String>,
     /// Default catalog for statements executed on this session.
     /// Routed through the kernel's `DefaultOpts` and onto the SEA
     /// `CreateSession.catalog` wire field.
@@ -355,45 +337,47 @@ pub struct ConnectionOptions {
 /// session.
 fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
     match options.auth_mode.unwrap_or_default() {
-        AuthMode::Pat => AuthConfig::pat(options.token.clone()).map_err(napi_err_from_kernel),
+        AuthMode::Pat => AuthConfig::pat(
+            options.token.clone(),
+            options.identity_federation_client_id.clone(),
+        )
+        .map_err(napi_err_from_kernel),
         AuthMode::OAuthM2m => AuthConfig::oauth_m2m(
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
             None,
+            options.identity_federation_client_id.clone(),
         )
         .map_err(napi_err_from_kernel),
-        // All U2M fields are optional. Default the OAuth client_id to
-        // the Node driver's own registered client
-        // (`databricks-sql-connector`, matching the standalone
-        // databricks-sql-nodejs `DatabricksOAuthManager.defaultClientId`)
-        // rather than the kernel's bare-Rust `databricks-cli` fallback,
-        // so the napi path presents the same OAuth app identity as the
-        // standalone Node driver and keeps a cache key distinct from the
-        // pyo3 (Python) binding. Port 8020 / default scopes are still
-        // filled by the kernel when omitted.
+        // napi injects no client_id/scope default: it rides the kernel's
+        // single U2M default bundle (databricks-sql-connector / sql
+        // offline_access / port 8030), which already IS the standalone Node
+        // driver's OAuth app identity. See PECOBLR-4039.
         AuthMode::OAuthU2m => {
-            // Reject an explicit empty client_id (parity with pyo3):
-            // an empty string would bypass the default and bind an empty
-            // OAuth client, surfacing as an opaque server error. Omit
-            // the field to get the `databricks-sql-connector` default.
+            // An explicit empty client_id is still rejected — it would bind
+            // an empty OAuth client and surface an opaque server error. Omit
+            // the field to use the kernel default.
             if matches!(options.oauth_client_id.as_deref(), Some("")) {
                 return Err(napi_err_from_kernel(
                     KernelError::invalid_argument().message(
                         "oauthClientId must be non-empty when set; omit it to use the \
-                         default 'databricks-sql-connector'",
+                         kernel default 'databricks-sql-connector'",
                     ),
                 ));
             }
             Ok(AuthConfig::oauth_u2m(
-                options
-                    .oauth_client_id
-                    .clone()
-                    .or_else(|| Some(NODE_OAUTH_CLIENT_ID.to_owned())),
+                options.oauth_client_id.clone(),
                 options.oauth_redirect_port,
                 options.oauth_scopes.clone(),
                 None,
                 None,
+                // `None` takes the kernel default: on-disk cache enabled,
+                // encrypted under a machine-local derived key since this
+                // binding exposes no passphrase option. Surfacing one through
+                // `options` would strengthen it further.
+                None,
+                options.identity_federation_client_id.clone(),
             ))
         }
     }
@@ -611,6 +595,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
+            identity_federation_client_id: None,
             catalog: None,
             schema: None,
             session_conf: None,
@@ -679,6 +664,24 @@ mod tests {
     }
 
     #[test]
+    fn federation_client_id_reaches_auth_config() {
+        let mut o = base();
+        o.token = Some("dapi-xxx".to_owned());
+        o.identity_federation_client_id = Some("federation-client".to_owned());
+
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::Pat {
+                identity_federation_client_id,
+                ..
+            } => assert_eq!(
+                identity_federation_client_id.as_deref(),
+                Some("federation-client")
+            ),
+            other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn m2m_requires_client_id_and_secret() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthM2m);
@@ -687,16 +690,22 @@ mod tests {
         assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_secret");
         o.oauth_client_secret = Some("sec".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        o.identity_federation_client_id = Some("federation-client".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2M {
                 client_id,
                 client_secret,
                 scopes,
+                identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(client_id, "cid");
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
@@ -706,32 +715,40 @@ mod tests {
     fn u2m_fields_are_all_optional() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthU2m);
-        // Bare U2M: the napi binding defaults client_id to
-        // `databricks-sql-connector` (matching the standalone Node
-        // driver), NOT the kernel's bare `databricks-cli`. Port 8020 /
-        // default scopes are still filled by the kernel.
+        // Bare U2M: napi injects no override, so client_id / scopes /
+        // redirect_port are all None and the kernel fills its default bundle
+        // (databricks-sql-connector / sql offline_access / 8030). See
+        // PECOBLR-4039.
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_port,
+                scopes,
                 ..
             } => {
-                assert_eq!(client_id.as_deref(), Some("databricks-sql-connector"));
+                assert!(client_id.is_none());
                 assert!(redirect_port.is_none());
+                assert!(scopes.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
         // Explicit overrides thread through.
         o.oauth_client_id = Some("custom-cli".to_owned());
         o.oauth_redirect_port = Some(9000);
+        o.identity_federation_client_id = Some("federation-client".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_port,
+                identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("custom-cli"));
                 assert_eq!(redirect_port, Some(9000));
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }

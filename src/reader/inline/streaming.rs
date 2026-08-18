@@ -14,8 +14,9 @@
 
 //! `InlineStreamingProvider` — rolling-window prefetch for multi-chunk inline Arrow.
 //!
-//! Lights up when the session has `can_cloud_download = false`. The
-//! server returns chunks one at a time via `GET /result/chunks/{idx}`
+//! Lights up when CloudFetch is disabled (`cloudfetch_enabled = false`,
+//! i.e. the execute request was sent with SEA `disposition = INLINE`).
+//! The server returns chunks one at a time via `GET /result/chunks/{idx}`
 //! with Arrow IPC bytes in `attachment`; this provider keeps a bounded
 //! number of those chunks decoded and ready in memory ahead of the
 //! consumer so the per-chunk SEA round-trip latency is hidden behind

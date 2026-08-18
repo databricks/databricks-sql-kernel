@@ -239,8 +239,8 @@ follow-ups in a later PR.
 ### PR 2 — Session
 
 **Goal.**
-`Session::builder().http_path(host, http_path).auth(AuthConfig::Pat{token}).open().await`
-returns a working session against a Databricks workspace. First
+A session built with `AuthConfig::Pat { token, identity_federation_client_id: None }`
+works against a Databricks workspace. First
 user-visible piece of the v0 surface; gives us a real E2E test.
 
 **What changes.**

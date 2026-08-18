@@ -201,6 +201,85 @@ impl Default for DefaultOpts {
     }
 }
 
+// ─── Token cache ────────────────────────────────────────────────────────────
+
+/// Policy for the on-disk U2M OAuth token cache.
+///
+/// The cache persists the refresh token so a user is not sent through the
+/// browser flow on every connection. Because a refresh token is a
+/// long-lived credential, the kernel only ever writes one **encrypted** —
+/// there is no plaintext mode.
+///
+/// | `enabled` | `passphrase` | result |
+/// |---|---|---|
+/// | `true` (default) | set | encrypted under the caller's passphrase |
+/// | `true` (default) | unset | encrypted under a machine-local derived key |
+/// | `false` | either | no disk reads or writes |
+///
+/// **Why the middle row is not an error.** The reference ODBC driver ships
+/// `EnableTokenCache=1` with `TokenCachePassPhrase` empty and still
+/// connects, so failing the connection there would break drop-in
+/// compatibility for any DSN that never set a passphrase. (The JDBC driver
+/// *does* fail in that case — `ClientConfigurator` throws "No token cache
+/// passphrase configured" — but for the ODBC surface the reference driver
+/// is the compatibility bar, and its behaviour is also the friendlier of
+/// the two.) A supplied passphrase is still strictly better: see
+/// [`super::auth::oauth::cache_crypto::derived_passphrase`] for exactly what
+/// the fallback key protects against and what it does not.
+///
+/// Disabling the cache stops **disk persistence only**. The in-memory token
+/// store still reuses and refreshes a token for the lifetime of the
+/// session, matching JDBC's `NoOpTokenCache`, so turning this off does not
+/// re-trigger the browser flow on every refresh within one process.
+#[derive(Debug, Clone)]
+pub struct TokenCacheConfig {
+    /// Whether to read and write the on-disk cache. Default `true`,
+    /// matching both the reference ODBC driver's and JDBC's
+    /// `EnableTokenCache=1`.
+    pub enabled: bool,
+    /// Passphrase for the AES-256 encryption key. Optional: when absent (or
+    /// blank) the kernel derives a machine-local key instead, matching the
+    /// reference driver, which caches with an empty `TokenCachePassPhrase`.
+    /// Supplying one is stronger — the cache then cannot be read without a
+    /// secret the machine does not hold.
+    pub passphrase: Option<String>,
+}
+
+impl Default for TokenCacheConfig {
+    fn default() -> Self {
+        Self {
+            // Match the reference driver's / JDBC's EnableTokenCache=1.
+            enabled: true,
+            passphrase: None,
+        }
+    }
+}
+
+impl TokenCacheConfig {
+    /// Resolve to the passphrase to encrypt with, or `None` when disk
+    /// caching is disabled.
+    ///
+    /// A blank passphrase is treated as absent rather than honoured: it is
+    /// almost always an unexpanded config placeholder (`$TOKEN_PASS` that
+    /// never got substituted), and deriving a key from `""` across every
+    /// machine would be materially weaker than the machine-local fallback.
+    ///
+    /// Infallible by design. Enabled-without-passphrase is a supported
+    /// configuration, not an error, so this cannot fail the connection —
+    /// see the type docs for why.
+    pub(crate) fn resolve(&self) -> Option<std::borrow::Cow<'_, str>> {
+        if !self.enabled {
+            return None;
+        }
+        match self.passphrase.as_deref() {
+            Some(p) if !p.trim().is_empty() => Some(std::borrow::Cow::Borrowed(p)),
+            _ => Some(std::borrow::Cow::Owned(
+                crate::auth::oauth::cache_crypto::derived_passphrase(),
+            )),
+        }
+    }
+}
+
 // ─── Authentication ─────────────────────────────────────────────────────────
 
 /// Authentication strategy.
@@ -210,15 +289,20 @@ impl Default for DefaultOpts {
 ///
 /// Optional fields default to sensible values when set to `None`:
 /// - OAuth scopes default to `["all-apis"]` for M2M and
-///   `["all-apis", "offline_access"]` for U2M.
-/// - U2M `redirect_port` defaults to `8020`.
-/// - U2M `client_id` defaults to `"databricks-cli"`.
+///   `["sql", "offline_access"]` for U2M.
+/// - U2M `redirect_port` defaults to `8030`.
+/// - U2M `client_id` defaults to `"databricks-sql-connector"`.
 /// - `token_url_override` defaults to OIDC discovery against the
 ///   workspace host.
 #[non_exhaustive]
 pub enum AuthConfig {
     /// Personal access token (`dapi…`).
-    Pat { token: String },
+    Pat {
+        token: String,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
+    },
 
     /// OAuth 2.0 machine-to-machine (client credentials grant).
     /// Used for service-principal authentication.
@@ -230,6 +314,9 @@ pub enum AuthConfig {
         /// Token endpoint override. `None` → discover via OIDC at
         /// `<host>/.well-known/oauth-authorization-server`.
         token_url_override: Option<String>,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
     },
 
     /// OAuth 2.0 user-to-machine (authorization code + PKCE, browser
@@ -238,13 +325,14 @@ pub enum AuthConfig {
     /// authorize endpoint, and exchanges the returned code for a
     /// token.
     OAuthU2M {
-        /// OAuth client ID. `None` → `"databricks-cli"` (the public
-        /// CLI client registered on every workspace).
+        /// OAuth client ID. `None` → `"databricks-sql-connector"` (the
+        /// default OAuth app, shared by the Node and Go drivers).
         client_id: Option<String>,
         /// Localhost port for the OAuth callback listener. `None` →
-        /// `8020`.
+        /// `8030` (the redirect port registered for
+        /// `databricks-sql-connector`).
         redirect_port: Option<u16>,
-        /// OAuth scopes. `None` → `["all-apis", "offline_access"]`
+        /// OAuth scopes. `None` → `["sql", "offline_access"]`
         /// (the `offline_access` scope is required to receive a
         /// refresh token, which the kernel caches and refreshes
         /// transparently).
@@ -254,6 +342,12 @@ pub enum AuthConfig {
         /// How long to wait for the user to complete the browser
         /// flow before timing out. `None` → 120 seconds.
         callback_timeout: Option<std::time::Duration>,
+        /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`]
+        /// (enabled, which then requires a passphrase — see that type).
+        token_cache: Option<TokenCacheConfig>,
+        /// SP-wide Workload Identity Federation client id. `None` selects
+        /// BYOT / account-wide WIF behavior when token exchange is needed.
+        identity_federation_client_id: Option<String>,
     },
 
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
@@ -284,10 +378,17 @@ impl AuthConfig {
     /// Bindings forward the raw optional from their host language; the
     /// required-field check lives here so every wrapper rejects a
     /// missing/empty token identically (`ErrorCode::InvalidArgument`)
-    /// instead of each re-implementing it at the binding boundary.
-    pub fn pat(token: Option<String>) -> crate::Result<Self> {
+    /// instead of each re-implementing it at the binding boundary. The
+    /// optional federation client id is forwarded unchanged.
+    pub fn pat(
+        token: Option<String>,
+        identity_federation_client_id: Option<String>,
+    ) -> crate::Result<Self> {
         match token {
-            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat { token }),
+            Some(token) if !token.is_empty() => Ok(AuthConfig::Pat {
+                token,
+                identity_federation_client_id,
+            }),
             _ => Err(crate::kernel_error::Error::invalid_argument()
                 .message("PAT auth requires a non-empty access token")),
         }
@@ -296,12 +397,14 @@ impl AuthConfig {
     /// Construct a [`AuthConfig::OAuthM2M`] from optional fields,
     /// validating that the required `client_id` / `client_secret` are
     /// present and non-empty. `scopes` / `token_url_override` are
-    /// optional and forwarded as-is (the kernel fills defaults).
+    /// optional and forwarded as-is (the kernel fills defaults), as is the
+    /// federation client id.
     pub fn oauth_m2m(
         client_id: Option<String>,
         client_secret: Option<String>,
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
+        identity_federation_client_id: Option<String>,
     ) -> crate::Result<Self> {
         let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
             crate::kernel_error::Error::invalid_argument()
@@ -316,21 +419,24 @@ impl AuthConfig {
             client_secret,
             scopes,
             token_url_override,
+            identity_federation_client_id,
         })
     }
 
     /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
-    /// U2M fields are optional — the kernel fills `databricks-cli` /
-    /// port 8020 / default scopes when omitted — so this performs no
+    /// U2M fields are optional — the kernel fills `databricks-sql-connector` /
+    /// port 8030 / `sql offline_access` when omitted — so this performs no
     /// validation and exists for symmetry with [`AuthConfig::pat`] /
     /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
-    /// uniformly.
+    /// uniformly, including the federation client id.
     pub fn oauth_u2m(
         client_id: Option<String>,
         redirect_port: Option<u16>,
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
+        token_cache: Option<TokenCacheConfig>,
+        identity_federation_client_id: Option<String>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -338,6 +444,27 @@ impl AuthConfig {
             scopes,
             token_url_override,
             callback_timeout,
+            token_cache,
+            identity_federation_client_id,
+        }
+    }
+
+    /// SP-wide federation client id attached to the selected base auth flow.
+    pub(crate) fn identity_federation_client_id(&self) -> Option<&str> {
+        match self {
+            Self::Pat {
+                identity_federation_client_id,
+                ..
+            }
+            | Self::OAuthM2M {
+                identity_federation_client_id,
+                ..
+            }
+            | Self::OAuthU2M {
+                identity_federation_client_id,
+                ..
+            } => identity_federation_client_id.as_deref(),
+            Self::OAuthFederation { .. } | Self::External(_) => None,
         }
     }
 }
@@ -363,25 +490,47 @@ pub trait TokenProvider: Send + Sync {
 impl std::fmt::Debug for AuthConfig {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Pat { .. } => f.write_str("Pat { token: <redacted> }"),
+            Self::Pat {
+                identity_federation_client_id,
+                ..
+            } => f
+                .debug_struct("Pat")
+                .field("token", &"<redacted>")
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
+                .finish(),
             Self::OAuthM2M {
-                client_id, scopes, ..
+                client_id,
+                scopes,
+                identity_federation_client_id,
+                ..
             } => f
                 .debug_struct("OAuthM2M")
                 .field("client_id", client_id)
                 .field("client_secret", &"<redacted>")
                 .field("scopes", scopes)
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
                 .finish(),
             Self::OAuthU2M {
                 client_id,
                 redirect_port,
                 scopes,
+                identity_federation_client_id,
                 ..
             } => f
                 .debug_struct("OAuthU2M")
                 .field("client_id", client_id)
                 .field("redirect_port", redirect_port)
                 .field("scopes", scopes)
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
                 .finish(),
             Self::OAuthFederation {
                 subject_token_type,
@@ -736,12 +885,18 @@ pub struct ResultConfig {
     /// large result sets via presigned URLs). Default: `true`.
     ///
     /// Setting this to `false` mirrors JDBC's `EnableQueryResultDownload=0`
-    /// behaviour. At session-create time the kernel sets the
-    /// `can_cloud_download` session conf to `"false"` so SEA serves
-    /// **all** result sizes via the inline-Arrow path, regardless of
-    /// result size — see the SEA inline-Arrow design (DD1) for the wire
-    /// contract. Users who need inline-only behaviour (e.g. workspaces
-    /// without cloud-storage egress) should set this to `false`.
+    /// behaviour. It is a **connection-level** setting: read once at
+    /// [`Session::open`](crate::Session::open) and applied to every
+    /// statement by selecting the SEA `disposition` on each
+    /// `ExecuteStatement` (`false` → `INLINE`, so SEA serves **all**
+    /// result sizes via the inline-Arrow path regardless of size). This
+    /// matches how the JDBC and Thrift reference drivers control
+    /// cloud-fetch (per request), and is deliberately **not** expressed
+    /// as a session conf — SEA has no `CAN_CLOUD_DOWNLOAD` conf and
+    /// rejects one at ExecuteStatement with `CONFIG_NOT_AVAILABLE`
+    /// (issue #196). Users who need inline-only behaviour (e.g.
+    /// workspaces without cloud-storage egress) should set this to
+    /// `false`.
     ///
     /// Disabling CloudFetch routes results to the inline-Arrow
     /// path. The kernel today supports the **single-attachment**
@@ -825,16 +980,192 @@ impl Default for ResultConfig {
     }
 }
 
+/// Upper bound applied to `cloudfetch_max_chunks_in_memory`. Peak RSS grows
+/// roughly linearly with this knob (each in-memory chunk is tens of MB), so
+/// an unbounded value — a typo like `"1000000"` meant as `"100"`, or a host
+/// bug — risks OOM on large result sets. This ceiling (16× the default of 16,
+/// and 8× the most aggressive value we've measured) is comfortably above any
+/// real tuning yet bounds the blast radius of a fat-fingered value.
+pub(crate) const CLOUDFETCH_MAX_CHUNKS_CEILING: usize = 256;
+
+/// A recognised client-side result knob — the typed identity of a
+/// `set_client_conf` key.
+///
+/// The C-ABI boundary (`kernel_session_config_set_client_conf`) is
+/// stringly-typed by design (so the ABI never churns and hosts can forward
+/// DSN attributes), but the string is parsed **once** into this enum via
+/// [`ClientConfKey::parse`] and everything downstream matches on the enum.
+/// The `match` in [`ResultConfig::apply_client_conf`] is exhaustive, so
+/// adding a variant here won't compile until the new knob is handled —
+/// there's no way to silently forget a knob. Each variant maps 1:1 onto a
+/// field of [`ResultConfig`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ClientConfKey {
+    CloudfetchEnabled,
+    CloudfetchLinkPrefetchWindow,
+    CloudfetchMaxChunksInMemory,
+    InlineMaxChunksInMemory,
+    ComplexTypesAsJson,
+    IntervalsAsString,
+}
+
+impl ClientConfKey {
+    /// Every recognised key, in declaration order. Used for error messages
+    /// and to pin parity with [`ResultConfig`]'s fields in tests.
+    pub(crate) const ALL: &'static [ClientConfKey] = &[
+        Self::CloudfetchEnabled,
+        Self::CloudfetchLinkPrefetchWindow,
+        Self::CloudfetchMaxChunksInMemory,
+        Self::InlineMaxChunksInMemory,
+        Self::ComplexTypesAsJson,
+        Self::IntervalsAsString,
+    ];
+
+    /// The canonical wire spelling of this key.
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::CloudfetchEnabled => "cloudfetch_enabled",
+            Self::CloudfetchLinkPrefetchWindow => "cloudfetch_link_prefetch_window",
+            Self::CloudfetchMaxChunksInMemory => "cloudfetch_max_chunks_in_memory",
+            Self::InlineMaxChunksInMemory => "inline_max_chunks_in_memory",
+            Self::ComplexTypesAsJson => "complex_types_as_json",
+            Self::IntervalsAsString => "intervals_as_string",
+        }
+    }
+
+    /// Parse a caller-supplied key string (case-insensitive) into a known
+    /// key, or `None` if it is not a recognised client-conf key.
+    pub(crate) fn parse(key: &str) -> Option<Self> {
+        Self::ALL
+            .iter()
+            .copied()
+            .find(|k| key.eq_ignore_ascii_case(k.as_str()))
+    }
+}
+
+impl ResultConfig {
+    /// Apply one client-side result knob by name, parsing `value` into the
+    /// matching typed field.
+    ///
+    /// This is the single validated entry point behind the C ABI's
+    /// `kernel_session_config_set_client_conf` (and any host that forwards
+    /// DSN / connection-string attributes as key/value pairs). The key is
+    /// resolved via [`ClientConfKey::parse`] (case-insensitive).
+    ///
+    /// Unlike the server `session_conf` map, these knobs are **client-side**
+    /// and never reach the SEA wire — so this deliberately does NOT accept
+    /// server conf keys (`ANSI_MODE`, `TIMEZONE`, …); those go through
+    /// [`filter_session_conf`] instead. Keeping the two channels separate is
+    /// the point (see #226).
+    ///
+    /// # Errors
+    /// Returns `ErrorCode::InvalidArgument` when:
+    /// - `key` is not a recognised client-conf key, or
+    /// - `value` cannot be parsed for that key's type (booleans accept
+    ///   exactly `"true"` / `"false"` case-insensitively; the `usize`
+    ///   windows require a positive integer).
+    ///
+    /// A `cloudfetch_max_chunks_in_memory` above
+    /// [`CLOUDFETCH_MAX_CHUNKS_CEILING`] is **clamped** (with a `warn!`),
+    /// not rejected — a fat-fingered value must not fail the connection, but
+    /// it must not drive peak RSS toward OOM either.
+    pub(crate) fn apply_client_conf(&mut self, key: &str, value: &str) -> crate::Result<()> {
+        let Some(known) = ClientConfKey::parse(key) else {
+            return Err(crate::kernel_error::Error::invalid_argument().message(format!(
+                "unknown client conf key {key:?}; recognised client-side result knobs are {:?}. \
+                 (Server session confs like ANSI_MODE / TIMEZONE go through session_conf, not here.)",
+                ClientConfKey::ALL
+                    .iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>(),
+            )));
+        };
+
+        // Booleans accept exactly "true"/"false" (case-insensitive). SEA and
+        // the reference drivers use these literal forms; anything else is a
+        // caller error we surface rather than silently coerce.
+        let parse_bool = |v: &str| -> crate::Result<bool> {
+            match v.trim().to_ascii_lowercase().as_str() {
+                "true" => Ok(true),
+                "false" => Ok(false),
+                _ => Err(
+                    crate::kernel_error::Error::invalid_argument().message(format!(
+                        "client conf '{}' expects \"true\" or \"false\", got {v:?}",
+                        known.as_str(),
+                    )),
+                ),
+            }
+        };
+        let parse_positive_usize = |v: &str| -> crate::Result<usize> {
+            match v.trim().parse::<usize>() {
+                Ok(n) if n > 0 => Ok(n),
+                _ => Err(
+                    crate::kernel_error::Error::invalid_argument().message(format!(
+                        "client conf '{}' expects a positive integer, got {v:?}",
+                        known.as_str(),
+                    )),
+                ),
+            }
+        };
+
+        // Exhaustive: adding a ClientConfKey variant forces a new arm here.
+        match known {
+            ClientConfKey::CloudfetchEnabled => {
+                self.cloudfetch_enabled = parse_bool(value)?;
+            }
+            ClientConfKey::CloudfetchLinkPrefetchWindow => {
+                self.cloudfetch_link_prefetch_window = parse_positive_usize(value)?;
+            }
+            ClientConfKey::CloudfetchMaxChunksInMemory => {
+                let n = parse_positive_usize(value)?;
+                let clamped = n.min(CLOUDFETCH_MAX_CHUNKS_CEILING);
+                if clamped != n {
+                    crate::klog::warn!(
+                        requested = n,
+                        ceiling = CLOUDFETCH_MAX_CHUNKS_CEILING,
+                        "clamping cloudfetch_max_chunks_in_memory to the ceiling \
+                         (peak RSS scales with this knob)",
+                    );
+                }
+                self.cloudfetch_max_chunks_in_memory = clamped;
+            }
+            ClientConfKey::InlineMaxChunksInMemory => {
+                self.inline_max_chunks_in_memory = parse_positive_usize(value)?;
+            }
+            ClientConfKey::ComplexTypesAsJson => {
+                self.complex_types_as_json = parse_bool(value)?;
+            }
+            ClientConfKey::IntervalsAsString => {
+                self.intervals_as_string = parse_bool(value)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 // ─── Logging ────────────────────────────────────────────────────────────────
 
 #[non_exhaustive]
 #[derive(Debug, Clone, Default)]
 pub struct LoggingConfig {
-    /// Log filter, e.g. `databricks_sql_kernel=debug`. If `None`, the
-    /// kernel honors `RUST_LOG` from the environment.
+    /// A full [`tracing_subscriber::EnvFilter`] directive, applied
+    /// **verbatim** on the direct-Rust `Session::open` path.
+    ///
+    /// The kernel emits every event on the target
+    /// [`crate::KERNEL_LOG_TARGET`] = `databricks::sql::kernel`, and
+    /// `EnvFilter` matches by `::`-delimited segment prefix, so the
+    /// directive MUST name that target with `::` separators, e.g.
+    /// `databricks::sql::kernel=debug`. The underscore crate-name form
+    /// (`databricks_sql_kernel=debug`) matches **nothing** — the log file
+    /// is created but stays empty and no error is surfaced. If `None`, the
+    /// kernel honors `RUST_LOG` from the environment (falling back to
+    /// `databricks::sql::kernel=warn`).
     pub filter: Option<String>,
 
-    /// File to write logs to. If `None`, logs go to stderr.
+    /// Destination for logs. If it names an existing directory (or ends
+    /// with a path separator), a `databricks-sql-kernel.log` file is
+    /// created *inside* it; otherwise it is taken as the log file path. If
+    /// `None`, logs go to stderr.
     pub file: Option<PathBuf>,
 }
 
@@ -883,31 +1214,26 @@ pub struct SessionConfig {
     /// the *client-side* knobs; this map carries everything else.
     ///
     /// The kernel passes user-supplied entries through unchanged,
-    /// **except** for keys synthesised from typed client-side
-    /// knobs that have a wire counterpart:
+    /// after filtering them against the kernel allowlist (see
+    /// [`filter_session_conf`] / [`SESSION_CONF_ALLOWLIST`]). The
+    /// kernel does not synthesise any entries here from typed
+    /// client-side knobs.
     ///
-    /// - [`ResultConfig::cloudfetch_enabled`] `= false` synthesises
-    ///   `can_cloud_download = "false"` (case-insensitive on the
-    ///   key) so SEA serves results inline. If the user already
-    ///   supplied a non-empty `can_cloud_download` value under
-    ///   any casing, the user's value wins and no synthesis
-    ///   happens. The synthesis path also purges empty-string
-    ///   case-variants the user may have left in the map (the
-    ///   server's behaviour for empty values is undefined) so the
-    ///   wire body carries at most one `can_cloud_download`-shaped
-    ///   key.
+    /// In particular, [`ResultConfig::cloudfetch_enabled`] is **not**
+    /// expressed as a session conf: SEA has no `CAN_CLOUD_DOWNLOAD`
+    /// conf (it is accepted at CreateSession but rejected at the first
+    /// ExecuteStatement with `CONFIG_NOT_AVAILABLE`, issue #196).
+    /// CloudFetch-disable is instead applied per-statement via the SEA
+    /// `disposition` field, matching the JDBC / Thrift reference
+    /// drivers. A stray caller-supplied `can_cloud_download` is dropped
+    /// by [`filter_session_conf`] (it is not allowlisted).
     ///
-    /// Future typed-knob → session_conf synthesis follows the
-    /// same pattern (the wrapping `inject_default(...)` helper can
-    /// be lifted out once a second knob lands here).
-    ///
-    /// **Boolean-valued conf keys** (e.g. `can_cloud_download`)
-    /// should use the exact strings `"true"` / `"false"`. SEA
-    /// accepts these literally; other forms (`"True"`, `"yes"`,
-    /// `"1"`) either fail at session-create or behave as
-    /// undefined on the server. The kernel does not pre-validate
-    /// — its posture is "trust the user's session_conf" — so
-    /// non-canonical values flow to the server as-is.
+    /// **Boolean-valued conf keys** should use the exact strings
+    /// `"true"` / `"false"`. SEA accepts these literally; other forms
+    /// (`"True"`, `"yes"`, `"1"`) either fail at session-create or
+    /// behave as undefined on the server. The kernel does not
+    /// pre-validate — its posture is "trust the user's session_conf" —
+    /// so non-canonical values flow to the server as-is.
     pub session_conf: HashMap<String, String>,
 
     pub http: HttpConfig,
@@ -930,13 +1256,15 @@ pub struct SessionConfig {
 /// and uppercased before being sent.
 pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
     "ANSI_MODE",
-    // `CAN_CLOUD_DOWNLOAD` is the kernel-synthesised flag (set by
-    // `Session::open` when `ResultConfig::cloudfetch_enabled = false`)
-    // telling SEA to serve every result via the inline-Arrow path.
-    // Listed here so a user-supplied value (with any casing) survives
-    // the allowlist filter and so the kernel's own synthesis passes
-    // through normalisation without special-casing.
-    "CAN_CLOUD_DOWNLOAD",
+    // NOTE: `CAN_CLOUD_DOWNLOAD` is deliberately NOT allowlisted. SEA has
+    // no such session conf — it is accepted at CreateSession but rejected
+    // at the first ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue
+    // #196). CloudFetch-disable is expressed per-statement via the SEA
+    // `disposition` (see `SeaRestTransport::call_execute_api` and
+    // `TransportConfig::cloudfetch_enabled`), matching both the JDBC and
+    // Thrift reference drivers. A stray caller-supplied `can_cloud_download`
+    // is therefore dropped by `filter_session_conf` (with a warn) rather
+    // than forwarded to the wire where it would break the session.
     "COLLATION",
     "ENABLE_PHOTON",
     "LEGACY_TIME_PARSER_POLICY",
@@ -1013,6 +1341,109 @@ pub(crate) fn filter_session_conf(
 mod tests {
     use super::*;
 
+    // ─── token cache policy ────────────────────────────────────────
+
+    #[test]
+    fn token_cache_defaults_to_enabled() {
+        // Both the reference ODBC driver and JDBC default EnableTokenCache
+        // to 1, with no passphrase.
+        assert!(TokenCacheConfig::default().enabled);
+        assert!(TokenCacheConfig::default().passphrase.is_none());
+    }
+
+    #[test]
+    fn token_cache_enabled_with_passphrase_resolves_to_it() {
+        let cfg = TokenCacheConfig {
+            enabled: true,
+            passphrase: Some("s3cr3t".to_string()),
+        };
+        assert_eq!(cfg.resolve().as_deref(), Some("s3cr3t"));
+    }
+
+    #[test]
+    fn token_cache_enabled_without_passphrase_falls_back_to_derived_key() {
+        // The reference ODBC driver ships EnableTokenCache=1 with an empty
+        // TokenCachePassPhrase and still caches, so this combination must
+        // NOT fail the connection — a DSN that never set a passphrase has to
+        // keep working. It must also not disable caching silently, which
+        // would reintroduce a browser prompt on every connection.
+        let cfg = TokenCacheConfig::default();
+        let passphrase = cfg
+            .resolve()
+            .expect("enabled + no passphrase must still cache");
+        assert!(
+            !passphrase.trim().is_empty(),
+            "fallback passphrase must be non-empty, else the cache would be \
+             encrypted under nothing"
+        );
+    }
+
+    #[test]
+    fn token_cache_blank_passphrase_uses_the_derived_key_not_the_blank() {
+        // An all-whitespace passphrase is almost always an unexpanded config
+        // placeholder. Honouring it literally would key every machine's cache
+        // identically, which is strictly weaker than the machine-local
+        // fallback, so blank must be treated as absent.
+        let derived = TokenCacheConfig::default()
+            .resolve()
+            .expect("default resolves")
+            .into_owned();
+        for blank in ["", "   ", "\t\n"] {
+            let cfg = TokenCacheConfig {
+                enabled: true,
+                passphrase: Some(blank.to_string()),
+            };
+            let resolved = cfg.resolve().expect("blank still caches");
+            assert_ne!(
+                resolved.as_ref(),
+                blank,
+                "blank passphrase {blank:?} must not be used verbatim"
+            );
+            assert_eq!(
+                resolved.as_ref(),
+                derived,
+                "blank passphrase {blank:?} should fall back to the derived key"
+            );
+        }
+    }
+
+    #[test]
+    fn token_cache_derived_key_is_stable_across_calls() {
+        // If the fallback were not deterministic, every process would write a
+        // cache the next one cannot read — a silent browser prompt on every
+        // connection, which is the failure this whole feature avoids.
+        assert_eq!(
+            TokenCacheConfig::default()
+                .resolve()
+                .map(|p| p.into_owned()),
+            TokenCacheConfig::default()
+                .resolve()
+                .map(|p| p.into_owned())
+        );
+    }
+
+    #[test]
+    fn token_cache_disabled_resolves_to_none_without_passphrase() {
+        // Disabling must always be valid — it is the escape hatch for
+        // processes that must not write credentials to disk at all.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: None,
+        };
+        assert_eq!(cfg.resolve(), None);
+    }
+
+    #[test]
+    fn token_cache_disabled_ignores_a_supplied_passphrase() {
+        // `enabled: false` wins: a leftover passphrase must not silently
+        // re-enable disk persistence.
+        let cfg = TokenCacheConfig {
+            enabled: false,
+            passphrase: Some("ignored".to_string()),
+        };
+        assert_eq!(cfg.resolve(), None);
+    }
+
     // ─── session_conf allowlist ────────────────────────────────────
 
     #[test]
@@ -1038,6 +1469,30 @@ mod tests {
         let out = filter_session_conf(raw);
         assert_eq!(out.len(), 1);
         assert_eq!(out.get("TIMEZONE").map(String::as_str), Some("UTC"));
+    }
+
+    #[test]
+    fn session_conf_filter_drops_can_cloud_download() {
+        // Regression tripwire for issue #196: `can_cloud_download` is NOT a
+        // valid SEA session conf (the server rejects it at ExecuteStatement
+        // with CONFIG_NOT_AVAILABLE). It must be dropped by the allowlist
+        // filter — never forwarded to the wire — regardless of casing.
+        // CloudFetch-disable is applied per-statement via the SEA
+        // disposition instead. If someone re-adds it to the allowlist, this
+        // test flips RED.
+        for spelling in [
+            "can_cloud_download",
+            "CAN_CLOUD_DOWNLOAD",
+            "Can_Cloud_Download",
+        ] {
+            let mut raw = std::collections::HashMap::new();
+            raw.insert(spelling.to_string(), "false".to_string());
+            let out = filter_session_conf(raw);
+            assert!(
+                out.is_empty(),
+                "can_cloud_download ({spelling:?}) must be dropped, got {out:?}"
+            );
+        }
     }
 
     #[test]
@@ -1107,42 +1562,70 @@ mod tests {
 
     #[test]
     fn pat_rejects_missing_or_empty_token() {
-        let err = AuthConfig::pat(None).unwrap_err();
+        let err = AuthConfig::pat(None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("non-empty access token"));
 
-        let err = AuthConfig::pat(Some(String::new())).unwrap_err();
+        let err = AuthConfig::pat(Some(String::new()), None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
     }
 
     #[test]
     fn pat_accepts_non_empty_token() {
-        match AuthConfig::pat(Some("dapi-x".to_string())).unwrap() {
-            AuthConfig::Pat { token } => assert_eq!(token, "dapi-x"),
+        match AuthConfig::pat(
+            Some("dapi-x".to_string()),
+            Some("federation-client".to_string()),
+        )
+        .unwrap()
+        {
+            AuthConfig::Pat {
+                token,
+                identity_federation_client_id,
+            } => {
+                assert_eq!(token, "dapi-x");
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
+            }
             other => panic!("expected Pat, got {other:?}"),
         }
     }
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_id() {
-        let err = AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None).unwrap_err();
+        let err =
+            AuthConfig::oauth_m2m(None, Some("sec".to_string()), None, None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
 
-        let err = AuthConfig::oauth_m2m(Some(String::new()), Some("sec".to_string()), None, None)
-            .unwrap_err();
+        let err = AuthConfig::oauth_m2m(
+            Some(String::new()),
+            Some("sec".to_string()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_id"));
     }
 
     #[test]
     fn oauth_m2m_rejects_missing_or_empty_client_secret() {
-        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None).unwrap_err();
+        let err =
+            AuthConfig::oauth_m2m(Some("cid".to_string()), None, None, None, None).unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
 
-        let err = AuthConfig::oauth_m2m(Some("cid".to_string()), Some(String::new()), None, None)
-            .unwrap_err();
+        let err = AuthConfig::oauth_m2m(
+            Some("cid".to_string()),
+            Some(String::new()),
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
         assert_eq!(err.code, crate::kernel_error::ErrorCode::InvalidArgument);
         assert!(err.message.contains("client_secret"));
     }
@@ -1154,6 +1637,7 @@ mod tests {
             Some("sec".to_string()),
             Some(vec!["all-apis".to_string()]),
             None,
+            Some("federation-client".to_string()),
         )
         .unwrap()
         {
@@ -1162,14 +1646,81 @@ mod tests {
                 client_secret,
                 scopes,
                 token_url_override,
+                identity_federation_client_id,
             } => {
                 assert_eq!(client_id, "cid");
                 assert_eq!(client_secret, "sec");
                 assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
                 assert!(token_url_override.is_none());
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("federation-client")
+                );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn oauth_u2m_carries_identity_federation_client_id() {
+        let auth = AuthConfig::oauth_u2m(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some("federation-client".to_string()),
+        );
+
+        assert_eq!(
+            auth.identity_federation_client_id(),
+            Some("federation-client")
+        );
+    }
+
+    #[test]
+    fn auth_variants_carry_identity_federation_client_id() {
+        let auths = [
+            AuthConfig::Pat {
+                token: "token".to_string(),
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+            AuthConfig::OAuthM2M {
+                client_id: "cid".to_string(),
+                client_secret: "secret".to_string(),
+                scopes: None,
+                token_url_override: None,
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+            AuthConfig::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: None,
+                token_url_override: None,
+                callback_timeout: None,
+                token_cache: None,
+                identity_federation_client_id: Some("federation-client".to_string()),
+            },
+        ];
+
+        for auth in auths {
+            assert_eq!(
+                auth.identity_federation_client_id(),
+                Some("federation-client")
+            );
+        }
+    }
+
+    #[test]
+    fn oauth_federation_has_no_mandatory_federation_client_id() {
+        let auth = AuthConfig::OAuthFederation {
+            subject_token: "subject-token".to_string(),
+            subject_token_type: "urn:ietf:params:oauth:token-type:jwt".to_string(),
+            audience: "audience".to_string(),
+        };
+
+        assert_eq!(auth.identity_federation_client_id(), None);
     }
 
     // ─── ConnectionConfig parsing ──────────────────────────────────
@@ -1286,6 +1837,7 @@ mod tests {
     fn debug_pat_redacts_token() {
         let c = AuthConfig::Pat {
             token: "dapi_secret".to_string(),
+            identity_federation_client_id: None,
         };
         let s = format!("{c:?}");
         assert!(!s.contains("dapi_secret"), "token leaked: {s}");
@@ -1299,6 +1851,7 @@ mod tests {
             client_secret: "supersecret".to_string(),
             scopes: None,
             token_url_override: None,
+            identity_federation_client_id: None,
         };
         let s = format!("{c:?}");
         assert!(!s.contains("supersecret"), "secret leaked: {s}");

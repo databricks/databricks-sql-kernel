@@ -46,6 +46,26 @@ pub(crate) struct TransportConfig {
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,
+    /// Whether CloudFetch (cloud-storage-backed result download via
+    /// external links) is enabled for this session.
+    ///
+    /// This is a **connection-level** setting — like the reference JDBC
+    /// driver's `EnableQueryResultDownload`, it is read once at session
+    /// open and applied to every `ExecuteStatement`, not toggled per
+    /// statement. It selects the SEA `disposition` sent on each execute:
+    /// `true` → `INLINE_OR_EXTERNAL_LINKS` (results may come back as
+    /// external CloudFetch links), `false` → `INLINE` (the server serves
+    /// every result inline, regardless of size).
+    ///
+    /// **Why this is `disposition`, not a session conf.** SEA has no
+    /// `CAN_CLOUD_DOWNLOAD` session conf — sending one is accepted at
+    /// `CreateSession` but rejected at the first `ExecuteStatement` with
+    /// `CONFIG_NOT_AVAILABLE` (see issue #196). Both the JDBC and Thrift
+    /// reference drivers control cloud-fetch per request (SEA
+    /// `disposition` / Thrift `canDownloadResult`), never via session
+    /// conf; this mirrors JDBC's SEA path
+    /// (`DatabricksSdkClient.getRequest`).
+    pub cloudfetch_enabled: bool,
 }
 
 impl Default for TransportConfig {
@@ -53,6 +73,8 @@ impl Default for TransportConfig {
         Self {
             poll_timeout: Duration::from_secs(600),
             poll_interval: Duration::from_millis(500),
+            // Mirror `ResultConfig::default().cloudfetch_enabled`.
+            cloudfetch_enabled: true,
         }
     }
 }
@@ -342,10 +364,10 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// `row_offset`).
     ///
     /// Used by the inline-Arrow streaming path that lights up when
-    /// `ResultConfig.cloudfetch_enabled == false` (i.e. SEA's
-    /// `can_cloud_download=false` session conf). The server-side
-    /// response for this path carries Arrow IPC bytes inline in
-    /// `attachment` rather than emitting `external_links`.
+    /// `ResultConfig.cloudfetch_enabled == false` (i.e. the execute
+    /// request was sent with SEA `disposition = INLINE`). The
+    /// server-side response for this path carries Arrow IPC bytes inline
+    /// in `attachment` rather than emitting `external_links`.
     ///
     /// Per the bounded SEA API contract for OSS drivers:
     /// - `chunk_index` is derived from the *previous* chunk's
@@ -379,7 +401,9 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     async fn list_catalogs(&self, session_id: &str) -> Result<ExecuteResult>;
 
     /// List schemas, optionally filtered by catalog and pattern.
-    /// When catalog is None or wildcard, uses "SHOW SCHEMAS IN ALL CATALOGS".
+    /// `catalog = None` emits "SHOW SCHEMAS IN ALL CATALOGS"; a `Some`
+    /// catalog is scoped verbatim (a literal `%` / `*` / `""` matches no
+    /// real catalog → 0 rows, not "all catalogs").
     async fn list_schemas(
         &self,
         session_id: &str,
@@ -388,7 +412,11 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     ) -> Result<ExecuteResult>;
 
     /// List tables, optionally filtered.
-    /// When catalog is None or wildcard, uses "SHOW TABLES IN ALL CATALOGS".
+    /// `catalog = None` emits "SHOW TABLES IN ALL CATALOGS"; a `Some`
+    /// catalog is scoped verbatim (a literal `%` / `*` / `""` matches no
+    /// real catalog → 0 rows, not "all catalogs"). The higher-level
+    /// `Metadata::list_tables` resolves real catalog wildcards before
+    /// this point.
     async fn list_tables(
         &self,
         session_id: &str,
@@ -435,6 +463,24 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
         function_pattern: Option<&str>,
+    ) -> Result<ExecuteResult>;
+
+    /// List procedure parameter / return columns, optionally filtered by
+    /// catalog, schema pattern, procedure name pattern, and column name
+    /// pattern.
+    ///
+    /// Uses `information_schema.parameters` JOINed to
+    /// `information_schema.routines` filtered by `routine_type = 'PROCEDURE'`
+    /// (function arguments excluded, matching JDBC `getProcedureColumns`).
+    /// When catalog is None, queries `system.information_schema`
+    /// (cross-catalog). When catalog is empty string, returns empty result.
+    async fn list_procedure_columns(
+        &self,
+        session_id: &str,
+        catalog: Option<&str>,
+        schema_pattern: Option<&str>,
+        procedure_pattern: Option<&str>,
+        column_pattern: Option<&str>,
     ) -> Result<ExecuteResult>;
 
     /// List primary-key columns for the given table. Catalog, schema,

@@ -202,7 +202,14 @@ fn parse_type(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option
         "ARRAY" => parse_array(trimmed, type_interval_type, depth)?,
         "MAP" => parse_map(trimmed, type_interval_type, depth)?,
         "STRUCT" => parse_struct(trimmed, type_interval_type, depth)?,
-        "VOID" | "NULL" => DataType::Null,
+        // Untyped NULL (`SELECT NULL` / VOID) maps to `Utf8`, not
+        // `DataType::Null`: the server reports it as STRING (and the
+        // Thrift / JDBC reference exposes it as STRING), so an
+        // empty-result VOID column reports the same type as a
+        // `CAST(NULL AS STRING)` sibling — consistent with the live-data
+        // path, which coerces the Arrow `Null` column to `Utf8` in the
+        // result post-processor. See issue #203 (DATATYPE-041).
+        "VOID" | "NULL" => DataType::Utf8,
         _ => DataType::Utf8,
     })
 }
@@ -449,6 +456,14 @@ pub fn databricks_type_to_xdbc(type_name: &str) -> i16 {
         // splitter doesn't cut on whitespace) and fall through to
         // `JDBC_OTHER`, matching Thrift's behaviour for those.
         "INTERVAL" => JDBC_VARCHAR,
+        // ── Untyped NULL / VOID ──────────────────────────────────
+        // The server reports untyped NULL (`SELECT NULL`) as STRING and
+        // the JDBC reference maps a NULL-named column to `Types.VARCHAR`
+        // (DatabricksTypeUtil: `case NULL: return Types.VARCHAR`), so
+        // report VARCHAR rather than the `JDBC_OTHER` sentinel — keeping
+        // this surface consistent with the Arrow type (`Utf8`). See
+        // issue #203 (DATATYPE-041).
+        "VOID" | "NULL" => JDBC_VARCHAR,
         // ── Unknown ──────────────────────────────────────────────
         // `JDBC_OTHER` (1111) is the JDBC sentinel "I don't know what
         // this is". Earlier kernel versions returned `VARCHAR` here
@@ -726,8 +741,11 @@ mod tests {
 
     #[test]
     fn test_databricks_type_to_arrow_special() {
-        assert_eq!(databricks_type_to_arrow("VOID"), DataType::Null);
-        assert_eq!(databricks_type_to_arrow("NULL"), DataType::Null);
+        // Untyped NULL / VOID surfaces as the server-reported STRING
+        // (`Utf8`), matching a `CAST(NULL AS STRING)` sibling and the
+        // Thrift / JDBC reference — see issue #203 (DATATYPE-041).
+        assert_eq!(databricks_type_to_arrow("VOID"), DataType::Utf8);
+        assert_eq!(databricks_type_to_arrow("NULL"), DataType::Utf8);
         assert_eq!(
             databricks_type_to_arrow("INTERVAL"),
             DataType::Interval(IntervalUnit::DayTime)
@@ -838,6 +856,15 @@ mod tests {
             databricks_type_to_xdbc("INTERVAL HOUR TO MINUTE"),
             JDBC_OTHER
         );
+    }
+
+    #[test]
+    fn test_databricks_type_to_xdbc_void_null_is_varchar() {
+        // Untyped NULL / VOID reports VARCHAR (12), matching the server's
+        // STRING type and the JDBC reference (`case NULL: Types.VARCHAR`)
+        // — not the `JDBC_OTHER` sentinel. Issue #203 (DATATYPE-041).
+        assert_eq!(databricks_type_to_xdbc("VOID"), JDBC_VARCHAR);
+        assert_eq!(databricks_type_to_xdbc("NULL"), JDBC_VARCHAR);
     }
 
     #[test]

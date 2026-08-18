@@ -28,6 +28,19 @@ changes go in their respective binding's NEXT_CHANGELOG.
   value is ignored (default preserved) with a warning rather than failing session
   creation. The key is client-only — it is consumed before session creation and never
   reaches the SEA wire. Benefits ODBC too.
+- Auth: mandatory OIDC token exchange (BYOT federation) — when an authenticated
+  token was issued by a party other than the target workspace (Azure AD, an external
+  IdP, a Bring-Your-Own-Token, or a Workload Identity Federation token), the kernel
+  now exchanges it for an in-house Databricks token at `<host>/oidc/v1/token` before
+  using it, transparently across PAT / M2M / U2M. Gated by the token's `iss` claim
+  (non-JWT and same-host tokens pass through with no HTTP call) and falls back to the
+  original token if the exchange fails, so existing flows are unaffected. New optional
+  `identity_federation_client_id` fields on the PAT, M2M, and U2M `AuthConfig`
+  variants select SP-wide WIF; unset means BYOT / account-wide WIF. Follows the
+  ADBC wire contract (`grant_type=jwt-bearer`, `assertion`, `scope=sql`).
+- Auth constructors now accept the optional federation client id directly;
+  the C ABI exposes it through
+  `kernel_session_config_set_identity_federation_client_id()`.
 
 ### Updated
 

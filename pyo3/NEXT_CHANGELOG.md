@@ -13,6 +13,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(..., identity_federation_client_id=...)` selects SP-wide Workload
+  Identity Federation during mandatory token exchange.
+
 ### Updated
 
 ### Fixed
