@@ -12,101 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Telemetry and metrics collection for the Databricks ADBC driver.
+//! Telemetry model and serialization support.
+//!
+//! These types mirror the SQL driver telemetry envelope used by the ADBC and
+//! JDBC drivers. Phase 1 intentionally stops at model/serialization boundaries;
+//! later phases add lifecycle observers and production export.
 
-use std::time::{Duration, Instant};
+#![allow(dead_code)]
 
-/// Configuration for telemetry collection.
-///
-/// Telemetry is disabled by default and requires explicit opt-in.
-/// When enabled, the driver collects anonymous usage metrics such as
-/// query execution times and error counts. No query content or
-/// personally identifiable information is collected.
-#[derive(Debug, Clone, Default)]
-pub struct TelemetryConfig {
-    /// Whether telemetry collection is enabled (default: false).
-    pub enabled: bool,
-}
-
-/// Collects and reports driver telemetry data.
-#[derive(Debug)]
-pub struct TelemetryCollector {
-    config: TelemetryConfig,
-}
-
-impl TelemetryCollector {
-    /// Creates a new telemetry collector with the given configuration.
-    pub fn new(config: TelemetryConfig) -> Self {
-        Self { config }
-    }
-
-    /// Returns whether telemetry is enabled.
-    pub fn is_enabled(&self) -> bool {
-        self.config.enabled
-    }
-
-    /// Records a query execution metric.
-    pub fn record_query_execution(&self, _duration: Duration, _rows_fetched: u64) {
-        if self.config.enabled {
-            // TODO: Implement telemetry reporting
-        }
-    }
-
-    /// Records an error occurrence.
-    pub fn record_error(&self, _error_type: &str) {
-        if self.config.enabled {
-            // TODO: Implement telemetry reporting
-        }
-    }
-}
-
-impl Default for TelemetryCollector {
-    fn default() -> Self {
-        Self::new(TelemetryConfig::default())
-    }
-}
-
-/// A timer for measuring operation durations.
-#[derive(Debug)]
-pub struct Timer {
-    start: Instant,
-}
-
-impl Timer {
-    /// Starts a new timer.
-    pub fn start() -> Self {
-        Self {
-            start: Instant::now(),
-        }
-    }
-
-    /// Returns the elapsed duration since the timer was started.
-    pub fn elapsed(&self) -> Duration {
-        self.start.elapsed()
-    }
-}
+mod exporter;
+mod models;
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::thread::sleep;
-
-    #[test]
-    fn test_telemetry_config_default_disabled() {
-        let config = TelemetryConfig::default();
-        assert!(!config.enabled);
-    }
-
-    #[test]
-    fn test_telemetry_collector_disabled() {
-        let collector = TelemetryCollector::new(TelemetryConfig { enabled: false });
-        assert!(!collector.is_enabled());
-    }
-
-    #[test]
-    fn test_timer() {
-        let timer = Timer::start();
-        sleep(Duration::from_millis(10));
-        assert!(timer.elapsed() >= Duration::from_millis(10));
-    }
-}
+pub(crate) mod test_support;
