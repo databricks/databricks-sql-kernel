@@ -20,8 +20,8 @@
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
 //!   `client_id` + `client_secret`, optional `scopes` / `token_url`.
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
-//!   optional `client_id` / `redirect_port` / `redirect_ports` / `scopes` /
-//!   `token_url` / `oauth_callback_timeout_secs`.
+//!   optional `client_id` / `redirect_ports` / `scopes` / `token_url` /
+//!   `oauth_callback_timeout_secs`.
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
 //! itself (OIDC discovery against the workspace host, transparent
@@ -50,12 +50,12 @@ pub(crate) struct OAuthParams {
     pub client_secret: Option<String>,
     pub scopes: Option<Vec<String>>,
     pub token_url: Option<String>,
-    pub redirect_port: Option<u16>,
-    /// Candidate U2M redirect ports, tried in order (first free binds).
-    /// Mutually exclusive with `redirect_port` — setting both is rejected
-    /// in [`build_auth_config`]. When set (non-empty) it gives the busy-port
-    /// fallback the Thrift connector has across its registered range
-    /// (`databricks-sql-python` → 8020‑8024).
+    /// Candidate U2M redirect ports, tried in order (first free binds). A
+    /// single fixed port is just a one-element list (`vec![port]`); a
+    /// multi-port list gives the busy-port fallback the Thrift connector has
+    /// across its registered range (`databricks-sql-python` → 8020‑8024).
+    /// `None`/empty → the databricks-sql-python default (8020) when the
+    /// default client is in use, else the kernel default.
     pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
@@ -173,27 +173,21 @@ fn build_auth_config_inner(
         "oauth-u2m" => {
             // Browser flow: every field is optional and `None` lets the
             // kernel apply its defaults (client_id "databricks-sql-connector",
-            // redirect_port 8030, scopes ["sql", "offline_access"],
+            // redirect port 8030, scopes ["sql", "offline_access"],
             // callback timeout 120s). But a *present-yet-degenerate*
             // value is a footgun the kernel can't distinguish from an
             // intentional setting, so reject those here:
             //   - client_id="" would bypass the default and bind an
             //     empty client id;
-            //   - redirect_port=0 binds an OS-assigned ephemeral port,
-            //     which can't match the IdP's static redirect_uri;
+            //   - an empty redirect_ports list, or a 0 entry (which binds an
+            //     OS-assigned ephemeral port that can't match the IdP's
+            //     static redirect_uri);
             //   - callback_timeout_secs=0 means "time out immediately",
             //     not "wait forever" (a common cross-system confusion).
             if matches!(oauth.client_id.as_deref(), Some("")) {
                 return Err(
                     "auth_type='oauth-u2m' client_id must be non-empty when set; \
                      omit it to use the default 'databricks-sql-python'"
-                        .to_owned(),
-                );
-            }
-            if oauth.redirect_port == Some(0) {
-                return Err(
-                    "auth_type='oauth-u2m' redirect_port must be non-zero when set \
-                     (a static port the IdP redirect_uri can match); omit it for the default"
                         .to_owned(),
                 );
             }
@@ -204,16 +198,15 @@ fn build_auth_config_inner(
                         .to_owned(),
                 );
             }
-            // `redirect_ports` (the busy-port-fallback range) is caller-supplied
-            // and takes precedence over `redirect_port` downstream. Reject the
-            // degenerate shapes for the same reason as `redirect_port=0`: an
-            // empty list carries no port, and a 0 entry binds an ephemeral port
-            // that can't match the IdP's static redirect_uri.
+            // `redirect_ports` is the ordered list of candidate callback ports
+            // (a single fixed port is just `[port]`). Reject the degenerate
+            // shapes: an empty list carries no port, and a 0 entry binds an
+            // ephemeral port that can't match the IdP's static redirect_uri.
             if let Some(ports) = oauth.redirect_ports.as_deref() {
                 if ports.is_empty() {
                     return Err(
                         "auth_type='oauth-u2m' redirect_ports must be non-empty when set; \
-                         omit it to use redirect_port or the default"
+                         omit it for the default"
                             .to_owned(),
                     );
                 }
@@ -221,18 +214,6 @@ fn build_auth_config_inner(
                     return Err(
                         "auth_type='oauth-u2m' redirect_ports entries must be non-zero \
                          (each must be a static port the IdP redirect_uri can match)"
-                            .to_owned(),
-                    );
-                }
-                // Both knobs set is ambiguous: downstream `redirect_ports` wins
-                // and `redirect_port` is silently dropped. Reject it up front
-                // (mirroring the degenerate-shape rejections above) so the
-                // caller doesn't set 9000 and get a range that never honors it.
-                if oauth.redirect_port.is_some() {
-                    return Err(
-                        "auth_type='oauth-u2m' set either redirect_port or redirect_ports, \
-                         not both (redirect_ports would take precedence and redirect_port \
-                         would be ignored)"
                             .to_owned(),
                     );
                 }
@@ -273,22 +254,17 @@ fn build_auth_config_inner(
             };
             // Pin the databricks-sql-python app's own redirect port when
             // relying on the default client_id — the kernel default (8030) is
-            // for the databricks-sql-connector app and would mismatch.
-            let redirect_port = match oauth.redirect_port {
-                Some(p) => Some(p),
-                None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
+            // for the databricks-sql-connector app and would mismatch. An
+            // explicit caller list (e.g. the connector's registered range for
+            // busy-port fallback) is used as-is; otherwise, under the default
+            // client, forward the pinned databricks-sql-python port as a
+            // one-element list. A custom client_id with no ports defers to the
+            // kernel (None) — that app owns its own redirect port.
+            let redirect_ports = match oauth.redirect_ports {
+                Some(ports) => Some(ports),
+                None if !caller_set_client_id => Some(vec![PYSQL_OAUTH_REDIRECT_PORT]),
                 None => None,
             };
-            // Collapse the two (mutually exclusive) Python knobs into the
-            // kernel's single `redirect_ports` list. At most one is set here
-            // (both-set is rejected above): an explicit `redirect_ports` (the
-            // connector's registered range, for busy-port fallback) passes
-            // through; otherwise the single `redirect_port` (caller-supplied or
-            // the pinned databricks-sql-python default) becomes a one-element
-            // list.
-            let redirect_ports = oauth
-                .redirect_ports
-                .or_else(|| redirect_port.map(|p| vec![p]));
             Ok(AuthConfig::oauth_u2m(
                 client_id,
                 redirect_ports,
@@ -531,21 +507,6 @@ mod tests {
     }
 
     #[test]
-    fn u2m_both_redirect_port_and_ports_rejected() {
-        let err = build_auth_config_inner(
-            "oauth-u2m",
-            None,
-            OAuthParams {
-                redirect_port: Some(9000),
-                redirect_ports: Some(vec![8020, 8021]),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("not both"), "got: {err}");
-    }
-
-    #[test]
     fn u2m_explicit_client_id_overrides_default() {
         let cfg = build_auth_config_inner(
             "oauth-u2m",
@@ -605,7 +566,7 @@ mod tests {
             "oauth-u2m",
             None,
             OAuthParams {
-                redirect_port: Some(9999),
+                redirect_ports: Some(vec![9999]),
                 callback_timeout_secs: Some(300),
                 identity_federation_client_id: Some("federation-client".into()),
                 ..Default::default()
@@ -645,20 +606,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("client_id must be non-empty"), "{err}");
-    }
-
-    #[test]
-    fn u2m_rejects_zero_redirect_port() {
-        let err = build_auth_config_inner(
-            "oauth-u2m",
-            None,
-            OAuthParams {
-                redirect_port: Some(0),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("redirect_port must be non-zero"), "{err}");
     }
 
     #[test]

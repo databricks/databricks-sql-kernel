@@ -74,8 +74,8 @@ enum CallbackResult {
 /// use std::time::Duration;
 ///
 /// # async fn example() -> databricks_sql_kernel::Result<()> {
-/// // Start callback server on port 8030
-/// let server = CallbackServer::new(8030).await?;
+/// // Start callback server, binding the first free candidate port.
+/// let server = CallbackServer::new_in_range(&[8030]).await?;
 /// let redirect_uri = server.redirect_uri();
 /// println!("Redirect URI: {}", redirect_uri);
 ///
@@ -106,36 +106,6 @@ impl Drop for CallbackServer {
 }
 
 impl CallbackServer {
-    /// Creates a new callback server listening on the specified port.
-    ///
-    /// The server binds to `127.0.0.1:{port}` and is ready to receive one callback.
-    ///
-    /// # Arguments
-    ///
-    /// * `port` - Port number to listen on (typically 8030)
-    ///
-    /// # Returns
-    ///
-    /// A configured server ready to wait for callbacks, or an error if:
-    /// - The port is already in use
-    /// - Permission denied to bind to the port
-    /// - Invalid port number
-    ///
-    /// # Errors
-    ///
-    /// Returns `io()` error if the server cannot bind to the specified port.
-    pub async fn new(port: u16) -> Result<Self> {
-        let listener = Self::bind(port).await.map_err(|e| {
-            Error::io()
-                .message(format!(
-                    "Failed to bind callback server to 127.0.0.1:{}: {}",
-                    port, e
-                ))
-                .context("OAuth callback server")
-        })?;
-        Self::from_listener(listener)
-    }
-
     /// Creates a callback server on the first bindable port in `ports`.
     ///
     /// Tries each candidate port in order and keeps the first one that binds,
@@ -490,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn test_callback_captures_code() {
         // Start callback server
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -533,7 +503,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_validates_state() {
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -578,7 +548,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_timeout() {
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
 
@@ -598,7 +568,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_missing_code() {
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -629,7 +599,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_auth_error() {
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -692,7 +662,7 @@ mod tests {
     #[tokio::test]
     async fn test_redirect_uri_format() {
         // Use port 0 to let the OS assign an available port, avoiding conflicts
-        let server = CallbackServer::new(0)
+        let server = CallbackServer::new_in_range(&[0])
             .await
             .expect("Failed to create server");
         let uri = server.redirect_uri();
