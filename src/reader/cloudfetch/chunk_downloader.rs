@@ -259,19 +259,41 @@ mod tests {
     /// configured per-chunk `download_timeout`, not hang. Regression for the
     /// reyden nightly where a fault-injected CloudFetch stall wedged
     /// `response.bytes()` for ~52 min until the CI job cap killed it.
+    ///
+    /// The wedge the fix targets is specifically the *body read*: reqwest's
+    /// client-level timeout covers `execute()` (headers), while the
+    /// separately-awaited `response.bytes()` is where a stalled blob read
+    /// blocks (see the comment on `download`). So this test must reproduce
+    /// that phase, not just a slow header response — a raw TCP server sends
+    /// the status line + `Content-Length` headers immediately, then stalls
+    /// mid-body forever. `execute()` therefore returns promptly and it is the
+    /// body read that hangs until the per-chunk `tokio::time::timeout` fires.
     #[tokio::test]
-    async fn download_times_out_when_response_stalls() {
-        use wiremock::matchers::{method, path};
-        use wiremock::{Mock, MockServer, ResponseTemplate};
+    async fn download_times_out_when_response_body_stalls() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
 
-        // Respond far later than the downloader's per-chunk timeout,
-        // simulating a wedged blob read.
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/chunk0"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(10)))
-            .mount(&server)
-            .await;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Accept one connection, flush headers promising a body we never
+        // finish sending, then hold the socket open so the body read wedges.
+        tokio::spawn(async move {
+            if let Ok((mut socket, _)) = listener.accept().await {
+                // Drain the request line/headers so the client can proceed.
+                let mut buf = [0u8; 1024];
+                let _ = socket.read(&mut buf).await;
+                // Headers flushed immediately: execute() completes here.
+                let _ = socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 1048576\r\n\r\n")
+                    .await;
+                let _ = socket.flush().await;
+                // A few body bytes, then stall indefinitely: bytes() hangs.
+                let _ = socket.write_all(b"partial").await;
+                let _ = socket.flush().await;
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
 
         let http_client = Arc::new(
             DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap(),
@@ -287,7 +309,7 @@ mod tests {
         );
 
         let link = CloudFetchLink {
-            url: format!("{}/chunk0", server.uri()),
+            url: format!("http://{}/chunk0", addr),
             ..create_test_link()
         };
 
