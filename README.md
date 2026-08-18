@@ -19,9 +19,11 @@
 Rust client core for Databricks SQL — the shared engine intended to power the
 Databricks ODBC, Python, Go, and Node.js drivers.
 
-The kernel is currently exposed via the [ADBC](https://arrow.apache.org/adbc/)
-trait surface from `adbc_core`. A native (non-ADBC) Rust API and a stable C
-ABI for ODBC/Go consumers are planned.
+The kernel exposes a Databricks-native v0 async API (`Session` →
+`Statement` → `ExecutedStatement` → `ResultStream`, plus a flat `Metadata`
+surface) for direct Rust use, the PyO3 (Python) and napi-rs (Node.js)
+wrappers, and a C ABI for ODBC / Go consumers. See
+[`docs/spec-v0.md`](docs/spec-v0.md) for the API spec.
 
 ## Status
 
