@@ -87,11 +87,28 @@ Connector drives `OAuthM2M` with:
 | `scopes` | `["2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"]` |
 
 The `oauth2` crate sends `grant_type=client_credentials` with the client id/secret
-via HTTP Basic (which Entra v2.0 accepts) to the override endpoint; the returned
-Entra token (audience `2ff814a6-…`, issuer `sts.windows.net/{tenant}`) is used as
-the bearer. Its foreign issuer means `FederationProvider` round-trips it through
+via HTTP Basic to the override endpoint; the returned Entra token (audience
+`2ff814a6-…`, issuer `sts.windows.net/{tenant}`) is used as the bearer.
+
+> **Credential-transmission style (PR #263 review thread).** A reviewer noted the
+> Azure docs *example* uses `client_secret_post` (form body), whereas the kernel's
+> `exchange_client_credentials()` sends `client_secret_basic` (HTTP Basic).
+> Verified non-blocking: Entra's published
+> `token_endpoint_auth_methods_supported` is
+> `["client_secret_post","private_key_jwt","client_secret_basic","self_signed_tls_client_auth"]`
+> — `client_secret_basic` **is** supported, so no change to the M2M provider's
+> credential transmission is required. Its foreign issuer means `FederationProvider` round-trips it through
 `{host}/oidc/v1/token` (required when the workspace is *not* Azure; a benign
 pass-through when it is).
+
+> **Cloud/environment ownership (PR #263 review thread).** A reviewer correctly
+> noted the Azure cloud (Public / USGov / China → login host) is a property of
+> the *SP's Azure tenant*, not the workspace's host, so deriving it from the
+> workspace host (as an earlier draft did) is wrong. In the generic-override
+> design this is moot for the kernel: the connector builds the full
+> `token_url_override` for the correct cloud and the kernel uses it verbatim —
+> the kernel never infers an environment. The per-cloud host table lives in each
+> connector (`databricks-sdk-py` `azure.py`, etc.).
 
 ### Azure U2M (`azure-oauth`, PECOBLR-4120)
 
