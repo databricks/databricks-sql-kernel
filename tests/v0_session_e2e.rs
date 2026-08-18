@@ -123,7 +123,7 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
         .http_path(host, http_path)
         .auth(AuthConfig::OAuthU2M {
             client_id: None,
-            redirect_port: None,
+            redirect_ports: None,
             scopes: None,
             token_url_override: None,
             callback_timeout: None,

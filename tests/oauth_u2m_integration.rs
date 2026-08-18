@@ -118,7 +118,7 @@ async fn test_u2m_refresh_token_full_flow() {
         "test-client-id",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
-        8020,
+        vec![8020],
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
@@ -192,7 +192,7 @@ async fn test_u2m_refresh_token_stale_immediate_return() {
         "test-client-id-stale",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
-        8021,
+        vec![8021],
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
@@ -272,7 +272,7 @@ async fn test_u2m_refresh_token_expired_fallback() {
         "test-client-id-expired",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
-        0,                      // Use port 0 to avoid conflicts
+        vec![0],                // Use port 0 to avoid conflicts
         Duration::from_secs(5), // Short timeout for test
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
@@ -347,7 +347,7 @@ async fn test_u2m_refresh_updates_cache() {
         "test-client-id-cache",
         http_client,
         vec!["all-apis".to_string(), "offline_access".to_string()],
-        8023,
+        vec![8023],
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
