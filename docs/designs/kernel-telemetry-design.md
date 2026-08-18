@@ -15,39 +15,6 @@ JDBC and the ADBC implementation. Binding crates and the C ABI configure
 telemetry through `TelemetryConfig`; they should not duplicate metric
 collection, batching, circuit breaking, or export logic.
 
-## Inputs Reviewed
-
-- `docs/spec-v0.md`, the local mirror of the common kernel design.
-- `src/telemetry/mod.rs`, currently a minimal reserved collector.
-- `src/config.rs`, where public `TelemetryConfig` is currently empty and
-exported at the crate root.
-- `src/session.rs`, `src/statement/*`, `src/metadata_v0.rs`, and
-`src/result_stream.rs`, which define the session-owned handle graph.
-- ADBC implementation under `~/databricks`, especially:
-  - `csharp/doc/telemetry-design.md`
-  - `docs/designs/PECO-3022-sea-telemetry-integration-design.md`
-  - `docs/designs/fix-telemetry-gaps-design.md`
-  - `csharp/src/Telemetry/ConnectionTelemetry.cs`
-  - `csharp/src/Telemetry/IConnectionTelemetry.cs`
-  - `csharp/src/Telemetry/StatementTelemetryContext.cs`
-  - `csharp/src/Telemetry/TelemetrySessionContext.cs`
-  - `csharp/src/Telemetry/TelemetryClient.cs`
-  - `csharp/src/Telemetry/TelemetryClientManager.cs`
-  - `csharp/src/Telemetry/DatabricksTelemetryExporter.cs`
-  - `csharp/src/Telemetry/CircuitBreakerTelemetryExporter.cs`
-  - `csharp/src/FeatureFlagCache.cs`
-  - `csharp/src/FeatureFlagContext.cs`
-  - `csharp/src/Telemetry/Proto/sql_driver_telemetry.proto`
-  - telemetry unit/E2E tests under `csharp/test/*/Telemetry`.
-- JDBC implementation under `~/databricks-jdbc` as a secondary reference for
-production behavior that ADBC intentionally mirrors: endpoint shape,
-feature-flag lineage, batching, circuit breaking, and close-time flush.
-
-The two Google Docs links in the request were not directly accessible from the
-shell export path during this pass. The kernel spec is already mirrored in this
-repo. The local `~/databricks` checkout is the primary implementation/design
-reference for this plan.
-
 ## Goals
 
 1. Centralize telemetry in `src/telemetry` so it is a foundational kernel
@@ -78,31 +45,38 @@ paths containing local secrets, or arbitrary connection strings.
 
 ## Proposed Architecture
 
-```
-SessionConfig.telemetry
-      |
-      v
-Session::open
-      |
-      +--> TelemetryManager::client_for_host(host)
-      |        |
-      |        +--> TelemetryClient (host-scoped queue, batch flush timer)
-      |        +--> TelemetryExporter (HTTP POST)
-      |        +--> CircuitBreaker
-      |
-      +--> TelemetrySessionContext
-      |
-      v
-SessionInner { telemetry: Arc<TelemetryRuntime> }
-      |
-      +--> Statement / Metadata obtain StatementOperationObserver
-      |
-      +--> TelemetryObserver owns StatementTelemetryContext
-      |
-      +--> ExecutedStatement / ExecutedAsyncStatement / ResultStream call observer lifecycle hooks
-      |
-      v
-TelemetryClient.enqueue(TelemetryFrontendLog)
+```mermaid
+flowchart TD
+    config["SessionConfig.telemetry"]
+    open["Session::open"]
+    session["SessionInner<br/>telemetry: Arc&lt;TelemetryRuntime&gt;"]
+    runtime["TelemetryRuntime<br/>ConnectionTelemetry"]
+    context["TelemetrySessionContext"]
+    manager["TelemetryClientManager<br/>one client per host"]
+    client["TelemetryClient<br/>queue + batch flush"]
+    exporter["DatabricksTelemetryExporter<br/>HTTP POST"]
+    breaker["CircuitBreakerTelemetryExporter"]
+    statement["Statement / Metadata"]
+    observer["StatementOperationObserver"]
+    operation_context["StatementTelemetryContext"]
+    result["ExecutedStatement / ExecutedAsyncStatement / ResultStream"]
+    event["TelemetryFrontendLog"]
+
+    config --> open
+    open --> context
+    open --> manager
+    manager --> client
+    client --> breaker
+    breaker --> exporter
+    context --> runtime
+    client --> runtime
+    runtime --> session
+    session --> statement
+    statement --> observer
+    observer --> operation_context
+    operation_context --> result
+    result --> event
+    event --> client
 ```
 
 ### Core Types
@@ -251,6 +225,32 @@ attach the observer to the returned bare `ResultStream`. Because metadata
 returns a bare `ResultStream` with no executed handle, that stream owns
 finalization on exhaustion/drop/error.
 
+```mermaid
+sequenceDiagram
+    participant Caller
+    participant Session as Session::open / Session::close
+    participant SEA as SEA REST API
+    participant Runtime as TelemetryRuntime
+    participant Client as TelemetryClient
+    participant Exporter as TelemetryExporter
+
+    Caller->>Session: open(config)
+    Session->>SEA: create_session
+    SEA-->>Session: session_id
+    Session->>Runtime: build(session_id, telemetry config)
+    Runtime->>Client: enqueue CREATE_SESSION
+    Client-->>Exporter: flush when batch policy fires
+    Session-->>Caller: Session
+
+    Caller->>Session: close()
+    Session->>Runtime: emit DELETE_SESSION
+    Runtime->>Client: enqueue DELETE_SESSION
+    Runtime->>Client: bounded flush
+    Client-->>Exporter: export pending events
+    Session->>SEA: delete_session
+    Session-->>Caller: close result
+```
+
 ### Event Emission
 
 Use deterministic, idempotent emission. Every real observer has an emitted flag.
@@ -271,6 +271,27 @@ session delete telemetry.
 
 Do not emit on every batch. Batch-level and chunk-level metrics should be
 accumulated on the context and included in the terminal event.
+
+```mermaid
+sequenceDiagram
+    participant Statement
+    participant Observer as StatementOperationObserver
+    participant Handle as ExecutedStatement / ExecutedAsyncStatement
+    participant Stream as ResultStream
+    participant Client as TelemetryClient
+
+    Statement->>Observer: on_execute_started
+    Statement->>Observer: on_statement_submitted(statement_id)
+    Statement-->>Handle: return executed handle
+    Handle-->>Stream: attach observer
+    Stream->>Observer: on_first_batch_ready
+    loop Each result batch
+        Stream->>Observer: accumulate batch and row counts
+    end
+    Stream->>Observer: on_consumed
+    Stream->>Observer: on_finalized
+    Observer->>Client: enqueue one terminal event
+```
 
 ### Export Pipeline
 
@@ -459,6 +480,28 @@ Each phase should be independently deliverable and testable. Avoid landing a
 large telemetry framework that cannot be exercised until later phases. The early
 phases should produce real events through the same queue/exporter path that
 later statement and metadata telemetry use.
+
+```mermaid
+flowchart LR
+    p1["Phase 1<br/>Models + test exporter"]
+    p2["Phase 2<br/>Connection telemetry E2E"]
+    p3["Phase 3<br/>Statement telemetry E2E"]
+    p4["Phase 4<br/>ResultStream + CloudFetch metrics"]
+    p5["Phase 5<br/>Metadata lifecycle"]
+    p6["Phase 6<br/>Production export pipeline"]
+    p7["Phase 7<br/>Binding wiring"]
+    p8["Phase 8<br/>Circuit breaker hardening"]
+    p9["Phase 9<br/>Feature flags"]
+
+    p1 --> p2
+    p2 --> p3
+    p3 --> p4
+    p3 --> p5
+    p2 --> p6
+    p6 --> p7
+    p6 --> p8
+    p8 --> p9
+```
 
 ### Phase 1: Model And Serialization Contract
 
@@ -701,6 +744,39 @@ flaky.
 | Sensitive data emitted accidentally             | Allowlist-only event builders and redaction tests                                                                                                         |
 | Future transport modes need different fields    | Non-exhaustive transport/result enums and protocol-neutral contexts; v0 records only `SeaRest`                                                            |
 
+
+## Appendix: Inputs Reviewed
+
+- `docs/spec-v0.md`, the local mirror of the common kernel design.
+- `src/telemetry/mod.rs`, currently a minimal reserved collector.
+- `src/config.rs`, where public `TelemetryConfig` is currently empty and
+exported at the crate root.
+- `src/session.rs`, `src/statement/*`, `src/metadata_v0.rs`, and
+`src/result_stream.rs`, which define the session-owned handle graph.
+- ADBC implementation under `~/databricks`, especially:
+  - `csharp/doc/telemetry-design.md`
+  - `docs/designs/PECO-3022-sea-telemetry-integration-design.md`
+  - `docs/designs/fix-telemetry-gaps-design.md`
+  - `csharp/src/Telemetry/ConnectionTelemetry.cs`
+  - `csharp/src/Telemetry/IConnectionTelemetry.cs`
+  - `csharp/src/Telemetry/StatementTelemetryContext.cs`
+  - `csharp/src/Telemetry/TelemetrySessionContext.cs`
+  - `csharp/src/Telemetry/TelemetryClient.cs`
+  - `csharp/src/Telemetry/TelemetryClientManager.cs`
+  - `csharp/src/Telemetry/DatabricksTelemetryExporter.cs`
+  - `csharp/src/Telemetry/CircuitBreakerTelemetryExporter.cs`
+  - `csharp/src/FeatureFlagCache.cs`
+  - `csharp/src/FeatureFlagContext.cs`
+  - `csharp/src/Telemetry/Proto/sql_driver_telemetry.proto`
+  - telemetry unit/E2E tests under `csharp/test/*/Telemetry`.
+- JDBC implementation under `~/databricks-jdbc` as a secondary reference for
+production behavior that ADBC intentionally mirrors: endpoint shape,
+feature-flag lineage, batching, circuit breaking, and close-time flush.
+
+The two Google Docs links in the request were not directly accessible from the
+shell export path during this pass. The kernel spec is already mirrored in this
+repo. The local `~/databricks` checkout is the primary implementation/design
+reference for this plan.
 
 ## Recommendation
 
