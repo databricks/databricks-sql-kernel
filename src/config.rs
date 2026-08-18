@@ -1127,7 +1127,12 @@ pub struct TelemetryConfig {
     pub batch_size: usize,
 
     /// Maximum time an explicit session close should wait for the final
-    /// telemetry flush. `Drop` never waits.
+    /// telemetry flush. `Drop` never waits — and because the `Drop`
+    /// teardown path does not call into the telemetry runtime at all,
+    /// connection telemetry (CREATE/DELETE_SESSION) is exported only for
+    /// sessions closed via an explicit `Session::close`. A session that is
+    /// dropped rather than closed discards its buffered CREATE_SESSION and
+    /// emits no DELETE_SESSION.
     pub close_flush_timeout: Duration,
 
     #[cfg(test)]

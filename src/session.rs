@@ -173,6 +173,14 @@ impl SessionInner {
     /// executed handles) still hold `Arc<SessionInner>` clones, so an
     /// explicit close genuinely *initiates* the delete rather than
     /// deferring it to an idle-timeout.
+    ///
+    /// This path deliberately does **not** touch the telemetry runtime:
+    /// it emits no DELETE_SESSION event and never flushes the buffered
+    /// CREATE_SESSION. Connection telemetry (CREATE/DELETE_SESSION) is
+    /// therefore exported only via an explicit [`Session::close`] — a
+    /// session that is dropped rather than closed discards its buffered
+    /// connection telemetry. This matches the documented contract that
+    /// `Drop` never waits (see [`crate::config::TelemetryConfig`]).
     pub(crate) fn initiate_delete(&self) {
         if self
             .closed
