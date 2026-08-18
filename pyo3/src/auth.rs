@@ -53,7 +53,8 @@ pub(crate) struct OAuthParams {
     /// Candidate U2M redirect ports, tried in order (first free binds). A
     /// single fixed port is just a one-element list (`vec![port]`); a
     /// multi-port list gives the busy-port fallback the Thrift connector has
-    /// across its registered range (`databricks-sql-python` → 8020‑8024).
+    /// across its registered ports (`databricks-sql-python` → the discrete
+    /// set `8020`/`8025`, not a contiguous range).
     /// `None`/empty → the databricks-sql-python default (8020) when the
     /// default client is in use, else the kernel default.
     pub redirect_ports: Option<Vec<u16>>,

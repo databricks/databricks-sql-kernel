@@ -335,8 +335,9 @@ pub enum AuthConfig {
         /// which is how the single-port bindings (C ABI, N-API) forward
         /// their one port. Every entry must be a registered redirect URI
         /// of the OAuth app; a multi-port list mirrors the Thrift
-        /// connector's registered range (`databricks-sql-python` →
-        /// 8020‑8024) for busy-port fallback.
+        /// connector's registered redirect ports (`databricks-sql-python`
+        /// → the discrete set `8020`/`8025`, not a contiguous range) for
+        /// busy-port fallback.
         redirect_ports: Option<Vec<u16>>,
         /// OAuth scopes. `None` → `["sql", "offline_access"]`
         /// (the `offline_access` scope is required to receive a

@@ -111,7 +111,8 @@ impl CallbackServer {
     /// Tries each candidate port in order and keeps the first one that binds,
     /// skipping ports already in use (`AddrInUse`) — the same busy-port
     /// tolerance the Thrift connector's `OAuthManager` provides by iterating its
-    /// registered redirect-URI range (e.g. `databricks-sql-python` → 8020‑8024).
+    /// registered redirect URIs (e.g. `databricks-sql-python` → the discrete
+    /// set `8020`/`8025`, not a contiguous range).
     /// The kernel's single-port U2M API otherwise fails outright when its one
     /// port is occupied by a stale listener or a second concurrent connection.
     ///
