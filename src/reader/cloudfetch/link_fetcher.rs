@@ -1144,6 +1144,7 @@ mod tests {
                 status: StatementStatus {
                     state: StatementState::Succeeded,
                     error: None,
+                    sql_state: None,
                     num_modified_rows: None,
                     display_message: None,
                     diagnostic_info: None,

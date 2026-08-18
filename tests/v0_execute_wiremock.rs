@@ -231,9 +231,10 @@ fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
         "statement_id": statement_id,
         "status": {
             "state": "FAILED",
+            "sql_state": sql_state,
             "error": {
                 "error_code": "INVALID_PARAMETER_VALUE",
-                "message": format!("{message}. SQLSTATE: {sql_state}"),
+                "message": message,
             }
         },
     })

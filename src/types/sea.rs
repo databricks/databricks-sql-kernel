@@ -64,6 +64,10 @@ pub struct StatementStatus {
     pub state: StatementState,
     #[serde(default)]
     pub error: Option<ServiceError>,
+    /// SQLSTATE reported for the statement. This is the canonical SEA
+    /// wire location used by Reyden and newer DBSQL responses.
+    #[serde(default)]
+    pub sql_state: Option<String>,
     /// Number of rows modified by the statement (UPDATE / INSERT /
     /// DELETE / MERGE). Absent on SELECT and on warehouses that don't
     /// surface the counter.
@@ -123,6 +127,7 @@ impl std::fmt::Debug for StatementStatus {
         f.debug_struct("StatementStatus")
             .field("state", &self.state)
             .field("error", &self.error)
+            .field("sql_state", &self.sql_state)
             .field("num_modified_rows", &self.num_modified_rows)
             .field("display_message", &summarise(&self.display_message))
             .field("diagnostic_info", &summarise(&self.diagnostic_info))
@@ -150,7 +155,8 @@ pub struct ServiceError {
     pub error_code: Option<String>,
     #[serde(default)]
     pub message: Option<String>,
-    /// SQL state code if provided by server (typically in the message, but may be a separate field)
+    /// SQL state code from legacy error envelopes. Newer SEA responses
+    /// report this on [`StatementStatus::sql_state`].
     #[serde(default)]
     pub sql_state: Option<String>,
 }
@@ -593,6 +599,32 @@ mod tests {
         assert_eq!(response.status.state, StatementState::Failed);
         let err = response.status.error.expect("error envelope present");
         assert_eq!(err.error_code.as_deref(), Some("BAD_REQUEST"));
+    }
+
+    #[test]
+    fn test_failed_response_deserializes_status_sql_state() {
+        let json = r#"{
+            "statement_id": "stmt-failed",
+            "status": {
+                "state": "FAILED",
+                "sql_state": "57KD0",
+                "error": {
+                    "error_code": "BAD_REQUEST",
+                    "message": "Statement has timed out after 2 seconds."
+                }
+            }
+        }"#;
+
+        let response: StatementExecutionResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(response.status.sql_state.as_deref(), Some("57KD0"));
+        assert_eq!(
+            response
+                .status
+                .error
+                .as_ref()
+                .and_then(|error| error.sql_state.as_deref()),
+            None
+        );
     }
 
     #[test]

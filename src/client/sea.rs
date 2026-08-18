@@ -338,19 +338,15 @@ impl SeaRestTransport {
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);
 
-                if let Some(err) = service_error {
-                    // SQLSTATE: prefer the structured field; fall back
-                    // to parsing the message ("SQLSTATE: XXXXX" pattern).
-                    let sqlstate = err
-                        .sql_state
-                        .as_ref()
-                        .filter(|s| s.len() == 5)
-                        .cloned()
-                        .or_else(|| crate::kernel_error::extract_sqlstate_from_message(&error_msg));
-                    if let Some(s) = sqlstate {
-                        error = error.with_sql_state(s);
-                    }
+                // Reyden and newer DBSQL responses report SQLSTATE on
+                // status.sql_state. Legacy nested-error and message
+                // forms remain supported by the helper's fallbacks.
+                if let Some(s) = crate::kernel_error::extract_sqlstate_from_status(&response.status)
+                {
+                    error = error.with_sql_state(s);
+                }
 
+                if let Some(err) = service_error {
                     // Databricks-specific error code slug
                     // (`STATEMENT_NOT_FOUND`, `WAREHOUSE_STOPPED`, …).
                     // Wrappers branch on this to map host-language
@@ -1454,6 +1450,7 @@ mod tests {
                     ),
                     sql_state: None,
                 }),
+                sql_state: None,
                 num_modified_rows: None,
                 display_message: None,
                 diagnostic_info: None,
