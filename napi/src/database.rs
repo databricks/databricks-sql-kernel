@@ -368,7 +368,9 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             }
             Ok(AuthConfig::oauth_u2m(
                 options.oauth_client_id.clone(),
-                options.oauth_redirect_port,
+                // Node exposes a single redirect port; forward it as a
+                // one-element candidate list (kernel binds the first free one).
+                options.oauth_redirect_port.map(|p| vec![p]),
                 options.oauth_scopes.clone(),
                 None,
                 None,
@@ -722,29 +724,30 @@ mod tests {
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
-                redirect_port,
+                redirect_ports,
                 scopes,
                 ..
             } => {
                 assert!(client_id.is_none());
-                assert!(redirect_port.is_none());
+                assert!(redirect_ports.is_none());
                 assert!(scopes.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
-        // Explicit overrides thread through.
+        // Explicit overrides thread through. Node's single redirect port is
+        // forwarded as a one-element candidate list.
         o.oauth_client_id = Some("custom-cli".to_owned());
         o.oauth_redirect_port = Some(9000);
         o.identity_federation_client_id = Some("federation-client".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
-                redirect_port,
+                redirect_ports,
                 identity_federation_client_id,
                 ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("custom-cli"));
-                assert_eq!(redirect_port, Some(9000));
+                assert_eq!(redirect_ports, Some(vec![9000]));
                 assert_eq!(
                     identity_federation_client_id.as_deref(),
                     Some("federation-client")

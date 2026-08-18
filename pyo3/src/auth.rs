@@ -266,9 +266,17 @@ fn build_auth_config_inner(
                 None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
                 None => None,
             };
+            // Collapse the two Python knobs into the kernel's single
+            // `redirect_ports` list. An explicit `redirect_ports` (the
+            // connector's registered range, for busy-port fallback) wins;
+            // otherwise the single `redirect_port` (caller-supplied or the
+            // pinned databricks-sql-python default) becomes a one-element list.
+            let redirect_ports = oauth
+                .redirect_ports
+                .or_else(|| redirect_port.map(|p| vec![p]));
             Ok(AuthConfig::oauth_u2m(
                 client_id,
-                redirect_port,
+                redirect_ports,
                 scopes,
                 oauth.token_url,
                 oauth.callback_timeout_secs.map(Duration::from_secs),
@@ -281,8 +289,7 @@ fn build_auth_config_inner(
                 // TokenCachePassPhrase — would strengthen it further.
                 None,
                 oauth.identity_federation_client_id,
-            )
-            .with_redirect_ports(oauth.redirect_ports))
+            ))
         }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', 'oauth-u2m'"
@@ -422,7 +429,6 @@ mod tests {
         match cfg {
             AuthConfig::OAuthU2M {
                 client_id,
-                redirect_port,
                 redirect_ports,
                 scopes,
                 token_url_override,
@@ -432,10 +438,10 @@ mod tests {
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 // Python bundle pins its own app's registered port (8020),
-                // NOT the kernel default 8030 (databricks-sql-connector).
-                assert_eq!(redirect_port, Some(8020));
-                // No range supplied → redirect_ports stays None (single-port).
-                assert_eq!(redirect_ports, None);
+                // NOT the kernel default 8030 (databricks-sql-connector). With
+                // no explicit range, the single pinned port is forwarded as a
+                // one-element candidate list.
+                assert_eq!(redirect_ports, Some(vec![8020]));
                 assert_eq!(
                     scopes,
                     Some(vec!["sql".to_string(), "offline_access".to_string()])
@@ -524,7 +530,7 @@ mod tests {
             AuthConfig::OAuthU2M {
                 client_id,
                 scopes,
-                redirect_port,
+                redirect_ports,
                 ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("my-custom-app"));
@@ -532,7 +538,7 @@ mod tests {
                 // bundle's defaults — a custom app owns its own scopes and
                 // redirect port, so both defer to the kernel (None).
                 assert!(scopes.is_none());
-                assert!(redirect_port.is_none());
+                assert!(redirect_ports.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
@@ -578,12 +584,13 @@ mod tests {
         .unwrap();
         match cfg {
             AuthConfig::OAuthU2M {
-                redirect_port,
+                redirect_ports,
                 callback_timeout,
                 identity_federation_client_id,
                 ..
             } => {
-                assert_eq!(redirect_port, Some(9999));
+                // The single caller port is forwarded as a one-element list.
+                assert_eq!(redirect_ports, Some(vec![9999]));
                 assert_eq!(callback_timeout, Some(Duration::from_secs(300)));
                 assert_eq!(
                     identity_federation_client_id.as_deref(),
