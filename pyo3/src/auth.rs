@@ -20,8 +20,8 @@
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
 //!   `client_id` + `client_secret`, optional `scopes` / `token_url`.
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
-//!   optional `client_id` / `redirect_port` / `scopes` / `token_url` /
-//!   `oauth_callback_timeout_secs`.
+//!   optional `client_id` / `redirect_port` / `redirect_ports` / `scopes` /
+//!   `token_url` / `oauth_callback_timeout_secs`.
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
 //! itself (OIDC discovery against the workspace host, transparent
