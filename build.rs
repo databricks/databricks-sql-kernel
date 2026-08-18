@@ -38,5 +38,12 @@ fn main() {
         println!("cargo:rustc-env=RUSTC_VERSION={version}");
     }
 
+    // Re-run when the selected compiler changes. Cargo already recompiles (and
+    // therefore re-runs) this build script whenever the driving rustc's version
+    // changes, since the script binary's fingerprint tracks the compiler — so a
+    // `rustup update` refreshes `RUSTC_VERSION` on its own. This trigger adds the
+    // complementary case where a different compiler is chosen via the `RUSTC`
+    // environment variable without `build.rs` itself changing.
+    println!("cargo:rerun-if-env-changed=RUSTC");
     println!("cargo:rerun-if-changed=build.rs");
 }
