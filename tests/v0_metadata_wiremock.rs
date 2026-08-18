@@ -143,10 +143,10 @@ fn failed_response_body(sql_state: &str, message: &str) -> String {
         "statement_id": "stmt-test",
         "status": {
             "state": "FAILED",
+            "sql_state": sql_state,
             "error": {
                 "error_code": "BAD_REQUEST",
                 "message": message,
-                "sql_state": sql_state,
             }
         },
     })
