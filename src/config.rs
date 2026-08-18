@@ -290,7 +290,7 @@ impl TokenCacheConfig {
 /// Optional fields default to sensible values when set to `None`:
 /// - OAuth scopes default to `["all-apis"]` for M2M and
 ///   `["sql", "offline_access"]` for U2M.
-/// - U2M `redirect_ports` defaults to `[8030]`.
+/// - U2M `redirect_ports` defaults to the `[8030, 8031, 8032, 8033, 8034]` window.
 /// - U2M `client_id` defaults to `"databricks-sql-connector"`.
 /// - `token_url_override` defaults to OIDC discovery against the
 ///   workspace host.
@@ -330,7 +330,8 @@ pub enum AuthConfig {
         client_id: Option<String>,
         /// Candidate localhost callback ports, tried in order; the first
         /// one free is bound (busy-port fallback). `None`/empty → the
-        /// `8030` default (registered for `databricks-sql-connector`).
+        /// `[8030, 8031, 8032, 8033, 8034]` default window (the
+        /// `databricks-sql-connector` app accepts any loopback port).
         /// A single fixed port is just a one-element list (`vec![p]`) —
         /// which is how the single-port bindings (C ABI, N-API) forward
         /// their one port. Every entry must be a registered redirect URI
@@ -432,14 +433,16 @@ impl AuthConfig {
 
     /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
     /// U2M fields are optional — the kernel fills `databricks-sql-connector` /
-    /// port 8030 / `sql offline_access` when omitted — so this performs no
+    /// the `[8030, 8031, 8032, 8033, 8034]` port window / `sql offline_access`
+    /// when omitted — so this performs no
     /// validation and exists for symmetry with [`AuthConfig::pat`] /
     /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
     /// uniformly, including the federation client id.
     ///
     /// `redirect_ports` is the ordered list of candidate callback ports
     /// (first free binds). Single-port callers pass a one-element list
-    /// (`Some(vec![port])`); `None`/empty falls back to the `8030` default.
+    /// (`Some(vec![port])`); `None`/empty falls back to the
+    /// `[8030, 8031, 8032, 8033, 8034]` default window.
     pub fn oauth_u2m(
         client_id: Option<String>,
         redirect_ports: Option<Vec<u16>>,

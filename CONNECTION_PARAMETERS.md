@@ -56,7 +56,7 @@ An enum; pick one variant. Use the validating constructors
 | Field | Description | Default |
 |-------|-------------|---------|
 | `client_id` | OAuth client id. | `"databricks-sql-connector"` |
-| `redirect_ports` | Ordered candidate localhost ports for the OAuth callback listener; the first free port is bound (busy-port fallback). `None`/empty selects the default. Each port must be a registered redirect URI of the OAuth app. The default app's redirect URI is registered for `http://localhost:8030`. | `[8030]` |
+| `redirect_ports` | Ordered candidate localhost ports for the OAuth callback listener; the first free port is bound (busy-port fallback). `None`/empty selects the default window. The default app (`databricks-sql-connector`) accepts any `http://localhost:{port}` because its in-house OAuth normalizes loopback redirect URIs by dropping the port (RFC 8252 §7.3); for other apps every port must be a registered redirect URI. | `[8030, 8031, 8032, 8033, 8034]` |
 | `scopes` | OAuth scopes. `offline_access` is required to receive a refresh token (cached and refreshed transparently). | `["sql", "offline_access"]` |
 | `token_url_override` | Token endpoint override. | OIDC discovery |
 | `callback_timeout` | How long to wait for the user to complete the browser flow. | `120s` |
