@@ -145,7 +145,11 @@ impl StatementStatus {
                 let mut error = Error::sql_error()
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);
-                if let Some(s) = crate::kernel_error::extract_sqlstate_from_status(&response.status)
+                if let Some(s) = response
+                    .status
+                    .sql_state
+                    .as_deref()
+                    .filter(|s| s.len() == 5)
                 {
                     error = error.with_sql_state(s);
                 }

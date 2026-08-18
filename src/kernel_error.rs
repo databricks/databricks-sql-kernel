@@ -680,28 +680,6 @@ pub(crate) fn carry_extended_status(
 
 // ─── SQLSTATE extraction helpers ────────────────────────────────────
 
-/// Extract the SQLSTATE from a SEA statement status.
-///
-/// SEA's canonical field is `status.sql_state` (used by Reyden and
-/// newer DBSQL responses). Retain message parsing as a fallback for
-/// responses that only include SQLSTATE in their display text.
-pub(crate) fn extract_sqlstate_from_status(
-    status: &crate::types::sea::StatementStatus,
-) -> Option<String> {
-    status
-        .sql_state
-        .as_ref()
-        .filter(|s| s.len() == 5)
-        .cloned()
-        .or_else(|| {
-            status
-                .error
-                .as_ref()
-                .and_then(|error| error.message.as_deref())
-                .and_then(extract_sqlstate_from_message)
-        })
-}
-
 /// Extract a SQLSTATE from a free-form error message.
 ///
 /// Many Databricks error envelopes include `SQLSTATE: XXXXX` in the
@@ -848,44 +826,6 @@ mod tests {
     #[test]
     fn extract_sqlstate_absent_returns_none() {
         assert_eq!(extract_sqlstate_from_message("nope"), None);
-    }
-
-    #[test]
-    fn extract_sqlstate_from_status_prefers_top_level_field() {
-        let status: crate::types::sea::StatementStatus = serde_json::from_str(
-            r#"{
-                "state": "FAILED",
-                "sql_state": "57KD0",
-                "error": {
-                    "message": "legacy SQLSTATE: 42000",
-                    "sql_state": "42601"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            extract_sqlstate_from_status(&status).as_deref(),
-            Some("57KD0")
-        );
-    }
-
-    #[test]
-    fn extract_sqlstate_from_status_falls_back_to_error_message() {
-        let status: crate::types::sea::StatementStatus = serde_json::from_str(
-            r#"{
-                "state": "FAILED",
-                "error": {
-                    "message": "table not found. SQLSTATE: 42P01"
-                }
-            }"#,
-        )
-        .unwrap();
-
-        assert_eq!(
-            extract_sqlstate_from_status(&status).as_deref(),
-            Some("42P01")
-        );
     }
 
     #[test]
