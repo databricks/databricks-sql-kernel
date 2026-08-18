@@ -156,7 +156,8 @@ pub struct ServiceError {
     #[serde(default)]
     pub message: Option<String>,
     /// SQLSTATE accepted by the shared transport-error decoder.
-    /// Statement failures use [`StatementStatus::sql_state`] instead.
+    /// Statement failures use [`StatementStatus::sql_state`] or parse
+    /// their error message instead.
     #[serde(default)]
     pub sql_state: Option<String>,
 }

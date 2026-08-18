@@ -338,11 +338,7 @@ impl SeaRestTransport {
                     .message(&error_msg)
                     .with_query_id(&response.statement_id);
 
-                if let Some(s) = response
-                    .status
-                    .sql_state
-                    .as_deref()
-                    .filter(|s| s.len() == 5)
+                if let Some(s) = crate::kernel_error::extract_sqlstate_from_status(&response.status)
                 {
                     error = error.with_sql_state(s);
                 }
@@ -1431,7 +1427,7 @@ mod tests {
         // A synchronously-rejected request (e.g. a parameter-binding
         // `BAD_REQUEST`) comes back FAILED with no statement_id. The
         // envelope must surface as a SqlError carrying the real server
-        // message, structured SQLSTATE, and the `error_code` slug — NOT an
+        // message, parsed SQLSTATE, and the `error_code` slug — NOT an
         // opaque DataLoss parse failure. The slug is deliberately NOT
         // remapped to InvalidArgument: SEA returns `BAD_REQUEST` for
         // genuine SQL errors too (TABLE_OR_VIEW_NOT_FOUND etc.), so it's
@@ -1451,7 +1447,7 @@ mod tests {
                     ),
                     sql_state: None,
                 }),
-                sql_state: Some("22023".to_string()),
+                sql_state: None,
                 num_modified_rows: None,
                 display_message: None,
                 diagnostic_info: None,
@@ -1465,6 +1461,7 @@ mod tests {
                 assert_eq!(e.code, crate::kernel_error::ErrorCode::SqlError);
                 assert_eq!(e.error_code.as_deref(), Some("BAD_REQUEST"));
                 assert!(e.message.contains("MISSING_NAME"));
+                // SQLSTATE parsed from the message text.
                 assert_eq!(e.sql_state.as_deref(), Some("22023"));
             }
             _ => panic!("expected Err outcome for a FAILED response"),
