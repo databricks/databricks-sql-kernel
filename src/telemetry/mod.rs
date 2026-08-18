@@ -25,6 +25,3 @@ mod models;
 
 #[cfg(test)]
 pub(crate) mod test_support;
-
-pub(crate) use exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExporter};
-pub(crate) use models::OperationType;

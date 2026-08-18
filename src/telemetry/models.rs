@@ -394,8 +394,8 @@ pub(super) fn unix_time_millis() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::exporter::TelemetryExporter;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
-    use crate::telemetry::TelemetryExporter;
     use serde_json::Value;
 
     #[test]
