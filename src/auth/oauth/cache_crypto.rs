@@ -302,12 +302,15 @@ mod tests {
 
     #[test]
     fn tampered_ciphertext_is_rejected() {
-        let payload = encrypt(b"secret", PASSPHRASE);
+        // Use a full plaintext block so PKCS#7 appends a full padding block,
+        // giving us at least two ciphertext blocks. In CBC mode, flipping a
+        // byte in the previous ciphertext block flips the corresponding byte
+        // in the final plaintext block after decrypt. The final block is all
+        // padding, so this makes the padding invalid deterministically.
+        let payload = encrypt(&[0u8; IV_LEN], PASSPHRASE);
         let mut decoded = BASE64.decode(payload.as_bytes()).expect("valid base64");
-        // Flip a bit in the final ciphertext block, which PKCS#7 unpadding
-        // then rejects.
-        let last = decoded.len() - 1;
-        decoded[last] ^= 0xff;
+        let previous_ciphertext_block_last_byte = decoded.len() - IV_LEN - 1;
+        decoded[previous_ciphertext_block_last_byte] ^= 0xff;
         let tampered = BASE64.encode(&decoded);
         assert_eq!(decrypt(tampered.as_bytes(), PASSPHRASE), None);
     }

@@ -26,11 +26,12 @@
 
 use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{
-    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TlsConfig,
-    TokenCacheConfig,
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TelemetryConfig,
+    TlsConfig, TokenCacheConfig,
 };
 use crate::kernel_error::Error;
 use crate::session::Session;
+use crate::telemetry::DriverSystemConfiguration;
 use std::collections::HashMap;
 use std::ffi::{c_char, CStr};
 use std::time::Duration;
@@ -143,6 +144,13 @@ pub struct KernelSessionConfig {
     /// reach the SEA wire (unlike [`Self::session_conf`]). See
     /// [`ResultConfig`].
     result: ResultConfig,
+    /// Telemetry collection/export knobs. Defaults to disabled; populated by
+    /// `kernel_session_config_set_telemetry_config`.
+    telemetry: TelemetryConfig,
+    /// Driver/runtime/system identity supplied by the binding layer. `None`
+    /// lets the kernel use only its own defaults; `Some` lets the kernel fill
+    /// any omitted fields it knows how to derive.
+    driver_system_configuration: Option<DriverSystemConfiguration>,
 }
 
 /// C-side proxy config captured from `kernel_session_config_set_proxy`.
@@ -225,6 +233,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         token_cache: TokenCacheConfig::default(),
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
         result: ResultConfig::default(),
+        telemetry: TelemetryConfig::default(),
+        driver_system_configuration: None,
     });
     std::ptr::write(out, Box::into_raw(config));
     KernelStatusCode::Success
@@ -537,6 +547,103 @@ pub unsafe extern "C" fn kernel_session_config_set_retry_config(
             // 0 => keep the kernel default budget; any non-zero value overrides it.
             overall_timeout: (overall_timeout_ms != 0)
                 .then(|| Duration::from_millis(overall_timeout_ms)),
+        });
+        Ok(())
+    })
+}
+
+/// Configure telemetry collection and export.
+///
+/// Telemetry is disabled by default. Passing `enabled = true` records kernel
+/// operation telemetry and exports it through the Databricks SQL driver
+/// telemetry endpoint. Export failures are fail-open and never change user
+/// operation results.
+///
+/// `batch_size`, `flush_interval_ms`, and `close_flush_timeout_ms` must be
+/// greater than zero. `max_retries == 0` disables telemetry export retries.
+/// `retry_delay_ms == 0` is accepted and means immediate retry.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+    batch_size: usize,
+    flush_interval_ms: u64,
+    max_retries: u32,
+    retry_delay_ms: u64,
+    close_flush_timeout_ms: u64,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if batch_size == 0 {
+            return Err(Error::invalid_argument().message("telemetry batch_size must be > 0"));
+        }
+        if flush_interval_ms == 0 {
+            return Err(
+                Error::invalid_argument().message("telemetry flush_interval_ms must be > 0")
+            );
+        }
+        if close_flush_timeout_ms == 0 {
+            return Err(
+                Error::invalid_argument().message("telemetry close_flush_timeout_ms must be > 0")
+            );
+        }
+
+        c.telemetry = TelemetryConfig {
+            enabled,
+            batch_size,
+            flush_interval: Duration::from_millis(flush_interval_ms),
+            max_retries,
+            retry_delay: Duration::from_millis(retry_delay_ms),
+            close_flush_timeout: Duration::from_millis(close_flush_timeout_ms),
+            ..Default::default()
+        };
+        Ok(())
+    })
+}
+
+/// Configure driver/runtime/system identity supplied by the binding layer.
+///
+/// Every string argument is optional: pass null for values the binding does
+/// not know. The kernel fills any missing fields it can derive before emitting
+/// telemetry. Calling this function with all-null fields explicitly records an
+/// empty override, which is equivalent to not calling it for v0.
+///
+/// # Safety
+/// `config` must be a live config handle. Non-null string pointers must point
+/// to NUL-terminated UTF-8 strings valid for the duration of the call.
+#[allow(clippy::too_many_arguments)]
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_driver_system_configuration(
+    config: *mut KernelSessionConfig,
+    driver_name: *const c_char,
+    driver_version: *const c_char,
+    runtime_name: *const c_char,
+    runtime_version: *const c_char,
+    runtime_vendor: *const c_char,
+    os_name: *const c_char,
+    os_version: *const c_char,
+    os_arch: *const c_char,
+    client_app_name: *const c_char,
+    locale_name: *const c_char,
+    char_set_encoding: *const c_char,
+    process_name: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.driver_system_configuration = Some(DriverSystemConfiguration {
+            driver_version: optional_str(driver_version, "driver_version")?,
+            runtime_name: optional_str(runtime_name, "runtime_name")?,
+            runtime_version: optional_str(runtime_version, "runtime_version")?,
+            runtime_vendor: optional_str(runtime_vendor, "runtime_vendor")?,
+            os_name: optional_str(os_name, "os_name")?,
+            os_version: optional_str(os_version, "os_version")?,
+            os_arch: optional_str(os_arch, "os_arch")?,
+            driver_name: optional_str(driver_name, "driver_name")?,
+            client_app_name: optional_str(client_app_name, "client_app_name")?,
+            locale_name: optional_str(locale_name, "locale_name")?,
+            char_set_encoding: optional_str(char_set_encoding, "char_set_encoding")?,
+            process_name: optional_str(process_name, "process_name")?,
         });
         Ok(())
     })
@@ -978,6 +1085,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         identity_federation_client_id,
         token_cache,
         result,
+        telemetry,
+        driver_system_configuration,
     } = config;
 
     block_on_ffi(move || {
@@ -1058,10 +1167,14 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 .auth(auth)
                 .session_conf(session_conf)
                 .result(result)
+                .telemetry(telemetry)
                 .defaults(crate::config::DefaultOpts {
                     ignore_transactions,
                     ..Default::default()
                 });
+            if let Some(system_configuration) = driver_system_configuration {
+                builder = builder.driver_system_configuration(system_configuration);
+            }
 
             // Skip `.http()` when neither headers nor a retry spec was set, so
             // the kernel's full `HttpConfig::default()` applies untouched.
@@ -1659,6 +1772,179 @@ mod tests {
                     .as_deref(),
                 Some("federation-client")
             );
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_records_knobs() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_config(config, true, 25, 1_000, 2, 50, 2_500),
+                KernelStatusCode::Success
+            );
+
+            let telemetry = &config.as_ref().unwrap().telemetry;
+            assert!(telemetry.enabled);
+            assert_eq!(telemetry.batch_size, 25);
+            assert_eq!(telemetry.flush_interval, Duration::from_millis(1_000));
+            assert_eq!(telemetry.max_retries, 2);
+            assert_eq!(telemetry.retry_delay, Duration::from_millis(50));
+            assert_eq!(telemetry.close_flush_timeout, Duration::from_millis(2_500));
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_rejects_zero_required_fields() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_config(config, true, 0, 1, 0, 0, 1),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(
+                kernel_session_config_set_telemetry_config(config, true, 1, 0, 0, 0, 1),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(
+                kernel_session_config_set_telemetry_config(config, true, 1, 1, 0, 0, 0),
+                KernelStatusCode::InvalidArgument
+            );
+            assert!(
+                !config.as_ref().unwrap().telemetry.enabled,
+                "rejected calls must leave default disabled telemetry"
+            );
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_driver_system_configuration_records_optional_fields() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let driver_name = CString::new("ODBC").unwrap();
+            let driver_version = CString::new("1.2.3").unwrap();
+            let runtime_name = CString::new("native").unwrap();
+            let runtime_version = CString::new("0").unwrap();
+            let runtime_vendor = CString::new("Databricks").unwrap();
+            let os_name = CString::new("Linux").unwrap();
+            let os_version = CString::new("6.1").unwrap();
+            let os_arch = CString::new("x86_64").unwrap();
+            let client_app_name = CString::new("app").unwrap();
+            let locale_name = CString::new("en_US").unwrap();
+            let char_set_encoding = CString::new("UTF-8").unwrap();
+            let process_name = CString::new("odbc-test").unwrap();
+
+            assert_eq!(
+                kernel_session_config_set_driver_system_configuration(
+                    config,
+                    driver_name.as_ptr(),
+                    driver_version.as_ptr(),
+                    runtime_name.as_ptr(),
+                    runtime_version.as_ptr(),
+                    runtime_vendor.as_ptr(),
+                    os_name.as_ptr(),
+                    os_version.as_ptr(),
+                    os_arch.as_ptr(),
+                    client_app_name.as_ptr(),
+                    locale_name.as_ptr(),
+                    char_set_encoding.as_ptr(),
+                    process_name.as_ptr(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let system_configuration = config
+                .as_ref()
+                .unwrap()
+                .driver_system_configuration
+                .as_ref()
+                .expect("driver system configuration");
+            assert_eq!(system_configuration.driver_name.as_deref(), Some("ODBC"));
+            assert_eq!(
+                system_configuration.driver_version.as_deref(),
+                Some("1.2.3")
+            );
+            assert_eq!(system_configuration.runtime_name.as_deref(), Some("native"));
+            assert_eq!(system_configuration.runtime_version.as_deref(), Some("0"));
+            assert_eq!(
+                system_configuration.runtime_vendor.as_deref(),
+                Some("Databricks")
+            );
+            assert_eq!(system_configuration.os_name.as_deref(), Some("Linux"));
+            assert_eq!(system_configuration.os_version.as_deref(), Some("6.1"));
+            assert_eq!(system_configuration.os_arch.as_deref(), Some("x86_64"));
+            assert_eq!(system_configuration.client_app_name.as_deref(), Some("app"));
+            assert_eq!(system_configuration.locale_name.as_deref(), Some("en_US"));
+            assert_eq!(
+                system_configuration.char_set_encoding.as_deref(),
+                Some("UTF-8")
+            );
+            assert_eq!(
+                system_configuration.process_name.as_deref(),
+                Some("odbc-test")
+            );
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_driver_system_configuration_allows_null_optional_fields() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_driver_system_configuration(
+                    config,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let system_configuration = config
+                .as_ref()
+                .unwrap()
+                .driver_system_configuration
+                .as_ref()
+                .expect("driver system configuration");
+            assert_eq!(system_configuration, &DriverSystemConfiguration::default());
+
             kernel_session_config_free(config);
         }
     }
