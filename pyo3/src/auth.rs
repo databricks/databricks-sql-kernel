@@ -52,9 +52,10 @@ pub(crate) struct OAuthParams {
     pub token_url: Option<String>,
     pub redirect_port: Option<u16>,
     /// Candidate U2M redirect ports, tried in order (first free binds).
-    /// When set (non-empty) this takes precedence over `redirect_port` and
-    /// gives the busy-port fallback the Thrift connector has across its
-    /// registered range (`databricks-sql-python` → 8020‑8024).
+    /// Mutually exclusive with `redirect_port` — setting both is rejected
+    /// in [`build_auth_config`]. When set (non-empty) it gives the busy-port
+    /// fallback the Thrift connector has across its registered range
+    /// (`databricks-sql-python` → 8020‑8024).
     pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
@@ -278,11 +279,13 @@ fn build_auth_config_inner(
                 None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
                 None => None,
             };
-            // Collapse the two Python knobs into the kernel's single
-            // `redirect_ports` list. An explicit `redirect_ports` (the
-            // connector's registered range, for busy-port fallback) wins;
-            // otherwise the single `redirect_port` (caller-supplied or the
-            // pinned databricks-sql-python default) becomes a one-element list.
+            // Collapse the two (mutually exclusive) Python knobs into the
+            // kernel's single `redirect_ports` list. At most one is set here
+            // (both-set is rejected above): an explicit `redirect_ports` (the
+            // connector's registered range, for busy-port fallback) passes
+            // through; otherwise the single `redirect_port` (caller-supplied or
+            // the pinned databricks-sql-python default) becomes a one-element
+            // list.
             let redirect_ports = oauth
                 .redirect_ports
                 .or_else(|| redirect_port.map(|p| vec![p]));
