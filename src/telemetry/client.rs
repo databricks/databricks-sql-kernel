@@ -77,11 +77,16 @@ impl TelemetryClient {
         let exporter = Arc::clone(&self.exporter);
         let timeout = self.close_flush_timeout;
         let _ = tokio::time::timeout(timeout, async move {
-            for handle in in_flight {
-                let _ = handle.await;
-            }
+            // Export the freshly-drained `pending` batch first: on close this is
+            // the connection-lifecycle events (buffered `CREATE_SESSION` plus the
+            // just-emitted `DELETE_SESSION`) and is the freshest, most important
+            // data. Joining in-flight handles first could consume the whole
+            // timeout and silently drop this batch.
             if !batch.is_empty() {
                 export_batch(exporter, batch).await;
+            }
+            for handle in in_flight {
+                let _ = handle.await;
             }
         })
         .await;
