@@ -1059,12 +1059,26 @@ fn result_to_post_process_options(
 }
 
 /// Kernel default U2M OAuth client id. The default `{client_id, scopes,
-/// redirect_port}` form one coupled bundle (each OAuth app is registered with
-/// its own redirect URI): the `databricks-sql-connector` app, shared by the
+/// redirect_ports}` form one coupled bundle (each OAuth app is registered with
+/// its own redirect URIs): the `databricks-sql-connector` app, shared by the
 /// Node and Go drivers. See PECOBLR-4039.
 const DEFAULT_U2M_CLIENT_ID: &str = "databricks-sql-connector";
-/// Redirect port registered for [`DEFAULT_U2M_CLIENT_ID`].
-const DEFAULT_U2M_REDIRECT_PORT: u16 = 8030;
+/// Default candidate redirect ports for [`DEFAULT_U2M_CLIENT_ID`], tried in
+/// order — the kernel binds the first free one, so a bare-default consumer
+/// (Node, Go, ODBC, bare Rust) gets busy-port fallback when 8030 is occupied
+/// (a stale prior listener, or a second concurrent U2M connection), instead of
+/// failing outright.
+///
+/// Why a contiguous 8030–8034 window is safe even though only 8030 is the
+/// "canonical" registered port: [`DEFAULT_U2M_CLIENT_ID`] authenticates via
+/// Databricks in-house OAuth, which normalizes loopback redirect URIs by
+/// **dropping the port before comparison** (RFC 8252 §7.3 — "an exact match is
+/// required except for the port component"). So every `http://localhost:{port}`
+/// is accepted for this client regardless of the specific port, and no
+/// per-port app registration is needed. (Validated live: :8030, plus arbitrary
+/// ports, all complete the flow.) The first port is the canonical 8030 so the
+/// common case is unchanged.
+const DEFAULT_U2M_REDIRECT_PORTS: [u16; 5] = [8030, 8031, 8032, 8033, 8034];
 
 /// Scopes registered for [`DEFAULT_U2M_CLIENT_ID`] (`sql offline_access`).
 fn default_u2m_scopes() -> Vec<String> {
@@ -1076,15 +1090,24 @@ fn default_u2m_scopes() -> Vec<String> {
 /// Extracted from [`build_auth_provider`] so the defaulting is unit-testable
 /// without OIDC discovery. Because the bundle is coupled, a caller overriding
 /// `client_id` for a different OAuth app must also supply the matching
-/// `redirect_port` (and usually `scopes`).
+/// `redirect_ports` (and usually `scopes`).
 fn resolve_u2m_bundle(
     client_id: Option<&str>,
-    redirect_port: Option<u16>,
+    redirect_ports: Option<&[u16]>,
     scopes: Option<&[String]>,
-) -> (String, u16, Vec<String>) {
+) -> (String, Vec<u16>, Vec<String>) {
+    // A non-empty `redirect_ports` list (the caller's registered redirect URIs,
+    // one or many) is used verbatim; otherwise the kernel default. Every entry
+    // must be a registered redirect URI of the chosen OAuth app — the
+    // {client_id, ports, scopes} bundle stays coupled. Single-port bindings
+    // forward a one-element list.
+    let ports = match redirect_ports {
+        Some(ports) if !ports.is_empty() => ports.to_vec(),
+        _ => DEFAULT_U2M_REDIRECT_PORTS.to_vec(),
+    };
     (
         client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
-        redirect_port.unwrap_or(DEFAULT_U2M_REDIRECT_PORT),
+        ports,
         scopes
             .map(<[String]>::to_vec)
             .unwrap_or_else(default_u2m_scopes),
@@ -1157,7 +1180,7 @@ async fn build_base_auth_provider(
         }
         AuthConfig::OAuthU2M {
             client_id,
-            redirect_port,
+            redirect_ports,
             scopes,
             token_url_override,
             callback_timeout,
@@ -1167,8 +1190,13 @@ async fn build_base_auth_provider(
             // Fill the coupled kernel default bundle for any unset field
             // (databricks-sql-connector / sql offline_access / 8030). Consumers
             // using a different app override the whole bundle. See PECOBLR-4039.
-            let (client_id, redirect_port, scopes) =
-                resolve_u2m_bundle(client_id.as_deref(), *redirect_port, scopes.as_deref());
+            // `callback_ports` is the caller's registered redirect range (or a
+            // single-element default); the flow binds the first free one.
+            let (client_id, callback_ports, scopes) = resolve_u2m_bundle(
+                client_id.as_deref(),
+                redirect_ports.as_deref(),
+                scopes.as_deref(),
+            );
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
             // `Some(passphrase)` enables the on-disk cache, `None` disables
             // it. When the cache is on but the caller supplied no passphrase,
@@ -1184,7 +1212,7 @@ async fn build_base_auth_provider(
                 &client_id,
                 http_client,
                 scopes,
-                redirect_port,
+                callback_ports,
                 timeout,
                 token_url_override.clone(),
                 cache_policy,
@@ -1206,10 +1234,11 @@ mod u2m_default_tests {
     #[test]
     fn u2m_default_bundle_is_connector_sql_8030() {
         // Caller omits everything → kernel default databricks-sql-connector
-        // app bundle (PECOBLR-4039).
-        let (client_id, port, scopes) = resolve_u2m_bundle(None, None, None);
+        // app bundle (PECOBLR-4039), with the full default candidate-port
+        // window so bare-default consumers get busy-port fallback too.
+        let (client_id, ports, scopes) = resolve_u2m_bundle(None, None, None);
         assert_eq!(client_id, "databricks-sql-connector");
-        assert_eq!(port, 8030);
+        assert_eq!(ports, vec![8030, 8031, 8032, 8033, 8034]);
         assert_eq!(
             scopes,
             vec!["sql".to_string(), "offline_access".to_string()]
@@ -1219,13 +1248,34 @@ mod u2m_default_tests {
     #[test]
     fn u2m_bundle_honours_caller_overrides() {
         // A consumer overriding for a different OAuth app supplies the whole
-        // coupled bundle; each field is threaded through verbatim.
+        // coupled bundle; each field is threaded through verbatim. A single
+        // fixed port arrives as a one-element list.
         let custom = vec!["all-apis".to_string()];
-        let (client_id, port, scopes) =
-            resolve_u2m_bundle(Some("databricks-sql-python"), Some(8020), Some(&custom));
+        let (client_id, ports, scopes) =
+            resolve_u2m_bundle(Some("databricks-sql-python"), Some(&[8020]), Some(&custom));
         assert_eq!(client_id, "databricks-sql-python");
-        assert_eq!(port, 8020);
+        assert_eq!(ports, vec![8020]);
         assert_eq!(scopes, custom);
+    }
+
+    #[test]
+    fn u2m_bundle_uses_the_full_redirect_ports_list() {
+        // A multi-port list (the connector's registered range) is used verbatim
+        // for busy-port fallback.
+        let (_, ports, _) = resolve_u2m_bundle(None, Some(&[9001, 9002, 9003]), None);
+        assert_eq!(ports, vec![9001, 9002, 9003]);
+    }
+
+    #[test]
+    fn u2m_bundle_empty_or_none_ports_use_default() {
+        // For the default client, both an empty list and None fall back to the
+        // kernel default port window (first is the canonical 8030; the rest are
+        // fallback candidates).
+        let default = vec![8030, 8031, 8032, 8033, 8034];
+        let (_, ports_empty, _) = resolve_u2m_bundle(None, Some(&[]), None);
+        assert_eq!(ports_empty, default);
+        let (_, ports_none, _) = resolve_u2m_bundle(None, None, None);
+        assert_eq!(ports_none, default);
     }
 }
 

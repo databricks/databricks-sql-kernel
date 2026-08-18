@@ -290,7 +290,7 @@ impl TokenCacheConfig {
 /// Optional fields default to sensible values when set to `None`:
 /// - OAuth scopes default to `["all-apis"]` for M2M and
 ///   `["sql", "offline_access"]` for U2M.
-/// - U2M `redirect_port` defaults to `8030`.
+/// - U2M `redirect_ports` defaults to the `[8030, 8031, 8032, 8033, 8034]` window.
 /// - U2M `client_id` defaults to `"databricks-sql-connector"`.
 /// - `token_url_override` defaults to OIDC discovery against the
 ///   workspace host.
@@ -320,18 +320,26 @@ pub enum AuthConfig {
     },
 
     /// OAuth 2.0 user-to-machine (authorization code + PKCE, browser
-    /// flow). The kernel spins up a localhost listener on
-    /// `redirect_port`, opens the user's browser to the workspace's
-    /// authorize endpoint, and exchanges the returned code for a
-    /// token.
+    /// flow). The kernel spins up a localhost listener on the first
+    /// free `redirect_ports` candidate, opens the user's browser to
+    /// the workspace's authorize endpoint, and exchanges the returned
+    /// code for a token.
     OAuthU2M {
         /// OAuth client ID. `None` → `"databricks-sql-connector"` (the
         /// default OAuth app, shared by the Node and Go drivers).
         client_id: Option<String>,
-        /// Localhost port for the OAuth callback listener. `None` →
-        /// `8030` (the redirect port registered for
-        /// `databricks-sql-connector`).
-        redirect_port: Option<u16>,
+        /// Candidate localhost callback ports, tried in order; the first
+        /// one free is bound (busy-port fallback). `None`/empty → the
+        /// `[8030, 8031, 8032, 8033, 8034]` default window (the
+        /// `databricks-sql-connector` app accepts any loopback port).
+        /// A single fixed port is just a one-element list (`vec![p]`) —
+        /// which is how the single-port bindings (C ABI, N-API) forward
+        /// their one port. Every entry must be a registered redirect URI
+        /// of the OAuth app; a multi-port list mirrors the Thrift
+        /// connector's registered redirect ports (`databricks-sql-python`
+        /// → the discrete set `8020`/`8025`, not a contiguous range) for
+        /// busy-port fallback.
+        redirect_ports: Option<Vec<u16>>,
         /// OAuth scopes. `None` → `["sql", "offline_access"]`
         /// (the `offline_access` scope is required to receive a
         /// refresh token, which the kernel caches and refreshes
@@ -425,13 +433,19 @@ impl AuthConfig {
 
     /// Construct a [`AuthConfig::OAuthU2M`] from optional fields. All
     /// U2M fields are optional — the kernel fills `databricks-sql-connector` /
-    /// port 8030 / `sql offline_access` when omitted — so this performs no
+    /// the `[8030, 8031, 8032, 8033, 8034]` port window / `sql offline_access`
+    /// when omitted — so this performs no
     /// validation and exists for symmetry with [`AuthConfig::pat`] /
     /// [`AuthConfig::oauth_m2m`] so bindings can forward optionals
     /// uniformly, including the federation client id.
+    ///
+    /// `redirect_ports` is the ordered list of candidate callback ports
+    /// (first free binds). Single-port callers pass a one-element list
+    /// (`Some(vec![port])`); `None`/empty falls back to the
+    /// `[8030, 8031, 8032, 8033, 8034]` default window.
     pub fn oauth_u2m(
         client_id: Option<String>,
-        redirect_port: Option<u16>,
+        redirect_ports: Option<Vec<u16>>,
         scopes: Option<Vec<String>>,
         token_url_override: Option<String>,
         callback_timeout: Option<std::time::Duration>,
@@ -440,7 +454,7 @@ impl AuthConfig {
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
-            redirect_port,
+            redirect_ports,
             scopes,
             token_url_override,
             callback_timeout,
@@ -518,14 +532,14 @@ impl std::fmt::Debug for AuthConfig {
                 .finish(),
             Self::OAuthU2M {
                 client_id,
-                redirect_port,
+                redirect_ports,
                 scopes,
                 identity_federation_client_id,
                 ..
             } => f
                 .debug_struct("OAuthU2M")
                 .field("client_id", client_id)
-                .field("redirect_port", redirect_port)
+                .field("redirect_ports", redirect_ports)
                 .field("scopes", scopes)
                 .field(
                     "identity_federation_client_id",
@@ -1680,6 +1694,37 @@ mod tests {
     }
 
     #[test]
+    fn oauth_u2m_none_ports_stays_none() {
+        // No ports supplied → redirect_ports is None (session fills the default).
+        let auth = AuthConfig::oauth_u2m(None, None, None, None, None, None, None);
+        match auth {
+            AuthConfig::OAuthU2M { redirect_ports, .. } => assert_eq!(redirect_ports, None),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_u2m_carries_redirect_ports_list() {
+        // A caller (e.g. the connector's registered range) forwards the whole
+        // list; a single-port binding forwards a one-element list.
+        let auth = AuthConfig::oauth_u2m(
+            None,
+            Some(vec![8020, 8021, 8022]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+        match auth {
+            AuthConfig::OAuthU2M { redirect_ports, .. } => {
+                assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022]));
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn auth_variants_carry_identity_federation_client_id() {
         let auths = [
             AuthConfig::Pat {
@@ -1695,7 +1740,7 @@ mod tests {
             },
             AuthConfig::OAuthU2M {
                 client_id: None,
-                redirect_port: None,
+                redirect_ports: None,
                 scopes: None,
                 token_url_override: None,
                 callback_timeout: None,

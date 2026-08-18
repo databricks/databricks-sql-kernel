@@ -67,7 +67,7 @@ impl Session {
     ///   `client_id` + `client_secret` (optional `oauth_scopes`,
     ///   `token_url`).
     /// - `"oauth-u2m"`: browser authorization-code + PKCE flow
-    ///   (optional `client_id`, `redirect_port`, `oauth_scopes`,
+    ///   (optional `client_id`, `redirect_ports`, `oauth_scopes`,
     ///   `token_url`, `oauth_callback_timeout_secs`).
     ///
     /// OAuth is kernel-owned: the kernel acquires and transparently
@@ -120,7 +120,7 @@ impl Session {
         client_secret=None,
         oauth_scopes=None,
         token_url=None,
-        redirect_port=None,
+        redirect_ports=None,
         oauth_callback_timeout_secs=None,
         identity_federation_client_id=None,
         tls_ca_cert=None,
@@ -150,7 +150,7 @@ impl Session {
         client_secret: Option<String>,
         oauth_scopes: Option<Vec<String>>,
         token_url: Option<String>,
-        redirect_port: Option<u16>,
+        redirect_ports: Option<Vec<u16>>,
         oauth_callback_timeout_secs: Option<u64>,
         identity_federation_client_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
@@ -197,7 +197,7 @@ impl Session {
             client_secret,
             scopes: oauth_scopes,
             token_url,
-            redirect_port,
+            redirect_ports,
             callback_timeout_secs: oauth_callback_timeout_secs,
             identity_federation_client_id,
         };

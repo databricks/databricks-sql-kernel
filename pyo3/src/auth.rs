@@ -20,7 +20,7 @@
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
 //!   `client_id` + `client_secret`, optional `scopes` / `token_url`.
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
-//!   optional `client_id` / `redirect_port` / `scopes` / `token_url` /
+//!   optional `client_id` / `redirect_ports` / `scopes` / `token_url` /
 //!   `oauth_callback_timeout_secs`.
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
@@ -50,7 +50,16 @@ pub(crate) struct OAuthParams {
     pub client_secret: Option<String>,
     pub scopes: Option<Vec<String>>,
     pub token_url: Option<String>,
-    pub redirect_port: Option<u16>,
+    /// Candidate U2M redirect ports, tried in order (first free binds). A
+    /// single fixed port is just a one-element list (`vec![port]`); a
+    /// multi-port list gives the busy-port fallback the Thrift connector has
+    /// across its registered ports (`databricks-sql-python` → the discrete
+    /// set `8020`/`8025`, not a contiguous range).
+    /// `None` → the databricks-sql-python default (8020) when the
+    /// default client is in use, else the kernel default. At the pyo3
+    /// boundary an explicit *empty* list is rejected (see
+    /// [`build_auth_config`]), not defaulted.
+    pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
 }
@@ -167,14 +176,15 @@ fn build_auth_config_inner(
         "oauth-u2m" => {
             // Browser flow: every field is optional and `None` lets the
             // kernel apply its defaults (client_id "databricks-sql-connector",
-            // redirect_port 8030, scopes ["sql", "offline_access"],
+            // redirect port 8030, scopes ["sql", "offline_access"],
             // callback timeout 120s). But a *present-yet-degenerate*
             // value is a footgun the kernel can't distinguish from an
             // intentional setting, so reject those here:
             //   - client_id="" would bypass the default and bind an
             //     empty client id;
-            //   - redirect_port=0 binds an OS-assigned ephemeral port,
-            //     which can't match the IdP's static redirect_uri;
+            //   - an empty redirect_ports list, or a 0 entry (which binds an
+            //     OS-assigned ephemeral port that can't match the IdP's
+            //     static redirect_uri);
             //   - callback_timeout_secs=0 means "time out immediately",
             //     not "wait forever" (a common cross-system confusion).
             if matches!(oauth.client_id.as_deref(), Some("")) {
@@ -184,19 +194,32 @@ fn build_auth_config_inner(
                         .to_owned(),
                 );
             }
-            if oauth.redirect_port == Some(0) {
-                return Err(
-                    "auth_type='oauth-u2m' redirect_port must be non-zero when set \
-                     (a static port the IdP redirect_uri can match); omit it for the default"
-                        .to_owned(),
-                );
-            }
             if oauth.callback_timeout_secs == Some(0) {
                 return Err(
                     "auth_type='oauth-u2m' oauth_callback_timeout_secs must be > 0 when set \
                      (0 would time out the browser flow immediately); omit it for the default"
                         .to_owned(),
                 );
+            }
+            // `redirect_ports` is the ordered list of candidate callback ports
+            // (a single fixed port is just `[port]`). Reject the degenerate
+            // shapes: an empty list carries no port, and a 0 entry binds an
+            // ephemeral port that can't match the IdP's static redirect_uri.
+            if let Some(ports) = oauth.redirect_ports.as_deref() {
+                if ports.is_empty() {
+                    return Err(
+                        "auth_type='oauth-u2m' redirect_ports must be non-empty when set; \
+                         omit it for the default"
+                            .to_owned(),
+                    );
+                }
+                if ports.contains(&0) {
+                    return Err(
+                        "auth_type='oauth-u2m' redirect_ports entries must be non-zero \
+                         (each must be a static port the IdP redirect_uri can match)"
+                            .to_owned(),
+                    );
+                }
             }
             // Default the U2M OAuth client to the Python connector's
             // own registered client (`databricks-sql-python`), NOT the
@@ -234,15 +257,20 @@ fn build_auth_config_inner(
             };
             // Pin the databricks-sql-python app's own redirect port when
             // relying on the default client_id — the kernel default (8030) is
-            // for the databricks-sql-connector app and would mismatch.
-            let redirect_port = match oauth.redirect_port {
-                Some(p) => Some(p),
-                None if !caller_set_client_id => Some(PYSQL_OAUTH_REDIRECT_PORT),
+            // for the databricks-sql-connector app and would mismatch. An
+            // explicit caller list (e.g. the connector's registered range for
+            // busy-port fallback) is used as-is; otherwise, under the default
+            // client, forward the pinned databricks-sql-python port as a
+            // one-element list. A custom client_id with no ports defers to the
+            // kernel (None) — that app owns its own redirect port.
+            let redirect_ports = match oauth.redirect_ports {
+                Some(ports) => Some(ports),
+                None if !caller_set_client_id => Some(vec![PYSQL_OAUTH_REDIRECT_PORT]),
                 None => None,
             };
             Ok(AuthConfig::oauth_u2m(
                 client_id,
-                redirect_port,
+                redirect_ports,
                 scopes,
                 oauth.token_url,
                 oauth.callback_timeout_secs.map(Duration::from_secs),
@@ -395,7 +423,7 @@ mod tests {
         match cfg {
             AuthConfig::OAuthU2M {
                 client_id,
-                redirect_port,
+                redirect_ports,
                 scopes,
                 token_url_override,
                 callback_timeout,
@@ -404,8 +432,10 @@ mod tests {
             } => {
                 assert_eq!(client_id.as_deref(), Some("databricks-sql-python"));
                 // Python bundle pins its own app's registered port (8020),
-                // NOT the kernel default 8030 (databricks-sql-connector).
-                assert_eq!(redirect_port, Some(8020));
+                // NOT the kernel default 8030 (databricks-sql-connector). With
+                // no explicit range, the single pinned port is forwarded as a
+                // one-element candidate list.
+                assert_eq!(redirect_ports, Some(vec![8020]));
                 assert_eq!(
                     scopes,
                     Some(vec!["sql".to_string(), "offline_access".to_string()])
@@ -427,6 +457,59 @@ mod tests {
     }
 
     #[test]
+    fn u2m_redirect_ports_are_forwarded() {
+        // A caller-supplied port range (the connector's registered redirect
+        // URIs) is carried through onto the config for busy-port fallback.
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                client_id: Some("databricks-sql-python".to_string()),
+                redirect_ports: Some(vec![8020, 8021, 8022, 8023, 8024]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M { redirect_ports, .. } => {
+                assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022, 8023, 8024]));
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_empty_redirect_ports_rejected() {
+        let err = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("redirect_ports must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn u2m_zero_in_redirect_ports_rejected() {
+        let err = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![8020, 0]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("non-zero"), "got: {err}");
+    }
+
+    #[test]
     fn u2m_explicit_client_id_overrides_default() {
         let cfg = build_auth_config_inner(
             "oauth-u2m",
@@ -441,7 +524,7 @@ mod tests {
             AuthConfig::OAuthU2M {
                 client_id,
                 scopes,
-                redirect_port,
+                redirect_ports,
                 ..
             } => {
                 assert_eq!(client_id.as_deref(), Some("my-custom-app"));
@@ -449,7 +532,7 @@ mod tests {
                 // bundle's defaults — a custom app owns its own scopes and
                 // redirect port, so both defer to the kernel (None).
                 assert!(scopes.is_none());
-                assert!(redirect_port.is_none());
+                assert!(redirect_ports.is_none());
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
@@ -486,7 +569,7 @@ mod tests {
             "oauth-u2m",
             None,
             OAuthParams {
-                redirect_port: Some(9999),
+                redirect_ports: Some(vec![9999]),
                 callback_timeout_secs: Some(300),
                 identity_federation_client_id: Some("federation-client".into()),
                 ..Default::default()
@@ -495,12 +578,13 @@ mod tests {
         .unwrap();
         match cfg {
             AuthConfig::OAuthU2M {
-                redirect_port,
+                redirect_ports,
                 callback_timeout,
                 identity_federation_client_id,
                 ..
             } => {
-                assert_eq!(redirect_port, Some(9999));
+                // The single caller port is forwarded as a one-element list.
+                assert_eq!(redirect_ports, Some(vec![9999]));
                 assert_eq!(callback_timeout, Some(Duration::from_secs(300)));
                 assert_eq!(
                     identity_federation_client_id.as_deref(),
@@ -525,20 +609,6 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("client_id must be non-empty"), "{err}");
-    }
-
-    #[test]
-    fn u2m_rejects_zero_redirect_port() {
-        let err = build_auth_config_inner(
-            "oauth-u2m",
-            None,
-            OAuthParams {
-                redirect_port: Some(0),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("redirect_port must be non-zero"), "{err}");
     }
 
     #[test]

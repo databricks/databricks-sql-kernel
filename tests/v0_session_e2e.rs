@@ -123,7 +123,7 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
         .http_path(host, http_path)
         .auth(AuthConfig::OAuthU2M {
             client_id: None,
-            redirect_port: None,
+            redirect_ports: None,
             scopes: None,
             token_url_override: None,
             callback_timeout: None,
@@ -139,6 +139,61 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
         .open()
         .await
         .expect("Session::open with OAuthU2M should succeed");
+
+    assert!(!session.session_id().is_empty());
+    session.close().await.expect("close()");
+}
+
+// PECOBLR-4144: prove the redirect-port busy-port fallback end-to-end.
+//
+// Databricks in-house OAuth accepts any loopback redirect port for the
+// databricks-sql-python client — it drops the port from `http://localhost`
+// redirect URIs before comparison, per RFC 8252 — so binding a different port
+// than the first candidate still completes the flow. We occupy 8020 so the
+// kernel's `new_first_free` must skip it and bind the next candidate (8025);
+// the browser then redirects to http://localhost:8025 and the flow still
+// completes. Before this change the kernel took a single port and would have
+// failed outright when 8020 was busy.
+//
+// Manual/interactive: opens a browser. Run with:
+//   DATABRICKS_HOST=... DATABRICKS_HTTP_PATH=... DATABRICKS_RUN_U2M=1 \
+//     ~/.cargo/bin/cargo test --test v0_session_e2e -- --ignored \
+//     open_with_oauth_u2m_falls_back_past_busy_port --nocapture
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn open_with_oauth_u2m_falls_back_past_busy_port() {
+    if env_var("DATABRICKS_RUN_U2M").is_none() {
+        eprintln!("skipping U2M fallback test — set DATABRICKS_RUN_U2M=1 to run (opens browser)");
+        return;
+    }
+    let (host, http_path) = require_host_and_path();
+
+    // Occupy 8020 for the duration of the test so the callback server cannot
+    // bind it and must fall back to the next candidate (8025). A plain std
+    // listener on 127.0.0.1:8020 is enough to trigger AddrInUse.
+    let _occupied = std::net::TcpListener::bind("127.0.0.1:8020")
+        .expect("failed to occupy port 8020 for the fallback test");
+    eprintln!("port 8020 occupied; expecting the browser to redirect to http://localhost:8025");
+
+    let session = Session::builder()
+        .http_path(host, http_path)
+        .auth(AuthConfig::OAuthU2M {
+            // databricks-sql-python; any loopback port is accepted (RFC 8252).
+            client_id: Some("databricks-sql-python".to_string()),
+            redirect_ports: Some(vec![8020, 8025]),
+            scopes: Some(vec!["sql".to_string(), "offline_access".to_string()]),
+            token_url_override: None,
+            callback_timeout: None,
+            // Disable the on-disk cache so the browser flow actually runs.
+            token_cache: Some(databricks_sql_kernel::TokenCacheConfig {
+                enabled: false,
+                passphrase: None,
+            }),
+            identity_federation_client_id: None,
+        })
+        .open()
+        .await
+        .expect("Session::open should succeed via the 8025 fallback");
 
     assert!(!session.session_id().is_empty());
     session.close().await.expect("close()");

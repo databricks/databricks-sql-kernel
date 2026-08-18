@@ -965,7 +965,10 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     scopes,
                 } => AuthConfig::oauth_u2m(
                     client_id,
-                    redirect_port,
+                    // The C ABI exposes a single redirect port; forward it as a
+                    // one-element candidate list (the kernel binds the first
+                    // free port, trivially that one). Keeps the FFI unchanged.
+                    redirect_port.map(|p| vec![p]),
                     scopes.and_then(|s| parse_scopes(&s)),
                     None,
                     None,

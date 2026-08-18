@@ -136,8 +136,8 @@ pub struct AuthorizationCodeProvider {
     http_client: Arc<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis offline_access")
     scopes: Vec<String>,
-    /// Callback server port
-    callback_port: u16,
+    /// Candidate callback-server ports, tried in order (first free binds).
+    callback_ports: Vec<u16>,
     /// Callback timeout
     callback_timeout: Duration,
     /// Whether to open browser automatically (set to false in tests)
@@ -239,7 +239,7 @@ impl AuthorizationCodeProvider {
             client_id,
             http_client,
             scopes,
-            callback_port,
+            vec![callback_port],
             callback_timeout,
             None, // No token_endpoint override
             None, // On-disk cache disabled: no passphrase available here
@@ -263,7 +263,7 @@ impl AuthorizationCodeProvider {
         client_id: &str,
         http_client: Arc<DatabricksHttpClient>,
         scopes: Vec<String>,
-        callback_port: u16,
+        callback_ports: Vec<u16>,
         callback_timeout: Duration,
         token_endpoint_override: Option<String>,
         cache_passphrase: Option<String>,
@@ -308,7 +308,7 @@ impl AuthorizationCodeProvider {
             token_store,
             http_client,
             scopes,
-            callback_port,
+            callback_ports,
             callback_timeout,
             open_browser: true,
             cache_passphrase,
@@ -359,7 +359,7 @@ impl AuthProvider for AuthorizationCodeProvider {
         let token_endpoint = self.token_endpoint.clone();
         let auth_endpoint = self.auth_endpoint.clone();
         let scopes = self.scopes.clone();
-        let callback_port = self.callback_port;
+        let callback_ports = self.callback_ports.clone();
         let callback_timeout = self.callback_timeout;
         let open_browser = self.open_browser;
         let http_client = self.http_client.clone();
@@ -479,8 +479,9 @@ impl AuthProvider for AuthorizationCodeProvider {
                     // Generate PKCE challenge
                     let (pkce_challenge, pkce_verifier) = PkceCodeChallenge::new_random_sha256();
 
-                    // Start callback server
-                    let callback_server = CallbackServer::new(callback_port).await?;
+                    // Start callback server, binding the first free candidate
+                    // port (busy-port fallback across the registered range).
+                    let callback_server = CallbackServer::new_first_free(&callback_ports).await?;
                     let redirect_uri = callback_server.redirect_uri();
 
                     // Build OAuth client
@@ -658,7 +659,7 @@ mod tests {
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
-            8020,
+            vec![8020],
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
@@ -711,7 +712,7 @@ mod tests {
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
-            8020,
+            vec![8020],
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
@@ -780,7 +781,7 @@ mod tests {
             "test-client-id",
             http_client,
             vec!["all-apis".to_string(), "offline_access".to_string()],
-            0,                      // Use port 0 to avoid conflicts
+            vec![0],                // Use port 0 to avoid conflicts
             Duration::from_secs(5), // Short timeout for test
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
