@@ -290,7 +290,7 @@ impl TokenCacheConfig {
 /// Optional fields default to sensible values when set to `None`:
 /// - OAuth scopes default to `["all-apis"]` for M2M and
 ///   `["sql", "offline_access"]` for U2M.
-/// - U2M `redirect_port` defaults to `8030`.
+/// - U2M `redirect_ports` defaults to `[8030]`.
 /// - U2M `client_id` defaults to `"databricks-sql-connector"`.
 /// - `token_url_override` defaults to OIDC discovery against the
 ///   workspace host.
@@ -320,10 +320,10 @@ pub enum AuthConfig {
     },
 
     /// OAuth 2.0 user-to-machine (authorization code + PKCE, browser
-    /// flow). The kernel spins up a localhost listener on
-    /// `redirect_port`, opens the user's browser to the workspace's
-    /// authorize endpoint, and exchanges the returned code for a
-    /// token.
+    /// flow). The kernel spins up a localhost listener on the first
+    /// free `redirect_ports` candidate, opens the user's browser to
+    /// the workspace's authorize endpoint, and exchanges the returned
+    /// code for a token.
     OAuthU2M {
         /// OAuth client ID. `None` → `"databricks-sql-connector"` (the
         /// default OAuth app, shared by the Node and Go drivers).
