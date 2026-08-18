@@ -121,6 +121,7 @@ impl Session {
         oauth_scopes=None,
         token_url=None,
         redirect_port=None,
+        redirect_ports=None,
         oauth_callback_timeout_secs=None,
         identity_federation_client_id=None,
         tls_ca_cert=None,
@@ -151,6 +152,7 @@ impl Session {
         oauth_scopes: Option<Vec<String>>,
         token_url: Option<String>,
         redirect_port: Option<u16>,
+        redirect_ports: Option<Vec<u16>>,
         oauth_callback_timeout_secs: Option<u64>,
         identity_federation_client_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
@@ -198,6 +200,7 @@ impl Session {
             scopes: oauth_scopes,
             token_url,
             redirect_port,
+            redirect_ports,
             callback_timeout_secs: oauth_callback_timeout_secs,
             identity_federation_client_id,
         };

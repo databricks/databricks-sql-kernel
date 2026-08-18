@@ -125,16 +125,90 @@ impl CallbackServer {
     ///
     /// Returns `io()` error if the server cannot bind to the specified port.
     pub async fn new(port: u16) -> Result<Self> {
-        let addr: SocketAddr = format!("127.0.0.1:{}", port).parse().map_err(|e| {
-            Error::invalid_argument().message(format!("Invalid port number {}: {}", port, e))
-        })?;
-
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
+        let listener = Self::bind(port).await.map_err(|e| {
             Error::io()
-                .message(format!("Failed to bind callback server to {}: {}", addr, e))
+                .message(format!(
+                    "Failed to bind callback server to 127.0.0.1:{}: {}",
+                    port, e
+                ))
                 .context("OAuth callback server")
         })?;
+        Self::from_listener(listener)
+    }
 
+    /// Creates a callback server on the first bindable port in `ports`.
+    ///
+    /// Tries each candidate port in order and keeps the first one that binds,
+    /// skipping ports already in use (`AddrInUse`) — the same busy-port
+    /// tolerance the Thrift connector's `OAuthManager` provides by iterating its
+    /// registered redirect-URI range (e.g. `databricks-sql-python` → 8020‑8024).
+    /// The kernel's single-port U2M API otherwise fails outright when its one
+    /// port is occupied by a stale listener or a second concurrent connection.
+    ///
+    /// [`redirect_uri`](Self::redirect_uri) reflects whichever port actually
+    /// bound, so the OAuth `redirect_uri` matches automatically — every port a
+    /// caller passes must therefore be a registered redirect URI of its OAuth
+    /// app.
+    ///
+    /// # Arguments
+    ///
+    /// * `ports` - Candidate ports to try, in preference order (must be non-empty).
+    ///
+    /// # Errors
+    ///
+    /// - `invalid_argument` if `ports` is empty.
+    /// - `io()` if a non-`AddrInUse` bind error occurs (returned immediately,
+    ///   not retried), or if every candidate port is already in use.
+    pub async fn new_in_range(ports: &[u16]) -> Result<Self> {
+        if ports.is_empty() {
+            return Err(Error::invalid_argument()
+                .message("CallbackServer::new_in_range requires at least one candidate port"));
+        }
+
+        let mut last_in_use: Option<std::io::Error> = None;
+        for &port in ports {
+            match Self::bind(port).await {
+                Ok(listener) => return Self::from_listener(listener),
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => {
+                    crate::klog::debug!("Callback port {} is in use, trying next", port);
+                    last_in_use = Some(e);
+                }
+                // A non-"address in use" failure (permission denied, etc.) is not
+                // something the next port would fix — surface it immediately,
+                // mirroring the Thrift loop which only continues on EADDRINUSE.
+                Err(e) => {
+                    return Err(Error::io()
+                        .message(format!(
+                            "Failed to bind callback server to 127.0.0.1:{}: {}",
+                            port, e
+                        ))
+                        .context("OAuth callback server"));
+                }
+            }
+        }
+
+        Err(Error::io()
+            .message(format!(
+                "All candidate callback ports are in use: {:?}{}",
+                ports,
+                last_in_use
+                    .map(|e| format!(" (last error: {})", e))
+                    .unwrap_or_default()
+            ))
+            .context("OAuth callback server"))
+    }
+
+    /// Binds a `TcpListener` on `127.0.0.1:{port}`, returning the raw
+    /// `std::io::Error` so callers can distinguish `AddrInUse` (retryable across
+    /// a port range) from other failures.
+    async fn bind(port: u16) -> std::io::Result<TcpListener> {
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        TcpListener::bind(addr).await
+    }
+
+    /// Wraps a bound listener in a running `CallbackServer` (reads the actual
+    /// bound port, opens the result channel, spawns the accept task).
+    fn from_listener(listener: TcpListener) -> Result<Self> {
         // Get the actual port (in case port 0 was specified for automatic assignment)
         let actual_port = listener
             .local_addr()
@@ -636,5 +710,72 @@ mod tests {
             .parse()
             .unwrap();
         assert!(port > 0, "Expected a non-zero port, got: {}", port);
+    }
+
+    #[tokio::test]
+    async fn test_new_in_range_empty_is_error() {
+        let result = CallbackServer::new_in_range(&[]).await;
+        assert!(result.is_err(), "empty port list should be rejected");
+    }
+
+    #[tokio::test]
+    async fn test_new_in_range_single_port_binds() {
+        // A one-element range behaves like new(0): binds an OS-assigned port.
+        let server = CallbackServer::new_in_range(&[0])
+            .await
+            .expect("should bind the single candidate port");
+        assert!(
+            server.redirect_uri().starts_with("http://localhost:"),
+            "unexpected redirect_uri: {}",
+            server.redirect_uri()
+        );
+        assert!(server.port > 0);
+    }
+
+    #[tokio::test]
+    async fn test_new_in_range_skips_busy_port() {
+        // Occupy a port, then offer it as the first candidate followed by 0
+        // (OS-assigned, always bindable). The server must skip the busy port
+        // and bind the next candidate instead.
+        let occupied = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("failed to occupy a port");
+        let busy_port = occupied.local_addr().unwrap().port();
+
+        let server = CallbackServer::new_in_range(&[busy_port, 0])
+            .await
+            .expect("should fall back past the busy port");
+
+        assert_ne!(
+            server.port, busy_port,
+            "server should not have bound the occupied port {}",
+            busy_port
+        );
+        assert!(server.port > 0);
+        // redirect_uri must reflect the port that actually bound.
+        assert_eq!(
+            server.redirect_uri(),
+            format!("http://localhost:{}", server.port)
+        );
+    }
+
+    #[tokio::test]
+    async fn test_new_in_range_all_busy_is_error() {
+        // Occupy two ports and offer only those two — all candidates are busy.
+        let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let p1 = l1.local_addr().unwrap().port();
+        let p2 = l2.local_addr().unwrap().port();
+
+        // Avoid unwrap_err(): CallbackServer (the Ok type) is not Debug.
+        let msg = match CallbackServer::new_in_range(&[p1, p2]).await {
+            Ok(_) => panic!("all candidate ports busy should be an error"),
+            Err(e) => format!("{:?}", e),
+        };
+        assert!(
+            msg.contains("in use"),
+            "error should mention ports in use: {}",
+            msg
+        );
     }
 }

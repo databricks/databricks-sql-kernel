@@ -1080,11 +1080,21 @@ fn default_u2m_scopes() -> Vec<String> {
 fn resolve_u2m_bundle(
     client_id: Option<&str>,
     redirect_port: Option<u16>,
+    redirect_ports: Option<&[u16]>,
     scopes: Option<&[String]>,
-) -> (String, u16, Vec<String>) {
+) -> (String, Vec<u16>, Vec<String>) {
+    // Port precedence: an explicit, non-empty `redirect_ports` list (the
+    // busy-port-fallback range) wins; otherwise the single `redirect_port`;
+    // otherwise the kernel default. Every entry must be a registered redirect
+    // URI of the chosen OAuth app — the {client_id, ports, scopes} bundle stays
+    // coupled.
+    let ports = match redirect_ports {
+        Some(ports) if !ports.is_empty() => ports.to_vec(),
+        _ => vec![redirect_port.unwrap_or(DEFAULT_U2M_REDIRECT_PORT)],
+    };
     (
         client_id.unwrap_or(DEFAULT_U2M_CLIENT_ID).to_string(),
-        redirect_port.unwrap_or(DEFAULT_U2M_REDIRECT_PORT),
+        ports,
         scopes
             .map(<[String]>::to_vec)
             .unwrap_or_else(default_u2m_scopes),
@@ -1158,6 +1168,7 @@ async fn build_base_auth_provider(
         AuthConfig::OAuthU2M {
             client_id,
             redirect_port,
+            redirect_ports,
             scopes,
             token_url_override,
             callback_timeout,
@@ -1167,8 +1178,14 @@ async fn build_base_auth_provider(
             // Fill the coupled kernel default bundle for any unset field
             // (databricks-sql-connector / sql offline_access / 8030). Consumers
             // using a different app override the whole bundle. See PECOBLR-4039.
-            let (client_id, redirect_port, scopes) =
-                resolve_u2m_bundle(client_id.as_deref(), *redirect_port, scopes.as_deref());
+            // `callback_ports` is the caller's registered redirect range (or a
+            // single-element default); the flow binds the first free one.
+            let (client_id, callback_ports, scopes) = resolve_u2m_bundle(
+                client_id.as_deref(),
+                *redirect_port,
+                redirect_ports.as_deref(),
+                scopes.as_deref(),
+            );
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
             // `Some(passphrase)` enables the on-disk cache, `None` disables
             // it. When the cache is on but the caller supplied no passphrase,
@@ -1184,7 +1201,7 @@ async fn build_base_auth_provider(
                 &client_id,
                 http_client,
                 scopes,
-                redirect_port,
+                callback_ports,
                 timeout,
                 token_url_override.clone(),
                 cache_policy,
@@ -1206,10 +1223,10 @@ mod u2m_default_tests {
     #[test]
     fn u2m_default_bundle_is_connector_sql_8030() {
         // Caller omits everything → kernel default databricks-sql-connector
-        // app bundle (PECOBLR-4039).
-        let (client_id, port, scopes) = resolve_u2m_bundle(None, None, None);
+        // app bundle (PECOBLR-4039). No port range → single default port.
+        let (client_id, ports, scopes) = resolve_u2m_bundle(None, None, None, None);
         assert_eq!(client_id, "databricks-sql-connector");
-        assert_eq!(port, 8030);
+        assert_eq!(ports, vec![8030]);
         assert_eq!(
             scopes,
             vec!["sql".to_string(), "offline_access".to_string()]
@@ -1221,11 +1238,37 @@ mod u2m_default_tests {
         // A consumer overriding for a different OAuth app supplies the whole
         // coupled bundle; each field is threaded through verbatim.
         let custom = vec!["all-apis".to_string()];
-        let (client_id, port, scopes) =
-            resolve_u2m_bundle(Some("databricks-sql-python"), Some(8020), Some(&custom));
+        let (client_id, ports, scopes) = resolve_u2m_bundle(
+            Some("databricks-sql-python"),
+            Some(8020),
+            None,
+            Some(&custom),
+        );
         assert_eq!(client_id, "databricks-sql-python");
-        assert_eq!(port, 8020);
+        assert_eq!(ports, vec![8020]);
         assert_eq!(scopes, custom);
+    }
+
+    #[test]
+    fn u2m_bundle_redirect_ports_take_precedence() {
+        // A non-empty redirect_ports list is the busy-port-fallback range and
+        // wins over the single redirect_port.
+        let (_, ports, _) = resolve_u2m_bundle(None, Some(8020), Some(&[9001, 9002, 9003]), None);
+        assert_eq!(ports, vec![9001, 9002, 9003]);
+    }
+
+    #[test]
+    fn u2m_bundle_empty_redirect_ports_falls_back_to_single_port() {
+        // An empty list is treated as "unset" — fall back to redirect_port.
+        let (_, ports, _) = resolve_u2m_bundle(None, Some(8021), Some(&[]), None);
+        assert_eq!(ports, vec![8021]);
+    }
+
+    #[test]
+    fn u2m_bundle_no_ports_at_all_uses_default() {
+        // Neither redirect_ports nor redirect_port → the kernel default port.
+        let (_, ports, _) = resolve_u2m_bundle(None, None, Some(&[]), None);
+        assert_eq!(ports, vec![8030]);
     }
 }
 

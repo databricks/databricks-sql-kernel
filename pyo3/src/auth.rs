@@ -51,6 +51,11 @@ pub(crate) struct OAuthParams {
     pub scopes: Option<Vec<String>>,
     pub token_url: Option<String>,
     pub redirect_port: Option<u16>,
+    /// Candidate U2M redirect ports, tried in order (first free binds).
+    /// When set (non-empty) this takes precedence over `redirect_port` and
+    /// gives the busy-port fallback the Thrift connector has across its
+    /// registered range (`databricks-sql-python` → 8020‑8024).
+    pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
 }
@@ -198,6 +203,27 @@ fn build_auth_config_inner(
                         .to_owned(),
                 );
             }
+            // `redirect_ports` (the busy-port-fallback range) is caller-supplied
+            // and takes precedence over `redirect_port` downstream. Reject the
+            // degenerate shapes for the same reason as `redirect_port=0`: an
+            // empty list carries no port, and a 0 entry binds an ephemeral port
+            // that can't match the IdP's static redirect_uri.
+            if let Some(ports) = oauth.redirect_ports.as_deref() {
+                if ports.is_empty() {
+                    return Err(
+                        "auth_type='oauth-u2m' redirect_ports must be non-empty when set; \
+                         omit it to use redirect_port or the default"
+                            .to_owned(),
+                    );
+                }
+                if ports.contains(&0) {
+                    return Err(
+                        "auth_type='oauth-u2m' redirect_ports entries must be non-zero \
+                         (each must be a static port the IdP redirect_uri can match)"
+                            .to_owned(),
+                    );
+                }
+            }
             // Default the U2M OAuth client to the Python connector's
             // own registered client (`databricks-sql-python`), NOT the
             // kernel's bare-Rust fallback (`databricks-sql-connector`). This
@@ -255,7 +281,8 @@ fn build_auth_config_inner(
                 // TokenCachePassPhrase — would strengthen it further.
                 None,
                 oauth.identity_federation_client_id,
-            ))
+            )
+            .with_redirect_ports(oauth.redirect_ports))
         }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', 'oauth-u2m'"
@@ -396,6 +423,7 @@ mod tests {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_port,
+                redirect_ports,
                 scopes,
                 token_url_override,
                 callback_timeout,
@@ -406,6 +434,8 @@ mod tests {
                 // Python bundle pins its own app's registered port (8020),
                 // NOT the kernel default 8030 (databricks-sql-connector).
                 assert_eq!(redirect_port, Some(8020));
+                // No range supplied → redirect_ports stays None (single-port).
+                assert_eq!(redirect_ports, None);
                 assert_eq!(
                     scopes,
                     Some(vec!["sql".to_string(), "offline_access".to_string()])
@@ -424,6 +454,59 @@ mod tests {
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn u2m_redirect_ports_are_forwarded() {
+        // A caller-supplied port range (the connector's registered redirect
+        // URIs) is carried through onto the config for busy-port fallback.
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                client_id: Some("databricks-sql-python".to_string()),
+                redirect_ports: Some(vec![8020, 8021, 8022, 8023, 8024]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M { redirect_ports, .. } => {
+                assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022, 8023, 8024]));
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_empty_redirect_ports_rejected() {
+        let err = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("redirect_ports must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn u2m_zero_in_redirect_ports_rejected() {
+        let err = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![8020, 0]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("non-zero"), "got: {err}");
     }
 
     #[test]

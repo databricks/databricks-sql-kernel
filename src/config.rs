@@ -330,8 +330,17 @@ pub enum AuthConfig {
         client_id: Option<String>,
         /// Localhost port for the OAuth callback listener. `None` →
         /// `8030` (the redirect port registered for
-        /// `databricks-sql-connector`).
+        /// `databricks-sql-connector`). Ignored when `redirect_ports`
+        /// is set to a non-empty list.
         redirect_port: Option<u16>,
+        /// Candidate localhost callback ports, tried in order; the first
+        /// one free is bound (busy-port fallback). When `Some` and
+        /// non-empty this takes precedence over `redirect_port`. Every
+        /// port must be a registered redirect URI of the OAuth app —
+        /// this mirrors the Thrift connector's registered range
+        /// (`databricks-sql-python` → 8020‑8024). `None`/empty → fall
+        /// back to `redirect_port` (or the `8030` default).
+        redirect_ports: Option<Vec<u16>>,
         /// OAuth scopes. `None` → `["sql", "offline_access"]`
         /// (the `offline_access` scope is required to receive a
         /// refresh token, which the kernel caches and refreshes
@@ -441,12 +450,27 @@ impl AuthConfig {
         AuthConfig::OAuthU2M {
             client_id,
             redirect_port,
+            redirect_ports: None,
             scopes,
             token_url_override,
             callback_timeout,
             token_cache,
             identity_federation_client_id,
         }
+    }
+
+    /// Attach a list of candidate U2M redirect ports (busy-port fallback).
+    ///
+    /// Additive to [`AuthConfig::oauth_u2m`] so bindings can opt into the
+    /// port range without a constructor signature change. When set to a
+    /// non-empty list, the kernel binds the first free port in order and
+    /// derives the OAuth `redirect_uri` from it — so every port must be a
+    /// registered redirect URI of the OAuth app. A no-op on non-U2M variants.
+    pub fn with_redirect_ports(mut self, ports: Option<Vec<u16>>) -> Self {
+        if let AuthConfig::OAuthU2M { redirect_ports, .. } = &mut self {
+            *redirect_ports = ports;
+        }
+        self
     }
 
     /// SP-wide federation client id attached to the selected base auth flow.
@@ -519,6 +543,7 @@ impl std::fmt::Debug for AuthConfig {
             Self::OAuthU2M {
                 client_id,
                 redirect_port,
+                redirect_ports,
                 scopes,
                 identity_federation_client_id,
                 ..
@@ -526,6 +551,7 @@ impl std::fmt::Debug for AuthConfig {
                 .debug_struct("OAuthU2M")
                 .field("client_id", client_id)
                 .field("redirect_port", redirect_port)
+                .field("redirect_ports", redirect_ports)
                 .field("scopes", scopes)
                 .field(
                     "identity_federation_client_id",
@@ -1680,6 +1706,42 @@ mod tests {
     }
 
     #[test]
+    fn oauth_u2m_defaults_redirect_ports_to_none() {
+        let auth = AuthConfig::oauth_u2m(None, Some(8020), None, None, None, None, None);
+        match auth {
+            AuthConfig::OAuthU2M { redirect_ports, .. } => assert_eq!(redirect_ports, None),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_redirect_ports_sets_the_list_on_u2m() {
+        let auth = AuthConfig::oauth_u2m(None, None, None, None, None, None, None)
+            .with_redirect_ports(Some(vec![8020, 8021, 8022]));
+        match auth {
+            AuthConfig::OAuthU2M {
+                redirect_ports,
+                redirect_port,
+                ..
+            } => {
+                assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022]));
+                // The single-port field is left untouched by the builder.
+                assert_eq!(redirect_port, None);
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn with_redirect_ports_is_noop_on_non_u2m() {
+        // Applying the U2M-only builder to a PAT config must not panic or alter it.
+        let auth = AuthConfig::pat(Some("dapi123".to_string()), None)
+            .unwrap()
+            .with_redirect_ports(Some(vec![8020]));
+        assert!(matches!(auth, AuthConfig::Pat { .. }));
+    }
+
+    #[test]
     fn auth_variants_carry_identity_federation_client_id() {
         let auths = [
             AuthConfig::Pat {
@@ -1696,6 +1758,7 @@ mod tests {
             AuthConfig::OAuthU2M {
                 client_id: None,
                 redirect_port: None,
+                redirect_ports: None,
                 scopes: None,
                 token_url_override: None,
                 callback_timeout: None,
