@@ -1059,8 +1059,8 @@ fn result_to_post_process_options(
 }
 
 /// Kernel default U2M OAuth client id. The default `{client_id, scopes,
-/// redirect_port}` form one coupled bundle (each OAuth app is registered with
-/// its own redirect URI): the `databricks-sql-connector` app, shared by the
+/// redirect_ports}` form one coupled bundle (each OAuth app is registered with
+/// its own redirect URIs): the `databricks-sql-connector` app, shared by the
 /// Node and Go drivers. See PECOBLR-4039.
 const DEFAULT_U2M_CLIENT_ID: &str = "databricks-sql-connector";
 /// Default candidate redirect ports for [`DEFAULT_U2M_CLIENT_ID`], tried in
@@ -1090,7 +1090,7 @@ fn default_u2m_scopes() -> Vec<String> {
 /// Extracted from [`build_auth_provider`] so the defaulting is unit-testable
 /// without OIDC discovery. Because the bundle is coupled, a caller overriding
 /// `client_id` for a different OAuth app must also supply the matching
-/// `redirect_port` (and usually `scopes`).
+/// `redirect_ports` (and usually `scopes`).
 fn resolve_u2m_bundle(
     client_id: Option<&str>,
     redirect_ports: Option<&[u16]>,
