@@ -114,6 +114,18 @@ pub struct KernelSessionConfig {
     ignore_transactions: bool,
     /// SP-wide WIF client id applied to the selected auth mode.
     identity_federation_client_id: Option<String>,
+    /// OAuth token-endpoint override (populated by
+    /// `kernel_session_config_set_oauth_token_endpoint`). Applied as
+    /// `token_url_override` to the selected OAuth mode (M2M or U2M) at build
+    /// time; lets a host point the token exchange at a non-workspace endpoint
+    /// (e.g. an Azure/Entra token endpoint for an Azure service principal).
+    /// `None` ⇒ OIDC discovery against the workspace host.
+    oauth_token_endpoint: Option<String>,
+    /// Comma-separated OAuth **M2M** scopes override (populated by
+    /// `kernel_session_config_set_oauth_m2m_scopes`, split at build time).
+    /// `None` ⇒ kernel default (`all-apis`). U2M scopes are set via
+    /// `kernel_session_config_set_auth_u2m` instead.
+    oauth_m2m_scopes: Option<String>,
     /// On-disk U2M token-cache policy (populated by
     /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
@@ -206,6 +218,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
         identity_federation_client_id: None,
+        oauth_token_endpoint: None,
+        oauth_m2m_scopes: None,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
@@ -364,6 +378,45 @@ pub unsafe extern "C" fn kernel_session_config_set_identity_federation_client_id
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
         c.identity_federation_client_id = Some(required_str(client_id, "client_id")?);
+        Ok(())
+    })
+}
+
+/// Set an OAuth token-endpoint override, applied as `token_url_override` to
+/// whichever OAuth mode (M2M or U2M) is selected. Lets a host point the token
+/// exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
+/// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an Azure
+/// service principal. Leaving it unset uses OIDC discovery against the
+/// workspace host. No-op for PAT auth.
+///
+/// # Safety
+/// `config` must be live and `token_endpoint` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_oauth_token_endpoint(
+    config: *mut KernelSessionConfig,
+    token_endpoint: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.oauth_token_endpoint = Some(required_str(token_endpoint, "token_endpoint")?);
+        Ok(())
+    })
+}
+
+/// Set the OAuth **M2M** scopes (comma-separated; split at build time) — e.g.
+/// `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` for an Azure service
+/// principal. Leaving it unset uses the kernel default (`all-apis`). U2M scopes
+/// are set via [`kernel_session_config_set_auth_u2m`] instead; this setter only
+/// affects M2M auth.
+///
+/// # Safety
+/// `config` must be live and `scopes` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_oauth_m2m_scopes(
+    config: *mut KernelSessionConfig,
+    scopes: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.oauth_m2m_scopes = Some(required_str(scopes, "scopes")?);
         Ok(())
     })
 }
@@ -903,6 +956,53 @@ fn merge_http_config(
     http
 }
 
+/// Assemble the kernel [`AuthConfig`] from the C-side [`AuthSpec`] plus the
+/// cross-cutting OAuth overrides captured by the additive setters
+/// (`set_oauth_token_endpoint` / `set_oauth_m2m_scopes`). Pure (no I/O), so the
+/// wiring is unit-testable without opening a session.
+///
+/// `oauth_token_endpoint` becomes `token_url_override` on whichever OAuth mode
+/// is selected (M2M or U2M); `oauth_m2m_scopes` supplies the M2M scopes (U2M
+/// scopes arrive on the `AuthSpec::OAuthU2M` itself). Both are ignored for PAT.
+fn auth_spec_to_config(
+    auth: AuthSpec,
+    oauth_token_endpoint: Option<String>,
+    oauth_m2m_scopes: Option<String>,
+    identity_federation_client_id: Option<String>,
+    token_cache: TokenCacheConfig,
+) -> crate::kernel_error::Result<AuthConfig> {
+    let auth = match auth {
+        AuthSpec::Pat { token } => AuthConfig::pat(Some(token), identity_federation_client_id)?,
+        AuthSpec::OAuthM2M {
+            client_id,
+            client_secret,
+        } => AuthConfig::oauth_m2m(
+            Some(client_id),
+            Some(client_secret),
+            oauth_m2m_scopes.and_then(|s| parse_scopes(&s)),
+            oauth_token_endpoint,
+            identity_federation_client_id,
+        )?,
+        AuthSpec::OAuthU2M {
+            client_id,
+            redirect_port,
+            scopes,
+        } => AuthConfig::oauth_u2m(
+            client_id,
+            // The C ABI exposes a single redirect port; forward it as a
+            // one-element candidate list (the kernel binds the first free
+            // port, trivially that one). Keeps the FFI unchanged.
+            redirect_port.map(|p| vec![p]),
+            scopes.and_then(|s| parse_scopes(&s)),
+            oauth_token_endpoint,
+            None,
+            Some(token_cache),
+            identity_federation_client_id,
+        ),
+    };
+    Ok(auth)
+}
+
 /// Translate the C-side config into a [`Session`], driving the async
 /// `Session::open` on the process-wide runtime. Errors are stored in the
 /// thread-local buffer; the returned `KernelStatusCode` is the mapped
@@ -918,6 +1018,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         retry,
         ignore_transactions,
         identity_federation_client_id,
+        oauth_token_endpoint,
+        oauth_m2m_scopes,
         token_cache,
         result,
     } = config;
@@ -945,37 +1047,13 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 }
             };
 
-            let auth = match auth {
-                AuthSpec::Pat { token } => {
-                    AuthConfig::pat(Some(token), identity_federation_client_id)?
-                }
-                AuthSpec::OAuthM2M {
-                    client_id,
-                    client_secret,
-                } => AuthConfig::oauth_m2m(
-                    Some(client_id),
-                    Some(client_secret),
-                    None,
-                    None,
-                    identity_federation_client_id,
-                )?,
-                AuthSpec::OAuthU2M {
-                    client_id,
-                    redirect_port,
-                    scopes,
-                } => AuthConfig::oauth_u2m(
-                    client_id,
-                    // The C ABI exposes a single redirect port; forward it as a
-                    // one-element candidate list (the kernel binds the first
-                    // free port, trivially that one). Keeps the FFI unchanged.
-                    redirect_port.map(|p| vec![p]),
-                    scopes.and_then(|s| parse_scopes(&s)),
-                    None,
-                    None,
-                    Some(token_cache),
-                    identity_federation_client_id,
-                ),
-            };
+            let auth = auth_spec_to_config(
+                auth,
+                oauth_token_endpoint,
+                oauth_m2m_scopes,
+                identity_federation_client_id,
+                token_cache,
+            )?;
 
             let mut builder = Session::builder()
                 .connection(connection)
@@ -1234,6 +1312,66 @@ pub unsafe extern "C" fn kernel_session_rollback(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn m2m_carries_scopes_and_token_endpoint_override() {
+        // The additive setters must reach the built AuthConfig so an Azure SP
+        // M2M config can point the client-credentials exchange at the Entra
+        // token endpoint with the Azure resource scope.
+        let token_endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthM2M {
+                client_id: "azure-client-id".to_string(),
+                client_secret: "azure-client-secret".to_string(),
+            },
+            Some(token_endpoint.to_string()),
+            Some("2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("m2m config builds");
+
+        match auth {
+            AuthConfig::OAuthM2M {
+                scopes,
+                token_url_override,
+                ..
+            } => {
+                assert_eq!(
+                    scopes,
+                    Some(vec![
+                        "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()
+                    ])
+                );
+                assert_eq!(token_url_override.as_deref(), Some(token_endpoint));
+            }
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_carries_token_endpoint_override() {
+        let token_endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: None,
+            },
+            Some(token_endpoint.to_string()),
+            None,
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m config builds");
+
+        match auth {
+            AuthConfig::OAuthU2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(token_endpoint)),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_scopes_trims_and_drops_empties() {

@@ -255,6 +255,24 @@ KernelStatusCode
 kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* config,
                                                         const char* client_id);
 
+/* Optional OAuth token-endpoint override, applied to whichever OAuth mode
+ * (M2M or U2M) is selected. Points the token exchange at a non-workspace
+ * endpoint — e.g. the Azure/Entra token endpoint
+ * `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` for an Azure
+ * service principal. Unset → OIDC discovery against the workspace host.
+ * No effect on PAT auth. */
+KernelStatusCode
+kernel_session_config_set_oauth_token_endpoint(KernelSessionConfig* config,
+                                               const char* token_endpoint);
+
+/* Optional OAuth M2M scopes (comma-separated), e.g.
+ * `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` for an Azure service
+ * principal. Unset → kernel default (`all-apis`). Affects M2M only; U2M scopes
+ * are set via kernel_session_config_set_auth_u2m. */
+KernelStatusCode
+kernel_session_config_set_oauth_m2m_scopes(KernelSessionConfig* config,
+                                           const char* scopes);
+
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
  * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
  * reserved keys are instead CLIENT-ONLY: they tune the kernel locally, are

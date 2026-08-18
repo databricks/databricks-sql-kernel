@@ -61,6 +61,29 @@ An enum; pick one variant. Use the validating constructors
 | `token_url_override` | Token endpoint override. | OIDC discovery |
 | `callback_timeout` | How long to wait for the user to complete the browser flow. | `120s` |
 
+**Azure Entra ID (Microsoft Entra) OAuth.** There is no dedicated Azure
+variant — Azure rides the generic OAuth flows via the overrides above, with the
+connector supplying the Azure endpoint / scope / client id it already owns:
+
+- **Azure service principal (M2M):** `OAuthM2M` with
+  `client_id`/`client_secret` = the Entra app credentials,
+  `token_url_override = https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`
+  (per-cloud host), and `scopes = ["2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"]`
+  (the Azure Databricks application id). Setting a `token_url_override` also
+  skips workspace OIDC discovery, since the client-credentials grant never uses
+  the authorization endpoint.
+- **Azure U2M (`azure-oauth`):** `OAuthU2M` with the Azure app client id
+  (`96eecda7-19ea-49cc-abb5-240097d554f5`), the Azure delegated scope
+  (`{app_id}/user_impersonation offline_access`), and its redirect port;
+  endpoints come from OIDC discovery, which an Azure workspace redirects to
+  Entra. (The kernel-native `databricks-oauth` U2M also works on Azure
+  workspaces with no Azure-specific values.)
+
+The bindings expose these overrides as: pyo3 `token_url` / `oauth_scopes` /
+`client_id`; napi `oauthTokenUrl` / `oauthScopes` / `oauthClientId`; C ABI
+`kernel_session_config_set_oauth_token_endpoint` /
+`kernel_session_config_set_oauth_m2m_scopes` (+ the `set_auth_*` setters).
+
 Two further variants are reserved but not usable in v0:
 `OAuthFederation` (RFC 8693 token exchange — returns `InvalidArgument`
 until implemented) and `External` (a caller-supplied `TokenProvider`).

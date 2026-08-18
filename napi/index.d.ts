@@ -206,6 +206,14 @@ export interface ConnectionOptions {
    */
   oauthScopes?: Array<string>
   /**
+   * OAuth token-endpoint override (M2M / U2M). Points the token exchange at a
+   * non-workspace endpoint — e.g. the Azure/Entra token endpoint
+   * `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an Azure
+   * service principal. Omitted ⇒ OIDC discovery against the workspace host.
+   * Ignored for `Pat`.
+   */
+  oauthTokenUrl?: string
+  /**
    * SP-wide Workload Identity Federation client id used during mandatory
    * token exchange. Omitted selects BYOT / account-wide WIF.
    */

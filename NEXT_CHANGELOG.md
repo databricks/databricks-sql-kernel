@@ -11,6 +11,24 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Azure Entra ID OAuth support via generic overrides (no dedicated Azure auth
+  flow). Azure service-principal M2M rides `OAuthM2M` with an Entra
+  `token_url_override` + the `2ff814a6-…/.default` scope; Azure U2M rides
+  `OAuthU2M`. New C ABI setters expose the pieces the C surface was missing:
+  `kernel_session_config_set_oauth_token_endpoint()` (applied as
+  `token_url_override` to the selected OAuth mode) and
+  `kernel_session_config_set_oauth_m2m_scopes()` (M2M scopes). Both are additive
+  — existing `set_auth_m2m` / `set_auth_u2m` signatures are unchanged.
+  (PECOBLR-4141 / PECOBLR-4120.)
+
+### Changed
+
+- OAuth M2M: when a `token_url_override` is set, OIDC discovery against the
+  workspace is now **skipped** — the client-credentials grant never uses the
+  authorization endpoint, so pinning the token endpoint (e.g. an Azure/Entra
+  endpoint that is not the workspace's) no longer makes a needless round-trip
+  to, or depends on, the workspace OIDC config.
+
 - C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
   HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
   `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own

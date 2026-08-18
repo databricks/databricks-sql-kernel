@@ -157,6 +157,12 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
+    /// OAuth token-endpoint override (M2M / U2M). Points the token exchange
+    /// at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
+    /// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an
+    /// Azure service principal. Omitted ⇒ OIDC discovery against the workspace
+    /// host. Ignored for [`AuthMode::Pat`].
+    pub oauth_token_url: Option<String>,
     /// SP-wide Workload Identity Federation client id used during mandatory
     /// token exchange. Omitted selects BYOT / account-wide WIF.
     pub identity_federation_client_id: Option<String>,
@@ -346,7 +352,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
-            None,
+            options.oauth_token_url.clone(),
             options.identity_federation_client_id.clone(),
         )
         .map_err(napi_err_from_kernel),
@@ -378,7 +384,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                     .filter(|&p| p != 0)
                     .map(|p| vec![p]),
                 options.oauth_scopes.clone(),
-                None,
+                options.oauth_token_url.clone(),
                 None,
                 // `None` takes the kernel default: on-disk cache enabled,
                 // encrypted under a machine-local derived key since this
@@ -603,6 +609,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
+            oauth_token_url: None,
             identity_federation_client_id: None,
             catalog: None,
             schema: None,
@@ -686,6 +693,49 @@ mod tests {
                 Some("federation-client")
             ),
             other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_token_url_forwards_as_token_url_override() {
+        // `oauthTokenUrl` must reach the built AuthConfig as
+        // `token_url_override` for BOTH M2M and U2M, so a Node caller can point
+        // the token exchange at an Azure/Entra endpoint. Omitting it leaves the
+        // override `None` (kernel OIDC discovery).
+        let endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+
+        let mut m2m = base();
+        m2m.auth_mode = Some(AuthMode::OAuthM2m);
+        m2m.oauth_client_id = Some("cid".to_owned());
+        m2m.oauth_client_secret = Some("sec".to_owned());
+        m2m.oauth_token_url = Some(endpoint.to_owned());
+        match build_auth_config(&m2m).unwrap() {
+            AuthConfig::OAuthM2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+
+        let mut u2m = base();
+        u2m.auth_mode = Some(AuthMode::OAuthU2m);
+        u2m.oauth_token_url = Some(endpoint.to_owned());
+        match build_auth_config(&u2m).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+
+        // Omitted → None (default OIDC discovery).
+        let mut none = base();
+        none.auth_mode = Some(AuthMode::OAuthM2m);
+        none.oauth_client_id = Some("cid".to_owned());
+        none.oauth_client_secret = Some("sec".to_owned());
+        match build_auth_config(&none).unwrap() {
+            AuthConfig::OAuthM2M {
+                token_url_override, ..
+            } => assert!(token_url_override.is_none()),
+            other => panic!("expected OAuthM2M, got {other:?}"),
         }
     }
 

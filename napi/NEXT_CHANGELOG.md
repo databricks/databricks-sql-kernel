@@ -14,6 +14,10 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `ConnectionOptions.oauthTokenUrl` — OAuth token-endpoint override, forwarded
+  as `token_url_override` for both M2M and U2M. Lets a Node caller point the
+  token exchange at a non-workspace endpoint (e.g. the Azure/Entra token
+  endpoint for an Azure service principal). (PECOBLR-4141.)
 - `ConnectionOptions.identityFederationClientId` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
 

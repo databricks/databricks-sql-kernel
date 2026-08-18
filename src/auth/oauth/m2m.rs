@@ -194,17 +194,20 @@ impl ClientCredentialsProvider {
         scopes: Vec<String>,
         token_endpoint_override: Option<String>,
     ) -> Result<Self> {
-        // Discover OIDC endpoints or use override
-        let (token_endpoint, auth_endpoint) = if let Some(token_endpoint) = token_endpoint_override
-        {
-            // Use override for token endpoint, still discover auth endpoint
-            // (auth endpoint is not typically overridden for M2M since it's not used)
-            let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-            (token_endpoint, endpoints.authorization_endpoint)
-        } else {
-            // Discover both endpoints via OIDC
-            let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-            (endpoints.token_endpoint, endpoints.authorization_endpoint)
+        // Discover OIDC endpoints, or skip discovery entirely when the token
+        // endpoint is overridden. The client-credentials grant never uses the
+        // authorization endpoint, so when a caller pins the token endpoint
+        // (e.g. an Azure/Entra endpoint, which is NOT the workspace's) there is
+        // no reason to round-trip the workspace OIDC config — and doing so
+        // would needlessly depend on it being reachable and describing the
+        // right issuer. Reuse the token endpoint as the (unused) auth URL
+        // placeholder so the `oauth2` client still constructs.
+        let (token_endpoint, auth_endpoint) = match token_endpoint_override {
+            Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
+            None => {
+                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+                (endpoints.token_endpoint, endpoints.authorization_endpoint)
+            }
         };
 
         Ok(Self {
@@ -326,7 +329,7 @@ mod tests {
     use crate::client::http::HttpClientConfig;
     use crate::client::retry::{build_retry_configs, RetryConfig};
     use std::collections::HashMap;
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// Helper to create a mock OIDC discovery response
@@ -677,5 +680,61 @@ mod tests {
             .expect("Failed to get auth header");
 
         assert_eq!(auth_header, "Bearer test-token-custom-scopes");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_m2m_override_skips_discovery() {
+        // When a token-endpoint override is set (e.g. an Azure/Entra endpoint,
+        // which is NOT the workspace's), the client-credentials grant never
+        // uses the authorization endpoint, so OIDC discovery against the
+        // workspace must be skipped entirely — no needless round-trip, and no
+        // dependency on the workspace OIDC config describing the right issuer.
+        let mock_server = MockServer::start().await;
+
+        // Discovery must NOT be hit.
+        Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": format!("{}/oidc/v1/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oidc/v1/token", mock_server.uri()),
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        // The exchange lands on the override endpoint with the configured
+        // (Azure resource) scope, via HTTP Basic.
+        Mock::given(method("POST"))
+            .and(path("/azure/tenant/oauth2/v2.0/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("2ff814a6"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "azure-access-token",
+                "token_type": "Bearer",
+                "expires_in": 3600,
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+
+        let token_endpoint = format!("{}/azure/tenant/oauth2/v2.0/token", mock_server.uri());
+        let provider = ClientCredentialsProvider::new_with_full_config(
+            &mock_server.uri(),
+            "azure-client-id",
+            "azure-client-secret",
+            http_client,
+            vec!["2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()],
+            Some(token_endpoint),
+        )
+        .await
+        .expect("provider creation must not require discovery when overridden");
+
+        let auth_header = provider.get_auth_header().expect("get auth header");
+        assert_eq!(auth_header, "Bearer azure-access-token");
     }
 }
