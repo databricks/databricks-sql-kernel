@@ -481,7 +481,7 @@ impl AuthProvider for AuthorizationCodeProvider {
 
                     // Start callback server, binding the first free candidate
                     // port (busy-port fallback across the registered range).
-                    let callback_server = CallbackServer::new_in_range(&callback_ports).await?;
+                    let callback_server = CallbackServer::new_first_free(&callback_ports).await?;
                     let redirect_uri = callback_server.redirect_uri();
 
                     // Build OAuth client

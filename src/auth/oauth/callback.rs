@@ -75,7 +75,7 @@ enum CallbackResult {
 ///
 /// # async fn example() -> databricks_sql_kernel::Result<()> {
 /// // Start callback server, binding the first free candidate port.
-/// let server = CallbackServer::new_in_range(&[8030]).await?;
+/// let server = CallbackServer::new_first_free(&[8030]).await?;
 /// let redirect_uri = server.redirect_uri();
 /// println!("Redirect URI: {}", redirect_uri);
 ///
@@ -130,10 +130,10 @@ impl CallbackServer {
     /// - `invalid_argument` if `ports` is empty.
     /// - `io()` if a non-`AddrInUse` bind error occurs (returned immediately,
     ///   not retried), or if every candidate port is already in use.
-    pub async fn new_in_range(ports: &[u16]) -> Result<Self> {
+    pub async fn new_first_free(ports: &[u16]) -> Result<Self> {
         if ports.is_empty() {
             return Err(Error::invalid_argument()
-                .message("CallbackServer::new_in_range requires at least one candidate port"));
+                .message("CallbackServer::new_first_free requires at least one candidate port"));
         }
 
         let mut last_in_use: Option<std::io::Error> = None;
@@ -461,7 +461,7 @@ mod tests {
     #[tokio::test]
     async fn test_callback_captures_code() {
         // Start callback server
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -504,7 +504,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_validates_state() {
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -549,7 +549,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_timeout() {
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
 
@@ -569,7 +569,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_missing_code() {
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -600,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_callback_auth_error() {
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
         let port = server.port;
@@ -663,7 +663,7 @@ mod tests {
     #[tokio::test]
     async fn test_redirect_uri_format() {
         // Use port 0 to let the OS assign an available port, avoiding conflicts
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("Failed to create server");
         let uri = server.redirect_uri();
@@ -684,15 +684,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_in_range_empty_is_error() {
-        let result = CallbackServer::new_in_range(&[]).await;
+    async fn test_new_first_free_empty_is_error() {
+        let result = CallbackServer::new_first_free(&[]).await;
         assert!(result.is_err(), "empty port list should be rejected");
     }
 
     #[tokio::test]
-    async fn test_new_in_range_single_port_binds() {
+    async fn test_new_first_free_single_port_binds() {
         // A one-element range behaves like new(0): binds an OS-assigned port.
-        let server = CallbackServer::new_in_range(&[0])
+        let server = CallbackServer::new_first_free(&[0])
             .await
             .expect("should bind the single candidate port");
         assert!(
@@ -704,7 +704,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_in_range_skips_busy_port() {
+    async fn test_new_first_free_skips_busy_port() {
         // Occupy a port, then offer it as the first candidate followed by 0
         // (OS-assigned, always bindable). The server must skip the busy port
         // and bind the next candidate instead.
@@ -713,7 +713,7 @@ mod tests {
             .expect("failed to occupy a port");
         let busy_port = occupied.local_addr().unwrap().port();
 
-        let server = CallbackServer::new_in_range(&[busy_port, 0])
+        let server = CallbackServer::new_first_free(&[busy_port, 0])
             .await
             .expect("should fall back past the busy port");
 
@@ -731,7 +731,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_new_in_range_all_busy_is_error() {
+    async fn test_new_first_free_all_busy_is_error() {
         // Occupy two ports and offer only those two — all candidates are busy.
         let l1 = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let l2 = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -739,7 +739,7 @@ mod tests {
         let p2 = l2.local_addr().unwrap().port();
 
         // Avoid unwrap_err(): CallbackServer (the Ok type) is not Debug.
-        let msg = match CallbackServer::new_in_range(&[p1, p2]).await {
+        let msg = match CallbackServer::new_first_free(&[p1, p2]).await {
             Ok(_) => panic!("all candidate ports busy should be an error"),
             Err(e) => format!("{:?}", e),
         };

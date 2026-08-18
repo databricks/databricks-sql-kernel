@@ -67,8 +67,8 @@ impl Session {
     ///   `client_id` + `client_secret` (optional `oauth_scopes`,
     ///   `token_url`).
     /// - `"oauth-u2m"`: browser authorization-code + PKCE flow
-    ///   (optional `client_id`, `redirect_port` / `redirect_ports`,
-    ///   `oauth_scopes`, `token_url`, `oauth_callback_timeout_secs`).
+    ///   (optional `client_id`, `redirect_ports`, `oauth_scopes`,
+    ///   `token_url`, `oauth_callback_timeout_secs`).
     ///
     /// OAuth is kernel-owned: the kernel acquires and transparently
     /// refreshes tokens itself.
@@ -120,7 +120,6 @@ impl Session {
         client_secret=None,
         oauth_scopes=None,
         token_url=None,
-        redirect_port=None,
         redirect_ports=None,
         oauth_callback_timeout_secs=None,
         identity_federation_client_id=None,
@@ -151,7 +150,6 @@ impl Session {
         client_secret: Option<String>,
         oauth_scopes: Option<Vec<String>>,
         token_url: Option<String>,
-        redirect_port: Option<u16>,
         redirect_ports: Option<Vec<u16>>,
         oauth_callback_timeout_secs: Option<u64>,
         identity_federation_client_id: Option<String>,
@@ -194,12 +192,6 @@ impl Session {
                 ));
             }
         };
-        // `redirect_port` is a single-port convenience kwarg kept for
-        // backward compatibility with existing callers (e.g. the connector's
-        // `Session(..., redirect_port=8020)`); `redirect_ports` is the
-        // multi-port list. Fold the scalar into a one-element list.
-        let redirect_ports = fold_redirect_ports(redirect_port, redirect_ports)
-            .map_err(pyo3::exceptions::PyValueError::new_err)?;
         let oauth = OAuthParams {
             client_id,
             client_secret,
@@ -419,28 +411,6 @@ impl Session {
     }
 }
 
-/// Reconcile the single-port `redirect_port` kwarg with the multi-port
-/// `redirect_ports` list.
-///
-/// `redirect_port` is kept for backward compatibility with existing
-/// callers (e.g. the connector's `Session(..., redirect_port=8020)`) and
-/// is folded into a one-element list. `redirect_ports` is the multi-port
-/// form. Passing BOTH is ambiguous, so it is rejected rather than silently
-/// picking one. Extracted as a free fn so it is unit-testable without an
-/// initialized Python interpreter.
-fn fold_redirect_ports(
-    redirect_port: Option<u16>,
-    redirect_ports: Option<Vec<u16>>,
-) -> Result<Option<Vec<u16>>, &'static str> {
-    match (redirect_port, redirect_ports) {
-        (Some(_), Some(_)) => {
-            Err("pass either redirect_port (single) or redirect_ports (list), not both")
-        }
-        (Some(p), None) => Ok(Some(vec![p])),
-        (None, ports) => Ok(ports),
-    }
-}
-
 #[cfg(test)]
 mod send_sync_tests {
     use super::*;
@@ -449,37 +419,5 @@ mod send_sync_tests {
     fn runtime_arc_is_send_sync() {
         assert_send_sync::<Arc<Runtime>>();
         assert_send_sync::<SessionInner>();
-    }
-}
-
-#[cfg(test)]
-mod redirect_port_tests {
-    use super::*;
-
-    #[test]
-    fn single_redirect_port_folds_into_list() {
-        assert_eq!(
-            fold_redirect_ports(Some(8020), None).unwrap(),
-            Some(vec![8020])
-        );
-    }
-
-    #[test]
-    fn redirect_ports_list_passes_through() {
-        assert_eq!(
-            fold_redirect_ports(None, Some(vec![8020, 8021])).unwrap(),
-            Some(vec![8020, 8021])
-        );
-    }
-
-    #[test]
-    fn neither_set_is_none() {
-        assert_eq!(fold_redirect_ports(None, None).unwrap(), None);
-    }
-
-    #[test]
-    fn both_set_is_rejected() {
-        let err = fold_redirect_ports(Some(8020), Some(vec![8021])).unwrap_err();
-        assert!(err.contains("not both"), "unexpected error: {err}");
     }
 }

@@ -146,12 +146,14 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
 
 // PECOBLR-4144: prove the redirect-port busy-port fallback end-to-end.
 //
-// The databricks-sql-python OAuth app registers multiple localhost redirect
-// URIs (e.g. http://localhost:8020 and http://localhost:8025). We occupy the
-// first (8020) so the kernel's `new_in_range` must skip it and bind the second
-// (8025); the browser then redirects to http://localhost:8025 and the flow
-// still completes. Before this change the kernel took a single port and would
-// have failed outright when 8020 was busy.
+// Databricks in-house OAuth accepts any loopback redirect port for the
+// databricks-sql-python client — it drops the port from `http://localhost`
+// redirect URIs before comparison, per RFC 8252 — so binding a different port
+// than the first candidate still completes the flow. We occupy 8020 so the
+// kernel's `new_first_free` must skip it and bind the next candidate (8025);
+// the browser then redirects to http://localhost:8025 and the flow still
+// completes. Before this change the kernel took a single port and would have
+// failed outright when 8020 was busy.
 //
 // Manual/interactive: opens a browser. Run with:
 //   DATABRICKS_HOST=... DATABRICKS_HTTP_PATH=... DATABRICKS_RUN_U2M=1 \
@@ -176,7 +178,7 @@ async fn open_with_oauth_u2m_falls_back_past_busy_port() {
     let session = Session::builder()
         .http_path(host, http_path)
         .auth(AuthConfig::OAuthU2M {
-            // The databricks-sql-python app (both 8020 and 8025 registered).
+            // databricks-sql-python; any loopback port is accepted (RFC 8252).
             client_id: Some("databricks-sql-python".to_string()),
             redirect_ports: Some(vec![8020, 8025]),
             scopes: Some(vec!["sql".to_string(), "offline_access".to_string()]),
