@@ -57,6 +57,9 @@ impl TelemetryRuntime {
             return Self::disabled();
         };
 
+        // `0` is the "unknown workspace" sentinel (see `TelemetryFrontendLog::workspace_id`),
+        // matching the sibling drivers' convention for the `workspaceId` proto field. Both the
+        // unset and unparseable cases fall back to it; downstream aggregation treats `0` as unknown.
         let workspace_id = match connection.org_id.as_deref() {
             None => {
                 tracing::debug!(
