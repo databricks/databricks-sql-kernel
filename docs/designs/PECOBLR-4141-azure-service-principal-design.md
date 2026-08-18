@@ -34,11 +34,23 @@ credential strategy including its two Azure-specific request headers.
 
 ### What is *not* in scope
 
-- **Azure U2M (`auth_type='azure-oauth'`) already works** and is unchanged. Kernel
-  U2M runs the standard workspace OIDC browser flow (`{host}/oidc/v1/authorize`);
-  for an `adb-*.azuredatabricks.net` workspace that federates to Entra
-  server-side, with no client-side Entra involvement. Confirmed against the
-  Databricks OAuth U2M docs and the kernel's existing U2M provider.
+- **Azure U2M (`auth_type='azure-oauth'`) — tracked separately by PECOBLR-4120,
+  not this ticket.** It is *not* plain workspace OIDC (an earlier draft of this
+  doc claimed so — that was wrong). The Thrift-path reference
+  (`AzureOAuthEndpointCollection`) uses the Azure app client id
+  `96eecda7-19ea-49cc-abb5-240097d554f5` on redirect port `8030`, and an **AAD
+  delegated scope** `{app_id}/user_impersonation offline_access` (app_id defaults
+  to `2ff814a6-…`, overridable via `DATABRICKS_AZURE_TENANT_ID`) — not `sql
+  offline_access`. Crucially, this needs **no new kernel auth flow**: the kernel
+  already forwards an arbitrary client id / redirect port / scope verbatim
+  through the existing `oauth-u2m` provider and discovers endpoints via
+  `{host}/oidc/…` (which an Azure workspace redirects to Azure AD). The
+  outstanding work there is **connector-side** — `auth_bridge.py` synthesising
+  the Azure scope instead of forwarding the literal `sql offline_access` (see
+  PECOBLR-4120, the Azure analogue of PECOBLR-4040 for `databricks-oauth`). This
+  design leaves Azure U2M to PECOBLR-4120 and covers only Azure SP **M2M**, whose
+  token *must* be minted by Entra client-credentials and so genuinely requires a
+  new kernel flow.
 - **Azure CLI / MSAL / managed-identity** credential sources. Only the
   client-secret service-principal flow is in scope (the `azure_*` kwargs the
   ticket names).
@@ -230,31 +242,32 @@ calls). The `X-Databricks-Azure-*` names are not in the reserved set.
 
 ## Binding surfaces
 
-Selector name `azure-client-secret` matches the `databricks-sdk` auth-type
-string, so the connector maps its detected Azure SP config onto the kernel
-verbatim.
+Selector name `azure-sp-m2m` matches the connector's own `AuthType` enum value
+(`databricks-sql-python` `auth/common.py`: `AZURE_SP_M2M = "azure-sp-m2m"`), so
+the connector maps its detected Azure SP config onto the kernel verbatim with no
+string translation.
 
 ### pyo3 (`pyo3/src/auth.rs`, `pyo3/src/session.rs`)
 
 - New `Session(...)` kwargs: `azure_client_id`, `azure_client_secret`,
   `azure_tenant_id`, `azure_workspace_resource_id`, `azure_environment`.
-- New `auth_type="azure-client-secret"` in `build_auth_config_inner`, requiring
-  the three mandatory `azure_*` fields (validated with the existing `non_empty`
+- New `auth_type="azure-sp-m2m"` in `build_auth_config_inner`, requiring the
+  three mandatory `azure_*` fields (validated with the existing `non_empty`
   helper) and forwarding the two optionals.
 - Carried on the `OAuthParams`-adjacent path (a small `AzureParams` struct, or
   extend `OAuthParams`) to keep the ctor signature tidy.
 
 ### napi (`napi/src/database.rs`, `napi/index.d.ts` by hand)
 
-- New `AuthMode::AzureClientSecret` variant + `azureClientId` /
-  `azureClientSecret` / `azureTenantId` / `azureWorkspaceResourceId` /
-  `azureEnvironment` fields on `ConnectionOptions`.
+- New `AuthMode::AzureSpM2m` variant + `azureClientId` / `azureClientSecret` /
+  `azureTenantId` / `azureWorkspaceResourceId` / `azureEnvironment` fields on
+  `ConnectionOptions`.
 - New arm in `build_auth_config` calling `AuthConfig::azure_service_principal`.
 
 ### C ABI (`src/c_abi/session.rs`, `include/databricks_kernel.h` by hand)
 
 - New `AuthSpec::AzureServicePrincipal { ... }` and a setter
-  `kernel_session_config_set_auth_azure_client_secret(config, azure_client_id,
+  `kernel_session_config_set_auth_azure_sp_m2m(config, azure_client_id,
   azure_client_secret, azure_tenant_id, azure_workspace_resource_id /*nullable*/,
   azure_environment /*nullable*/)`, mutually exclusive with the other
   `set_auth_*` setters (last-wins, as today). Declared in the hand-written
