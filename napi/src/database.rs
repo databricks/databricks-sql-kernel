@@ -370,7 +370,13 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 options.oauth_client_id.clone(),
                 // Node exposes a single redirect port; forward it as a
                 // one-element candidate list (kernel binds the first free one).
-                options.oauth_redirect_port.map(|p| vec![p]),
+                // A `0` port would bind an OS-assigned ephemeral port that can
+                // never match the IdP's static redirect_uri, so map `0 -> None`
+                // to fall back to the kernel default (matches C ABI + pyo3).
+                options
+                    .oauth_redirect_port
+                    .filter(|&p| p != 0)
+                    .map(|p| vec![p]),
                 options.oauth_scopes.clone(),
                 None,
                 None,
