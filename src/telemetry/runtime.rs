@@ -256,12 +256,14 @@ fn build_system_configuration() -> DriverSystemConfiguration {
 /// leading directory path so host-specific/PII-ish path segments are not
 /// exported. Falls back to the raw `argv[0]` if it has no file-name component.
 fn process_name() -> Option<String> {
-    let arg0 = std::env::args().next()?;
+    // Use `args_os()` rather than `args()`: the latter panics during iteration
+    // if `argv[0]` is not valid Unicode, which would break the fail-open
+    // telemetry contract (telemetry must never change user operation results).
+    let arg0 = std::env::args_os().next()?;
     let basename = std::path::Path::new(&arg0)
         .file_name()
-        .map(|s| s.to_string_lossy().into_owned())
-        .unwrap_or(arg0);
-    Some(basename)
+        .unwrap_or(arg0.as_os_str());
+    Some(basename.to_string_lossy().into_owned())
 }
 
 fn build_connection_params(
