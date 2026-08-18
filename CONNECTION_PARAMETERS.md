@@ -157,7 +157,6 @@ for per-parameter meaning and accepted values):
 | Key | Notes |
 |-----|-------|
 | `ANSI_MODE` | Enable/disable ANSI SQL behaviour. |
-| `CAN_CLOUD_DOWNLOAD` | Kernel-synthesised from `ResultConfig::cloudfetch_enabled = false`; a user-supplied value (any casing) wins. |
 | `COLLATION` | Default collation. |
 | `ENABLE_PHOTON` | Toggle the Photon engine. |
 | `LEGACY_TIME_PARSER_POLICY` | Legacy datetime parsing behaviour. |
