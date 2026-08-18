@@ -55,8 +55,10 @@ pub(crate) struct OAuthParams {
     /// multi-port list gives the busy-port fallback the Thrift connector has
     /// across its registered ports (`databricks-sql-python` → the discrete
     /// set `8020`/`8025`, not a contiguous range).
-    /// `None`/empty → the databricks-sql-python default (8020) when the
-    /// default client is in use, else the kernel default.
+    /// `None` → the databricks-sql-python default (8020) when the
+    /// default client is in use, else the kernel default. At the pyo3
+    /// boundary an explicit *empty* list is rejected (see
+    /// [`build_auth_config`]), not defaulted.
     pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
