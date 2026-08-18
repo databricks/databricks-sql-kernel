@@ -30,11 +30,14 @@ cadences and may not move in lockstep with the crate.
   bounds each HTTP GET + body read with a per-chunk deadline
   (`CloudFetchConfig::download_timeout`, default 5 minutes via
   `DEFAULT_DOWNLOAD_TIMEOUT_SECS`), returning a retriable timeout on expiry
-  so the provider retry loop can react. reqwest's client-level timeout only
-  covers the header phase, not the separately-awaited `response.bytes()`,
-  which previously let a wedged read block for the full CI job window. 5 min
-  matches the ADBC C# driver default; the Python (Thrift) driver uses a 60s
-  between-bytes read timeout for the same purpose.
+  so the provider retry loop can react. The deadline is per *attempt*: the
+  retry loop re-applies it on each retry, so the worst-case bound for a
+  repeatedly-stalling chunk is `max_retries * download_timeout`. reqwest's
+  client-level timeout only covers the header phase, not the
+  separately-awaited `response.bytes()`, which previously let a wedged read
+  block for the full CI job window. 5 min matches the ADBC C# driver default;
+  the Python (Thrift) driver uses a 60s between-bytes read timeout for the
+  same purpose.
 - **Metadata conformance (catalog match-all wildcard)** — a *literal*
   catalog `%`, `*`, or `""` reaching `Metadata::list_schemas` /
   `list_tables` is now scoped verbatim (`SHOW … IN [CATALOG] \`%\``) and

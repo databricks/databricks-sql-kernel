@@ -52,9 +52,11 @@ impl ChunkDownloader {
     /// * `http_client` - HTTP client for making requests
     /// * `compression` - Compression codec used by the server
     /// * `speed_threshold_mbps` - Log warning if speed falls below this (MB/s)
-    /// * `download_timeout` - Per-chunk download deadline (HTTP GET + body
+    /// * `download_timeout` - Per-*attempt* download deadline (HTTP GET + body
     ///   read); a stall that exceeds it fails with a retriable timeout rather
-    ///   than hanging.
+    ///   than hanging. Because the provider retry loop re-invokes `download()`
+    ///   with a fresh deadline each time, the worst-case bound for a single
+    ///   chunk that keeps stalling is `max_retries * download_timeout`.
     pub fn new(
         http_client: Arc<DatabricksHttpClient>,
         compression: CompressionCodec,

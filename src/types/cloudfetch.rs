@@ -42,7 +42,10 @@ pub const DEFAULT_CHUNK_READY_TIMEOUT_SECS: u64 = 30;
 /// to 5 minutes to match the ADBC C# driver's default download timeout; the
 /// Python (Thrift) driver uses a 60s between-bytes read timeout for the same
 /// purpose. This is a total per-attempt deadline (not idle-based), so a
-/// genuinely large chunk must complete within it.
+/// genuinely large chunk must complete within it. Note it bounds a single
+/// attempt: the provider retry loop re-applies a fresh deadline per attempt,
+/// so the worst-case bound for a repeatedly-stalling chunk is
+/// `max_retries * download_timeout`.
 pub const DEFAULT_DOWNLOAD_TIMEOUT_SECS: u64 = 300;
 
 /// Configuration for CloudFetch streaming.
@@ -58,8 +61,10 @@ pub struct CloudFetchConfig {
     pub retry_delay: Duration,
     /// Timeout for waiting for a chunk to be ready.
     pub chunk_ready_timeout: Option<Duration>,
-    /// Per-chunk download timeout (HTTP GET + body read). A stalled download
-    /// that exceeds this fails with a retriable timeout rather than hanging.
+    /// Per-*attempt* download timeout (HTTP GET + body read). A stalled
+    /// download that exceeds this fails with a retriable timeout rather than
+    /// hanging; the retry loop re-applies it per attempt, so the worst-case
+    /// bound for a repeatedly-stalling chunk is `max_retries * download_timeout`.
     /// Defaults to [`DEFAULT_DOWNLOAD_TIMEOUT_SECS`].
     pub download_timeout: Duration,
     /// Log warning if download speed falls below this threshold (MB/s).
