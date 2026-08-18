@@ -31,6 +31,7 @@ pub(crate) mod test_support;
 
 #[cfg(test)]
 pub(crate) use exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExporter};
+pub use models::DriverSystemConfiguration;
 pub(crate) use models::OperationType;
 #[cfg(test)]
 pub(crate) use models::TelemetryRequest;

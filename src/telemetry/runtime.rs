@@ -43,6 +43,7 @@ impl TelemetryRuntime {
         config: &TelemetryConfig,
         connection: &ConnectionConfig,
         auth: &AuthConfig,
+        system_configuration: Option<DriverSystemConfiguration>,
         session_id: String,
     ) -> Self {
         if !config.enabled || config.batch_size == 0 {
@@ -60,7 +61,7 @@ impl TelemetryRuntime {
                 .as_deref()
                 .and_then(|org_id| org_id.parse::<i64>().ok())
                 .unwrap_or_default(),
-            system_configuration: build_system_configuration(),
+            system_configuration: build_system_configuration(system_configuration),
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
         });
@@ -212,8 +213,10 @@ fn test_or_noop_exporter(config: &TelemetryConfig) -> Option<Arc<dyn TelemetryEx
     }
 }
 
-fn build_system_configuration() -> DriverSystemConfiguration {
-    DriverSystemConfiguration {
+fn build_system_configuration(
+    override_config: Option<DriverSystemConfiguration>,
+) -> DriverSystemConfiguration {
+    let defaults = DriverSystemConfiguration {
         driver_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         runtime_name: Some("rust".to_string()),
         runtime_version: option_env!("RUSTC_VERSION").map(str::to_string),
@@ -226,6 +229,34 @@ fn build_system_configuration() -> DriverSystemConfiguration {
         locale_name: std::env::var("LANG").ok().filter(|s| !s.is_empty()),
         char_set_encoding: Some("UTF-8".to_string()),
         process_name: std::env::args().next(),
+    };
+
+    merge_system_configuration(defaults, override_config)
+}
+
+fn merge_system_configuration(
+    defaults: DriverSystemConfiguration,
+    override_config: Option<DriverSystemConfiguration>,
+) -> DriverSystemConfiguration {
+    let Some(override_config) = override_config else {
+        return defaults;
+    };
+
+    DriverSystemConfiguration {
+        driver_version: override_config.driver_version.or(defaults.driver_version),
+        runtime_name: override_config.runtime_name.or(defaults.runtime_name),
+        runtime_version: override_config.runtime_version.or(defaults.runtime_version),
+        runtime_vendor: override_config.runtime_vendor.or(defaults.runtime_vendor),
+        os_name: override_config.os_name.or(defaults.os_name),
+        os_version: override_config.os_version.or(defaults.os_version),
+        os_arch: override_config.os_arch.or(defaults.os_arch),
+        driver_name: override_config.driver_name.or(defaults.driver_name),
+        client_app_name: override_config.client_app_name.or(defaults.client_app_name),
+        locale_name: override_config.locale_name.or(defaults.locale_name),
+        char_set_encoding: override_config
+            .char_set_encoding
+            .or(defaults.char_set_encoding),
+        process_name: override_config.process_name.or(defaults.process_name),
     }
 }
 

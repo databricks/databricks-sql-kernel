@@ -67,7 +67,7 @@ use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::mutable::Statement;
-use crate::telemetry::{OperationType, TelemetryRuntime};
+use crate::telemetry::{DriverSystemConfiguration, OperationType, TelemetryRuntime};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -373,6 +373,7 @@ impl Session {
             &config.telemetry,
             &config.connection,
             &config.auth,
+            config.driver_system_configuration.clone(),
             session_info.session_id.clone(),
         ));
         telemetry
@@ -693,6 +694,7 @@ pub struct SessionBuilder {
     result: Option<ResultConfig>,
     logging: Option<LoggingConfig>,
     telemetry: Option<TelemetryConfig>,
+    driver_system_configuration: Option<DriverSystemConfiguration>,
     session_conf: HashMap<String, String>,
     transport: Option<TransportMode>,
     /// Sentinel for [`SessionBuilder::http_path`] parse failures.
@@ -822,6 +824,19 @@ impl SessionBuilder {
         self
     }
 
+    /// Driver/runtime identity stamped onto telemetry logs.
+    ///
+    /// Binding layers should use this to pass their own driver name,
+    /// version, runtime, and process details. Any fields left unset are
+    /// filled from kernel defaults when the session opens.
+    pub fn driver_system_configuration(
+        mut self,
+        system_configuration: DriverSystemConfiguration,
+    ) -> Self {
+        self.driver_system_configuration = Some(system_configuration);
+        self
+    }
+
     /// Server-bound session conf passed through to SEA `session_confs`.
     pub fn session_conf(mut self, conf: HashMap<String, String>) -> Self {
         self.session_conf = conf;
@@ -860,6 +875,7 @@ impl SessionBuilder {
             connection,
             defaults: self.defaults,
             auth,
+            driver_system_configuration: self.driver_system_configuration,
             session_conf: self.session_conf,
             http: self.http.unwrap_or_default(),
             proxy: self.proxy,
@@ -1189,6 +1205,7 @@ mod retry_config_tests {
             auth: AuthConfig::Pat {
                 token: "dapi-test".to_string(),
             },
+            driver_system_configuration: None,
             session_conf: Default::default(),
             http,
             proxy: None,
@@ -1725,6 +1742,50 @@ mod is_open_tests {
             .collect::<Vec<_>>();
 
         assert_eq!(operations, vec!["CREATE_SESSION", "DELETE_SESSION"]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_uses_client_driver_system_configuration_with_kernel_defaults() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-system-config").await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+            })
+            .telemetry(telemetry)
+            .driver_system_configuration(DriverSystemConfiguration {
+                driver_name: Some("databricks-sql-python".to_string()),
+                driver_version: Some("1.2.3".to_string()),
+                runtime_name: Some("python".to_string()),
+                ..Default::default()
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        session.close().await.expect("close succeeds");
+
+        let requests = exporter.requests();
+        assert_eq!(requests.len(), 1, "close should flush one pending batch");
+        let value: Value =
+            serde_json::from_str(&requests[0].proto_logs[0]).expect("valid frontend log json");
+        let system = &value["entry"]["sql_driver_log"]["system_configuration"];
+        assert_eq!(system["driver_name"], "databricks-sql-python");
+        assert_eq!(system["driver_version"], "1.2.3");
+        assert_eq!(system["runtime_name"], "python");
+        assert_eq!(system["runtime_vendor"], "rust-lang");
+        assert_eq!(system["char_set_encoding"], "UTF-8");
     }
 
     #[tokio::test]

@@ -54,6 +54,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::telemetry::DriverSystemConfiguration;
+
 // ─── Connection identity ────────────────────────────────────────────────────
 
 /// Required: identifies the workspace and warehouse to connect to.
@@ -1200,6 +1202,11 @@ pub struct SessionConfig {
 
     /// Required: how to authenticate.
     pub auth: AuthConfig,
+
+    /// Client-provided driver/runtime identity. Telemetry uses this for
+    /// `DriverSystemConfiguration`, filling any missing fields with
+    /// kernel defaults at session-open time.
+    pub driver_system_configuration: Option<DriverSystemConfiguration>,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate
