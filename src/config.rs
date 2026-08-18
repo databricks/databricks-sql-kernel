@@ -1109,10 +1109,14 @@ pub struct LoggingConfig {
 /// Telemetry collection and export settings.
 ///
 /// Telemetry is disabled by default. When enabled, the kernel records
-/// driver operation metrics and exports them through the Databricks SQL
-/// driver telemetry envelope. Telemetry failures are fail-open: export
-/// errors are logged at trace/debug level and never change user operation
-/// results.
+/// driver operation metrics intended for export through the Databricks
+/// SQL driver telemetry envelope.
+///
+/// **Note:** production export is not yet wired in this release. Setting
+/// `enabled: true` currently activates the collection path but exports to
+/// a no-op sink (no data leaves the process); the real exporter lands in a
+/// later PR. Telemetry failures are fail-open: export errors are logged at
+/// trace/debug level and never change user operation results.
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {

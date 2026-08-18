@@ -50,16 +50,33 @@ impl TelemetryRuntime {
         }
 
         let Some(exporter) = test_or_noop_exporter(config) else {
+            tracing::debug!(
+                "telemetry: enabled in config but no exporter is wired in this build; \
+                 collection is a no-op and no data will be exported"
+            );
             return Self::disabled();
+        };
+
+        let workspace_id = match connection.org_id.as_deref() {
+            None => {
+                tracing::debug!(
+                    "telemetry: connection.org_id is unset; defaulting workspace_id to 0"
+                );
+                0
+            }
+            Some(org_id) => org_id.parse::<i64>().unwrap_or_else(|e| {
+                tracing::debug!(
+                    org_id,
+                    error = %e,
+                    "telemetry: failed to parse connection.org_id as i64; defaulting workspace_id to 0"
+                );
+                0
+            }),
         };
 
         let session = Arc::new(TelemetrySessionContext {
             session_id,
-            workspace_id: connection
-                .org_id
-                .as_deref()
-                .and_then(|org_id| org_id.parse::<i64>().ok())
-                .unwrap_or_default(),
+            workspace_id,
             system_configuration: build_system_configuration(),
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
@@ -233,6 +250,13 @@ fn build_connection_params(
     connection: &ConnectionConfig,
     auth: &AuthConfig,
 ) -> DriverConnectionParameters {
+    // `http_path` is reconstructed from `warehouse_id` (the config parses/normalises
+    // the incoming path down to the id, so the canonical `/sql/1.0/warehouses/{id}`
+    // form is reproduced here). `mode`, `enable_arrow`, `enable_direct_results`, and
+    // `auto_commit` are fixed invariants of this kernel rather than placeholders: it
+    // only speaks SEA, always fetches Arrow results with direct results enabled, and
+    // exposes no autocommit-off path. Revisit these if the kernel ever gains a
+    // configurable transport or session mode.
     DriverConnectionParameters {
         http_path: Some(format!("/sql/1.0/warehouses/{}", connection.warehouse_id)),
         mode: Some(DriverMode::Sea),
@@ -283,7 +307,13 @@ fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
 fn sanitize_error(error: &KernelError) -> DriverErrorInfo {
     DriverErrorInfo {
         error_name: Some(error.code.slug().to_string()),
-        stack_trace: error.sql_state.clone(),
+        // We deliberately do NOT emit a stack trace here: sibling drivers
+        // (e.g. ADBC) omit trace data for security reasons, and the kernel has
+        // no trace to surface at this layer. A SQLSTATE code is not a stack
+        // trace, so we leave this `None` rather than overloading the field with
+        // semantically-wrong data that downstream telemetry consumers would
+        // misinterpret.
+        stack_trace: None,
     }
 }
 

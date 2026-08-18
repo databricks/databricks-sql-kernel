@@ -56,10 +56,14 @@ impl TelemetryClient {
             let handle = tokio::spawn(async move {
                 export_batch(exporter, batch).await;
             });
-            self.in_flight
+            let mut in_flight = self
+                .in_flight
                 .lock()
-                .expect("poisoned telemetry in-flight queue")
-                .push(handle);
+                .expect("poisoned telemetry in-flight queue");
+            // Prune completed handles so a long-lived session with a small
+            // `batch_size` doesn't accumulate finished handles until close.
+            in_flight.retain(|handle| !handle.is_finished());
+            in_flight.push(handle);
         }
     }
 
@@ -97,5 +101,93 @@ impl TelemetryClient {
             .expect("poisoned telemetry in-flight queue")
             .drain(..)
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::telemetry::test_support::CapturingTelemetryExporter;
+
+    fn client(exporter: Arc<CapturingTelemetryExporter>, batch_size: usize) -> TelemetryClient {
+        TelemetryClient::new(
+            exporter as Arc<dyn TelemetryExporter>,
+            batch_size,
+            Duration::from_secs(5),
+        )
+    }
+
+    #[tokio::test]
+    async fn enqueue_spawns_export_when_batch_size_reached() {
+        let exporter = Arc::new(CapturingTelemetryExporter::default());
+        let client = client(Arc::clone(&exporter), 1);
+
+        // With batch_size == 1, the single enqueue reaches the threshold, drains
+        // `pending` into a batch, and spawns `export_batch` on a stored in-flight
+        // handle — all mid-session, before any `flush`/close.
+        client.enqueue(TelemetryFrontendLog::default());
+
+        assert!(
+            client
+                .pending
+                .lock()
+                .expect("poisoned telemetry queue")
+                .is_empty(),
+            "pending should be drained once the batch is spawned"
+        );
+
+        let handles = client.drain_in_flight();
+        assert_eq!(
+            handles.len(),
+            1,
+            "enqueue should spawn exactly one export task"
+        );
+        for handle in handles {
+            handle.await.expect("spawned export task panicked");
+        }
+
+        let requests = exporter.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "exporter should receive the batch mid-session (before close)"
+        );
+        assert_eq!(requests[0].proto_logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_bounded_joins_in_flight_export() {
+        let exporter = Arc::new(CapturingTelemetryExporter::default());
+        let client = client(Arc::clone(&exporter), 1);
+
+        // Spawns a batch export via the in-flight path...
+        client.enqueue(TelemetryFrontendLog::default());
+        // ...which flush_bounded must await through its stored handle.
+        client.flush_bounded().await;
+
+        let requests = exporter.requests();
+        assert_eq!(
+            requests.len(),
+            1,
+            "flush_bounded should join the in-flight export so its batch is exported"
+        );
+        assert_eq!(requests[0].proto_logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn flush_bounded_exports_remaining_pending_below_batch_size() {
+        let exporter = Arc::new(CapturingTelemetryExporter::default());
+        let client = client(Arc::clone(&exporter), 200);
+
+        // Below the batch threshold: nothing is spawned, the event sits in
+        // `pending` until flush drains and exports it directly.
+        client.enqueue(TelemetryFrontendLog::default());
+        assert!(client.drain_in_flight().is_empty());
+
+        client.flush_bounded().await;
+
+        let requests = exporter.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].proto_logs.len(), 1);
     }
 }
