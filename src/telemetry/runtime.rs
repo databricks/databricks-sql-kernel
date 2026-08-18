@@ -242,8 +242,23 @@ fn build_system_configuration() -> DriverSystemConfiguration {
         client_app_name: None,
         locale_name: std::env::var("LANG").ok().filter(|s| !s.is_empty()),
         char_set_encoding: Some("UTF-8".to_string()),
-        process_name: std::env::args().next(),
+        // Use only the basename of argv[0]: the full path frequently embeds a
+        // username or other host-specific/PII-ish information that should not
+        // leave the process in telemetry.
+        process_name: process_name(),
     }
+}
+
+/// Returns the file-name (basename) component of `argv[0]`, dropping any
+/// leading directory path so host-specific/PII-ish path segments are not
+/// exported. Falls back to the raw `argv[0]` if it has no file-name component.
+fn process_name() -> Option<String> {
+    let arg0 = std::env::args().next()?;
+    let basename = std::path::Path::new(&arg0)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or(arg0);
+    Some(basename)
 }
 
 fn build_connection_params(
