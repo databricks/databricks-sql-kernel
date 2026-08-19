@@ -250,24 +250,30 @@ pub(crate) async fn discover_tenant(
     host: &str,
     http_client: &std::sync::Arc<crate::client::http::DatabricksHttpClient>,
 ) -> crate::kernel_error::Result<String> {
-    use crate::client::retry::RequestType;
     use crate::kernel_error::Error;
 
     let url = format!("{}/aad/auth", host.trim_end_matches('/'));
-    let request = http_client.inner().get(&url).build().map_err(|e| {
-        Error::io().message(format!(
-            "Failed to build Azure tenant-discovery request: {e}"
+    // Read the tenant off the FIRST `/aad/auth` redirect hop's `Location`
+    // (matching the connector's `get_azure_tenant_id_from_host`), NOT the final
+    // URL after following the whole chain. The workspace's first 3xx points at
+    // `login.microsoftonline.com/{tenant}/oauth2/authorize?…`; parsing that hop
+    // avoids assuming the tenant stays the first path segment across every
+    // downstream Entra redirect (a `/common/` step or a `login.live.com` bounce
+    // would otherwise yield a bogus "tenant" or trip the host guard).
+    let location = http_client.first_redirect_location(&url).await?;
+    let location = location.ok_or_else(|| {
+        Error::unauthenticated().message(format!(
+            "Azure tenant discovery: {url} did not return a redirect Location; \
+             pass azure_tenant_id explicitly"
         ))
     })?;
-    // The workspace `/aad/auth` 302-redirects to
-    // `login.microsoftonline.com/{tenant}/oauth2/authorize?…`. The kernel HTTP
-    // client follows redirects, so the final URL still carries the tenant as
-    // its first path segment (the tenant stays in the path throughout the
-    // Microsoft login flow). Parse it from there.
-    let response = http_client
-        .execute_without_auth(request, RequestType::AuthDiscovery)
-        .await?;
-    tenant_from_login_url(response.url())
+    let redirect_url = reqwest::Url::parse(&location).map_err(|e| {
+        Error::unauthenticated().message(format!(
+            "Azure tenant discovery: {url} redirect Location {location:?} is not a \
+             valid URL ({e}); pass azure_tenant_id explicitly"
+        ))
+    })?;
+    tenant_from_login_url(&redirect_url)
 }
 
 /// Parse the Azure tenant id from the Entra login URL the workspace's
@@ -405,6 +411,65 @@ mod tests {
         // "tenant" — fail so the caller passes azure_tenant_id explicitly.
         let url = reqwest::Url::parse("https://evil.example.com/not-a-tenant/x").unwrap();
         assert!(tenant_from_login_url(&url).is_err());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discover_tenant_reads_first_aad_auth_redirect_hop() {
+        // `/aad/auth` returns a 302 whose Location is the Entra authorize URL
+        // carrying the tenant as its first path segment. We must read that FIRST
+        // hop's Location and NOT follow the redirect chain onward to
+        // login.microsoftonline.com (which is unreachable/uninterceptable and,
+        // more importantly, might traverse a non-tenant-prefixed hop). Mounting
+        // ONLY `/aad/auth` proves discovery never issues a second request.
+        use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/aad/auth"))
+            .respond_with(ResponseTemplate::new(302).insert_header(
+                "location",
+                "https://login.microsoftonline.com/9f37a392-f0ae-4280-9796-f1864a10effc/oauth2/authorize?client_id=x",
+            ))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("http client"),
+        );
+        let tenant = discover_tenant(&mock_server.uri(), &http_client)
+            .await
+            .expect("tenant discovered");
+        assert_eq!(tenant, "9f37a392-f0ae-4280-9796-f1864a10effc");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn discover_tenant_errors_when_no_redirect() {
+        // A 200 (no Location) means the workspace isn't Azure / isn't
+        // redirecting — surface an explicit error steering to azure_tenant_id.
+        use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
+        use std::sync::Arc;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/aad/auth"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("http client"),
+        );
+        assert!(discover_tenant(&mock_server.uri(), &http_client)
+            .await
+            .is_err());
     }
 
     // ─── AzureServicePrincipalProvider (two-token composition) ───────────────

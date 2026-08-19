@@ -75,22 +75,38 @@ bindings just select the flow.
   `2ff814a6-…`), `callback_timeout` (`120s`), `token_cache`. This is **not** the
   discovered `{host}/oidc/v1/authorize` path, which redirects to a malformed
   Entra URL (404) for the Azure client — the v2.0 path is the fix.
-- **Azure service principal (M2M):** today via `OAuthM2M` with
-  `client_id`/`client_secret` = the Entra app credentials,
-  `token_url_override = https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token`,
-  and `scopes = ["2ff814a6-…/.default"]`. Setting `token_url_override` also skips
-  workspace OIDC discovery. A dedicated kernel-owned `azure-sp-m2m` variant (with
-  in-kernel `/aad/auth` tenant auto-discovery, so the tenant is optional) is the
-  next slice — see `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
+- **Azure service principal M2M (`AzureServicePrincipal`, `azure-sp-m2m`):
+  supported.** The kernel owns Azure resolution: it builds the Entra token
+  endpoint (`{login_host}/{tenant}/oauth2/v2.0/token`) and the
+  `{app_id}/.default` data scope, and — when `azure_tenant_id` is omitted —
+  auto-discovers the tenant from the workspace's `/aad/auth` redirect (matching
+  the Thrift connector), so bindings forward only the credentials. Fields:
+  `azure_client_id` / `azure_client_secret` (Entra app credentials, required),
+  `azure_tenant_id` (optional — auto-discovered when omitted),
+  `azure_workspace_resource_id` (optional — see below),
+  `identity_federation_client_id` (optional WIF). Construct via the
+  `AuthConfig::azure_service_principal(...)` validating constructor. See
+  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
 
-The Azure **management token** (`X-Databricks-Azure-SP-Management-Token`) is not
-implemented — no SQL connector (Go, Node) uses it; a workspace-member SP
+  The generic `OAuthM2M` path (Entra `token_url_override` +
+  `2ff814a6-…/.default` scope) still works and requires an explicit tenant;
+  `azure-sp-m2m` is the preferred, zero-config-tenant flow.
+
+The Azure **management token** (`X-Databricks-Azure-SP-Management-Token`, paired
+with `X-Databricks-Azure-Workspace-Resource-Id`) is an optional add-on to
+`azure-sp-m2m`, gated on `azure_workspace_resource_id`. When that field is set,
+the kernel additionally fetches an Azure-management token and sends both headers,
+so the control plane can authorize an SP that holds an Azure RBAC role but is not
+a workspace member. When it is unset (the common case), a workspace-member SP
 authenticates with the data token alone.
 
-The bindings expose these overrides as: pyo3 `token_url` / `oauth_scopes` /
-`client_id`; napi `oauthTokenUrl` / `oauthScopes` / `oauthClientId`; C ABI
-`kernel_session_config_set_oauth_token_endpoint` /
-`kernel_session_config_set_oauth_scopes` (+ the `set_auth_*` setters).
+The bindings expose the generic OAuth overrides as: pyo3 `token_url` /
+`oauth_scopes` / `client_id`; napi `oauthTokenUrl` / `oauthScopes` /
+`oauthClientId`; C ABI `kernel_session_config_set_oauth_token_endpoint` /
+`kernel_session_config_set_oauth_scopes` (+ the `set_auth_*` setters). The pyo3
+binding additionally exposes `azure-sp-m2m` via `auth_type="azure-sp-m2m"` with
+the `azure_client_id` / `azure_client_secret` / `azure_tenant_id` (optional) /
+`azure_workspace_resource_id` (optional) kwargs.
 
 Two further variants are reserved but not usable in v0:
 `OAuthFederation` (RFC 8693 token exchange — returns `InvalidArgument`
