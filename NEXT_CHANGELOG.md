@@ -11,6 +11,19 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Auth: `AuthConfig::OAuthM2MPrivateKey` — OAuth 2.0 machine-to-machine using a JWT
+  private-key client assertion (RFC 7523) instead of a client secret. The kernel
+  signs a short-lived JWT with a PEM/PKCS#8 private key (RSA or EC; unencrypted or
+  PBES2-passphrase-encrypted) and sends it as the `client_assertion` in the
+  client-credentials grant. Supported algorithms: `RS256`/`384`/`512`,
+  `PS256`/`384`/`512`, `ES256`, `ES384` (default `RS256`); `ES512` is not supported
+  and is rejected with a clear error. Construct via `AuthConfig::oauth_m2m_private_key`.
+- C ABI: `kernel_session_config_set_auth_m2m_jwt()` — expose the JWT private-key M2M
+  flow over the C ABI (for ODBC / Go consumers), alongside the existing
+  `set_auth_pat` / `set_auth_m2m` / `set_auth_u2m` setters. Required `client_id` /
+  `jwt_key_file` / `jwt_kid`; optional `jwt_passphrase` (encrypted PKCS#8),
+  `jwt_algorithm` (NULL → `RS256`), `scopes` (comma-separated; NULL → `all-apis`),
+  and `token_url` (NULL → OIDC discovery). Maps to `AuthConfig::oauth_m2m_private_key`.
 - C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
   HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
   `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own

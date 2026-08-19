@@ -285,6 +285,7 @@ fn auth_type(auth: &AuthConfig) -> String {
     match auth {
         AuthConfig::Pat { .. } => "pat",
         AuthConfig::OAuthM2M { .. } => "oauth-m2m",
+        AuthConfig::OAuthM2MPrivateKey { .. } => "oauth-m2m-jwt",
         AuthConfig::OAuthU2M { .. } => "oauth-u2m",
         AuthConfig::OAuthFederation { .. } => "oauth-federation",
         AuthConfig::External(_) => "external",
@@ -296,6 +297,7 @@ fn auth_mech(auth: &AuthConfig) -> DriverAuthMech {
     match auth {
         AuthConfig::Pat { .. } => DriverAuthMech::Pat,
         AuthConfig::OAuthM2M { .. }
+        | AuthConfig::OAuthM2MPrivateKey { .. }
         | AuthConfig::OAuthU2M { .. }
         | AuthConfig::OAuthFederation { .. } => DriverAuthMech::Oauth,
         AuthConfig::External(_) => DriverAuthMech::Other,
@@ -305,7 +307,9 @@ fn auth_mech(auth: &AuthConfig) -> DriverAuthMech {
 fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
     match auth {
         AuthConfig::Pat { .. } => Some(DriverAuthFlow::TokenPassthrough),
-        AuthConfig::OAuthM2M { .. } => Some(DriverAuthFlow::ClientCredentials),
+        AuthConfig::OAuthM2M { .. } | AuthConfig::OAuthM2MPrivateKey { .. } => {
+            Some(DriverAuthFlow::ClientCredentials)
+        }
         AuthConfig::OAuthU2M { .. } => Some(DriverAuthFlow::BrowserBasedAuthentication),
         AuthConfig::OAuthFederation { .. } | AuthConfig::External(_) => None,
     }

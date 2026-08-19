@@ -113,11 +113,43 @@ pbkdf2 = { version = "0.13.0", default-features = false, features = ["hmac"] }  
 hmac = "0.13.0"                                                                  # PRF backing PBKDF2
 zeroize = "1.9"                                                                  # Wipe derived key material on drop
 
+# JWT private-key client-credentials auth (service-principal M2M with a
+# signed client assertion instead of a client secret). Mirrors the JDBC
+# driver's JwtPrivateKeyClientCredentials. We sign with `jsonwebtoken`
+# (RS/PS/ES families, backed by `ring` — already in the graph via rustls,
+# so this adds no new heavyweight dependency) and load PEM/PKCS#8 keys
+# with the RustCrypto `pkcs8`/`sec1` family. This deliberately avoids the
+# `openssl` crate to preserve the pure-Rust/rustls posture the napi
+# binding depends on (see the `reqwest` / `[features]` TLS notes above);
+# the one accepted gap vs. JDBC/BouncyCastle is ES512 (P-521), which
+# `ring` does not support. All crates are dual Apache-2.0/MIT.
+#
+# Pinned to 9.x deliberately. jsonwebtoken 10.x dropped the built-in
+# `ring` backend and forces an explicit crypto backend, both of which
+# regress us: `rust_crypto` pulls `rsa` (RUSTSEC-2023-0071, Marvin) into
+# the RUNTIME crate, and `aws_lc_rs` links a C library (AWS-LC) that
+# breaks the pure-Rust posture and adds a recurring C-CVE maintenance
+# tail. 9.x's advisory GHSA-h395-gr6q-cpjc is in the DECODE/validation
+# path, which the kernel never exercises (it only signs), so it is
+# suppressed with justification in `osv-scanner.toml` rather than paying
+# the 10.x cost. Revisit if jsonwebtoken ships a ring-backed 10.x.
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
+pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
 wiremock = "0.6"
 tempfile = "3"
 log = "0.4"
+# Test-only private-key generation for the JWT auth tests. Keys are
+# generated in-process (RSA + P-256, plus a PBES2-encrypted PKCS#8
+# variant) rather than committed as PEM fixtures, so the repo's secret
+# scanner has nothing to flag and the tests need no `openssl` CLI (which
+# the repo deliberately avoids — not present on Windows). These are the
+# RustCrypto siblings of the `pkcs8` runtime dep. dev-only: never linked
+# into the shipped crate.
+rsa = { version = "0.9", features = ["pem"] }
+p256 = { version = "0.13", features = ["pkcs8", "pem"] }
 
 # TLS backend selection.
 #
