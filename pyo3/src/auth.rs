@@ -291,10 +291,11 @@ fn build_auth_config_inner(
             // the Azure app client id, port 8030, and the
             // `{app_id}/user_impersonation offline_access` scope. The binding
             // only forwards optional overrides — no endpoint/scope construction
-            // here. `app_id` (the connector's `DATABRICKS_AZURE_TENANT_ID`
-            // override for the scope resource) is threaded via `token_url`,
-            // which carries no meaning for this flow otherwise; a dedicated
-            // kwarg can replace it if needed.
+            // here. The `app_id` scope-resource override (the connector's
+            // `DATABRICKS_AZURE_TENANT_ID`) is NOT yet forwarded from Python:
+            // we always pass `None` below so the kernel default applies. A
+            // dedicated kwarg can wire it through if a caller needs to override
+            // it; `token_url` is not consulted for this flow.
             if matches!(oauth.client_id.as_deref(), Some("")) {
                 return Err("auth_type='azure-oauth' client_id must be non-empty when set; \
                             omit it to use the default Azure app"
