@@ -90,10 +90,22 @@ const AZURE_APP_IDS_BY_SUFFIX: &[(&str, &str)] = &[
 /// the M2M `.default` scope). Falls back to [`AZURE_DATABRICKS_APP_ID`] (prod)
 /// for commercial prod and sovereign hosts.
 pub(crate) fn effective_app_id(host: &str) -> &'static str {
-    let host = host.trim_end_matches('/').to_ascii_lowercase();
+    // Reduce to the host authority (drop scheme and any path) before matching,
+    // so the suffix test can't be fooled by the pattern appearing mid-string.
+    let host = host.to_ascii_lowercase();
+    let authority = host
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&host);
+    let authority = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(authority)
+        .trim_end_matches('.');
     for (suffix, app_id) in AZURE_APP_IDS_BY_SUFFIX {
-        // Match the host component, ignoring scheme/path.
-        if host.contains(suffix) {
+        // Match the host suffix, not a substring: a host that merely embeds the
+        // pattern (e.g. `adb-1.dev.azuredatabricks.net.example.com`) is not dev/staging.
+        if authority.ends_with(suffix) {
             return app_id;
         }
     }
@@ -403,6 +415,16 @@ mod tests {
         // Sovereign / unknown → prod app id fallback.
         assert_eq!(
             effective_app_id("https://adb-1.databricks.azure.us"),
+            AZURE_DATABRICKS_APP_ID
+        );
+        // A host that merely embeds the dev/staging pattern mid-string must not
+        // be misclassified — suffix match, not substring.
+        assert_eq!(
+            effective_app_id("https://adb-1.dev.azuredatabricks.net.example.com"),
+            AZURE_DATABRICKS_APP_ID
+        );
+        assert_eq!(
+            effective_app_id("https://adb-1.staging.azuredatabricks.net.evil.com"),
             AZURE_DATABRICKS_APP_ID
         );
     }
