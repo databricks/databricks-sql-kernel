@@ -382,7 +382,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.jwt_passphrase.clone(),
             options.jwt_algorithm.clone(),
             options.oauth_scopes.clone(),
-            None,
+            options.oauth_token_url.clone(),
         )
         .map_err(napi_err_from_kernel),
         // napi injects no client_id/scope default: it rides the kernel's
@@ -732,7 +732,7 @@ mod tests {
     #[test]
     fn oauth_token_url_forwards_as_token_url_override() {
         // `oauthTokenUrl` must reach the built AuthConfig as
-        // `token_url_override` for BOTH M2M and U2M, so a Node caller can point
+        // `token_url_override` for M2M, M2M-JWT, and U2M, so a Node caller can point
         // the token exchange at an Azure/Entra endpoint. Omitting it leaves the
         // override `None` (kernel OIDC discovery).
         let endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
@@ -757,6 +757,19 @@ mod tests {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
             other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+
+        let mut jwt = base();
+        jwt.auth_mode = Some(AuthMode::OAuthM2mJwt);
+        jwt.oauth_client_id = Some("cid".to_owned());
+        jwt.jwt_key_file = Some("/k.pem".to_owned());
+        jwt.jwt_kid = Some("kid".to_owned());
+        jwt.oauth_token_url = Some(endpoint.to_owned());
+        match build_auth_config(&jwt).unwrap() {
+            AuthConfig::OAuthM2MPrivateKey {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
 
         // Omitted → None (default OIDC discovery).
