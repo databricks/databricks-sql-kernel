@@ -387,7 +387,9 @@ impl StatementSpec {
         Ok(self)
     }
 
-    /// Set the server-side row cap (SEA `row_limit`). `None` clears it.
+    /// Set the SEA `row_limit` field. `None` omits it. Values are forwarded
+    /// verbatim, including `0`; this does not apply JDBC `maxRows`
+    /// normalization (where `0` means unlimited).
     pub fn row_limit(&mut self, row_limit: Option<i64>) -> &mut Self {
         self.row_limit = row_limit;
         self

@@ -58,7 +58,7 @@ def test_range_drains_to_pyarrow_table(session):
         stmt.close()
 
 
-@pytest.mark.parametrize("row_limit", [None, 0, 1, 5])
+@pytest.mark.parametrize("row_limit", [None, 1, 5])
 @live
 def test_row_limit(session, row_limit):
     stmt = session.statement()

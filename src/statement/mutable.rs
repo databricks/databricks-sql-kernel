@@ -900,12 +900,15 @@ mod tests {
     fn build_execute_params_threads_row_limit_to_wire() {
         // Headline parity feature: spec.row_limit must reach
         // ExecuteParams.row_limit. A regression dropping it would otherwise
-        // pass every other test (the seam this pins).
-        let mut spec = StatementSpec::new();
-        spec.sql("SELECT 1").row_limit(Some(100));
-        let (sql, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(sql, "SELECT 1");
-        assert_eq!(params.row_limit, Some(100));
+        // pass every other test (the seam this pins). Zero is intentionally
+        // forwarded rather than normalized to None as JDBC maxRows would be.
+        for row_limit in [0, 100] {
+            let mut spec = StatementSpec::new();
+            spec.sql("SELECT 1").row_limit(Some(row_limit));
+            let (sql, params) = build_execute_params(&spec, None).unwrap();
+            assert_eq!(sql, "SELECT 1");
+            assert_eq!(params.row_limit, Some(row_limit));
+        }
     }
 
     #[test]
