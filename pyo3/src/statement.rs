@@ -66,6 +66,13 @@ impl Statement {
         Ok(())
     }
 
+    /// Set the server-side row cap for this statement. ``None`` clears it.
+    fn set_row_limit(&mut self, row_limit: Option<i64>) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        inner.stmt.spec().row_limit(row_limit);
+        Ok(())
+    }
+
     /// Set per-statement query tags.
     ///
     /// ``tags`` is a ``dict[str, str | None]`` — a ``None`` value emits
