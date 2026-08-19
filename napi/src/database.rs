@@ -160,6 +160,13 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
+    /// OAuth token endpoint override. When omitted the kernel discovers the
+    /// endpoint via the workspace's OIDC configuration. Set it to point the
+    /// client-credentials / JWT client-assertion grant at the workspace's
+    /// configured IdP token endpoint (e.g. Entra ID for Azure Databricks),
+    /// which is required when that IdP — not Databricks-native OIDC — is the
+    /// authority for [`AuthMode::OAuthM2m`] / [`AuthMode::OAuthM2mJwt`].
+    pub token_url: Option<String>,
     /// Path to the PEM private-key file. Required for
     /// [`AuthMode::OAuthM2mJwt`].
     pub jwt_key_file: Option<String>,
@@ -361,7 +368,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
-            None,
+            options.token_url.clone(),
             options.identity_federation_client_id.clone(),
         )
         .map_err(napi_err_from_kernel),
@@ -376,7 +383,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.jwt_passphrase.clone(),
             options.jwt_algorithm.clone(),
             options.oauth_scopes.clone(),
-            None,
+            options.token_url.clone(),
         )
         .map_err(napi_err_from_kernel),
         // napi injects no client_id/scope default: it rides the kernel's
@@ -632,6 +639,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
+            token_url: None,
             jwt_key_file: None,
             jwt_kid: None,
             jwt_passphrase: None,
@@ -765,6 +773,7 @@ mod tests {
         o.jwt_passphrase = Some("pass".to_owned());
         o.jwt_algorithm = Some("ES256".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        o.token_url = Some("https://idp.example/token".to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 client_id,
@@ -773,6 +782,7 @@ mod tests {
                 jwt_passphrase,
                 jwt_algorithm,
                 scopes,
+                token_url_override,
                 ..
             } => {
                 assert_eq!(client_id, "cid");
@@ -781,6 +791,7 @@ mod tests {
                 assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
                 assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
                 assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+                assert_eq!(token_url_override.as_deref(), Some("https://idp.example/token"));
             }
             other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
