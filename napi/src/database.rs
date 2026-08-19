@@ -76,6 +76,9 @@ pub enum AuthMode {
     Pat,
     /// OAuth 2.0 machine-to-machine — `oauthClientId` + `oauthClientSecret`.
     OAuthM2m,
+    /// OAuth 2.0 machine-to-machine with a JWT private-key client
+    /// assertion — `oauthClientId` + `jwtKeyFile` + `jwtKid`.
+    OAuthM2mJwt,
     /// OAuth 2.0 user-to-machine (browser flow) — optional `oauthClientId`
     /// + `oauthRedirectPort`.
     OAuthU2m,
@@ -157,12 +160,24 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
-    /// OAuth token-endpoint override (M2M / U2M). Points the token exchange
-    /// at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
+    /// OAuth token-endpoint override (M2M / U2M / M2M-JWT). Points the token
+    /// exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
     /// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an
     /// Azure service principal. Omitted ⇒ OIDC discovery against the workspace
     /// host. Ignored for [`AuthMode::Pat`].
     pub oauth_token_url: Option<String>,
+    /// Path to the PEM private-key file. Required for
+    /// [`AuthMode::OAuthM2mJwt`].
+    pub jwt_key_file: Option<String>,
+    /// JWT key id (`kid`). Required for [`AuthMode::OAuthM2mJwt`].
+    pub jwt_kid: Option<String>,
+    /// Passphrase for an encrypted PKCS#8 key. Optional for
+    /// [`AuthMode::OAuthM2mJwt`] (omit for an unencrypted key).
+    pub jwt_passphrase: Option<String>,
+    /// JWT signing algorithm (`RS256`/`384`/`512`, `PS256`/`384`/`512`,
+    /// `ES256`, `ES384`). Optional for [`AuthMode::OAuthM2mJwt`]
+    /// (omitted ⇒ kernel default `RS256`).
+    pub jwt_algorithm: Option<String>,
     /// SP-wide Workload Identity Federation client id used during mandatory
     /// token exchange. Omitted selects BYOT / account-wide WIF.
     pub identity_federation_client_id: Option<String>,
@@ -354,6 +369,20 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.oauth_scopes.clone(),
             options.oauth_token_url.clone(),
             options.identity_federation_client_id.clone(),
+        )
+        .map_err(napi_err_from_kernel),
+        // JWT private-key client assertion. client_id + jwt_key_file +
+        // jwt_kid are mandatory; passphrase/algorithm are optional (the
+        // kernel defaults the algorithm to RS256 and validates the
+        // key/algorithm/passphrase at session open).
+        AuthMode::OAuthM2mJwt => AuthConfig::oauth_m2m_private_key(
+            options.oauth_client_id.clone(),
+            options.jwt_key_file.clone(),
+            options.jwt_kid.clone(),
+            options.jwt_passphrase.clone(),
+            options.jwt_algorithm.clone(),
+            options.oauth_scopes.clone(),
+            None,
         )
         .map_err(napi_err_from_kernel),
         // napi injects no client_id/scope default: it rides the kernel's
@@ -610,6 +639,10 @@ mod tests {
             oauth_redirect_port: None,
             oauth_scopes: None,
             oauth_token_url: None,
+            jwt_key_file: None,
+            jwt_kid: None,
+            jwt_passphrase: None,
+            jwt_algorithm: None,
             identity_federation_client_id: None,
             catalog: None,
             schema: None,
@@ -766,6 +799,40 @@ mod tests {
                 );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m2m_jwt_requires_client_id_key_file_and_kid() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthM2mJwt);
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_id");
+        o.oauth_client_id = Some("cid".to_owned());
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "jwt_key_file");
+        o.jwt_key_file = Some("/k.pem".to_owned());
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "jwt_kid");
+        o.jwt_kid = Some("kid".to_owned());
+        o.jwt_passphrase = Some("pass".to_owned());
+        o.jwt_algorithm = Some("ES256".to_owned());
+        o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthM2MPrivateKey {
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_passphrase,
+                jwt_algorithm,
+                scopes,
+                ..
+            } => {
+                assert_eq!(client_id, "cid");
+                assert_eq!(jwt_key_file, "/k.pem");
+                assert_eq!(jwt_kid, "kid");
+                assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
+                assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
+                assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+            }
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
     }
 

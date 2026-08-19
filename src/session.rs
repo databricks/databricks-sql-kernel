@@ -47,7 +47,7 @@
 
 use crate::auth::{
     AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
-    PersonalAccessToken,
+    JwtClientCredentialsProvider, PersonalAccessToken,
 };
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
@@ -68,9 +68,10 @@ use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::mutable::Statement;
+use crate::telemetry::{DriverSystemConfiguration, OperationType, TelemetryRuntime};
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tracing::{info_span, Instrument, Span};
 
 /// Crate-internal session state. Wrapped in `Arc` and shared with
@@ -103,6 +104,11 @@ pub(crate) struct SessionInner {
     /// enters this span via `let _g = self.inner.log_span.enter();`
     /// so log lines tied to a session are visibly grouped.
     log_span: Span,
+
+    /// Session-scoped telemetry runtime. It is a no-op runtime when
+    /// telemetry is disabled or initialization fails, so callsites can
+    /// emit lifecycle events without branching on config.
+    telemetry: Arc<TelemetryRuntime>,
 
     /// Flips to `true` only after [`Session::close`] has
     /// **successfully** awaited the `delete_session` call. Tells
@@ -332,7 +338,7 @@ impl Session {
         ));
         let reader_factory = ResultReaderFactory::new(
             sea.clone() as Arc<dyn Transport>,
-            http_client,
+            http_client.clone(),
             result_to_cloudfetch_config(&config.result),
             result_to_post_process_options(&config.result),
             runtime_handle.clone(),
@@ -354,6 +360,7 @@ impl Session {
         // ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue #196). So the
         // user's `session_conf` flows to CreateSession untouched; the
         // kernel synthesises nothing here.
+        let create_started = Instant::now();
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
@@ -361,6 +368,19 @@ impl Session {
                 crate::config::filter_session_conf(config.session_conf.clone()),
             )
             .await?;
+        let create_elapsed = create_started.elapsed();
+
+        let telemetry = Arc::new(TelemetryRuntime::from_config(
+            &config.telemetry,
+            &config.connection,
+            &config.auth,
+            config.driver_system_configuration.clone(),
+            http_client,
+            session_info.session_id.clone(),
+        ));
+        telemetry
+            .connection()
+            .emit_operation(OperationType::CreateSession, create_elapsed, None);
 
         // 5. Tag the per-session tracing span. Future log lines
         //    inherit `session_id` automatically. Target is pinned to the
@@ -380,6 +400,7 @@ impl Session {
                 config,
                 runtime_handle,
                 log_span,
+                telemetry,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 // Autocommit defaults to on (every statement commits); a
                 // caller opts into explicit transactions via set_autocommit.
@@ -629,10 +650,24 @@ impl Session {
         }
         let span = self.inner.log_span.clone();
         async {
-            self.inner
+            let telemetry = self.inner.telemetry.connection();
+            let delete_started = Instant::now();
+            if let Err(error) = self
+                .inner
                 .transport
                 .delete_session(&self.inner.session_id)
-                .await?;
+                .await
+            {
+                telemetry.emit_operation(
+                    OperationType::DeleteSession,
+                    delete_started.elapsed(),
+                    Some(&error),
+                );
+                telemetry.finish().await;
+                return Err(error);
+            }
+            telemetry.emit_operation(OperationType::DeleteSession, delete_started.elapsed(), None);
+            telemetry.finish().await;
             self.inner
                 .closed
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -661,6 +696,7 @@ pub struct SessionBuilder {
     result: Option<ResultConfig>,
     logging: Option<LoggingConfig>,
     telemetry: Option<TelemetryConfig>,
+    driver_system_configuration: Option<DriverSystemConfiguration>,
     session_conf: HashMap<String, String>,
     transport: Option<TransportMode>,
     /// Sentinel for [`SessionBuilder::http_path`] parse failures.
@@ -790,6 +826,19 @@ impl SessionBuilder {
         self
     }
 
+    /// Driver/runtime identity stamped onto telemetry logs.
+    ///
+    /// Binding layers should use this to pass their own driver name,
+    /// version, runtime, and process details. Any fields left unset are
+    /// filled from kernel defaults when the session opens.
+    pub fn driver_system_configuration(
+        mut self,
+        system_configuration: DriverSystemConfiguration,
+    ) -> Self {
+        self.driver_system_configuration = Some(system_configuration);
+        self
+    }
+
     /// Server-bound session conf passed through to SEA `session_confs`.
     pub fn session_conf(mut self, conf: HashMap<String, String>) -> Self {
         self.session_conf = conf;
@@ -828,6 +877,7 @@ impl SessionBuilder {
             connection,
             defaults: self.defaults,
             auth,
+            driver_system_configuration: self.driver_system_configuration,
             session_conf: self.session_conf,
             http: self.http.unwrap_or_default(),
             proxy: self.proxy,
@@ -962,6 +1012,16 @@ fn build_retry_configs_for_session(
         RetryConfigOverrides {
             overall_timeout: Some(Duration::from_secs(20)),
             max_retries: Some(0),
+            ..Default::default()
+        },
+    );
+    overrides.insert(
+        RequestCategory::Telemetry,
+        RetryConfigOverrides {
+            min_wait: Some(config.telemetry.retry_delay),
+            max_wait: Some(config.telemetry.retry_delay),
+            overall_timeout: Some(config.telemetry.close_flush_timeout),
+            max_retries: Some(config.telemetry.max_retries),
             ..Default::default()
         },
     );
@@ -1299,6 +1359,38 @@ async fn build_base_auth_provider(
             .await?;
             Ok(Arc::new(provider))
         }
+        AuthConfig::OAuthM2MPrivateKey {
+            client_id,
+            jwt_key_file,
+            jwt_kid,
+            jwt_passphrase,
+            jwt_algorithm,
+            scopes,
+            token_url_override,
+        } => {
+            if client_id.is_empty() || jwt_key_file.is_empty() || jwt_kid.is_empty() {
+                return Err(Error::invalid_argument().message(
+                    "AuthConfig::OAuthM2MPrivateKey requires non-empty client_id, \
+                     jwt_key_file, and jwt_kid",
+                ));
+            }
+            let scopes = scopes
+                .clone()
+                .unwrap_or_else(|| vec!["all-apis".to_string()]);
+            let provider = JwtClientCredentialsProvider::new(
+                host,
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_passphrase.as_deref(),
+                jwt_algorithm.as_deref(),
+                http_client,
+                scopes,
+                token_url_override.clone(),
+            )
+            .await?;
+            Ok(Arc::new(provider))
+        }
         AuthConfig::OAuthFederation { .. } => Err(Error::invalid_argument()
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
@@ -1374,6 +1466,7 @@ mod retry_config_tests {
                 token: "dapi-test".to_string(),
                 identity_federation_client_id: None,
             },
+            driver_system_configuration: None,
             session_conf: Default::default(),
             http,
             proxy: None,
@@ -1382,6 +1475,13 @@ mod retry_config_tests {
             logging: Default::default(),
             telemetry: Default::default(),
             transport: None,
+        }
+    }
+
+    fn config_with_telemetry(telemetry: TelemetryConfig) -> SessionConfig {
+        SessionConfig {
+            telemetry,
+            ..config_with_http(HttpConfig::default())
         }
     }
 
@@ -1452,6 +1552,23 @@ mod retry_config_tests {
         let auth = &configs[&RequestCategory::Auth];
         assert_eq!(auth.overall_timeout, Duration::from_secs(30));
         assert_eq!(auth.max_retries, 3);
+    }
+
+    #[test]
+    fn telemetry_retry_knobs_have_dedicated_category() {
+        let telemetry = TelemetryConfig {
+            max_retries: 2,
+            retry_delay: Duration::from_millis(50),
+            close_flush_timeout: Duration::from_secs(7),
+            ..TelemetryConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_telemetry(telemetry));
+        let telemetry = &configs[&RequestCategory::Telemetry];
+
+        assert_eq!(telemetry.min_wait, Duration::from_millis(50));
+        assert_eq!(telemetry.max_wait, Duration::from_millis(50));
+        assert_eq!(telemetry.max_retries, 2);
+        assert_eq!(telemetry.overall_timeout, Duration::from_secs(7));
     }
 
     #[test]
@@ -1737,6 +1854,11 @@ mod retry_config_tests {
 #[cfg(test)]
 mod is_open_tests {
     use super::*;
+    use crate::telemetry::test_support::CapturingTelemetryExporter;
+    use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
+    use serde_json::Value;
+    use std::future::Future;
+    use std::pin::Pin;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1849,5 +1971,180 @@ mod is_open_tests {
             session.autocommit(),
             "autocommit must stay on when transactions are ignored"
         );
+    }
+
+    #[tokio::test]
+    async fn telemetry_disabled_emits_no_connection_events() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-disabled").await;
+        let exporter = CapturingTelemetryExporter::default();
+
+        let session = telemetry_test_session(&server, "sess-telemetry-disabled", {
+            let exporter = std::sync::Arc::new(exporter.clone());
+            TelemetryConfig::default().with_exporter(exporter)
+        })
+        .await;
+
+        session.close().await.expect("close succeeds");
+
+        assert!(
+            exporter.requests().is_empty(),
+            "disabled telemetry must not export requests"
+        );
+    }
+
+    #[tokio::test]
+    async fn telemetry_enabled_exports_create_and_delete_on_close() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-enabled").await;
+        let exporter = CapturingTelemetryExporter::default();
+
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-enabled", telemetry).await;
+
+        session.close().await.expect("close succeeds");
+
+        let requests = exporter.requests();
+        assert_eq!(requests.len(), 1, "close should flush one pending batch");
+        assert_eq!(requests[0].proto_logs.len(), 2);
+        let operations = requests[0]
+            .proto_logs
+            .iter()
+            .map(|log| {
+                let value: Value = serde_json::from_str(log).expect("valid frontend log json");
+                assert_eq!(
+                    value["entry"]["sql_driver_log"]["session_id"],
+                    "sess-telemetry-enabled"
+                );
+                value["entry"]["sql_driver_log"]["sql_operation"]["operation_detail"]
+                    ["operation_type"]
+                    .as_str()
+                    .expect("operation_type string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(operations, vec!["CREATE_SESSION", "DELETE_SESSION"]);
+    }
+
+    #[tokio::test]
+    async fn telemetry_uses_client_driver_system_configuration_with_kernel_defaults() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-system-config").await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .telemetry(telemetry)
+            .driver_system_configuration(DriverSystemConfiguration {
+                driver_name: Some("databricks-sql-python".to_string()),
+                driver_version: Some("1.2.3".to_string()),
+                runtime_name: Some("python".to_string()),
+                ..Default::default()
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        session.close().await.expect("close succeeds");
+
+        let requests = exporter.requests();
+        assert_eq!(requests.len(), 1, "close should flush one pending batch");
+        let value: Value =
+            serde_json::from_str(&requests[0].proto_logs[0]).expect("valid frontend log json");
+        let system = &value["entry"]["sql_driver_log"]["system_configuration"];
+        assert_eq!(system["driver_name"], "databricks-sql-python");
+        assert_eq!(system["driver_version"], "1.2.3");
+        assert_eq!(system["runtime_name"], "python");
+        assert_eq!(system["runtime_vendor"], "rust-lang");
+        assert_eq!(system["char_set_encoding"], "UTF-8");
+    }
+
+    #[tokio::test]
+    async fn telemetry_export_failure_does_not_fail_session_close() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-failure").await;
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(FailingTelemetryExporter));
+
+        let session = telemetry_test_session(&server, "sess-telemetry-failure", telemetry).await;
+
+        session
+            .close()
+            .await
+            .expect("telemetry export failure must be fail-open");
+    }
+
+    async fn telemetry_test_session(
+        server: &MockServer,
+        expected_session_id: &str,
+        telemetry: TelemetryConfig,
+    ) -> Session {
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .telemetry(telemetry)
+            .open()
+            .await
+            .expect("session must open");
+
+        assert_eq!(session.session_id(), expected_session_id);
+        session
+    }
+
+    async fn mount_session_create_delete(server: &MockServer, session_id: &str) {
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(format!(
+                r#"{{"session_id":"{session_id}","warehouse_id":"test_wh"}}"#
+            )))
+            .mount(server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("/api/2.0/sql/sessions/{session_id}")))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(server)
+            .await;
+    }
+
+    #[derive(Debug)]
+    struct FailingTelemetryExporter;
+
+    impl TelemetryExporter for FailingTelemetryExporter {
+        fn export<'a>(
+            &'a self,
+            _request: TelemetryRequest,
+        ) -> Pin<Box<dyn Future<Output = TelemetryExportResult> + Send + 'a>> {
+            Box::pin(async {
+                Err(crate::telemetry::TelemetryExportError::Export(
+                    "expected test failure".to_string(),
+                ))
+            })
+        }
     }
 }

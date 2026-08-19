@@ -113,6 +113,11 @@ export const enum AuthMode {
   /** OAuth 2.0 machine-to-machine — `oauthClientId` + `oauthClientSecret`. */
   OAuthM2m = 'OAuthM2m',
   /**
+   * OAuth 2.0 machine-to-machine with a JWT private-key client
+   * assertion — `oauthClientId` + `jwtKeyFile` + `jwtKid`.
+   */
+  OAuthM2mJwt = 'OAuthM2mJwt',
+  /**
    * OAuth 2.0 user-to-machine (browser flow) — optional `oauthClientId`
    * + `oauthRedirectPort`.
    */
@@ -206,13 +211,31 @@ export interface ConnectionOptions {
    */
   oauthScopes?: Array<string>
   /**
-   * OAuth token-endpoint override (M2M / U2M). Points the token exchange at a
-   * non-workspace endpoint — e.g. the Azure/Entra token endpoint
+   * OAuth token-endpoint override (M2M / U2M / M2M-JWT). Points the token
+   * exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
    * `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an Azure
    * service principal. Omitted ⇒ OIDC discovery against the workspace host.
    * Ignored for `Pat`.
    */
   oauthTokenUrl?: string
+  /**
+   * Path to the PEM private-key file. Required for
+   * [`AuthMode::OAuthM2mJwt`].
+   */
+  jwtKeyFile?: string
+  /** JWT key id (`kid`). Required for [`AuthMode::OAuthM2mJwt`]. */
+  jwtKid?: string
+  /**
+   * Passphrase for an encrypted PKCS#8 key. Optional for
+   * [`AuthMode::OAuthM2mJwt`] (omit for an unencrypted key).
+   */
+  jwtPassphrase?: string
+  /**
+   * JWT signing algorithm (`RS256`/`384`/`512`, `PS256`/`384`/`512`,
+   * `ES256`, `ES384`). Optional for [`AuthMode::OAuthM2mJwt`]
+   * (omitted ⇒ kernel default `RS256`).
+   */
+  jwtAlgorithm?: string
   /**
    * SP-wide Workload Identity Federation client id used during mandatory
    * token exchange. Omitted selects BYOT / account-wide WIF.

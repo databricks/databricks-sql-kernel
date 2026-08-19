@@ -1673,7 +1673,8 @@ lGrv15pBcePj
             };
             overrides.insert(RequestCategory::Sea, ovr.clone());
             overrides.insert(RequestCategory::CloudFetch, ovr.clone());
-            overrides.insert(RequestCategory::Auth, ovr);
+            overrides.insert(RequestCategory::Auth, ovr.clone());
+            overrides.insert(RequestCategory::Telemetry, ovr);
 
             let global = RetryConfig::default();
             let retry_configs = build_retry_configs(&global, &overrides);
