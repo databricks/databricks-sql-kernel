@@ -607,9 +607,9 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
         ));
     }
     if matches!(options.telemetry_close_flush_timeout_ms, Some(0)) {
-        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
-            "telemetryCloseFlushTimeoutMs must be > 0",
-        )));
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("telemetryCloseFlushTimeoutMs must be > 0"),
+        ));
     }
 
     let mut telemetry = TelemetryConfig::default();
@@ -1374,7 +1374,10 @@ mod tests {
             build_driver_system_configuration(&o).expect("driver system configuration mentioned");
 
         assert_eq!(system_configuration.driver_name.as_deref(), Some("NodeSQL"));
-        assert_eq!(system_configuration.driver_version.as_deref(), Some("1.2.3"));
+        assert_eq!(
+            system_configuration.driver_version.as_deref(),
+            Some("1.2.3")
+        );
         assert_eq!(system_configuration.runtime_name.as_deref(), Some("node"));
         assert_eq!(
             system_configuration.runtime_version.as_deref(),
