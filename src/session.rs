@@ -1216,6 +1216,49 @@ async fn build_base_auth_provider(
                 timeout,
                 token_url_override.clone(),
                 cache_policy,
+                None, // Databricks-native U2M: discover the authorize endpoint
+            )
+            .await?;
+            Ok(Arc::new(provider))
+        }
+        AuthConfig::AzureOAuthU2M {
+            client_id,
+            redirect_ports,
+            app_id,
+            callback_timeout,
+            token_cache,
+            ..
+        } => {
+            // The kernel owns Azure resolution (it is the auth core): pin the
+            // workspace **v2.0** authorize+token endpoints (the workspace
+            // redirects them to Entra — the discovered /oidc/v1/authorize
+            // redirects to a malformed Entra URL), and fill the Azure app
+            // client id / port / delegated scope. No tenant needed for U2M.
+            use crate::auth::oauth::azure;
+            let client_id = client_id
+                .clone()
+                .unwrap_or_else(|| azure::AZURE_U2M_CLIENT_ID.to_string());
+            let callback_ports = match redirect_ports.as_deref() {
+                Some(ports) if !ports.is_empty() => ports.to_vec(),
+                _ => vec![azure::AZURE_U2M_REDIRECT_PORT],
+            };
+            let scopes = azure::u2m_scopes(app_id.as_deref());
+            let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
+            let cache_policy = token_cache
+                .clone()
+                .unwrap_or_default()
+                .resolve()
+                .map(|p| p.into_owned());
+            let provider = AuthorizationCodeProvider::new_with_full_config(
+                host,
+                &client_id,
+                http_client,
+                scopes,
+                callback_ports,
+                timeout,
+                Some(azure::u2m_token_url(host)),
+                cache_policy,
+                Some(azure::u2m_authorize_url(host)),
             )
             .await?;
             Ok(Arc::new(provider))

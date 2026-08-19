@@ -21,6 +21,7 @@
 //! - OIDC endpoint discovery
 //! - File-based token caching
 
+pub(crate) mod azure;
 pub mod cache;
 pub(crate) mod cache_crypto;
 pub mod callback;

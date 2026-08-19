@@ -285,8 +285,33 @@ fn build_auth_config_inner(
                 oauth.identity_federation_client_id,
             ))
         }
+        "azure-oauth" => {
+            // Azure Entra U2M. The kernel owns Azure resolution (it is the
+            // auth core): it pins the workspace v2.0 authorize/token endpoints,
+            // the Azure app client id, port 8030, and the
+            // `{app_id}/user_impersonation offline_access` scope. The binding
+            // only forwards optional overrides — no endpoint/scope construction
+            // here. `app_id` (the connector's `DATABRICKS_AZURE_TENANT_ID`
+            // override for the scope resource) is threaded via `token_url`,
+            // which carries no meaning for this flow otherwise; a dedicated
+            // kwarg can replace it if needed.
+            if matches!(oauth.client_id.as_deref(), Some("")) {
+                return Err("auth_type='azure-oauth' client_id must be non-empty when set; \
+                            omit it to use the default Azure app"
+                    .to_owned());
+            }
+            Ok(AuthConfig::azure_oauth_u2m(
+                oauth.client_id,
+                oauth.redirect_ports,
+                None, // app_id: kernel default (2ff814a6-…) / DATABRICKS_AZURE_TENANT_ID
+                oauth.callback_timeout_secs.map(Duration::from_secs),
+                None, // token_cache: kernel default (enabled, machine-local key)
+                oauth.identity_federation_client_id,
+            ))
+        }
         other => Err(format!(
-            "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', 'oauth-u2m'"
+            "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', \
+             'oauth-u2m', 'azure-oauth'"
         )),
     }
 }

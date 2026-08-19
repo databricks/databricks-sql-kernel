@@ -122,6 +122,7 @@ async fn test_u2m_refresh_token_full_flow() {
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
+        None, // No authorization_endpoint override
     )
     .await
     .expect("Failed to create AuthorizationCodeProvider");
@@ -196,6 +197,7 @@ async fn test_u2m_refresh_token_stale_immediate_return() {
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
+        None, // No authorization_endpoint override
     )
     .await
     .expect("Failed to create provider");
@@ -276,6 +278,7 @@ async fn test_u2m_refresh_token_expired_fallback() {
         Duration::from_secs(5), // Short timeout for test
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
+        None, // No authorization_endpoint override
     )
     .await
     .expect("Failed to create provider");
@@ -351,6 +354,7 @@ async fn test_u2m_refresh_updates_cache() {
         Duration::from_secs(120),
         None,
         Some(TEST_CACHE_PASSPHRASE.to_string()),
+        None, // No authorization_endpoint override
     )
     .await
     .expect("Failed to create provider");

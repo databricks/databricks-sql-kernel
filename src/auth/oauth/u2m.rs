@@ -243,6 +243,7 @@ impl AuthorizationCodeProvider {
             callback_timeout,
             None, // No token_endpoint override
             None, // On-disk cache disabled: no passphrase available here
+            None, // No authorization_endpoint override (discover)
         )
         .await
     }
@@ -267,12 +268,26 @@ impl AuthorizationCodeProvider {
         callback_timeout: Duration,
         token_endpoint_override: Option<String>,
         cache_passphrase: Option<String>,
+        authorization_endpoint_override: Option<String>,
     ) -> Result<Self> {
-        // Discover OIDC endpoints (unless token_endpoint is overridden, we still need auth endpoint)
-        let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-
-        // Use override if provided, otherwise use discovered endpoint
-        let token_endpoint = token_endpoint_override.unwrap_or(endpoints.token_endpoint);
+        // Resolve the authorization + token endpoints. When BOTH are
+        // overridden (the Azure `azure-oauth` flow pins the workspace v2.0
+        // `{host}/oidc/oauth2/v2.0/{authorize,token}` paths), skip OIDC
+        // discovery entirely — the discovered `{host}/oidc/v1/authorize`
+        // redirects to a malformed Entra URL for the Azure client, so the
+        // caller must be able to pin the v2.0 authorize path. Otherwise
+        // discover and let either override fill in.
+        let (token_endpoint, auth_endpoint) =
+            match (token_endpoint_override, authorization_endpoint_override) {
+                (Some(token), Some(auth)) => (token, auth),
+                (token_override, auth_override) => {
+                    let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+                    (
+                        token_override.unwrap_or(endpoints.token_endpoint),
+                        auth_override.unwrap_or(endpoints.authorization_endpoint),
+                    )
+                }
+            };
 
         // Create token store
         let token_store = TokenStore::new();
@@ -304,7 +319,7 @@ impl AuthorizationCodeProvider {
             host: host.to_string(),
             client_id: client_id.to_string(),
             token_endpoint,
-            auth_endpoint: endpoints.authorization_endpoint,
+            auth_endpoint,
             token_store,
             http_client,
             scopes,
@@ -663,6 +678,7 @@ mod tests {
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
+            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
@@ -716,6 +732,7 @@ mod tests {
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
+            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
@@ -785,6 +802,7 @@ mod tests {
             Duration::from_secs(5), // Short timeout for test
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
+            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
