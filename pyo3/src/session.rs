@@ -123,6 +123,10 @@ impl Session {
         redirect_ports=None,
         oauth_callback_timeout_secs=None,
         identity_federation_client_id=None,
+        azure_client_id=None,
+        azure_client_secret=None,
+        azure_tenant_id=None,
+        azure_workspace_resource_id=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
         tls_skip_hostname_verify=false,
@@ -153,6 +157,10 @@ impl Session {
         redirect_ports: Option<Vec<u16>>,
         oauth_callback_timeout_secs: Option<u64>,
         identity_federation_client_id: Option<String>,
+        azure_client_id: Option<String>,
+        azure_client_secret: Option<String>,
+        azure_tenant_id: Option<String>,
+        azure_workspace_resource_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
         tls_skip_hostname_verify: bool,
@@ -200,6 +208,10 @@ impl Session {
             redirect_ports,
             callback_timeout_secs: oauth_callback_timeout_secs,
             identity_federation_client_id,
+            azure_client_id,
+            azure_client_secret,
+            azure_tenant_id,
+            azure_workspace_resource_id,
         };
         let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;
 

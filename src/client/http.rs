@@ -723,6 +723,16 @@ impl DatabricksHttpClient {
         provider.get_auth_header()
     }
 
+    /// Extra auth headers to attach alongside `Authorization` (e.g. the Azure SP
+    /// management-token pair). Empty for every provider except the Azure SP one.
+    /// Errors if the auth provider has not been set.
+    pub fn auth_extra_headers(&self) -> Result<Vec<(String, String)>> {
+        let provider = self.auth_provider.get().ok_or_else(|| {
+            Error::invalid_state().message("Auth provider not set. Call set_auth_provider() first.")
+        })?;
+        provider.extra_headers()
+    }
+
     /// Returns the retry config for the given request category.
     fn retry_config(&self, category: RequestCategory) -> &RetryConfig {
         self.retry_configs
@@ -817,6 +827,12 @@ impl DatabricksHttpClient {
             if with_auth {
                 let auth_header = self.auth_header()?;
                 req_builder = req_builder.header("Authorization", auth_header);
+                // Extra auth headers (Azure SP management-token pair). Empty for
+                // every other provider. Applied only on authenticated requests,
+                // never on the token/OIDC calls that use `execute_without_auth`.
+                for (name, value) in self.auth_extra_headers()? {
+                    req_builder = req_builder.header(name, value);
+                }
             }
 
             // Add org ID header for multi-tenant workspace routing

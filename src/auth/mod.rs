@@ -29,4 +29,18 @@ use std::fmt::Debug;
 pub trait AuthProvider: Send + Sync + Debug {
     /// Returns the authorization header value for HTTP requests.
     fn get_auth_header(&self) -> Result<String>;
+
+    /// Extra headers to attach **alongside** `Authorization` on authenticated
+    /// requests (never on unauthenticated token/OIDC calls). Default: none.
+    ///
+    /// Overridden only by the Azure service-principal provider, which emits the
+    /// `X-Databricks-Azure-SP-Management-Token` + `X-Databricks-Azure-Workspace-
+    /// Resource-Id` pair when a workspace resource id is configured (so the
+    /// control plane can authorize an SP that has an Azure RBAC role but is not
+    /// a workspace member). These are dynamic (the management token refreshes),
+    /// so they cannot be static `custom_headers`. Called on every authenticated
+    /// request, so implementations must be cheap / internally cached.
+    fn extra_headers(&self) -> Result<Vec<(String, String)>> {
+        Ok(Vec::new())
+    }
 }

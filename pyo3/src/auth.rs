@@ -62,6 +62,13 @@ pub(crate) struct OAuthParams {
     pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
     pub identity_federation_client_id: Option<String>,
+    /// Azure Entra service-principal credentials (`azure-sp-m2m`). The kernel
+    /// resolves the Entra endpoint / scope and (when `azure_tenant_id` is
+    /// omitted) the tenant itself.
+    pub azure_client_id: Option<String>,
+    pub azure_client_secret: Option<String>,
+    pub azure_tenant_id: Option<String>,
+    pub azure_workspace_resource_id: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -338,9 +345,24 @@ fn build_auth_config_inner(
                 oauth.identity_federation_client_id,
             ))
         }
+        "azure-sp-m2m" => {
+            // Azure Entra service-principal M2M. The kernel owns Azure
+            // resolution: it builds the Entra token endpoint + `.default`
+            // scope and auto-discovers the tenant from the workspace when
+            // `azure_tenant_id` is omitted. The binding forwards only the
+            // Entra credentials (+ optional tenant).
+            AuthConfig::azure_service_principal(
+                oauth.azure_client_id,
+                oauth.azure_client_secret,
+                oauth.azure_tenant_id,
+                oauth.azure_workspace_resource_id,
+                oauth.identity_federation_client_id,
+            )
+            .map_err(|err| err.to_string())
+        }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', \
-             'oauth-u2m', 'azure-oauth'"
+             'oauth-u2m', 'azure-oauth', 'azure-sp-m2m'"
         )),
     }
 }

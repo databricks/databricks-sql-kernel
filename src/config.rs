@@ -385,6 +385,35 @@ pub enum AuthConfig {
         identity_federation_client_id: Option<String>,
     },
 
+    /// Azure Entra ID **service-principal** machine-to-machine auth — the
+    /// `azure-sp-m2m` flow. Client-credentials against Entra directly
+    /// (`{login_host}/{tenant}/oauth2/v2.0/token`) with the Azure app
+    /// credentials and the `{app_id}/.default` scope. The kernel resolves the
+    /// endpoint, scope, and (when `azure_tenant_id` is omitted) the tenant
+    /// itself — so bindings forward only the credentials. The Azure
+    /// management-token header pair is an optional add-on gated on
+    /// `azure_workspace_resource_id` (see that field); a workspace-member SP
+    /// authenticates with the data token alone.
+    AzureServicePrincipal {
+        /// Entra app-registration client id.
+        azure_client_id: String,
+        /// Entra app-registration client secret.
+        azure_client_secret: String,
+        /// Entra tenant id. `None` → auto-discovered from the workspace's
+        /// `/aad/auth` redirect (matching the Thrift connector).
+        azure_tenant_id: Option<String>,
+        /// Azure workspace ARM resource id. When set, the kernel additionally
+        /// fetches an Azure-management token and sends the
+        /// `X-Databricks-Azure-SP-Management-Token` +
+        /// `X-Databricks-Azure-Workspace-Resource-Id` pair, so the control
+        /// plane can authorize an SP that has an Azure RBAC role but is not a
+        /// workspace member. `None` → data token only (the common case).
+        azure_workspace_resource_id: Option<String>,
+        /// SP-wide Workload Identity Federation client id, forwarded to the
+        /// federation wrapper.
+        identity_federation_client_id: Option<String>,
+    },
+
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
     /// (e.g. exchanging a Workload Identity token for a Databricks
     /// access token).
@@ -514,6 +543,37 @@ impl AuthConfig {
         }
     }
 
+    /// Construct a [`AuthConfig::AzureServicePrincipal`] (the `azure-sp-m2m`
+    /// flow), validating that the Entra `azure_client_id` / `azure_client_secret`
+    /// are present and non-empty. `azure_tenant_id` is optional (the kernel
+    /// auto-discovers it from the workspace when omitted).
+    pub fn azure_service_principal(
+        azure_client_id: Option<String>,
+        azure_client_secret: Option<String>,
+        azure_tenant_id: Option<String>,
+        azure_workspace_resource_id: Option<String>,
+        identity_federation_client_id: Option<String>,
+    ) -> crate::Result<Self> {
+        let azure_client_id = azure_client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("Azure SP auth requires a non-empty azure_client_id")
+        })?;
+        let azure_client_secret =
+            azure_client_secret
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    crate::kernel_error::Error::invalid_argument()
+                        .message("Azure SP auth requires a non-empty azure_client_secret")
+                })?;
+        Ok(AuthConfig::AzureServicePrincipal {
+            azure_client_id,
+            azure_client_secret,
+            azure_tenant_id: azure_tenant_id.filter(|s| !s.is_empty()),
+            azure_workspace_resource_id: azure_workspace_resource_id.filter(|s| !s.is_empty()),
+            identity_federation_client_id,
+        })
+    }
+
     /// SP-wide federation client id attached to the selected base auth flow.
     pub(crate) fn identity_federation_client_id(&self) -> Option<&str> {
         match self {
@@ -530,6 +590,10 @@ impl AuthConfig {
                 ..
             }
             | Self::AzureOAuthU2M {
+                identity_federation_client_id,
+                ..
+            }
+            | Self::AzureServicePrincipal {
                 identity_federation_client_id,
                 ..
             } => identity_federation_client_id.as_deref(),
@@ -612,6 +676,23 @@ impl std::fmt::Debug for AuthConfig {
                 .field("client_id", client_id)
                 .field("redirect_ports", redirect_ports)
                 .field("app_id", app_id)
+                .field(
+                    "identity_federation_client_id",
+                    identity_federation_client_id,
+                )
+                .finish(),
+            Self::AzureServicePrincipal {
+                azure_client_id,
+                azure_tenant_id,
+                azure_workspace_resource_id,
+                identity_federation_client_id,
+                ..
+            } => f
+                .debug_struct("AzureServicePrincipal")
+                .field("azure_client_id", azure_client_id)
+                .field("azure_client_secret", &"<redacted>")
+                .field("azure_tenant_id", azure_tenant_id)
+                .field("azure_workspace_resource_id", azure_workspace_resource_id)
                 .field(
                     "identity_federation_client_id",
                     identity_federation_client_id,

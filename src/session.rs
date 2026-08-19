@@ -1263,6 +1263,42 @@ async fn build_base_auth_provider(
             .await?;
             Ok(Arc::new(provider))
         }
+        AuthConfig::AzureServicePrincipal {
+            azure_client_id,
+            azure_client_secret,
+            azure_tenant_id,
+            azure_workspace_resource_id,
+            ..
+        } => {
+            // Kernel owns Azure resolution: build the Entra token endpoint
+            // ({login}/{tenant}/oauth2/v2.0/token) and the {app_id}/.default
+            // scope, discovering the tenant from the workspace's /aad/auth
+            // redirect when the caller omits it (Thrift parity). When a
+            // workspace resource id is supplied, the provider also emits the
+            // management-token pair (for RBAC-only SPs); otherwise it sends the
+            // data token alone.
+            use crate::auth::oauth::azure::AzureServicePrincipalProvider;
+            if azure_client_id.is_empty() || azure_client_secret.is_empty() {
+                return Err(Error::invalid_argument().message(
+                    "AuthConfig::AzureServicePrincipal requires non-empty \
+                     azure_client_id and azure_client_secret",
+                ));
+            }
+            let tenant = match azure_tenant_id {
+                Some(t) if !t.is_empty() => t.clone(),
+                _ => crate::auth::oauth::azure::discover_tenant(host, &http_client).await?,
+            };
+            let provider = AzureServicePrincipalProvider::new(
+                host,
+                azure_client_id,
+                azure_client_secret,
+                &tenant,
+                azure_workspace_resource_id.clone(),
+                http_client,
+            )
+            .await?;
+            Ok(Arc::new(provider))
+        }
         AuthConfig::OAuthFederation { .. } => Err(Error::invalid_argument()
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
