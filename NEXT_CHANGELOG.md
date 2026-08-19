@@ -43,11 +43,12 @@ changes go in their respective binding's NEXT_CHANGELOG.
   setters expose the pieces the C surface was missing:
   `kernel_session_config_set_oauth_token_endpoint()` and
   `kernel_session_config_set_oauth_scopes()` — both applied to whichever OAuth
-  mode (M2M or U2M) is selected, matching the single `oauth_scopes` /
-  `token_url` the pyo3 and napi bindings already share across both flows. Both
-  are additive — existing `set_auth_m2m` / `set_auth_u2m` signatures are
-  unchanged (for U2M, `set_oauth_scopes` takes precedence over scopes passed
-  positionally to `set_auth_u2m`). (PECOBLR-4141 / PECOBLR-4120.)
+  mode (M2M, M2M-JWT, or U2M) is selected, matching the single `oauth_scopes` /
+  `token_url` the pyo3 and napi bindings already share across those flows. Both
+  are additive — existing `set_auth_m2m` / `set_auth_m2m_jwt` / `set_auth_u2m`
+  signatures are unchanged (for U2M and M2M-JWT, `set_oauth_scopes` /
+  `set_oauth_token_endpoint` take precedence over scopes/token-endpoint passed
+  positionally to those setters). (PECOBLR-4141 / PECOBLR-4120.)
 
 - Auth: `AuthConfig::OAuthM2MPrivateKey` — OAuth 2.0 machine-to-machine using a JWT
   private-key client assertion (RFC 7523) instead of a client secret. The kernel
