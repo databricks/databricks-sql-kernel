@@ -338,7 +338,7 @@ impl Session {
         ));
         let reader_factory = ResultReaderFactory::new(
             sea.clone() as Arc<dyn Transport>,
-            http_client,
+            http_client.clone(),
             result_to_cloudfetch_config(&config.result),
             result_to_post_process_options(&config.result),
             runtime_handle.clone(),
@@ -375,6 +375,7 @@ impl Session {
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
+            http_client,
             session_info.session_id.clone(),
         ));
         telemetry
@@ -662,11 +663,11 @@ impl Session {
                     delete_started.elapsed(),
                     Some(&error),
                 );
-                telemetry.flush().await;
+                telemetry.finish().await;
                 return Err(error);
             }
             telemetry.emit_operation(OperationType::DeleteSession, delete_started.elapsed(), None);
-            telemetry.flush().await;
+            telemetry.finish().await;
             self.inner
                 .closed
                 .store(true, std::sync::atomic::Ordering::Release);
@@ -1011,6 +1012,16 @@ fn build_retry_configs_for_session(
         RetryConfigOverrides {
             overall_timeout: Some(Duration::from_secs(20)),
             max_retries: Some(0),
+            ..Default::default()
+        },
+    );
+    overrides.insert(
+        RequestCategory::Telemetry,
+        RetryConfigOverrides {
+            min_wait: Some(config.telemetry.retry_delay),
+            max_wait: Some(config.telemetry.retry_delay),
+            overall_timeout: Some(config.telemetry.close_flush_timeout),
+            max_retries: Some(config.telemetry.max_retries),
             ..Default::default()
         },
     );
@@ -1388,6 +1399,13 @@ mod retry_config_tests {
         }
     }
 
+    fn config_with_telemetry(telemetry: TelemetryConfig) -> SessionConfig {
+        SessionConfig {
+            telemetry,
+            ..config_with_http(HttpConfig::default())
+        }
+    }
+
     #[test]
     fn http_retry_knobs_flow_into_global_config() {
         let http = HttpConfig {
@@ -1455,6 +1473,23 @@ mod retry_config_tests {
         let auth = &configs[&RequestCategory::Auth];
         assert_eq!(auth.overall_timeout, Duration::from_secs(30));
         assert_eq!(auth.max_retries, 3);
+    }
+
+    #[test]
+    fn telemetry_retry_knobs_have_dedicated_category() {
+        let telemetry = TelemetryConfig {
+            max_retries: 2,
+            retry_delay: Duration::from_millis(50),
+            close_flush_timeout: Duration::from_secs(7),
+            ..TelemetryConfig::default()
+        };
+        let configs = build_retry_configs_for_session(&config_with_telemetry(telemetry));
+        let telemetry = &configs[&RequestCategory::Telemetry];
+
+        assert_eq!(telemetry.min_wait, Duration::from_millis(50));
+        assert_eq!(telemetry.max_wait, Duration::from_millis(50));
+        assert_eq!(telemetry.max_retries, 2);
+        assert_eq!(telemetry.overall_timeout, Duration::from_secs(7));
     }
 
     #[test]

@@ -440,6 +440,10 @@ circuit_breaker_threshold = 5
 circuit_breaker_timeout = 60 seconds
 ```
 
+`flush_interval = 0` is invalid and disables telemetry; the kernel follows
+JDBC by using a non-zero periodic flush default rather than ADBC's no-periodic
+flush default.
+
 Add test-only injection behind `#[cfg(any(test, feature = "test-utils"))]`:
 
 ```rust
@@ -531,7 +535,7 @@ Deliverable:
 - Replace `src/telemetry/mod.rs` with `ConnectionTelemetry`,
 `NoOpConnectionTelemetry`, `TelemetrySessionContext`, config parsing,
 event-building helpers, `TelemetryClient`, and test exporter injection.
-- Expand `TelemetryConfig` in `src/config.rs` with ADBC-compatible defaults.
+- Expand `TelemetryConfig` in `src/config.rs` with SQL-driver-compatible defaults.
 - Add `TelemetryRuntime` to `SessionInner`.
 - Wire `Session::open` to create connection telemetry after `create_session`
 returns, using no-op fallback on disabled telemetry, invalid config, or
