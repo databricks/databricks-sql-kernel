@@ -105,12 +105,17 @@ redirect available):
 - **Scope**: `{effective_app_id}/.default` (app id from the host's cloud).
 - **Credentials**: `azure_client_id` / `azure_client_secret` via HTTP Basic
   (Entra v2.0 advertises `client_secret_basic`; verified).
-- **Management token / `azure_workspace_resource_id`: still not implemented.**
-  No SQL connector (Go, Node) uses it; Python's Thrift path sends it but the SQL
-  data path doesn't require it for a workspace-member SP. An SP that is not a
-  workspace member (RBAC-only) remains unsupported on the kernel path,
-  documented. Revisit only with a concrete SQL customer need; the seam would be a
-  second-token + refreshing-extra-header mechanism.
+- **Management token / `azure_workspace_resource_id`: implemented (optional
+  add-on).** When `azure_workspace_resource_id` is supplied, the kernel
+  additionally fetches an Azure-management token (scope
+  `https://management.core.windows.net/.default`) and emits the
+  `X-Databricks-Azure-SP-Management-Token` +
+  `X-Databricks-Azure-Workspace-Resource-Id` header pair via the provider's
+  `extra_headers`, so the control plane can authorize an SP that holds an Azure
+  RBAC role but is not a workspace member. `azure_workspace_resource_id` is
+  optional and defaults to `None` (data token only — the common
+  workspace-member case). See `AZURE_MANAGEMENT_SCOPE` /
+  `AzureServicePrincipalProvider::extra_headers` in `src/auth/oauth/azure.rs`.
 
 ## Federation
 
@@ -135,6 +140,7 @@ AuthConfig::AzureServicePrincipal {   // azure-sp-m2m
     azure_client_id: String,
     azure_client_secret: String,
     azure_tenant_id: Option<String>,  // None → auto-discover via /aad/auth
+    azure_workspace_resource_id: Option<String>, // Some → also send SP management-token headers
     identity_federation_client_id: Option<String>,
 }
 ```
@@ -172,4 +178,5 @@ flows, incl. Go's Databricks-SP M2M and the workspace-OIDC databricks-oauth).
   commits). Retained as primitives.
 - Live test found the `/oidc/v1/authorize` 404 → authorize must be v2.0.
 - Decision (team): kernel is the auth core, bindings thin → Azure resolution
-  moves into the kernel (this doc). Management token stays out.
+  moves into the kernel (this doc). Management token implemented as an optional
+  add-on gated on `azure_workspace_resource_id` (RBAC-only SP support).
