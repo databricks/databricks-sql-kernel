@@ -72,12 +72,18 @@ connector supplying the Azure endpoint / scope / client id it already owns:
   (the Azure Databricks application id). Setting a `token_url_override` also
   skips workspace OIDC discovery, since the client-credentials grant never uses
   the authorization endpoint.
-- **Azure U2M (`azure-oauth`):** `OAuthU2M` with the Azure app client id
-  (`96eecda7-19ea-49cc-abb5-240097d554f5`), the Azure delegated scope
-  (`{app_id}/user_impersonation offline_access`), and its redirect port;
-  endpoints come from OIDC discovery, which an Azure workspace redirects to
-  Entra. (The kernel-native `databricks-oauth` U2M also works on Azure
-  workspaces with no Azure-specific values.)
+- **Azure U2M (`azure-oauth`): not yet supported on the kernel path
+  (unverified).** Unlike M2M, the U2M authorization-code flow needs the
+  *authorize* endpoint, and `token_url_override` only replaces the *token*
+  endpoint. U2M still discovers and uses the workspace `authorization_endpoint`
+  (`{host}/oidc/v1/authorize`), which on an Azure workspace redirects to a
+  malformed `login.microsoftonline.com/{tenant}/v1/authorize` that 404s. The
+  fix — kernel-owned Azure resolution pinning `{host}/oidc/oauth2/v2.0/authorize`
+  — is **not implemented in this PR** (see
+  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`, PECOBLR-4120),
+  so there is no working generic-override recipe for Azure U2M yet. The
+  kernel-native `databricks-oauth` U2M flow is the supported browser option on
+  Azure workspaces.
 
 The bindings expose these overrides as: pyo3 `token_url` / `oauth_scopes` /
 `client_id`; napi `oauthTokenUrl` / `oauthScopes` / `oauthClientId`; C ABI
