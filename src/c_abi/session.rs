@@ -1004,7 +1004,12 @@ fn auth_spec_to_config(
             redirect_port.map(|p| vec![p]),
             // The shared `set_oauth_scopes` wins; fall back to the scopes
             // passed positionally to `set_auth_u2m` (pre-existing path).
-            oauth_scopes.or(scopes).and_then(|s| parse_scopes(&s)),
+            // Parse each source *before* choosing precedence: a present-but-
+            // empty shared value (`Some("")`) parses to `None`, so the
+            // positional fallback is preserved instead of being shadowed.
+            oauth_scopes
+                .and_then(|s| parse_scopes(&s))
+                .or_else(|| scopes.and_then(|s| parse_scopes(&s))),
             oauth_token_endpoint,
             None,
             Some(token_cache),
@@ -1444,6 +1449,32 @@ mod tests {
         match auth {
             AuthConfig::OAuthU2M { scopes, .. } => {
                 assert_eq!(scopes, Some(vec!["from-set-oauth-scopes".to_string()]))
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_shared_oauth_scopes_falls_back_to_u2m_positional_scopes() {
+        // A present-but-empty shared value (`set_oauth_scopes("")`) parses to
+        // no scopes, so it must NOT shadow the positional `set_auth_u2m`
+        // scopes: precedence is chosen on the *parsed* result, not the raw
+        // `Option<String>`. Guards the documented positional-fallback contract.
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: Some("from-set-auth-u2m".to_string()),
+            },
+            None,
+            Some(String::new()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m");
+        match auth {
+            AuthConfig::OAuthU2M { scopes, .. } => {
+                assert_eq!(scopes, Some(vec!["from-set-auth-u2m".to_string()]))
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
         }
