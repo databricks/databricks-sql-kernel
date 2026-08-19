@@ -20,7 +20,36 @@ all-features = true
 
 [advisories]
 yanked = "warn"
-ignore = []
+ignore = [
+    # RUSTSEC-2023-0071 — "Marvin Attack": RSA timing sidechannel in the
+    # `rsa` crate. No fixed version exists (only 0.10 release candidates;
+    # stable 0.9.x is still affected), so it cannot be cleared by a bump.
+    #
+    # `rsa` is a DEV-ONLY dependency here: it generates RSA test keys
+    # in-process for the JWT auth unit tests (`src/auth/oauth/test_keys.rs`)
+    # so we don't commit PEM fixtures (secret scanner) or shell out to
+    # `openssl` (not on Windows). Verified dev-only via `cargo tree -i rsa`
+    # — it is never linked into the shipped kernel, pyo3, or napi artifacts,
+    # so the timing sidechannel is not reachable by any driver consumer.
+    # The runtime signing path uses `jsonwebtoken` (ring), not `rsa`.
+    #
+    # We keep `rsa` (rather than dropping RSA test coverage for EC-only)
+    # because RS256 is the JDBC default and the most common real-world key
+    # type, so exercising the RSA load+sign path in tests has value.
+    # Re-evaluate when `rsa` ships a constant-time stable release.
+    "RUSTSEC-2023-0071",
+    # RUSTSEC-2026-0258 — "h2 unbounded empty DATA frames". A DoS advisory
+    # in `h2 0.4.15`, pulled in transitively via `hyper` <- `reqwest`
+    # (`cargo tree -i h2`); not a direct dependency and unrelated to this
+    # crate's code. 0.4.15 is already the latest 0.4.x (a `cargo update -p
+    # h2` is a no-op), so it cannot be cleared by a bump; clearing it needs
+    # an upstream `hyper`/`reqwest` release that requires the fixed `h2`.
+    # The advisory concerns a server-side frame-flood; the kernel is an
+    # HTTP *client* to Databricks SEA, so the attack surface is not exercised
+    # here. Pre-existing on `main` (fires against the shared reqwest stack,
+    # not this PR). Re-evaluate when the reqwest/hyper stack picks up the fix.
+    "RUSTSEC-2026-0258",
+]
 
 [licenses]
 # Permissive licenses we allow in transitive deps. Adding a new

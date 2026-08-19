@@ -49,14 +49,15 @@ enum ConnectionSpec {
     HttpPath { host: String, http_path: String },
 }
 
-/// Auth choice captured from the C-side setters. v0 C ABI wires PAT and
-/// OAuth M2M; other [`AuthConfig`] variants stay Rust-crate-only.
+/// Auth choice captured from the C-side setters. The C ABI wires PAT,
+/// OAuth M2M (shared-secret and JWT private-key), and OAuth U2M; other
+/// [`AuthConfig`] variants stay Rust-crate-only.
 ///
-/// NOTE (secret handling): `token` / `client_secret` are copied out of
-/// the C string into owned `String`s and are not zeroized on drop, so
-/// plaintext lingers in freed heap. This matches the rest of the crate
-/// (no `zeroize`/`secrecy` anywhere); when the crate adopts a
-/// zeroize-on-drop policy, these copies must be included.
+/// NOTE (secret handling): `token` / `client_secret` / `jwt_passphrase`
+/// are copied out of the C string into owned `String`s and are not
+/// zeroized on drop, so plaintext lingers in freed heap. This matches the
+/// rest of the crate (no `zeroize`/`secrecy` anywhere); when the crate
+/// adopts a zeroize-on-drop policy, these copies must be included.
 enum AuthSpec {
     Pat {
         token: String,
@@ -64,6 +65,20 @@ enum AuthSpec {
     OAuthM2M {
         client_id: String,
         client_secret: String,
+    },
+    /// OAuth M2M via a JWT private-key client assertion. `client_id`,
+    /// `jwt_key_file`, and `jwt_kid` are required; `jwt_passphrase` (for an
+    /// encrypted PKCS#8 key), `jwt_algorithm` (`None` ⇒ `RS256`), `scopes`
+    /// (comma-separated; `None` ⇒ kernel default `all-apis`), and
+    /// `token_url` (`None` ⇒ OIDC discovery) are optional.
+    OAuthM2MJwt {
+        client_id: String,
+        jwt_key_file: String,
+        jwt_kid: String,
+        jwt_passphrase: Option<String>,
+        jwt_algorithm: Option<String>,
+        scopes: Option<String>,
+        token_url: Option<String>,
     },
     /// OAuth user-to-machine (authorization code + PKCE, browser flow).
     /// All fields optional — the kernel fills `databricks-sql-connector` /
@@ -311,6 +326,49 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_m2m(
         c.auth = Some(AuthSpec::OAuthM2M {
             client_id: required_str(client_id, "client_id")?,
             client_secret: required_str(client_secret, "client_secret")?,
+        });
+        Ok(())
+    })
+}
+
+/// Set OAuth M2M authentication via a JWT private-key client assertion
+/// (RFC 7523). Instead of a client secret, the kernel signs a short-lived
+/// JWT with the configured private key and sends it as the
+/// `client_assertion` in the client-credentials grant. Mutually exclusive
+/// with the other `set_auth_*` setters — the last one called wins.
+///
+/// `client_id`, `jwt_key_file` (path to a PEM/PKCS#8 private key), and
+/// `jwt_kid` (key id written into the JWT header) are required. The rest
+/// are optional (pass NULL to omit): `jwt_passphrase` (for an encrypted
+/// PKCS#8 key), `jwt_algorithm` (`RS256`/`384`/`512`, `PS256`/`384`/`512`,
+/// `ES256`, `ES384`; NULL → `RS256`), `scopes` (a comma-separated list;
+/// NULL → the kernel default `all-apis`), and `token_url` (an explicit
+/// token endpoint; NULL → discover via OIDC).
+///
+/// # Safety
+/// `config` must be a live config handle; the required args must be
+/// NUL-terminated C strings, and the optional args, if non-null, must be
+/// NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_auth_m2m_jwt(
+    config: *mut KernelSessionConfig,
+    client_id: *const c_char,
+    jwt_key_file: *const c_char,
+    jwt_kid: *const c_char,
+    jwt_passphrase: *const c_char,
+    jwt_algorithm: *const c_char,
+    scopes: *const c_char,
+    token_url: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.auth = Some(AuthSpec::OAuthM2MJwt {
+            client_id: required_str(client_id, "client_id")?,
+            jwt_key_file: required_str(jwt_key_file, "jwt_key_file")?,
+            jwt_kid: required_str(jwt_kid, "jwt_kid")?,
+            jwt_passphrase: optional_str(jwt_passphrase, "jwt_passphrase")?,
+            jwt_algorithm: optional_str(jwt_algorithm, "jwt_algorithm")?,
+            scopes: optional_str(scopes, "scopes")?,
+            token_url: optional_str(token_url, "token_url")?,
         });
         Ok(())
     })
@@ -932,7 +990,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             })?;
             let auth = auth.ok_or_else(|| {
                 Error::invalid_argument().message(
-                    "session config requires auth (set_auth_pat, set_auth_m2m, or set_auth_u2m)",
+                    "session config requires auth (set_auth_pat, set_auth_m2m, \
+                     set_auth_m2m_jwt, or set_auth_u2m)",
                 )
             })?;
 
@@ -958,6 +1017,23 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                     None,
                     None,
                     identity_federation_client_id,
+                )?,
+                AuthSpec::OAuthM2MJwt {
+                    client_id,
+                    jwt_key_file,
+                    jwt_kid,
+                    jwt_passphrase,
+                    jwt_algorithm,
+                    scopes,
+                    token_url,
+                } => AuthConfig::oauth_m2m_private_key(
+                    Some(client_id),
+                    Some(jwt_key_file),
+                    Some(jwt_kid),
+                    jwt_passphrase,
+                    jwt_algorithm,
+                    scopes.and_then(|s| parse_scopes(&s)),
+                    token_url,
                 )?,
                 AuthSpec::OAuthU2M {
                     client_id,
@@ -1280,6 +1356,62 @@ mod tests {
                 *got, expected,
                 "headers must be appended in order, duplicates kept"
             );
+            kernel_session_config_free(config);
+        }
+    }
+
+    /// The JWT private-key M2M setter captures the required and optional
+    /// fields verbatim; NULL optionals record as `None`. Guards the C-side
+    /// wiring into `AuthSpec::OAuthM2MJwt` (which then maps to
+    /// `AuthConfig::oauth_m2m_private_key` at open).
+    #[test]
+    fn set_auth_m2m_jwt_records_fields() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let client_id = CString::new("sp-client-id").unwrap();
+            let key_file = CString::new("/keys/jwt.pem").unwrap();
+            let kid = CString::new("kid-1").unwrap();
+            let passphrase = CString::new("secret").unwrap();
+            let algorithm = CString::new("ES256").unwrap();
+            let scopes = CString::new("all-apis,sql").unwrap();
+            assert_eq!(
+                kernel_session_config_set_auth_m2m_jwt(
+                    config,
+                    client_id.as_ptr(),
+                    key_file.as_ptr(),
+                    kid.as_ptr(),
+                    passphrase.as_ptr(),
+                    algorithm.as_ptr(),
+                    scopes.as_ptr(),
+                    std::ptr::null(), // token_url omitted → OIDC discovery
+                ),
+                KernelStatusCode::Success
+            );
+
+            match config.as_ref().unwrap().auth.as_ref().unwrap() {
+                AuthSpec::OAuthM2MJwt {
+                    client_id,
+                    jwt_key_file,
+                    jwt_kid,
+                    jwt_passphrase,
+                    jwt_algorithm,
+                    scopes,
+                    token_url,
+                } => {
+                    assert_eq!(client_id, "sp-client-id");
+                    assert_eq!(jwt_key_file, "/keys/jwt.pem");
+                    assert_eq!(jwt_kid, "kid-1");
+                    assert_eq!(jwt_passphrase.as_deref(), Some("secret"));
+                    assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
+                    assert_eq!(scopes.as_deref(), Some("all-apis,sql"));
+                    assert_eq!(*token_url, None);
+                }
+                _ => panic!("expected AuthSpec::OAuthM2MJwt"),
+            }
             kernel_session_config_free(config);
         }
     }

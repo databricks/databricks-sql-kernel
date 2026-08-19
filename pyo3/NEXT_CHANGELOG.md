@@ -13,6 +13,12 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(auth_type="oauth-m2m-jwt", ...)` — OAuth 2.0 machine-to-machine auth using
+  a JWT private-key client assertion instead of a client secret. New keyword args
+  `jwt_key_file` (required), `jwt_kid` (required), `jwt_passphrase` (optional, for
+  encrypted PKCS#8 keys), and `jwt_algorithm` (optional, default `RS256`), alongside
+  the existing `client_id` / `oauth_scopes` / `token_url`. Forwards to the kernel's
+  `AuthConfig::OAuthM2MPrivateKey`.
 - `Session(..., identity_federation_client_id=...)` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
 - `Statement.set_row_limit(...)` sets the SEA server-side row cap; passing

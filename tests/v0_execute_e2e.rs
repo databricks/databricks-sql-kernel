@@ -48,6 +48,78 @@ async fn live_session() -> Session {
         .expect("Session::open against live workspace")
 }
 
+/// Open a live session authenticated via the JWT private-key M2M flow
+/// (`AuthConfig::OAuthM2MPrivateKey`).
+///
+/// This grant (RFC 7523 `private_key_jwt`) authenticates against the token
+/// endpoint of the workspace's configured OAuth identity provider — e.g.
+/// Entra ID for an Azure Databricks workspace — which verifies the signed
+/// client assertion against the public key/certificate registered on the
+/// service principal *in that IdP*. Databricks' AWS-native OIDC endpoint
+/// does not advertise `private_key_jwt`, so point `DATABRICKS_JWT_TOKEN_URL`
+/// at the IdP token endpoint for those workspaces.
+///
+/// Env vars (in addition to `DATABRICKS_HOST` / `DATABRICKS_HTTP_PATH`):
+/// - `DATABRICKS_JWT_CLIENT_ID` — the service principal's client/application id
+/// - `DATABRICKS_JWT_KEY_FILE`  — path to the PEM private key
+/// - `DATABRICKS_JWT_KID`       — key id matching the registered public key
+/// - `DATABRICKS_JWT_PASSPHRASE` — optional, for an encrypted PKCS#8 key
+/// - `DATABRICKS_JWT_ALGORITHM`  — optional, defaults to `RS256`
+/// - `DATABRICKS_JWT_TOKEN_URL`  — optional IdP token endpoint override; when
+///   unset the kernel discovers the endpoint via the workspace's OIDC config
+///
+/// Returns `None` (rather than panicking) when the JWT-specific vars are
+/// absent, so the shared `v0 E2E surface` CI job — which only provides PAT /
+/// client-secret credentials — skips this test instead of failing it.
+async fn live_jwt_session() -> Option<Session> {
+    let host = env_var("DATABRICKS_HOST").expect("DATABRICKS_HOST required");
+    let path = env_var("DATABRICKS_HTTP_PATH").expect("DATABRICKS_HTTP_PATH required");
+    let (client_id, key_file, kid) = match (
+        env_var("DATABRICKS_JWT_CLIENT_ID"),
+        env_var("DATABRICKS_JWT_KEY_FILE"),
+        env_var("DATABRICKS_JWT_KID"),
+    ) {
+        (Some(c), Some(f), Some(k)) => (c, f, k),
+        _ => {
+            eprintln!(
+                "skipping jwt_m2m_select_one_round_trip: set DATABRICKS_JWT_CLIENT_ID, \
+                 DATABRICKS_JWT_KEY_FILE, and DATABRICKS_JWT_KID to run it"
+            );
+            return None;
+        }
+    };
+    // Some IdPs (e.g. Entra ID) require a resource-specific scope such as
+    // `<databricks-resource-id>/.default` rather than the Databricks-native
+    // `all-apis`; allow overriding via `DATABRICKS_JWT_SCOPES` (space- or
+    // comma-separated). Unset → kernel default (`all-apis`).
+    let scopes = env_var("DATABRICKS_JWT_SCOPES").map(|s| {
+        s.split([' ', ','])
+            .filter(|p| !p.is_empty())
+            .map(str::to_string)
+            .collect::<Vec<_>>()
+    });
+
+    let auth = AuthConfig::oauth_m2m_private_key(
+        Some(client_id),
+        Some(key_file),
+        Some(kid),
+        env_var("DATABRICKS_JWT_PASSPHRASE"),
+        env_var("DATABRICKS_JWT_ALGORITHM"),
+        scopes,                              // None → kernel default (all-apis)
+        env_var("DATABRICKS_JWT_TOKEN_URL"), // IdP token endpoint; None → OIDC discovery
+    )
+    .expect("build OAuthM2MPrivateKey config");
+
+    Some(
+        Session::builder()
+            .http_path(host, path)
+            .auth(auth)
+            .open()
+            .await
+            .expect("Session::open with JWT private-key M2M against live workspace"),
+    )
+}
+
 async fn drain_rows(stream: &mut ResultStream) -> usize {
     let mut total = 0;
     while let Some(rb) = stream.next_batch().await.expect("next_batch") {
@@ -73,6 +145,34 @@ async fn select_one_round_trip() {
     assert_eq!(row.get_i64(0).unwrap(), Some(1));
     assert!(stream.next_row_in_batch().is_none());
     assert!(stream.next_batch().await.unwrap().is_none());
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+/// **JWT private-key M2M against a live workspace.** Authenticates as a
+/// service principal via a signed client-assertion JWT
+/// (`AuthConfig::OAuthM2MPrivateKey`), then runs `SELECT 1`. Proves the
+/// full flow end-to-end: key load → OIDC discovery → assertion signing →
+/// client-credentials token exchange → authenticated query. See
+/// [`live_jwt_session`] for the required env vars.
+///
+/// Uses the multi-threaded runtime: the JWT provider runs a blocking token
+/// exchange inside `get_auth_header`, which requires it.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn jwt_m2m_select_one_round_trip() {
+    let Some(session) = live_jwt_session().await else {
+        return; // JWT credentials not configured — skip (see live_jwt_session).
+    };
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let mut exec = stmt.execute().await.expect("execute SELECT 1 via JWT M2M");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+    assert_eq!(row.get_i64(0).unwrap(), Some(1));
 
     exec.close().await.expect("close");
     session.close().await.expect("session close");

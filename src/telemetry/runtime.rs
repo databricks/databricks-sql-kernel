@@ -12,14 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::client::TelemetryClient;
+use super::databricks::{DatabricksTelemetryExporter, TelemetryEndpoint};
 use super::exporter::TelemetryExporter;
+use super::manager::{TelemetryClientLease, TelemetryClientManager};
 use super::models::{
     unix_time_millis, DriverAuthFlow, DriverAuthMech, DriverConnectionParameters, DriverErrorInfo,
     DriverMode, DriverSystemConfiguration, FrontendLogContext, FrontendLogEntry, HostDetails,
     OperationDetail, OperationType, OssSqlDriverTelemetryLog, SqlExecutionEvent,
     TelemetryClientContext, TelemetryFrontendLog,
 };
+use crate::client::DatabricksHttpClient;
 use crate::config::{AuthConfig, ConnectionConfig, TelemetryConfig};
 use crate::kernel_error::Error as KernelError;
 use std::future::Future;
@@ -44,15 +46,12 @@ impl TelemetryRuntime {
         connection: &ConnectionConfig,
         auth: &AuthConfig,
         system_configuration: Option<DriverSystemConfiguration>,
+        http_client: Arc<DatabricksHttpClient>,
         session_id: String,
     ) -> Self {
-        if !config.enabled || config.batch_size == 0 {
+        if !valid_config(config) {
             return Self::disabled();
         }
-
-        let Some(exporter) = test_or_noop_exporter(config) else {
-            return Self::disabled();
-        };
 
         let session = Arc::new(TelemetrySessionContext {
             session_id,
@@ -65,16 +64,18 @@ impl TelemetryRuntime {
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
         });
-        let client = Arc::new(TelemetryClient::new(
+        let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
+        let lease = TelemetryClientManager::global().get_or_create(
+            &connection.host,
+            config,
             exporter,
-            config.batch_size,
-            config.close_flush_timeout,
-        ));
+            bypass_cache,
+        );
 
         Self {
             connection: Arc::new(RealConnectionTelemetry {
                 session,
-                client,
+                lease,
                 next_event_id: AtomicU64::new(1),
             }),
         }
@@ -95,7 +96,7 @@ pub(crate) trait ConnectionTelemetry: Send + Sync {
         error: Option<&KernelError>,
     );
 
-    fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
+    fn finish<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 }
 
 #[derive(Debug)]
@@ -123,14 +124,14 @@ impl ConnectionTelemetry for NoOpConnectionTelemetry {
     ) {
     }
 
-    fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    fn finish<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async {})
     }
 }
 
 struct RealConnectionTelemetry {
     session: Arc<TelemetrySessionContext>,
-    client: Arc<TelemetryClient>,
+    lease: TelemetryClientLease,
     next_event_id: AtomicU64,
 }
 
@@ -189,28 +190,50 @@ impl ConnectionTelemetry for RealConnectionTelemetry {
         elapsed: Duration,
         error: Option<&KernelError>,
     ) {
-        self.client
+        self.lease
+            .client()
             .enqueue(self.build_operation_log(operation_type, elapsed, error));
     }
 
-    fn flush<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+    fn finish<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
         Box::pin(async move {
-            self.client.flush_bounded().await;
+            self.lease.release().await;
         })
     }
 }
 
-fn test_or_noop_exporter(config: &TelemetryConfig) -> Option<Arc<dyn TelemetryExporter>> {
+fn valid_config(config: &TelemetryConfig) -> bool {
+    config.enabled
+        && config.batch_size > 0
+        && !config.flush_interval.is_zero()
+        && !config.close_flush_timeout.is_zero()
+}
+
+fn exporter_for_config(
+    config: &TelemetryConfig,
+    connection: &ConnectionConfig,
+    http_client: Arc<DatabricksHttpClient>,
+) -> (Arc<dyn TelemetryExporter>, bool) {
     #[cfg(test)]
     {
-        config.exporter.clone()
+        if let Some(exporter) = config.exporter.clone() {
+            // Test-injected exporters must not enter the global per-host cache:
+            // parallel tests commonly reuse the same mock host with different
+            // capturing exporters, and cache reuse would route events to the
+            // exporter from whichever test created the host client first.
+            return (exporter, true);
+        }
     }
 
-    #[cfg(not(test))]
-    {
-        let _ = config;
-        None
-    }
+    let _ = config;
+    (
+        Arc::new(DatabricksTelemetryExporter::new(
+            &connection.host,
+            http_client,
+            TelemetryEndpoint::Authenticated,
+        )),
+        false,
+    )
 }
 
 fn build_system_configuration(
@@ -285,6 +308,7 @@ fn auth_type(auth: &AuthConfig) -> String {
     match auth {
         AuthConfig::Pat { .. } => "pat",
         AuthConfig::OAuthM2M { .. } => "oauth-m2m",
+        AuthConfig::OAuthM2MPrivateKey { .. } => "oauth-m2m-jwt",
         AuthConfig::OAuthU2M { .. } => "oauth-u2m",
         AuthConfig::OAuthFederation { .. } => "oauth-federation",
         AuthConfig::External(_) => "external",
@@ -296,6 +320,7 @@ fn auth_mech(auth: &AuthConfig) -> DriverAuthMech {
     match auth {
         AuthConfig::Pat { .. } => DriverAuthMech::Pat,
         AuthConfig::OAuthM2M { .. }
+        | AuthConfig::OAuthM2MPrivateKey { .. }
         | AuthConfig::OAuthU2M { .. }
         | AuthConfig::OAuthFederation { .. } => DriverAuthMech::Oauth,
         AuthConfig::External(_) => DriverAuthMech::Other,
@@ -305,7 +330,9 @@ fn auth_mech(auth: &AuthConfig) -> DriverAuthMech {
 fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
     match auth {
         AuthConfig::Pat { .. } => Some(DriverAuthFlow::TokenPassthrough),
-        AuthConfig::OAuthM2M { .. } => Some(DriverAuthFlow::ClientCredentials),
+        AuthConfig::OAuthM2M { .. } | AuthConfig::OAuthM2MPrivateKey { .. } => {
+            Some(DriverAuthFlow::ClientCredentials)
+        }
         AuthConfig::OAuthU2M { .. } => Some(DriverAuthFlow::BrowserBasedAuthentication),
         AuthConfig::OAuthFederation { .. } | AuthConfig::External(_) => None,
     }
@@ -320,4 +347,28 @@ fn sanitize_error(error: &KernelError) -> DriverErrorInfo {
 
 fn duration_millis(duration: Duration) -> i64 {
     duration.as_millis().min(i64::MAX as u128) as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_config_requires_non_zero_flush_interval() {
+        let default_config = TelemetryConfig::default();
+        assert_eq!(default_config.flush_interval, Duration::from_secs(5));
+
+        let enabled = TelemetryConfig {
+            enabled: true,
+            ..TelemetryConfig::default()
+        };
+        assert!(valid_config(&enabled));
+
+        let zero_interval = TelemetryConfig {
+            enabled: true,
+            flush_interval: Duration::ZERO,
+            ..TelemetryConfig::default()
+        };
+        assert!(!valid_config(&zero_interval));
+    }
 }

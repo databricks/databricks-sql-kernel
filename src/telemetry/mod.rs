@@ -22,7 +22,9 @@
 #![allow(dead_code)]
 
 mod client;
+mod databricks;
 mod exporter;
+mod manager;
 mod models;
 mod runtime;
 

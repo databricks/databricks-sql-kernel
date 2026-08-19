@@ -14,11 +14,15 @@
 
 //! Translate Python auth kwargs into a kernel `AuthConfig`.
 //!
-//! Supports three `auth_type` values:
+//! Supports four `auth_type` values:
 //!
 //! - `"pat"` — personal access token (`access_token`).
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
 //!   `client_id` + `client_secret`, optional `scopes` / `token_url`.
+//! - `"oauth-m2m-jwt"` — OAuth 2.0 client-credentials with a JWT
+//!   private-key client assertion (RFC 7523): `client_id` +
+//!   `jwt_key_file` + `jwt_kid`, optional `jwt_passphrase` /
+//!   `jwt_algorithm` / `scopes` / `token_url`.
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
 //!   optional `client_id` / `redirect_ports` / `scopes` / `token_url` /
 //!   `oauth_callback_timeout_secs`.
@@ -61,6 +65,11 @@ pub(crate) struct OAuthParams {
     /// [`build_auth_config`]), not defaulted.
     pub redirect_ports: Option<Vec<u16>>,
     pub callback_timeout_secs: Option<u64>,
+    // JWT private-key M2M (`auth_type="oauth-m2m-jwt"`).
+    pub jwt_key_file: Option<String>,
+    pub jwt_kid: Option<String>,
+    pub jwt_passphrase: Option<String>,
+    pub jwt_algorithm: Option<String>,
     pub identity_federation_client_id: Option<String>,
 }
 
@@ -172,6 +181,31 @@ fn build_auth_config_inner(
                 oauth.identity_federation_client_id,
             )
             .map_err(|err| err.to_string())
+        }
+        "oauth-m2m-jwt" => {
+            // JWT private-key client assertion: client_id + key file +
+            // kid are mandatory; passphrase/algorithm are optional (the
+            // kernel defaults the algorithm to RS256 and validates the
+            // key/algorithm/passphrase at session open).
+            let client_id = non_empty(
+                oauth.client_id,
+                "auth_type='oauth-m2m-jwt' requires client_id",
+            )?;
+            let jwt_key_file = non_empty(
+                oauth.jwt_key_file,
+                "auth_type='oauth-m2m-jwt' requires jwt_key_file",
+            )?;
+            let jwt_kid = non_empty(oauth.jwt_kid, "auth_type='oauth-m2m-jwt' requires jwt_kid")?;
+            AuthConfig::oauth_m2m_private_key(
+                Some(client_id),
+                Some(jwt_key_file),
+                Some(jwt_kid),
+                oauth.jwt_passphrase,
+                oauth.jwt_algorithm,
+                oauth.scopes,
+                oauth.token_url,
+            )
+            .map_err(|e| e.message)
         }
         "oauth-u2m" => {
             // Browser flow: every field is optional and `None` lets the
@@ -286,7 +320,8 @@ fn build_auth_config_inner(
             ))
         }
         other => Err(format!(
-            "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', 'oauth-u2m'"
+            "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', \
+             'oauth-m2m-jwt', 'oauth-u2m'"
         )),
     }
 }
@@ -407,6 +442,87 @@ mod tests {
                 );
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn m2m_jwt_requires_client_id_key_file_and_kid() {
+        // Missing client_id.
+        let err = build_auth_config_inner(
+            "oauth-m2m-jwt",
+            None,
+            OAuthParams {
+                jwt_key_file: Some("/k.pem".into()),
+                jwt_kid: Some("kid".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("client_id"), "{err}");
+
+        // Missing key file.
+        let err = build_auth_config_inner(
+            "oauth-m2m-jwt",
+            None,
+            OAuthParams {
+                client_id: Some("id".into()),
+                jwt_kid: Some("kid".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("jwt_key_file"), "{err}");
+
+        // Missing kid.
+        let err = build_auth_config_inner(
+            "oauth-m2m-jwt",
+            None,
+            OAuthParams {
+                client_id: Some("id".into()),
+                jwt_key_file: Some("/k.pem".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("jwt_kid"), "{err}");
+    }
+
+    #[test]
+    fn m2m_jwt_builds_with_all_fields() {
+        let cfg = build_auth_config_inner(
+            "oauth-m2m-jwt",
+            None,
+            OAuthParams {
+                client_id: Some("id".into()),
+                jwt_key_file: Some("/k.pem".into()),
+                jwt_kid: Some("kid".into()),
+                jwt_passphrase: Some("pass".into()),
+                jwt_algorithm: Some("ES256".into()),
+                scopes: Some(vec!["all-apis".into()]),
+                token_url: Some("https://example/token".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthM2MPrivateKey {
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_passphrase,
+                jwt_algorithm,
+                scopes,
+                token_url_override,
+            } => {
+                assert_eq!(client_id, "id");
+                assert_eq!(jwt_key_file, "/k.pem");
+                assert_eq!(jwt_kid, "kid");
+                assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
+                assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
+                assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
+                assert_eq!(token_url_override.as_deref(), Some("https://example/token"));
+            }
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
     }
 

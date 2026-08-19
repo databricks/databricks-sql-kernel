@@ -360,6 +360,34 @@ pub enum AuthConfig {
         identity_federation_client_id: Option<String>,
     },
 
+    /// OAuth 2.0 machine-to-machine using a JWT private-key client
+    /// assertion (RFC 7523) instead of a client secret. The kernel signs
+    /// a short-lived JWT with the configured private key and sends it as
+    /// the `client_assertion` in the client-credentials grant; the
+    /// authorization server verifies it against the service principal's
+    /// registered public key.
+    ///
+    /// Supported `jwt_algorithm` values: `RS256`/`384`/`512`,
+    /// `PS256`/`384`/`512`, `ES256`, `ES384` (`None` → `RS256`). `ES512`
+    /// is not supported.
+    OAuthM2MPrivateKey {
+        client_id: String,
+        /// Path to the PEM-encoded private key file.
+        jwt_key_file: String,
+        /// Key id written into the JWT header (`kid`) so the server can
+        /// select the matching registered public key.
+        jwt_kid: String,
+        /// Passphrase for an encrypted PKCS#8 key. `None` for an
+        /// unencrypted key.
+        jwt_passphrase: Option<String>,
+        /// JWT signing algorithm name. `None` → `RS256`.
+        jwt_algorithm: Option<String>,
+        /// OAuth scopes to request. `None` → `["all-apis"]`.
+        scopes: Option<Vec<String>>,
+        /// Token endpoint override. `None` → discover via OIDC.
+        token_url_override: Option<String>,
+    },
+
     /// OAuth 2.0 token exchange (RFC 8693), for federated identity
     /// (e.g. exchanging a Workload Identity token for a Databricks
     /// access token).
@@ -480,8 +508,51 @@ impl AuthConfig {
                 identity_federation_client_id,
                 ..
             } => identity_federation_client_id.as_deref(),
-            Self::OAuthFederation { .. } | Self::External(_) => None,
+            // JWT private-key M2M does not thread an SP-wide federation
+            // client id yet (the flow already proves identity via the
+            // signed assertion); wire it here if/when that's needed.
+            Self::OAuthM2MPrivateKey { .. } | Self::OAuthFederation { .. } | Self::External(_) => {
+                None
+            }
         }
+    }
+
+    /// Construct a [`AuthConfig::OAuthM2MPrivateKey`] from optional
+    /// fields, validating that the required `client_id`, `jwt_key_file`,
+    /// and `jwt_kid` are present and non-empty. `jwt_passphrase` /
+    /// `jwt_algorithm` / `scopes` / `token_url_override` are optional and
+    /// forwarded as-is (the kernel fills defaults and validates the key /
+    /// algorithm at session open).
+    pub fn oauth_m2m_private_key(
+        client_id: Option<String>,
+        jwt_key_file: Option<String>,
+        jwt_kid: Option<String>,
+        jwt_passphrase: Option<String>,
+        jwt_algorithm: Option<String>,
+        scopes: Option<Vec<String>>,
+        token_url_override: Option<String>,
+    ) -> crate::Result<Self> {
+        let client_id = client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M private-key auth requires a non-empty client_id")
+        })?;
+        let jwt_key_file = jwt_key_file.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M private-key auth requires a non-empty jwt_key_file")
+        })?;
+        let jwt_kid = jwt_kid.filter(|s| !s.is_empty()).ok_or_else(|| {
+            crate::kernel_error::Error::invalid_argument()
+                .message("OAuth M2M private-key auth requires a non-empty jwt_kid")
+        })?;
+        Ok(AuthConfig::OAuthM2MPrivateKey {
+            client_id,
+            jwt_key_file,
+            jwt_kid,
+            jwt_passphrase,
+            jwt_algorithm,
+            scopes,
+            token_url_override,
+        })
     }
 }
 
@@ -547,6 +618,22 @@ impl std::fmt::Debug for AuthConfig {
                     "identity_federation_client_id",
                     identity_federation_client_id,
                 )
+                .finish(),
+            Self::OAuthM2MPrivateKey {
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_algorithm,
+                scopes,
+                ..
+            } => f
+                .debug_struct("OAuthM2MPrivateKey")
+                .field("client_id", client_id)
+                .field("jwt_key_file", jwt_key_file)
+                .field("jwt_kid", jwt_kid)
+                .field("jwt_passphrase", &"<redacted>")
+                .field("jwt_algorithm", jwt_algorithm)
+                .field("scopes", scopes)
                 .finish(),
             Self::OAuthFederation {
                 subject_token_type,
@@ -1185,7 +1272,7 @@ pub struct LoggingConfig {
     pub file: Option<PathBuf>,
 }
 
-// ─── Telemetry (reserved) ───────────────────────────────────────────────────
+// ─── Telemetry ──────────────────────────────────────────────────────────────
 
 /// Telemetry collection and export settings.
 ///
@@ -1203,6 +1290,16 @@ pub struct TelemetryConfig {
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
 
+    /// Periodic background flush interval. Defaults to five seconds, matching
+    /// JDBC. A zero interval is invalid and disables telemetry.
+    pub flush_interval: Duration,
+
+    /// Maximum number of HTTP retries for telemetry export.
+    pub max_retries: u32,
+
+    /// Fixed retry delay between telemetry export attempts.
+    pub retry_delay: Duration,
+
     /// Maximum time an explicit session close should wait for the final
     /// telemetry flush. `Drop` never waits.
     pub close_flush_timeout: Duration,
@@ -1217,6 +1314,9 @@ impl std::fmt::Debug for TelemetryConfig {
         debug
             .field("enabled", &self.enabled)
             .field("batch_size", &self.batch_size)
+            .field("flush_interval", &self.flush_interval)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
             .field("close_flush_timeout", &self.close_flush_timeout);
         #[cfg(test)]
         debug.field(
@@ -1231,7 +1331,10 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            batch_size: 200,
+            batch_size: 100,
+            flush_interval: Duration::from_secs(5),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(100),
             close_flush_timeout: Duration::from_secs(5),
             #[cfg(test)]
             exporter: None,
@@ -1737,6 +1840,117 @@ mod tests {
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
+    }
+
+    // ─── OAuthM2MPrivateKey (JWT) constructor ──────────────────────
+    // Mirrors JDBC's builder null-checks (should_ThrowException_When_*).
+
+    #[test]
+    fn oauth_m2m_private_key_rejects_missing_or_empty_client_id() {
+        let err = AuthConfig::oauth_m2m_private_key(
+            None,
+            Some("/k.pem".to_string()),
+            Some("kid".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("client_id"));
+
+        let err = AuthConfig::oauth_m2m_private_key(
+            Some(String::new()),
+            Some("/k.pem".to_string()),
+            Some("kid".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("client_id"));
+    }
+
+    #[test]
+    fn oauth_m2m_private_key_rejects_missing_key_file() {
+        let err = AuthConfig::oauth_m2m_private_key(
+            Some("cid".to_string()),
+            None,
+            Some("kid".to_string()),
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("jwt_key_file"));
+    }
+
+    #[test]
+    fn oauth_m2m_private_key_rejects_missing_kid() {
+        let err = AuthConfig::oauth_m2m_private_key(
+            Some("cid".to_string()),
+            Some("/k.pem".to_string()),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("jwt_kid"));
+    }
+
+    #[test]
+    fn oauth_m2m_private_key_accepts_all_fields() {
+        match AuthConfig::oauth_m2m_private_key(
+            Some("cid".to_string()),
+            Some("/k.pem".to_string()),
+            Some("kid".to_string()),
+            Some("pass".to_string()),
+            Some("ES256".to_string()),
+            Some(vec!["all-apis".to_string()]),
+            Some("https://h/token".to_string()),
+        )
+        .unwrap()
+        {
+            AuthConfig::OAuthM2MPrivateKey {
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_passphrase,
+                jwt_algorithm,
+                scopes,
+                token_url_override,
+            } => {
+                assert_eq!(client_id, "cid");
+                assert_eq!(jwt_key_file, "/k.pem");
+                assert_eq!(jwt_kid, "kid");
+                assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
+                assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
+                assert_eq!(scopes, Some(vec!["all-apis".to_string()]));
+                assert_eq!(token_url_override.as_deref(), Some("https://h/token"));
+            }
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn debug_oauth_m2m_private_key_redacts_passphrase() {
+        let cfg = AuthConfig::oauth_m2m_private_key(
+            Some("cid".to_string()),
+            Some("/k.pem".to_string()),
+            Some("kid".to_string()),
+            Some("super-secret-pass".to_string()),
+            Some("RS256".to_string()),
+            None,
+            None,
+        )
+        .unwrap();
+        let dbg = format!("{cfg:?}");
+        assert!(dbg.contains("<redacted>"), "{dbg}");
+        assert!(!dbg.contains("super-secret-pass"), "{dbg}");
     }
 
     #[test]

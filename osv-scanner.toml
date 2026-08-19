@@ -23,4 +23,51 @@
 # separately so this file stays empty on the initial landing; once we
 # have real suppressions to enforce against, wire it up.
 
-# (intentionally empty — add entries here as needed)
+[[IgnoredVulns]]
+id = "GHSA-h395-gr6q-cpjc"
+# CVE-2026-25537 — a type-confusion bug in jsonwebtoken's claim-VALIDATION
+# logic: when DECODING a token, a standard claim (nbf/exp) supplied with the
+# wrong JSON type deserializes to FailedToParse, which the validator treats
+# like NotPresent and skips the check, letting an attacker bypass nbf/exp.
+# Fixed in jsonwebtoken 10.3.0.
+#
+# Not reachable here: the kernel only SIGNS client assertions
+# (`jsonwebtoken::encode` in `src/auth/oauth/jwt_key.rs`) and never decodes
+# or validates JWTs — verified: no `jsonwebtoken::decode` / `Validation`
+# calls anywhere in `src/`. The vulnerable code path is never invoked.
+#
+# We stay on 9.x (ring-backed) rather than upgrade: jsonwebtoken 10.x drops
+# the ring backend and forces either `rust_crypto` (pulls `rsa` /
+# RUSTSEC-2023-0071 into the runtime crate) or `aws_lc_rs` (C library, breaks
+# the pure-Rust posture the napi binding depends on). Neither is warranted to
+# close a bug we cannot trigger. See the Cargo.toml note on the jsonwebtoken
+# pin. Precedent: databricks-sql-go suppresses an unreachable advisory the
+# same way (PR #362, GO-2026-5932).
+#
+# ignoreUntil forces a periodic re-review: when it lapses OSV re-reports the
+# finding, and someone must reconfirm we still never decode (and re-evaluate a
+# ring-backed 10.x if one exists) before renewing.
+ignoreUntil = 2027-02-14
+reason = "jsonwebtoken claim-validation bug (CVE-2026-25537) is in the decode path; the kernel only signs, never decodes/validates JWTs (verified: no decode/Validation calls in src/). Upgrade to 10.x deferred — it forces rust_crypto (rsa/RUSTSEC-2023-0071 in runtime) or aws_lc_rs (C dep). Re-review on expiry."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0258"
+# "h2 unbounded empty DATA frames" — a DoS advisory in `h2 0.4.15`, pulled in
+# transitively via `hyper` <- `reqwest` (`cargo tree -i h2`). Not a direct
+# dependency and unrelated to this crate's code; pre-existing on `main` (fires
+# against the shared reqwest/hyper stack, not this PR).
+#
+# Not reachable in the way the advisory describes: it concerns a SERVER
+# accepting a flood of empty DATA frames; the kernel is an HTTP *client* to
+# Databricks SEA and never runs an h2 server, so the affected entrypoint is
+# not exposed.
+#
+# Cannot be cleared by a bump: 0.4.15 is already the latest 0.4.x
+# (`cargo update -p h2` is a no-op); clearing it needs an upstream
+# `reqwest`/`hyper` release that pulls the fixed `h2`.
+#
+# ignoreUntil forces periodic re-review: when it lapses OSV re-reports the
+# finding, and someone must reconfirm the client-only posture (and re-check
+# for a reqwest/hyper release carrying the fix) before renewing.
+ignoreUntil = 2027-02-14
+reason = "h2 (RUSTSEC-2026-0258) DoS is a server-side empty-DATA-frame flood; the kernel is an HTTP client only and runs no h2 server. Transitive via reqwest/hyper, pre-existing on main, latest 0.4.x so no bump available. Re-review on expiry."

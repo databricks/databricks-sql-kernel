@@ -238,6 +238,22 @@ KernelStatusCode kernel_session_config_set_auth_pat(KernelSessionConfig* config,
 KernelStatusCode kernel_session_config_set_auth_m2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     const char* client_secret);
+/* OAuth M2M via a JWT private-key client assertion (RFC 7523): the kernel signs
+ * a short-lived JWT with the private key and sends it as the client_assertion
+ * instead of a client secret. `client_id`, `jwt_key_file` (PEM/PKCS#8 private
+ * key path), and `jwt_kid` (key id in the JWT header) are required. Optional
+ * (pass NULL to omit): `jwt_passphrase` (encrypted PKCS#8 key), `jwt_algorithm`
+ * (RS256/384/512, PS256/384/512, ES256, ES384; NULL → RS256), `scopes`
+ * (comma-separated; NULL → kernel default `all-apis`), and `token_url` (explicit
+ * token endpoint; NULL → discover via OIDC). */
+KernelStatusCode kernel_session_config_set_auth_m2m_jwt(KernelSessionConfig* config,
+                                                        const char* client_id,
+                                                        const char* jwt_key_file,
+                                                        const char* jwt_kid,
+                                                        const char* jwt_passphrase,
+                                                        const char* jwt_algorithm,
+                                                        const char* scopes,
+                                                        const char* token_url);
 /* OAuth U2M (user-to-machine: authorization code + PKCE, browser flow).
  * All args optional: `client_id` NULL → `databricks-sql-connector` client;
  * `redirect_port` 0 → kernel default (8030); `scopes` (comma-separated)
