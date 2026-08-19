@@ -27,6 +27,7 @@ mod exporter;
 mod manager;
 mod models;
 mod runtime;
+mod statement;
 
 #[cfg(test)]
 pub(crate) mod test_support;
@@ -34,7 +35,8 @@ pub(crate) mod test_support;
 #[cfg(test)]
 pub(crate) use exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExporter};
 pub use models::DriverSystemConfiguration;
-pub(crate) use models::OperationType;
 #[cfg(test)]
 pub(crate) use models::TelemetryRequest;
+pub(crate) use models::{ExecutionResultFormat, OperationType, StatementType};
 pub(crate) use runtime::TelemetryRuntime;
+pub(crate) use statement::StatementTelemetry;

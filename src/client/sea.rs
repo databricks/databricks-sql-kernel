@@ -26,6 +26,7 @@ use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::metadata::sql::SqlCommandBuilder;
 use crate::reader::ResultReaderFactory;
+use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
     CreateSessionRequest, CreateSessionResponse, ExecuteParams, ExecuteStatementRequest,
@@ -542,6 +543,31 @@ impl SeaRestTransport {
         })
     }
 
+    fn telemetry_result_format(response: &ExecuteResponse) -> ExecutionResultFormat {
+        let Some(result) = response.result.as_ref() else {
+            return ExecutionResultFormat::FormatUnspecified;
+        };
+        if result
+            .external_links
+            .as_ref()
+            .is_some_and(|links| !links.is_empty())
+        {
+            ExecutionResultFormat::ExternalLinks
+        } else if result.inline_arrow_data.is_some() {
+            ExecutionResultFormat::InlineArrow
+        } else {
+            ExecutionResultFormat::FormatUnspecified
+        }
+    }
+
+    fn telemetry_is_compressed(response: &ExecuteResponse) -> bool {
+        response
+            .manifest
+            .as_ref()
+            .and_then(|manifest| manifest.result_compression.as_deref())
+            .is_some_and(|codec| !codec.is_empty())
+    }
+
     /// Execute a SQL statement end-to-end: call API → poll → create reader.
     ///
     /// Shared implementation for both user queries (`ExecuteStatement`) and
@@ -626,10 +652,14 @@ impl SeaRestTransport {
         // cleaned up (status.state=Closed) AND expose
         // num_modified_rows / display_message / etc. without a second
         // GetStatementStatus round-trip.
+        let telemetry_result_format = Self::telemetry_result_format(&response);
+        let telemetry_is_compressed = Self::telemetry_is_compressed(&response);
         Ok(ExecuteResult {
             statement_id: response.statement_id,
             reader,
             manifest: response.manifest,
+            telemetry_result_format,
+            telemetry_is_compressed,
             status: response.status,
         })
     }
@@ -919,10 +949,14 @@ impl Transport for SeaRestTransport {
                         return Err(e);
                     }
                 };
+                let telemetry_result_format = Self::telemetry_result_format(&r);
+                let telemetry_is_compressed = Self::telemetry_is_compressed(&r);
                 Ok(DirectOutcome::Completed(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
+                    telemetry_result_format,
+                    telemetry_is_compressed,
                     status: r.status,
                 }))
             }
@@ -944,10 +978,14 @@ impl Transport for SeaRestTransport {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
                 let reader = reader_factory.create_reader(&r.statement_id, &r).await?;
+                let telemetry_result_format = Self::telemetry_result_format(&r);
+                let telemetry_is_compressed = Self::telemetry_is_compressed(&r);
                 Ok(Some(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
+                    telemetry_result_format,
+                    telemetry_is_compressed,
                     status: r.status,
                 }))
             }
