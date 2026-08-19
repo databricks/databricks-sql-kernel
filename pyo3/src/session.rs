@@ -598,15 +598,9 @@ mod send_sync_tests {
 
     #[test]
     fn telemetry_kwargs_map_to_kernel_config() {
-        let telemetry = build_telemetry_config(
-            true,
-            Some(25),
-            Some(1_000),
-            Some(2),
-            Some(50),
-            Some(2_500),
-        )
-        .expect("valid telemetry config");
+        let telemetry =
+            build_telemetry_config(true, Some(25), Some(1_000), Some(2), Some(50), Some(2_500))
+                .expect("valid telemetry config");
 
         assert!(telemetry.enabled);
         assert_eq!(telemetry.batch_size, 25);
@@ -653,10 +647,22 @@ mod send_sync_tests {
         .expect("driver system configuration mentioned");
 
         assert_eq!(system_configuration.driver_name.as_deref(), Some("PySQL"));
-        assert_eq!(system_configuration.driver_version.as_deref(), Some("1.2.3"));
-        assert_eq!(system_configuration.runtime_name.as_deref(), Some("CPython"));
-        assert_eq!(system_configuration.runtime_version.as_deref(), Some("3.12"));
-        assert_eq!(system_configuration.runtime_vendor.as_deref(), Some("Python"));
+        assert_eq!(
+            system_configuration.driver_version.as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            system_configuration.runtime_name.as_deref(),
+            Some("CPython")
+        );
+        assert_eq!(
+            system_configuration.runtime_version.as_deref(),
+            Some("3.12")
+        );
+        assert_eq!(
+            system_configuration.runtime_vendor.as_deref(),
+            Some("Python")
+        );
         assert_eq!(system_configuration.os_name.as_deref(), Some("Linux"));
         assert_eq!(system_configuration.os_version.as_deref(), Some("6.1"));
         assert_eq!(system_configuration.os_arch.as_deref(), Some("x86_64"));
