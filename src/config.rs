@@ -1290,7 +1290,7 @@ pub struct TelemetryConfig {
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
 
-    /// Periodic background flush interval. Defaults to one second, matching
+    /// Periodic background flush interval. Defaults to five seconds, matching
     /// JDBC. A zero interval is invalid and disables telemetry.
     pub flush_interval: Duration,
 
@@ -1332,7 +1332,7 @@ impl Default for TelemetryConfig {
         Self {
             enabled: false,
             batch_size: 100,
-            flush_interval: Duration::from_secs(1),
+            flush_interval: Duration::from_secs(5),
             max_retries: 3,
             retry_delay: Duration::from_millis(100),
             close_flush_timeout: Duration::from_secs(5),

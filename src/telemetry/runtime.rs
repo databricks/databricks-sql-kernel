@@ -356,7 +356,7 @@ mod tests {
     #[test]
     fn telemetry_config_requires_non_zero_flush_interval() {
         let default_config = TelemetryConfig::default();
-        assert_eq!(default_config.flush_interval, Duration::from_secs(1));
+        assert_eq!(default_config.flush_interval, Duration::from_secs(5));
 
         let enabled = TelemetryConfig {
             enabled: true,
