@@ -64,6 +64,7 @@ use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
 use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
+use crate::telemetry::{OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -325,7 +326,9 @@ impl Statement {
         // canceller retained across a re-execute can't target the prior
         // query during the handoff (see `reset_inflight_slot`).
         self.reset_inflight_slot();
-        async {
+        let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
@@ -351,6 +354,11 @@ impl Statement {
                 .transport()
                 .execute_statement(self.session.session_id(), &sql, &exec_params)
                 .await?;
+            telemetry_for_body.on_statement_submitted(&result.statement_id);
+            telemetry_for_body.on_result_metadata(
+                result.telemetry_result_format,
+                result.telemetry_is_compressed,
+            );
 
             cancel_state.observe(&result.statement_id);
             guard.defuse();
@@ -380,17 +388,23 @@ impl Statement {
                 status.num_modified_rows =
                     crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
             }
-            Ok(ExecutedStatement::new(
+            let executed = ExecutedStatement::new(
                 Arc::clone(&self.session),
                 result.statement_id,
                 valid,
                 result_stream,
                 closed,
                 status,
-            ))
+            );
+            telemetry_for_body.finalize(None);
+            Ok(executed)
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            telemetry.finalize(Some(error));
+        }
+        result
     }
 
     /// Submit-and-return. `wait_timeout=0s`; no direct results. Same
@@ -406,7 +420,9 @@ impl Statement {
         // Clear the shared in-flight-id slot before the first `.await`
         // (see `reset_inflight_slot`).
         self.reset_inflight_slot();
-        async {
+        let telemetry = self.statement_telemetry(OperationType::ExecuteStatementAsync);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
@@ -421,6 +437,7 @@ impl Statement {
                 .transport()
                 .submit_statement(self.session.session_id(), &sql, &exec_params)
                 .await?;
+            telemetry_for_body.on_statement_submitted(&response.statement_id);
 
             cancel_state.observe(&response.statement_id);
             guard.defuse();
@@ -446,10 +463,15 @@ impl Statement {
                 // values immediately even before the caller drives
                 // the first poll.
                 response.status,
+                telemetry_for_body,
             ))
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            telemetry.finalize(Some(error));
+        }
+        result
     }
 
     /// directResults execute — the Thrift/JDBC model.
@@ -484,7 +506,9 @@ impl Statement {
         // Clear the shared in-flight-id slot before the first `.await`
         // (see `reset_inflight_slot`).
         self.reset_inflight_slot();
-        async {
+        let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             self.invalidate_prior().await;
             // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
             // UNSET, so `execute_statement_direct` sends ExecuteStatement with no
@@ -523,6 +547,11 @@ impl Statement {
             let valid = ValidityFlag::new();
             match outcome {
                 DirectOutcome::Completed(result) => {
+                    telemetry_for_body.on_statement_submitted(&result.statement_id);
+                    telemetry_for_body.on_result_metadata(
+                        result.telemetry_result_format,
+                        result.telemetry_is_compressed,
+                    );
                     cancel_state.observe(&result.statement_id);
                     guard.defuse();
                     let already_closed = result.status.state == StatementState::Closed;
@@ -531,16 +560,19 @@ impl Statement {
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
                     let result_stream = ResultStream::from_reader(result.reader).await?;
-                    Ok(DirectStatement::Completed(ExecutedStatement::new(
+                    let executed = ExecutedStatement::new(
                         Arc::clone(&self.session),
                         result.statement_id,
                         valid,
                         result_stream,
                         closed,
                         result.status,
-                    )))
+                    );
+                    telemetry_for_body.finalize(None);
+                    Ok(DirectStatement::Completed(executed))
                 }
                 DirectOutcome::Running(resp) => {
+                    telemetry_for_body.on_statement_submitted(&resp.statement_id);
                     cancel_state.observe(&resp.statement_id);
                     guard.defuse();
                     // Still running — start the closed flag false (the server
@@ -556,12 +588,22 @@ impl Statement {
                         valid,
                         closed,
                         resp.status,
+                        telemetry_for_body,
                     )))
                 }
             }
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            telemetry.finalize(Some(error));
+        }
+        result
+    }
+
+    fn statement_telemetry(&self, operation_type: OperationType) -> StatementTelemetry {
+        self.session
+            .statement_telemetry_observer(StatementType::Sql, operation_type)
     }
 
     /// Explicit close. Cancels and closes any executed handle this

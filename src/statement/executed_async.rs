@@ -52,6 +52,7 @@ use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::validity::ValidityFlag;
+use crate::telemetry::StatementTelemetry;
 use crate::types::sea::StatementState;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -218,6 +219,7 @@ pub struct ExecutedAsyncStatement {
     /// don't `.await` and the poll loop releases the lock before
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
+    statement_telemetry: StatementTelemetry,
 }
 
 impl ExecutedAsyncStatement {
@@ -242,6 +244,7 @@ impl ExecutedAsyncStatement {
         valid: ValidityFlag,
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
+        statement_telemetry: StatementTelemetry,
     ) -> Self {
         Self {
             session,
@@ -251,6 +254,7 @@ impl ExecutedAsyncStatement {
             // The submitting handle owns the statement lifecycle.
             owning: true,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            statement_telemetry,
         }
     }
 
@@ -283,6 +287,7 @@ impl ExecutedAsyncStatement {
             closed: Arc::new(AtomicBool::new(true)),
             owning: false,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            statement_telemetry: StatementTelemetry::noop(),
         }
     }
 
@@ -375,11 +380,14 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         async {
             self.valid.check()?;
+            let status_started = std::time::Instant::now();
             let response = self
                 .session
                 .transport()
                 .statement_status(&self.statement_id)
                 .await?;
+            self.statement_telemetry
+                .record_poll(status_started.elapsed());
             // Cache the wire status so the extended-field accessors
             // reflect what THIS handle has observed (instead of the
             // stale initial-submit snapshot).
@@ -443,11 +451,14 @@ impl ExecutedAsyncStatement {
 
             loop {
                 self.valid.check()?;
+                let status_started = std::time::Instant::now();
                 let response = self
                     .session
                     .transport()
                     .statement_status(&self.statement_id)
                     .await?;
+                self.statement_telemetry
+                    .record_poll(status_started.elapsed());
                 // Cache the wire status so the extended-field
                 // accessors reflect THIS poll's observation — not the
                 // initial-submit snapshot that's now stale by minutes.
@@ -457,7 +468,13 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        return self.materialise_result().await;
+                        let result = self.materialise_result().await;
+                        if let Err(error) = &result {
+                            self.statement_telemetry.finalize(Some(error));
+                        } else {
+                            self.statement_telemetry.finalize(None);
+                        }
+                        return result;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
@@ -465,6 +482,7 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
+                        self.statement_telemetry.finalize(Some(&e));
                         return Err(e);
                     }
                     StatementStatus::Cancelled => {
@@ -482,10 +500,10 @@ impl ExecutedAsyncStatement {
                         let error = Error::cancelled()
                             .message(format!("Statement {} was cancelled", self.statement_id))
                             .with_query_id(&self.statement_id);
-                        return Err(crate::kernel_error::carry_extended_status(
-                            error,
-                            &response.status,
-                        ));
+                        let error =
+                            crate::kernel_error::carry_extended_status(error, &response.status);
+                        self.statement_telemetry.finalize(Some(&error));
+                        return Err(error);
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
                         if start.elapsed() > cfg.poll_timeout {
@@ -494,10 +512,12 @@ impl ExecutedAsyncStatement {
                             // so the server stops charging DBUs on the
                             // now-orphaned query when we return — same
                             // policy as a caller-initiated future drop.
-                            return Err(Error::timeout().message(format!(
+                            let error = Error::timeout().message(format!(
                                 "Statement {} did not reach a terminal state within {:?}",
                                 self.statement_id, cfg.poll_timeout
-                            )));
+                            ));
+                            self.statement_telemetry.finalize(Some(&error));
+                            return Err(error);
                         }
                         tokio::time::sleep(cfg.poll_interval).await;
                     }
@@ -518,7 +538,13 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         async {
             self.valid.check()?;
-            self.materialise_result().await
+            let result = self.materialise_result().await;
+            if let Err(error) = &result {
+                self.statement_telemetry.finalize(Some(error));
+            } else {
+                self.statement_telemetry.finalize(None);
+            }
+            result
         }
         .instrument(span)
         .await
@@ -537,6 +563,10 @@ impl ExecutedAsyncStatement {
             .await?
         {
             Some(result) => {
+                self.statement_telemetry.on_result_metadata(
+                    result.telemetry_result_format,
+                    result.telemetry_is_compressed,
+                );
                 // If the server already auto-closed the statement
                 // (`state == Closed`), pre-set the shared `closed` flag so
                 // this handle's `close()` / `Drop` — and `invalidate_prior`
