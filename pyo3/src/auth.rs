@@ -301,6 +301,34 @@ fn build_auth_config_inner(
                             omit it to use the default Azure app"
                     .to_owned());
             }
+            // `redirect_ports` / `callback_timeout_secs` carry the same U2M
+            // semantics here as in the `oauth-u2m` arm, so reject the same
+            // present-yet-degenerate shapes: a 0 timeout times the browser
+            // flow out immediately, and an empty list / 0 port entry binds an
+            // ephemeral port that can't match the IdP's static redirect_uri.
+            if oauth.callback_timeout_secs == Some(0) {
+                return Err(
+                    "auth_type='azure-oauth' oauth_callback_timeout_secs must be > 0 when set \
+                     (0 would time out the browser flow immediately); omit it for the default"
+                        .to_owned(),
+                );
+            }
+            if let Some(ports) = oauth.redirect_ports.as_deref() {
+                if ports.is_empty() {
+                    return Err(
+                        "auth_type='azure-oauth' redirect_ports must be non-empty when set; \
+                         omit it for the default"
+                            .to_owned(),
+                    );
+                }
+                if ports.contains(&0) {
+                    return Err(
+                        "auth_type='azure-oauth' redirect_ports entries must be non-zero \
+                         (each must be a static port the IdP redirect_uri can match)"
+                            .to_owned(),
+                    );
+                }
+            }
             Ok(AuthConfig::azure_oauth_u2m(
                 oauth.client_id,
                 oauth.redirect_ports,
@@ -652,6 +680,54 @@ mod tests {
             err.contains("oauth_callback_timeout_secs must be > 0"),
             "{err}"
         );
+    }
+
+    #[test]
+    fn azure_oauth_rejects_zero_callback_timeout() {
+        let err = build_auth_config_inner(
+            "azure-oauth",
+            None,
+            OAuthParams {
+                callback_timeout_secs: Some(0),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("oauth_callback_timeout_secs must be > 0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn azure_oauth_rejects_empty_redirect_ports() {
+        let err = build_auth_config_inner(
+            "azure-oauth",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("redirect_ports must be non-empty"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn azure_oauth_rejects_zero_in_redirect_ports() {
+        let err = build_auth_config_inner(
+            "azure-oauth",
+            None,
+            OAuthParams {
+                redirect_ports: Some(vec![8020, 0]),
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.contains("non-zero"), "got: {err}");
     }
 
     #[test]
