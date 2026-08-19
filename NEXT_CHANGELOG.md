@@ -11,6 +11,18 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Azure Entra U2M (`azure-oauth`) is now a kernel-owned flow
+  (`AuthConfig::AzureOAuthU2M` / pyo3 `auth_type="azure-oauth"`). The kernel
+  resolves the Azure browser flow itself — it pins the workspace v2.0
+  endpoints (`{host}/oidc/oauth2/v2.0/{authorize,token}`, which the workspace
+  redirects to Entra), the Azure app client id (`96eecda7-…`), port `8030`, and
+  the `{app_id}/user_impersonation offline_access` scope — so bindings only
+  forward the selector. The U2M provider gained an authorization-endpoint
+  override so the Azure path pins `/oidc/oauth2/v2.0/authorize` instead of the
+  discovered `/oidc/v1/authorize` (which an Azure workspace redirects to a
+  malformed Entra URL). Live-verified end-to-end against an Azure workspace.
+  (PECOBLR-4120.)
+
 - Azure Entra ID OAuth support via generic overrides (no dedicated Azure auth
   flow). Azure service-principal M2M rides `OAuthM2M` with an Entra
   `token_url_override` + the `2ff814a6-…/.default` scope; Azure U2M rides
