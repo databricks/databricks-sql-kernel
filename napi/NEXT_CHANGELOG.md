@@ -14,6 +14,12 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- `AuthMode.OAuthM2mJwt` — OAuth 2.0 machine-to-machine auth using a JWT private-key
+  client assertion instead of a client secret. New `ConnectionOptions` fields
+  `jwtKeyFile` (required), `jwtKid` (required), `jwtPassphrase` (optional, for
+  encrypted PKCS#8 keys), and `jwtAlgorithm` (optional, default `RS256`), alongside
+  the existing `oauthClientId` / `oauthScopes`. Forwards to the kernel's
+  `AuthConfig::OAuthM2MPrivateKey`.
 - `ConnectionOptions.identityFederationClientId` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
 

@@ -122,6 +122,10 @@ impl Session {
         token_url=None,
         redirect_ports=None,
         oauth_callback_timeout_secs=None,
+        jwt_key_file=None,
+        jwt_kid=None,
+        jwt_passphrase=None,
+        jwt_algorithm=None,
         identity_federation_client_id=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
@@ -152,6 +156,10 @@ impl Session {
         token_url: Option<String>,
         redirect_ports: Option<Vec<u16>>,
         oauth_callback_timeout_secs: Option<u64>,
+        jwt_key_file: Option<String>,
+        jwt_kid: Option<String>,
+        jwt_passphrase: Option<String>,
+        jwt_algorithm: Option<String>,
         identity_federation_client_id: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
@@ -187,8 +195,8 @@ impl Session {
                 );
                 return Err(pyo3::exceptions::PyValueError::new_err(
                     "Session requires auth: pass access_token (PAT) or set \
-                     auth_type to 'oauth-m2m' / 'oauth-u2m' with the matching \
-                     credentials",
+                     auth_type to 'oauth-m2m' / 'oauth-m2m-jwt' / 'oauth-u2m' \
+                     with the matching credentials",
                 ));
             }
         };
@@ -199,6 +207,10 @@ impl Session {
             token_url,
             redirect_ports,
             callback_timeout_secs: oauth_callback_timeout_secs,
+            jwt_key_file,
+            jwt_kid,
+            jwt_passphrase,
+            jwt_algorithm,
             identity_federation_client_id,
         };
         let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;

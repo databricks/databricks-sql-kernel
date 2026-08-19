@@ -47,7 +47,7 @@
 
 use crate::auth::{
     AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
-    PersonalAccessToken,
+    JwtClientCredentialsProvider, PersonalAccessToken,
 };
 use crate::client::http::TlsConfig as HttpTlsConfig;
 use crate::client::retry::{
@@ -1265,6 +1265,38 @@ async fn build_base_auth_provider(
                 timeout,
                 token_url_override.clone(),
                 cache_policy,
+            )
+            .await?;
+            Ok(Arc::new(provider))
+        }
+        AuthConfig::OAuthM2MPrivateKey {
+            client_id,
+            jwt_key_file,
+            jwt_kid,
+            jwt_passphrase,
+            jwt_algorithm,
+            scopes,
+            token_url_override,
+        } => {
+            if client_id.is_empty() || jwt_key_file.is_empty() || jwt_kid.is_empty() {
+                return Err(Error::invalid_argument().message(
+                    "AuthConfig::OAuthM2MPrivateKey requires non-empty client_id, \
+                     jwt_key_file, and jwt_kid",
+                ));
+            }
+            let scopes = scopes
+                .clone()
+                .unwrap_or_else(|| vec!["all-apis".to_string()]);
+            let provider = JwtClientCredentialsProvider::new(
+                host,
+                client_id,
+                jwt_key_file,
+                jwt_kid,
+                jwt_passphrase.as_deref(),
+                jwt_algorithm.as_deref(),
+                http_client,
+                scopes,
+                token_url_override.clone(),
             )
             .await?;
             Ok(Arc::new(provider))
