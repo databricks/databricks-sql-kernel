@@ -23,17 +23,24 @@ changes go in their respective binding's NEXT_CHANGELOG.
   malformed Entra URL). Live-verified end-to-end against an Azure workspace.
   (PECOBLR-4120.)
 
-- Azure Entra service-principal M2M is now a kernel-owned flow
+- Azure Entra service-principal M2M (`azure-sp-m2m`) is now a kernel-owned flow
   (`AuthConfig::AzureServicePrincipal` / pyo3 `auth_type="azure-sp-m2m"`). The
-  kernel builds the Entra token endpoint (`{login_host}/{tenant}/oauth2/v2.0/token`)
-  and the `{app_id}/.default` data scope, and auto-discovers the tenant from the
-  workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted — so bindings
-  forward only the credentials. Setting `azure_workspace_resource_id` additionally
-  emits the `X-Databricks-Azure-SP-Management-Token` +
-  `X-Databricks-Azure-Workspace-Resource-Id` header pair for SPs authorized via
-  Azure RBAC rather than workspace membership. The generic `OAuthM2M` path (Entra
-  `token_url_override` + the `2ff814a6-…/.default` scope, explicit tenant) still
-  works. New C ABI setters expose the pieces the C surface was missing:
+  kernel resolves the Entra token endpoint (`{login}/{tenant}/oauth2/v2.0/token`)
+  and the `{effective_app_id}/.default` scope, and auto-discovers the tenant from
+  the workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted (Thrift
+  parity) — so bindings forward only the SP credentials. The Azure
+  management-token pair (`X-Databricks-Azure-SP-Management-Token` +
+  `X-Databricks-Azure-Workspace-Resource-Id`) is an optional add-on gated on
+  `azure_workspace_resource_id`: set it and the kernel fetches a second Entra
+  token (ARM `.default` scope) so an SP holding only an Azure RBAC role (not a
+  workspace member) can authenticate; omit it and the SP uses the data token
+  alone. A new `AuthProvider::extra_headers()` carries the dynamic pair. Common
+  case (tenant auto-discovered, data token only) live-verified end-to-end against
+  an Azure workspace. (PECOBLR-4141.)
+
+- Generic Azure/Entra OAuth overrides (the pre-dedicated-flow path, still valid
+  for custom setups where a caller pins the endpoint/scope itself). New C ABI
+  setters expose the pieces the C surface was missing:
   `kernel_session_config_set_oauth_token_endpoint()` and
   `kernel_session_config_set_oauth_scopes()` — both applied to whichever OAuth
   mode (M2M or U2M) is selected, matching the single `oauth_scopes` /
