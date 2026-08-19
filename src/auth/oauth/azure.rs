@@ -294,6 +294,22 @@ fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Resul
              login host (got {host:?}); pass azure_tenant_id explicitly"
         )));
     }
+    // The tenant parses fine on sovereign clouds (USGov `login.microsoftonline.us`,
+    // China `login.chinacloudapi.cn`), but the M2M token exchange
+    // (`sp_m2m_token_url`) and `AZURE_MANAGEMENT_SCOPE` are hardcoded to the
+    // commercial Entra login / ARM hosts. Rather than let discovery succeed and
+    // then fail confusingly at the sovereign token endpoint, reject a
+    // non-commercial login host here with a message that names the limitation.
+    // Deriving the sovereign login/management hosts is the documented follow-up.
+    if host != "login.microsoftonline.com" {
+        return Err(Error::unauthenticated().message(format!(
+            "Azure tenant discovery: workspace redirected to a sovereign-cloud \
+             login host ({host:?}), which the service-principal M2M flow does \
+             not yet support (the Entra token endpoint and management scope are \
+             commercial-cloud only); pass azure_tenant_id explicitly if you have \
+             configured a sovereign-cloud endpoint out of band"
+        )));
+    }
     final_url
         .path_segments()
         .and_then(|mut segments| segments.next())
@@ -411,6 +427,25 @@ mod tests {
         // "tenant" — fail so the caller passes azure_tenant_id explicitly.
         let url = reqwest::Url::parse("https://evil.example.com/not-a-tenant/x").unwrap();
         assert!(tenant_from_login_url(&url).is_err());
+    }
+
+    #[test]
+    fn tenant_parse_rejects_sovereign_login_host() {
+        // A USGov / China workspace redirects to a sovereign Entra login host,
+        // from which the tenant parses fine — but the M2M token endpoint and
+        // management scope are hardcoded to the commercial cloud, so discovery
+        // must fail early with a clear message instead of succeeding and then
+        // failing confusingly at the commercial token endpoint.
+        for host in [
+            "https://login.microsoftonline.us/tenant-abc/oauth2/authorize?client_id=x",
+            "https://login.chinacloudapi.cn/tenant-abc/oauth2/authorize?client_id=x",
+        ] {
+            let url = reqwest::Url::parse(host).unwrap();
+            assert!(
+                tenant_from_login_url(&url).is_err(),
+                "expected sovereign host {host:?} to be rejected"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
