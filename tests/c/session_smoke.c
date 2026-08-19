@@ -140,9 +140,9 @@ static void test_http_path_and_m2m_setters(void) {
   rc = kernel_session_config_set_oauth_token_endpoint(
       config, "https://login.microsoftonline.com/tenant/oauth2/v2.0/token");
   CHECK(rc == KernelStatusCode_Success, "set_oauth_token_endpoint succeeds");
-  rc = kernel_session_config_set_oauth_m2m_scopes(
+  rc = kernel_session_config_set_oauth_scopes(
       config, "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default");
-  CHECK(rc == KernelStatusCode_Success, "set_oauth_m2m_scopes succeeds");
+  CHECK(rc == KernelStatusCode_Success, "set_oauth_scopes succeeds");
   kernel_session_config_free(config);
 }
 

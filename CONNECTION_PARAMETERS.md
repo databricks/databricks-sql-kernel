@@ -82,7 +82,7 @@ connector supplying the Azure endpoint / scope / client id it already owns:
 The bindings expose these overrides as: pyo3 `token_url` / `oauth_scopes` /
 `client_id`; napi `oauthTokenUrl` / `oauthScopes` / `oauthClientId`; C ABI
 `kernel_session_config_set_oauth_token_endpoint` /
-`kernel_session_config_set_oauth_m2m_scopes` (+ the `set_auth_*` setters).
+`kernel_session_config_set_oauth_scopes` (+ the `set_auth_*` setters).
 
 Two further variants are reserved but not usable in v0:
 `OAuthFederation` (RFC 8693 token exchange — returns `InvalidArgument`

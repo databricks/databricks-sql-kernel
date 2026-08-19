@@ -265,13 +265,16 @@ KernelStatusCode
 kernel_session_config_set_oauth_token_endpoint(KernelSessionConfig* config,
                                                const char* token_endpoint);
 
-/* Optional OAuth M2M scopes (comma-separated), e.g.
+/* Optional OAuth scopes (comma-separated), applied to whichever OAuth mode
+ * (M2M or U2M) is selected — e.g.
  * `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` for an Azure service
- * principal. Unset → kernel default (`all-apis`). Affects M2M only; U2M scopes
- * are set via kernel_session_config_set_auth_u2m. */
+ * principal (M2M), or `sql,offline_access` (U2M). Mirrors the single
+ * `oauth_scopes` the pyo3 / napi bindings expose across both flows. Unset →
+ * kernel per-mode default (`all-apis` for M2M; `sql offline_access` for U2M).
+ * For U2M it overrides any scopes passed to kernel_session_config_set_auth_u2m. */
 KernelStatusCode
-kernel_session_config_set_oauth_m2m_scopes(KernelSessionConfig* config,
-                                           const char* scopes);
+kernel_session_config_set_oauth_scopes(KernelSessionConfig* config,
+                                       const char* scopes);
 
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
  * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
