@@ -36,7 +36,7 @@
 mod json;
 
 use crate::kernel_error::{Error, Result};
-use crate::reader::{ResultReader, ResultReaderAdapter};
+use crate::reader::{ResultReader, ResultReaderAdapter, ResultReaderMetrics};
 use crate::types::sea::ResultManifest;
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -239,6 +239,10 @@ impl ResultReader for ResultPostProcessor {
             Some(t) => Ok(Some(t(&batch)?)),
             None => Ok(Some(batch)),
         }
+    }
+
+    fn metrics(&self) -> Option<ResultReaderMetrics> {
+        self.inner.metrics()
     }
 }
 

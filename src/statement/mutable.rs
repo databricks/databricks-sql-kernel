@@ -378,6 +378,7 @@ impl Statement {
             self.last_closed = Some(Arc::clone(&closed));
 
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
+            result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
             // returns the count as the result set. If the server didn't
             // already supply `num_modified_rows`, derive it from that
@@ -396,7 +397,6 @@ impl Statement {
                 closed,
                 status,
             );
-            telemetry_for_body.finalize(None);
             Ok(executed)
         }
         .instrument(span)
@@ -559,7 +559,8 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    let result_stream = ResultStream::from_reader(result.reader).await?;
+                    let mut result_stream = ResultStream::from_reader(result.reader).await?;
+                    result_stream.attach_telemetry(telemetry_for_body.clone());
                     let executed = ExecutedStatement::new(
                         Arc::clone(&self.session),
                         result.statement_id,
@@ -568,7 +569,6 @@ impl Statement {
                         closed,
                         result.status,
                     );
-                    telemetry_for_body.finalize(None);
                     Ok(DirectStatement::Completed(executed))
                 }
                 DirectOutcome::Running(resp) => {

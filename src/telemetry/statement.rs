@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::models::{ExecutionResultFormat, OperationType, StatementType};
+use super::models::{ChunkDetails, ExecutionResultFormat, OperationType, StatementType};
 use super::runtime::ConnectionTelemetry;
 use crate::kernel_error::Error as KernelError;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,6 +62,18 @@ impl StatementTelemetry {
         self.observer.record_poll(elapsed);
     }
 
+    pub(crate) fn record_result_batch(&self, rows: usize) {
+        self.observer.record_result_batch(rows);
+    }
+
+    pub(crate) fn record_result_consumed(&self) {
+        self.observer.record_result_consumed();
+    }
+
+    pub(crate) fn record_chunk_metrics(&self, metrics: ChunkMetrics) {
+        self.observer.record_chunk_metrics(metrics);
+    }
+
     pub(crate) fn finalize(&self, error: Option<&KernelError>) {
         self.observer.finalize(error);
     }
@@ -71,7 +83,31 @@ pub(super) trait StatementOperationObserver: Send + Sync {
     fn on_statement_submitted(&self, statement_id: &str);
     fn on_result_metadata(&self, result_format: ExecutionResultFormat, is_compressed: bool);
     fn record_poll(&self, elapsed: Duration);
+    fn record_result_batch(&self, rows: usize);
+    fn record_result_consumed(&self);
+    fn record_chunk_metrics(&self, metrics: ChunkMetrics);
     fn finalize(&self, error: Option<&KernelError>);
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct ChunkMetrics {
+    pub total_chunks_present: Option<i32>,
+    pub total_chunks_iterated: Option<i32>,
+    pub initial_chunk_latency: Option<Duration>,
+    pub slowest_chunk_latency: Option<Duration>,
+    pub sum_chunks_download_time: Option<Duration>,
+}
+
+impl ChunkMetrics {
+    pub(crate) fn into_details(self) -> ChunkDetails {
+        ChunkDetails {
+            initial_chunk_latency_millis: self.initial_chunk_latency.map(duration_millis),
+            slowest_chunk_latency_millis: self.slowest_chunk_latency.map(duration_millis),
+            total_chunks_present: self.total_chunks_present,
+            total_chunks_iterated: self.total_chunks_iterated,
+            sum_chunks_download_time_millis: self.sum_chunks_download_time.map(duration_millis),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,6 +123,9 @@ pub(crate) struct StatementTelemetryContext {
     pub poll_latency: Duration,
     pub first_batch_latency: Option<Duration>,
     pub consumption_latency: Option<Duration>,
+    pub result_batch_count: i32,
+    pub result_row_count: i64,
+    pub chunk_metrics: Option<ChunkMetrics>,
 }
 
 struct TelemetryObserver {
@@ -122,6 +161,9 @@ impl TelemetryObserver {
                     poll_latency: Duration::ZERO,
                     first_batch_latency: None,
                     consumption_latency: None,
+                    result_batch_count: 0,
+                    result_row_count: 0,
+                    chunk_metrics: None,
                 },
             }),
             finalized: AtomicBool::new(false),
@@ -147,6 +189,31 @@ impl StatementOperationObserver for TelemetryObserver {
         if let Ok(mut state) = self.state.lock() {
             state.context.poll_count = state.context.poll_count.saturating_add(1);
             state.context.poll_latency += elapsed;
+        }
+    }
+
+    fn record_result_batch(&self, rows: usize) {
+        if let Ok(mut state) = self.state.lock() {
+            if state.context.first_batch_latency.is_none() {
+                state.context.first_batch_latency = Some(state.started_at.elapsed());
+            }
+            state.context.result_batch_count = state.context.result_batch_count.saturating_add(1);
+            state.context.result_row_count = state
+                .context
+                .result_row_count
+                .saturating_add(rows.try_into().unwrap_or(i64::MAX));
+        }
+    }
+
+    fn record_result_consumed(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.context.consumption_latency = Some(state.started_at.elapsed());
+        }
+    }
+
+    fn record_chunk_metrics(&self, metrics: ChunkMetrics) {
+        if let Ok(mut state) = self.state.lock() {
+            state.context.chunk_metrics = Some(metrics);
         }
     }
 
@@ -179,5 +246,15 @@ impl StatementOperationObserver for NoOpObserver {
 
     fn record_poll(&self, _elapsed: Duration) {}
 
+    fn record_result_batch(&self, _rows: usize) {}
+
+    fn record_result_consumed(&self) {}
+
+    fn record_chunk_metrics(&self, _metrics: ChunkMetrics) {}
+
     fn finalize(&self, _error: Option<&KernelError>) {}
+}
+
+fn duration_millis(duration: Duration) -> i64 {
+    duration.as_millis().try_into().unwrap_or(i64::MAX)
 }
