@@ -14,232 +14,162 @@
   limitations under the License.
 -->
 
-# Azure Entra ID OAuth on the kernel via generic overrides — PECOBLR-4141 / PECOBLR-4120
+# Azure Entra ID OAuth — kernel as the Azure-aware auth core (PECOBLR-4141 / 4120)
 
-## Overview
+## Direction
 
-`databricks-sql-python` users authenticating to Azure Databricks with either an
-**Azure service principal** (M2M — `azure-sp-m2m`) or the **Azure browser flow**
-(U2M — `azure-oauth`) must keep working when the connector runs on the kernel
-backend.
+**The kernel is the auth core; bindings are thin.** The kernel owns Azure
+cloud-awareness — it detects the cloud from the workspace host, constructs the
+correct Entra endpoints, auto-discovers the tenant, and applies the Azure client
+id / scope / redirect-port defaults. Each binding forwards only its native auth
+selector (+ the SP credentials for M2M); it does **not** build URLs, map scopes,
+or discover tenants.
 
-**The kernel does not need any Azure-specific auth code.** It already ships a
-generic OAuth engine — `OAuthM2M` (client-credentials) and `OAuthU2M`
-(authorization-code + PKCE) — whose endpoint, scope, and client-id are all
-**overridable**. Azure is expressed by *driving those existing flows with Azure
-values*, which the connectors already compute today. The kernel's job is only to
-make every binding able to pass those overrides through.
+This supersedes the earlier "generic-override, kernel stays cloud-agnostic"
+draft. The generic `token_url` / `scopes` overrides added in the first cut of
+this PR **remain** as primitives (the Azure layer sets them internally, and they
+stay usable for non-Azure custom endpoints), but Azure resolution now lives in
+the kernel.
 
-This supersedes an earlier draft of this doc that proposed a dedicated
-`AuthConfig::AzureServicePrincipal` variant, a new provider, an
-`AuthProvider::extra_headers()` trait extension, and the Azure
-management-token headers. All of that is **dropped** — see
-[Why not a dedicated Azure flow](#why-not-a-dedicated-azure-flow).
+### Why (and the correction that motivated it)
 
-## Why the kernel stays generic (evidence)
+A live run against a real Azure workspace showed the generic approach's fatal
+gap: the kernel's OIDC discovery returns `{host}/oidc/v1/authorize`, and the
+workspace redirects that to a **malformed** `login.microsoftonline.com/{tenant}/
+v1/authorize` (404). Every connector instead uses `{host}/oidc/oauth2/v2.0/
+authorize`, which redirects to a valid Entra URL. Getting that right — plus
+tenant discovery, per-cloud hosts, and the Azure defaults — is knowledge that
+would otherwise be duplicated into every binding adapter. Putting it in the
+kernel (as the Go driver's core already does) keeps it in one place.
 
-The two sibling SQL connectors already treat Azure as *generic OAuth with Azure
-values*, not a distinct auth mode, and **neither uses the Azure management
-token**:
+## Non-negotiable: invocation parity with Thrift
 
-- **Go (`databricks-sql-go`)** rolls its own OAuth, workspace-OIDC rooted, with
-  the cloud inferred from the hostname; its kernel path has no Azure branch at
-  all. Scope resource `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d`. No
-  `X-Databricks-Azure-SP-Management-Token`.
-- **Node (`databricks-sql-nodejs`)** drives Azure via `openid-client` with scope
-  `2ff814a6-…/.default` (M2M) / `…/user_impersonation` (U2M). Its **kernel path
-  explicitly rejects** the Azure-direct options with: *"the workspace-OIDC
-  discovery path handles Azure workspaces today without these options."* No
-  management token.
-- Only the general-purpose `databricks-sdk` carries the management-token
-  machinery (`azure.py` `add_sp_management_token()`), for broad control-plane
-  APIs — **not** the SQL data path (SEA / Thrift warehouse queries), which is all
-  the kernel serves.
+Switching a connection to `use_kernel=True` must **not** change how a user
+invokes Azure auth. The kernel API must let each binding preserve its exact
+Thrift-path `connect()` surface:
 
-So the SQL-connector-consistent design is: keep the kernel a cloud-agnostic OAuth
-engine; let each connector supply the Azure endpoint / scope / client-id it
-already owns.
+| Driver | Azure U2M — user passes | Azure M2M — user passes |
+| --- | --- | --- |
+| **Python** | `auth_type="azure-oauth"` | `auth_type="azure-sp-m2m"` + `azure_client_id` / `azure_client_secret`; **`azure_tenant_id` optional** (auto-discovered) |
+| **Go** | `authType=OauthU2M` (Azure inferred from host; no azure param) | `authType=OauthM2M` + `clientID`/`clientSecret` — a *Databricks* SP (workspace OIDC), **not** Azure AD |
+| **Node** | `authType='databricks-oauth'` + `azureTenantId` | `authType='databricks-oauth'` + `oauthClientId`/`Secret` + `azureTenantId` |
 
-## What the kernel already has
+Consequences the kernel API must satisfy:
+- `azure_tenant_id` is **optional** everywhere (kernel discovers it) — Thrift
+  parity, and a correction to the first cut which wrongly required it.
+- The kernel exposes **both** a Databricks-SP M2M (`oauth-m2m`, workspace OIDC)
+  and an Azure-AD-SP M2M (`azure-sp-m2m`, Entra) — Go's "Azure M2M" maps to the
+  former, Python's `azure-sp-m2m` to the latter.
+- Each binding's thin adapter normalizes its native selector (Python's explicit
+  `auth_type`, Go's host-inference, Node's `azureTenantId` flag) onto the kernel
+  Azure API; the kernel accepts an explicit Azure signal and does the rest.
 
-`AuthConfig` (`src/config.rs`) exposes, on both OAuth variants:
+## What the kernel owns — `src/auth/oauth/azure.rs` (new)
 
-- `OAuthM2M { client_id, client_secret, scopes, token_url_override, identity_federation_client_id }`
-- `OAuthU2M { client_id, redirect_ports, scopes, token_url_override, callback_timeout, token_cache, identity_federation_client_id }`
+1. **Cloud / environment detection** from the host suffix:
+   `.azuredatabricks.net` → Public, `.databricks.azure.us` → USGov,
+   `.databricks.azure.cn` → China. Per-cloud login host + Databricks app-id
+   table (Public/dev/staging app ids from the connector's `AzureAppId`; Gov/China
+   use the prod app id). Mirrors the Go driver's `azureTenants` map.
+2. **Endpoint construction** (see per-flow sections).
+3. **Tenant auto-discovery**: `GET {host}/aad/auth`, read the redirect to
+   `login.microsoftonline.com/{tenant}/…`, parse the tenant from the path.
+   Sovereign-aware (reads the real redirect host). Only needed for M2M.
+4. **Azure defaults**: U2M client id `96eecda7-19ea-49cc-abb5-240097d554f5`,
+   port `8030`; scope app-id `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d` (overridable
+   via `DATABRICKS_AZURE_TENANT_ID`, matching the connector).
 
-`token_url_override`, `scopes`, and `client_id` are exactly the knobs Azure
-needs. `FederationProvider` already wraps every flow and exchanges
-foreign-issuer JWTs (Azure AD tokens included) at `{host}/oidc/v1/token`,
-non-breaking. The HTTP client follows redirects by default, so workspace
-`/oidc/.well-known/…` discovery transparently follows an Azure workspace's
-redirect to Entra.
+## `azure-oauth` (U2M) — PECOBLR-4120
 
-## How each Azure mode maps onto the existing flows
+Browser authorization-code + PKCE, driven by the kernel's existing U2M provider
+with Azure endpoints/values:
 
-### Azure SP M2M (`azure-sp-m2m`, PECOBLR-4141)
+- **Authorize + token**: `{host}/oidc/oauth2/v2.0/authorize` and
+  `{host}/oidc/oauth2/v2.0/token` — the **workspace-host v2.0** paths (the Go
+  driver's proven pattern). No tenant needed: the workspace redirects the
+  authorize to Entra. This is the exact fix for the live 404 (`/oidc/v1/*` →
+  `/oidc/oauth2/v2.0/*`).
+- **Client id** `96eecda7-…`, **scope** `{app_id}/user_impersonation
+  offline_access`, **redirect port** `8030`.
+- The kernel gains an **authorize-endpoint override** internally so the Azure
+  path can pin `/oidc/oauth2/v2.0/authorize` instead of the discovered
+  `/oidc/v1/authorize`. (Discovery is otherwise unchanged for non-Azure U2M.)
 
-Connector drives `OAuthM2M` with:
+## `azure-sp-m2m` (M2M) — PECOBLR-4141
 
-| Field | Azure value |
-| --- | --- |
-| `client_id` / `client_secret` | `azure_client_id` / `azure_client_secret` |
-| `token_url_override` | `https://login.microsoftonline.com/{azure_tenant_id}/oauth2/v2.0/token` (per-cloud host) |
-| `scopes` | `["2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default"]` |
+Client-credentials against **Entra directly** (no browser, so no workspace
+redirect available):
 
-The `oauth2` crate sends `grant_type=client_credentials` with the client id/secret
-via HTTP Basic to the override endpoint; the returned Entra token (audience
-`2ff814a6-…`, issuer `sts.windows.net/{tenant}`) is used as the bearer.
+- **Token endpoint**: `{login_host}/{tenant}/oauth2/v2.0/token`, tenant
+  **auto-discovered** via `/aad/auth` when `azure_tenant_id` is omitted.
+- **Scope**: `{effective_app_id}/.default` (app id from the host's cloud).
+- **Credentials**: `azure_client_id` / `azure_client_secret` via HTTP Basic
+  (Entra v2.0 advertises `client_secret_basic`; verified).
+- **Management token / `azure_workspace_resource_id`: still not implemented.**
+  No SQL connector (Go, Node) uses it; Python's Thrift path sends it but the SQL
+  data path doesn't require it for a workspace-member SP. An SP that is not a
+  workspace member (RBAC-only) remains unsupported on the kernel path,
+  documented. Revisit only with a concrete SQL customer need; the seam would be a
+  second-token + refreshing-extra-header mechanism.
 
-> **Credential-transmission style (PR #263 review thread).** A reviewer noted the
-> Azure docs *example* uses `client_secret_post` (form body), whereas the kernel's
-> `exchange_client_credentials()` sends `client_secret_basic` (HTTP Basic).
-> Verified non-blocking: Entra's published
-> `token_endpoint_auth_methods_supported` is
-> `["client_secret_post","private_key_jwt","client_secret_basic","self_signed_tls_client_auth"]`
-> — `client_secret_basic` **is** supported, so no change to the M2M provider's
-> credential transmission is required. Its foreign issuer means `FederationProvider` round-trips it through
-`{host}/oidc/v1/token` (required when the workspace is *not* Azure; a benign
-pass-through when it is).
+## Federation
 
-> **Cloud/environment ownership (PR #263 review thread).** A reviewer correctly
-> noted the Azure cloud (Public / USGov / China → login host) is a property of
-> the *SP's Azure tenant*, not the workspace's host, so deriving it from the
-> workspace host (as an earlier draft did) is wrong. In the generic-override
-> design this is moot for the kernel: the connector builds the full
-> `token_url_override` for the correct cloud and the kernel uses it verbatim —
-> the kernel never infers an environment. The per-cloud host table lives in each
-> connector (`databricks-sdk-py` `azure.py`, etc.).
+Unchanged. `FederationProvider` still wraps every flow; an Entra-issued token is
+foreign-issuer and round-trips through `{host}/oidc/v1/token` (benign on Azure,
+required for an Azure SP reaching a non-Azure workspace), with the non-breaking
+fallback.
 
-### Azure U2M (`azure-oauth`, PECOBLR-4120)
+## AuthConfig
 
-Connector drives `OAuthU2M` with the Azure app client id
-`96eecda7-19ea-49cc-abb5-240097d554f5`, `redirect_ports=[8030]`, and scope
-`["{app_id}/user_impersonation", "offline_access"]` (`app_id` defaults to
-`2ff814a6-…`, overridable via `DATABRICKS_AZURE_TENANT_ID`). Authorization/token
-endpoints come from the kernel's existing OIDC discovery against `{host}/oidc/…`,
-which the Azure workspace redirects to Entra.
+Two new variants (bindings map onto them):
 
-Note the **kernel-blessed direction for Azure U2M is actually `databricks-oauth`**
-(Databricks-native OAuth, which already works on Azure workspaces via
-workspace-OIDC and needs *no* Azure values) — this is what the Go and Node kernel
-paths use. `azure-oauth` (Entra-direct) is a legacy-compatibility path for callers
-who pin it; it costs the kernel nothing beyond the override plumbing below.
+```rust
+AuthConfig::AzureOAuthU2M {
+    client_id: Option<String>,        // None → 96eecda7-…
+    redirect_ports: Option<Vec<u16>>, // None → [8030]
+    app_id: Option<String>,           // scope resource; None → 2ff814a6-… / env
+    token_cache: Option<TokenCacheConfig>,
+    identity_federation_client_id: Option<String>,
+}
+AuthConfig::AzureServicePrincipal {   // azure-sp-m2m
+    azure_client_id: String,
+    azure_client_secret: String,
+    azure_tenant_id: Option<String>,  // None → auto-discover via /aad/auth
+    identity_federation_client_id: Option<String>,
+}
+```
 
-### Static workspace-resource-id header, if ever needed
+The existing `OAuthU2M` / `OAuthM2M` variants are unchanged (Databricks-native
+flows, incl. Go's Databricks-SP M2M and the workspace-OIDC databricks-oauth).
 
-`X-Databricks-Azure-Workspace-Resource-Id` is a *static* string, so a connector
-that wants it forwards it through the existing custom-headers channel
-(pyo3 `http_headers`, napi `customHeaders`, C ABI
-`kernel_session_config_set_custom_header`). No kernel change, no new seam.
+## Thin bindings
 
-## Kernel-repo work (the entire change)
-
-pyo3 already exposes `token_url` + `oauth_scopes` + `client_id`, so **Python needs
-no kernel change** — the work is in the other two bindings plus tests/docs.
-
-### napi (`napi/src/database.rs`, `napi/index.d.ts` by hand)
-
-Add an `oauthTokenUrl?: string` field to `ConnectionOptions` and forward it as
-`token_url_override` in `build_auth_config` for **both** the `OAuthM2m` and
-`OAuthU2m` arms (both currently hardcode `None`). `oauthScopes` /
-`oauthClientId` are already forwarded.
-
-### C ABI (`src/c_abi/session.rs`, `include/databricks_kernel.h` by hand)
-
-- `AuthSpec::OAuthM2M` gains `scopes: Option<String>` and
-  `token_endpoint: Option<String>`; `set_auth_m2m` takes two more (nullable)
-  args and threads them into `AuthConfig::oauth_m2m` (currently passes
-  `None, None`).
-- `AuthSpec::OAuthU2M` gains `token_endpoint: Option<String>`; `set_auth_u2m`
-  takes one more (nullable) arg and threads it into `AuthConfig::oauth_u2m`
-  (currently `None`).
-- Update the hand-written header and `tests/c/session_smoke.c`.
-
-### Core refinement (optional but recommended)
-
-In `m2m.rs`, when `token_endpoint_override` is `Some`, **skip OIDC discovery**:
-the authorization endpoint is unused by the client-credentials grant, so
-discovering it against the workspace is a needless round-trip and a needless
-dependency on workspace OIDC for a pure-Entra token endpoint. Synthesize a
-placeholder auth URL (unused) instead. U2M still discovers (it needs the
-authorize endpoint for the browser step).
-
-### Docs / changelog
-
-`CONNECTION_PARAMETERS.md` documents the override knobs as the Azure mechanism
-(with a worked `azure-sp-m2m` / `azure-oauth` example). Root + per-binding
-`NEXT_CHANGELOG.md` entries.
-
-## Connector responsibilities (out of this repo, for reference)
-
-These land in `databricks-sql-python` / `-nodejs` (tracked by PECOBLR-4141 /
--4120 / the Node ticket), not here:
-
-- **Python `auth_bridge.py`:** for `azure-sp-m2m`, forward `client_id` /
-  `client_secret` / `token_url` / `scopes` as in the table above; for
-  `azure-oauth`, synthesise the `{app_id}/user_impersonation offline_access`
-  scope (the current bug is forwarding literal `sql offline_access`) and the
-  Azure client id / port.
-- **napi consumer (Node):** stop rejecting Azure in the kernel adapter; map its
-  Azure options onto `oauthTokenUrl` / `oauthScopes` / `oauthClientId`.
-
-## Why not a dedicated Azure flow
-
-The earlier draft added `AuthConfig::AzureServicePrincipal`, a provider, an
-`extra_headers()` trait method, and the management-token headers. Rejected
-because:
-
-- **No SQL connector uses the management token** (Go and Node confirm), so the
-  `extra_headers()` seam and the second-token flow it existed for buy nothing on
-  the SQL data path. Supporting the "Azure RBAC role but not a workspace member"
-  scenario is a `databricks-sdk` control-plane concern, not a SQL one.
-- A dedicated variant forks a **fourth** copy of the Azure constants (app id,
-  per-cloud hosts, scope format) into the kernel, when the connectors already
-  own and maintain them. The override approach keeps a single source of truth per
-  connector and makes the kernel cloud-agnostic (matching Go and Node).
-- Smaller, less security-sensitive change: no new provider, no trait change, no
-  new auth variant.
-
-If a future non-SQL consumer genuinely needs the management token, revisit then;
-the `extra_headers()` design in this doc's git history is the starting point.
-
-## Error handling
-
-Unchanged from the existing OAuth flows: bad Entra credentials / endpoint errors
-surface as `Unauthenticated` from `get_auth_header()` (M2M) or the browser-flow
-error (U2M); a failed federation exchange falls back to the original token
-(non-breaking). Missing required fields are rejected at the binding boundary by
-the existing `AuthConfig::oauth_m2m` / `oauth_u2m` validating constructors.
+- **pyo3**: `auth_type="azure-oauth"` → `AzureOAuthU2M`; `auth_type="azure-sp-m2m"`
+  + `azure_*` kwargs → `AzureServicePrincipal`. No endpoint/scope/tenant logic.
+- **napi**: `AuthMode::AzureOAuth` / `AzureSpM2m` + `azure*` fields.
+- **C ABI**: `set_auth_azure_oauth` / `set_auth_azure_sp_m2m` setters.
+- **Connector #919**: `auth_bridge.py` simplifies to selector-mapping only —
+  forwards `auth_type` + azure creds, stops constructing URLs / scopes and stops
+  discovering the tenant (the kernel does it). Drops the kernel-path dependency
+  on `AzureOAuthEndpointCollection` / `get_azure_tenant_id_from_host`.
 
 ## Testing
 
-- **napi:** `ConnectionOptions.oauthTokenUrl` forwarded to `token_url_override`
-  for M2M and U2M (unit test on `build_auth_config`); field present in
-  `index.d.ts`.
-- **C ABI:** `set_auth_m2m` scopes + token endpoint and `set_auth_u2m` token
-  endpoint recorded and threaded (unit tests; NULL-optional handling); smoke-test
-  line in `tests/c/session_smoke.c`.
-- **Wiremock (`tests/azure_oauth_wiremock.rs`):** an Azure-shaped M2M run — mock
-  an Entra-like token endpoint, drive `OAuthM2M` with `token_url_override` +
-  `2ff814a6-…/.default` scope, assert the exchange hits the override endpoint
-  with Basic auth and the right scope, and that the resulting foreign-issuer
-  token flows through `FederationProvider`.
-- **Discovery-follows-redirect:** a wiremock test that OIDC discovery follows a
-  302 from `{host}/oidc/.well-known/…` to an Entra-like config host (guards the
-  PECOBLR-4120 assumption).
-- **E2E (`#[ignore]`):** real Azure workspace — `azure-sp-m2m` via env vars
-  (`DATABRICKS_AZURE_CLIENT_ID` / `_SECRET` / `_TENANT_ID`) driving `oauth-m2m`
-  with the override; and `databricks-oauth`/`azure-oauth` U2M against an Azure
-  workspace.
-- **Core:** if the skip-discovery-on-override refinement lands, a unit test that
-  M2M with an override performs no discovery request.
+- **Unit (`azure.rs`)**: cloud/env detection per host suffix; endpoint
+  construction (U2M workspace v2.0; M2M Entra token URL per cloud); scope
+  app-id defaulting + `DATABRICKS_AZURE_TENANT_ID` override.
+- **Wiremock**: tenant discovery (`/aad/auth` 302 → parse tenant); `azure-sp-m2m`
+  hits the Entra token endpoint with Basic + `.default` scope; `azure-oauth`
+  uses the `/oidc/oauth2/v2.0/authorize` path (regression for the live 404).
+- **Binding boundary**: pyo3 kwargs accepted; napi/C-ABI selectors record values.
+- **Live (required before GA)**: `azure-oauth` U2M against a real Azure workspace
+  (browser) — confirm the v2.0 authorize path fixes the 404 and the query runs;
+  `azure-sp-m2m` with a real workspace-member Entra SP; sovereign-cloud spot check.
 
-## Deltas vs. reference
+## Status / evolution
 
-- **Same** Entra endpoint, `2ff814a6-…` app id, scope strings, and v2.0 endpoint
-  as `databricks-sdk` / Go / Node — but supplied by the connector, not baked into
-  the kernel.
-- **Dropped** vs. `databricks-sdk`: the management token and its two
-  `X-Databricks-Azure-*` headers (no SQL connector uses them).
-- **Federation:** the kernel additionally runs its mandatory issuer-gated
-  exchange on top, as it already does for every OAuth flow.
+- First cut: generic overrides, kernel cloud-agnostic (shipped in this PR's early
+  commits). Retained as primitives.
+- Live test found the `/oidc/v1/authorize` 404 → authorize must be v2.0.
+- Decision (team): kernel is the auth core, bindings thin → Azure resolution
+  moves into the kernel (this doc). Management token stays out.
