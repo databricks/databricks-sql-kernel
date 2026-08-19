@@ -471,8 +471,6 @@ impl ExecutedAsyncStatement {
                         let result = self.materialise_result().await;
                         if let Err(error) = &result {
                             self.statement_telemetry.finalize(Some(error));
-                        } else {
-                            self.statement_telemetry.finalize(None);
                         }
                         return result;
                     }
@@ -541,8 +539,6 @@ impl ExecutedAsyncStatement {
             let result = self.materialise_result().await;
             if let Err(error) = &result {
                 self.statement_telemetry.finalize(Some(error));
-            } else {
-                self.statement_telemetry.finalize(None);
             }
             result
         }
@@ -581,6 +577,7 @@ impl ExecutedAsyncStatement {
                     self.closed.store(true, Ordering::Release);
                 }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
+                stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so

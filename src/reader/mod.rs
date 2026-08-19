@@ -38,6 +38,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
 
@@ -469,6 +470,7 @@ impl ResultReaderFactory {
             self.config.clone(),
             link_fetcher,
             chunk_downloader,
+            total_chunk_count.and_then(|count| count.try_into().ok()),
             self.runtime_handle.clone(),
         );
 
@@ -590,6 +592,24 @@ pub trait ResultReader: Send + Sync {
 
     /// Get the next record batch, or None if end of results.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
+
+    /// Optional reader-level metrics accumulated below `ResultStream`.
+    ///
+    /// CloudFetch overrides this to surface chunk download metrics into
+    /// statement telemetry. Inline/in-memory readers keep the default.
+    fn metrics(&self) -> Option<ResultReaderMetrics> {
+        None
+    }
+}
+
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ResultReaderMetrics {
+    pub total_chunks_present: Option<i32>,
+    pub total_chunks_iterated: Option<i32>,
+    pub initial_chunk_latency: Option<Duration>,
+    pub slowest_chunk_latency: Option<Duration>,
+    pub sum_chunks_download_time: Option<Duration>,
 }
 
 /// Wrapper for StreamingCloudFetchProvider that implements ResultReader.
@@ -611,6 +631,10 @@ impl ResultReader for CloudFetchResultReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch().await
+    }
+
+    fn metrics(&self) -> Option<ResultReaderMetrics> {
+        self.provider.metrics()
     }
 }
 

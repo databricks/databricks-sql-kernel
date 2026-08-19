@@ -24,6 +24,7 @@ use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, error, info, warn};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
+use crate::reader::ResultReaderMetrics;
 use crate::types::cloudfetch::{
     ChunkEntry, ChunkState, CloudFetchConfig, DEFAULT_CHUNK_READY_TIMEOUT_SECS,
 };
@@ -32,7 +33,7 @@ use arrow_schema::SchemaRef;
 use arrow_select::concat::concat_batches;
 use dashmap::DashMap;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
@@ -168,6 +169,8 @@ pub struct StreamingCloudFetchProvider {
     // `Arc<...>` so spawned download tasks can hold their own clone
     // without keeping the whole provider alive past stream end.
     refresh_coordinator: Arc<RefreshCoordinator>,
+
+    metrics: Arc<CloudFetchMetrics>,
 }
 
 /// Coordinates concurrent batched link-refresh attempts.
@@ -201,8 +204,65 @@ struct DownloadCtx {
     refresh_coordinator: Arc<RefreshCoordinator>,
     cancel_token: CancellationToken,
     statement_id: Option<Arc<str>>,
+    metrics: Arc<CloudFetchMetrics>,
     max_retries: u32,
     retry_delay: std::time::Duration,
+}
+
+#[derive(Debug)]
+struct CloudFetchMetrics {
+    total_chunks_present: Option<i32>,
+    total_chunks_iterated: AtomicI32,
+    initial_chunk_latency_ms: AtomicI64,
+    slowest_chunk_latency_ms: AtomicI64,
+    sum_chunks_download_time_ms: AtomicI64,
+}
+
+impl CloudFetchMetrics {
+    fn new(total_chunks_present: Option<i32>) -> Self {
+        Self {
+            total_chunks_present,
+            total_chunks_iterated: AtomicI32::new(0),
+            initial_chunk_latency_ms: AtomicI64::new(-1),
+            slowest_chunk_latency_ms: AtomicI64::new(0),
+            sum_chunks_download_time_ms: AtomicI64::new(0),
+        }
+    }
+
+    fn record_chunk_download(&self, elapsed: std::time::Duration) {
+        let millis = elapsed.as_millis().try_into().unwrap_or(i64::MAX);
+        let _ = self.initial_chunk_latency_ms.compare_exchange(
+            -1,
+            millis,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+        self.slowest_chunk_latency_ms
+            .fetch_max(millis, Ordering::AcqRel);
+        self.sum_chunks_download_time_ms
+            .fetch_add(millis, Ordering::AcqRel);
+    }
+
+    fn record_chunk_iterated(&self) {
+        self.total_chunks_iterated.fetch_add(1, Ordering::AcqRel);
+    }
+
+    fn snapshot(&self) -> ResultReaderMetrics {
+        let initial = self.initial_chunk_latency_ms.load(Ordering::Acquire);
+        let iterated = self.total_chunks_iterated.load(Ordering::Acquire);
+        ResultReaderMetrics {
+            total_chunks_present: self.total_chunks_present,
+            total_chunks_iterated: Some(iterated),
+            initial_chunk_latency: (initial >= 0)
+                .then(|| std::time::Duration::from_millis(initial as u64)),
+            slowest_chunk_latency: Some(std::time::Duration::from_millis(
+                self.slowest_chunk_latency_ms.load(Ordering::Acquire) as u64,
+            )),
+            sum_chunks_download_time: Some(std::time::Duration::from_millis(
+                self.sum_chunks_download_time_ms.load(Ordering::Acquire) as u64,
+            )),
+        }
+    }
 }
 
 impl std::fmt::Debug for StreamingCloudFetchProvider {
@@ -261,6 +321,7 @@ impl StreamingCloudFetchProvider {
         config: CloudFetchConfig,
         link_fetcher: Arc<dyn ChunkLinkFetcher>,
         chunk_downloader: Arc<ChunkDownloader>,
+        total_chunks_present: Option<i32>,
         runtime_handle: tokio::runtime::Handle,
     ) -> Arc<Self> {
         let statement_id = link_fetcher.statement_id().map(Arc::from);
@@ -281,6 +342,7 @@ impl StreamingCloudFetchProvider {
             runtime_handle,
             statement_id,
             refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            metrics: Arc::new(CloudFetchMetrics::new(total_chunks_present)),
         });
 
         // Start background initialization that fetches links and schedules downloads
@@ -379,6 +441,7 @@ impl StreamingCloudFetchProvider {
 
             // Move to next chunk
             let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
+            self.metrics.record_chunk_iterated();
 
             debug!(
                 "Released chunk {}: chunks_in_memory={}/{}, consumer advancing to {}",
@@ -564,6 +627,7 @@ impl StreamingCloudFetchProvider {
                 refresh_coordinator: Arc::clone(&self.refresh_coordinator),
                 cancel_token: self.cancel_token.clone(),
                 statement_id: self.statement_id.clone(),
+                metrics: Arc::clone(&self.metrics),
                 max_retries: self.config.max_retries,
                 retry_delay: self.config.retry_delay,
             };
@@ -765,8 +829,13 @@ impl StreamingCloudFetchProvider {
             };
 
             // Attempt download
+            let download_started = std::time::Instant::now();
             match ctx.downloader.download(&link).await {
-                Ok(batches) => return Ok(batches),
+                Ok(batches) => {
+                    ctx.metrics
+                        .record_chunk_download(download_started.elapsed());
+                    return Ok(batches);
+                }
                 Err(e) => {
                     // Every completed download failure consumes the hard attempt
                     // budget, even when its link became stale while in flight.
@@ -851,6 +920,14 @@ impl StreamingCloudFetchProvider {
                 }
             }
         }
+    }
+
+    pub(crate) fn metrics(&self) -> Option<ResultReaderMetrics> {
+        let snapshot = self.metrics.snapshot();
+        snapshot
+            .total_chunks_iterated
+            .is_some_and(|count| count > 0)
+            .then_some(snapshot)
     }
 
     /// Refresh presigned-URL links for `chunk_index` and every
@@ -1504,6 +1581,7 @@ mod tests {
             refresh_coordinator: Arc::new(RefreshCoordinator::default()),
             cancel_token: CancellationToken::new(),
             statement_id: None,
+            metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
             max_retries: MAX_DOWNLOAD_ATTEMPTS,
             retry_delay: std::time::Duration::ZERO,
         };
