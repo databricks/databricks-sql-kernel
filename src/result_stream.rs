@@ -46,8 +46,9 @@
 //! batch.
 
 use crate::kernel_error::{Error, Result};
-use crate::reader::ResultReader;
+use crate::reader::{ResultReader, ResultReaderMetrics};
 use crate::session::SessionInner;
+use crate::telemetry::{ChunkMetrics, StatementTelemetry};
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, DecimalType, Float32Type, Float64Type,
@@ -484,6 +485,57 @@ pub struct ResultStream {
     /// owning `ExecutedStatement` (or its `Drop`) issues the close, so
     /// a second guard here would double-fire.
     close_guard: Option<StatementCloseGuard>,
+
+    telemetry: Option<ResultStreamTelemetry>,
+}
+
+struct ResultStreamTelemetry {
+    telemetry: StatementTelemetry,
+    finalized: bool,
+    consumed_recorded: bool,
+}
+
+impl ResultStreamTelemetry {
+    fn new(telemetry: StatementTelemetry) -> Self {
+        Self {
+            telemetry,
+            finalized: false,
+            consumed_recorded: false,
+        }
+    }
+
+    fn record_batch(&self, batch: &ResultBatch) {
+        match batch {
+            ResultBatch::Arrow(batch) => self.telemetry.record_result_batch(batch.num_rows()),
+        }
+    }
+
+    fn finish(&mut self, metrics: Option<ResultReaderMetrics>, error: Option<&Error>) {
+        if self.finalized {
+            return;
+        }
+        if let Some(metrics) = metrics {
+            self.telemetry.record_chunk_metrics(ChunkMetrics {
+                total_chunks_present: metrics.total_chunks_present,
+                total_chunks_iterated: metrics.total_chunks_iterated,
+                initial_chunk_latency: metrics.initial_chunk_latency,
+                slowest_chunk_latency: metrics.slowest_chunk_latency,
+                sum_chunks_download_time: metrics.sum_chunks_download_time,
+            });
+        }
+        if !self.consumed_recorded {
+            self.telemetry.record_result_consumed();
+            self.consumed_recorded = true;
+        }
+        self.telemetry.finalize(error);
+        self.finalized = true;
+    }
+}
+
+impl Drop for ResultStreamTelemetry {
+    fn drop(&mut self) {
+        self.finish(None, None);
+    }
 }
 
 /// Fire-and-forget `CloseStatement`-on-Drop for a server statement that
@@ -539,6 +591,7 @@ impl ResultStream {
             current_row_idx: 0,
             exhausted: false,
             close_guard: None,
+            telemetry: None,
         })
     }
 
@@ -567,6 +620,10 @@ impl ResultStream {
             });
         }
         Ok(stream)
+    }
+
+    pub(crate) fn attach_telemetry(&mut self, telemetry: StatementTelemetry) {
+        self.telemetry = Some(ResultStreamTelemetry::new(telemetry));
     }
 
     /// Result schema. Available before any batches have been pulled.
@@ -602,22 +659,40 @@ impl ResultStream {
         if let Some(batch) = self.prefetched.take() {
             self.current = Some(batch);
             self.current_row_idx = 0;
+            if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
+                telemetry.record_batch(batch);
+            }
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
+            if let Some(telemetry) = &mut self.telemetry {
+                telemetry.finish(self.reader.metrics(), None);
+            }
             return Ok(None);
         }
-        match self.reader.next_batch().await? {
-            Some(rb) => {
+        match self.reader.next_batch().await {
+            Ok(Some(rb)) => {
                 self.current = Some(ResultBatch::Arrow(rb));
                 self.current_row_idx = 0;
+                if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
+                    telemetry.record_batch(batch);
+                }
                 Ok(self.current.as_ref())
             }
-            None => {
+            Ok(None) => {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), None);
+                }
                 Ok(None)
+            }
+            Err(e) => {
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), Some(&e));
+                }
+                Err(e)
             }
         }
     }
@@ -734,6 +809,7 @@ impl ResultStream {
         OwnedBatchIter {
             reader: self.reader,
             prefetched,
+            telemetry: self.telemetry,
             done: false,
         }
     }
@@ -751,6 +827,7 @@ pub struct OwnedBatchIter {
     /// [`ResultStream::peek_first_batch`]); yielded before the reader's
     /// own batches so it isn't lost.
     prefetched: Option<RecordBatch>,
+    telemetry: Option<ResultStreamTelemetry>,
     done: bool,
 }
 
@@ -762,6 +839,9 @@ impl Iterator for OwnedBatchIter {
             return None;
         }
         if let Some(batch) = self.prefetched.take() {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_batch(&ResultBatch::Arrow(batch.clone()));
+            }
             return Some(Ok(batch));
         }
         // Runtime-aware blocking poll: uses block_in_place + the
@@ -772,15 +852,34 @@ impl Iterator for OwnedBatchIter {
         // the nested-block_on panic from issue #19 on the sync
         // iterator path.
         match crate::util::runtime::block_on_current_runtime(self.reader.next_batch()) {
-            Ok(Some(batch)) => Some(Ok(batch)),
+            Ok(Some(batch)) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.record_batch(&ResultBatch::Arrow(batch.clone()));
+                }
+                Some(Ok(batch))
+            }
             Ok(None) => {
                 self.done = true;
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), None);
+                }
                 None
             }
             Err(e) => {
                 self.done = true;
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), Some(&e));
+                }
                 Some(Err(e))
             }
+        }
+    }
+}
+
+impl Drop for OwnedBatchIter {
+    fn drop(&mut self) {
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(self.reader.metrics(), None);
         }
     }
 }

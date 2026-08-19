@@ -1852,6 +1852,7 @@ mod is_open_tests {
     use super::*;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
+    use crate::ResultBatch;
     use arrow_array::{Int64Array, RecordBatch};
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
@@ -2258,7 +2259,9 @@ mod is_open_tests {
 
         let mut stmt = session.statement();
         stmt.spec().sql("SELECT 1 AS n");
-        let _exec = stmt.execute().await.expect("execute succeeds");
+        let mut exec = stmt.execute().await.expect("execute succeeds");
+        assert!(exec.next_batch().await.expect("first batch").is_some());
+        assert!(exec.next_batch().await.expect("stream exhausted").is_none());
         session.close().await.expect("close succeeds");
 
         let statement_log = exported_logs(&exporter)
@@ -2365,7 +2368,13 @@ mod is_open_tests {
         stmt.spec().sql("SELECT 1 AS n");
         let async_exec = stmt.submit().await.expect("submit succeeds");
         let _ = async_exec.status().await.expect("status succeeds");
-        let _stream = async_exec.await_result().await.expect("await succeeds");
+        let mut stream = async_exec.await_result().await.expect("await succeeds");
+        assert!(stream.next_batch().await.expect("first batch").is_some());
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("stream exhausted")
+            .is_none());
         let _again = async_exec.fetch_result().await.expect("fetch succeeds");
         session.close().await.expect("close succeeds");
 
@@ -2529,6 +2538,146 @@ mod is_open_tests {
         );
     }
 
+    #[tokio::test]
+    async fn result_stream_exhaustion_exports_result_latency() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-result").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_inline_body("stmt-telemetry-result", &int64_batch("n", vec![1, 2, 3])),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-result", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT n FROM values");
+        let mut exec = stmt.execute().await.expect("execute succeeds");
+        let first = exec
+            .next_batch()
+            .await
+            .expect("first batch")
+            .expect("batch");
+        let ResultBatch::Arrow(batch) = first;
+        assert_eq!(batch.num_rows(), 3);
+        assert!(exec.next_batch().await.expect("stream exhausted").is_none());
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .expect("statement event exported");
+        let result_latency =
+            &statement_log["entry"]["sql_driver_log"]["sql_operation"]["result_latency"];
+        assert!(
+            result_latency["result_set_ready_latency_millis"]
+                .as_i64()
+                .is_some(),
+            "first-batch latency should be recorded"
+        );
+        assert!(
+            result_latency["result_set_consumption_latency_millis"]
+                .as_i64()
+                .is_some(),
+            "consumption latency should be recorded on exhaustion"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_unexhausted_result_stream_finalizes_statement_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-drop").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_inline_body("stmt-telemetry-drop", &int64_batch("n", vec![1])),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-drop", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let exec = stmt.execute().await.expect("execute succeeds");
+        drop(exec);
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .expect("statement event exported after drop");
+        assert_eq!(
+            statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-drop"
+        );
+    }
+
+    #[tokio::test]
+    async fn cloudfetch_consumption_exports_chunk_details() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-cloudfetch").await;
+        mount_close_any_statement(&server).await;
+        let batch = int64_batch("n", vec![1, 2]);
+        let ipc = arrow_ipc_bytes(&batch);
+        let chunk_path = "/cloud-fetch/stmt-telemetry-cloudfetch/chunk-0.arrow";
+        Mock::given(method("GET"))
+            .and(path(chunk_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc.clone()))
+            .mount(&server)
+            .await;
+        mount_execute(
+            &server,
+            succeeded_cloudfetch_body(
+                "stmt-telemetry-cloudfetch",
+                &batch,
+                &format!("{}{}", server.uri(), chunk_path),
+                ipc.len(),
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-cloudfetch", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT n FROM cloudfetch");
+        let mut exec = stmt.execute().await.expect("execute succeeds");
+        assert!(exec.next_batch().await.expect("first batch").is_some());
+        assert!(exec.next_batch().await.expect("stream exhausted").is_none());
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .expect("statement event exported");
+        let sql_operation = &statement_log["entry"]["sql_driver_log"]["sql_operation"];
+        assert_eq!(sql_operation["execution_result"], "EXTERNAL_LINKS");
+        let chunk_details = &sql_operation["chunk_details"];
+        assert_eq!(chunk_details["total_chunks_present"], 1);
+        assert_eq!(chunk_details["total_chunks_iterated"], 1);
+        assert!(
+            chunk_details["initial_chunk_latency_millis"]
+                .as_i64()
+                .is_some(),
+            "initial chunk latency should be recorded"
+        );
+    }
+
     async fn telemetry_test_session(
         server: &MockServer,
         expected_session_id: &str,
@@ -2660,6 +2809,58 @@ mod is_open_tests {
                 "row_count": batch.num_rows() as i64,
                 "byte_count": ipc.len() as i64,
                 "attachment": attachment,
+            },
+        })
+        .to_string()
+    }
+
+    fn succeeded_cloudfetch_body(
+        statement_id: &str,
+        batch: &RecordBatch,
+        chunk_url: &str,
+        byte_count: usize,
+    ) -> String {
+        let columns: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "name": f.name(),
+                    "type_name": "BIGINT",
+                    "type_text": "BIGINT",
+                    "position": i as i32,
+                })
+            })
+            .collect();
+        let expiration = (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+
+        json!({
+            "statement_id": statement_id,
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": batch.num_columns() as i32,
+                    "columns": columns,
+                },
+                "total_chunk_count": 1,
+                "total_row_count": batch.num_rows() as i64,
+                "total_byte_count": byte_count as i64,
+                "truncated": false,
+                "result_compression": "",
+            },
+            "result": {
+                "external_links": [{
+                    "external_link": chunk_url,
+                    "expiration": expiration,
+                    "chunk_index": 0,
+                    "row_offset": 0,
+                    "row_count": batch.num_rows() as i64,
+                    "byte_count": byte_count as i64,
+                    "next_chunk_index": null,
+                }],
             },
         })
         .to_string()
