@@ -432,7 +432,7 @@ Defaults:
 ```rust
 enabled = false
 batch_size = 100
-flush_interval = 1 second
+flush_interval = 5 seconds
 max_retries = 3
 retry_delay = 100 milliseconds
 circuit_breaker_enabled = true
