@@ -42,6 +42,8 @@ pub enum RequestType {
     CancelStatement,
     CloseStatement,
     GetResultChunks,
+    // Telemetry
+    TelemetryExport,
     // CloudFetch
     CloudFetchDownload,
     // Auth
@@ -55,6 +57,7 @@ pub enum RequestCategory {
     Sea,
     CloudFetch,
     Auth,
+    Telemetry,
 }
 
 /// Whether a request is safe to retry after a failure where the server
@@ -77,6 +80,8 @@ impl RequestType {
             | Self::CancelStatement
             | Self::CloseStatement
             | Self::GetResultChunks => RequestCategory::Sea,
+
+            Self::TelemetryExport => RequestCategory::Telemetry,
 
             Self::CloudFetchDownload => RequestCategory::CloudFetch,
 
@@ -140,6 +145,7 @@ pub fn build_retry_configs(
         RequestCategory::Sea,
         RequestCategory::CloudFetch,
         RequestCategory::Auth,
+        RequestCategory::Telemetry,
     ];
 
     categories
@@ -448,6 +454,10 @@ mod tests {
             RequestCategory::Auth
         );
         assert_eq!(RequestType::AuthDiscovery.category(), RequestCategory::Auth);
+        assert_eq!(
+            RequestType::TelemetryExport.category(),
+            RequestCategory::Telemetry
+        );
     }
 
     #[test]
@@ -467,6 +477,7 @@ mod tests {
             RequestType::CancelStatement,
             RequestType::CloseStatement,
             RequestType::GetResultChunks,
+            RequestType::TelemetryExport,
             RequestType::CloudFetchDownload,
             RequestType::AuthTokenRequest,
             RequestType::AuthDiscovery,

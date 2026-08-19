@@ -1272,7 +1272,7 @@ pub struct LoggingConfig {
     pub file: Option<PathBuf>,
 }
 
-// ─── Telemetry (reserved) ───────────────────────────────────────────────────
+// ─── Telemetry ──────────────────────────────────────────────────────────────
 
 /// Telemetry collection and export settings.
 ///
@@ -1290,6 +1290,16 @@ pub struct TelemetryConfig {
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
 
+    /// Periodic background flush interval. Defaults to one second, matching
+    /// JDBC. A zero interval is invalid and disables telemetry.
+    pub flush_interval: Duration,
+
+    /// Maximum number of HTTP retries for telemetry export.
+    pub max_retries: u32,
+
+    /// Fixed retry delay between telemetry export attempts.
+    pub retry_delay: Duration,
+
     /// Maximum time an explicit session close should wait for the final
     /// telemetry flush. `Drop` never waits.
     pub close_flush_timeout: Duration,
@@ -1304,6 +1314,9 @@ impl std::fmt::Debug for TelemetryConfig {
         debug
             .field("enabled", &self.enabled)
             .field("batch_size", &self.batch_size)
+            .field("flush_interval", &self.flush_interval)
+            .field("max_retries", &self.max_retries)
+            .field("retry_delay", &self.retry_delay)
             .field("close_flush_timeout", &self.close_flush_timeout);
         #[cfg(test)]
         debug.field(
@@ -1318,7 +1331,10 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            batch_size: 200,
+            batch_size: 100,
+            flush_interval: Duration::from_secs(1),
+            max_retries: 3,
+            retry_delay: Duration::from_millis(100),
             close_flush_timeout: Duration::from_secs(5),
             #[cfg(test)]
             exporter: None,
