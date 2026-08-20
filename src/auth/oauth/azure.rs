@@ -52,22 +52,40 @@ const AZURE_APP_IDS_BY_SUFFIX: &[(&str, &str)] = &[
     ),
 ];
 
-/// The effective Azure Databricks resource app id for `host` (the resource in
-/// the M2M `.default` scope). Falls back to [`AZURE_DATABRICKS_APP_ID`] (prod)
-/// for commercial prod and sovereign hosts.
-pub(crate) fn effective_app_id(host: &str) -> &'static str {
-    // Reduce to the host authority (drop scheme and any path) before matching,
-    // so the suffix test can't be fooled by the pattern appearing mid-string.
+/// Azure sovereign-cloud workspace host suffixes. The M2M token exchange in
+/// [`sp_m2m_token_url`] only targets the commercial [`AZURE_AAD_LOGIN_HOST`], so
+/// these hosts cannot be served yet; [`reject_sovereign_host`] rejects them up
+/// front with a clear message instead of letting the exchange fail opaquely
+/// against the commercial directory. Wiring the matching sovereign login hosts
+/// is the documented follow-up.
+const AZURE_SOVEREIGN_HOST_SUFFIXES: &[&str] = &[
+    ".databricks.azure.us", // Azure Government (USGov)
+    ".databricks.azure.cn", // Azure China
+];
+
+/// Reduce a workspace URL/host to its lowercase host authority (scheme and any
+/// path/query/fragment dropped, trailing dot trimmed), so a suffix test can't
+/// be fooled by the pattern appearing in the scheme or path (e.g.
+/// `adb-1.dev.azuredatabricks.net.example.com`).
+fn host_authority(host: &str) -> String {
     let host = host.to_ascii_lowercase();
     let authority = host
         .split_once("://")
         .map(|(_, rest)| rest)
         .unwrap_or(&host);
-    let authority = authority
+    authority
         .split(['/', '?', '#'])
         .next()
         .unwrap_or(authority)
-        .trim_end_matches('.');
+        .trim_end_matches('.')
+        .to_string()
+}
+
+/// The effective Azure Databricks resource app id for `host` (the resource in
+/// the M2M `.default` scope). Falls back to [`AZURE_DATABRICKS_APP_ID`] (prod)
+/// for commercial prod and sovereign hosts.
+pub(crate) fn effective_app_id(host: &str) -> &'static str {
+    let authority = host_authority(host);
     for (suffix, app_id) in AZURE_APP_IDS_BY_SUFFIX {
         // Match the host suffix, not a substring: a host that merely embeds the
         // pattern (e.g. `adb-1.dev.azuredatabricks.net.example.com`) is not dev/staging.
@@ -76,6 +94,31 @@ pub(crate) fn effective_app_id(host: &str) -> &'static str {
         }
     }
     AZURE_DATABRICKS_APP_ID
+}
+
+/// Reject a known Azure sovereign-cloud workspace `host` on the `azure-sp-m2m`
+/// path. Because [`sp_m2m_token_url`] hardcodes the commercial
+/// [`AZURE_AAD_LOGIN_HOST`], a sovereign workspace — even with an explicit
+/// `azure_tenant_id` — would exchange credentials against the *commercial*
+/// Entra directory and fail with an opaque Entra error. This mirrors the
+/// sovereign rejection [`tenant_from_login_url`] already performs on the
+/// discovery redirect, so both the explicit-tenant and discovery halves fail
+/// the same clear way until sovereign login hosts are wired (the documented
+/// follow-up).
+pub(crate) fn reject_sovereign_host(host: &str) -> crate::kernel_error::Result<()> {
+    use crate::kernel_error::Error;
+    let authority = host_authority(host);
+    for suffix in AZURE_SOVEREIGN_HOST_SUFFIXES {
+        if authority.ends_with(suffix) {
+            return Err(Error::invalid_argument().message(format!(
+                "azure-sp-m2m: sovereign cloud workspace {host:?} is not yet \
+                 supported (the token exchange only targets the commercial \
+                 Microsoft login host, so an explicit azure_tenant_id would hit \
+                 the wrong directory) — this is a documented follow-up"
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// The Entra **token** endpoint for the M2M client-credentials grant:
@@ -368,6 +411,27 @@ mod tests {
         )
         .unwrap();
         assert!(tenant_from_login_url(&url).is_err());
+    }
+
+    #[test]
+    fn reject_sovereign_host_matches_known_sovereign_suffixes() {
+        // USGov and China workspace hosts are rejected: sp_m2m_token_url only
+        // targets the commercial login host, so an explicit azure_tenant_id
+        // would otherwise hit the wrong directory and fail opaquely.
+        assert!(reject_sovereign_host("https://adb-1.11.databricks.azure.us").is_err());
+        assert!(reject_sovereign_host("https://adb-1.11.databricks.azure.cn").is_err());
+    }
+
+    #[test]
+    fn reject_sovereign_host_allows_commercial_and_dev_staging() {
+        // Commercial prod, dev, and staging are all served by the commercial
+        // login host, so they pass the guard.
+        assert!(reject_sovereign_host("https://adb-1.4.azuredatabricks.net").is_ok());
+        assert!(reject_sovereign_host("https://adb-1.dev.azuredatabricks.net").is_ok());
+        assert!(reject_sovereign_host("https://adb-1.staging.azuredatabricks.net").is_ok());
+        // A host that merely embeds a sovereign suffix mid-string is not
+        // sovereign — suffix match on the authority, not a substring.
+        assert!(reject_sovereign_host("https://adb-1.databricks.azure.us.example.com").is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]
