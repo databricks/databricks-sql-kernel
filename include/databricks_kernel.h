@@ -276,7 +276,14 @@ kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* con
  * endpoint — e.g. the Azure/Entra token endpoint
  * `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` for an Azure
  * service principal. Unset → OIDC discovery against the workspace host.
- * No effect on PAT auth. */
+ * No effect on PAT auth.
+ *
+ * For U2M the override MUST end in `/token`: the kernel derives the
+ * authorization endpoint by swapping the trailing `/token` for `/authorize`,
+ * and rejects any other value with `InvalidArgument` at session open (a
+ * trailing slash or an IdP whose token path is not `/token` will fail). The
+ * Azure example above satisfies this. M2M / M2M-JWT have no such suffix
+ * requirement. */
 KernelStatusCode
 kernel_session_config_set_oauth_token_endpoint(KernelSessionConfig* config,
                                                const char* token_endpoint);
