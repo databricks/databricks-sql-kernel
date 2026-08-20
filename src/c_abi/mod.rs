@@ -57,10 +57,11 @@ use std::sync::OnceLock;
 ///
 /// Rust-crate consumers (PyO3 / napi-rs) own their own runtime and call
 /// the async surface directly; the C ABI has no caller-owned runtime to
-/// borrow, so it owns one here and `block_on`s every entry point through
-/// it. Initialised lazily on the first `kernel_session_open` and shared
-/// by every session for the life of the process (matches the
-/// migration-plan §5.2 contract).
+/// borrow, so it owns one here and drives every entry point through it
+/// (see [`block_on_ffi`], which spawns onto this runtime rather than
+/// blocking the caller thread on it). Initialised lazily on the first
+/// `kernel_session_open` and shared by every session for the life of the
+/// process (matches the migration-plan §5.2 contract).
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Fetch (initialising on first use) the process-wide C-ABI runtime.
@@ -100,32 +101,56 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
 /// typed [`Error`] in the thread-local last-error buffer on failure.
 ///
 /// Every `extern "C"` entry point that drives async work funnels through
-/// here so the runtime-fetch, `block_on`, error-store, and status-map
-/// steps stay in exactly one place. A panic inside the future is caught
-/// at the `block_on` edge and surfaced as `Internal` rather than
-/// unwinding across the FFI boundary (which is UB).
+/// here so the runtime-fetch, spawn, error-store, and status-map steps
+/// stay in exactly one place. A panic inside the future is caught and
+/// surfaced as `Internal` rather than unwinding across the FFI boundary
+/// (which is UB).
+///
+/// **How the work is driven (and why it isn't `block_on`):** the future is
+/// `spawn`ed onto the runtime's own worker threads and this thread blocks on
+/// a plain `std` channel for the result. It deliberately does NOT call
+/// `Runtime::block_on` on the caller thread. `block_on` *enters* the runtime
+/// on the calling thread, registering tokio's runtime-context thread-local
+/// there; if that thread is a native OS thread the kernel does not own (the
+/// intended ODBC / Go usage — e.g. the ODBC driver's result-prefetch thread)
+/// and is later torn down on Windows/MSVC, that context guard plus the
+/// `LAST_ERROR` `CString` thread-local are dropped during TLS teardown in an
+/// order that trips tokio's "EnterGuard dropped out of order" panic or the
+/// "System allocator may not use TLS with destructors" abort
+/// (databricks/databricks-sql-kernel#276). Spawning-and-blocking keeps the
+/// caller thread entirely outside the runtime, so no runtime-context TLS is
+/// registered on it and there is nothing to tear down.
+///
+/// Because the future is moved onto worker threads it must be `Send` (and its
+/// output `Send`); every kernel entry point's future already is.
 ///
 /// **Threading contract:** the C ABI must be driven from threads that are
-/// NOT already running inside a Tokio runtime. `Runtime::block_on` panics
-/// ("Cannot start a runtime from within a runtime") if called from a
-/// worker of any runtime — including this one — so a reentrant C-ABI call
-/// (e.g. a consumer that invokes a `kernel_*` entry point from a callback
-/// executing on a runtime worker) is rejected up front with a clear
-/// `Internal` error instead of the opaque caught-panic path. Native
-/// (non-runtime) caller threads — the intended ODBC / Go usage — are
-/// unaffected.
+/// NOT already running inside a Tokio runtime. A reentrant C-ABI call (a
+/// consumer that invokes a `kernel_*` entry point from a callback executing
+/// on a runtime worker) would block that worker on the result channel and can
+/// deadlock a single-threaded runtime, so it is rejected up front with a
+/// clear `Internal` error. Native (non-runtime) caller threads — the intended
+/// ODBC / Go usage — are unaffected.
 ///
 /// [`KernelStatusCode`]: crate::c_abi::KernelStatusCode
 /// [`Error`]: crate::kernel_error::Error
 pub(crate) fn block_on_ffi<F, Fut, T>(fut_builder: F) -> Result<T, KernelStatusCode>
 where
     F: FnOnce() -> Fut,
-    Fut: std::future::Future<Output = crate::kernel_error::Result<T>>,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<T>> + Send,
+    T: Send,
 {
+    use futures::future::FutureExt as _;
+
     error::clear_error();
-    // Reject reentrancy explicitly: calling `block_on` from within any
-    // Tokio runtime would panic. Surface a typed, actionable error rather
-    // than a caught panic mapped to a generic `Internal`.
+    // Reject reentrancy explicitly: a consumer that invokes a `kernel_*`
+    // entry point from a thread already running inside a Tokio runtime would
+    // otherwise have this thread block (on the channel below) waiting for a
+    // task that shares its runtime — a deadlock risk on a single-threaded
+    // runtime. Surface a typed, actionable error instead. `Handle::try_current`
+    // only reads (initialising it empty) the caller thread's Tokio context; it
+    // never *enters* the runtime, so it leaves no runtime-context state that
+    // could outlive into the thread's TLS teardown (the #276 hazard).
     if tokio::runtime::Handle::try_current().is_ok() {
         let e = crate::kernel_error::Error::new(
             crate::kernel_error::ErrorCode::Internal,
@@ -144,17 +169,72 @@ where
             return Err(code);
         }
     };
-    // Catch panics so a kernel bug can't unwind across `extern "C"`.
-    let result =
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| rt.block_on(fut_builder())));
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(e)) => {
+
+    // Drive the future on the runtime's OWN worker threads and block this
+    // (foreign) caller thread on a plain `std` channel — instead of calling
+    // `rt.block_on` here. This is the fix for #276: `Runtime::block_on`
+    // *enters* the runtime on the calling thread, registering tokio's
+    // runtime-context thread-local on it. When that thread is a native OS
+    // thread the kernel does not own (e.g. the ODBC driver's prefetch
+    // thread) and is later torn down on Windows/MSVC, tokio's context guard
+    // and the `LAST_ERROR` `CString` thread-local are dropped during TLS
+    // teardown in an order that trips tokio's "EnterGuard dropped out of
+    // order" panic or the "System allocator may not use TLS with destructors"
+    // abort. Spawning the work onto the runtime and blocking on a channel
+    // means the caller thread NEVER enters the runtime, so no runtime-context
+    // TLS is ever registered on it.
+    //
+    // A panic inside the future is caught here (rather than at a `block_on`
+    // edge) so it can't unwind across the `extern "C"` boundary (UB) and is
+    // surfaced as `Internal`.
+    type PanicPayload = Box<dyn std::any::Any + Send>;
+    let (tx, rx) =
+        std::sync::mpsc::sync_channel::<Result<crate::kernel_error::Result<T>, PanicPayload>>(1);
+    let future = fut_builder();
+    let task = async move {
+        let outcome = std::panic::AssertUnwindSafe(future).catch_unwind().await;
+        // `future` (and any borrows it held) is fully dropped by the time
+        // `.catch_unwind().await` resolves, i.e. before we signal completion.
+        let _ = tx.send(outcome);
+    };
+    // SAFETY: `future` may borrow data owned by the caller (e.g. a
+    // `&mut Statement` reached through a raw pointer at the entry points).
+    // We extend the task's lifetime to `'static` only so it can be spawned,
+    // and then BLOCK on `rx.recv()` below until the task has produced its
+    // outcome — at which point the future, and every borrow it held, has
+    // already been dropped. The borrows therefore never outlive their owner,
+    // and the extended lifetime is not observable past this call. (Even if
+    // the runtime were torn down and dropped the task without running it, the
+    // drop releases the borrows before `rx.recv()` observes the closed
+    // channel.) The process-wide runtime is a `'static` that never shuts down.
+    let task: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>> = unsafe {
+        std::mem::transmute::<
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + '_>>,
+            std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'static>>,
+        >(Box::pin(task))
+    };
+    rt.spawn(task);
+
+    match rx.recv() {
+        Ok(Ok(Ok(value))) => Ok(value),
+        Ok(Ok(Err(e))) => {
             let code = KernelStatusCode::from(e.code);
             error::store_error(e);
             Err(code)
         }
-        Err(panic) => Err(handle_panic(panic)),
+        Ok(Err(panic)) => Err(handle_panic(panic)),
+        Err(_) => {
+            // The channel closed without a value — only reachable if the
+            // runtime dropped the task before it ran (never happens for the
+            // process-wide runtime). The future is dropped by then, so this is
+            // sound; report it as `Internal`.
+            let e = crate::kernel_error::Error::internal()
+                .message("kernel C ABI runtime task was dropped before completion")
+                .location(concat!(file!(), ":", line!()));
+            let code = KernelStatusCode::from(e.code);
+            error::store_error(e);
+            Err(code)
+        }
     }
 }
 
@@ -301,5 +381,36 @@ mod tests {
                 "reentrancy error should explain the threading contract, got: {msg}",
             );
         });
+    }
+
+    /// `block_on_ffi` must drive the future on a runtime **worker** thread, not
+    /// on the calling thread — the core of the #276 fix. `Runtime::block_on`
+    /// (the pre-fix behaviour) drives the future on the *caller* thread, which
+    /// registers tokio's runtime-context thread-local there; when the caller is
+    /// a native OS thread the kernel does not own (the ODBC driver's prefetch
+    /// thread) and is later torn down on Windows/MSVC, that TLS teardown
+    /// corrupts the tokio context ("EnterGuard dropped out of order" panic /
+    /// "System allocator may not use TLS with destructors" abort). Asserting
+    /// the future ran on a *different* thread than the caller guards that the
+    /// work is spawned onto the runtime, not `block_on`'d on the caller — so no
+    /// runtime-context TLS is ever registered on a foreign caller thread.
+    ///
+    /// This is the portable regression guard for the fix; the end-to-end crash
+    /// only manifests through the ODBC driver's driver-manager e2e suite
+    /// (databricks-odbc#283), which skips the affected tests until the kernel
+    /// pin carrying this fix is bumped.
+    #[test]
+    fn block_on_ffi_runs_future_off_the_caller_thread() {
+        let caller = std::thread::current().id();
+        let ran_on: std::thread::ThreadId = block_on_ffi(|| async move {
+            Ok::<_, crate::kernel_error::Error>(std::thread::current().id())
+        })
+        .expect("trivial future completes successfully");
+        assert_ne!(
+            ran_on, caller,
+            "block_on_ffi must spawn the future onto a runtime worker (never `block_on` it \
+             on the caller thread), so no runtime-context TLS is registered on a foreign \
+             caller thread — see #276",
+        );
     }
 }
