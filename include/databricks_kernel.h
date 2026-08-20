@@ -449,6 +449,18 @@ KernelStatusCode kernel_session_close(kernel_session_t* session);
  * "not known-dead", not a positive liveness guarantee. No ownership. */
 KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* out);
 
+/* Actively validate the session against the server by round-tripping a
+ * lightweight `SELECT 1` test query (result discarded). This is the
+ * I/O-performing complement of kernel_session_is_open: it reaches the
+ * server, so it DOES detect a server idle-timeout, a killed warehouse, or
+ * a dropped link. Returns Success when the round-trip completes (session
+ * alive); on failure returns the mapped status (a transport/availability
+ * failure surfaces as Unavailable / NetworkError / Timeout — treat as
+ * "connection dead" when backing SQL_ATTR_CONNECTION_DEAD; the full error
+ * is in kernel_get_last_error). Runs SQL, so it MUST be called from a
+ * native (non-async-runtime) thread. No ownership. */
+KernelStatusCode kernel_session_test(const kernel_session_t* session);
+
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
                                               kernel_statement_t** out);
