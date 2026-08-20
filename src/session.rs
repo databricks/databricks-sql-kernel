@@ -1291,9 +1291,10 @@ async fn build_base_auth_provider(
             // ({login}/{tenant}/oauth2/v2.0/token) and the {app_id}/.default
             // scope, discovering the tenant from the workspace's /aad/auth
             // redirect when the caller omits it (Thrift parity). The provider
-            // always also emits the Azure SP management token; when a workspace
-            // resource id is supplied it adds the resource-id header too, so an
-            // RBAC-only SP (Azure role, not a workspace member) can authenticate.
+            // emits the Azure SP management token + resource-id header pair only
+            // when a workspace resource id is supplied (JDBC parity), so an
+            // RBAC-only SP (Azure role, not a workspace member) can authenticate
+            // while the common workspace-member SP is unaffected.
             use crate::auth::oauth::azure::{self, AzureServicePrincipalProvider};
             if azure_client_id.is_empty() || azure_client_secret.is_empty() {
                 return Err(Error::invalid_argument().message(

@@ -145,22 +145,31 @@ const SP_MANAGEMENT_TOKEN_HEADER: &str = "X-Databricks-Azure-SP-Management-Token
 /// token for the RBAC lookup).
 const WORKSPACE_RESOURCE_ID_HEADER: &str = "X-Databricks-Azure-Workspace-Resource-Id";
 
-/// Azure service-principal M2M provider (complete parity with the Thrift
-/// connector's `AzureServicePrincipalCredentialProvider`).
+/// Azure service-principal M2M provider (parity with the JDBC/Thrift
+/// connector's `AzureMSICredentialProvider` / SP credential provider).
 ///
-/// The `Authorization` bearer is the Databricks-audience **data** token. It
-/// **always** additionally emits the `X-Databricks-Azure-SP-Management-Token`
-/// header (a second Entra token, ARM `.default` scope) — exactly as the Thrift
-/// connector does — so the control plane can authorize a service principal that
-/// holds an Azure RBAC role but is not a workspace member. The
-/// `X-Databricks-Azure-Workspace-Resource-Id` header is added only when a
-/// workspace resource id is configured. Both tokens are ordinary
-/// client-credentials exchanges (reusing [`ClientCredentialsProvider`], which
-/// refreshes them), so the management token stays fresh on long-lived sessions.
+/// The `Authorization` bearer is the Databricks-audience **data** token, which
+/// alone authenticates the common workspace-member SP. The Azure Resource
+/// Manager **management token** add-on — the header pair
+/// `X-Databricks-Azure-SP-Management-Token` and
+/// `X-Databricks-Azure-Workspace-Resource-Id`, which lets the control plane
+/// authorize an SP that holds an Azure RBAC role but is not a workspace
+/// member — is emitted **only when a workspace resource id is configured**,
+/// matching the JDBC connector (`if (resourceId != null) { … }`).
+/// Gating it this way keeps the ARM `.default` exchange (and its consent
+/// requirement) off the request hot path for the common case: an app
+/// registration without ARM access would otherwise fail *every* authenticated
+/// request on that second exchange, even though the data token alone would
+/// authenticate it. When configured, the management token is an ordinary
+/// client-credentials exchange (reusing [`ClientCredentialsProvider`], which
+/// refreshes it), so it stays fresh on long-lived sessions.
 #[derive(Debug)]
 pub(crate) struct AzureServicePrincipalProvider {
     data: super::m2m::ClientCredentialsProvider,
-    management: super::m2m::ClientCredentialsProvider,
+    /// `Some` only when `azure_workspace_resource_id` was supplied — the
+    /// management token and its paired resource-id header are emitted together
+    /// or not at all (JDBC parity).
+    management: Option<super::m2m::ClientCredentialsProvider>,
     /// `Some` only when `azure_workspace_resource_id` was supplied.
     workspace_resource_id: Option<String>,
 }
@@ -211,15 +220,26 @@ impl AzureServicePrincipalProvider {
             Some(token_url.clone()),
         )
         .await?;
-        let management = super::m2m::ClientCredentialsProvider::new_with_full_config(
-            host,
-            azure_client_id,
-            azure_client_secret,
-            http_client,
-            vec![AZURE_MANAGEMENT_SCOPE.to_string()],
-            Some(token_url),
-        )
-        .await?;
+        // Build the management-token source ONLY when a workspace resource id
+        // is configured (JDBC parity: `if (resourceId != null)`). Without one,
+        // the ARM `management.core.windows.net/.default` exchange — which an app
+        // registration lacking ARM access cannot complete — would run on every
+        // authenticated request via `extra_headers()` and break the common
+        // workspace-member SP case that the data token alone authenticates.
+        let management = match &workspace_resource_id {
+            Some(_) => Some(
+                super::m2m::ClientCredentialsProvider::new_with_full_config(
+                    host,
+                    azure_client_id,
+                    azure_client_secret,
+                    http_client,
+                    vec![AZURE_MANAGEMENT_SCOPE.to_string()],
+                    Some(token_url),
+                )
+                .await?,
+            ),
+            None => None,
+        };
         Ok(Self {
             data,
             management,
@@ -234,19 +254,25 @@ impl crate::auth::AuthProvider for AzureServicePrincipalProvider {
     }
 
     fn extra_headers(&self) -> crate::kernel_error::Result<Vec<(String, String)>> {
+        // The management token + resource-id header pair is emitted only when a
+        // workspace resource id was configured (JDBC parity: `if (resourceId !=
+        // null)`). In the common workspace-member case both are absent and the
+        // data token in the `Authorization` bearer authenticates alone — so the
+        // ARM `.default` exchange never runs on the request hot path.
+        let (Some(management), Some(rid)) = (&self.management, &self.workspace_resource_id) else {
+            return Ok(Vec::new());
+        };
         // The management header carries the RAW access token (no `Bearer `
-        // prefix), matching the connector's `cloud_token.access_token`. Always
-        // sent, exactly as the Thrift connector does.
-        let bearer = self.management.get_auth_header()?;
+        // prefix), matching the connector's `cloud_token.access_token`.
+        let bearer = management.get_auth_header()?;
         let token = bearer
             .strip_prefix("Bearer ")
             .unwrap_or(&bearer)
             .to_string();
-        let mut headers = vec![(SP_MANAGEMENT_TOKEN_HEADER.to_string(), token)];
-        if let Some(rid) = &self.workspace_resource_id {
-            headers.push((WORKSPACE_RESOURCE_ID_HEADER.to_string(), rid.clone()));
-        }
-        Ok(headers)
+        Ok(vec![
+            (SP_MANAGEMENT_TOKEN_HEADER.to_string(), token),
+            (WORKSPACE_RESOURCE_ID_HEADER.to_string(), rid.clone()),
+        ])
     }
 }
 
@@ -498,9 +524,11 @@ mod tests {
     // The Entra token endpoint, the `{app}/.default` scope, and the
     // client-credentials exchange are unit-tested elsewhere. These cover the
     // composition unique to this provider: `Authorization` is always the data
-    // token; `X-Databricks-Azure-SP-Management-Token` is ALWAYS emitted (Thrift
-    // parity); `X-Databricks-Azure-Workspace-Resource-Id` only when configured.
-    // `new_with_token_url` points both token sources at a mock server.
+    // token; the `X-Databricks-Azure-SP-Management-Token` +
+    // `X-Databricks-Azure-Workspace-Resource-Id` pair is emitted ONLY when a
+    // workspace resource id is configured (JDBC parity), and neither header is
+    // present otherwise. `new_with_token_url` points both token sources at a
+    // mock server.
     use crate::auth::AuthProvider as _;
     use wiremock::matchers::body_string_contains;
 
@@ -530,7 +558,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn sp_m2m_always_emits_management_token_and_resource_id_when_set() {
+    async fn sp_m2m_emits_management_token_and_resource_id_when_set() {
         use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
         use std::sync::Arc;
         let mock_server = wiremock::MockServer::start().await;
@@ -563,7 +591,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn sp_m2m_emits_management_token_without_resource_id_when_unset() {
+    async fn sp_m2m_omits_management_token_when_resource_id_unset() {
         use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
         use std::sync::Arc;
         let mock_server = wiremock::MockServer::start().await;
@@ -583,12 +611,12 @@ mod tests {
         .await
         .expect("provider builds");
 
+        // The data token alone authenticates the common workspace-member SP.
         assert_eq!(provider.get_auth_header().unwrap(), "Bearer data-token");
+        // Without a workspace resource id, neither the management token nor the
+        // resource-id header is emitted (JDBC parity) — so the ARM `.default`
+        // exchange never runs on the request hot path.
         let extra = provider.extra_headers().unwrap();
-        // Management token still present (always), but no resource-id header.
-        assert!(extra
-            .iter()
-            .any(|(k, v)| k == SP_MANAGEMENT_TOKEN_HEADER && v == "mgmt-token"));
-        assert!(!extra.iter().any(|(k, _)| k == WORKSPACE_RESOURCE_ID_HEADER));
+        assert!(extra.is_empty());
     }
 }

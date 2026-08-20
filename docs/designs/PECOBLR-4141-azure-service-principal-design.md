@@ -16,6 +16,15 @@
 
 # Azure Entra ID OAuth — kernel as the Azure-aware auth core (PECOBLR-4141 / 4120)
 
+> **Scope of this PR (shipped vs. planned).** This PR ships **only** the M2M
+> path — `AuthConfig::AzureServicePrincipal` (`azure-sp-m2m`), its provider in
+> `src/auth/oauth/azure.rs`, and the pyo3 `auth_type="azure-sp-m2m"` selector.
+> Everything describing the **U2M** path — the `azure-oauth` selector, the
+> `AuthConfig::AzureOAuthU2M` variant, the authorize-endpoint override, and the
+> napi/C-ABI U2M setters — is **PLANNED (PECOBLR-4120), not in this PR**. Those
+> sections are marked inline below; treat this document as the design target for
+> the full Azure surface, not a description of the delivered code.
+
 ## Direction
 
 **The kernel is the auth core; bindings are thin.** The kernel owns Azure
@@ -79,7 +88,10 @@ Consequences the kernel API must satisfy:
    port `8030`; scope app-id `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d` (overridable
    via `DATABRICKS_AZURE_TENANT_ID`, matching the connector).
 
-## `azure-oauth` (U2M) — PECOBLR-4120
+## `azure-oauth` (U2M) — PECOBLR-4120 — **PLANNED, not in this PR**
+
+> Not implemented in this PR. `src/auth/oauth/azure.rs` currently has no U2M
+> flow; the design below is the target for the follow-up (PECOBLR-4120).
 
 Browser authorization-code + PKCE, driven by the kernel's existing U2M provider
 with Azure endpoints/values:
@@ -105,18 +117,18 @@ redirect available):
 - **Scope**: `{effective_app_id}/.default` (app id from the host's cloud).
 - **Credentials**: `azure_client_id` / `azure_client_secret` via HTTP Basic
   (Entra v2.0 advertises `client_secret_basic`; verified).
-- **Management token / `azure_workspace_resource_id`: planned (optional
-  add-on), not yet implemented.** When supplied, the kernel would
-  additionally fetch an Azure-management token (scope
-  `https://management.core.windows.net/.default`) and emit the
-  `X-Databricks-Azure-SP-Management-Token` +
-  `X-Databricks-Azure-Workspace-Resource-Id` header pair, so the control
-  plane can authorize an SP that holds an Azure RBAC role but is not a
-  workspace member. It would be optional and default to `None` (data token
-  only — the common workspace-member case). This slice is not in the current
-  cut: the `AzureServicePrincipal` variant has no `azure_workspace_resource_id`
-  field yet, and no management-token support exists in
-  `src/auth/oauth/azure.rs`.
+- **Management token / `azure_workspace_resource_id`: optional add-on, gated on
+  the resource id (JDBC parity: `if (resourceId != null)`).** When
+  `azure_workspace_resource_id` is supplied, the kernel additionally fetches an
+  Azure-management token (scope `https://management.core.windows.net/.default`)
+  and emits the `X-Databricks-Azure-SP-Management-Token` +
+  `X-Databricks-Azure-Workspace-Resource-Id` header pair, so the control plane
+  can authorize an SP that holds an Azure RBAC role but is not a workspace
+  member. It defaults to `None` (data token only — the common workspace-member
+  case); gating avoids forcing the ARM `.default` exchange, which an app
+  registration without ARM access cannot complete, onto every SP's request hot
+  path. Implemented in `src/auth/oauth/azure.rs`
+  (`AzureServicePrincipalProvider`).
 
 ## Federation
 
@@ -127,9 +139,11 @@ fallback.
 
 ## AuthConfig
 
-Two new variants (bindings map onto them):
+Target surface — two variants. **`AzureServicePrincipal` ships in this PR;
+`AzureOAuthU2M` is PLANNED (PECOBLR-4120) and not yet added to `config.rs`.**
 
 ```rust
+// PLANNED (PECOBLR-4120) — not in this PR
 AuthConfig::AzureOAuthU2M {
     client_id: Option<String>,        // None → 96eecda7-…
     redirect_ports: Option<Vec<u16>>, // None → [8030]
@@ -141,7 +155,7 @@ AuthConfig::AzureServicePrincipal {   // azure-sp-m2m
     azure_client_id: String,
     azure_client_secret: String,
     azure_tenant_id: Option<String>,  // None → auto-discover via /aad/auth
-    // azure_workspace_resource_id: planned (management-token headers) — not in the current cut
+    azure_workspace_resource_id: Option<String>, // Some → emit management-token headers (JDBC-gated)
     identity_federation_client_id: Option<String>,
 }
 ```
@@ -151,10 +165,13 @@ flows, incl. Go's Databricks-SP M2M and the workspace-OIDC databricks-oauth).
 
 ## Thin bindings
 
-- **pyo3**: `auth_type="azure-oauth"` → `AzureOAuthU2M`; `auth_type="azure-sp-m2m"`
-  + `azure_*` kwargs → `AzureServicePrincipal`. No endpoint/scope/tenant logic.
-- **napi**: `AuthMode::AzureOAuth` / `AzureSpM2m` + `azure*` fields.
-- **C ABI**: `set_auth_azure_oauth` / `set_auth_azure_sp_m2m` setters.
+- **pyo3**: `auth_type="azure-sp-m2m"` + `azure_*` kwargs → `AzureServicePrincipal`
+  (shipped). `auth_type="azure-oauth"` → `AzureOAuthU2M` is **PLANNED
+  (PECOBLR-4120)**. No endpoint/scope/tenant logic in the binding.
+- **napi**: `AzureSpM2m` + `azure*` fields (planned surface); `AzureOAuth`
+  U2M is **PLANNED (PECOBLR-4120)**.
+- **C ABI**: `set_auth_azure_sp_m2m` setter (planned surface);
+  `set_auth_azure_oauth` is **PLANNED (PECOBLR-4120)**.
 - **Connector #919**: `auth_bridge.py` simplifies to selector-mapping only —
   forwards `auth_type` + azure creds, stops constructing URLs / scopes and stops
   discovering the tenant (the kernel does it). Drops the kernel-path dependency

@@ -17,13 +17,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
   and the `{effective_app_id}/.default` scope, and auto-discovers the tenant from
   the workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted (Thrift
   parity) — so bindings forward only the SP credentials. The `Authorization`
-  bearer is the Databricks-audience data token; the kernel **always** also sends
-  the Azure SP management token (`X-Databricks-Azure-SP-Management-Token`, a
-  second Entra token on the ARM `.default` scope), matching the Thrift
-  connector, so a service principal that holds an Azure RBAC role but is not a
-  workspace member can authenticate. When `azure_workspace_resource_id` is set,
-  the `X-Databricks-Azure-Workspace-Resource-Id` header is added too. A new
-  `AuthProvider::extra_headers()` carries the pair. Covered by an `#[ignore]`d
+  bearer is the Databricks-audience data token, which alone authenticates the
+  common workspace-member SP. When `azure_workspace_resource_id` is set, the
+  kernel additionally sends the Azure SP management token
+  (`X-Databricks-Azure-SP-Management-Token`, a second Entra token on the ARM
+  `.default` scope) paired with the `X-Databricks-Azure-Workspace-Resource-Id`
+  header, matching the JDBC connector (`if (resourceId != null)`), so a service
+  principal that holds an Azure RBAC role but is not a workspace member can
+  authenticate. When it is unset (the default) neither header is sent and no ARM
+  management-scope token is fetched. A new `AuthProvider::extra_headers()`
+  carries the pair. Covered by an `#[ignore]`d
   end-to-end test (`azure_sp_m2m_select_one_round_trip`) that exercises the flow
   against a live Azure workspace when Azure SP credentials are configured.
   (PECOBLR-4141.)

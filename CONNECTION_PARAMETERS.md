@@ -84,7 +84,8 @@ bindings just select the flow.
   the Thrift connector), so bindings forward only the credentials. Fields:
   `azure_client_id` / `azure_client_secret` (Entra app credentials, required),
   `azure_tenant_id` (optional — auto-discovered when omitted),
-  `identity_federation_client_id` (optional WIF). Construct via the
+  `azure_workspace_resource_id` (optional — enables the management-token add-on,
+  see below), `identity_federation_client_id` (optional WIF). Construct via the
   `AuthConfig::azure_service_principal(...)` validating constructor. See
   `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
 
@@ -93,10 +94,13 @@ bindings just select the flow.
   `azure-sp-m2m` is the preferred, zero-config-tenant flow.
 
 The `azure-sp-m2m` flow authenticates a workspace-member SP with the Databricks
-data token alone. (An Azure **management-token** add-on — sending
+data token alone. The Azure **management-token** add-on — sending
 `X-Databricks-Azure-SP-Management-Token` + `X-Databricks-Azure-Workspace-Resource-Id`
 so the control plane can authorize an SP that holds an Azure RBAC role but is not
-a workspace member — is not implemented in v0.)
+a workspace member — is emitted **only when `azure_workspace_resource_id` is set**,
+matching the JDBC connector (`if (resourceId != null)`). When it is unset (the
+default) neither header is sent and no ARM management-scope token is fetched, so
+the common workspace-member SP is unaffected.
 
 The bindings expose the generic OAuth overrides as: pyo3 `token_url` /
 `oauth_scopes` / `client_id`; napi `oauthTokenUrl` / `oauthScopes` /

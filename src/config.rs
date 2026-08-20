@@ -366,11 +366,14 @@ pub enum AuthConfig {
     /// credentials and the `{app_id}/.default` scope. The kernel resolves the
     /// endpoint, scope, and (when `azure_tenant_id` is omitted) the tenant
     /// itself — so bindings forward only the credentials. The `Authorization`
-    /// bearer is the Databricks-audience data token; the kernel additionally
-    /// always sends the Azure SP management token
-    /// (`X-Databricks-Azure-SP-Management-Token`), matching the Thrift
-    /// connector, so a service principal with an Azure RBAC role but no
-    /// workspace membership can authenticate.
+    /// bearer is the Databricks-audience data token, which authenticates the
+    /// common workspace-member SP on its own. The Azure Resource Manager
+    /// management-token add-on (`X-Databricks-Azure-SP-Management-Token` +
+    /// `X-Databricks-Azure-Workspace-Resource-Id`) is emitted only when
+    /// `azure_workspace_resource_id` is set — matching the JDBC connector
+    /// (`if (resourceId != null)`) — so an SP with an Azure RBAC role but no
+    /// workspace membership can authenticate without forcing the extra ARM
+    /// token exchange on every other SP.
     AzureServicePrincipal {
         /// Entra app-registration client id.
         azure_client_id: String,
@@ -379,10 +382,12 @@ pub enum AuthConfig {
         /// Entra tenant id. `None` → auto-discovered from the workspace's
         /// `/aad/auth` redirect (matching the Thrift connector).
         azure_tenant_id: Option<String>,
-        /// Azure workspace ARM resource id. When set, the kernel adds the
-        /// `X-Databricks-Azure-Workspace-Resource-Id` header alongside the
-        /// always-sent management token, so the control plane can resolve the
-        /// SP's Azure RBAC role against this specific workspace resource.
+        /// Azure workspace ARM resource id. When set, the kernel fetches the
+        /// ARM management token and emits it together with the
+        /// `X-Databricks-Azure-Workspace-Resource-Id` header, so the control
+        /// plane can resolve the SP's Azure RBAC role against this specific
+        /// workspace resource. When unset (the default), neither header is
+        /// sent and the data token authenticates alone.
         azure_workspace_resource_id: Option<String>,
         /// SP-wide Workload Identity Federation client id, forwarded to the
         /// federation wrapper.
