@@ -821,4 +821,52 @@ mod tests {
             "Should fail when falling back to browser flow in unit test"
         );
     }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_u2m_both_overrides_skip_discovery() {
+        // The Azure `azure-oauth` flow pins BOTH the v2.0 authorize and token
+        // endpoints because the discovered `{host}/oidc/v1/authorize`
+        // redirects to a malformed Entra URL for the Azure client. When both
+        // overrides are set, OIDC discovery must be skipped entirely and the
+        // provider must carry the pinned endpoints verbatim.
+        let mock_server = MockServer::start().await;
+
+        // Discovery must NOT be hit when both endpoints are pinned.
+        Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": format!("{}/oidc/v1/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oidc/v1/token", mock_server.uri()),
+            })))
+            .expect(0)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+
+        let token_endpoint = format!("{}/oidc/oauth2/v2.0/token", mock_server.uri());
+        let auth_endpoint = format!("{}/oidc/oauth2/v2.0/authorize", mock_server.uri());
+
+        let provider = AuthorizationCodeProvider::new_with_full_config(
+            &mock_server.uri(),
+            "azure-client-id",
+            http_client,
+            vec!["all-apis".to_string(), "offline_access".to_string()],
+            vec![8020],
+            Duration::from_secs(120),
+            Some(token_endpoint.clone()),
+            None, // On-disk cache disabled so no seeded token interferes.
+            Some(auth_endpoint.clone()),
+        )
+        .await
+        .expect("provider creation must not require discovery when both endpoints are pinned");
+
+        // The pinned v2.0 endpoints are carried verbatim (discovery skipped).
+        assert_eq!(provider.token_endpoint, token_endpoint);
+        assert_eq!(provider.auth_endpoint, auth_endpoint);
+        // Discovery `.expect(0)` is verified on mock_server drop.
+    }
 }

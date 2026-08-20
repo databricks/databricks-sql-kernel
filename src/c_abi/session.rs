@@ -1038,6 +1038,12 @@ fn auth_spec_to_config(
     identity_federation_client_id: Option<String>,
     token_cache: TokenCacheConfig,
 ) -> crate::kernel_error::Result<AuthConfig> {
+    // `required_str` guards only `null`, so `set_oauth_token_endpoint(config, "")`
+    // yields `Some("")`. Normalize a present-but-empty endpoint to `None` here so
+    // the `.or(token_url)` fallbacks below survive (mirroring the scopes path,
+    // which parses `Some("")` to `None`) instead of shadowing the positional
+    // `token_url` with an empty endpoint that fails opaquely at `TokenUrl::new("")`.
+    let oauth_token_endpoint = oauth_token_endpoint.filter(|s| !s.is_empty());
     let auth = match auth {
         AuthSpec::Pat { token } => AuthConfig::pat(Some(token), identity_federation_client_id)?,
         AuthSpec::OAuthM2M {
@@ -1559,6 +1565,38 @@ mod tests {
                 assert_eq!(scopes, Some(vec!["from-set-auth-u2m".to_string()]))
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_shared_oauth_token_endpoint_falls_back_to_jwt_positional_token_url() {
+        // A present-but-empty shared value (`set_oauth_token_endpoint("")`) must
+        // NOT shadow the positional `token_url`: precedence is chosen on the
+        // normalized result, not the raw `Option<String>`. Otherwise the empty
+        // endpoint wins and fails opaquely at `TokenUrl::new("")` during the
+        // first token exchange. Mirrors the scopes fallback contract above.
+        let positional = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthM2MJwt {
+                client_id: "id".to_string(),
+                jwt_key_file: "/tmp/key.pem".to_string(),
+                jwt_kid: "kid".to_string(),
+                jwt_passphrase: None,
+                jwt_algorithm: None,
+                scopes: None,
+                token_url: Some(positional.to_string()),
+            },
+            Some(String::new()),
+            None,
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("m2m jwt");
+        match auth {
+            AuthConfig::OAuthM2MPrivateKey {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(positional)),
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
     }
 

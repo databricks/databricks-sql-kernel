@@ -318,8 +318,9 @@ fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Resul
             "Azure tenant discovery: workspace redirected to a sovereign-cloud \
              login host ({host:?}), which the service-principal M2M flow does \
              not yet support (the Entra token endpoint and management scope are \
-             commercial-cloud only); pass azure_tenant_id explicitly if you have \
-             configured a sovereign-cloud endpoint out of band"
+             hardcoded to the commercial cloud); passing azure_tenant_id \
+             explicitly does not help here, since the token exchange still \
+             targets the commercial Entra host regardless of tenant"
         )));
     }
     final_url
