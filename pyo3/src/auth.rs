@@ -80,6 +80,7 @@ pub(crate) struct OAuthParams {
     pub azure_client_id: Option<String>,
     pub azure_client_secret: Option<String>,
     pub azure_tenant_id: Option<String>,
+    pub azure_workspace_resource_id: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -333,12 +334,14 @@ fn build_auth_config_inner(
             // Azure Entra service-principal M2M. The kernel owns Azure
             // resolution: it builds the Entra token endpoint + `.default`
             // scope and auto-discovers the tenant from the workspace when
-            // `azure_tenant_id` is omitted. The binding forwards only the
-            // Entra credentials (+ optional tenant).
+            // `azure_tenant_id` is omitted. The binding forwards the Entra
+            // credentials (+ optional tenant + optional workspace resource id
+            // for the management-token resource-id header).
             AuthConfig::azure_service_principal(
                 oauth.azure_client_id,
                 oauth.azure_client_secret,
                 oauth.azure_tenant_id,
+                oauth.azure_workspace_resource_id,
                 oauth.identity_federation_client_id,
             )
             .map_err(|err| err.to_string())

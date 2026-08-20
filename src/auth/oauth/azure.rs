@@ -90,6 +90,123 @@ pub(crate) fn sp_m2m_scope(host: &str) -> String {
     format!("{}/.default", effective_app_id(host))
 }
 
+/// The Azure Resource Manager scope for the **management token** (commercial
+/// cloud). Matches the connector's `AZURE_MANAGED_RESOURCE`
+/// (`https://management.core.windows.net/`), as a v2.0 `.default` scope.
+const AZURE_MANAGEMENT_SCOPE: &str = "https://management.core.windows.net/.default";
+
+/// Header carrying the SP's Azure Resource Manager token, so the Databricks
+/// control plane can validate the SP's Azure RBAC role on the workspace.
+const SP_MANAGEMENT_TOKEN_HEADER: &str = "X-Databricks-Azure-SP-Management-Token";
+/// Header naming the workspace's ARM resource id (paired with the management
+/// token for the RBAC lookup).
+const WORKSPACE_RESOURCE_ID_HEADER: &str = "X-Databricks-Azure-Workspace-Resource-Id";
+
+/// Azure service-principal M2M provider (complete parity with the Thrift
+/// connector's `AzureServicePrincipalCredentialProvider`).
+///
+/// The `Authorization` bearer is the Databricks-audience **data** token. It
+/// **always** additionally emits the `X-Databricks-Azure-SP-Management-Token`
+/// header (a second Entra token, ARM `.default` scope) — exactly as the Thrift
+/// connector does — so the control plane can authorize a service principal that
+/// holds an Azure RBAC role but is not a workspace member. The
+/// `X-Databricks-Azure-Workspace-Resource-Id` header is added only when a
+/// workspace resource id is configured. Both tokens are ordinary
+/// client-credentials exchanges (reusing [`ClientCredentialsProvider`], which
+/// refreshes them), so the management token stays fresh on long-lived sessions.
+#[derive(Debug)]
+pub(crate) struct AzureServicePrincipalProvider {
+    data: super::m2m::ClientCredentialsProvider,
+    management: super::m2m::ClientCredentialsProvider,
+    /// `Some` only when `azure_workspace_resource_id` was supplied.
+    workspace_resource_id: Option<String>,
+}
+
+impl AzureServicePrincipalProvider {
+    /// Build the provider. `tenant` is the (already-resolved) Entra tenant;
+    /// `host` selects the resource app id for the data scope. Both the data and
+    /// management token sources hit the same Entra token endpoint with
+    /// different scopes.
+    pub(crate) async fn new(
+        host: &str,
+        azure_client_id: &str,
+        azure_client_secret: &str,
+        tenant: &str,
+        workspace_resource_id: Option<String>,
+        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
+    ) -> crate::kernel_error::Result<Self> {
+        Self::new_with_token_url(
+            host,
+            azure_client_id,
+            azure_client_secret,
+            sp_m2m_token_url(tenant),
+            workspace_resource_id,
+            http_client,
+        )
+        .await
+    }
+
+    /// Build the provider against an explicit Entra token endpoint. `new`
+    /// derives that endpoint from the tenant (`sp_m2m_token_url`); this seam
+    /// takes it directly so tests can point both token sources at a mock server
+    /// (the real endpoint host, `login.microsoftonline.com`, is not
+    /// interceptable).
+    async fn new_with_token_url(
+        host: &str,
+        azure_client_id: &str,
+        azure_client_secret: &str,
+        token_url: String,
+        workspace_resource_id: Option<String>,
+        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
+    ) -> crate::kernel_error::Result<Self> {
+        let data = super::m2m::ClientCredentialsProvider::new_with_full_config(
+            host,
+            azure_client_id,
+            azure_client_secret,
+            http_client.clone(),
+            vec![sp_m2m_scope(host)],
+            Some(token_url.clone()),
+        )
+        .await?;
+        let management = super::m2m::ClientCredentialsProvider::new_with_full_config(
+            host,
+            azure_client_id,
+            azure_client_secret,
+            http_client,
+            vec![AZURE_MANAGEMENT_SCOPE.to_string()],
+            Some(token_url),
+        )
+        .await?;
+        Ok(Self {
+            data,
+            management,
+            workspace_resource_id,
+        })
+    }
+}
+
+impl crate::auth::AuthProvider for AzureServicePrincipalProvider {
+    fn get_auth_header(&self) -> crate::kernel_error::Result<String> {
+        self.data.get_auth_header()
+    }
+
+    fn extra_headers(&self) -> crate::kernel_error::Result<Vec<(String, String)>> {
+        // The management header carries the RAW access token (no `Bearer `
+        // prefix), matching the connector's `cloud_token.access_token`. Always
+        // sent, exactly as the Thrift connector does.
+        let bearer = self.management.get_auth_header()?;
+        let token = bearer
+            .strip_prefix("Bearer ")
+            .unwrap_or(&bearer)
+            .to_string();
+        let mut headers = vec![(SP_MANAGEMENT_TOKEN_HEADER.to_string(), token)];
+        if let Some(rid) = &self.workspace_resource_id {
+            headers.push((WORKSPACE_RESOURCE_ID_HEADER.to_string(), rid.clone()));
+        }
+        Ok(headers)
+    }
+}
+
 /// Discover the workspace's Azure tenant id by reading the `{host}/aad/auth`
 /// redirect to Entra (`https://login.microsoftonline.com/{tenant}/oauth2/…`),
 /// exactly as the connector's `get_azure_tenant_id_from_host` does. The tenant
@@ -310,5 +427,104 @@ mod tests {
         assert!(discover_tenant(&mock_server.uri(), &http_client)
             .await
             .is_err());
+    }
+
+    // ─── AzureServicePrincipalProvider header composition ────────────────────
+    //
+    // The Entra token endpoint, the `{app}/.default` scope, and the
+    // client-credentials exchange are unit-tested elsewhere. These cover the
+    // composition unique to this provider: `Authorization` is always the data
+    // token; `X-Databricks-Azure-SP-Management-Token` is ALWAYS emitted (Thrift
+    // parity); `X-Databricks-Azure-Workspace-Resource-Id` only when configured.
+    // `new_with_token_url` points both token sources at a mock server.
+    use crate::auth::AuthProvider as _;
+    use wiremock::matchers::body_string_contains;
+
+    /// Mount two token responses on the same Entra endpoint, differentiated by
+    /// the scope in the request body: the data scope (`{app}/.default`, contains
+    /// `2ff814a6`) returns `data-token`; the management scope
+    /// (`management.core.windows.net`) returns `mgmt-token`.
+    async fn mount_dual_token_endpoint(mock_server: &wiremock::MockServer) {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, ResponseTemplate};
+        Mock::given(method("POST"))
+            .and(path("/tenant-abc/oauth2/v2.0/token"))
+            .and(body_string_contains("management.core.windows.net"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "mgmt-token", "token_type": "Bearer", "expires_in": 3600,
+            })))
+            .mount(mock_server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/tenant-abc/oauth2/v2.0/token"))
+            .and(body_string_contains("2ff814a6"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "data-token", "token_type": "Bearer", "expires_in": 3600,
+            })))
+            .mount(mock_server)
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sp_m2m_always_emits_management_token_and_resource_id_when_set() {
+        use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
+        use std::sync::Arc;
+        let mock_server = wiremock::MockServer::start().await;
+        mount_dual_token_endpoint(&mock_server).await;
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).expect("client"),
+        );
+        let token_url = format!("{}/tenant-abc/oauth2/v2.0/token", mock_server.uri());
+        let provider = AzureServicePrincipalProvider::new_with_token_url(
+            "https://adb-1.4.azuredatabricks.net",
+            "sp-client-id",
+            "sp-client-secret",
+            token_url,
+            Some("/subscriptions/s/resourceGroups/rg/workspace/w".to_string()),
+            http_client,
+        )
+        .await
+        .expect("provider builds");
+
+        assert_eq!(provider.get_auth_header().unwrap(), "Bearer data-token");
+        let extra = provider.extra_headers().unwrap();
+        assert!(extra.contains(&(
+            SP_MANAGEMENT_TOKEN_HEADER.to_string(),
+            "mgmt-token".to_string()
+        )));
+        assert!(extra.contains(&(
+            WORKSPACE_RESOURCE_ID_HEADER.to_string(),
+            "/subscriptions/s/resourceGroups/rg/workspace/w".to_string()
+        )));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn sp_m2m_emits_management_token_without_resource_id_when_unset() {
+        use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
+        use std::sync::Arc;
+        let mock_server = wiremock::MockServer::start().await;
+        mount_dual_token_endpoint(&mock_server).await;
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).expect("client"),
+        );
+        let token_url = format!("{}/tenant-abc/oauth2/v2.0/token", mock_server.uri());
+        let provider = AzureServicePrincipalProvider::new_with_token_url(
+            "https://adb-1.4.azuredatabricks.net",
+            "sp-client-id",
+            "sp-client-secret",
+            token_url,
+            None,
+            http_client,
+        )
+        .await
+        .expect("provider builds");
+
+        assert_eq!(provider.get_auth_header().unwrap(), "Bearer data-token");
+        let extra = provider.extra_headers().unwrap();
+        // Management token still present (always), but no resource-id header.
+        assert!(extra
+            .iter()
+            .any(|(k, v)| k == SP_MANAGEMENT_TOKEN_HEADER && v == "mgmt-token"));
+        assert!(!extra.iter().any(|(k, _)| k == WORKSPACE_RESOURCE_ID_HEADER));
     }
 }

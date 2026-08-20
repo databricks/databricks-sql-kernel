@@ -1284,16 +1284,17 @@ async fn build_base_auth_provider(
             azure_client_id,
             azure_client_secret,
             azure_tenant_id,
+            azure_workspace_resource_id,
             ..
         } => {
             // Kernel owns Azure resolution: build the Entra token endpoint
             // ({login}/{tenant}/oauth2/v2.0/token) and the {app_id}/.default
             // scope, discovering the tenant from the workspace's /aad/auth
-            // redirect when the caller omits it (Thrift parity). This is a plain
-            // client-credentials grant against Entra with the Databricks-audience
-            // data token — the SP must be a workspace member (RBAC-only SPs, via
-            // the Azure management token, are a planned follow-up).
-            use crate::auth::oauth::azure;
+            // redirect when the caller omits it (Thrift parity). The provider
+            // always also emits the Azure SP management token; when a workspace
+            // resource id is supplied it adds the resource-id header too, so an
+            // RBAC-only SP (Azure role, not a workspace member) can authenticate.
+            use crate::auth::oauth::azure::{self, AzureServicePrincipalProvider};
             if azure_client_id.is_empty() || azure_client_secret.is_empty() {
                 return Err(Error::invalid_argument().message(
                     "AuthConfig::AzureServicePrincipal requires non-empty \
@@ -1304,13 +1305,13 @@ async fn build_base_auth_provider(
                 Some(t) if !t.is_empty() => t.clone(),
                 _ => azure::discover_tenant(host, &http_client).await?,
             };
-            let provider = ClientCredentialsProvider::new_with_full_config(
+            let provider = AzureServicePrincipalProvider::new(
                 host,
                 azure_client_id,
                 azure_client_secret,
+                &tenant,
+                azure_workspace_resource_id.clone(),
                 http_client,
-                vec![azure::sp_m2m_scope(host)],
-                Some(azure::sp_m2m_token_url(&tenant)),
             )
             .await?;
             Ok(Arc::new(provider))

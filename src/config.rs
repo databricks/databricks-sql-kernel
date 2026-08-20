@@ -365,10 +365,12 @@ pub enum AuthConfig {
     /// (`{login_host}/{tenant}/oauth2/v2.0/token`) with the Azure app
     /// credentials and the `{app_id}/.default` scope. The kernel resolves the
     /// endpoint, scope, and (when `azure_tenant_id` is omitted) the tenant
-    /// itself — so bindings forward only the credentials. The SP authenticates
-    /// with the Databricks-audience data token; it must be a workspace member.
-    /// (Support for an RBAC-only SP via the Azure management-token header pair
-    /// is a planned follow-up.)
+    /// itself — so bindings forward only the credentials. The `Authorization`
+    /// bearer is the Databricks-audience data token; the kernel additionally
+    /// always sends the Azure SP management token
+    /// (`X-Databricks-Azure-SP-Management-Token`), matching the Thrift
+    /// connector, so a service principal with an Azure RBAC role but no
+    /// workspace membership can authenticate.
     AzureServicePrincipal {
         /// Entra app-registration client id.
         azure_client_id: String,
@@ -377,6 +379,11 @@ pub enum AuthConfig {
         /// Entra tenant id. `None` → auto-discovered from the workspace's
         /// `/aad/auth` redirect (matching the Thrift connector).
         azure_tenant_id: Option<String>,
+        /// Azure workspace ARM resource id. When set, the kernel adds the
+        /// `X-Databricks-Azure-Workspace-Resource-Id` header alongside the
+        /// always-sent management token, so the control plane can resolve the
+        /// SP's Azure RBAC role against this specific workspace resource.
+        azure_workspace_resource_id: Option<String>,
         /// SP-wide Workload Identity Federation client id, forwarded to the
         /// federation wrapper.
         identity_federation_client_id: Option<String>,
@@ -523,6 +530,7 @@ impl AuthConfig {
         azure_client_id: Option<String>,
         azure_client_secret: Option<String>,
         azure_tenant_id: Option<String>,
+        azure_workspace_resource_id: Option<String>,
         identity_federation_client_id: Option<String>,
     ) -> crate::Result<Self> {
         let azure_client_id = azure_client_id.filter(|s| !s.is_empty()).ok_or_else(|| {
@@ -540,6 +548,7 @@ impl AuthConfig {
             azure_client_id,
             azure_client_secret,
             azure_tenant_id: azure_tenant_id.filter(|s| !s.is_empty()),
+            azure_workspace_resource_id: azure_workspace_resource_id.filter(|s| !s.is_empty()),
             identity_federation_client_id,
         })
     }
@@ -677,6 +686,7 @@ impl std::fmt::Debug for AuthConfig {
             Self::AzureServicePrincipal {
                 azure_client_id,
                 azure_tenant_id,
+                azure_workspace_resource_id,
                 identity_federation_client_id,
                 ..
             } => f
@@ -684,6 +694,7 @@ impl std::fmt::Debug for AuthConfig {
                 .field("azure_client_id", azure_client_id)
                 .field("azure_client_secret", &"<redacted>")
                 .field("azure_tenant_id", azure_tenant_id)
+                .field("azure_workspace_resource_id", azure_workspace_resource_id)
                 .field(
                     "identity_federation_client_id",
                     identity_federation_client_id,

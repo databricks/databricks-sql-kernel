@@ -16,10 +16,14 @@ changes go in their respective binding's NEXT_CHANGELOG.
   kernel resolves the Entra token endpoint (`{login}/{tenant}/oauth2/v2.0/token`)
   and the `{effective_app_id}/.default` scope, and auto-discovers the tenant from
   the workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted (Thrift
-  parity) — so bindings forward only the SP credentials. A plain
-  client-credentials grant against Entra yields the Databricks-audience data
-  token; the SP must be a workspace member. (RBAC-only SPs via the Azure
-  management token are a planned follow-up.) Covered by an `#[ignore]`d
+  parity) — so bindings forward only the SP credentials. The `Authorization`
+  bearer is the Databricks-audience data token; the kernel **always** also sends
+  the Azure SP management token (`X-Databricks-Azure-SP-Management-Token`, a
+  second Entra token on the ARM `.default` scope), matching the Thrift
+  connector, so a service principal that holds an Azure RBAC role but is not a
+  workspace member can authenticate. When `azure_workspace_resource_id` is set,
+  the `X-Databricks-Azure-Workspace-Resource-Id` header is added too. A new
+  `AuthProvider::extra_headers()` carries the pair. Covered by an `#[ignore]`d
   end-to-end test (`azure_sp_m2m_select_one_round_trip`) that exercises the flow
   against a live Azure workspace when Azure SP credentials are configured.
   (PECOBLR-4141.)

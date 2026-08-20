@@ -126,8 +126,9 @@ async fn live_jwt_session() -> Option<Session> {
 /// The kernel resolves the Entra token endpoint
 /// (`{login}/{tenant}/oauth2/v2.0/token`) and the `{effective_app_id}/.default`
 /// scope, and auto-discovers the tenant from the workspace's `/aad/auth`
-/// redirect when `DATABRICKS_AZURE_TENANT_ID` is unset. The SP must be a
-/// workspace member (the data token alone authenticates it).
+/// redirect when `DATABRICKS_AZURE_TENANT_ID` is unset. It always also sends
+/// the Azure SP management token; set `DATABRICKS_AZURE_WORKSPACE_RESOURCE_ID`
+/// to additionally send the workspace-resource-id header (for an RBAC-only SP).
 ///
 /// Returns `None` (rather than panicking) when the Azure-specific vars are
 /// absent, so the shared `v0 E2E surface` CI job skips this test instead of
@@ -137,6 +138,7 @@ async fn live_jwt_session() -> Option<Session> {
 /// - `DATABRICKS_AZURE_CLIENT_ID`     — the Entra app-registration client id
 /// - `DATABRICKS_AZURE_CLIENT_SECRET` — the Entra app-registration secret
 /// - `DATABRICKS_AZURE_TENANT_ID`     — optional; unset → auto-discovered
+/// - `DATABRICKS_AZURE_WORKSPACE_RESOURCE_ID` — optional; adds the resource-id header
 async fn live_azure_sp_m2m_session() -> Option<Session> {
     let host = env_var("DATABRICKS_HOST").expect("DATABRICKS_HOST required");
     let path = env_var("DATABRICKS_HTTP_PATH").expect("DATABRICKS_HTTP_PATH required");
@@ -158,6 +160,7 @@ async fn live_azure_sp_m2m_session() -> Option<Session> {
         Some(client_id),
         Some(client_secret),
         env_var("DATABRICKS_AZURE_TENANT_ID"), // None → auto-discover from /aad/auth
+        env_var("DATABRICKS_AZURE_WORKSPACE_RESOURCE_ID"), // None → no resource-id header
         None,                                  // no SP-wide WIF
     )
     .expect("build AzureServicePrincipal config");
