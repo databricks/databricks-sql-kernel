@@ -128,20 +128,28 @@ pub(crate) async fn discover_tenant(
 
 /// Parse the Azure tenant id from the Entra login URL the workspace's
 /// `/aad/auth` redirects to (`https://login.microsoftonline.com/{tenant}/…`).
-/// The tenant is the first path segment; the host must be a Microsoft login
-/// host (guards against a non-AAD redirect on a misconfigured workspace).
-/// Extracted so the parse is unit-testable without a live workspace (the HTTP
-/// round-trip itself is verified against a real Azure workspace).
+/// The tenant is the first path segment; the host must be the **commercial**
+/// Microsoft login host (guards against a non-AAD redirect on a misconfigured
+/// workspace). Sovereign clouds (e.g. `chinacloudapi.cn`) are intentionally
+/// rejected here: [`sp_m2m_token_url`] only builds against the commercial
+/// [`AZURE_AAD_LOGIN_HOST`], so accepting a sovereign redirect would let
+/// discovery succeed while the token exchange silently hits the wrong
+/// directory. Rejecting keeps the two halves consistent until sovereign login
+/// hosts are wired (the documented follow-up), and steers the caller to pass
+/// `azure_tenant_id` explicitly. Extracted so the parse is unit-testable
+/// without a live workspace (the HTTP round-trip itself is verified against a
+/// real Azure workspace).
 fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Result<String> {
     use crate::kernel_error::Error;
     let host = final_url
         .host_str()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !host.contains("microsoftonline") && !host.contains("chinacloudapi") {
+    if !host.contains("microsoftonline") {
         return Err(Error::unauthenticated().message(format!(
-            "Azure tenant discovery: /aad/auth did not redirect to a Microsoft \
-             login host (got {host:?}); pass azure_tenant_id explicitly"
+            "Azure tenant discovery: /aad/auth did not redirect to the commercial \
+             Microsoft login host (got {host:?}); sovereign clouds are not yet \
+             supported for azure-sp-m2m — pass azure_tenant_id explicitly"
         )));
     }
     final_url
@@ -228,6 +236,20 @@ mod tests {
         // A workspace that redirects somewhere unexpected must not yield a bogus
         // "tenant" — fail so the caller passes azure_tenant_id explicitly.
         let url = reqwest::Url::parse("https://evil.example.com/not-a-tenant/x").unwrap();
+        assert!(tenant_from_login_url(&url).is_err());
+    }
+
+    #[test]
+    fn tenant_parse_rejects_sovereign_login_host() {
+        // A China sovereign workspace redirects to login.chinacloudapi.cn, but
+        // sp_m2m_token_url only targets the commercial AZURE_AAD_LOGIN_HOST — so
+        // discovery must reject sovereign hosts rather than let the token
+        // exchange silently hit the wrong directory. Consistency guard for the
+        // documented sovereign follow-up.
+        let url = reqwest::Url::parse(
+            "https://login.chinacloudapi.cn/9f37a392-f0ae-4280-9796-f1864a10effc/oauth2/authorize?client_id=x",
+        )
+        .unwrap();
         assert!(tenant_from_login_url(&url).is_err());
     }
 
