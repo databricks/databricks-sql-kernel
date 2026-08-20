@@ -9,23 +9,6 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ## [Unreleased]
 
-### Breaking
-
-- **OAuth U2M override semantics** — when a `token_url_override` is set for the
-  U2M authorization-code flow, OIDC discovery is now **skipped** and the
-  authorization endpoint is **derived** from the override by swapping a trailing
-  `/token` → `/authorize` (the OAuth2 v2.0 sibling layout the override targets).
-  Previously the kernel still ran discovery and used the *discovered*
-  `authorization_endpoint`, overriding only the token endpoint. Consequently the
-  override now **must end in `/token`** — a mismatch is rejected with
-  `InvalidArgument` at session open instead of failing later.
-  **Migration:** any caller that pinned a U2M `token_url` whose token path is not
-  `/token`, or whose real authorize endpoint is not the `/authorize` sibling of
-  that token path, must update the override (or drop it to fall back to
-  discovery). This is API-visible to downstream bindings: pyo3 already exposed
-  `token_url` for `auth_type="oauth-u2m"` before this release, so a Python caller
-  pinning a non-`/token` U2M endpoint will now fail where it previously worked.
-
 ### Added
 
 - Azure Entra service-principal M2M (`azure-sp-m2m`) is now a kernel-owned flow

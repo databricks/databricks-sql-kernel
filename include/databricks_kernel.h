@@ -278,12 +278,11 @@ kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* con
  * service principal. Unset → OIDC discovery against the workspace host.
  * No effect on PAT auth.
  *
- * For U2M the override MUST end in `/token`: the kernel derives the
- * authorization endpoint by swapping the trailing `/token` for `/authorize`,
- * and rejects any other value with `InvalidArgument` at session open (a
- * trailing slash or an IdP whose token path is not `/token` will fail). The
- * Azure example above satisfies this. M2M / M2M-JWT have no such suffix
- * requirement. */
+ * The override replaces the token endpoint ONLY. For U2M the authorization
+ * endpoint always comes from OIDC discovery against the workspace host — it is
+ * never derived from this override — so no particular suffix is required and no
+ * value is rejected at session open. M2M / M2M-JWT likewise only have their
+ * token endpoint replaced. */
 KernelStatusCode
 kernel_session_config_set_oauth_token_endpoint(KernelSessionConfig* config,
                                                const char* token_endpoint);
