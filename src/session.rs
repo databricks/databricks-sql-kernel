@@ -1344,6 +1344,12 @@ async fn build_base_auth_provider(
                      azure_client_id and azure_client_secret",
                 ));
             }
+            // Guard sovereign-cloud hosts here, independent of tenant
+            // resolution: the discovery-path guard in `tenant_from_login_url`
+            // is skipped when the caller passes an explicit `azure_tenant_id`,
+            // so without this an explicit-tenant USGov/China user would
+            // silently build a commercial-only token URL.
+            crate::auth::oauth::azure::reject_sovereign_host_for_sp_m2m(host)?;
             let tenant = match azure_tenant_id {
                 Some(t) if !t.is_empty() => t.clone(),
                 _ => crate::auth::oauth::azure::discover_tenant(host, &http_client).await?,

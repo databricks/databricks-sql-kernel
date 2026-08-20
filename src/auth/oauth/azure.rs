@@ -124,6 +124,49 @@ pub(crate) fn sp_m2m_scope(host: &str) -> String {
     format!("{}/.default", effective_app_id(host))
 }
 
+/// Sovereign-cloud Azure Databricks workspace host suffixes (USGov, China).
+/// The SP M2M flow's Entra token endpoint ([`sp_m2m_token_url`]) and management
+/// scope ([`AZURE_MANAGEMENT_SCOPE`]) are hardcoded to the commercial cloud, so
+/// these are not yet supported.
+const AZURE_SOVEREIGN_HOST_SUFFIXES: &[&str] = &[".databricks.azure.us", ".databricks.azure.cn"];
+
+/// Reject a sovereign-cloud workspace `host` before the SP M2M flow builds a
+/// commercial-only token URL. This guard is independent of tenant resolution:
+/// [`tenant_from_login_url`] only fires on the auto-discovery path, so a caller
+/// that passes `azure_tenant_id` explicitly would otherwise skip the check and
+/// silently authenticate against the wrong (commercial) Entra host. Mirrors the
+/// [`tenant_from_login_url`] sovereign message so both paths fail identically.
+pub(crate) fn reject_sovereign_host_for_sp_m2m(host: &str) -> crate::kernel_error::Result<()> {
+    use crate::kernel_error::Error;
+    // Reduce to the host authority (drop scheme and any path) before matching,
+    // so the suffix test can't be fooled by the pattern appearing mid-string.
+    let host_lower = host.to_ascii_lowercase();
+    let authority = host_lower
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(&host_lower);
+    let authority = authority
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(authority)
+        .trim_end_matches('.');
+    if AZURE_SOVEREIGN_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| authority.ends_with(suffix))
+    {
+        return Err(Error::unauthenticated().message(format!(
+            "Azure service-principal M2M: workspace host {authority:?} is a \
+             sovereign-cloud (USGov/China) host, which the service-principal \
+             M2M flow does not yet support (the Entra token endpoint and \
+             management scope are hardcoded to the commercial cloud); passing \
+             azure_tenant_id explicitly does not help here, since the token \
+             exchange still targets the commercial Entra host regardless of \
+             tenant"
+        )));
+    }
+    Ok(())
+}
+
 /// The Azure Resource Manager scope for the **management token** (commercial
 /// cloud). Matches the connector's `AZURE_MANAGED_RESOURCE`
 /// (`https://management.core.windows.net/`), as a v2.0 `.default` scope.
@@ -467,6 +510,36 @@ mod tests {
             assert!(
                 tenant_from_login_url(&url).is_err(),
                 "expected sovereign host {host:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sp_m2m_rejects_sovereign_host_regardless_of_tenant() {
+        // The explicit-tenant path skips `tenant_from_login_url`, so this
+        // host-based guard is the only thing that stops a USGov/China caller
+        // from silently building a commercial-only token URL.
+        for host in [
+            "https://adb-1.databricks.azure.us",
+            "https://adb-1.databricks.azure.cn",
+            "adb-1.databricks.azure.us/sql/1.0/warehouses/x",
+        ] {
+            assert!(
+                reject_sovereign_host_for_sp_m2m(host).is_err(),
+                "expected sovereign host {host:?} to be rejected"
+            );
+        }
+        // Commercial (and dev/staging) hosts pass the guard.
+        for host in [
+            "https://adb-1.azuredatabricks.net",
+            "https://adb-1.dev.azuredatabricks.net",
+            // A host merely embedding the sovereign pattern mid-string is not
+            // sovereign — suffix match, not substring.
+            "https://adb-1.databricks.azure.us.example.com",
+        ] {
+            assert!(
+                reject_sovereign_host_for_sp_m2m(host).is_ok(),
+                "expected commercial host {host:?} to pass"
             );
         }
     }
