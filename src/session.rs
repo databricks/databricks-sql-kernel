@@ -2391,6 +2391,104 @@ mod is_open_tests {
         );
     }
 
+    #[tokio::test]
+    async fn async_statement_status_failure_exports_error_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-status-failure").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-status-failure")).await;
+        mount_status(
+            &server,
+            "stmt-telemetry-status-failure",
+            failed_body(
+                "stmt-telemetry-status-failure",
+                "async status failure near secret_token",
+                "42000",
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-status-failure", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT secret_token FROM sensitive_table");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let status = async_exec.status().await.expect("status succeeds");
+        assert!(
+            matches!(status, crate::statement::StatementStatus::Failed(_)),
+            "status should surface terminal failure"
+        );
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported");
+        let encoded = serde_json::to_string(&statement_log).expect("json stringify");
+        assert!(
+            !encoded.contains("SELECT secret_token FROM sensitive_table"),
+            "statement telemetry must not include SQL text"
+        );
+        let sql_log = &statement_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-status-failure");
+        assert_eq!(sql_log["error_info"]["stack_trace"], "42000");
+    }
+
+    #[tokio::test]
+    async fn async_statement_await_poll_error_exports_error_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-await-poll-error").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-await-poll-error")).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/sql/statements/stmt-telemetry-await-poll-error",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-await-poll-error", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let err = match async_exec.await_result().await {
+            Ok(_) => panic!("await should fail while polling status"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Failed to parse status response"),
+            "unexpected polling error: {err}"
+        );
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported");
+        assert_eq!(
+            statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-await-poll-error"
+        );
+        assert!(
+            statement_log["entry"]["sql_driver_log"]["error_info"].is_object(),
+            "polling error should be exported as statement telemetry"
+        );
+    }
+
     async fn telemetry_test_session(
         server: &MockServer,
         expected_session_id: &str,

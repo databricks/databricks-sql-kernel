@@ -372,13 +372,20 @@ impl ExecutedAsyncStatement {
         }
     }
 
+    fn cancelled_error(&self, status: &crate::types::sea::StatementStatus) -> Error {
+        let error = Error::cancelled()
+            .message(format!("Statement {} was cancelled", self.statement_id))
+            .with_query_id(&self.statement_id);
+        crate::kernel_error::carry_extended_status(error, status)
+    }
+
     /// One-shot status check. Non-blocking. Issues a single
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`
     /// has already invalidated this handle.
     pub async fn status(&self) -> Result<StatementStatus> {
         let span = self.session.log_span().clone();
-        async {
+        let result = async {
             self.valid.check()?;
             let status_started = std::time::Instant::now();
             let response = self
@@ -392,10 +399,28 @@ impl ExecutedAsyncStatement {
             // reflect what THIS handle has observed (instead of the
             // stale initial-submit snapshot).
             self.record_latest_status(response.status.clone());
-            Ok(StatementStatus::from_sea_response(&response))
+            let status = StatementStatus::from_sea_response(&response);
+            match &status {
+                StatementStatus::Failed(error) => {
+                    self.statement_telemetry.finalize(Some(error));
+                }
+                StatementStatus::Cancelled => {
+                    let error = self.cancelled_error(&response.status);
+                    self.statement_telemetry.finalize(Some(&error));
+                }
+                StatementStatus::Pending
+                | StatementStatus::Running
+                | StatementStatus::Succeeded
+                | StatementStatus::Closed => {}
+            }
+            Ok(status)
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            self.statement_telemetry.finalize(Some(error));
+        }
+        result
     }
 
     /// Block until the server reaches a terminal state, then return
@@ -419,7 +444,7 @@ impl ExecutedAsyncStatement {
     /// `status()` or `await_result()` to resume.
     pub async fn await_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let result = async {
             self.valid.check()?;
 
             // Poll cadence + ceiling come from the transport's config —
@@ -497,11 +522,7 @@ impl ExecutedAsyncStatement {
                         // (not invalid_state) so the connector maps it to
                         // OperationalError, not ProgrammingError — see the
                         // sync arm in client/sea.rs for the rationale.
-                        let error = Error::cancelled()
-                            .message(format!("Statement {} was cancelled", self.statement_id))
-                            .with_query_id(&self.statement_id);
-                        let error =
-                            crate::kernel_error::carry_extended_status(error, &response.status);
+                        let error = self.cancelled_error(&response.status);
                         self.statement_telemetry.finalize(Some(&error));
                         return Err(error);
                     }
@@ -525,7 +546,11 @@ impl ExecutedAsyncStatement {
             }
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            self.statement_telemetry.finalize(Some(error));
+        }
+        result
     }
 
     /// Fetch the result without polling. Errors if the statement has
@@ -536,7 +561,7 @@ impl ExecutedAsyncStatement {
     /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let result = async {
             self.valid.check()?;
             let result = self.materialise_result().await;
             if let Err(error) = &result {
@@ -547,7 +572,11 @@ impl ExecutedAsyncStatement {
             result
         }
         .instrument(span)
-        .await
+        .await;
+        if let Err(error) = &result {
+            self.statement_telemetry.finalize(Some(error));
+        }
+        result
     }
 
     /// Internal: resolve the reader for an (expected to be) terminal
