@@ -282,6 +282,14 @@ impl crate::auth::AuthProvider for AzureServicePrincipalProvider {
 /// is the first path segment of the redirect Location. Used when the caller
 /// does not pass an explicit `azure_tenant_id`, so `azure-sp-m2m` is zero-config
 /// on the tenant (Thrift parity).
+///
+/// This single `/aad/auth` probe is NOT retry-aware (see
+/// [`DatabricksHttpClient::first_redirect_location`]), and its error is
+/// propagated with `?` here and again in `build_base_auth_provider`, with no
+/// automatic fallback at the call site. A transient network blip (5xx /
+/// timeout / connection reset) during discovery therefore fails `Session::open`
+/// outright; passing an explicit `azure_tenant_id` skips discovery and avoids
+/// this probe.
 pub(crate) async fn discover_tenant(
     host: &str,
     http_client: &std::sync::Arc<crate::client::http::DatabricksHttpClient>,

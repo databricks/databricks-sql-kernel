@@ -784,8 +784,18 @@ impl DatabricksHttpClient {
     /// redirect hop (matching the connector's `get_azure_tenant_id_from_host`),
     /// rather than parsing the final URL after following the whole Entra
     /// redirect chain (which can traverse non-tenant-prefixed hops like
-    /// `/common/` or a `login.live.com` bounce). No retry: a single hop is
-    /// enough and discovery is best-effort with an explicit-tenant fallback.
+    /// `/common/` or a `login.live.com` bounce).
+    ///
+    /// NOT retry-aware: unlike [`execute`](Self::execute) /
+    /// [`execute_without_auth`], this one-off client does NOT run the kernel's
+    /// retry ladder, so a transient 5xx / timeout / connection reset on this
+    /// single probe surfaces as an error. Because the only caller
+    /// (`azure::discover_tenant`) propagates that error with `?` and there is
+    /// no automatic retry or fallback at the call site, a transient blip during
+    /// discovery is fatal to `Session::open` for a zero-config-tenant
+    /// `azure-sp-m2m` caller; the recourse is to re-run with an explicit
+    /// `azure_tenant_id` (which skips discovery entirely). A single hop is
+    /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
         let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
         let response = client.get(url).send().await.map_err(|e| {
