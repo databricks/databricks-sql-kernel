@@ -773,7 +773,8 @@ mod tests {
         o.jwt_passphrase = Some("pass".to_owned());
         o.jwt_algorithm = Some("ES256".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
-        o.token_url = Some("https://idp.example/token".to_owned());
+        let token_url = "https://idp.example/token";
+        o.token_url = Some(token_url.to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 client_id,
@@ -791,7 +792,7 @@ mod tests {
                 assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
                 assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
                 assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
-                assert_eq!(token_url_override.as_deref(), Some("https://idp.example/token"));
+                assert_eq!(token_url_override.as_deref(), Some(token_url));
             }
             other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }
