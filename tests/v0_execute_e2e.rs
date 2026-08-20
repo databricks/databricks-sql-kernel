@@ -126,9 +126,12 @@ async fn live_jwt_session() -> Option<Session> {
 /// The kernel resolves the Entra token endpoint
 /// (`{login}/{tenant}/oauth2/v2.0/token`) and the `{effective_app_id}/.default`
 /// scope, and auto-discovers the tenant from the workspace's `/aad/auth`
-/// redirect when `DATABRICKS_AZURE_TENANT_ID` is unset. It always also sends
-/// the Azure SP management token; set `DATABRICKS_AZURE_WORKSPACE_RESOURCE_ID`
-/// to additionally send the workspace-resource-id header (for an RBAC-only SP).
+/// redirect when `DATABRICKS_AZURE_TENANT_ID` is unset. Set
+/// `DATABRICKS_AZURE_WORKSPACE_RESOURCE_ID` (for an RBAC-only SP) to make the
+/// kernel exchange for the Azure SP management token and send it together with
+/// the workspace-resource-id header; when it is unset, neither is emitted (no
+/// ARM `.default` exchange runs), matching the JDBC `if (resourceId != null)`
+/// parity.
 ///
 /// Returns `None` (rather than panicking) when the Azure-specific vars are
 /// absent, so the shared `v0 E2E surface` CI job skips this test instead of
