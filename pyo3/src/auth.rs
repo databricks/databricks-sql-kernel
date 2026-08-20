@@ -28,7 +28,9 @@
 //!   `oauth_callback_timeout_secs`.
 //! - `"azure-sp-m2m"` — Azure Entra service-principal M2M:
 //!   `azure_client_id` + `azure_client_secret`, optional
-//!   `azure_tenant_id` (auto-discovered from the workspace when omitted).
+//!   `azure_tenant_id` (auto-discovered from the workspace when omitted)
+//!   / `azure_workspace_resource_id` (opts into the Azure management
+//!   token by setting the management-token resource-id header).
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
 //! itself (OIDC discovery against the workspace host, transparent

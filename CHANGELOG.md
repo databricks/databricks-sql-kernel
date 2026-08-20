@@ -24,24 +24,6 @@ cadences and may not move in lockstep with the crate.
   multi-statement transactions (Private Preview; requires catalog-managed
   tables server-side).
 
-### Changed
-- **BREAKING (U2M `token_url` override semantics)** — when a U2M
-  (`oauth-u2m`) `token_endpoint_override` / `token_url` is set, the
-  kernel now **skips OIDC discovery entirely** and derives the
-  authorization endpoint from the override by swapping a trailing
-  `/token` → `/authorize` (siblings under a shared base, matching the
-  Azure `{host}/oidc/oauth2/v2.0/token` layout the override targets).
-  Previously the token endpoint was overridden but the *authorize*
-  endpoint still came from the discovered `authorization_endpoint`.
-  Consequences for pre-existing callers who set a U2M `token_url`:
-  the override **must end in `/token`** or session open now fails with
-  `InvalidArgument`; and if the real authorize endpoint is not a
-  `/authorize` sibling of the token path, the derived URL will differ
-  from what discovery previously returned. Callers relying on the old
-  discover-then-override behavior must drop the override (letting
-  discovery supply both endpoints) or supply a `/token`-suffixed URL
-  whose `/authorize` sibling is correct.
-
 ### Fixed
 - **Metadata conformance (catalog match-all wildcard)** — a *literal*
   catalog `%`, `*`, or `""` reaching `Metadata::list_schemas` /
