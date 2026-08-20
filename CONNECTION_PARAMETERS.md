@@ -34,7 +34,7 @@ warehouse id and org id out of a `/sql/1.0/warehouses/{id}` path).
 ## `AuthConfig` — authentication (required)
 
 An enum; pick one variant. Use the validating constructors
-(`AuthConfig::pat`, `::oauth_m2m`, `::oauth_u2m`, `::azure_oauth_u2m`).
+(`AuthConfig::pat`, `::oauth_m2m`, `::oauth_u2m`, `::azure_service_principal`).
 
 **`Pat`** — personal access token:
 
@@ -65,16 +65,17 @@ An enum; pick one variant. Use the validating constructors
 core — it resolves the Azure endpoints / scope / client id from the host, so
 bindings just select the flow.
 
-- **Azure U2M (`AzureOAuthU2M`, `azure-oauth`): supported — live-verified.**
-  The kernel pins the workspace **v2.0** endpoints
+- **Azure U2M (`AzureOAuthU2M`, `azure-oauth`): planned — not yet in v0.**
+  The `AzureOAuthU2M` variant / `AuthConfig::azure_oauth_u2m(...)` constructor and
+  the pyo3 `auth_type="azure-oauth"` selector are **not** shipped in this release;
+  the design (PECOBLR-4120) is tracked in
+  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`. When it lands the
+  kernel will pin the workspace **v2.0** endpoints
   (`{host}/oidc/oauth2/v2.0/{authorize,token}`, which the workspace redirects to
   Entra), the Azure app client id (`96eecda7-…`), port `8030`, and the
-  `{app_id}/user_impersonation offline_access` scope. No tenant needed (the
-  workspace redirect resolves it). Fields — all optional: `client_id`,
-  `redirect_ports` (default `[8030]`), `app_id` (scope resource; default
-  `2ff814a6-…`), `callback_timeout` (`120s`), `token_cache`. This is **not** the
-  discovered `{host}/oidc/v1/authorize` path, which redirects to a malformed
-  Entra URL (404) for the Azure client — the v2.0 path is the fix.
+  `{app_id}/user_impersonation offline_access` scope, with no tenant needed (the
+  workspace redirect resolves it). Until then, use `azure-sp-m2m` for Azure
+  authentication.
 - **Azure service principal M2M (`AzureServicePrincipal`, `azure-sp-m2m`):
   supported.** The kernel owns Azure resolution: it builds the Entra token
   endpoint (`{login_host}/{tenant}/oauth2/v2.0/token`) and the

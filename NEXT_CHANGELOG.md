@@ -19,8 +19,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
   parity) — so bindings forward only the SP credentials. A plain
   client-credentials grant against Entra yields the Databricks-audience data
   token; the SP must be a workspace member. (RBAC-only SPs via the Azure
-  management token are a planned follow-up.) Live-verified end-to-end against an
-  Azure workspace. (PECOBLR-4141.)
+  management token are a planned follow-up.) Covered by an `#[ignore]`d
+  end-to-end test (`azure_sp_m2m_select_one_round_trip`) that exercises the flow
+  against a live Azure workspace when Azure SP credentials are configured.
+  (PECOBLR-4141.)
 
 - Generic Azure/Entra OAuth overrides (the pre-dedicated-flow path, still valid
   for custom setups where a caller pins the endpoint/scope itself). New C ABI
