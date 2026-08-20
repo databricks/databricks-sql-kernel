@@ -831,6 +831,60 @@ pub unsafe extern "C" fn kernel_init_logging(
     }
 }
 
+/// Initialize process-wide kernel logging through a host callback.
+///
+/// This is the callback counterpart to [`kernel_init_logging`]. `level` has
+/// the same OFF/ERROR/WARN/INFO/DEBUG/TRACE semantics (NULL honors `RUST_LOG`,
+/// defaulting to WARN). The first logging initializer in the process wins;
+/// subsequent callback or file/stderr initializer calls are no-ops reporting
+/// that first call's outcome.
+///
+/// The callback receives lower-case `level`, the tracing `target`, and the
+/// rendered message including structured fields. String pointers are valid
+/// only until the callback returns. It may be invoked concurrently from
+/// multiple kernel threads and must return promptly. It must not re-enter the
+/// kernel C ABI or emit another kernel tracing event. `user_data` is passed
+/// through unchanged and must remain valid for the process lifetime.
+///
+/// Returns `InvalidArgument` when `callback` is NULL. Returns `Internal` when
+/// the first subscriber install fails because another subscriber already owns
+/// the process-global tracing slot.
+///
+/// # Safety
+/// `level`, if non-null, must be a NUL-terminated C string. `callback` and
+/// `user_data` must satisfy the lifetime and threading contract above.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_init_logging_callback(
+    level: *const c_char,
+    callback: Option<crate::c_abi::KernelLogCallback>,
+    user_data: *mut std::ffi::c_void,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(callback) = callback else {
+        return crate::c_abi::error::store_and_code(
+            Error::invalid_argument().message("kernel log callback must not be NULL"),
+        );
+    };
+
+    let level = optional_str(level, "log level").ok().flatten();
+    if level
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+    {
+        return KernelStatusCode::Success;
+    }
+    let filter = level.as_deref().map(crate::logging::filter_from_level);
+
+    if crate::logging::init_callback_logging(filter, callback, user_data) {
+        KernelStatusCode::Success
+    } else {
+        crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: logging was not initialized because a global \
+             subscriber was already installed",
+        ))
+    }
+}
+
 /// Add (or overwrite) one server-bound session-conf entry. Unknown keys
 /// are filtered against the kernel allowlist at `open()` time, matching
 /// the Rust-crate path.

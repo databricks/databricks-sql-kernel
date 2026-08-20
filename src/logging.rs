@@ -52,13 +52,17 @@
 
 #![allow(dead_code)]
 
+use std::ffi::{c_void, CString};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, time::SystemTime},
-    layer::SubscriberExt,
+    layer::{Context, SubscriberExt},
+    registry::LookupSpan,
     util::SubscriberInitExt,
-    EnvFilter,
+    EnvFilter, Layer,
 };
 
 /// Records the outcome of the first `init_logging` call: `true` if the
@@ -210,6 +214,121 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
         // Success only if the subscriber installed AND the requested file
         // (if any) was honoured.
         installed && file_requested_ok
+    })
+}
+
+/// Collect a tracing event's message and structured fields into one line.
+#[derive(Default)]
+struct CallbackMessageVisitor {
+    message: String,
+    fields: String,
+}
+
+impl CallbackMessageVisitor {
+    fn finish(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else if self.message.is_empty() {
+            self.fields
+        } else {
+            format!("{} {}", self.message, self.fields)
+        }
+    }
+
+    fn push_field(&mut self, name: &str, value: String) {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        self.fields.push_str(name);
+        self.fields.push('=');
+        self.fields.push_str(&value);
+    }
+}
+
+impl Visit for CallbackMessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.push_field(field.name(), format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_owned();
+        } else {
+            self.push_field(field.name(), value.to_owned());
+        }
+    }
+}
+
+fn callback_cstring(value: &str) -> CString {
+    CString::new(value).unwrap_or_else(|_| {
+        let sanitized = value.replace('\0', "?");
+        CString::new(sanitized).expect("replacing NUL produces a valid CString")
+    })
+}
+
+struct CallbackLogLayer {
+    callback: crate::c_abi::KernelLogCallback,
+    user_data: usize,
+}
+
+impl<S> Layer<S> for CallbackLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        let metadata = event.metadata();
+        let mut visitor = CallbackMessageVisitor::default();
+        event.record(&mut visitor);
+
+        let level = callback_cstring(&metadata.level().to_string().to_ascii_lowercase());
+        let target = callback_cstring(metadata.target());
+        let message = callback_cstring(&visitor.finish());
+
+        // SAFETY: the caller supplied a valid process-lifetime callback and
+        // user-data pointer under `kernel_init_logging_callback`'s contract.
+        // The C strings remain alive until the callback returns.
+        unsafe {
+            (self.callback)(
+                level.as_ptr(),
+                target.as_ptr(),
+                message.as_ptr(),
+                self.user_data as *mut c_void,
+            );
+        }
+    }
+}
+
+/// Install a process-wide subscriber that forwards records to a host callback.
+///
+/// Shares [`LOGGING_INITIALIZED`] with file/stderr logging, preserving the
+/// existing first-call-wins contract across every C and direct-Rust entry point.
+pub(crate) fn init_callback_logging(
+    filter: Option<String>,
+    callback: crate::c_abi::KernelLogCallback,
+    user_data: *mut c_void,
+) -> bool {
+    *LOGGING_INITIALIZED.get_or_init(|| {
+        let filter = filter.map_or_else(
+            || {
+                EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+                    EnvFilter::new(format!("{}=warn", crate::klog::KERNEL_LOG_TARGET))
+                })
+            },
+            EnvFilter::new,
+        );
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(CallbackLogLayer {
+                callback,
+                user_data: user_data as usize,
+            })
+            .try_init()
+            .is_ok()
     })
 }
 

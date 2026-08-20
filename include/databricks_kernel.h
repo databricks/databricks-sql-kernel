@@ -350,6 +350,20 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
+/* One callback-delivered kernel log record. Strings are valid only during the
+ * callback. Calls may be concurrent; copy retained strings and synchronize the
+ * destination. `user_data` is the pointer supplied at initialization. */
+typedef void (*KernelLogCallback)(const char* level, const char* target,
+                                  const char* message, void* user_data);
+
+/* Initialize kernel logging through a host callback. The level and
+ * process-wide first-call-wins behavior match kernel_init_logging. The callback
+ * must remain valid for the process lifetime, return promptly, and must not
+ * re-enter the kernel C ABI. A NULL callback returns InvalidArgument. */
+KernelStatusCode kernel_init_logging_callback(const char* level,
+                                              KernelLogCallback callback,
+                                              void* user_data);
+
 /* ─── Proxy / TLS (optional) ──────────────────────────────────────────
  *
  * All optional; defaults are: no explicit proxy (reqwest honours

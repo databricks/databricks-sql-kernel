@@ -259,13 +259,29 @@ static void test_client_conf_setter(void) {
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(NULL cfg) → InvalidArgument");
 }
 
-/* kernel_init_logging is idempotent and null-tolerant. */
+static void capture_log(const char* level, const char* target,
+                        const char* message, void* user_data) {
+  (void)level;
+  (void)target;
+  (void)message;
+  (void)user_data;
+}
+
+/* Logging initialization is idempotent; callback registration rejects NULL. */
 static void test_init_logging(void) {
-  KernelStatusCode rc = kernel_init_logging("WARN", NULL);
+  KernelStatusCode rc = kernel_init_logging_callback("WARN", NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "init_logging_callback(NULL callback) rejects invalid input");
+
+  rc = kernel_init_logging("WARN", NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging(level, NULL file) succeeds");
   /* Second call is a no-op (subscriber already installed) but still Success. */
   rc = kernel_init_logging(NULL, NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
+  /* The alternate callback initializer links and shares the same no-op result. */
+  rc = kernel_init_logging_callback(NULL, capture_log, NULL);
+  CHECK(rc == KernelStatusCode_Success,
+        "init_logging_callback after first install is a safe no-op");
 }
 
 /* is_open null-guards its args. (The true→false behavior is covered by the
