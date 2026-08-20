@@ -120,6 +120,58 @@ async fn live_jwt_session() -> Option<Session> {
     )
 }
 
+/// Open a live session authenticated via the Azure Entra service-principal
+/// M2M flow (`AuthConfig::AzureServicePrincipal` / `azure-sp-m2m`).
+///
+/// The kernel resolves the Entra token endpoint
+/// (`{login}/{tenant}/oauth2/v2.0/token`) and the `{effective_app_id}/.default`
+/// scope, and auto-discovers the tenant from the workspace's `/aad/auth`
+/// redirect when `DATABRICKS_AZURE_TENANT_ID` is unset. The SP must be a
+/// workspace member (the data token alone authenticates it).
+///
+/// Returns `None` (rather than panicking) when the Azure-specific vars are
+/// absent, so the shared `v0 E2E surface` CI job skips this test instead of
+/// failing it.
+///
+/// Env vars (in addition to `DATABRICKS_HOST` / `DATABRICKS_HTTP_PATH`):
+/// - `DATABRICKS_AZURE_CLIENT_ID`     — the Entra app-registration client id
+/// - `DATABRICKS_AZURE_CLIENT_SECRET` — the Entra app-registration secret
+/// - `DATABRICKS_AZURE_TENANT_ID`     — optional; unset → auto-discovered
+async fn live_azure_sp_m2m_session() -> Option<Session> {
+    let host = env_var("DATABRICKS_HOST").expect("DATABRICKS_HOST required");
+    let path = env_var("DATABRICKS_HTTP_PATH").expect("DATABRICKS_HTTP_PATH required");
+    let (client_id, client_secret) = match (
+        env_var("DATABRICKS_AZURE_CLIENT_ID"),
+        env_var("DATABRICKS_AZURE_CLIENT_SECRET"),
+    ) {
+        (Some(c), Some(s)) => (c, s),
+        _ => {
+            eprintln!(
+                "skipping azure_sp_m2m_select_one_round_trip: set \
+                 DATABRICKS_AZURE_CLIENT_ID and DATABRICKS_AZURE_CLIENT_SECRET to run it"
+            );
+            return None;
+        }
+    };
+
+    let auth = AuthConfig::azure_service_principal(
+        Some(client_id),
+        Some(client_secret),
+        env_var("DATABRICKS_AZURE_TENANT_ID"), // None → auto-discover from /aad/auth
+        None,                                  // no SP-wide WIF
+    )
+    .expect("build AzureServicePrincipal config");
+
+    Some(
+        Session::builder()
+            .http_path(host, path)
+            .auth(auth)
+            .open()
+            .await
+            .expect("Session::open with Azure SP M2M against live workspace"),
+    )
+}
+
 async fn drain_rows(stream: &mut ResultStream) -> usize {
     let mut total = 0;
     while let Some(rb) = stream.next_batch().await.expect("next_batch") {
@@ -168,6 +220,34 @@ async fn jwt_m2m_select_one_round_trip() {
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT 1 AS n");
     let mut exec = stmt.execute().await.expect("execute SELECT 1 via JWT M2M");
+
+    let stream = exec.result_stream_mut();
+    stream.next_batch().await.unwrap().unwrap();
+    let row = stream.next_row_in_batch().expect("one row");
+    assert_eq!(row.get_i64(0).unwrap(), Some(1));
+
+    exec.close().await.expect("close");
+    session.close().await.expect("session close");
+}
+
+/// End-to-end round trip through the Azure Entra service-principal M2M flow
+/// (`AuthConfig::AzureServicePrincipal`), then runs `SELECT 1`. Proves the
+/// kernel discovers the tenant, exchanges the SP credentials at Entra for the
+/// `{app_id}/.default` scope, and the resulting token executes a query. Skips
+/// (does not fail) when the Azure SP vars are unset — see
+/// [`live_azure_sp_m2m_session`] for the required env vars.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore]
+async fn azure_sp_m2m_select_one_round_trip() {
+    let Some(session) = live_azure_sp_m2m_session().await else {
+        return; // Azure SP credentials not configured — skip.
+    };
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let mut exec = stmt
+        .execute()
+        .await
+        .expect("execute SELECT 1 via Azure SP M2M");
 
     let stream = exec.result_stream_mut();
     stream.next_batch().await.unwrap().unwrap();
