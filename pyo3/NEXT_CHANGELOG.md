@@ -21,6 +21,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
   `AuthConfig::OAuthM2MPrivateKey`.
 - `Session(..., identity_federation_client_id=...)` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
+- `Statement.set_row_limit(...)` sets the SEA server-side row cap; passing
+  `None` clears it.
 
 ### Updated
 
