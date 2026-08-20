@@ -241,7 +241,7 @@ impl AuthorizationCodeProvider {
             scopes,
             vec![callback_port],
             callback_timeout,
-            None, // No token_endpoint override (discover)
+            None, // No token_endpoint override
             None, // On-disk cache disabled: no passphrase available here
         )
         .await
@@ -268,37 +268,11 @@ impl AuthorizationCodeProvider {
         token_endpoint_override: Option<String>,
         cache_passphrase: Option<String>,
     ) -> Result<Self> {
-        // Resolve the authorization + token endpoints. When the token endpoint
-        // is overridden, skip OIDC discovery and derive the authorize endpoint
-        // from it by swapping the trailing `/token` for `/authorize` (the two
-        // are siblings under a shared base for the OAuth2 v2.0 layout the
-        // override targets). This avoids a separate authorize override and a
-        // needless discovery round-trip. Otherwise discover both from the
-        // workspace OIDC config.
-        //
-        // The override MUST end in `/token`: the authorization-code flow needs a
-        // distinct authorize endpoint, and there is no reliable way to derive it
-        // from an arbitrary token URL. Rejecting the mismatch here surfaces a
-        // clear error instead of later POSTing the browser authorization request
-        // at the token endpoint and failing in a confusing way.
-        let (token_endpoint, auth_endpoint) = match token_endpoint_override {
-            Some(token) => {
-                let auth = token
-                    .strip_suffix("/token")
-                    .map(|base| format!("{base}/authorize"))
-                    .ok_or_else(|| {
-                        Error::invalid_argument().message(format!(
-                            "U2M token_endpoint override must end in `/token` so the \
-                             authorization endpoint can be derived, got: {token}"
-                        ))
-                    })?;
-                (token, auth)
-            }
-            None => {
-                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-                (endpoints.token_endpoint, endpoints.authorization_endpoint)
-            }
-        };
+        // Discover OIDC endpoints (unless token_endpoint is overridden, we still need auth endpoint)
+        let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+
+        // Use override if provided, otherwise use discovered endpoint
+        let token_endpoint = token_endpoint_override.unwrap_or(endpoints.token_endpoint);
 
         // Create token store
         let token_store = TokenStore::new();
@@ -330,7 +304,7 @@ impl AuthorizationCodeProvider {
             host: host.to_string(),
             client_id: client_id.to_string(),
             token_endpoint,
-            auth_endpoint,
+            auth_endpoint: endpoints.authorization_endpoint,
             token_store,
             http_client,
             scopes,
@@ -827,83 +801,6 @@ mod tests {
         assert!(
             result.is_err(),
             "Should fail when falling back to browser flow in unit test"
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_u2m_token_override_derives_authorize_and_skips_discovery() {
-        // When the token endpoint is overridden, OIDC discovery must be skipped
-        // entirely and the authorize endpoint derived from it (trailing
-        // `/token` → `/authorize`).
-        let mock_server = MockServer::start().await;
-
-        // Discovery must NOT be hit when the token endpoint is pinned.
-        Mock::given(method("GET"))
-            .and(path("/oidc/.well-known/oauth-authorization-server"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "authorization_endpoint": format!("{}/oidc/v1/authorize", mock_server.uri()),
-                "token_endpoint": format!("{}/oidc/v1/token", mock_server.uri()),
-            })))
-            .expect(0)
-            .mount(&mock_server)
-            .await;
-
-        let http_client = Arc::new(
-            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
-                .expect("Failed to create HTTP client"),
-        );
-
-        let token_endpoint = format!("{}/oidc/oauth2/v2.0/token", mock_server.uri());
-
-        let provider = AuthorizationCodeProvider::new_with_full_config(
-            &mock_server.uri(),
-            "azure-client-id",
-            http_client,
-            vec!["all-apis".to_string(), "offline_access".to_string()],
-            vec![8020],
-            Duration::from_secs(120),
-            Some(token_endpoint.clone()),
-            None, // On-disk cache disabled so no seeded token interferes.
-        )
-        .await
-        .expect("provider creation must not require discovery when the token endpoint is pinned");
-
-        // The pinned token endpoint is carried verbatim; the authorize endpoint
-        // is derived from it (discovery skipped).
-        assert_eq!(provider.token_endpoint, token_endpoint);
-        assert_eq!(
-            provider.auth_endpoint,
-            format!("{}/oidc/oauth2/v2.0/authorize", mock_server.uri())
-        );
-        // Discovery `.expect(0)` is verified on mock_server drop.
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn test_u2m_token_override_not_ending_in_token_is_rejected() {
-        // An override that does not end in `/token` cannot yield an authorize
-        // endpoint, so provider creation must fail with a clear error instead
-        // of silently falling back to the token URL for the browser flow.
-        let http_client = Arc::new(
-            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
-                .expect("Failed to create HTTP client"),
-        );
-
-        let result = AuthorizationCodeProvider::new_with_full_config(
-            "https://example.databricks.com",
-            "azure-client-id",
-            http_client,
-            vec!["all-apis".to_string()],
-            vec![8020],
-            Duration::from_secs(120),
-            Some("https://login.example.com/oauth2/v2.0/tokens".to_string()),
-            None,
-        )
-        .await;
-
-        let err = result.expect_err("override not ending in `/token` must be rejected");
-        assert!(
-            err.to_string().contains("must end in `/token`"),
-            "error should explain the `/token` requirement, got: {err}"
         );
     }
 }
