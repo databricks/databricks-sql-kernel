@@ -83,7 +83,6 @@ bindings just select the flow.
   the Thrift connector), so bindings forward only the credentials. Fields:
   `azure_client_id` / `azure_client_secret` (Entra app credentials, required),
   `azure_tenant_id` (optional — auto-discovered when omitted),
-  `azure_workspace_resource_id` (optional — see below),
   `identity_federation_client_id` (optional WIF). Construct via the
   `AuthConfig::azure_service_principal(...)` validating constructor. See
   `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
@@ -92,21 +91,19 @@ bindings just select the flow.
   `2ff814a6-…/.default` scope) still works and requires an explicit tenant;
   `azure-sp-m2m` is the preferred, zero-config-tenant flow.
 
-The Azure **management token** (`X-Databricks-Azure-SP-Management-Token`, paired
-with `X-Databricks-Azure-Workspace-Resource-Id`) is an optional add-on to
-`azure-sp-m2m`, gated on `azure_workspace_resource_id`. When that field is set,
-the kernel additionally fetches an Azure-management token and sends both headers,
+The `azure-sp-m2m` flow authenticates a workspace-member SP with the Databricks
+data token alone. (An Azure **management-token** add-on — sending
+`X-Databricks-Azure-SP-Management-Token` + `X-Databricks-Azure-Workspace-Resource-Id`
 so the control plane can authorize an SP that holds an Azure RBAC role but is not
-a workspace member. When it is unset (the common case), a workspace-member SP
-authenticates with the data token alone.
+a workspace member — is not implemented in v0.)
 
 The bindings expose the generic OAuth overrides as: pyo3 `token_url` /
 `oauth_scopes` / `client_id`; napi `oauthTokenUrl` / `oauthScopes` /
 `oauthClientId`; C ABI `kernel_session_config_set_oauth_token_endpoint` /
 `kernel_session_config_set_oauth_scopes` (+ the `set_auth_*` setters). The pyo3
 binding additionally exposes `azure-sp-m2m` via `auth_type="azure-sp-m2m"` with
-the `azure_client_id` / `azure_client_secret` / `azure_tenant_id` (optional) /
-`azure_workspace_resource_id` (optional) kwargs.
+the `azure_client_id` / `azure_client_secret` / `azure_tenant_id` (optional)
+kwargs.
 
 Two further variants are reserved but not usable in v0:
 `OAuthFederation` (RFC 8693 token exchange — returns `InvalidArgument`

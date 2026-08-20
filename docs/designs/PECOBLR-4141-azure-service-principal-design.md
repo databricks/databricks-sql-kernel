@@ -105,17 +105,18 @@ redirect available):
 - **Scope**: `{effective_app_id}/.default` (app id from the host's cloud).
 - **Credentials**: `azure_client_id` / `azure_client_secret` via HTTP Basic
   (Entra v2.0 advertises `client_secret_basic`; verified).
-- **Management token / `azure_workspace_resource_id`: implemented (optional
-  add-on).** When `azure_workspace_resource_id` is supplied, the kernel
-  additionally fetches an Azure-management token (scope
-  `https://management.core.windows.net/.default`) and emits the
+- **Management token / `azure_workspace_resource_id`: planned (optional
+  add-on), not yet implemented.** When supplied, the kernel would
+  additionally fetch an Azure-management token (scope
+  `https://management.core.windows.net/.default`) and emit the
   `X-Databricks-Azure-SP-Management-Token` +
-  `X-Databricks-Azure-Workspace-Resource-Id` header pair via the provider's
-  `extra_headers`, so the control plane can authorize an SP that holds an Azure
-  RBAC role but is not a workspace member. `azure_workspace_resource_id` is
-  optional and defaults to `None` (data token only — the common
-  workspace-member case). See `AZURE_MANAGEMENT_SCOPE` /
-  `AzureServicePrincipalProvider::extra_headers` in `src/auth/oauth/azure.rs`.
+  `X-Databricks-Azure-Workspace-Resource-Id` header pair, so the control
+  plane can authorize an SP that holds an Azure RBAC role but is not a
+  workspace member. It would be optional and default to `None` (data token
+  only — the common workspace-member case). This slice is not in the current
+  cut: the `AzureServicePrincipal` variant has no `azure_workspace_resource_id`
+  field yet, and no management-token support exists in
+  `src/auth/oauth/azure.rs`.
 
 ## Federation
 
@@ -140,7 +141,7 @@ AuthConfig::AzureServicePrincipal {   // azure-sp-m2m
     azure_client_id: String,
     azure_client_secret: String,
     azure_tenant_id: Option<String>,  // None → auto-discover via /aad/auth
-    azure_workspace_resource_id: Option<String>, // Some → also send SP management-token headers
+    // azure_workspace_resource_id: planned (management-token headers) — not in the current cut
     identity_federation_client_id: Option<String>,
 }
 ```

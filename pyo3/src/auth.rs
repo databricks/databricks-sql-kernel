@@ -14,7 +14,7 @@
 
 //! Translate Python auth kwargs into a kernel `AuthConfig`.
 //!
-//! Supports four `auth_type` values:
+//! Supports five `auth_type` values:
 //!
 //! - `"pat"` — personal access token (`access_token`).
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
@@ -26,6 +26,9 @@
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
 //!   optional `client_id` / `redirect_ports` / `scopes` / `token_url` /
 //!   `oauth_callback_timeout_secs`.
+//! - `"azure-sp-m2m"` — Azure Entra service-principal M2M:
+//!   `azure_client_id` + `azure_client_secret`, optional
+//!   `azure_tenant_id` (auto-discovered from the workspace when omitted).
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
 //! itself (OIDC discovery against the workspace host, transparent
@@ -141,7 +144,8 @@ const PYSQL_OAUTH_REDIRECT_PORT: u16 = 8020;
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
 /// constructor accepts.
 ///
-/// `auth_type` is one of `"pat"`, `"oauth-m2m"`, `"oauth-u2m"`. Thin
+/// `auth_type` is one of `"pat"`, `"oauth-m2m"`, `"oauth-m2m-jwt"`,
+/// `"oauth-u2m"`, `"azure-sp-m2m"`. Thin
 /// wrapper over [`build_auth_config_inner`] that maps its plain-`String`
 /// validation error onto a `PyValueError`. Keeping the logic in the
 /// inner fn lets the unit tests assert on the error text without an
