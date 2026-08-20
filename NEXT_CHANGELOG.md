@@ -65,6 +65,18 @@ changes go in their respective binding's NEXT_CHANGELOG.
   endpoint that is not the workspace's) no longer makes a needless round-trip
   to, or depends on, the workspace OIDC config.
 
+- **Breaking (OAuth U2M override semantics):** when a `token_url_override` is
+  set for the U2M authorization-code flow, OIDC discovery is now **skipped** and
+  the authorization endpoint is **derived** from the override by swapping a
+  trailing `/token` → `/authorize` (the OAuth2 v2.0 sibling layout the override
+  targets). Previously the kernel still ran discovery and used the *discovered*
+  `authorization_endpoint`, overriding only the token endpoint. Consequently the
+  override now **must end in `/token`** — a mismatch is rejected with
+  `InvalidArgument` at session open instead of failing later. Callers who set a
+  U2M `token_url` whose token path is not `/token`, or whose real authorize
+  endpoint is not the `/authorize` sibling of that token path, must update the
+  override (or drop it to fall back to discovery).
+
 - C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
   HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
   `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own
