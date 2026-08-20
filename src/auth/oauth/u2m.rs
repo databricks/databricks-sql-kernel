@@ -275,12 +275,23 @@ impl AuthorizationCodeProvider {
         // override targets). This avoids a separate authorize override and a
         // needless discovery round-trip. Otherwise discover both from the
         // workspace OIDC config.
+        //
+        // The override MUST end in `/token`: the authorization-code flow needs a
+        // distinct authorize endpoint, and there is no reliable way to derive it
+        // from an arbitrary token URL. Rejecting the mismatch here surfaces a
+        // clear error instead of later POSTing the browser authorization request
+        // at the token endpoint and failing in a confusing way.
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token) => {
                 let auth = token
                     .strip_suffix("/token")
                     .map(|base| format!("{base}/authorize"))
-                    .unwrap_or_else(|| token.clone());
+                    .ok_or_else(|| {
+                        Error::invalid_argument().message(format!(
+                            "U2M token_endpoint override must end in `/token` so the \
+                             authorization endpoint can be derived, got: {token}"
+                        ))
+                    })?;
                 (token, auth)
             }
             None => {
@@ -865,5 +876,34 @@ mod tests {
             format!("{}/oidc/oauth2/v2.0/authorize", mock_server.uri())
         );
         // Discovery `.expect(0)` is verified on mock_server drop.
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_u2m_token_override_not_ending_in_token_is_rejected() {
+        // An override that does not end in `/token` cannot yield an authorize
+        // endpoint, so provider creation must fail with a clear error instead
+        // of silently falling back to the token URL for the browser flow.
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+
+        let result = AuthorizationCodeProvider::new_with_full_config(
+            "https://example.databricks.com",
+            "azure-client-id",
+            http_client,
+            vec!["all-apis".to_string()],
+            vec![8020],
+            Duration::from_secs(120),
+            Some("https://login.example.com/oauth2/v2.0/tokens".to_string()),
+            None,
+        )
+        .await;
+
+        let err = result.expect_err("override not ending in `/token` must be rejected");
+        assert!(
+            err.to_string().contains("must end in `/token`"),
+            "error should explain the `/token` requirement, got: {err}"
+        );
     }
 }
