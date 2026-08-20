@@ -1280,48 +1280,6 @@ async fn build_base_auth_provider(
             .await?;
             Ok(Arc::new(provider))
         }
-        AuthConfig::AzureOAuthU2M {
-            client_id,
-            redirect_ports,
-            app_id,
-            callback_timeout,
-            token_cache,
-            ..
-        } => {
-            // The kernel owns Azure resolution (it is the auth core): pin the
-            // workspace **v2.0** token endpoint (the `AuthorizationCodeProvider`
-            // derives the authorize endpoint from it — the discovered
-            // /oidc/v1/authorize redirects to a malformed Entra URL), and fill
-            // the Azure app client id / port / delegated scope. No tenant needed
-            // for U2M (the workspace redirect resolves it).
-            use crate::auth::oauth::azure;
-            let client_id = client_id
-                .clone()
-                .unwrap_or_else(|| azure::AZURE_U2M_CLIENT_ID.to_string());
-            let callback_ports = match redirect_ports.as_deref() {
-                Some(ports) if !ports.is_empty() => ports.to_vec(),
-                _ => vec![azure::AZURE_U2M_REDIRECT_PORT],
-            };
-            let scopes = azure::u2m_scopes(app_id.as_deref());
-            let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
-            let cache_policy = token_cache
-                .clone()
-                .unwrap_or_default()
-                .resolve()
-                .map(|p| p.into_owned());
-            let provider = AuthorizationCodeProvider::new_with_full_config(
-                host,
-                &client_id,
-                http_client,
-                scopes,
-                callback_ports,
-                timeout,
-                Some(azure::u2m_token_url(host)),
-                cache_policy,
-            )
-            .await?;
-            Ok(Arc::new(provider))
-        }
         AuthConfig::AzureServicePrincipal {
             azure_client_id,
             azure_client_secret,

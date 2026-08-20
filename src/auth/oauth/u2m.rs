@@ -269,13 +269,12 @@ impl AuthorizationCodeProvider {
         cache_passphrase: Option<String>,
     ) -> Result<Self> {
         // Resolve the authorization + token endpoints. When the token endpoint
-        // is overridden (only the Azure `azure-oauth` flow does this, pinning
-        // the workspace v2.0 `{host}/oidc/oauth2/v2.0/token` path), skip OIDC
-        // discovery and derive the authorize endpoint from it by swapping the
-        // trailing `/token` for `/authorize`. This avoids a separate authorize
-        // override and the discovered `{host}/oidc/v1/authorize` path, which
-        // redirects to a malformed Entra URL for the Azure client. Otherwise
-        // discover both from the workspace OIDC config.
+        // is overridden, skip OIDC discovery and derive the authorize endpoint
+        // from it by swapping the trailing `/token` for `/authorize` (the two
+        // are siblings under a shared base for the OAuth2 v2.0 layout the
+        // override targets). This avoids a separate authorize override and a
+        // needless discovery round-trip. Otherwise discover both from the
+        // workspace OIDC config.
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token) => {
                 let auth = token
@@ -822,11 +821,9 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn test_u2m_token_override_derives_authorize_and_skips_discovery() {
-        // The Azure `azure-oauth` flow pins the v2.0 token endpoint (the
-        // discovered `{host}/oidc/v1/authorize` redirects to a malformed Entra
-        // URL for the Azure client). When the token endpoint is overridden, OIDC
-        // discovery must be skipped entirely and the authorize endpoint derived
-        // from it (trailing `/token` → `/authorize`).
+        // When the token endpoint is overridden, OIDC discovery must be skipped
+        // entirely and the authorize endpoint derived from it (trailing
+        // `/token` → `/authorize`).
         let mock_server = MockServer::start().await;
 
         // Discovery must NOT be hit when the token endpoint is pinned.

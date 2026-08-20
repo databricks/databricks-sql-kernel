@@ -325,59 +325,6 @@ fn build_auth_config_inner(
                 oauth.identity_federation_client_id,
             ))
         }
-        "azure-oauth" => {
-            // Azure Entra U2M. The kernel owns Azure resolution (it is the
-            // auth core): it pins the workspace v2.0 authorize/token endpoints,
-            // the Azure app client id, port 8030, and the
-            // `{app_id}/user_impersonation offline_access` scope. The binding
-            // only forwards optional overrides — no endpoint/scope construction
-            // here. The `app_id` scope-resource override (the connector's
-            // `DATABRICKS_AZURE_TENANT_ID`) is NOT yet forwarded from Python:
-            // we always pass `None` below so the kernel default applies. A
-            // dedicated kwarg can wire it through if a caller needs to override
-            // it; `token_url` is not consulted for this flow.
-            if matches!(oauth.client_id.as_deref(), Some("")) {
-                return Err("auth_type='azure-oauth' client_id must be non-empty when set; \
-                            omit it to use the default Azure app"
-                    .to_owned());
-            }
-            // `redirect_ports` / `callback_timeout_secs` carry the same U2M
-            // semantics here as in the `oauth-u2m` arm, so reject the same
-            // present-yet-degenerate shapes: a 0 timeout times the browser
-            // flow out immediately, and an empty list / 0 port entry binds an
-            // ephemeral port that can't match the IdP's static redirect_uri.
-            if oauth.callback_timeout_secs == Some(0) {
-                return Err(
-                    "auth_type='azure-oauth' oauth_callback_timeout_secs must be > 0 when set \
-                     (0 would time out the browser flow immediately); omit it for the default"
-                        .to_owned(),
-                );
-            }
-            if let Some(ports) = oauth.redirect_ports.as_deref() {
-                if ports.is_empty() {
-                    return Err(
-                        "auth_type='azure-oauth' redirect_ports must be non-empty when set; \
-                         omit it for the default"
-                            .to_owned(),
-                    );
-                }
-                if ports.contains(&0) {
-                    return Err(
-                        "auth_type='azure-oauth' redirect_ports entries must be non-zero \
-                         (each must be a static port the IdP redirect_uri can match)"
-                            .to_owned(),
-                    );
-                }
-            }
-            Ok(AuthConfig::azure_oauth_u2m(
-                oauth.client_id,
-                oauth.redirect_ports,
-                None, // app_id: kernel default (2ff814a6-…) / DATABRICKS_AZURE_TENANT_ID
-                oauth.callback_timeout_secs.map(Duration::from_secs),
-                None, // token_cache: kernel default (enabled, machine-local key)
-                oauth.identity_federation_client_id,
-            ))
-        }
         "azure-sp-m2m" => {
             // Azure Entra service-principal M2M. The kernel owns Azure
             // resolution: it builds the Entra token endpoint + `.default`
@@ -394,7 +341,7 @@ fn build_auth_config_inner(
         }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', \
-             'oauth-m2m-jwt', 'oauth-u2m', 'azure-oauth', 'azure-sp-m2m'"
+             'oauth-m2m-jwt', 'oauth-u2m', 'azure-sp-m2m'"
         )),
     }
 }
@@ -815,54 +762,6 @@ mod tests {
             err.contains("oauth_callback_timeout_secs must be > 0"),
             "{err}"
         );
-    }
-
-    #[test]
-    fn azure_oauth_rejects_zero_callback_timeout() {
-        let err = build_auth_config_inner(
-            "azure-oauth",
-            None,
-            OAuthParams {
-                callback_timeout_secs: Some(0),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("oauth_callback_timeout_secs must be > 0"),
-            "{err}"
-        );
-    }
-
-    #[test]
-    fn azure_oauth_rejects_empty_redirect_ports() {
-        let err = build_auth_config_inner(
-            "azure-oauth",
-            None,
-            OAuthParams {
-                redirect_ports: Some(vec![]),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(
-            err.contains("redirect_ports must be non-empty"),
-            "got: {err}"
-        );
-    }
-
-    #[test]
-    fn azure_oauth_rejects_zero_in_redirect_ports() {
-        let err = build_auth_config_inner(
-            "azure-oauth",
-            None,
-            OAuthParams {
-                redirect_ports: Some(vec![8020, 0]),
-                ..Default::default()
-            },
-        )
-        .unwrap_err();
-        assert!(err.contains("non-zero"), "got: {err}");
     }
 
     #[test]

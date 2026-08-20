@@ -18,47 +18,16 @@
 //! Azure endpoints, scopes, and app ids, that knowledge lives here once and is
 //! shared by every binding (mirroring how the Go driver's core infers the
 //! cloud). This module holds the Azure constants and the endpoint/scope
-//! builders used by the `azure-oauth` (U2M) and `azure-sp-m2m` (M2M) flows.
+//! builders used by the `azure-sp-m2m` (service-principal M2M) flow.
 //!
-//! **U2M (`azure-oauth`)** uses the **workspace-hosted v2.0** endpoints
-//! (`{host}/oidc/oauth2/v2.0/{authorize,token}`) — the same pattern the Go
-//! driver uses. The workspace redirects the browser to Entra, so no tenant is
-//! needed. This is deliberately NOT the OIDC-discovered `{host}/oidc/v1/authorize`
-//! path: a live test showed the workspace redirects that to a malformed
-//! `login.microsoftonline.com/{tenant}/v1/authorize` (404), whereas the
-//! `/oidc/oauth2/v2.0/authorize` path redirects to a valid Entra URL.
+//! (Azure U2M has no dedicated flow: the in-house `databricks-oauth` browser
+//! flow works against Azure workspaces, so it is the default there.)
 
 /// Databricks first-party "Azure Databricks" application id (production). Used
-/// as the default resource in the U2M delegated scope and as the M2M `.default`
-/// resource. Constant across clouds for the scope; the connector's
-/// `DATABRICKS_AZURE_TENANT_ID` env override maps onto the `app_id` argument.
+/// as the M2M `{app_id}/.default` scope resource fallback. Constant across
+/// clouds; the connector's `DATABRICKS_AZURE_TENANT_ID` env override maps onto
+/// the resource app id.
 pub(crate) const AZURE_DATABRICKS_APP_ID: &str = "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d";
-
-/// OAuth client id for the Azure U2M browser flow. Matches the connectors'
-/// `PYSQL_OAUTH_AZURE_CLIENT_ID` / Go's `azureClientId`.
-pub(crate) const AZURE_U2M_CLIENT_ID: &str = "96eecda7-19ea-49cc-abb5-240097d554f5";
-
-/// Default localhost redirect port registered for [`AZURE_U2M_CLIENT_ID`].
-pub(crate) const AZURE_U2M_REDIRECT_PORT: u16 = 8030;
-
-/// The workspace-hosted v2.0 **token** endpoint for the Azure U2M flow. The
-/// authorize endpoint is derived from this by the `AuthorizationCodeProvider`
-/// (swapping the trailing `/token` for `/authorize`), so there is no separate
-/// authorize builder.
-pub(crate) fn u2m_token_url(host: &str) -> String {
-    format!("{}/oidc/oauth2/v2.0/token", host.trim_end_matches('/'))
-}
-
-/// The AAD delegated scope set for U2M: `{app_id}/user_impersonation` plus
-/// `offline_access` (so a refresh token is issued). `app_id` defaults to
-/// [`AZURE_DATABRICKS_APP_ID`] when the caller doesn't override it.
-pub(crate) fn u2m_scopes(app_id: Option<&str>) -> Vec<String> {
-    let app = app_id.unwrap_or(AZURE_DATABRICKS_APP_ID);
-    vec![
-        format!("{app}/user_impersonation"),
-        "offline_access".to_string(),
-    ]
-}
 
 // ─── M2M (azure-sp-m2m) ──────────────────────────────────────────────────────
 
@@ -250,45 +219,6 @@ fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Resul
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn u2m_token_url_is_workspace_v2_path() {
-        // The v2.0 path is the fix for the live 404: the discovered
-        // /oidc/v1/token path's sibling authorize redirects to a malformed Entra
-        // URL, whereas /oidc/oauth2/v2.0/{token,authorize} does not.
-        let host = "https://adb-123.4.azuredatabricks.net";
-        assert_eq!(
-            u2m_token_url(host),
-            "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/token"
-        );
-    }
-
-    #[test]
-    fn u2m_token_url_normalises_trailing_slash() {
-        let host = "https://adb-123.4.azuredatabricks.net/";
-        assert_eq!(
-            u2m_token_url(host),
-            "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/token"
-        );
-    }
-
-    #[test]
-    fn u2m_scopes_default_to_databricks_app_impersonation() {
-        assert_eq!(
-            u2m_scopes(None),
-            vec![
-                format!("{AZURE_DATABRICKS_APP_ID}/user_impersonation"),
-                "offline_access".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn u2m_scopes_honour_app_id_override() {
-        let scopes = u2m_scopes(Some("custom-app-id"));
-        assert_eq!(scopes[0], "custom-app-id/user_impersonation");
-        assert_eq!(scopes[1], "offline_access");
-    }
 
     #[test]
     fn m2m_token_url_is_entra_v2_per_tenant() {

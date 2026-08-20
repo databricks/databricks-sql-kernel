@@ -360,33 +360,6 @@ pub enum AuthConfig {
         identity_federation_client_id: Option<String>,
     },
 
-    /// Azure Entra ID user-to-machine (browser) auth — the `azure-oauth`
-    /// flow. Unlike [`Self::OAuthU2M`] (Databricks-native OIDC), this uses
-    /// the workspace's **v2.0** authorize/token endpoints
-    /// (`{host}/oidc/oauth2/v2.0/{authorize,token}`), which the workspace
-    /// redirects to Microsoft Entra, and the Azure delegated scope
-    /// `{app_id}/user_impersonation offline_access`. The kernel resolves all
-    /// of that from the host, so bindings only forward the (optional)
-    /// overrides. No tenant is needed (the workspace redirect resolves it).
-    AzureOAuthU2M {
-        /// OAuth client id. `None` → the Azure Databricks app
-        /// (`96eecda7-…`).
-        client_id: Option<String>,
-        /// Candidate localhost callback ports. `None`/empty → `[8030]`.
-        redirect_ports: Option<Vec<u16>>,
-        /// Resource app id used in the `{app_id}/user_impersonation` scope.
-        /// `None` → the Azure Databricks app id (`2ff814a6-…`); a binding
-        /// forwards the `DATABRICKS_AZURE_TENANT_ID` override here.
-        app_id: Option<String>,
-        /// How long to wait for the browser callback. `None` → 120s.
-        callback_timeout: Option<std::time::Duration>,
-        /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`].
-        token_cache: Option<TokenCacheConfig>,
-        /// SP-wide Workload Identity Federation client id, forwarded to the
-        /// federation wrapper.
-        identity_federation_client_id: Option<String>,
-    },
-
     /// Azure Entra ID **service-principal** machine-to-machine auth — the
     /// `azure-sp-m2m` flow. Client-credentials against Entra directly
     /// (`{login_host}/{tenant}/oauth2/v2.0/token`) with the Azure app
@@ -542,30 +515,6 @@ impl AuthConfig {
         }
     }
 
-    /// Construct a [`AuthConfig::AzureOAuthU2M`] (the `azure-oauth` browser
-    /// flow) from optional fields. All fields are optional — the kernel fills
-    /// the Azure app client id (`96eecda7-…`), port `8030`, and the
-    /// `{app_id}/user_impersonation offline_access` scope — so this performs no
-    /// validation and exists for symmetry with the other constructors so
-    /// bindings can forward optionals uniformly.
-    pub fn azure_oauth_u2m(
-        client_id: Option<String>,
-        redirect_ports: Option<Vec<u16>>,
-        app_id: Option<String>,
-        callback_timeout: Option<std::time::Duration>,
-        token_cache: Option<TokenCacheConfig>,
-        identity_federation_client_id: Option<String>,
-    ) -> Self {
-        AuthConfig::AzureOAuthU2M {
-            client_id,
-            redirect_ports,
-            app_id,
-            callback_timeout,
-            token_cache,
-            identity_federation_client_id,
-        }
-    }
-
     /// Construct a [`AuthConfig::AzureServicePrincipal`] (the `azure-sp-m2m`
     /// flow), validating that the Entra `azure_client_id` / `azure_client_secret`
     /// are present and non-empty. `azure_tenant_id` is optional (the kernel
@@ -607,10 +556,6 @@ impl AuthConfig {
                 ..
             }
             | Self::OAuthU2M {
-                identity_federation_client_id,
-                ..
-            }
-            | Self::AzureOAuthU2M {
                 identity_federation_client_id,
                 ..
             }
@@ -724,22 +669,6 @@ impl std::fmt::Debug for AuthConfig {
                 .field("client_id", client_id)
                 .field("redirect_ports", redirect_ports)
                 .field("scopes", scopes)
-                .field(
-                    "identity_federation_client_id",
-                    identity_federation_client_id,
-                )
-                .finish(),
-            Self::AzureOAuthU2M {
-                client_id,
-                redirect_ports,
-                app_id,
-                identity_federation_client_id,
-                ..
-            } => f
-                .debug_struct("AzureOAuthU2M")
-                .field("client_id", client_id)
-                .field("redirect_ports", redirect_ports)
-                .field("app_id", app_id)
                 .field(
                     "identity_federation_client_id",
                     identity_federation_client_id,
