@@ -160,12 +160,13 @@ pub struct ConnectionOptions {
     /// OAuth scopes override (M2M / U2M). Omitted ⇒ kernel defaults
     /// (`["all-apis"]` for M2M; `["sql", "offline_access"]` for U2M).
     pub oauth_scopes: Option<Vec<String>>,
-    /// OAuth token-endpoint override (M2M / U2M / M2M-JWT). Points the token
-    /// exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
-    /// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an
-    /// Azure service principal. Omitted ⇒ OIDC discovery against the workspace
-    /// host. Ignored for [`AuthMode::Pat`].
-    pub oauth_token_url: Option<String>,
+    /// OAuth token endpoint override. When omitted the kernel discovers the
+    /// endpoint via the workspace's OIDC configuration. Set it to point the
+    /// client-credentials / JWT client-assertion grant at the workspace's
+    /// configured IdP token endpoint (e.g. Entra ID for Azure Databricks),
+    /// which is required when that IdP — not Databricks-native OIDC — is the
+    /// authority for [`AuthMode::OAuthM2m`] / [`AuthMode::OAuthM2mJwt`].
+    pub token_url: Option<String>,
     /// Path to the PEM private-key file. Required for
     /// [`AuthMode::OAuthM2mJwt`].
     pub jwt_key_file: Option<String>,
@@ -367,7 +368,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.oauth_client_id.clone(),
             options.oauth_client_secret.clone(),
             options.oauth_scopes.clone(),
-            options.oauth_token_url.clone(),
+            options.token_url.clone(),
             options.identity_federation_client_id.clone(),
         )
         .map_err(napi_err_from_kernel),
@@ -382,7 +383,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
             options.jwt_passphrase.clone(),
             options.jwt_algorithm.clone(),
             options.oauth_scopes.clone(),
-            options.oauth_token_url.clone(),
+            options.token_url.clone(),
         )
         .map_err(napi_err_from_kernel),
         // napi injects no client_id/scope default: it rides the kernel's
@@ -413,7 +414,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                     .filter(|&p| p != 0)
                     .map(|p| vec![p]),
                 options.oauth_scopes.clone(),
-                options.oauth_token_url.clone(),
+                options.token_url.clone(),
                 None,
                 // `None` takes the kernel default: on-disk cache enabled,
                 // encrypted under a machine-local derived key since this
@@ -638,7 +639,7 @@ mod tests {
             oauth_client_secret: None,
             oauth_redirect_port: None,
             oauth_scopes: None,
-            oauth_token_url: None,
+            token_url: None,
             jwt_key_file: None,
             jwt_kid: None,
             jwt_passphrase: None,
@@ -730,8 +731,8 @@ mod tests {
     }
 
     #[test]
-    fn oauth_token_url_forwards_as_token_url_override() {
-        // `oauthTokenUrl` must reach the built AuthConfig as
+    fn token_url_forwards_as_override() {
+        // `tokenUrl` must reach the built AuthConfig as
         // `token_url_override` for M2M, M2M-JWT, and U2M, so a Node caller can point
         // the token exchange at an Azure/Entra endpoint. Omitting it leaves the
         // override `None` (kernel OIDC discovery).
@@ -741,7 +742,7 @@ mod tests {
         m2m.auth_mode = Some(AuthMode::OAuthM2m);
         m2m.oauth_client_id = Some("cid".to_owned());
         m2m.oauth_client_secret = Some("sec".to_owned());
-        m2m.oauth_token_url = Some(endpoint.to_owned());
+        m2m.token_url = Some(endpoint.to_owned());
         match build_auth_config(&m2m).unwrap() {
             AuthConfig::OAuthM2M {
                 token_url_override, ..
@@ -751,7 +752,7 @@ mod tests {
 
         let mut u2m = base();
         u2m.auth_mode = Some(AuthMode::OAuthU2m);
-        u2m.oauth_token_url = Some(endpoint.to_owned());
+        u2m.token_url = Some(endpoint.to_owned());
         match build_auth_config(&u2m).unwrap() {
             AuthConfig::OAuthU2M {
                 token_url_override, ..
@@ -764,7 +765,7 @@ mod tests {
         jwt.oauth_client_id = Some("cid".to_owned());
         jwt.jwt_key_file = Some("/k.pem".to_owned());
         jwt.jwt_kid = Some("kid".to_owned());
-        jwt.oauth_token_url = Some(endpoint.to_owned());
+        jwt.token_url = Some(endpoint.to_owned());
         match build_auth_config(&jwt).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 token_url_override, ..
@@ -828,6 +829,8 @@ mod tests {
         o.jwt_passphrase = Some("pass".to_owned());
         o.jwt_algorithm = Some("ES256".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
+        let token_url = "https://idp.example/token";
+        o.token_url = Some(token_url.to_owned());
         match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 client_id,
@@ -836,6 +839,7 @@ mod tests {
                 jwt_passphrase,
                 jwt_algorithm,
                 scopes,
+                token_url_override,
                 ..
             } => {
                 assert_eq!(client_id, "cid");
@@ -844,6 +848,7 @@ mod tests {
                 assert_eq!(jwt_passphrase.as_deref(), Some("pass"));
                 assert_eq!(jwt_algorithm.as_deref(), Some("ES256"));
                 assert_eq!(scopes, Some(vec!["all-apis".to_owned()]));
+                assert_eq!(token_url_override.as_deref(), Some(token_url));
             }
             other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
         }

@@ -36,3 +36,7 @@ def test_exports_expected_classes():
     }
     actual = {n for n in dir(k) if not n.startswith("_")}
     assert expected.issubset(actual), f"missing exports: {expected - actual}"
+
+
+def test_statement_exposes_row_limit():
+    assert callable(k.Statement.set_row_limit)

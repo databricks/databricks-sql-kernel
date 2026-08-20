@@ -211,13 +211,14 @@ export interface ConnectionOptions {
    */
   oauthScopes?: Array<string>
   /**
-   * OAuth token-endpoint override (M2M / U2M / M2M-JWT). Points the token
-   * exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
-   * `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an Azure
-   * service principal. Omitted ⇒ OIDC discovery against the workspace host.
-   * Ignored for `Pat`.
+   * OAuth token endpoint override. When omitted the kernel discovers the
+   * endpoint via the workspace's OIDC configuration. Set it to point the
+   * client-credentials / JWT client-assertion grant at the workspace's
+   * configured IdP token endpoint (e.g. Entra ID for Azure Databricks),
+   * which is required when that IdP — not Databricks-native OIDC — is the
+   * authority for [`AuthMode::OAuthM2m`] / [`AuthMode::OAuthM2mJwt`].
    */
-  oauthTokenUrl?: string
+  tokenUrl?: string
   /**
    * Path to the PEM private-key file. Required for
    * [`AuthMode::OAuthM2mJwt`].

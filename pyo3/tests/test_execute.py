@@ -58,6 +58,22 @@ def test_range_drains_to_pyarrow_table(session):
         stmt.close()
 
 
+@pytest.mark.parametrize("row_limit", [None, 1, 5])
+@live
+def test_row_limit(session, row_limit):
+    stmt = session.statement()
+    stmt.set_sql("SELECT id FROM range(10) ORDER BY id")
+    stmt.set_row_limit(row_limit)
+    exec_ = stmt.execute()
+    try:
+        table = exec_.fetch_all_arrow()
+        expected = list(range(10 if row_limit is None else row_limit))
+        assert table.column(0).to_pylist() == expected
+    finally:
+        exec_.close()
+        stmt.close()
+
+
 @live
 def test_executed_statement_double_close_is_idempotent(session):
     stmt = session.statement()
