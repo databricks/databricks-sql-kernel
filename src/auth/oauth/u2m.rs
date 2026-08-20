@@ -241,9 +241,8 @@ impl AuthorizationCodeProvider {
             scopes,
             vec![callback_port],
             callback_timeout,
-            None, // No token_endpoint override
+            None, // No token_endpoint override (discover)
             None, // On-disk cache disabled: no passphrase available here
-            None, // No authorization_endpoint override (discover)
         )
         .await
     }
@@ -268,26 +267,28 @@ impl AuthorizationCodeProvider {
         callback_timeout: Duration,
         token_endpoint_override: Option<String>,
         cache_passphrase: Option<String>,
-        authorization_endpoint_override: Option<String>,
     ) -> Result<Self> {
-        // Resolve the authorization + token endpoints. When BOTH are
-        // overridden (the Azure `azure-oauth` flow pins the workspace v2.0
-        // `{host}/oidc/oauth2/v2.0/{authorize,token}` paths), skip OIDC
-        // discovery entirely — the discovered `{host}/oidc/v1/authorize`
-        // redirects to a malformed Entra URL for the Azure client, so the
-        // caller must be able to pin the v2.0 authorize path. Otherwise
-        // discover and let either override fill in.
-        let (token_endpoint, auth_endpoint) =
-            match (token_endpoint_override, authorization_endpoint_override) {
-                (Some(token), Some(auth)) => (token, auth),
-                (token_override, auth_override) => {
-                    let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-                    (
-                        token_override.unwrap_or(endpoints.token_endpoint),
-                        auth_override.unwrap_or(endpoints.authorization_endpoint),
-                    )
-                }
-            };
+        // Resolve the authorization + token endpoints. When the token endpoint
+        // is overridden (only the Azure `azure-oauth` flow does this, pinning
+        // the workspace v2.0 `{host}/oidc/oauth2/v2.0/token` path), skip OIDC
+        // discovery and derive the authorize endpoint from it by swapping the
+        // trailing `/token` for `/authorize`. This avoids a separate authorize
+        // override and the discovered `{host}/oidc/v1/authorize` path, which
+        // redirects to a malformed Entra URL for the Azure client. Otherwise
+        // discover both from the workspace OIDC config.
+        let (token_endpoint, auth_endpoint) = match token_endpoint_override {
+            Some(token) => {
+                let auth = token
+                    .strip_suffix("/token")
+                    .map(|base| format!("{base}/authorize"))
+                    .unwrap_or_else(|| token.clone());
+                (token, auth)
+            }
+            None => {
+                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+                (endpoints.token_endpoint, endpoints.authorization_endpoint)
+            }
+        };
 
         // Create token store
         let token_store = TokenStore::new();
@@ -678,7 +679,6 @@ mod tests {
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
-            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
@@ -732,7 +732,6 @@ mod tests {
             Duration::from_secs(120),
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
-            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
@@ -802,7 +801,6 @@ mod tests {
             Duration::from_secs(5), // Short timeout for test
             None,
             Some(TEST_CACHE_PASSPHRASE.to_string()),
-            None, // No authorization_endpoint override
         )
         .await
         .expect("Failed to create provider");
@@ -823,15 +821,15 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_u2m_both_overrides_skip_discovery() {
-        // The Azure `azure-oauth` flow pins BOTH the v2.0 authorize and token
-        // endpoints because the discovered `{host}/oidc/v1/authorize`
-        // redirects to a malformed Entra URL for the Azure client. When both
-        // overrides are set, OIDC discovery must be skipped entirely and the
-        // provider must carry the pinned endpoints verbatim.
+    async fn test_u2m_token_override_derives_authorize_and_skips_discovery() {
+        // The Azure `azure-oauth` flow pins the v2.0 token endpoint (the
+        // discovered `{host}/oidc/v1/authorize` redirects to a malformed Entra
+        // URL for the Azure client). When the token endpoint is overridden, OIDC
+        // discovery must be skipped entirely and the authorize endpoint derived
+        // from it (trailing `/token` → `/authorize`).
         let mock_server = MockServer::start().await;
 
-        // Discovery must NOT be hit when both endpoints are pinned.
+        // Discovery must NOT be hit when the token endpoint is pinned.
         Mock::given(method("GET"))
             .and(path("/oidc/.well-known/oauth-authorization-server"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -848,7 +846,6 @@ mod tests {
         );
 
         let token_endpoint = format!("{}/oidc/oauth2/v2.0/token", mock_server.uri());
-        let auth_endpoint = format!("{}/oidc/oauth2/v2.0/authorize", mock_server.uri());
 
         let provider = AuthorizationCodeProvider::new_with_full_config(
             &mock_server.uri(),
@@ -859,14 +856,17 @@ mod tests {
             Duration::from_secs(120),
             Some(token_endpoint.clone()),
             None, // On-disk cache disabled so no seeded token interferes.
-            Some(auth_endpoint.clone()),
         )
         .await
-        .expect("provider creation must not require discovery when both endpoints are pinned");
+        .expect("provider creation must not require discovery when the token endpoint is pinned");
 
-        // The pinned v2.0 endpoints are carried verbatim (discovery skipped).
+        // The pinned token endpoint is carried verbatim; the authorize endpoint
+        // is derived from it (discovery skipped).
         assert_eq!(provider.token_endpoint, token_endpoint);
-        assert_eq!(provider.auth_endpoint, auth_endpoint);
+        assert_eq!(
+            provider.auth_endpoint,
+            format!("{}/oidc/oauth2/v2.0/authorize", mock_server.uri())
+        );
         // Discovery `.expect(0)` is verified on mock_server drop.
     }
 }

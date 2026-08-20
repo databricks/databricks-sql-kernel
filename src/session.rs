@@ -1276,7 +1276,6 @@ async fn build_base_auth_provider(
                 timeout,
                 token_url_override.clone(),
                 cache_policy,
-                None, // Databricks-native U2M: discover the authorize endpoint
             )
             .await?;
             Ok(Arc::new(provider))
@@ -1290,10 +1289,11 @@ async fn build_base_auth_provider(
             ..
         } => {
             // The kernel owns Azure resolution (it is the auth core): pin the
-            // workspace **v2.0** authorize+token endpoints (the workspace
-            // redirects them to Entra — the discovered /oidc/v1/authorize
-            // redirects to a malformed Entra URL), and fill the Azure app
-            // client id / port / delegated scope. No tenant needed for U2M.
+            // workspace **v2.0** token endpoint (the `AuthorizationCodeProvider`
+            // derives the authorize endpoint from it — the discovered
+            // /oidc/v1/authorize redirects to a malformed Entra URL), and fill
+            // the Azure app client id / port / delegated scope. No tenant needed
+            // for U2M (the workspace redirect resolves it).
             use crate::auth::oauth::azure;
             let client_id = client_id
                 .clone()
@@ -1318,7 +1318,6 @@ async fn build_base_auth_provider(
                 timeout,
                 Some(azure::u2m_token_url(host)),
                 cache_policy,
-                Some(azure::u2m_authorize_url(host)),
             )
             .await?;
             Ok(Arc::new(provider))
@@ -1327,17 +1326,16 @@ async fn build_base_auth_provider(
             azure_client_id,
             azure_client_secret,
             azure_tenant_id,
-            azure_workspace_resource_id,
             ..
         } => {
             // Kernel owns Azure resolution: build the Entra token endpoint
             // ({login}/{tenant}/oauth2/v2.0/token) and the {app_id}/.default
             // scope, discovering the tenant from the workspace's /aad/auth
-            // redirect when the caller omits it (Thrift parity). When a
-            // workspace resource id is supplied, the provider also emits the
-            // management-token pair (for RBAC-only SPs); otherwise it sends the
-            // data token alone.
-            use crate::auth::oauth::azure::AzureServicePrincipalProvider;
+            // redirect when the caller omits it (Thrift parity). This is a plain
+            // client-credentials grant against Entra with the Databricks-audience
+            // data token — the SP must be a workspace member (RBAC-only SPs, via
+            // the Azure management token, are a planned follow-up).
+            use crate::auth::oauth::azure;
             if azure_client_id.is_empty() || azure_client_secret.is_empty() {
                 return Err(Error::invalid_argument().message(
                     "AuthConfig::AzureServicePrincipal requires non-empty \
@@ -1352,15 +1350,15 @@ async fn build_base_auth_provider(
             crate::auth::oauth::azure::reject_sovereign_host_for_sp_m2m(host)?;
             let tenant = match azure_tenant_id {
                 Some(t) if !t.is_empty() => t.clone(),
-                _ => crate::auth::oauth::azure::discover_tenant(host, &http_client).await?,
+                _ => azure::discover_tenant(host, &http_client).await?,
             };
-            let provider = AzureServicePrincipalProvider::new(
+            let provider = ClientCredentialsProvider::new_with_full_config(
                 host,
                 azure_client_id,
                 azure_client_secret,
-                &tenant,
-                azure_workspace_resource_id.clone(),
                 http_client,
+                vec![azure::sp_m2m_scope(host)],
+                Some(azure::sp_m2m_token_url(&tenant)),
             )
             .await?;
             Ok(Arc::new(provider))

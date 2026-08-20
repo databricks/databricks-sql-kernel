@@ -17,26 +17,22 @@ changes go in their respective binding's NEXT_CHANGELOG.
   endpoints (`{host}/oidc/oauth2/v2.0/{authorize,token}`, which the workspace
   redirects to Entra), the Azure app client id (`96eecda7-…`), port `8030`, and
   the `{app_id}/user_impersonation offline_access` scope — so bindings only
-  forward the selector. The U2M provider gained an authorization-endpoint
-  override so the Azure path pins `/oidc/oauth2/v2.0/authorize` instead of the
-  discovered `/oidc/v1/authorize` (which an Azure workspace redirects to a
-  malformed Entra URL). Live-verified end-to-end against an Azure workspace.
-  (PECOBLR-4120.)
+  forward the selector. The U2M provider derives the authorize endpoint from the
+  pinned token endpoint (swapping the trailing `/token` for `/authorize`), so the
+  Azure path uses `/oidc/oauth2/v2.0/authorize` instead of the discovered
+  `/oidc/v1/authorize` (which an Azure workspace redirects to a malformed Entra
+  URL). Live-verified end-to-end against an Azure workspace. (PECOBLR-4120.)
 
 - Azure Entra service-principal M2M (`azure-sp-m2m`) is now a kernel-owned flow
   (`AuthConfig::AzureServicePrincipal` / pyo3 `auth_type="azure-sp-m2m"`). The
   kernel resolves the Entra token endpoint (`{login}/{tenant}/oauth2/v2.0/token`)
   and the `{effective_app_id}/.default` scope, and auto-discovers the tenant from
   the workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted (Thrift
-  parity) — so bindings forward only the SP credentials. The Azure
-  management-token pair (`X-Databricks-Azure-SP-Management-Token` +
-  `X-Databricks-Azure-Workspace-Resource-Id`) is an optional add-on gated on
-  `azure_workspace_resource_id`: set it and the kernel fetches a second Entra
-  token (ARM `.default` scope) so an SP holding only an Azure RBAC role (not a
-  workspace member) can authenticate; omit it and the SP uses the data token
-  alone. A new `AuthProvider::extra_headers()` carries the dynamic pair. Common
-  case (tenant auto-discovered, data token only) live-verified end-to-end against
-  an Azure workspace. (PECOBLR-4141.)
+  parity) — so bindings forward only the SP credentials. A plain
+  client-credentials grant against Entra yields the Databricks-audience data
+  token; the SP must be a workspace member. (RBAC-only SPs via the Azure
+  management token are a planned follow-up.) Live-verified end-to-end against an
+  Azure workspace. (PECOBLR-4141.)
 
 - Generic Azure/Entra OAuth overrides (the pre-dedicated-flow path, still valid
   for custom setups where a caller pins the endpoint/scope itself). New C ABI

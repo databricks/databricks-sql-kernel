@@ -425,13 +425,6 @@ impl Drop for ExchangeGuard<'_> {
 }
 
 impl AuthProvider for FederationProvider {
-    /// Delegate extra headers (e.g. the Azure SP management-token pair) to the
-    /// wrapped provider — the federation exchange only rewrites the bearer, not
-    /// the accompanying headers.
-    fn extra_headers(&self) -> Result<Vec<(String, String)>> {
-        self.inner.extra_headers()
-    }
-
     fn get_auth_header(&self) -> Result<String> {
         let header = self.inner.get_auth_header()?;
 

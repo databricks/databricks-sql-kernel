@@ -41,13 +41,10 @@ pub(crate) const AZURE_U2M_CLIENT_ID: &str = "96eecda7-19ea-49cc-abb5-240097d554
 /// Default localhost redirect port registered for [`AZURE_U2M_CLIENT_ID`].
 pub(crate) const AZURE_U2M_REDIRECT_PORT: u16 = 8030;
 
-/// The workspace-hosted v2.0 **authorize** endpoint for the Azure U2M flow.
-/// The workspace redirects this to the tenant's Entra authorize URL.
-pub(crate) fn u2m_authorize_url(host: &str) -> String {
-    format!("{}/oidc/oauth2/v2.0/authorize", host.trim_end_matches('/'))
-}
-
-/// The workspace-hosted v2.0 **token** endpoint for the Azure U2M flow.
+/// The workspace-hosted v2.0 **token** endpoint for the Azure U2M flow. The
+/// authorize endpoint is derived from this by the `AuthorizationCodeProvider`
+/// (swapping the trailing `/token` for `/authorize`), so there is no separate
+/// authorize builder.
 pub(crate) fn u2m_token_url(host: &str) -> String {
     format!("{}/oidc/oauth2/v2.0/token", host.trim_end_matches('/'))
 }
@@ -125,9 +122,8 @@ pub(crate) fn sp_m2m_scope(host: &str) -> String {
 }
 
 /// Sovereign-cloud Azure Databricks workspace host suffixes (USGov, China).
-/// The SP M2M flow's Entra token endpoint ([`sp_m2m_token_url`]) and management
-/// scope ([`AZURE_MANAGEMENT_SCOPE`]) are hardcoded to the commercial cloud, so
-/// these are not yet supported.
+/// The SP M2M flow's Entra token endpoint ([`sp_m2m_token_url`]) is hardcoded to
+/// the commercial cloud, so these are not yet supported.
 const AZURE_SOVEREIGN_HOST_SUFFIXES: &[&str] = &[".databricks.azure.us", ".databricks.azure.cn"];
 
 /// Reject a sovereign-cloud workspace `host` before the SP M2M flow builds a
@@ -165,134 +161,6 @@ pub(crate) fn reject_sovereign_host_for_sp_m2m(host: &str) -> crate::kernel_erro
         )));
     }
     Ok(())
-}
-
-/// The Azure Resource Manager scope for the **management token** (commercial
-/// cloud). Matches the connector's `AZURE_MANAGED_RESOURCE`
-/// (`https://management.core.windows.net/`), as a v2.0 `.default` scope.
-pub(crate) const AZURE_MANAGEMENT_SCOPE: &str = "https://management.core.windows.net/.default";
-
-/// Header carrying the SP's Azure Resource Manager token, so the Databricks
-/// control plane can validate the SP's Azure RBAC role on the workspace.
-const SP_MANAGEMENT_TOKEN_HEADER: &str = "X-Databricks-Azure-SP-Management-Token";
-/// Header naming the workspace's ARM resource id (paired with the management
-/// token for the RBAC lookup).
-const WORKSPACE_RESOURCE_ID_HEADER: &str = "X-Databricks-Azure-Workspace-Resource-Id";
-
-/// Azure service-principal M2M provider. The `Authorization` bearer is the
-/// Databricks-audience data token; when a workspace resource id is configured
-/// it additionally emits the management-token pair via [`AuthProvider::extra_headers`]
-/// so the control plane can authorize an SP that has an Azure RBAC role but is
-/// not (yet) a workspace member. Both tokens are ordinary client-credentials
-/// exchanges (reusing [`ClientCredentialsProvider`], which refreshes them), so
-/// the management token stays fresh on long-lived sessions.
-#[derive(Debug)]
-pub(crate) struct AzureServicePrincipalProvider {
-    data: super::m2m::ClientCredentialsProvider,
-    /// `Some` only when `azure_workspace_resource_id` was supplied.
-    management: Option<ManagementHeaders>,
-}
-
-#[derive(Debug)]
-struct ManagementHeaders {
-    token_source: super::m2m::ClientCredentialsProvider,
-    workspace_resource_id: String,
-}
-
-impl AzureServicePrincipalProvider {
-    /// Build the provider. `tenant` is the (already-resolved) Entra tenant;
-    /// `host` selects the resource app id for the data scope. The management
-    /// token source is created only when `workspace_resource_id` is `Some`.
-    pub(crate) async fn new(
-        host: &str,
-        azure_client_id: &str,
-        azure_client_secret: &str,
-        tenant: &str,
-        workspace_resource_id: Option<String>,
-        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
-    ) -> crate::kernel_error::Result<Self> {
-        Self::new_with_token_url(
-            host,
-            azure_client_id,
-            azure_client_secret,
-            sp_m2m_token_url(tenant),
-            workspace_resource_id,
-            http_client,
-        )
-        .await
-    }
-
-    /// Build the provider against an explicit Entra token endpoint. `new`
-    /// derives that endpoint from the tenant (`sp_m2m_token_url`); this seam
-    /// takes it directly so tests can point both token sources at a mock server
-    /// (the real endpoint host, `login.microsoftonline.com`, is not
-    /// interceptable). Both the data-scope and management-scope client-
-    /// credentials grants hit the same `token_url` with different scopes.
-    async fn new_with_token_url(
-        host: &str,
-        azure_client_id: &str,
-        azure_client_secret: &str,
-        token_url: String,
-        workspace_resource_id: Option<String>,
-        http_client: std::sync::Arc<crate::client::http::DatabricksHttpClient>,
-    ) -> crate::kernel_error::Result<Self> {
-        let data = super::m2m::ClientCredentialsProvider::new_with_full_config(
-            host,
-            azure_client_id,
-            azure_client_secret,
-            http_client.clone(),
-            vec![sp_m2m_scope(host)],
-            Some(token_url.clone()),
-        )
-        .await?;
-
-        let management = match workspace_resource_id {
-            Some(rid) => {
-                let token_source = super::m2m::ClientCredentialsProvider::new_with_full_config(
-                    host,
-                    azure_client_id,
-                    azure_client_secret,
-                    http_client,
-                    vec![AZURE_MANAGEMENT_SCOPE.to_string()],
-                    Some(token_url),
-                )
-                .await?;
-                Some(ManagementHeaders {
-                    token_source,
-                    workspace_resource_id: rid,
-                })
-            }
-            None => None,
-        };
-
-        Ok(Self { data, management })
-    }
-}
-
-impl crate::auth::AuthProvider for AzureServicePrincipalProvider {
-    fn get_auth_header(&self) -> crate::kernel_error::Result<String> {
-        self.data.get_auth_header()
-    }
-
-    fn extra_headers(&self) -> crate::kernel_error::Result<Vec<(String, String)>> {
-        let Some(mgmt) = &self.management else {
-            return Ok(Vec::new());
-        };
-        // The management header carries the RAW access token (no `Bearer `
-        // prefix), matching the connector's `cloud_token.access_token`.
-        let bearer = mgmt.token_source.get_auth_header()?;
-        let token = bearer
-            .strip_prefix("Bearer ")
-            .unwrap_or(&bearer)
-            .to_string();
-        Ok(vec![
-            (
-                WORKSPACE_RESOURCE_ID_HEADER.to_string(),
-                mgmt.workspace_resource_id.clone(),
-            ),
-            (SP_MANAGEMENT_TOKEN_HEADER.to_string(), token),
-        ])
-    }
 }
 
 /// Discover the workspace's Azure tenant id by reading the `{host}/aad/auth`
@@ -351,19 +219,19 @@ fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Resul
     }
     // The tenant parses fine on sovereign clouds (USGov `login.microsoftonline.us`,
     // China `login.chinacloudapi.cn`), but the M2M token exchange
-    // (`sp_m2m_token_url`) and `AZURE_MANAGEMENT_SCOPE` are hardcoded to the
-    // commercial Entra login / ARM hosts. Rather than let discovery succeed and
-    // then fail confusingly at the sovereign token endpoint, reject a
-    // non-commercial login host here with a message that names the limitation.
-    // Deriving the sovereign login/management hosts is the documented follow-up.
+    // (`sp_m2m_token_url`) is hardcoded to the commercial Entra login host.
+    // Rather than let discovery succeed and then fail confusingly at the
+    // sovereign token endpoint, reject a non-commercial login host here with a
+    // message that names the limitation. Deriving the sovereign login host is
+    // the documented follow-up.
     if host != "login.microsoftonline.com" {
         return Err(Error::unauthenticated().message(format!(
             "Azure tenant discovery: workspace redirected to a sovereign-cloud \
              login host ({host:?}), which the service-principal M2M flow does \
-             not yet support (the Entra token endpoint and management scope are \
-             hardcoded to the commercial cloud); passing azure_tenant_id \
-             explicitly does not help here, since the token exchange still \
-             targets the commercial Entra host regardless of tenant"
+             not yet support (the Entra token endpoint is hardcoded to the \
+             commercial cloud); passing azure_tenant_id explicitly does not help \
+             here, since the token exchange still targets the commercial Entra \
+             host regardless of tenant"
         )));
     }
     final_url
@@ -384,14 +252,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn u2m_endpoints_are_workspace_v2_paths() {
-        // The v2.0 path is the fix for the live 404: /oidc/v1/authorize
-        // redirects to a malformed Entra URL, /oidc/oauth2/v2.0/authorize does not.
+    fn u2m_token_url_is_workspace_v2_path() {
+        // The v2.0 path is the fix for the live 404: the discovered
+        // /oidc/v1/token path's sibling authorize redirects to a malformed Entra
+        // URL, whereas /oidc/oauth2/v2.0/{token,authorize} does not.
         let host = "https://adb-123.4.azuredatabricks.net";
-        assert_eq!(
-            u2m_authorize_url(host),
-            "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/authorize"
-        );
         assert_eq!(
             u2m_token_url(host),
             "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/token"
@@ -399,11 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn u2m_endpoints_normalise_trailing_slash() {
+    fn u2m_token_url_normalises_trailing_slash() {
         let host = "https://adb-123.4.azuredatabricks.net/";
         assert_eq!(
-            u2m_authorize_url(host),
-            "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/authorize"
+            u2m_token_url(host),
+            "https://adb-123.4.azuredatabricks.net/oidc/oauth2/v2.0/token"
         );
     }
 
@@ -601,127 +466,5 @@ mod tests {
         assert!(discover_tenant(&mock_server.uri(), &http_client)
             .await
             .is_err());
-    }
-
-    // ─── AzureServicePrincipalProvider (two-token composition) ───────────────
-    //
-    // The Entra token endpoint (`sp_m2m_token_url`), the `{app}/.default` scope,
-    // and the client-credentials exchange+refresh are each unit-tested
-    // elsewhere. These tests cover the composition unique to this provider: the
-    // `Authorization` bearer is always the *data* token, and the management
-    // header pair is emitted (with the raw, un-`Bearer`-prefixed token) only
-    // when a workspace resource id is configured. A `new_with_token_url` seam
-    // points both token sources at a mock server (the real `new` derives the
-    // same URL from the tenant, which is `login.microsoftonline.com` and not
-    // interceptable).
-    use crate::auth::AuthProvider;
-    use crate::client::http::{DatabricksHttpClient, HttpClientConfig};
-    use std::sync::Arc;
-    use wiremock::matchers::{body_string_contains, method, path};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
-
-    /// Mount two token responses on the same Entra endpoint, differentiated by
-    /// the scope carried in the request body: the Databricks-audience data
-    /// scope (`{app}/.default`, contains `2ff814a6`) returns `data-token`; the
-    /// management scope (`management.core.windows.net`) returns `mgmt-token`.
-    async fn mount_dual_token_endpoint(mock_server: &MockServer) {
-        Mock::given(method("POST"))
-            .and(path("/tenant-abc/oauth2/v2.0/token"))
-            .and(body_string_contains("management.core.windows.net"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "mgmt-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-            })))
-            .mount(mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/tenant-abc/oauth2/v2.0/token"))
-            .and(body_string_contains("2ff814a6"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "data-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-            })))
-            .mount(mock_server)
-            .await;
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sp_m2m_with_resource_id_emits_management_header_pair() {
-        let mock_server = MockServer::start().await;
-        mount_dual_token_endpoint(&mock_server).await;
-        let http_client = Arc::new(
-            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
-                .expect("http client"),
-        );
-        let token_url = format!("{}/tenant-abc/oauth2/v2.0/token", mock_server.uri());
-
-        let provider = AzureServicePrincipalProvider::new_with_token_url(
-            "https://adb-1.4.azuredatabricks.net",
-            "sp-client-id",
-            "sp-client-secret",
-            token_url,
-            Some("/subscriptions/s/resourceGroups/rg/workspace/w".to_string()),
-            http_client,
-        )
-        .await
-        .expect("provider builds");
-
-        // Authorization is always the data (Databricks-audience) token.
-        assert_eq!(provider.get_auth_header().unwrap(), "Bearer data-token");
-
-        // Both management headers present; the token is raw (no `Bearer ` prefix).
-        let extra = provider.extra_headers().unwrap();
-        assert!(extra.contains(&(
-            WORKSPACE_RESOURCE_ID_HEADER.to_string(),
-            "/subscriptions/s/resourceGroups/rg/workspace/w".to_string()
-        )));
-        assert!(extra.contains(&(
-            SP_MANAGEMENT_TOKEN_HEADER.to_string(),
-            "mgmt-token".to_string()
-        )));
-    }
-
-    #[tokio::test(flavor = "multi_thread")]
-    async fn sp_m2m_without_resource_id_sends_data_token_only() {
-        let mock_server = MockServer::start().await;
-        // The management scope must never be requested when no resource id is set.
-        Mock::given(method("POST"))
-            .and(path("/tenant-abc/oauth2/v2.0/token"))
-            .and(body_string_contains("management.core.windows.net"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(0)
-            .mount(&mock_server)
-            .await;
-        Mock::given(method("POST"))
-            .and(path("/tenant-abc/oauth2/v2.0/token"))
-            .and(body_string_contains("2ff814a6"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "access_token": "data-token",
-                "token_type": "Bearer",
-                "expires_in": 3600,
-            })))
-            .mount(&mock_server)
-            .await;
-        let http_client = Arc::new(
-            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
-                .expect("http client"),
-        );
-        let token_url = format!("{}/tenant-abc/oauth2/v2.0/token", mock_server.uri());
-
-        let provider = AzureServicePrincipalProvider::new_with_token_url(
-            "https://adb-1.4.azuredatabricks.net",
-            "sp-client-id",
-            "sp-client-secret",
-            token_url,
-            None,
-            http_client,
-        )
-        .await
-        .expect("provider builds");
-
-        assert_eq!(provider.get_auth_header().unwrap(), "Bearer data-token");
-        assert!(provider.extra_headers().unwrap().is_empty());
     }
 }

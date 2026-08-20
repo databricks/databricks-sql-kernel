@@ -77,7 +77,6 @@ pub(crate) struct OAuthParams {
     pub azure_client_id: Option<String>,
     pub azure_client_secret: Option<String>,
     pub azure_tenant_id: Option<String>,
-    pub azure_workspace_resource_id: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -389,7 +388,6 @@ fn build_auth_config_inner(
                 oauth.azure_client_id,
                 oauth.azure_client_secret,
                 oauth.azure_tenant_id,
-                oauth.azure_workspace_resource_id,
                 oauth.identity_federation_client_id,
             )
             .map_err(|err| err.to_string())
