@@ -331,7 +331,16 @@ fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Resul
         .host_str()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    if !host.contains("microsoftonline") {
+    // Anchor the guard on the host authority, not a loose substring, mirroring
+    // `host_authority`/`effective_app_id`/`reject_sovereign_host` elsewhere in
+    // this module. A substring test (`contains("microsoftonline")`) would also
+    // admit sovereign login hosts (`login.microsoftonline.us` USGov,
+    // `login.microsoftonline.de`) and spoofed hosts
+    // (`login.microsoftonline.com.attacker.example`), handing an
+    // attacker-/wrong-directory-controlled first path segment to
+    // `sp_m2m_token_url`, which hardcodes the commercial host. Require the
+    // commercial `*.microsoftonline.com` authority so the comment holds.
+    if host != "microsoftonline.com" && !host.ends_with(".microsoftonline.com") {
         return Err(Error::unauthenticated().message(format!(
             "Azure tenant discovery: /aad/auth did not redirect to the commercial \
              Microsoft login host (got {host:?}); sovereign clouds are not yet \
@@ -434,6 +443,33 @@ mod tests {
         // documented sovereign follow-up.
         let url = reqwest::Url::parse(
             "https://login.chinacloudapi.cn/9f37a392-f0ae-4280-9796-f1864a10effc/oauth2/authorize?client_id=x",
+        )
+        .unwrap();
+        assert!(tenant_from_login_url(&url).is_err());
+    }
+
+    #[test]
+    fn tenant_parse_rejects_sovereign_microsoftonline_hosts() {
+        // login.microsoftonline.us (USGov) / .de satisfy a loose
+        // `contains("microsoftonline")` test but are NOT the commercial host
+        // sp_m2m_token_url targets — the authority-anchored guard must reject
+        // them so discovery can't feed a tenant to the wrong directory.
+        for host in [
+            "https://login.microsoftonline.us/tenant-abc/oauth2/authorize?client_id=x",
+            "https://login.microsoftonline.de/tenant-abc/oauth2/authorize?client_id=x",
+        ] {
+            let url = reqwest::Url::parse(host).unwrap();
+            assert!(tenant_from_login_url(&url).is_err());
+        }
+    }
+
+    #[test]
+    fn tenant_parse_rejects_spoofed_microsoftonline_host() {
+        // A host that merely embeds the commercial host as a prefix
+        // (`login.microsoftonline.com.attacker.example`) must not pass —
+        // suffix match on the authority, not a substring.
+        let url = reqwest::Url::parse(
+            "https://login.microsoftonline.com.attacker.example/tenant-abc/oauth2/authorize?client_id=x",
         )
         .unwrap();
         assert!(tenant_from_login_url(&url).is_err());
