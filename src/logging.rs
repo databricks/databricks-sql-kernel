@@ -110,6 +110,12 @@ pub(crate) fn filter_from_level(level: &str) -> String {
     )
 }
 
+/// Resolve the shared default filter for every logging destination: honor
+/// `RUST_LOG`, then fall back to warnings from the kernel target.
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_from_level("warn")))
+}
+
 /// Resolve a configured log destination to the actual file path to open.
 ///
 /// A destination that names an **existing directory**, or that ends with a
@@ -161,9 +167,7 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
         let filter = if let Some(ref directive) = config.filter {
             EnvFilter::new(directive.clone())
         } else {
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new(format!("{}=warn", crate::klog::KERNEL_LOG_TARGET))
-            })
+            default_env_filter()
         };
 
         // Resolve a directory-form destination to a file inside it, then try
@@ -315,14 +319,7 @@ pub(crate) fn init_callback_logging(
     user_data: *mut c_void,
 ) -> bool {
     *LOGGING_INITIALIZED.get_or_init(|| {
-        let filter = filter.map_or_else(
-            || {
-                EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                    EnvFilter::new(format!("{}=warn", crate::klog::KERNEL_LOG_TARGET))
-                })
-            },
-            EnvFilter::new,
-        );
+        let filter = filter.map_or_else(default_env_filter, EnvFilter::new);
 
         tracing_subscriber::registry()
             .with(filter)
@@ -419,7 +416,7 @@ mod tests {
     #[test]
     fn log_target_is_double_colon_delimited() {
         assert_eq!(crate::klog::KERNEL_LOG_TARGET, "databricks::sql::kernel");
-        // The directive we build (see init_logging) must use this exact
+        // The directive we build (see default_env_filter) must use this exact
         // target, not an underscore-joined token.
         let directive = format!("{}=debug", crate::klog::KERNEL_LOG_TARGET);
         assert!(directive.starts_with("databricks::sql::kernel="));
