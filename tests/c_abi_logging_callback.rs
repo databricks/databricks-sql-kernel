@@ -72,6 +72,8 @@ fn callback_receives_kernel_log_record() {
         "callback bridge smoke"
     );
 
+    // Delivery is deliberately synchronous: when the tracing call returns, the
+    // host sink has accepted the record. Hosts that want buffering own that policy.
     let records = RECORDS.lock().unwrap();
     let record = records
         .iter()

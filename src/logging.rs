@@ -288,9 +288,12 @@ where
         let target = callback_cstring(metadata.target());
         let message = callback_cstring(&visitor.finish());
 
-        // SAFETY: the caller supplied a valid process-lifetime callback and
-        // user-data pointer under `kernel_init_logging_callback`'s contract.
-        // The C strings remain alive until the callback returns.
+        // Deliver inline so hosts that want the same synchronous sink semantics
+        // as their native logger do not lose or reorder records. A host that
+        // prefers asynchronous delivery can enqueue in its callback. SAFETY: the
+        // caller supplied a valid process-lifetime callback and user-data pointer
+        // under `kernel_init_logging_callback`'s contract. The C strings remain
+        // alive until the callback returns.
         unsafe {
             (self.callback)(
                 level.as_ptr(),
