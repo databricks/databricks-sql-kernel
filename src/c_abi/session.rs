@@ -14,10 +14,11 @@
 
 //! Session FFI — config marshalling, open / close / new_statement.
 //!
-//! Auth over the C ABI: **PAT, OAuth M2M, and OAuth U2M** (interactive
-//! browser flow) are all exposed (`set_auth_pat` / `set_auth_m2m` /
-//! `set_auth_u2m`). A host may also drive its own token flow and inject
-//! it via PAT.
+//! Auth over the C ABI: **PAT, OAuth M2M (shared-secret and JWT
+//! private-key), OAuth U2M** (interactive browser flow), and **Azure Entra
+//! service-principal M2M** are all exposed (`set_auth_pat` / `set_auth_m2m` /
+//! `set_auth_m2m_jwt` / `set_auth_u2m` / `set_auth_azure_sp`). A host may also
+//! drive its own token flow and inject it via PAT.
 //!
 //! Transaction control (autocommit / commit / rollback) is exposed via
 //! `kernel_session_set_autocommit` / `_get_autocommit` / `_commit` /
@@ -51,8 +52,8 @@ enum ConnectionSpec {
 }
 
 /// Auth choice captured from the C-side setters. The C ABI wires PAT,
-/// OAuth M2M (shared-secret and JWT private-key), and OAuth U2M; other
-/// [`AuthConfig`] variants stay Rust-crate-only.
+/// OAuth M2M (shared-secret and JWT private-key), OAuth U2M, and Azure Entra
+/// service-principal M2M; other [`AuthConfig`] variants stay Rust-crate-only.
 ///
 /// NOTE (secret handling): `token` / `client_secret` / `jwt_passphrase`
 /// are copied out of the C string into owned `String`s and are not
@@ -90,6 +91,18 @@ enum AuthSpec {
         /// Comma-separated scopes (split at build time). `None` ⇒ kernel
         /// default (`sql`, `offline_access`).
         scopes: Option<String>,
+    },
+    /// Azure Entra service-principal M2M. `azure_client_id` +
+    /// `azure_client_secret` are required; `azure_tenant_id` (`None` ⇒
+    /// kernel auto-discovers from the workspace `/aad/auth` redirect) and
+    /// `azure_workspace_resource_id` (`None` ⇒ data token authenticates
+    /// alone; `Some` ⇒ the kernel also sends the SP management token +
+    /// resource-id header) are optional.
+    AzureServicePrincipal {
+        azure_client_id: String,
+        azure_client_secret: String,
+        azure_tenant_id: Option<String>,
+        azure_workspace_resource_id: Option<String>,
     },
 }
 
@@ -432,6 +445,50 @@ pub unsafe extern "C" fn kernel_session_config_set_auth_u2m(
             // 0 is the "unset" sentinel → kernel default (8030).
             redirect_port: (redirect_port != 0).then_some(redirect_port),
             scopes: optional_str(scopes, "scopes")?,
+        });
+        Ok(())
+    })
+}
+
+/// Set Azure Entra service-principal M2M authentication. The kernel owns
+/// Azure resolution: it builds the Entra token endpoint + `{app}/.default`
+/// scope and auto-discovers the tenant from the workspace's `/aad/auth`
+/// redirect when `azure_tenant_id` is omitted. Mutually exclusive with the
+/// other `set_auth_*` setters — the last one called wins.
+///
+/// `azure_client_id` and `azure_client_secret` (the Entra app-registration
+/// credentials) are required. The rest are optional (pass NULL to omit):
+/// `azure_tenant_id` (NULL → auto-discover), and `azure_workspace_resource_id`
+/// (the workspace's ARM resource id; when set, the kernel additionally sends
+/// the Azure SP management token + `X-Databricks-Azure-Workspace-Resource-Id`
+/// header, so a service principal with an Azure RBAC role but no workspace
+/// membership can authenticate; NULL → the data token authenticates alone).
+///
+/// Azure AD U2M is not a separate setter — use
+/// [`kernel_session_config_set_auth_u2m`], which runs the kernel's
+/// workspace-federated browser flow (Azure Databricks workspaces support it).
+///
+/// # Safety
+/// `config` must be a live config handle; `azure_client_id` /
+/// `azure_client_secret` must be NUL-terminated C strings, and the optional
+/// args, if non-null, must be NUL-terminated C strings.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_auth_azure_sp(
+    config: *mut KernelSessionConfig,
+    azure_client_id: *const c_char,
+    azure_client_secret: *const c_char,
+    azure_tenant_id: *const c_char,
+    azure_workspace_resource_id: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.auth = Some(AuthSpec::AzureServicePrincipal {
+            azure_client_id: required_str(azure_client_id, "azure_client_id")?,
+            azure_client_secret: required_str(azure_client_secret, "azure_client_secret")?,
+            azure_tenant_id: optional_str(azure_tenant_id, "azure_tenant_id")?,
+            azure_workspace_resource_id: optional_str(
+                azure_workspace_resource_id,
+                "azure_workspace_resource_id",
+            )?,
         });
         Ok(())
     })
@@ -1209,6 +1266,18 @@ fn auth_spec_to_config(
             Some(token_cache),
             identity_federation_client_id,
         ),
+        AuthSpec::AzureServicePrincipal {
+            azure_client_id,
+            azure_client_secret,
+            azure_tenant_id,
+            azure_workspace_resource_id,
+        } => AuthConfig::azure_service_principal(
+            Some(azure_client_id),
+            Some(azure_client_secret),
+            azure_tenant_id,
+            azure_workspace_resource_id,
+            identity_federation_client_id,
+        )?,
     };
     Ok(auth)
 }
@@ -1600,6 +1669,82 @@ mod tests {
                 assert_eq!(token_url_override.as_deref(), Some(token_endpoint));
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn azure_sp_builds_azure_service_principal() {
+        // azure-sp forwards the Entra SP credentials (+ optional tenant +
+        // optional workspace resource id) and the shared federation id to the
+        // kernel's Azure SP flow.
+        let auth = auth_spec_to_config(
+            AuthSpec::AzureServicePrincipal {
+                azure_client_id: "entra-app-id".to_string(),
+                azure_client_secret: "entra-secret".to_string(),
+                azure_tenant_id: Some("tenant-abc".to_string()),
+                azure_workspace_resource_id: Some(
+                    "/subscriptions/s/resourceGroups/rg/workspace/w".to_string(),
+                ),
+            },
+            None,
+            None,
+            Some("fed-client-id".to_string()),
+            TokenCacheConfig::default(),
+        )
+        .expect("azure sp config builds");
+
+        match auth {
+            AuthConfig::AzureServicePrincipal {
+                azure_client_id,
+                azure_client_secret,
+                azure_tenant_id,
+                azure_workspace_resource_id,
+                identity_federation_client_id,
+            } => {
+                assert_eq!(azure_client_id, "entra-app-id");
+                assert_eq!(azure_client_secret, "entra-secret");
+                assert_eq!(azure_tenant_id.as_deref(), Some("tenant-abc"));
+                assert_eq!(
+                    azure_workspace_resource_id.as_deref(),
+                    Some("/subscriptions/s/resourceGroups/rg/workspace/w")
+                );
+                assert_eq!(
+                    identity_federation_client_id.as_deref(),
+                    Some("fed-client-id")
+                );
+            }
+            other => panic!("expected AzureServicePrincipal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn azure_sp_tenant_and_resource_id_optional() {
+        // Omitting tenant + resource id is valid — the kernel auto-discovers
+        // the tenant and sends the data token alone.
+        let auth = auth_spec_to_config(
+            AuthSpec::AzureServicePrincipal {
+                azure_client_id: "entra-app-id".to_string(),
+                azure_client_secret: "entra-secret".to_string(),
+                azure_tenant_id: None,
+                azure_workspace_resource_id: None,
+            },
+            None,
+            None,
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("azure sp config builds");
+
+        match auth {
+            AuthConfig::AzureServicePrincipal {
+                azure_tenant_id,
+                azure_workspace_resource_id,
+                ..
+            } => {
+                assert!(azure_tenant_id.is_none());
+                assert!(azure_workspace_resource_id.is_none());
+            }
+            other => panic!("expected AzureServicePrincipal, got {other:?}"),
         }
     }
 

@@ -264,6 +264,23 @@ KernelStatusCode kernel_session_config_set_auth_u2m(KernelSessionConfig* config,
                                                     const char* client_id,
                                                     uint16_t redirect_port,
                                                     const char* scopes);
+/* Azure Entra service-principal M2M. The kernel owns Azure resolution: it
+ * builds the Entra token endpoint + `{app}/.default` scope and auto-discovers
+ * the tenant from the workspace `/aad/auth` redirect when `azure_tenant_id` is
+ * NULL. `azure_client_id` and `azure_client_secret` (Entra app-registration
+ * credentials) are required. Optional (pass NULL to omit): `azure_tenant_id`,
+ * and `azure_workspace_resource_id` (workspace ARM resource id; when set, the
+ * kernel also sends the Azure SP management token +
+ * `X-Databricks-Azure-Workspace-Resource-Id` header, so a service principal
+ * with an Azure RBAC role but no workspace membership can authenticate; NULL →
+ * the data token authenticates alone). Azure AD U2M has no separate setter —
+ * use kernel_session_config_set_auth_u2m (the kernel's workspace-federated
+ * browser flow works against Azure Databricks workspaces). */
+KernelStatusCode kernel_session_config_set_auth_azure_sp(KernelSessionConfig* config,
+                                                         const char* azure_client_id,
+                                                         const char* azure_client_secret,
+                                                         const char* azure_tenant_id,
+                                                         const char* azure_workspace_resource_id);
 
 /* Optional SP-wide Workload Identity Federation client id used by mandatory
  * token exchange. Unset selects BYOT / account-wide WIF. */

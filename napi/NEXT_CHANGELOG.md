@@ -30,6 +30,18 @@ layout, or npm publishing. Pure-kernel changes go in the root
   `token_url_override`.
 - `ConnectionOptions.identityFederationClientId` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
+- `AuthMode.AzureSpM2m` — Azure Entra service-principal M2M. New
+  `ConnectionOptions` fields `azureClientId` (required) + `azureClientSecret`
+  (required), plus optional `azureTenantId` (kernel auto-discovers it from the
+  workspace's `/aad/auth` redirect when omitted) and `azureWorkspaceResourceId`
+  (when set, the kernel also sends the Azure SP management token +
+  `X-Databricks-Azure-Workspace-Resource-Id` header, so a service principal with
+  an Azure RBAC role but no workspace membership can authenticate; omitted ⇒ the
+  data token authenticates alone). Forwards to the kernel's
+  `AuthConfig::azure_service_principal`. The napi analog of the pyo3
+  `auth_type="azure-sp-m2m"` surface. Azure AD **U2M** needs no new mode — it
+  rides `AuthMode.OAuthU2m` (the kernel's workspace-federated browser flow,
+  which Azure workspaces support).
 
 ### Updated
 
