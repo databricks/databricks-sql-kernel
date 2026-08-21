@@ -90,8 +90,17 @@ pub struct ClientCredentialsProvider {
     token_store: TokenStore,
     /// HTTP client for token endpoint requests
     http_client: Arc<DatabricksHttpClient>,
-    /// OAuth scopes to request (typically "all-apis")
+    /// OAuth scopes to request (typically "all-apis"). Empty when `resource`
+    /// is set (a v1.0 `resource=` grant).
     scopes: Vec<String>,
+    /// Azure AD **v1.0** `resource=` value for the client-credentials grant,
+    /// used instead of `scope=`. When `Some`, the token request sends
+    /// `resource=<value>` (and no `scope`) to the v1.0 `/oauth2/token`
+    /// endpoint, yielding a token whose `aud` claim is that resource verbatim
+    /// (e.g. `https://management.core.windows.net/`, with the trailing slash
+    /// Databricks' control plane requires). The v2.0 `scope=<resource>/.default`
+    /// form drops that trailing slash from `aud`, which the server rejects.
+    resource: Option<String>,
     /// Tokio runtime handle captured from the constructing context;
     /// used to drive the async token exchange from the sync
     /// `get_auth_header` trait method safely whether or not the
@@ -218,6 +227,7 @@ impl ClientCredentialsProvider {
             token_store: TokenStore::new(),
             http_client,
             scopes,
+            resource: None,
             // `new_with_full_config` is `async`, so we're guaranteed
             // to be inside a tokio runtime here. Capture that handle
             // so `get_auth_header` can dispatch correctly later via
@@ -225,6 +235,34 @@ impl ClientCredentialsProvider {
             // wrapped the kernel in its own outer `block_on` (e.g.
             // the PyO3 binding) or eventually drives auth from a
             // non-tokio thread (e.g. the C ABI shim).
+            runtime_handle: RuntimeHandle::current(),
+        })
+    }
+
+    /// Construct a provider that mints tokens via the Azure AD **v1.0**
+    /// `resource=` client-credentials grant against `token_endpoint` (the v1.0
+    /// `{login}/{tenant}/oauth2/token` path), rather than the v2.0
+    /// `scope=<resource>/.default` form. The resulting token's `aud` claim is
+    /// `resource` verbatim — required for the Azure SP **management token**,
+    /// whose `aud` Databricks strict-matches as `https://management.core.windows.net/`
+    /// (trailing slash), which the v2.0 `.default` form drops. No OIDC discovery
+    /// (the endpoint is always supplied).
+    pub async fn new_with_resource_v1(
+        client_id: &str,
+        client_secret: &str,
+        http_client: Arc<DatabricksHttpClient>,
+        resource: String,
+        token_endpoint: String,
+    ) -> Result<Self> {
+        Ok(Self {
+            client_id: client_id.to_string(),
+            client_secret: client_secret.to_string(),
+            auth_endpoint: token_endpoint.clone(),
+            token_endpoint,
+            token_store: TokenStore::new(),
+            http_client,
+            scopes: Vec::new(),
+            resource: Some(resource),
             runtime_handle: RuntimeHandle::current(),
         })
     }
@@ -255,6 +293,7 @@ impl AuthProvider for ClientCredentialsProvider {
         let token_endpoint = self.token_endpoint.clone();
         let auth_endpoint = self.auth_endpoint.clone();
         let scopes = self.scopes.clone();
+        let resource = self.resource.clone();
 
         // Get or refresh token via TokenStore
         let runtime_handle = self.runtime_handle.clone();
@@ -267,6 +306,21 @@ impl AuthProvider for ClientCredentialsProvider {
             // a direct `block_on` when called from a plain thread
             // (e.g. the future C ABI shim). See `crate::util::runtime`.
             block_on_in_runtime(&runtime_handle, async {
+                // A v1.0 `resource=` grant (Azure SP management token) needs a
+                // lenient response parse — the Azure AD v1.0 token endpoint
+                // returns `expires_in` as a JSON *string*, which the `oauth2`
+                // crate's strict parser rejects. Fetch it directly instead.
+                if let Some(resource) = &resource {
+                    return fetch_v1_resource_token(
+                        &http_client,
+                        &token_endpoint,
+                        &client_id,
+                        &client_secret,
+                        resource,
+                    )
+                    .await;
+                }
+
                 // Build the OAuth client
                 let oauth_client = BasicClient::new(ClientId::new(client_id))
                     .set_client_secret(ClientSecret::new(client_secret))
@@ -279,7 +333,7 @@ impl AuthProvider for ClientCredentialsProvider {
                             .message(format!("Invalid token endpoint URL: {}", e))
                     })?);
 
-                // Build the token request
+                // v2.0 client-credentials grant: send `scope=` per requested scope.
                 let mut token_request = oauth_client.exchange_client_credentials();
                 for scope in &scopes {
                     token_request = token_request.add_scope(Scope::new(scope.clone()));
@@ -321,6 +375,96 @@ impl AuthProvider for ClientCredentialsProvider {
         // Return Bearer token
         Ok(format!("Bearer {}", token.access_token))
     }
+}
+
+/// Fetch an Azure AD **v1.0** `resource=` client-credentials token directly,
+/// tolerating the v1.0 endpoint's quirk of returning `expires_in` (and the
+/// other lifetime fields) as JSON *strings* rather than numbers — which the
+/// `oauth2` crate's strict `StandardTokenResponse` parser rejects with "Failed
+/// to parse server response".
+///
+/// Credentials go in the form body (`client_secret_post`); the token's `aud`
+/// claim is the requested `resource` verbatim (e.g.
+/// `https://management.core.windows.net/`, trailing slash included).
+async fn fetch_v1_resource_token(
+    http_client: &Arc<DatabricksHttpClient>,
+    token_endpoint: &str,
+    client_id: &str,
+    client_secret: &str,
+    resource: &str,
+) -> Result<OAuthToken> {
+    let response = http_client
+        .inner()
+        .post(token_endpoint)
+        .form(&[
+            ("grant_type", "client_credentials"),
+            ("client_id", client_id),
+            ("client_secret", client_secret),
+            ("resource", resource),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            Error::unauthenticated()
+                .message(format!("Azure v1.0 resource token exchange failed: {}", e))
+                .context("client credentials grant")
+        })?;
+
+    let status = response.status();
+    let body = response.text().await.map_err(|e| {
+        Error::unauthenticated()
+            .message(format!(
+                "Azure v1.0 resource token: reading response body: {}",
+                e
+            ))
+            .context("client credentials grant")
+    })?;
+    if !status.is_success() {
+        return Err(Error::unauthenticated()
+            .message(format!(
+                "Azure v1.0 resource token exchange failed: HTTP {}: {}",
+                status.as_u16(),
+                body
+            ))
+            .context("client credentials grant"));
+    }
+
+    // Parse leniently: `expires_in` may be a string ("3599") or a number.
+    let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+        Error::unauthenticated()
+            .message(format!("Azure v1.0 resource token: invalid JSON: {}", e))
+            .context("client credentials grant")
+    })?;
+    let access_token = json
+        .get("access_token")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| {
+            Error::unauthenticated()
+                .message("Azure v1.0 resource token: response missing access_token")
+                .context("client credentials grant")
+        })?
+        .to_string();
+    let token_type = json
+        .get("token_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Bearer")
+        .to_string();
+    let expires_in = json
+        .get("expires_in")
+        .and_then(|v| {
+            v.as_str()
+                .and_then(|s| s.parse::<i64>().ok())
+                .or_else(|| v.as_i64())
+        })
+        .unwrap_or(3600);
+
+    Ok(OAuthToken::new(
+        access_token,
+        token_type,
+        expires_in,
+        None, // No refresh token for M2M
+        vec![resource.to_string()],
+    ))
 }
 
 #[cfg(test)]
@@ -396,6 +540,52 @@ mod tests {
             .expect("Failed to get auth header");
 
         assert_eq!(auth_header, "Bearer test-access-token-m2m");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v1_resource_grant_tolerates_string_expires_in() {
+        // The Azure AD v1.0 `/oauth2/token` endpoint returns `expires_in` (and
+        // the other lifetime fields) as JSON *strings*, which the `oauth2`
+        // crate's strict parser rejects with "Failed to parse server response".
+        // `new_with_resource_v1` fetches directly and parses leniently. It also
+        // sends the credentials + `resource=` in the form body (no OIDC
+        // discovery, no scope).
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/tenant-abc/oauth2/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("management.core.windows.net"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "token_type": "Bearer",
+                "expires_in": "3599",   // v1.0 quirk: string, not number
+                "ext_expires_in": "3599",
+                "expires_on": "1787294104",
+                "not_before": "1787290204",
+                "resource": "https://management.core.windows.net/",
+                "access_token": "mgmt-access-token",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+        let provider = ClientCredentialsProvider::new_with_resource_v1(
+            "sp-client-id",
+            "sp-client-secret",
+            http_client,
+            "https://management.core.windows.net/".to_string(),
+            format!("{}/tenant-abc/oauth2/token", mock_server.uri()),
+        )
+        .await
+        .expect("provider builds");
+
+        assert_eq!(
+            provider.get_auth_header().expect("get_auth_header"),
+            "Bearer mgmt-access-token"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

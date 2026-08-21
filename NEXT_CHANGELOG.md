@@ -20,12 +20,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
   bearer is the Databricks-audience data token, which alone authenticates the
   common workspace-member SP. When `azure_workspace_resource_id` is set, the
   kernel additionally sends the Azure SP management token
-  (`X-Databricks-Azure-SP-Management-Token`, a second Entra token on the ARM
-  `.default` scope) paired with the `X-Databricks-Azure-Workspace-Resource-Id`
+  (`X-Databricks-Azure-SP-Management-Token`, a second Entra token for the Azure
+  Resource Manager) paired with the `X-Databricks-Azure-Workspace-Resource-Id`
   header, matching the JDBC connector (`if (resourceId != null)`), so a service
   principal that holds an Azure RBAC role but is not a workspace member can
-  authenticate. When it is unset (the default) neither header is sent and no ARM
-  management-scope token is fetched. A new `AuthProvider::extra_headers()`
+  authenticate. That token is minted via the Entra **v1.0** `resource=` grant
+  (`{login}/{tenant}/oauth2/token`) so its `aud` is
+  `https://management.core.windows.net/` verbatim — trailing slash included —
+  which the control plane requires; the v2.0 `.default` form drops the slash and
+  is rejected. When the resource id is unset (the default) neither header is sent
+  and no management token is fetched. A new `AuthProvider::extra_headers()`
   carries the pair. Covered by an `#[ignore]`d
   end-to-end test (`azure_sp_m2m_select_one_round_trip`) that exercises the flow
   against a live Azure workspace when Azure SP credentials are configured.

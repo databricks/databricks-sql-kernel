@@ -92,15 +92,27 @@ pub(crate) fn sp_m2m_token_url(tenant: &str) -> String {
     format!("{AZURE_AAD_LOGIN_HOST}/{tenant}/oauth2/v2.0/token")
 }
 
+/// Derive the Entra **v1.0** token endpoint (`.../oauth2/token`) from the
+/// **v2.0** data endpoint (`.../oauth2/v2.0/token`) by dropping the `/v2.0`
+/// segment. Deriving (rather than rebuilding from the tenant) preserves the
+/// caller's host — real (`login.microsoftonline.com`) or the test seam's mock
+/// server. The v1.0 `resource=` grant mints a token whose `aud` is the resource
+/// verbatim — trailing slash included — which the v2.0 `.default` form drops.
+fn management_token_url_from(data_token_url: &str) -> String {
+    data_token_url.replace("/oauth2/v2.0/token", "/oauth2/token")
+}
+
 /// The M2M scope: `{effective_app_id}/.default`.
 pub(crate) fn sp_m2m_scope(host: &str) -> String {
     format!("{}/.default", effective_app_id(host))
 }
 
-/// The Azure Resource Manager scope for the **management token** (commercial
-/// cloud). Matches the connector's `AZURE_MANAGED_RESOURCE`
-/// (`https://management.core.windows.net/`), as a v2.0 `.default` scope.
-const AZURE_MANAGEMENT_SCOPE: &str = "https://management.core.windows.net/.default";
+/// The Azure Resource Manager **resource** for the **management token**
+/// (commercial cloud). Matches the connector's `AZURE_MANAGED_RESOURCE`. Sent
+/// as a v1.0 `resource=` value (not a v2.0 `.default` scope) so the minted
+/// token's `aud` is exactly `https://management.core.windows.net/` — trailing
+/// slash included — which Databricks requires.
+const AZURE_MANAGEMENT_RESOURCE: &str = "https://management.core.windows.net/";
 
 /// Header carrying the SP's Azure Resource Manager token, so the Databricks
 /// control plane can validate the SP's Azure RBAC role on the workspace.
@@ -191,17 +203,26 @@ impl AzureServicePrincipalProvider {
         // authenticated request via `extra_headers()` and break the common
         // workspace-member SP case that the data token alone authenticates.
         let management = match &workspace_resource_id {
-            Some(_) => Some(
-                super::m2m::ClientCredentialsProvider::new_with_full_config(
-                    host,
-                    azure_client_id,
-                    azure_client_secret,
-                    http_client,
-                    vec![AZURE_MANAGEMENT_SCOPE.to_string()],
-                    Some(token_url),
+            Some(_) => {
+                // The management token uses the Azure AD **v1.0** `resource=`
+                // grant (against `{login}/{tenant}/oauth2/token`, no `/v2.0`) so
+                // its `aud` is `https://management.core.windows.net/` verbatim —
+                // trailing slash included — which Databricks strict-matches. The
+                // v2.0 `scope=<resource>/.default` form drops that slash. Derive
+                // the v1.0 endpoint from the (v2.0) data `token_url` so the test
+                // seam's mock host carries over.
+                let management_token_url = management_token_url_from(&token_url);
+                Some(
+                    super::m2m::ClientCredentialsProvider::new_with_resource_v1(
+                        azure_client_id,
+                        azure_client_secret,
+                        http_client,
+                        AZURE_MANAGEMENT_RESOURCE.to_string(),
+                        management_token_url,
+                    )
+                    .await?,
                 )
-                .await?,
-            ),
+            }
             None => None,
         };
         Ok(Self {
@@ -340,6 +361,23 @@ mod tests {
         assert_eq!(
             sp_m2m_token_url("tenant-123"),
             "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token"
+        );
+    }
+
+    #[test]
+    fn management_token_url_drops_v2_segment() {
+        // The management token's v1.0 `resource=` grant hits `.../oauth2/token`,
+        // derived from the v2.0 data endpoint by dropping `/v2.0`. The host
+        // (real or mock) is preserved.
+        assert_eq!(
+            management_token_url_from(
+                "https://login.microsoftonline.com/tenant-123/oauth2/v2.0/token"
+            ),
+            "https://login.microsoftonline.com/tenant-123/oauth2/token"
+        );
+        assert_eq!(
+            management_token_url_from("http://127.0.0.1:8080/tenant-abc/oauth2/v2.0/token"),
+            "http://127.0.0.1:8080/tenant-abc/oauth2/token"
         );
     }
 
@@ -504,15 +542,18 @@ mod tests {
     use crate::auth::AuthProvider as _;
     use wiremock::matchers::body_string_contains;
 
-    /// Mount two token responses on the same Entra endpoint, differentiated by
-    /// the scope in the request body: the data scope (`{app}/.default`, contains
-    /// `2ff814a6`) returns `data-token`; the management scope
-    /// (`management.core.windows.net`) returns `mgmt-token`.
+    /// Mount two token responses, one per Entra endpoint the provider calls:
+    /// the data token via the **v2.0** `scope=` grant (`.../oauth2/v2.0/token`,
+    /// body contains the app id `2ff814a6`) returns `data-token`; the management
+    /// token via the **v1.0** `resource=` grant (`.../oauth2/token`, body
+    /// contains `management.core.windows.net`) returns `mgmt-token`. The distinct
+    /// paths (v1.0 vs v2.0) mirror production and keep the two matchers
+    /// unambiguous.
     async fn mount_dual_token_endpoint(mock_server: &wiremock::MockServer) {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, ResponseTemplate};
         Mock::given(method("POST"))
-            .and(path("/tenant-abc/oauth2/v2.0/token"))
+            .and(path("/tenant-abc/oauth2/token"))
             .and(body_string_contains("management.core.windows.net"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "access_token": "mgmt-token", "token_type": "Bearer", "expires_in": 3600,
