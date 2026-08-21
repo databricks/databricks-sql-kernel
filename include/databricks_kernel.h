@@ -388,6 +388,29 @@ KernelStatusCode kernel_session_config_set_retry_config(KernelSessionConfig* con
                                                         uint32_t max_retries,
                                                         uint64_t overall_timeout_ms);
 
+/* Configure telemetry collection/export. Telemetry is disabled by default.
+ * `batch_size`, `flush_interval_ms`, and `close_flush_timeout_ms` must be > 0.
+ * `max_retries == 0` disables telemetry export retries; `retry_delay_ms == 0`
+ * means immediate retry. Telemetry failures are fail-open and never change user
+ * operation results. */
+KernelStatusCode kernel_session_config_set_telemetry_config(KernelSessionConfig* config,
+                                                            bool enabled, size_t batch_size,
+                                                            uint64_t flush_interval_ms,
+                                                            uint32_t max_retries,
+                                                            uint64_t retry_delay_ms,
+                                                            uint64_t close_flush_timeout_ms);
+
+/* Configure driver/runtime/system identity supplied by the binding layer.
+ * Every string argument is optional: pass NULL for values the binding does not
+ * know. The kernel fills any missing fields it can derive before emitting
+ * telemetry. Non-NULL strings must be UTF-8. */
+KernelStatusCode kernel_session_config_set_driver_system_configuration(
+    KernelSessionConfig* config, const char* driver_name, const char* driver_version,
+    const char* runtime_name, const char* runtime_version, const char* runtime_vendor,
+    const char* os_name, const char* os_version, const char* os_arch,
+    const char* client_app_name, const char* locale_name, const char* char_set_encoding,
+    const char* process_name);
+
 /* Whether transaction control is ignored (no-oped). `ignore = true` (the
  * default) gives IgnoreTransactions=1 semantics: commit / rollback /
  * autocommit-off become silent no-ops. `ignore = false` enables real

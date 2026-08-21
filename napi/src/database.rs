@@ -34,8 +34,8 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, Error as KernelError, HttpConfig, ProxyConfig, ResultConfig, Session,
-    TlsConfig,
+    AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError, HttpConfig,
+    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -194,6 +194,42 @@ pub struct ConnectionOptions {
     /// query-tag presets, …). Forwarded verbatim to SEA
     /// `session_confs`. Unknown keys are rejected server-side.
     pub session_conf: Option<HashMap<String, String>>,
+    /// Driver name reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub driver_name: Option<String>,
+    /// Driver version reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub driver_version: Option<String>,
+    /// Runtime name reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub runtime_name: Option<String>,
+    /// Runtime version reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub runtime_version: Option<String>,
+    /// Runtime vendor reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub runtime_vendor: Option<String>,
+    /// Operating system name reported in telemetry system configuration.
+    /// Omitted ⇒ kernel default.
+    pub os_name: Option<String>,
+    /// Operating system version reported in telemetry system configuration.
+    /// Omitted ⇒ kernel default.
+    pub os_version: Option<String>,
+    /// Operating system architecture reported in telemetry system
+    /// configuration. Omitted ⇒ kernel default.
+    pub os_arch: Option<String>,
+    /// Client application name reported in telemetry system configuration.
+    /// Omitted ⇒ absent unless the kernel can infer a default.
+    pub client_app_name: Option<String>,
+    /// Locale name reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub locale_name: Option<String>,
+    /// Character-set encoding reported in telemetry system configuration.
+    /// Omitted ⇒ kernel default.
+    pub char_set_encoding: Option<String>,
+    /// Process name reported in telemetry system configuration. Omitted ⇒
+    /// kernel default.
+    pub process_name: Option<String>,
     /// Maximum number of pooled HTTP connections per host. Routes
     /// through the kernel's [`HttpConfig::pool_max_idle_per_host`].
     /// Tunes the underlying `reqwest` connection pool — higher values
@@ -325,6 +361,25 @@ pub struct ConnectionOptions {
     /// Overall retry budget in whole seconds. Maps onto
     /// [`HttpConfig::overall_timeout`].
     pub retry_overall_timeout_secs: Option<u32>,
+    /// Enable kernel telemetry export. Omitted / `false` keeps telemetry
+    /// disabled. When enabled, the kernel records operation telemetry below the
+    /// binding layer and exports through the Databricks SQL driver telemetry
+    /// endpoint.
+    pub telemetry_enabled: Option<bool>,
+    /// Number of telemetry events buffered before a flush. Omitted ⇒ kernel
+    /// default. Must be greater than zero when supplied.
+    pub telemetry_batch_size: Option<u32>,
+    /// Periodic telemetry flush interval in milliseconds. Omitted ⇒ kernel
+    /// default. Must be greater than zero when supplied.
+    pub telemetry_flush_interval_ms: Option<u32>,
+    /// Maximum telemetry export retries. `0` disables telemetry export retries.
+    pub telemetry_max_retries: Option<u32>,
+    /// Fixed telemetry retry delay in milliseconds. `0` means immediate retry.
+    pub telemetry_retry_delay_ms: Option<u32>,
+    /// Maximum time explicit close waits for telemetry final flush, in
+    /// milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
+    /// supplied.
+    pub telemetry_close_flush_timeout_ms: Option<u32>,
     /// Programmatic HTTP/HTTPS proxy ([`ProxyInput`]) to route all kernel
     /// traffic through. Carries the proxy `url`, optional basic-auth
     /// `username` / `password`, and an optional `bypassHosts` list — mapped
@@ -524,6 +579,95 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     http
 }
 
+/// Map JS telemetry fields onto the kernel [`TelemetryConfig`].
+///
+/// Returns `None` when the caller did not mention telemetry at all, preserving
+/// the kernel default. A caller may set telemetry knobs while leaving
+/// `telemetry_enabled` false; the config is still passed through, but telemetry
+/// remains disabled until explicitly enabled.
+fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<TelemetryConfig>> {
+    let mentioned = options.telemetry_enabled.is_some()
+        || options.telemetry_batch_size.is_some()
+        || options.telemetry_flush_interval_ms.is_some()
+        || options.telemetry_max_retries.is_some()
+        || options.telemetry_retry_delay_ms.is_some()
+        || options.telemetry_close_flush_timeout_ms.is_some();
+    if !mentioned {
+        return Ok(None);
+    }
+
+    if matches!(options.telemetry_batch_size, Some(0)) {
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("telemetryBatchSize must be > 0"),
+        ));
+    }
+    if matches!(options.telemetry_flush_interval_ms, Some(0)) {
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("telemetryFlushIntervalMs must be > 0"),
+        ));
+    }
+    if matches!(options.telemetry_close_flush_timeout_ms, Some(0)) {
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("telemetryCloseFlushTimeoutMs must be > 0"),
+        ));
+    }
+
+    let mut telemetry = TelemetryConfig::default();
+    telemetry.enabled = options.telemetry_enabled.unwrap_or(false);
+    if let Some(v) = options.telemetry_batch_size {
+        telemetry.batch_size = v as usize;
+    }
+    if let Some(v) = options.telemetry_flush_interval_ms {
+        telemetry.flush_interval = std::time::Duration::from_millis(u64::from(v));
+    }
+    if let Some(v) = options.telemetry_max_retries {
+        telemetry.max_retries = v;
+    }
+    if let Some(v) = options.telemetry_retry_delay_ms {
+        telemetry.retry_delay = std::time::Duration::from_millis(u64::from(v));
+    }
+    if let Some(v) = options.telemetry_close_flush_timeout_ms {
+        telemetry.close_flush_timeout = std::time::Duration::from_millis(u64::from(v));
+    }
+    Ok(Some(telemetry))
+}
+
+/// Map JS driver/system fields onto the kernel [`DriverSystemConfiguration`].
+///
+/// Returns `None` when the caller did not mention any field, preserving the
+/// kernel defaults. When at least one field is supplied, the kernel fills any
+/// missing values it knows how to derive.
+fn build_driver_system_configuration(
+    options: &ConnectionOptions,
+) -> Option<DriverSystemConfiguration> {
+    let mentioned = options.driver_name.is_some()
+        || options.driver_version.is_some()
+        || options.runtime_name.is_some()
+        || options.runtime_version.is_some()
+        || options.runtime_vendor.is_some()
+        || options.os_name.is_some()
+        || options.os_version.is_some()
+        || options.os_arch.is_some()
+        || options.client_app_name.is_some()
+        || options.locale_name.is_some()
+        || options.char_set_encoding.is_some()
+        || options.process_name.is_some();
+    mentioned.then(|| DriverSystemConfiguration {
+        driver_version: options.driver_version.clone(),
+        runtime_name: options.runtime_name.clone(),
+        runtime_version: options.runtime_version.clone(),
+        runtime_vendor: options.runtime_vendor.clone(),
+        os_name: options.os_name.clone(),
+        os_version: options.os_version.clone(),
+        os_arch: options.os_arch.clone(),
+        driver_name: options.driver_name.clone(),
+        client_app_name: options.client_app_name.clone(),
+        locale_name: options.locale_name.clone(),
+        char_set_encoding: options.char_set_encoding.clone(),
+        process_name: options.process_name.clone(),
+    })
+}
+
 /// Open a Databricks SQL session and return an opaque `Connection`
 /// wrapping the kernel `Session`. Authentication is selected by
 /// `options.auth_mode` (PAT / OAuth M2M / OAuth U2M) — see
@@ -558,6 +702,8 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         // `&mut` because it moves the `custom_headers` list out of
         // `options` to avoid cloning the header strings.
         let http_config = build_http_config(&mut options);
+        let telemetry_config = build_telemetry_config(&options)?;
+        let driver_system_configuration = build_driver_system_configuration(&options);
 
         // SessionConfig is `#[non_exhaustive]` — go through the
         // builder, which is the only public path that constructs it.
@@ -600,6 +746,12 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         // before the transport fields moved.
         builder = builder.http(http_config);
         builder = builder.tls(tls_config);
+        if let Some(telemetry) = telemetry_config {
+            builder = builder.telemetry(telemetry);
+        }
+        if let Some(system_configuration) = driver_system_configuration {
+            builder = builder.driver_system_configuration(system_configuration);
+        }
         // Programmatic HTTP/HTTPS proxy. Only wire a `ProxyConfig` when a
         // proxy is supplied; otherwise leave it unset so the kernel keeps
         // reqwest's env-var behaviour (HTTPS_PROXY / NO_PROXY).
@@ -648,6 +800,18 @@ mod tests {
             catalog: None,
             schema: None,
             session_conf: None,
+            driver_name: None,
+            driver_version: None,
+            runtime_name: None,
+            runtime_version: None,
+            runtime_vendor: None,
+            os_name: None,
+            os_version: None,
+            os_arch: None,
+            client_app_name: None,
+            locale_name: None,
+            char_set_encoding: None,
+            process_name: None,
             max_connections: None,
             intervals_as_string: None,
             complex_types_as_json: None,
@@ -661,6 +825,12 @@ mod tests {
             retry_max_wait_secs: None,
             retry_max_attempts: None,
             retry_overall_timeout_secs: None,
+            telemetry_enabled: None,
+            telemetry_batch_size: None,
+            telemetry_flush_interval_ms: None,
+            telemetry_max_retries: None,
+            telemetry_retry_delay_ms: None,
+            telemetry_close_flush_timeout_ms: None,
             proxy: None,
             socket_timeout_ms: None,
         }
@@ -1179,5 +1349,109 @@ mod tests {
         assert_eq!(http.retry_max_wait, def.retry_max_wait);
         assert_eq!(http.retry_max_retries, def.retry_max_retries);
         assert_eq!(http.overall_timeout, def.overall_timeout);
+    }
+
+    #[test]
+    fn telemetry_options_map_onto_kernel_config() {
+        let mut o = base();
+        o.telemetry_enabled = Some(true);
+        o.telemetry_batch_size = Some(25);
+        o.telemetry_flush_interval_ms = Some(1_000);
+        o.telemetry_max_retries = Some(2);
+        o.telemetry_retry_delay_ms = Some(50);
+        o.telemetry_close_flush_timeout_ms = Some(2_500);
+
+        let telemetry = build_telemetry_config(&o)
+            .expect("valid telemetry config")
+            .expect("telemetry mentioned");
+
+        assert!(telemetry.enabled);
+        assert_eq!(telemetry.batch_size, 25);
+        assert_eq!(
+            telemetry.flush_interval,
+            std::time::Duration::from_millis(1_000)
+        );
+        assert_eq!(telemetry.max_retries, 2);
+        assert_eq!(telemetry.retry_delay, std::time::Duration::from_millis(50));
+        assert_eq!(
+            telemetry.close_flush_timeout,
+            std::time::Duration::from_millis(2_500)
+        );
+    }
+
+    #[test]
+    fn telemetry_options_unmentioned_returns_none() {
+        assert!(build_telemetry_config(&base()).unwrap().is_none());
+    }
+
+    #[test]
+    fn telemetry_options_reject_zero_required_fields() {
+        let mut o = base();
+        o.telemetry_batch_size = Some(0);
+        assert_invalid_arg(
+            build_telemetry_config(&o).unwrap_err(),
+            "telemetryBatchSize must be > 0",
+        );
+
+        let mut o = base();
+        o.telemetry_flush_interval_ms = Some(0);
+        assert_invalid_arg(
+            build_telemetry_config(&o).unwrap_err(),
+            "telemetryFlushIntervalMs must be > 0",
+        );
+
+        let mut o = base();
+        o.telemetry_close_flush_timeout_ms = Some(0);
+        assert_invalid_arg(
+            build_telemetry_config(&o).unwrap_err(),
+            "telemetryCloseFlushTimeoutMs must be > 0",
+        );
+    }
+
+    #[test]
+    fn driver_system_options_map_onto_kernel_config() {
+        assert!(build_driver_system_configuration(&base()).is_none());
+
+        let mut o = base();
+        o.driver_name = Some("NodeSQL".to_owned());
+        o.driver_version = Some("1.2.3".to_owned());
+        o.runtime_name = Some("node".to_owned());
+        o.runtime_version = Some("22.0.0".to_owned());
+        o.runtime_vendor = Some("Node.js".to_owned());
+        o.os_name = Some("Linux".to_owned());
+        o.os_version = Some("6.1".to_owned());
+        o.os_arch = Some("x86_64".to_owned());
+        o.client_app_name = Some("app".to_owned());
+        o.locale_name = Some("en_US".to_owned());
+        o.char_set_encoding = Some("UTF-8".to_owned());
+        o.process_name = Some("node".to_owned());
+
+        let system_configuration =
+            build_driver_system_configuration(&o).expect("driver system configuration mentioned");
+
+        assert_eq!(system_configuration.driver_name.as_deref(), Some("NodeSQL"));
+        assert_eq!(
+            system_configuration.driver_version.as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(system_configuration.runtime_name.as_deref(), Some("node"));
+        assert_eq!(
+            system_configuration.runtime_version.as_deref(),
+            Some("22.0.0")
+        );
+        assert_eq!(
+            system_configuration.runtime_vendor.as_deref(),
+            Some("Node.js")
+        );
+        assert_eq!(system_configuration.os_name.as_deref(), Some("Linux"));
+        assert_eq!(system_configuration.os_version.as_deref(), Some("6.1"));
+        assert_eq!(system_configuration.os_arch.as_deref(), Some("x86_64"));
+        assert_eq!(system_configuration.client_app_name.as_deref(), Some("app"));
+        assert_eq!(system_configuration.locale_name.as_deref(), Some("en_US"));
+        assert_eq!(
+            system_configuration.char_set_encoding.as_deref(),
+            Some("UTF-8")
+        );
+        assert_eq!(system_configuration.process_name.as_deref(), Some("node"));
     }
 }

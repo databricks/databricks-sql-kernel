@@ -51,6 +51,93 @@ pub(crate) struct SessionInner {
     pub(crate) runtime: Arc<Runtime>,
 }
 
+fn build_telemetry_config(
+    enabled: bool,
+    batch_size: Option<usize>,
+    flush_interval_ms: Option<u64>,
+    max_retries: Option<u32>,
+    retry_delay_ms: Option<u64>,
+    close_flush_timeout_ms: Option<u64>,
+) -> PyResult<databricks_sql_kernel::TelemetryConfig> {
+    if matches!(batch_size, Some(0)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "telemetry_batch_size must be > 0",
+        ));
+    }
+    if matches!(flush_interval_ms, Some(0)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "telemetry_flush_interval_ms must be > 0",
+        ));
+    }
+    if matches!(close_flush_timeout_ms, Some(0)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "telemetry_close_flush_timeout_ms must be > 0",
+        ));
+    }
+
+    let mut telemetry = databricks_sql_kernel::TelemetryConfig::default();
+    telemetry.enabled = enabled;
+    if let Some(v) = batch_size {
+        telemetry.batch_size = v;
+    }
+    if let Some(v) = flush_interval_ms {
+        telemetry.flush_interval = std::time::Duration::from_millis(v);
+    }
+    if let Some(v) = max_retries {
+        telemetry.max_retries = v;
+    }
+    if let Some(v) = retry_delay_ms {
+        telemetry.retry_delay = std::time::Duration::from_millis(v);
+    }
+    if let Some(v) = close_flush_timeout_ms {
+        telemetry.close_flush_timeout = std::time::Duration::from_millis(v);
+    }
+    Ok(telemetry)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_driver_system_configuration(
+    driver_name: Option<String>,
+    driver_version: Option<String>,
+    runtime_name: Option<String>,
+    runtime_version: Option<String>,
+    runtime_vendor: Option<String>,
+    os_name: Option<String>,
+    os_version: Option<String>,
+    os_arch: Option<String>,
+    client_app_name: Option<String>,
+    locale_name: Option<String>,
+    char_set_encoding: Option<String>,
+    process_name: Option<String>,
+) -> Option<databricks_sql_kernel::DriverSystemConfiguration> {
+    let mentioned = driver_name.is_some()
+        || driver_version.is_some()
+        || runtime_name.is_some()
+        || runtime_version.is_some()
+        || runtime_vendor.is_some()
+        || os_name.is_some()
+        || os_version.is_some()
+        || os_arch.is_some()
+        || client_app_name.is_some()
+        || locale_name.is_some()
+        || char_set_encoding.is_some()
+        || process_name.is_some();
+    mentioned.then_some(databricks_sql_kernel::DriverSystemConfiguration {
+        driver_version,
+        runtime_name,
+        runtime_version,
+        runtime_vendor,
+        os_name,
+        os_version,
+        os_arch,
+        driver_name,
+        client_app_name,
+        locale_name,
+        char_set_encoding,
+        process_name,
+    })
+}
+
 #[pymethods]
 impl Session {
     /// Open a new session against the given workspace.
@@ -144,8 +231,26 @@ impl Session {
         catalog=None,
         schema=None,
         session_conf=None,
+        driver_name=None,
+        driver_version=None,
+        runtime_name=None,
+        runtime_version=None,
+        runtime_vendor=None,
+        os_name=None,
+        os_version=None,
+        os_arch=None,
+        client_app_name=None,
+        locale_name=None,
+        char_set_encoding=None,
+        process_name=None,
         complex_types_as_json=false,
         intervals_as_string=false,
+        telemetry_enabled=false,
+        telemetry_batch_size=None,
+        telemetry_flush_interval_ms=None,
+        telemetry_max_retries=None,
+        telemetry_retry_delay_ms=None,
+        telemetry_close_flush_timeout_ms=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -182,8 +287,26 @@ impl Session {
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
+        driver_name: Option<String>,
+        driver_version: Option<String>,
+        runtime_name: Option<String>,
+        runtime_version: Option<String>,
+        runtime_vendor: Option<String>,
+        os_name: Option<String>,
+        os_version: Option<String>,
+        os_arch: Option<String>,
+        client_app_name: Option<String>,
+        locale_name: Option<String>,
+        char_set_encoding: Option<String>,
+        process_name: Option<String>,
         complex_types_as_json: bool,
         intervals_as_string: bool,
+        telemetry_enabled: bool,
+        telemetry_batch_size: Option<usize>,
+        telemetry_flush_interval_ms: Option<u64>,
+        telemetry_max_retries: Option<u32>,
+        telemetry_retry_delay_ms: Option<u64>,
+        telemetry_close_flush_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
         // Resolve auth_type. Explicit `auth_type` always wins. When
         // omitted, default to "pat" if `access_token` was passed
@@ -292,6 +415,40 @@ impl Session {
             None
         };
 
+        let driver_system_configuration = build_driver_system_configuration(
+            driver_name,
+            driver_version,
+            runtime_name,
+            runtime_version,
+            runtime_vendor,
+            os_name,
+            os_version,
+            os_arch,
+            client_app_name,
+            locale_name,
+            char_set_encoding,
+            process_name,
+        );
+
+        let telemetry_config = if telemetry_enabled
+            || telemetry_batch_size.is_some()
+            || telemetry_flush_interval_ms.is_some()
+            || telemetry_max_retries.is_some()
+            || telemetry_retry_delay_ms.is_some()
+            || telemetry_close_flush_timeout_ms.is_some()
+        {
+            Some(build_telemetry_config(
+                telemetry_enabled,
+                telemetry_batch_size,
+                telemetry_flush_interval_ms,
+                telemetry_max_retries,
+                telemetry_retry_delay_ms,
+                telemetry_close_flush_timeout_ms,
+            )?)
+        } else {
+            None
+        };
+
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker
         // count left to tokio's default (logical CPU count).
@@ -324,6 +481,12 @@ impl Session {
             }
             if let Some(http) = http_config {
                 builder = builder.http(http);
+            }
+            if let Some(telemetry) = telemetry_config {
+                builder = builder.telemetry(telemetry);
+            }
+            if let Some(system_configuration) = driver_system_configuration {
+                builder = builder.driver_system_configuration(system_configuration);
             }
             if catalog.is_some() || schema.is_some() {
                 let mut defaults = databricks_sql_kernel::DefaultOpts::default();
@@ -443,5 +606,84 @@ mod send_sync_tests {
     fn runtime_arc_is_send_sync() {
         assert_send_sync::<Arc<Runtime>>();
         assert_send_sync::<SessionInner>();
+    }
+
+    #[test]
+    fn telemetry_kwargs_map_to_kernel_config() {
+        let telemetry =
+            build_telemetry_config(true, Some(25), Some(1_000), Some(2), Some(50), Some(2_500))
+                .expect("valid telemetry config");
+
+        assert!(telemetry.enabled);
+        assert_eq!(telemetry.batch_size, 25);
+        assert_eq!(
+            telemetry.flush_interval,
+            std::time::Duration::from_millis(1_000)
+        );
+        assert_eq!(telemetry.max_retries, 2);
+        assert_eq!(telemetry.retry_delay, std::time::Duration::from_millis(50));
+        assert_eq!(
+            telemetry.close_flush_timeout,
+            std::time::Duration::from_millis(2_500)
+        );
+    }
+
+    #[test]
+    fn telemetry_kwargs_reject_zero_required_fields() {
+        assert!(build_telemetry_config(false, Some(0), None, None, None, None).is_err());
+        assert!(build_telemetry_config(false, None, Some(0), None, None, None).is_err());
+        assert!(build_telemetry_config(false, None, None, None, None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn driver_system_kwargs_map_to_kernel_config() {
+        assert!(build_driver_system_configuration(
+            None, None, None, None, None, None, None, None, None, None, None, None,
+        )
+        .is_none());
+
+        let system_configuration = build_driver_system_configuration(
+            Some("PySQL".to_owned()),
+            Some("1.2.3".to_owned()),
+            Some("CPython".to_owned()),
+            Some("3.12".to_owned()),
+            Some("Python".to_owned()),
+            Some("Linux".to_owned()),
+            Some("6.1".to_owned()),
+            Some("x86_64".to_owned()),
+            Some("app".to_owned()),
+            Some("en_US".to_owned()),
+            Some("UTF-8".to_owned()),
+            Some("pytest".to_owned()),
+        )
+        .expect("driver system configuration mentioned");
+
+        assert_eq!(system_configuration.driver_name.as_deref(), Some("PySQL"));
+        assert_eq!(
+            system_configuration.driver_version.as_deref(),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            system_configuration.runtime_name.as_deref(),
+            Some("CPython")
+        );
+        assert_eq!(
+            system_configuration.runtime_version.as_deref(),
+            Some("3.12")
+        );
+        assert_eq!(
+            system_configuration.runtime_vendor.as_deref(),
+            Some("Python")
+        );
+        assert_eq!(system_configuration.os_name.as_deref(), Some("Linux"));
+        assert_eq!(system_configuration.os_version.as_deref(), Some("6.1"));
+        assert_eq!(system_configuration.os_arch.as_deref(), Some("x86_64"));
+        assert_eq!(system_configuration.client_app_name.as_deref(), Some("app"));
+        assert_eq!(system_configuration.locale_name.as_deref(), Some("en_US"));
+        assert_eq!(
+            system_configuration.char_set_encoding.as_deref(),
+            Some("UTF-8")
+        );
+        assert_eq!(system_configuration.process_name.as_deref(), Some("pytest"));
     }
 }
