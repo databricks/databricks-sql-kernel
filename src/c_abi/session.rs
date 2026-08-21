@@ -1283,6 +1283,43 @@ pub unsafe extern "C" fn kernel_session_is_open(
     KernelStatusCode::Success
 }
 
+/// Actively validate the session against the server by round-tripping a
+/// lightweight `SELECT 1` test query (result discarded). This is the
+/// I/O-performing complement of [`kernel_session_is_open`]: where that is
+/// a local handle-state check, this reaches the server, so it DOES detect
+/// a server-side idle timeout, a killed warehouse, or a dropped network
+/// link.
+///
+/// Returns `Success` when the round-trip completes (the session is alive).
+/// On failure it returns the mapped status code — a transport/availability
+/// failure surfaces as `Unavailable` / `NetworkError` / `Timeout`, which a
+/// host can treat as "connection dead" when backing
+/// `SQL_ATTR_CONNECTION_DEAD`; the full typed error is retrievable via
+/// `kernel_get_last_error`. Mirrors the reference / JDBC drivers'
+/// connection-test probe.
+///
+/// Runs SQL, so — like the transaction-control entry points — it MUST be
+/// invoked from a native (non-async-runtime) thread. Does not borrow
+/// ownership; the caller still owns `session`.
+///
+/// # Safety
+/// `session` must be a live handle from [`kernel_session_open`] (not yet
+/// closed via [`kernel_session_close`]).
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_test(session: *const kernel_session_t) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(session) = (session as *const Session).as_ref() else {
+        crate::c_abi::error::store_error(
+            Error::invalid_argument().message("kernel_session_test: session must not be null"),
+        );
+        return KernelStatusCode::InvalidArgument;
+    };
+    match block_on_ffi(|| session.test_connection()) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
+}
+
 /// Construct a new mutable statement bound to this session. On success,
 /// `*out` holds an owned `kernel_statement_t` the caller releases with
 /// `kernel_statement_close`.
