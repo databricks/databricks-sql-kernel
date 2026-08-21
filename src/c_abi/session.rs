@@ -765,6 +765,27 @@ pub unsafe extern "C" fn kernel_session_config_set_driver_system_configuration(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LogLevelResolution {
+    Off,
+    Filter(Option<String>),
+}
+
+/// Parse the C ABI's best-effort bare log level into the shared subscriber
+/// filter representation. Invalid UTF-8 is treated like NULL and falls back to
+/// `RUST_LOG`; OFF intentionally skips subscriber installation.
+unsafe fn resolve_log_level(level: *const c_char) -> LogLevelResolution {
+    let level = unsafe { optional_str(level, "log level") }.ok().flatten();
+    if level
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+    {
+        LogLevelResolution::Off
+    } else {
+        LogLevelResolution::Filter(level.as_deref().map(crate::logging::filter_from_level))
+    }
+}
+
 /// Initialize kernel logging, **process-wide and once**. `level` is one
 /// of "OFF"/"ERROR"/"WARN"/"INFO"/"DEBUG"/"TRACE" (NULL ⇒ honour
 /// `RUST_LOG`, default `warn`); `file_path` is a log file (NULL ⇒ stderr).
@@ -796,22 +817,10 @@ pub unsafe extern "C" fn kernel_init_logging(
     file_path: *const c_char,
 ) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
-    // `level` is best-effort: a non-UTF-8 or unrecognized value falls back
-    // to RUST_LOG / the default, so treat a bad level as absent.
-    let level = optional_str(level, "log level").ok().flatten();
-    // Level "OFF" means "do not install a subscriber", but that is still an
-    // intentional, successful outcome. `init_logging` no longer special-cases
-    // it (it works on full EnvFilter directives), so honour OFF here before
-    // touching the file path.
-    if level
-        .as_deref()
-        .is_some_and(|l| l.eq_ignore_ascii_case("off"))
-    {
-        return KernelStatusCode::Success;
-    }
-    // The C ABI takes a BARE level; expand it to the full directive the
-    // shared installer expects (targeting the kernel's own log target).
-    let filter = level.as_deref().map(crate::logging::filter_from_level);
+    let filter = match unsafe { resolve_log_level(level) } {
+        LogLevelResolution::Off => return KernelStatusCode::Success,
+        LogLevelResolution::Filter(filter) => filter,
+    };
     // `file_path` is NOT best-effort: a non-UTF-8 path is a real error (the
     // caller asked us to write there and we can't), so surface it rather
     // than silently dropping the path and reporting Success.
@@ -869,14 +878,10 @@ pub unsafe extern "C" fn kernel_init_logging_callback(
         );
     };
 
-    let level = optional_str(level, "log level").ok().flatten();
-    if level
-        .as_deref()
-        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
-    {
-        return KernelStatusCode::Success;
-    }
-    let filter = level.as_deref().map(crate::logging::filter_from_level);
+    let filter = match unsafe { resolve_log_level(level) } {
+        LogLevelResolution::Off => return KernelStatusCode::Success,
+        LogLevelResolution::Filter(filter) => filter,
+    };
 
     if crate::logging::init_callback_logging(filter, callback, user_data) {
         KernelStatusCode::Success
@@ -1949,6 +1954,29 @@ mod tests {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(positional)),
             other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_log_level_preserves_shared_c_abi_semantics() {
+        let off = CString::new("oFf").unwrap();
+        let debug = CString::new("DEBUG").unwrap();
+        let invalid_utf8 = [0xff_u8, 0];
+
+        unsafe {
+            assert_eq!(resolve_log_level(off.as_ptr()), LogLevelResolution::Off);
+            assert_eq!(
+                resolve_log_level(debug.as_ptr()),
+                LogLevelResolution::Filter(Some("databricks::sql::kernel=debug".to_string()))
+            );
+            assert_eq!(
+                resolve_log_level(std::ptr::null()),
+                LogLevelResolution::Filter(None)
+            );
+            assert_eq!(
+                resolve_log_level(invalid_utf8.as_ptr().cast()),
+                LogLevelResolution::Filter(None)
+            );
         }
     }
 
