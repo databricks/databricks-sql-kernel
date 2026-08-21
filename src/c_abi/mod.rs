@@ -90,10 +90,69 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
                 .message(format!("failed to build the C-ABI tokio runtime: {e}"))
                 .location(concat!(file!(), ":", line!()))
         })?;
+    // On Windows, pin the module that contains the kernel into the process so
+    // it can never be unloaded while these worker threads are alive (#276).
+    // Must happen once the runtime — and therefore its detached `kernel-c-abi`
+    // worker threads — exists.
+    #[cfg(windows)]
+    pin_containing_module();
     // If another thread installed one between our `get` and here, keep
     // theirs and drop ours.
     let _ = RUNTIME.set(built);
     Ok(RUNTIME.get().expect("runtime just set"))
+}
+
+/// Pin the module containing the kernel so the ODBC / Go host cannot unload it
+/// while the C-ABI runtime's worker threads are still running.
+///
+/// The process-wide runtime (see [`runtime`]) is multi-thread and is never shut
+/// down: it spawns detached `kernel-c-abi` OS worker threads that outlive any
+/// single ODBC connection. The ODBC DriverManager, however, loads **and
+/// unloads** the driver DLL (which statically links this kernel) across
+/// connections. If `FreeLibrary` unmaps the DLL while those worker threads are
+/// still alive, they end up executing freed code — an Access Violation — and
+/// tokio's per-thread runtime-context guard is dropped after its thread-local
+/// `CONTEXT` has already been torn down, tripping the "EnterGuard values
+/// dropped out of order" panic (databricks/databricks-sql-kernel#276). The
+/// in-flight [`block_on_ffi`] task then never completes and the caller
+/// deadlocks on its result channel.
+///
+/// `GetModuleHandleExW` with `FROM_ADDRESS` resolves the module that contains a
+/// given code address, and `PIN` raises that module's reference count so it is
+/// never unloaded for the life of the process. We pass the address of this
+/// function itself (which lives in the kernel's statically-linked code), so the
+/// pinned module is whatever the kernel is linked into — the ODBC driver DLL
+/// for C-ABI consumers. Pinning is idempotent, so a lost runtime-build race
+/// calling it twice is harmless. This is the Windows-only complement to the
+/// spawn-not-`block_on` change in [`block_on_ffi`]: that keeps *foreign caller*
+/// threads out of the runtime; this keeps the runtime's *own* threads from
+/// being unmapped underneath themselves.
+#[cfg(windows)]
+fn pin_containing_module() {
+    const GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS: u32 = 0x0000_0004;
+    const GET_MODULE_HANDLE_EX_FLAG_PIN: u32 = 0x0000_0001;
+    // Declared inline rather than via a `windows-sys` dependency: `kernel32` is
+    // always linked on the MSVC target, and this avoids a new crate + its
+    // cargo-deny license review for a single call.
+    extern "system" {
+        fn GetModuleHandleExW(
+            dw_flags: u32,
+            lp_module_name: *const u16,
+            ph_module: *mut *mut core::ffi::c_void,
+        ) -> i32;
+    }
+    let mut module: *mut core::ffi::c_void = core::ptr::null_mut();
+    // SAFETY: with `FROM_ADDRESS`, `lp_module_name` is interpreted as an
+    // address, not a wide string; we pass a valid code address (this function)
+    // and a writable out-pointer. The returned handle is intentionally not
+    // released — pinning is meant to be permanent.
+    unsafe {
+        GetModuleHandleExW(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
+            pin_containing_module as usize as *const u16,
+            &mut module,
+        );
+    }
 }
 
 /// Run a fallible async block to completion on the process-wide runtime,
