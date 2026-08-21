@@ -106,8 +106,9 @@ unsafe fn run_metadata<F>(
 where
     F: FnOnce(
         &Session,
-    )
-        -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<ResultStream>> + '_>>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<ResultStream>> + Send + '_>,
+    >,
 {
     crate::c_abi::error::clear_error();
     let Some(session) = (session as *const Session).as_ref() else {
@@ -120,10 +121,18 @@ where
     // itself is handed to the owned handle and driven lazily (one batch
     // per `kernel_result_stream_next_batch`), so a large metadata result
     // (e.g. cross-catalog column listing) is not buffered up front.
-    let result = block_on_ffi(move || async move {
-        let stream = build(session).await?;
-        let schema = stream.schema();
-        Ok((schema, stream))
+    // Build the stream future on THIS (caller) thread — so `build` (which may
+    // capture raw C-string pointers, `!Send`) is consumed here and only the
+    // resulting `Send` future crosses onto the runtime's worker threads via
+    // `block_on_ffi`. See `block_on_ffi` for why the work must not run on the
+    // caller thread (#276).
+    let result = block_on_ffi(move || {
+        let stream_fut = build(session);
+        async move {
+            let stream = stream_fut.await?;
+            let schema = stream.schema();
+            Ok((schema, stream))
+        }
     });
     match result {
         Ok((schema, stream)) => {
@@ -162,9 +171,17 @@ pub unsafe extern "C" fn kernel_metadata_list_schemas(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal the raw C-string pointers on the caller thread (before the
+        // async block) so the spawned future captures only `Send` borrows,
+        // never the `!Send` raw pointers. See `block_on_ffi` (#276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
+            let (catalog, schema_pattern) = args?;
             session
                 .metadata()
                 .list_schemas(catalog, schema_pattern)
@@ -244,11 +261,17 @@ pub unsafe extern "C" fn kernel_metadata_list_tables(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_pattern(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+                opt_pattern(table_pattern, "table_pattern")?,
+                opt_str(table_types_csv, "table_types")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_pattern(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
-            let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
-            let types_csv = opt_str(table_types_csv, "table_types")?;
+            let (catalog, schema_pattern, table_pattern, types_csv) = args?;
             let types_owned = parse_table_types_filter(types_csv);
             session
                 .metadata()
@@ -279,11 +302,17 @@ pub unsafe extern "C" fn kernel_metadata_list_columns(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+                opt_pattern(table_pattern, "table_pattern")?,
+                opt_pattern(column_pattern, "column_pattern")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
-            let table_pattern = opt_pattern(table_pattern, "table_pattern")?;
-            let column_pattern = opt_pattern(column_pattern, "column_pattern")?;
+            let (catalog, schema_pattern, table_pattern, column_pattern) = args?;
             session
                 .metadata()
                 .list_columns(catalog, schema_pattern, table_pattern, column_pattern)
@@ -307,10 +336,16 @@ pub unsafe extern "C" fn kernel_metadata_primary_keys(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_ident(schema, "schema")?,
+                Identifier::new(req_str(table, "table")?)?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema = opt_ident(schema, "schema")?;
-            let table = Identifier::new(req_str(table, "table")?)?;
+            let (catalog, schema, table) = args?;
             session
                 .metadata()
                 .primary_keys(catalog, schema, table)
@@ -349,13 +384,26 @@ pub unsafe extern "C" fn kernel_metadata_foreign_keys(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(parent_catalog, "parent_catalog")?,
+                opt_ident(parent_schema, "parent_schema")?,
+                opt_ident(parent_table, "parent_table")?,
+                opt_ident(foreign_catalog, "foreign_catalog")?,
+                opt_ident(foreign_schema, "foreign_schema")?,
+                opt_ident(foreign_table, "foreign_table")?,
+            ))
+        })();
         Box::pin(async move {
-            let parent_catalog = opt_ident(parent_catalog, "parent_catalog")?;
-            let parent_schema = opt_ident(parent_schema, "parent_schema")?;
-            let parent_table = opt_ident(parent_table, "parent_table")?;
-            let foreign_catalog = opt_ident(foreign_catalog, "foreign_catalog")?;
-            let foreign_schema = opt_ident(foreign_schema, "foreign_schema")?;
-            let foreign_table = opt_ident(foreign_table, "foreign_table")?;
+            let (
+                parent_catalog,
+                parent_schema,
+                parent_table,
+                foreign_catalog,
+                foreign_schema,
+                foreign_table,
+            ) = args?;
             session
                 .metadata()
                 .foreign_keys(
@@ -407,10 +455,16 @@ pub unsafe extern "C" fn kernel_metadata_procedures(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+                opt_pattern(procedure_pattern, "procedure_pattern")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
-            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
+            let (catalog, schema_pattern, procedure_pattern) = args?;
             session
                 .metadata()
                 .procedures(catalog, schema_pattern, procedure_pattern)
@@ -435,10 +489,16 @@ pub unsafe extern "C" fn kernel_metadata_functions(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+                opt_pattern(function_pattern, "function_pattern")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
-            let function_pattern = opt_pattern(function_pattern, "function_pattern")?;
+            let (catalog, schema_pattern, function_pattern) = args?;
             session
                 .metadata()
                 .functions(catalog, schema_pattern, function_pattern)
@@ -466,11 +526,17 @@ pub unsafe extern "C" fn kernel_metadata_procedure_columns(
     out: *mut *mut kernel_result_stream_t,
 ) -> KernelStatusCode {
     run_metadata(session, out, |session| {
+        // Marshal raw C-string pointers on the caller thread (see #276).
+        let args = (|| -> Result<_> {
+            Ok((
+                opt_ident(catalog, "catalog")?,
+                opt_pattern(schema_pattern, "schema_pattern")?,
+                opt_pattern(procedure_pattern, "procedure_pattern")?,
+                opt_pattern(column_pattern, "column_pattern")?,
+            ))
+        })();
         Box::pin(async move {
-            let catalog = opt_ident(catalog, "catalog")?;
-            let schema_pattern = opt_pattern(schema_pattern, "schema_pattern")?;
-            let procedure_pattern = opt_pattern(procedure_pattern, "procedure_pattern")?;
-            let column_pattern = opt_pattern(column_pattern, "column_pattern")?;
+            let (catalog, schema_pattern, procedure_pattern, column_pattern) = args?;
             session
                 .metadata()
                 .procedure_columns(catalog, schema_pattern, procedure_pattern, column_pattern)
