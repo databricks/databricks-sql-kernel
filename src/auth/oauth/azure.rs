@@ -52,17 +52,6 @@ const AZURE_APP_IDS_BY_SUFFIX: &[(&str, &str)] = &[
     ),
 ];
 
-/// Azure sovereign-cloud workspace host suffixes. The M2M token exchange in
-/// [`sp_m2m_token_url`] only targets the commercial [`AZURE_AAD_LOGIN_HOST`], so
-/// these hosts cannot be served yet; [`reject_sovereign_host`] rejects them up
-/// front with a clear message instead of letting the exchange fail opaquely
-/// against the commercial directory. Wiring the matching sovereign login hosts
-/// is the documented follow-up.
-const AZURE_SOVEREIGN_HOST_SUFFIXES: &[&str] = &[
-    ".databricks.azure.us", // Azure Government (USGov)
-    ".databricks.azure.cn", // Azure China
-];
-
 /// Reduce a workspace URL/host to its lowercase host authority (scheme and any
 /// path/query/fragment dropped, trailing dot trimmed), so a suffix test can't
 /// be fooled by the pattern appearing in the scheme or path (e.g.
@@ -94,31 +83,6 @@ pub(crate) fn effective_app_id(host: &str) -> &'static str {
         }
     }
     AZURE_DATABRICKS_APP_ID
-}
-
-/// Reject a known Azure sovereign-cloud workspace `host` on the `azure-sp-m2m`
-/// path. Because [`sp_m2m_token_url`] hardcodes the commercial
-/// [`AZURE_AAD_LOGIN_HOST`], a sovereign workspace — even with an explicit
-/// `azure_tenant_id` — would exchange credentials against the *commercial*
-/// Entra directory and fail with an opaque Entra error. This mirrors the
-/// sovereign rejection [`tenant_from_login_url`] already performs on the
-/// discovery redirect, so both the explicit-tenant and discovery halves fail
-/// the same clear way until sovereign login hosts are wired (the documented
-/// follow-up).
-pub(crate) fn reject_sovereign_host(host: &str) -> crate::kernel_error::Result<()> {
-    use crate::kernel_error::Error;
-    let authority = host_authority(host);
-    for suffix in AZURE_SOVEREIGN_HOST_SUFFIXES {
-        if authority.ends_with(suffix) {
-            return Err(Error::invalid_argument().message(format!(
-                "azure-sp-m2m: sovereign cloud workspace {host:?} is not yet \
-                 supported (the token exchange only targets the commercial \
-                 Microsoft login host, so an explicit azure_tenant_id would hit \
-                 the wrong directory) — this is a documented follow-up"
-            )));
-        }
-    }
-    Ok(())
 }
 
 /// The Entra **token** endpoint for the M2M client-credentials grant:
@@ -322,37 +286,36 @@ pub(crate) async fn discover_tenant(
 
 /// Parse the Azure tenant id from the Entra login URL the workspace's
 /// `/aad/auth` redirects to (`https://login.microsoftonline.com/{tenant}/…`).
-/// The tenant is the first path segment; the host must be the **commercial**
-/// Microsoft login host (guards against a non-AAD redirect on a misconfigured
-/// workspace). Sovereign clouds (e.g. `chinacloudapi.cn`) are intentionally
-/// rejected here: [`sp_m2m_token_url`] only builds against the commercial
-/// [`AZURE_AAD_LOGIN_HOST`], so accepting a sovereign redirect would let
-/// discovery succeed while the token exchange silently hits the wrong
-/// directory. Rejecting keeps the two halves consistent until sovereign login
-/// hosts are wired (the documented follow-up), and steers the caller to pass
-/// `azure_tenant_id` explicitly. Extracted so the parse is unit-testable
-/// without a live workspace (the HTTP round-trip itself is verified against a
-/// real Azure workspace).
+/// The tenant is the first path segment; the host must be a Microsoft / Azure AD
+/// login host (guards against a non-AAD redirect on a misconfigured workspace).
+/// Extracted so the parse is unit-testable without a live workspace (the HTTP
+/// round-trip itself is verified against a real Azure workspace).
 fn tenant_from_login_url(final_url: &reqwest::Url) -> crate::kernel_error::Result<String> {
     use crate::kernel_error::Error;
     let host = final_url
         .host_str()
         .unwrap_or_default()
         .to_ascii_lowercase();
-    // Anchor the guard on the host authority, not a loose substring, mirroring
-    // `host_authority`/`effective_app_id`/`reject_sovereign_host` elsewhere in
-    // this module. A substring test (`contains("microsoftonline")`) would also
-    // admit sovereign login hosts (`login.microsoftonline.us` USGov,
-    // `login.microsoftonline.de`) and spoofed hosts
-    // (`login.microsoftonline.com.attacker.example`), handing an
-    // attacker-/wrong-directory-controlled first path segment to
-    // `sp_m2m_token_url`, which hardcodes the commercial host. Require the
-    // commercial `*.microsoftonline.com` authority so the comment holds.
-    if host != "microsoftonline.com" && !host.ends_with(".microsoftonline.com") {
+    // Anchor the guard on the host authority *suffix*, not a loose substring: a
+    // `contains("microsoftonline")` test would admit a spoofed host such as
+    // `login.microsoftonline.com.attacker.example`, handing an
+    // attacker-controlled first path segment to the token exchange. Accept the
+    // known Microsoft/Azure AD login authorities — commercial and sovereign
+    // (USGov `login.microsoftonline.us`, China `login.chinacloudapi.cn`). A
+    // sovereign workspace then fails naturally at the (commercial) token
+    // exchange, matching the Thrift connector; no sovereign special-casing here.
+    const MS_LOGIN_HOST_SUFFIXES: &[&str] = &[
+        ".microsoftonline.com", // commercial
+        ".microsoftonline.us",  // Azure Government (USGov)
+        ".chinacloudapi.cn",    // Azure China
+    ];
+    if !MS_LOGIN_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host.ends_with(suffix))
+    {
         return Err(Error::unauthenticated().message(format!(
-            "Azure tenant discovery: /aad/auth did not redirect to the commercial \
-             Microsoft login host (got {host:?}); sovereign clouds are not yet \
-             supported for azure-sp-m2m — pass azure_tenant_id explicitly"
+            "Azure tenant discovery: /aad/auth did not redirect to a Microsoft \
+             login host (got {host:?}); pass azure_tenant_id explicitly"
         )));
     }
     final_url
@@ -443,31 +406,17 @@ mod tests {
     }
 
     #[test]
-    fn tenant_parse_rejects_sovereign_login_host() {
-        // A China sovereign workspace redirects to login.chinacloudapi.cn, but
-        // sp_m2m_token_url only targets the commercial AZURE_AAD_LOGIN_HOST — so
-        // discovery must reject sovereign hosts rather than let the token
-        // exchange silently hit the wrong directory. Consistency guard for the
-        // documented sovereign follow-up.
-        let url = reqwest::Url::parse(
-            "https://login.chinacloudapi.cn/9f37a392-f0ae-4280-9796-f1864a10effc/oauth2/authorize?client_id=x",
-        )
-        .unwrap();
-        assert!(tenant_from_login_url(&url).is_err());
-    }
-
-    #[test]
-    fn tenant_parse_rejects_sovereign_microsoftonline_hosts() {
-        // login.microsoftonline.us (USGov) / .de satisfy a loose
-        // `contains("microsoftonline")` test but are NOT the commercial host
-        // sp_m2m_token_url targets — the authority-anchored guard must reject
-        // them so discovery can't feed a tenant to the wrong directory.
+    fn tenant_parse_accepts_sovereign_login_hosts() {
+        // Sovereign Microsoft/Azure AD login hosts (USGov login.microsoftonline.us,
+        // China login.chinacloudapi.cn) are accepted — the tenant parses fine. A
+        // sovereign workspace then fails naturally at the (commercial) token
+        // exchange, matching the Thrift connector (no sovereign special-casing).
         for host in [
             "https://login.microsoftonline.us/tenant-abc/oauth2/authorize?client_id=x",
-            "https://login.microsoftonline.de/tenant-abc/oauth2/authorize?client_id=x",
+            "https://login.chinacloudapi.cn/tenant-abc/oauth2/authorize?client_id=x",
         ] {
             let url = reqwest::Url::parse(host).unwrap();
-            assert!(tenant_from_login_url(&url).is_err());
+            assert_eq!(tenant_from_login_url(&url).unwrap(), "tenant-abc");
         }
     }
 
@@ -481,27 +430,6 @@ mod tests {
         )
         .unwrap();
         assert!(tenant_from_login_url(&url).is_err());
-    }
-
-    #[test]
-    fn reject_sovereign_host_matches_known_sovereign_suffixes() {
-        // USGov and China workspace hosts are rejected: sp_m2m_token_url only
-        // targets the commercial login host, so an explicit azure_tenant_id
-        // would otherwise hit the wrong directory and fail opaquely.
-        assert!(reject_sovereign_host("https://adb-1.11.databricks.azure.us").is_err());
-        assert!(reject_sovereign_host("https://adb-1.11.databricks.azure.cn").is_err());
-    }
-
-    #[test]
-    fn reject_sovereign_host_allows_commercial_and_dev_staging() {
-        // Commercial prod, dev, and staging are all served by the commercial
-        // login host, so they pass the guard.
-        assert!(reject_sovereign_host("https://adb-1.4.azuredatabricks.net").is_ok());
-        assert!(reject_sovereign_host("https://adb-1.dev.azuredatabricks.net").is_ok());
-        assert!(reject_sovereign_host("https://adb-1.staging.azuredatabricks.net").is_ok());
-        // A host that merely embeds a sovereign suffix mid-string is not
-        // sovereign — suffix match on the authority, not a substring.
-        assert!(reject_sovereign_host("https://adb-1.databricks.azure.us.example.com").is_ok());
     }
 
     #[tokio::test(flavor = "multi_thread")]

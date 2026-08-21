@@ -1302,13 +1302,6 @@ async fn build_base_auth_provider(
                      azure_client_id and azure_client_secret",
                 ));
             }
-            // Reject sovereign-cloud hosts up front: sp_m2m_token_url only
-            // targets the commercial Entra login host, so a sovereign workspace
-            // would fail opaquely against the wrong directory even with an
-            // explicit azure_tenant_id. This matches the sovereign rejection
-            // tenant discovery already performs, so both halves fail the same
-            // clear way until sovereign login hosts are wired (follow-up).
-            azure::reject_sovereign_host(host)?;
             let tenant = match azure_tenant_id {
                 Some(t) if !t.is_empty() => t.clone(),
                 _ => azure::discover_tenant(host, &http_client).await?,
