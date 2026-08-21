@@ -708,9 +708,15 @@ impl ResultStream {
     /// terminal result at statement-construction time.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
-            match self.reader.next_batch().await? {
-                Some(rb) => self.prefetched = Some(ResultBatch::Arrow(rb)),
-                None => self.exhausted = true,
+            match self.reader.next_batch().await {
+                Ok(Some(rb)) => self.prefetched = Some(ResultBatch::Arrow(rb)),
+                Ok(None) => self.exhausted = true,
+                Err(e) => {
+                    if let Some(telemetry) = &mut self.telemetry {
+                        telemetry.finish(self.reader.metrics(), Some(&e));
+                    }
+                    return Err(e);
+                }
             }
         }
         Ok(self.prefetched.as_ref())

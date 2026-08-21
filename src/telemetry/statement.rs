@@ -258,3 +258,101 @@ impl StatementOperationObserver for NoOpObserver {
 fn duration_millis(duration: Duration) -> i64 {
     duration.as_millis().try_into().unwrap_or(i64::MAX)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::kernel_error::ErrorCode;
+    use crate::reader::test_utils::ErrorReader;
+    use crate::result_stream::ResultStream;
+    use crate::telemetry::models::OperationType;
+    use crate::telemetry::runtime::{ConnectionTelemetry, TelemetrySessionContext};
+    use arrow_schema::Schema;
+    use std::future::Future;
+    use std::pin::Pin;
+
+    #[derive(Default)]
+    struct CapturingConnectionTelemetry {
+        statement_events: Mutex<Vec<CapturedStatementEvent>>,
+    }
+
+    struct CapturedStatementEvent {
+        context: StatementTelemetryContext,
+        error_code: Option<ErrorCode>,
+        error_message: Option<String>,
+    }
+
+    impl ConnectionTelemetry for CapturingConnectionTelemetry {
+        fn session(&self) -> Option<Arc<TelemetrySessionContext>> {
+            None
+        }
+
+        fn emit_operation(
+            &self,
+            _operation_type: OperationType,
+            _elapsed: Duration,
+            _error: Option<&KernelError>,
+        ) {
+        }
+
+        fn emit_statement_operation(
+            &self,
+            context: StatementTelemetryContext,
+            _elapsed: Duration,
+            error: Option<&KernelError>,
+        ) {
+            self.statement_events
+                .lock()
+                .expect("events mutex")
+                .push(CapturedStatementEvent {
+                    context,
+                    error_code: error.map(|e| e.code),
+                    error_message: error.map(|e| e.message.clone()),
+                });
+        }
+
+        fn finish<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn peek_first_batch_error_finalizes_statement_with_error_before_drop() {
+        let connection = Arc::new(CapturingConnectionTelemetry::default());
+        let telemetry = StatementTelemetry::new(
+            connection.clone(),
+            StatementType::Sql,
+            OperationType::ExecuteStatement,
+        );
+        let reader = ErrorReader {
+            schema: Arc::new(Schema::empty()),
+        };
+        let mut stream = ResultStream::from_reader(Box::new(reader))
+            .await
+            .expect("schema succeeds");
+        stream.attach_telemetry(telemetry);
+
+        let error = match stream.peek_first_batch().await {
+            Ok(_) => panic!("peek should surface reader error"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, ErrorCode::Internal);
+
+        drop(stream);
+
+        let events = connection.statement_events.lock().expect("events mutex");
+        assert_eq!(
+            events.len(),
+            1,
+            "peek error should finalize once; Drop must not overwrite it with success"
+        );
+        let event = &events[0];
+        assert_eq!(event.context.statement_type, StatementType::Sql);
+        assert_eq!(event.error_code, Some(ErrorCode::Internal));
+        assert_eq!(event.error_message.as_deref(), Some("simulated read error"));
+        assert!(
+            event.context.consumption_latency.is_some(),
+            "failed consumption should still record result-consumption latency"
+        );
+    }
+}
