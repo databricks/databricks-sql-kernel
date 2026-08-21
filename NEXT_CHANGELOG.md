@@ -24,6 +24,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `jwt_key_file` / `jwt_kid`; optional `jwt_passphrase` (encrypted PKCS#8),
   `jwt_algorithm` (NULL → `RS256`), `scopes` (comma-separated; NULL → `all-apis`),
   and `token_url` (NULL → OIDC discovery). Maps to `AuthConfig::oauth_m2m_private_key`.
+- C ABI: `kernel_session_test()` — actively validate a session by round-tripping a
+  lightweight `SELECT 1` test query (result discarded). The I/O-performing complement
+  of `kernel_session_is_open()` (a local handle-state check): it reaches the server, so
+  it detects a server-side idle timeout, a killed warehouse, or a dropped link. Returns
+  `Success` when the session is alive; a transport/availability failure surfaces as
+  `Unavailable` / `NetworkError` / `Timeout`, which a host can treat as "connection
+  dead" when backing `SQL_ATTR_CONNECTION_DEAD`. Mirrors the reference / JDBC drivers'
+  validate-on-borrow / connection-test probe. Runs SQL, so it must be called from a
+  native (non-async-runtime) thread. Backed by the new `Session::test_connection()`.
+  Benefits ODBC (databricks/databricks-odbc#298).
 - C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
   HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
   `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own

@@ -530,6 +530,35 @@ impl Session {
         !self.inner.closed.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// Actively validate the session against the server by round-tripping a
+    /// lightweight `SELECT 1` test query, discarding its result. Unlike
+    /// [`is_open`](Self::is_open) — a local handle-state check — this is a
+    /// real network probe: it detects a server-side idle timeout, a killed
+    /// warehouse, or a dropped link that the local flag cannot see.
+    ///
+    /// Returns `Ok(())` when the round-trip completes (the session is
+    /// alive). On failure the error carries the usual `KernelError`
+    /// category, so a caller can tell a transport/availability failure
+    /// (session dead) from, say, an auth error. This mirrors the reference
+    /// and JDBC drivers' validate-on-borrow / connection-test probe (a
+    /// `SELECT 1`), and backs the C ABI's `kernel_session_test` — the
+    /// I/O-performing complement of `kernel_session_is_open` that a host
+    /// can use to answer `SQL_ATTR_CONNECTION_DEAD` positively.
+    ///
+    /// Runs regardless of `ignore_transactions`: it is a read-only probe,
+    /// not transaction control. Must be called from a native
+    /// (non-async-runtime) thread when driven through the C ABI.
+    pub async fn test_connection(&self) -> Result<()> {
+        let span = self.inner.log_span().clone();
+        async {
+            let mut stmt = self.statement();
+            stmt.spec().sql("SELECT 1");
+            stmt.execute().await.map(|_executed| ())
+        }
+        .instrument(span)
+        .await
+    }
+
     /// Adopt an already-submitted server statement by its id, producing
     /// an [`ExecutedAsyncStatement`] that can poll [`status`] / await
     /// results / cancel — without having been the handle that submitted
@@ -1830,6 +1859,148 @@ mod is_open_tests {
             !session.is_open(),
             "after initiate_delete the session must report not-open"
         );
+    }
+
+    /// `Session::test_connection` round-trips a `SELECT 1` and returns
+    /// `Ok(())` when the server responds. Pins that the probe actually
+    /// issues a statement (POST /statements) rather than being a local
+    /// no-op like `is_open`.
+    #[tokio::test]
+    async fn test_connection_succeeds_and_issues_select_1() {
+        use arrow_array::{Int64Array, RecordBatch};
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+        use base64::{engine::general_purpose::STANDARD, Engine};
+        use serde_json::json;
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"session_id":"sess-test-conn","warehouse_id":"test_wh"}"#),
+            )
+            .mount(&server)
+            .await;
+        // The SELECT 1 result: one BIGINT column, one row.
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![std::sync::Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut w = StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            w.write(&batch).unwrap();
+            w.finish().unwrap();
+        }
+        let body = json!({
+            "statement_id": "stmt-test-conn",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": 1,
+                    "columns": [{ "name": "1", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0 }],
+                },
+                "total_chunk_count": 1,
+                "total_row_count": 1,
+                "total_byte_count": ipc.len() as i64,
+                "truncated": false,
+            },
+            "result": {
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": ipc.len() as i64,
+                "attachment": STANDARD.encode(&ipc),
+            },
+        })
+        .to_string();
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(&server)
+            .await;
+        // Swallow the statement + session close DELETEs.
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        session
+            .test_connection()
+            .await
+            .expect("test_connection must succeed against a live server");
+
+        // The probe must have issued a POST /statements (SELECT 1), not
+        // just a local flag read.
+        let recorded = server.received_requests().await.unwrap_or_default();
+        assert!(
+            recorded.iter().any(|r| {
+                r.method.as_str() == "POST" && r.url.path() == "/api/2.0/sql/statements"
+            }),
+            "test_connection must round-trip a statement to the server"
+        );
+    }
+
+    /// When the server is unreachable, `test_connection` returns an error
+    /// (not `Ok`) — the property a host relies on to flip
+    /// `SQL_ATTR_CONNECTION_DEAD` to dead. Contrasts with `is_open`, which
+    /// would still report the handle open here.
+    #[tokio::test]
+    async fn test_connection_fails_when_server_unreachable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(r#"{"session_id":"sess-dead","warehouse_id":"test_wh"}"#),
+            )
+            .mount(&server)
+            .await;
+        let uri = server.uri();
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(uri, "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        // Drop the mock server: subsequent statement round-trips have
+        // nowhere to land, so the SELECT 1 probe must fail.
+        drop(server);
+
+        // The local handle is still "open" — this is exactly the gap
+        // test_connection closes.
+        assert!(session.is_open(), "handle is still locally open");
+        let err = session
+            .test_connection()
+            .await
+            .expect_err("test_connection must fail once the server is gone");
+        eprintln!("[test_connection] probe error after server drop: {err:?}");
     }
 
     #[test]
