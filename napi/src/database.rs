@@ -62,7 +62,7 @@ use crate::util::guarded;
 /// Authentication mode selector crossing the napi boundary. The string
 /// literals are what napi-rs emits from this `#[napi(string_enum)]` — the
 /// NodeJS SEA adapter (`KernelAuth`) matches them verbatim (`'Pat'`,
-/// `'OAuthM2m'`, `'OAuthU2m'`).
+/// `'OAuthM2m'`, `'OAuthU2m'`, `'AzureSpM2m'`).
 ///
 /// Mirrors the kernel [`AuthConfig`] variants this binding supports.
 /// `OAuthFederation` / `External` are intentionally not exposed yet — the
@@ -82,6 +82,14 @@ pub enum AuthMode {
     /// OAuth 2.0 user-to-machine (browser flow) — optional `oauthClientId`
     /// + `oauthRedirectPort`.
     OAuthU2m,
+    /// Azure Entra service-principal M2M — `azureClientId` +
+    /// `azureClientSecret` (+ optional `azureTenantId` /
+    /// `azureWorkspaceResourceId`). The kernel builds the Entra token
+    /// endpoint + `.default` scope, auto-discovers the tenant from the
+    /// workspace when `azureTenantId` is omitted, and — when
+    /// `azureWorkspaceResourceId` is set — additionally sends the SP
+    /// management token for an RBAC-only service principal.
+    AzureSpM2m,
 }
 
 /// A single extra HTTP header as an explicit `{ name, value }` pair.
@@ -125,6 +133,8 @@ pub struct ProxyInput {
 /// - `OAuthM2m` — `oauthClientId` + `oauthClientSecret` required.
 /// - `OAuthU2m` — `oauthClientId` / `oauthRedirectPort` optional
 ///   (defaults to the `databricks-sql-connector` client on port 8030).
+/// - `AzureSpM2m` — `azureClientId` + `azureClientSecret` required
+///   (+ optional `azureTenantId` / `azureWorkspaceResourceId`).
 ///
 /// Catalog / schema / sessionConf are applied once at session creation
 /// and remain in effect for every statement run on the resulting
@@ -182,6 +192,23 @@ pub struct ConnectionOptions {
     /// SP-wide Workload Identity Federation client id used during mandatory
     /// token exchange. Omitted selects BYOT / account-wide WIF.
     pub identity_federation_client_id: Option<String>,
+    /// Azure Entra app-registration client id. Required for
+    /// [`AuthMode::AzureSpM2m`]; ignored otherwise.
+    pub azure_client_id: Option<String>,
+    /// Azure Entra app-registration client secret. Required for
+    /// [`AuthMode::AzureSpM2m`].
+    pub azure_client_secret: Option<String>,
+    /// Azure Entra tenant id. Optional for [`AuthMode::AzureSpM2m`];
+    /// omitted ⇒ the kernel auto-discovers it from the workspace's
+    /// `/aad/auth` redirect (matching the Thrift connector).
+    pub azure_tenant_id: Option<String>,
+    /// Azure workspace ARM resource id. Optional for [`AuthMode::AzureSpM2m`];
+    /// when set the kernel also sends the SP management token
+    /// (`X-Databricks-Azure-SP-Management-Token`) + the
+    /// `X-Databricks-Azure-Workspace-Resource-Id` header, so a service
+    /// principal with an Azure RBAC role but no workspace membership can
+    /// authenticate. Omitted ⇒ the data token authenticates alone.
+    pub azure_workspace_resource_id: Option<String>,
     /// Default catalog for statements executed on this session.
     /// Routed through the kernel's `DefaultOpts` and onto the SEA
     /// `CreateSession.catalog` wire field.
@@ -424,6 +451,21 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 options.identity_federation_client_id.clone(),
             ))
         }
+        // Azure Entra service-principal M2M. The kernel owns Azure
+        // resolution: it builds the Entra token endpoint + `.default` scope
+        // and auto-discovers the tenant from the workspace when
+        // `azureTenantId` is omitted. The binding forwards the Entra
+        // credentials (+ optional tenant + optional workspace resource id for
+        // the management-token resource-id header). Mirrors the pyo3
+        // `azure-sp-m2m` arm.
+        AuthMode::AzureSpM2m => AuthConfig::azure_service_principal(
+            options.azure_client_id.clone(),
+            options.azure_client_secret.clone(),
+            options.azure_tenant_id.clone(),
+            options.azure_workspace_resource_id.clone(),
+            options.identity_federation_client_id.clone(),
+        )
+        .map_err(napi_err_from_kernel),
     }
 }
 
@@ -645,6 +687,10 @@ mod tests {
             jwt_passphrase: None,
             jwt_algorithm: None,
             identity_federation_client_id: None,
+            azure_client_id: None,
+            azure_client_secret: None,
+            azure_tenant_id: None,
+            azure_workspace_resource_id: None,
             catalog: None,
             schema: None,
             session_conf: None,
@@ -699,6 +745,73 @@ mod tests {
             build_auth_config(&o).unwrap(),
             AuthConfig::Pat { .. }
         ));
+    }
+
+    #[test]
+    fn azure_sp_m2m_builds_azure_service_principal() {
+        // azure-sp-m2m forwards the Entra SP credentials (+ optional tenant +
+        // optional workspace resource id) to the kernel's Azure SP flow.
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::AzureSpM2m);
+        o.azure_client_id = Some("entra-app-id".to_owned());
+        o.azure_client_secret = Some("entra-secret".to_owned());
+        o.azure_tenant_id = Some("tenant-abc".to_owned());
+        o.azure_workspace_resource_id =
+            Some("/subscriptions/s/resourceGroups/rg/workspace/w".to_owned());
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::AzureServicePrincipal {
+                azure_client_id,
+                azure_client_secret,
+                azure_tenant_id,
+                azure_workspace_resource_id,
+                ..
+            } => {
+                assert_eq!(azure_client_id, "entra-app-id");
+                assert_eq!(azure_client_secret, "entra-secret");
+                assert_eq!(azure_tenant_id.as_deref(), Some("tenant-abc"));
+                assert_eq!(
+                    azure_workspace_resource_id.as_deref(),
+                    Some("/subscriptions/s/resourceGroups/rg/workspace/w")
+                );
+            }
+            other => panic!("expected AzureServicePrincipal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn azure_sp_m2m_tenant_and_resource_id_optional() {
+        // Omitting the tenant + resource id is valid: the kernel auto-discovers
+        // the tenant and sends the data token alone (no management token).
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::AzureSpM2m);
+        o.azure_client_id = Some("entra-app-id".to_owned());
+        o.azure_client_secret = Some("entra-secret".to_owned());
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::AzureServicePrincipal {
+                azure_tenant_id,
+                azure_workspace_resource_id,
+                ..
+            } => {
+                assert!(azure_tenant_id.is_none());
+                assert!(azure_workspace_resource_id.is_none());
+            }
+            other => panic!("expected AzureServicePrincipal, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn azure_sp_m2m_requires_client_id_and_secret() {
+        // The kernel ctor rejects a missing/empty client id or secret; the
+        // binding surfaces that as an InvalidArgument envelope.
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::AzureSpM2m);
+        o.azure_client_secret = Some("entra-secret".to_owned());
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "azure_client_id");
+
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::AzureSpM2m);
+        o.azure_client_id = Some("entra-app-id".to_owned());
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "azure_client_secret");
     }
 
     #[test]

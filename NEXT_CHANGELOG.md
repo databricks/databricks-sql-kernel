@@ -60,6 +60,17 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `jwt_key_file` / `jwt_kid`; optional `jwt_passphrase` (encrypted PKCS#8),
   `jwt_algorithm` (NULL → `RS256`), `scopes` (comma-separated; NULL → `all-apis`),
   and `token_url` (NULL → OIDC discovery). Maps to `AuthConfig::oauth_m2m_private_key`.
+- C ABI: `kernel_session_config_set_auth_azure_sp()` — expose Azure Entra
+  service-principal M2M over the C ABI (for ODBC / Go consumers). Required
+  `azure_client_id` / `azure_client_secret`; optional `azure_tenant_id`
+  (NULL → the kernel auto-discovers it from the workspace `/aad/auth` redirect) and
+  `azure_workspace_resource_id` (NULL → the data token authenticates alone; set →
+  the kernel also sends the Azure SP management token +
+  `X-Databricks-Azure-Workspace-Resource-Id` header, so an SP with an Azure RBAC
+  role but no workspace membership can authenticate). Maps to
+  `AuthConfig::azure_service_principal`. Azure AD U2M has no separate setter — it
+  rides `set_auth_u2m` (the kernel's workspace-federated browser flow, which Azure
+  Databricks workspaces support).
 - C ABI: `kernel_session_test()` — actively validate a session by round-tripping a
   lightweight `SELECT 1` test query (result discarded). The I/O-performing complement
   of `kernel_session_is_open()` (a local handle-state check): it reaches the server, so
