@@ -26,7 +26,8 @@ layout, or npm publishing. Pure-kernel changes go in the root
   configured IdP token endpoint (e.g. Entra ID for Azure Databricks). Required for
   `AuthMode.OAuthM2mJwt` against an external-IdP-backed workspace, since
   Databricks-native OIDC does not advertise the `private_key_jwt` method. Applies to
-  `AuthMode.OAuthM2m` too. Forwards to the kernel's `token_url_override`.
+  `AuthMode.OAuthM2m` and `AuthMode.OAuthU2m` too. Forwards to the kernel's
+  `token_url_override`.
 - `ConnectionOptions.identityFederationClientId` selects SP-wide Workload
   Identity Federation during mandatory token exchange.
 

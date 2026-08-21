@@ -271,6 +271,34 @@ KernelStatusCode
 kernel_session_config_set_identity_federation_client_id(KernelSessionConfig* config,
                                                         const char* client_id);
 
+/* Optional OAuth token-endpoint override, applied to whichever OAuth mode
+ * (M2M, M2M-JWT, or U2M) is selected. Points the token exchange at a non-workspace
+ * endpoint — e.g. the Azure/Entra token endpoint
+ * `https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token` for an Azure
+ * service principal. Unset → OIDC discovery against the workspace host.
+ * No effect on PAT auth.
+ *
+ * The override replaces the token endpoint ONLY. For U2M the authorization
+ * endpoint always comes from OIDC discovery against the workspace host — it is
+ * never derived from this override — so no particular suffix is required and no
+ * value is rejected at session open. M2M / M2M-JWT likewise only have their
+ * token endpoint replaced. */
+KernelStatusCode
+kernel_session_config_set_oauth_token_endpoint(KernelSessionConfig* config,
+                                               const char* token_endpoint);
+
+/* Optional OAuth scopes (comma-separated), applied to whichever OAuth mode
+ * (M2M, M2M-JWT, or U2M) is selected — e.g.
+ * `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` for an Azure service
+ * principal (M2M), or `sql,offline_access` (U2M). Mirrors the single
+ * `oauth_scopes` the pyo3 / napi bindings expose across both flows. Unset →
+ * kernel per-mode default (`all-apis` for M2M; `sql offline_access` for U2M).
+ * For U2M and M2M-JWT it takes precedence over any scopes passed positionally
+ * to kernel_session_config_set_auth_u2m / kernel_session_config_set_auth_m2m_jwt. */
+KernelStatusCode
+kernel_session_config_set_oauth_scopes(KernelSessionConfig* config,
+                                       const char* scopes);
+
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
  * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
  * reserved keys are instead CLIENT-ONLY: they tune the kernel locally, are

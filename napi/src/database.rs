@@ -414,7 +414,7 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                     .filter(|&p| p != 0)
                     .map(|p| vec![p]),
                 options.oauth_scopes.clone(),
-                None,
+                options.token_url.clone(),
                 None,
                 // `None` takes the kernel default: on-disk cache enabled,
                 // encrypted under a machine-local derived key since this
@@ -727,6 +727,62 @@ mod tests {
                 Some("federation-client")
             ),
             other => panic!("expected Pat, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_url_forwards_as_override() {
+        // `tokenUrl` must reach the built AuthConfig as
+        // `token_url_override` for M2M, M2M-JWT, and U2M, so a Node caller can point
+        // the token exchange at an Azure/Entra endpoint. Omitting it leaves the
+        // override `None` (kernel OIDC discovery).
+        let endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+
+        let mut m2m = base();
+        m2m.auth_mode = Some(AuthMode::OAuthM2m);
+        m2m.oauth_client_id = Some("cid".to_owned());
+        m2m.oauth_client_secret = Some("sec".to_owned());
+        m2m.token_url = Some(endpoint.to_owned());
+        match build_auth_config(&m2m).unwrap() {
+            AuthConfig::OAuthM2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+
+        let mut u2m = base();
+        u2m.auth_mode = Some(AuthMode::OAuthU2m);
+        u2m.token_url = Some(endpoint.to_owned());
+        match build_auth_config(&u2m).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+
+        let mut jwt = base();
+        jwt.auth_mode = Some(AuthMode::OAuthM2mJwt);
+        jwt.oauth_client_id = Some("cid".to_owned());
+        jwt.jwt_key_file = Some("/k.pem".to_owned());
+        jwt.jwt_kid = Some("kid".to_owned());
+        jwt.token_url = Some(endpoint.to_owned());
+        match build_auth_config(&jwt).unwrap() {
+            AuthConfig::OAuthM2MPrivateKey {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
+        }
+
+        // Omitted → None (default OIDC discovery).
+        let mut none = base();
+        none.auth_mode = Some(AuthMode::OAuthM2m);
+        none.oauth_client_id = Some("cid".to_owned());
+        none.oauth_client_secret = Some("sec".to_owned());
+        match build_auth_config(&none).unwrap() {
+            AuthConfig::OAuthM2M {
+                token_url_override, ..
+            } => assert!(token_url_override.is_none()),
+            other => panic!("expected OAuthM2M, got {other:?}"),
         }
     }
 

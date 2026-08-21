@@ -14,7 +14,7 @@
 
 //! Translate Python auth kwargs into a kernel `AuthConfig`.
 //!
-//! Supports four `auth_type` values:
+//! Supports five `auth_type` values:
 //!
 //! - `"pat"` — personal access token (`access_token`).
 //! - `"oauth-m2m"` — OAuth 2.0 client-credentials (service principal):
@@ -26,6 +26,11 @@
 //! - `"oauth-u2m"` — OAuth 2.0 authorization-code + PKCE browser flow:
 //!   optional `client_id` / `redirect_ports` / `scopes` / `token_url` /
 //!   `oauth_callback_timeout_secs`.
+//! - `"azure-sp-m2m"` — Azure Entra service-principal M2M:
+//!   `azure_client_id` + `azure_client_secret`, optional
+//!   `azure_tenant_id` (auto-discovered from the workspace when omitted)
+//!   / `azure_workspace_resource_id` (opts into the Azure management
+//!   token by setting the management-token resource-id header).
 //!
 //! OAuth is **kernel-owned**: the kernel acquires and refreshes tokens
 //! itself (OIDC discovery against the workspace host, transparent
@@ -71,6 +76,13 @@ pub(crate) struct OAuthParams {
     pub jwt_passphrase: Option<String>,
     pub jwt_algorithm: Option<String>,
     pub identity_federation_client_id: Option<String>,
+    /// Azure Entra service-principal credentials (`azure-sp-m2m`). The kernel
+    /// resolves the Entra endpoint / scope and (when `azure_tenant_id` is
+    /// omitted) the tenant itself.
+    pub azure_client_id: Option<String>,
+    pub azure_client_secret: Option<String>,
+    pub azure_tenant_id: Option<String>,
+    pub azure_workspace_resource_id: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -135,7 +147,8 @@ const PYSQL_OAUTH_REDIRECT_PORT: u16 = 8020;
 /// Build a kernel `AuthConfig` from the Python kwargs the `Session`
 /// constructor accepts.
 ///
-/// `auth_type` is one of `"pat"`, `"oauth-m2m"`, `"oauth-u2m"`. Thin
+/// `auth_type` is one of `"pat"`, `"oauth-m2m"`, `"oauth-m2m-jwt"`,
+/// `"oauth-u2m"`, `"azure-sp-m2m"`. Thin
 /// wrapper over [`build_auth_config_inner`] that maps its plain-`String`
 /// validation error onto a `PyValueError`. Keeping the logic in the
 /// inner fn lets the unit tests assert on the error text without an
@@ -319,9 +332,25 @@ fn build_auth_config_inner(
                 oauth.identity_federation_client_id,
             ))
         }
+        "azure-sp-m2m" => {
+            // Azure Entra service-principal M2M. The kernel owns Azure
+            // resolution: it builds the Entra token endpoint + `.default`
+            // scope and auto-discovers the tenant from the workspace when
+            // `azure_tenant_id` is omitted. The binding forwards the Entra
+            // credentials (+ optional tenant + optional workspace resource id
+            // for the management-token resource-id header).
+            AuthConfig::azure_service_principal(
+                oauth.azure_client_id,
+                oauth.azure_client_secret,
+                oauth.azure_tenant_id,
+                oauth.azure_workspace_resource_id,
+                oauth.identity_federation_client_id,
+            )
+            .map_err(|err| err.to_string())
+        }
         other => Err(format!(
             "unsupported auth_type {other:?}; expected one of 'pat', 'oauth-m2m', \
-             'oauth-m2m-jwt', 'oauth-u2m'"
+             'oauth-m2m-jwt', 'oauth-u2m', 'azure-sp-m2m'"
         )),
     }
 }

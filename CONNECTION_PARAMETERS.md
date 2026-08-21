@@ -34,7 +34,7 @@ warehouse id and org id out of a `/sql/1.0/warehouses/{id}` path).
 ## `AuthConfig` — authentication (required)
 
 An enum; pick one variant. Use the validating constructors
-(`AuthConfig::pat`, `::oauth_m2m`, `::oauth_u2m`).
+(`AuthConfig::pat`, `::oauth_m2m`, `::oauth_u2m`, `::azure_service_principal`).
 
 **`Pat`** — personal access token:
 
@@ -60,6 +60,55 @@ An enum; pick one variant. Use the validating constructors
 | `scopes` | OAuth scopes. `offline_access` is required to receive a refresh token (cached and refreshed transparently). | `["sql", "offline_access"]` |
 | `token_url_override` | Token endpoint override. | OIDC discovery |
 | `callback_timeout` | How long to wait for the user to complete the browser flow. | `120s` |
+
+**Azure Entra ID (Microsoft Entra) OAuth.** The kernel is the Azure-aware auth
+core — it resolves the Azure endpoints / scope / client id from the host, so
+bindings just select the flow.
+
+- **Azure U2M (`AzureOAuthU2M`, `azure-oauth`): planned — not yet in v0.**
+  The `AzureOAuthU2M` variant / `AuthConfig::azure_oauth_u2m(...)` constructor and
+  the pyo3 `auth_type="azure-oauth"` selector are **not** shipped in this release;
+  the design (PECOBLR-4120) is tracked in
+  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`. When it lands the
+  kernel will pin the workspace **v2.0** endpoints
+  (`{host}/oidc/oauth2/v2.0/{authorize,token}`, which the workspace redirects to
+  Entra), the Azure app client id (`96eecda7-…`), port `8030`, and the
+  `{app_id}/user_impersonation offline_access` scope, with no tenant needed (the
+  workspace redirect resolves it). Until then, use `azure-sp-m2m` for Azure
+  authentication.
+- **Azure service principal M2M (`AzureServicePrincipal`, `azure-sp-m2m`):
+  supported.** The kernel owns Azure resolution: it builds the Entra token
+  endpoint (`{login_host}/{tenant}/oauth2/v2.0/token`) and the
+  `{app_id}/.default` data scope, and — when `azure_tenant_id` is omitted —
+  auto-discovers the tenant from the workspace's `/aad/auth` redirect (matching
+  the Thrift connector), so bindings forward only the credentials. Fields:
+  `azure_client_id` / `azure_client_secret` (Entra app credentials, required),
+  `azure_tenant_id` (optional — auto-discovered when omitted),
+  `azure_workspace_resource_id` (optional — enables the management-token add-on,
+  see below), `identity_federation_client_id` (optional WIF). Construct via the
+  `AuthConfig::azure_service_principal(...)` validating constructor. See
+  `docs/designs/PECOBLR-4141-azure-service-principal-design.md`.
+
+  The generic `OAuthM2M` path (Entra `token_url_override` +
+  `2ff814a6-…/.default` scope) still works and requires an explicit tenant;
+  `azure-sp-m2m` is the preferred, zero-config-tenant flow.
+
+The `azure-sp-m2m` flow authenticates a workspace-member SP with the Databricks
+data token alone. The Azure **management-token** add-on — sending
+`X-Databricks-Azure-SP-Management-Token` + `X-Databricks-Azure-Workspace-Resource-Id`
+so the control plane can authorize an SP that holds an Azure RBAC role but is not
+a workspace member — is emitted **only when `azure_workspace_resource_id` is set**,
+matching the JDBC connector (`if (resourceId != null)`). When it is unset (the
+default) neither header is sent and no ARM management-scope token is fetched, so
+the common workspace-member SP is unaffected.
+
+The bindings expose the generic OAuth overrides as: pyo3 `token_url` /
+`oauth_scopes` / `client_id`; napi `oauthTokenUrl` / `oauthScopes` /
+`oauthClientId`; C ABI `kernel_session_config_set_oauth_token_endpoint` /
+`kernel_session_config_set_oauth_scopes` (+ the `set_auth_*` setters). The pyo3
+binding additionally exposes `azure-sp-m2m` via `auth_type="azure-sp-m2m"` with
+the `azure_client_id` / `azure_client_secret` / `azure_tenant_id` (optional)
+kwargs.
 
 Two further variants are reserved but not usable in v0:
 `OAuthFederation` (RFC 8693 token exchange — returns `InvalidArgument`

@@ -26,8 +26,8 @@
 //! The RSA key is generated once per test binary and shared via a
 //! `OnceLock`, because RSA-2048 key generation is the slow part; the
 //! encrypted and EC variants are cheap to derive on demand.
-
-#![cfg(test)]
+//!
+//! (Module is gated `#[cfg(test)]` at its declaration in `mod.rs`.)
 
 use std::sync::OnceLock;
 

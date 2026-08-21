@@ -129,6 +129,21 @@ pub struct KernelSessionConfig {
     ignore_transactions: bool,
     /// SP-wide WIF client id applied to the selected auth mode.
     identity_federation_client_id: Option<String>,
+    /// OAuth token-endpoint override (populated by
+    /// `kernel_session_config_set_oauth_token_endpoint`). Applied as
+    /// `token_url_override` to the selected OAuth mode (M2M or U2M) at build
+    /// time; lets a host point the token exchange at a non-workspace endpoint
+    /// (e.g. an Azure/Entra token endpoint for an Azure service principal).
+    /// `None` ⇒ OIDC discovery against the workspace host.
+    oauth_token_endpoint: Option<String>,
+    /// Comma-separated OAuth scopes override (populated by
+    /// `kernel_session_config_set_oauth_scopes`, split at build time), applied
+    /// to whichever OAuth mode (M2M or U2M) is selected — matching the single
+    /// `oauth_scopes` the pyo3 / napi bindings expose across both flows. `None`
+    /// ⇒ kernel per-mode default (`all-apis` for M2M; `sql offline_access` for
+    /// U2M). For U2M it takes precedence over scopes passed positionally to
+    /// `kernel_session_config_set_auth_u2m`.
+    oauth_scopes: Option<String>,
     /// On-disk U2M token-cache policy (populated by
     /// `kernel_session_config_set_u2m_token_cache_config`). Defaults to enabled with
     /// no passphrase, in which case the cache is encrypted under a
@@ -221,6 +236,8 @@ pub unsafe extern "C" fn kernel_session_config_new(
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
         identity_federation_client_id: None,
+        oauth_token_endpoint: None,
+        oauth_scopes: None,
         // Match the reference driver's / JDBC's EnableTokenCache=1.
         token_cache: TokenCacheConfig::default(),
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
@@ -422,6 +439,48 @@ pub unsafe extern "C" fn kernel_session_config_set_identity_federation_client_id
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
         c.identity_federation_client_id = Some(required_str(client_id, "client_id")?);
+        Ok(())
+    })
+}
+
+/// Set an OAuth token-endpoint override, applied as `token_url_override` to
+/// whichever OAuth mode (M2M or U2M) is selected. Lets a host point the token
+/// exchange at a non-workspace endpoint — e.g. the Azure/Entra token endpoint
+/// `https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token` for an Azure
+/// service principal. Leaving it unset uses OIDC discovery against the
+/// workspace host. No-op for PAT auth.
+///
+/// # Safety
+/// `config` must be live and `token_endpoint` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_oauth_token_endpoint(
+    config: *mut KernelSessionConfig,
+    token_endpoint: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.oauth_token_endpoint = Some(required_str(token_endpoint, "token_endpoint")?);
+        Ok(())
+    })
+}
+
+/// Set the OAuth scopes (comma-separated; split at build time), applied to
+/// whichever OAuth mode (M2M or U2M) is selected — e.g.
+/// `2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default` for an Azure service
+/// principal (M2M) or `sql,offline_access` (U2M). Mirrors the single
+/// `oauth_scopes` the pyo3 / napi bindings expose across both flows. Leaving it
+/// unset uses the kernel's per-mode default (`all-apis` for M2M; `sql
+/// offline_access` for U2M). For U2M it takes precedence over any scopes passed
+/// positionally to [`kernel_session_config_set_auth_u2m`].
+///
+/// # Safety
+/// `config` must be live and `scopes` must be a NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_oauth_scopes(
+    config: *mut KernelSessionConfig,
+    scopes: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.oauth_scopes = Some(required_str(scopes, "scopes")?);
         Ok(())
     })
 }
@@ -961,6 +1020,92 @@ fn merge_http_config(
     http
 }
 
+/// Assemble the kernel [`AuthConfig`] from the C-side [`AuthSpec`] plus the
+/// cross-cutting OAuth overrides captured by the additive setters
+/// (`set_oauth_token_endpoint` / `set_oauth_scopes`). Pure (no I/O), so the
+/// wiring is unit-testable without opening a session.
+///
+/// `oauth_token_endpoint` and `oauth_scopes` both apply to whichever OAuth mode
+/// is selected (M2M or U2M) — a single config carries exactly one mode, so one
+/// shared knob each is unambiguous (matching the pyo3 / napi bindings, which
+/// expose one `oauth_scopes` across both flows). For U2M, `oauth_scopes` takes
+/// precedence over any scopes passed positionally to `set_auth_u2m` (kept for
+/// back-compat). Both are ignored for PAT.
+fn auth_spec_to_config(
+    auth: AuthSpec,
+    oauth_token_endpoint: Option<String>,
+    oauth_scopes: Option<String>,
+    identity_federation_client_id: Option<String>,
+    token_cache: TokenCacheConfig,
+) -> crate::kernel_error::Result<AuthConfig> {
+    // `required_str` guards only `null`, so `set_oauth_token_endpoint(config, "")`
+    // yields `Some("")`. Normalize a present-but-empty endpoint to `None` here so
+    // the `.or(token_url)` fallbacks below survive (mirroring the scopes path,
+    // which parses `Some("")` to `None`) instead of shadowing the positional
+    // `token_url` with an empty endpoint that fails opaquely at `TokenUrl::new("")`.
+    let oauth_token_endpoint = oauth_token_endpoint.filter(|s| !s.is_empty());
+    let auth = match auth {
+        AuthSpec::Pat { token } => AuthConfig::pat(Some(token), identity_federation_client_id)?,
+        AuthSpec::OAuthM2M {
+            client_id,
+            client_secret,
+        } => AuthConfig::oauth_m2m(
+            Some(client_id),
+            Some(client_secret),
+            oauth_scopes.and_then(|s| parse_scopes(&s)),
+            oauth_token_endpoint,
+            identity_federation_client_id,
+        )?,
+        AuthSpec::OAuthM2MJwt {
+            client_id,
+            jwt_key_file,
+            jwt_kid,
+            jwt_passphrase,
+            jwt_algorithm,
+            scopes,
+            token_url,
+        } => AuthConfig::oauth_m2m_private_key(
+            Some(client_id),
+            Some(jwt_key_file),
+            Some(jwt_kid),
+            jwt_passphrase,
+            jwt_algorithm,
+            // The shared `set_oauth_scopes` wins; fall back to scopes passed
+            // positionally to `set_auth_m2m_jwt` (same precedence as U2M below).
+            oauth_scopes
+                .and_then(|s| parse_scopes(&s))
+                .or_else(|| scopes.and_then(|s| parse_scopes(&s))),
+            // The shared `set_oauth_token_endpoint` wins; fall back to the
+            // positional `token_url`.
+            oauth_token_endpoint.or(token_url),
+        )?,
+        AuthSpec::OAuthU2M {
+            client_id,
+            redirect_port,
+            scopes,
+        } => AuthConfig::oauth_u2m(
+            client_id,
+            // The C ABI exposes a single redirect port; forward it as a
+            // one-element candidate list (the kernel binds the first free
+            // port, trivially that one). Keeps the FFI unchanged.
+            redirect_port.map(|p| vec![p]),
+            // The shared `set_oauth_scopes` wins; fall back to the scopes
+            // passed positionally to `set_auth_u2m` (pre-existing path).
+            // Parse each source *before* choosing precedence: a present-but-
+            // empty shared value (`Some("")`) parses to `None`, so the
+            // positional fallback is preserved instead of being shadowed.
+            oauth_scopes
+                .and_then(|s| parse_scopes(&s))
+                .or_else(|| scopes.and_then(|s| parse_scopes(&s))),
+            oauth_token_endpoint,
+            None,
+            Some(token_cache),
+            identity_federation_client_id,
+        ),
+    };
+    Ok(auth)
+}
+
 /// Translate the C-side config into a [`Session`], driving the async
 /// `Session::open` on the process-wide runtime. Errors are stored in the
 /// thread-local buffer; the returned `KernelStatusCode` is the mapped
@@ -976,6 +1121,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         retry,
         ignore_transactions,
         identity_federation_client_id,
+        oauth_token_endpoint,
+        oauth_scopes,
         token_cache,
         result,
     } = config;
@@ -1004,54 +1151,13 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 }
             };
 
-            let auth = match auth {
-                AuthSpec::Pat { token } => {
-                    AuthConfig::pat(Some(token), identity_federation_client_id)?
-                }
-                AuthSpec::OAuthM2M {
-                    client_id,
-                    client_secret,
-                } => AuthConfig::oauth_m2m(
-                    Some(client_id),
-                    Some(client_secret),
-                    None,
-                    None,
-                    identity_federation_client_id,
-                )?,
-                AuthSpec::OAuthM2MJwt {
-                    client_id,
-                    jwt_key_file,
-                    jwt_kid,
-                    jwt_passphrase,
-                    jwt_algorithm,
-                    scopes,
-                    token_url,
-                } => AuthConfig::oauth_m2m_private_key(
-                    Some(client_id),
-                    Some(jwt_key_file),
-                    Some(jwt_kid),
-                    jwt_passphrase,
-                    jwt_algorithm,
-                    scopes.and_then(|s| parse_scopes(&s)),
-                    token_url,
-                )?,
-                AuthSpec::OAuthU2M {
-                    client_id,
-                    redirect_port,
-                    scopes,
-                } => AuthConfig::oauth_u2m(
-                    client_id,
-                    // The C ABI exposes a single redirect port; forward it as a
-                    // one-element candidate list (the kernel binds the first
-                    // free port, trivially that one). Keeps the FFI unchanged.
-                    redirect_port.map(|p| vec![p]),
-                    scopes.and_then(|s| parse_scopes(&s)),
-                    None,
-                    None,
-                    Some(token_cache),
-                    identity_federation_client_id,
-                ),
-            };
+            let auth = auth_spec_to_config(
+                auth,
+                oauth_token_endpoint,
+                oauth_scopes,
+                identity_federation_client_id,
+                token_cache,
+            )?;
 
             let mut builder = Session::builder()
                 .connection(connection)
@@ -1347,6 +1453,189 @@ pub unsafe extern "C" fn kernel_session_rollback(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn m2m_carries_scopes_and_token_endpoint_override() {
+        // The additive setters must reach the built AuthConfig so an Azure SP
+        // M2M config can point the client-credentials exchange at the Entra
+        // token endpoint with the Azure resource scope.
+        let token_endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthM2M {
+                client_id: "azure-client-id".to_string(),
+                client_secret: "azure-client-secret".to_string(),
+            },
+            Some(token_endpoint.to_string()),
+            Some("2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("m2m config builds");
+
+        match auth {
+            AuthConfig::OAuthM2M {
+                scopes,
+                token_url_override,
+                ..
+            } => {
+                assert_eq!(
+                    scopes,
+                    Some(vec![
+                        "2ff814a6-3304-4ab8-85cb-cd0e6f879c1d/.default".to_string()
+                    ])
+                );
+                assert_eq!(token_url_override.as_deref(), Some(token_endpoint));
+            }
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_carries_token_endpoint_override() {
+        let token_endpoint = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: None,
+            },
+            Some(token_endpoint.to_string()),
+            None,
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m config builds");
+
+        match auth {
+            AuthConfig::OAuthU2M {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(token_endpoint)),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_scopes_setter_is_shared_by_m2m_and_u2m() {
+        // The single `set_oauth_scopes` setter applies to whichever OAuth mode
+        // is selected — matching the shared `oauth_scopes` on pyo3 / napi.
+        let scopes = "custom-a,custom-b";
+        let want = Some(vec!["custom-a".to_string(), "custom-b".to_string()]);
+
+        let m2m = auth_spec_to_config(
+            AuthSpec::OAuthM2M {
+                client_id: "id".to_string(),
+                client_secret: "sec".to_string(),
+            },
+            None,
+            Some(scopes.to_string()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("m2m");
+        match m2m {
+            AuthConfig::OAuthM2M { scopes, .. } => assert_eq!(scopes, want),
+            other => panic!("expected OAuthM2M, got {other:?}"),
+        }
+
+        let u2m = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: None,
+            },
+            None,
+            Some(scopes.to_string()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m");
+        match u2m {
+            AuthConfig::OAuthU2M { scopes, .. } => assert_eq!(scopes, want),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn oauth_scopes_setter_overrides_u2m_positional_scopes() {
+        // For U2M, the shared setter wins over scopes passed positionally to
+        // `set_auth_u2m` (kept for back-compat).
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: Some("from-set-auth-u2m".to_string()),
+            },
+            None,
+            Some("from-set-oauth-scopes".to_string()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m");
+        match auth {
+            AuthConfig::OAuthU2M { scopes, .. } => {
+                assert_eq!(scopes, Some(vec!["from-set-oauth-scopes".to_string()]))
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_shared_oauth_scopes_falls_back_to_u2m_positional_scopes() {
+        // A present-but-empty shared value (`set_oauth_scopes("")`) parses to
+        // no scopes, so it must NOT shadow the positional `set_auth_u2m`
+        // scopes: precedence is chosen on the *parsed* result, not the raw
+        // `Option<String>`. Guards the documented positional-fallback contract.
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthU2M {
+                client_id: None,
+                redirect_port: None,
+                scopes: Some("from-set-auth-u2m".to_string()),
+            },
+            None,
+            Some(String::new()),
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("u2m");
+        match auth {
+            AuthConfig::OAuthU2M { scopes, .. } => {
+                assert_eq!(scopes, Some(vec!["from-set-auth-u2m".to_string()]))
+            }
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn empty_shared_oauth_token_endpoint_falls_back_to_jwt_positional_token_url() {
+        // A present-but-empty shared value (`set_oauth_token_endpoint("")`) must
+        // NOT shadow the positional `token_url`: precedence is chosen on the
+        // normalized result, not the raw `Option<String>`. Otherwise the empty
+        // endpoint wins and fails opaquely at `TokenUrl::new("")` during the
+        // first token exchange. Mirrors the scopes fallback contract above.
+        let positional = "https://login.microsoftonline.com/tenant/oauth2/v2.0/token";
+        let auth = auth_spec_to_config(
+            AuthSpec::OAuthM2MJwt {
+                client_id: "id".to_string(),
+                jwt_key_file: "/tmp/key.pem".to_string(),
+                jwt_kid: "kid".to_string(),
+                jwt_passphrase: None,
+                jwt_algorithm: None,
+                scopes: None,
+                token_url: Some(positional.to_string()),
+            },
+            Some(String::new()),
+            None,
+            None,
+            TokenCacheConfig::default(),
+        )
+        .expect("m2m jwt");
+        match auth {
+            AuthConfig::OAuthM2MPrivateKey {
+                token_url_override, ..
+            } => assert_eq!(token_url_override.as_deref(), Some(positional)),
+            other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
+        }
+    }
 
     #[test]
     fn parse_scopes_trims_and_drops_empties() {

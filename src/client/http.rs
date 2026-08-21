@@ -474,11 +474,47 @@ impl DatabricksHttpClient {
             })?;
         }
 
+        // Follow redirects for normal traffic (reqwest's default policy).
+        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+
+        // Surface which TLS backend was compiled in so oncall debugging
+        // a handshake / unknown-CA report can tell at a glance whether
+        // this binary is on native-tls (system CA store) or rustls
+        // (Mozilla webpki-roots). The two stacks differ on cert
+        // validation behavior, OCSP, and TLS 1.3 quirks.
+        debug!(
+            tls_backend = if cfg!(feature = "tls-rustls") {
+                "rustls"
+            } else {
+                "native-tls"
+            },
+            "DatabricksHttpClient initialised"
+        );
+
+        Ok(Self {
+            client,
+            config,
+            auth_provider: OnceLock::new(),
+            retry_configs,
+        })
+    }
+
+    /// Build a `reqwest::Client` from `config` with the given redirect policy.
+    ///
+    /// Factored out of `new()` so tenant discovery can obtain a client that
+    /// does NOT follow redirects (to read the first `/aad/auth` hop's
+    /// `Location`) while still honouring the workspace's TLS, proxy, timeout,
+    /// and user-agent configuration.
+    fn build_reqwest_client(
+        config: &HttpClientConfig,
+        redirect: reqwest::redirect::Policy,
+    ) -> Result<Client> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             .timeout(config.read_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
-            .user_agent(&config.user_agent);
+            .user_agent(&config.user_agent)
+            .redirect(redirect);
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {
@@ -656,29 +692,8 @@ impl DatabricksHttpClient {
             debug!("HTTP client using default proxy behavior (env vars)");
         }
 
-        let client = builder.build().map_err(|e| {
+        builder.build().map_err(|e| {
             Error::invalid_argument().message(format!("Failed to create HTTP client: {e}"))
-        })?;
-
-        // Surface which TLS backend was compiled in so oncall debugging
-        // a handshake / unknown-CA report can tell at a glance whether
-        // this binary is on native-tls (system CA store) or rustls
-        // (Mozilla webpki-roots). The two stacks differ on cert
-        // validation behavior, OCSP, and TLS 1.3 quirks.
-        debug!(
-            tls_backend = if cfg!(feature = "tls-rustls") {
-                "rustls"
-            } else {
-                "native-tls"
-            },
-            "DatabricksHttpClient initialised"
-        );
-
-        Ok(Self {
-            client,
-            config,
-            auth_provider: OnceLock::new(),
-            retry_configs,
         })
     }
 
@@ -723,6 +738,16 @@ impl DatabricksHttpClient {
         provider.get_auth_header()
     }
 
+    /// Extra auth headers to attach alongside `Authorization` (e.g. the Azure SP
+    /// management-token pair). Empty for every provider except the Azure SP one.
+    /// Errors if the auth provider has not been set.
+    pub fn auth_extra_headers(&self) -> Result<Vec<(String, String)>> {
+        let provider = self.auth_provider.get().ok_or_else(|| {
+            Error::invalid_state().message("Auth provider not set. Call set_auth_provider() first.")
+        })?;
+        provider.extra_headers()
+    }
+
     /// Returns the retry config for the given request category.
     fn retry_config(&self, category: RequestCategory) -> &RetryConfig {
         self.retry_configs
@@ -746,6 +771,41 @@ impl DatabricksHttpClient {
         request_type: RequestType,
     ) -> Result<Response> {
         self.execute_impl(request, false, request_type).await
+    }
+
+    /// Issue a single unauthenticated GET to `url` WITHOUT following redirects
+    /// and return the `Location` header of the (expected) 3xx response.
+    ///
+    /// Unlike [`execute`](Self::execute) / [`execute_without_auth`], which use a
+    /// redirect-following client, this builds a one-off client with a
+    /// no-redirect policy — reqwest fixes the redirect policy at client-build
+    /// time — while reusing the workspace's TLS/proxy/timeout config. Used by
+    /// Azure tenant discovery to read the tenant off the FIRST `/aad/auth`
+    /// redirect hop (matching the connector's `get_azure_tenant_id_from_host`),
+    /// rather than parsing the final URL after following the whole Entra
+    /// redirect chain (which can traverse non-tenant-prefixed hops like
+    /// `/common/` or a `login.live.com` bounce).
+    ///
+    /// NOT retry-aware: unlike [`execute`](Self::execute) /
+    /// [`execute_without_auth`], this one-off client does NOT run the kernel's
+    /// retry ladder, so a transient 5xx / timeout / connection reset on this
+    /// single probe surfaces as an error. Because the only caller
+    /// (`azure::discover_tenant`) propagates that error with `?` and there is
+    /// no automatic retry or fallback at the call site, a transient blip during
+    /// discovery is fatal to `Session::open` for a zero-config-tenant
+    /// `azure-sp-m2m` caller; the recourse is to re-run with an explicit
+    /// `azure_tenant_id` (which skips discovery entirely). A single hop is
+    /// sufficient for discovery, so no retry is attempted here.
+    pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
+        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let response = client.get(url).send().await.map_err(|e| {
+            Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
+        })?;
+        Ok(response
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string))
     }
 
     /// Internal implementation of execute with configurable auth and retry strategy.
@@ -817,6 +877,12 @@ impl DatabricksHttpClient {
             if with_auth {
                 let auth_header = self.auth_header()?;
                 req_builder = req_builder.header("Authorization", auth_header);
+                // Extra auth headers (Azure SP management-token pair). Empty for
+                // every other provider. Applied only on authenticated requests,
+                // never on the token/OIDC calls that use `execute_without_auth`.
+                for (name, value) in self.auth_extra_headers()? {
+                    req_builder = req_builder.header(name, value);
+                }
             }
 
             // Add org ID header for multi-tenant workspace routing

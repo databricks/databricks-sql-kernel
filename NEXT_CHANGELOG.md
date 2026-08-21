@@ -11,6 +11,42 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Azure Entra service-principal M2M (`azure-sp-m2m`) is now a kernel-owned flow
+  (`AuthConfig::AzureServicePrincipal` / pyo3 `auth_type="azure-sp-m2m"`). The
+  kernel resolves the Entra token endpoint (`{login}/{tenant}/oauth2/v2.0/token`)
+  and the `{effective_app_id}/.default` scope, and auto-discovers the tenant from
+  the workspace's `/aad/auth` redirect when `azure_tenant_id` is omitted (Thrift
+  parity) — so bindings forward only the SP credentials. The `Authorization`
+  bearer is the Databricks-audience data token, which alone authenticates the
+  common workspace-member SP. When `azure_workspace_resource_id` is set, the
+  kernel additionally sends the Azure SP management token
+  (`X-Databricks-Azure-SP-Management-Token`, a second Entra token for the Azure
+  Resource Manager) paired with the `X-Databricks-Azure-Workspace-Resource-Id`
+  header, matching the JDBC connector (`if (resourceId != null)`), so a service
+  principal that holds an Azure RBAC role but is not a workspace member can
+  authenticate. That token is minted via the Entra **v1.0** `resource=` grant
+  (`{login}/{tenant}/oauth2/token`) so its `aud` is
+  `https://management.core.windows.net/` verbatim — trailing slash included —
+  which the control plane requires; the v2.0 `.default` form drops the slash and
+  is rejected. When the resource id is unset (the default) neither header is sent
+  and no management token is fetched. A new `AuthProvider::extra_headers()`
+  carries the pair. Covered by an `#[ignore]`d
+  end-to-end test (`azure_sp_m2m_select_one_round_trip`) that exercises the flow
+  against a live Azure workspace when Azure SP credentials are configured.
+  (PECOBLR-4141.)
+
+- Generic Azure/Entra OAuth overrides (the pre-dedicated-flow path, still valid
+  for custom setups where a caller pins the endpoint/scope itself). New C ABI
+  setters expose the pieces the C surface was missing:
+  `kernel_session_config_set_oauth_token_endpoint()` and
+  `kernel_session_config_set_oauth_scopes()` — both applied to whichever OAuth
+  mode (M2M, M2M-JWT, or U2M) is selected, matching the single `oauth_scopes` /
+  `token_url` the pyo3 and napi bindings already share across those flows. Both
+  are additive — existing `set_auth_m2m` / `set_auth_m2m_jwt` / `set_auth_u2m`
+  signatures are unchanged (for U2M and M2M-JWT, `set_oauth_scopes` /
+  `set_oauth_token_endpoint` take precedence over scopes/token-endpoint passed
+  positionally to those setters). (PECOBLR-4141 / PECOBLR-4120.)
+
 - Auth: `AuthConfig::OAuthM2MPrivateKey` — OAuth 2.0 machine-to-machine using a JWT
   private-key client assertion (RFC 7523) instead of a client secret. The kernel
   signs a short-lived JWT with a PEM/PKCS#8 private key (RSA or EC; unencrypted or
@@ -34,6 +70,15 @@ changes go in their respective binding's NEXT_CHANGELOG.
   validate-on-borrow / connection-test probe. Runs SQL, so it must be called from a
   native (non-async-runtime) thread. Backed by the new `Session::test_connection()`.
   Benefits ODBC (databricks/databricks-odbc#298).
+
+### Changed
+
+- OAuth M2M: when a `token_url_override` is set, OIDC discovery against the
+  workspace is now **skipped** — the client-credentials grant never uses the
+  authorization endpoint, so pinning the token endpoint (e.g. an Azure/Entra
+  endpoint that is not the workspace's) no longer makes a needless round-trip
+  to, or depends on, the workspace OIDC config.
+
 - C ABI: `kernel_session_config_set_retry_config()` — expose the crate's existing
   HTTP retry knobs (`HttpConfig::retry_min_wait` / `retry_max_wait` /
   `retry_max_retries` / `overall_timeout`) over the C ABI so a host can make its own
