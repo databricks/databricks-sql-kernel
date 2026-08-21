@@ -12,42 +12,51 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Builds the C-ABI static library (libdatabricks_sql_kernel.a) for every
-# supported OS/arch on a NATIVE runner, checksums each one, and publishes them as
-# workflow artifacts + release assets.
+# Builds the kernel C-ABI static library for every supported OS/arch on a NATIVE
+# runner, checksums each one, and publishes them as workflow artifacts (and, on a
+# tag, GitHub release assets).
 #
-# This is the producer for the per-platform Go bindings distributed by
+# These archives are the per-platform Go bindings distributed by
 # github.com/databricks/databricks-sql-kernel-bindings — that repo holds one
 # nested Go module per platform (lib/<os>_<arch>/libdatabricks_sql_kernel.a), and
 # the Go driver (databricks-sql-go) requires the matching module so a kernel
 # opt-in `go get` build links a prebuilt archive with no Rust toolchain and no
 # `make kernel-lib` step.
 #
-# ARTIFACT-ONLY (no automated push): this workflow only BUILDS + uploads the
-# archives (as CI artifacts and, on a tag, GitHub release assets). It does NOT
-# push into any other repo. Getting the archives into the bindings repo is a
-# separate, deliberate step (download the artifacts/assets and commit them into
-# lib/<platform>/), done by a maintainer — not automated here. Each artifact is
-# named `kernel-c-abi-<platform>` and contains `libdatabricks_sql_kernel.a` (or
-# `databricks_sql_kernel.lib` on Windows), its `.sha256`, and the C header.
+# ARTIFACT-ONLY (no automated push): this workflow only BUILDS + uploads. Getting
+# the archives into the bindings repo is a deliberate maintainer step (download
+# the kernel-c-abi-<platform> artifact and commit it into lib/<platform>/). No
+# cross-repo token is used here.
 #
-# Why native runners (not cross-compilation): `cargo build` here uses the host
-# target (no `--target`), matching how the kernel is built and tested elsewhere.
-# Each archive is produced on its real OS/arch so the emitted machine code, the
-# system C++ runtime it expects, and the object-file format are all correct —
-# cross-toolchains are error-prone for a Rust staticlib with C++ transitive deps
-# (BoringSSL etc.). One job per platform, one archive out.
+# ── Toolchain correctness (why each target is what it is) ──────────────────────
+# The Go driver links the kernel through cgo. On every platform cgo uses a
+# GNU-family C toolchain (gcc/clang), which links a GNU-style static archive
+# (libNAME.a) — NEVER an MSVC import library (.lib). Therefore:
+#   * We always build with an EXPLICIT `--target` (never host-inferred), so the
+#     output triple is unambiguous and the emitted archive matches what the
+#     driver's cgo LDFLAGS expect.
+#   * Windows is built for the **x86_64-pc-windows-GNU** target (MinGW), NOT the
+#     msvc default of a windows-latest runner. msvc emits `databricks_sql_kernel.lib`,
+#     which cgo/MinGW on Windows cannot consume; the gnu target emits
+#     `libdatabricks_sql_kernel.a`, which it can. See the driver's cgo_windows.go.
+# Net: ALL platforms produce a uniformly named `libdatabricks_sql_kernel.a`.
 #
-# Triggered by:
-#   1. Pushing a `v*` git tag — the canonical release path (same trigger as
-#      cargo-publish.yml, so a kernel release produces both the crate and the
-#      C-ABI archives in lockstep).
-#   2. Manual `workflow_dispatch` — for ad-hoc archive builds / re-runs.
+# Build flags mirror the driver's build/kernel-lib.sh exactly
+# (`--release --locked --no-default-features --features tls-rustls`) so the
+# CI-produced archive is the same shape the driver expects (pure-Rust TLS).
 #
-# Build flags mirror the Go driver's build/kernel-lib.sh source build exactly:
-#   cargo build --release --locked --no-default-features --features tls-rustls
-# so the CI-produced archive is byte-for-byte the same shape the driver expects
-# (pure-Rust TLS, no default features).
+# Triggered by a `v*` tag (release path) or manual workflow_dispatch.
+#
+# ── PRE-MERGE NOTE: runner availability (the one thing to confirm on first run) ─
+# Every OTHER workflow in this repo runs on `databricks-protected-runner-group`
+# / `linux-ubuntu-latest`. This workflow is the first to request GitHub-hosted
+# `macos-14`, `macos-13`, `ubuntu-latest`, `ubuntu-24.04-arm`, and
+# `windows-latest` runners (per-platform native builds need them). Before relying
+# on this in a release, confirm the org permits these GitHub-hosted runner
+# labels (some orgs restrict runners to the protected group). If a label is not
+# permitted, that matrix leg will fail to schedule — swap it for the org's
+# equivalent macOS/Windows/ARM label in the matrix `runs-on` below; nothing else
+# changes. `fail-fast: false` keeps a disallowed leg from taking down the others.
 
 name: Build C-ABI Libraries
 
@@ -58,20 +67,20 @@ on:
   workflow_dispatch:
     inputs:
       upload_release:
-        description: "Attach archives to the GitHub release for the triggering tag"
+        description: "Attach archives to the GitHub release for the triggering tag (tag runs do this automatically)"
         required: false
-        default: "false"
+        type: boolean
+        default: false
 
 concurrency:
   # One archive-build run per ref; a newer push supersedes an in-flight build.
-  group: ${{ github.repository }}-build-c-abi-libs-${{ github.ref }}
+  group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+# Least privilege at the top level; the release job elevates contents:write for
+# itself only.
 permissions:
   contents: read
-  # OIDC token exchange for the .github/actions/setup-jfrog composite (cargo
-  # dependency proxy). See go/hardened-gha.
-  id-token: write
 
 defaults:
   run:
@@ -81,28 +90,35 @@ jobs:
   build:
     name: "C-ABI ${{ matrix.platform }}"
     runs-on: ${{ matrix.runs-on }}
+    permissions:
+      contents: read
+      # OIDC token exchange for the .github/actions/setup-jfrog composite (cargo
+      # dependency proxy). See go/hardened-gha.
+      id-token: write
     strategy:
       fail-fast: false
       matrix:
         include:
-          # `platform` is the Go GOOS_GOARCH tag the driver's nested modules key
-          # off (internal/backend/kernel/kernellib/<platform>). `runs-on` picks a
-          # NATIVE runner for that OS/arch so no cross-toolchain is involved.
+          # platform : the GOOS_GOARCH tag the bindings repo keys off
+          #            (lib/<platform>/); target : the explicit Rust triple we
+          #            build (never host-inferred); runs-on : a native runner for
+          #            that OS/arch (no cross-compilation).
           - platform: darwin_arm64
-            runs-on: macos-14          # Apple Silicon
-            archive: libdatabricks_sql_kernel.a
+            runs-on: macos-14              # Apple Silicon
+            target: aarch64-apple-darwin
           - platform: darwin_amd64
-            runs-on: macos-13          # Intel
-            archive: libdatabricks_sql_kernel.a
+            runs-on: macos-13              # Intel
+            target: x86_64-apple-darwin
           - platform: linux_amd64
             runs-on: ubuntu-latest
-            archive: libdatabricks_sql_kernel.a
+            target: x86_64-unknown-linux-gnu
           - platform: linux_arm64
-            runs-on: ubuntu-24.04-arm  # native ARM runner (no cross)
-            archive: libdatabricks_sql_kernel.a
+            runs-on: ubuntu-24.04-arm      # native ARM runner
+            target: aarch64-unknown-linux-gnu
           - platform: windows_amd64
             runs-on: windows-latest
-            archive: databricks_sql_kernel.lib  # MSVC toolchain names it .lib
+            # GNU (MinGW), NOT msvc — cgo links .a, not .lib. See header.
+            target: x86_64-pc-windows-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -114,59 +130,62 @@ jobs:
         with:
           cargo: "true"
 
+      # Install the toolchain WITH the explicit target for this matrix entry.
       - name: Set up Rust toolchain
         uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          target: ${{ matrix.target }}
 
-      # Build the staticlib with the SAME flags as the Go driver's
-      # build/kernel-lib.sh source build. No `--target`: host-native build on a
-      # matching native runner. The root Cargo.toml already declares
-      # crate-type = ["lib", "cdylib", "staticlib"], so `staticlib` emits the .a
-      # (or .lib on MSVC) under target/release/.
+      # Build the staticlib for the EXPLICIT target. The root Cargo.toml declares
+      # crate-type = [..., "staticlib"], and the lib name is databricks_sql_kernel,
+      # so every gnu/unix target emits `libdatabricks_sql_kernel.a`. With an
+      # explicit --target the output lands under target/<triple>/release/, so the
+      # staging step reads from there (NOT target/release/).
       - name: Build C-ABI static library
         run: |
-          cargo build --release --locked --no-default-features --features tls-rustls
+          cargo build --release --locked --no-default-features --features tls-rustls --target ${{ matrix.target }}
 
-      # macOS only: the archive itself has no install_name (that is a dylib
-      # concept), so nothing to rewrite for the STATIC lib. This step is a
-      # placeholder marker documenting that the static path needs no
-      # relocatability fix-up — unlike the dynamic .dylib path, which would need
-      # `install_name_tool -id @rpath/...`. Kept as an explicit no-op so a future
-      # dynamic variant has an obvious home.
-      - name: (static) no install_name fix-up needed
-        if: startsWith(matrix.platform, 'darwin')
-        run: echo "static .a carries no install_name; nothing to relocate"
-
-      # Stage the produced archive under a per-platform directory that mirrors
-      # the driver's nested-module layout, plus a SHA-256 the driver verifies
-      # before committing/using it.
+      # Stage the produced archive + a SHA-256 for verification, under a
+      # per-platform dir. Uniform archive name across all platforms:
+      # libdatabricks_sql_kernel.a (guaranteed by the gnu targets above).
       - name: Stage archive + checksum
         run: |
           set -euo pipefail
+          ARCHIVE="libdatabricks_sql_kernel.a"
+          SRC="target/${{ matrix.target }}/release/${ARCHIVE}"
           OUT="dist/${{ matrix.platform }}"
           mkdir -p "$OUT"
-          SRC="target/release/${{ matrix.archive }}"
           if [ ! -f "$SRC" ]; then
-            echo "::error::expected archive not found at $SRC"
-            ls -la target/release/ || true
+            echo "::error::expected static archive not found at ${SRC}"
+            echo "contents of target/${{ matrix.target }}/release:"
+            ls -la "target/${{ matrix.target }}/release" || true
             exit 1
           fi
-          cp "$SRC" "$OUT/${{ matrix.archive }}"
-          # Also emit the C header alongside so the driver can commit a matching
-          # header at the same revision. The header is generated into include/.
-          if [ -f include/databricks_kernel.h ]; then
-            cp include/databricks_kernel.h "$OUT/databricks_kernel.h"
+          cp "$SRC" "$OUT/${ARCHIVE}"
+          # Commit the matching C header so the bindings repo can pin a header at
+          # the same kernel revision. It is committed at include/databricks_kernel.h.
+          if [ ! -f include/databricks_kernel.h ]; then
+            echo "::error::include/databricks_kernel.h not found (expected committed header)"
+            exit 1
           fi
-          # Portable SHA-256 (shasum on macOS, sha256sum on Linux; certutil Win).
-          cd "$OUT"
-          if command -v sha256sum >/dev/null 2>&1; then
-            sha256sum "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-          elif command -v shasum >/dev/null 2>&1; then
-            shasum -a 256 "${{ matrix.archive }}" > "${{ matrix.archive }}.sha256"
-          else
-            certutil -hashfile "${{ matrix.archive }}" SHA256 | sed -n 2p > "${{ matrix.archive }}.sha256"
-          fi
-          echo "staged:"; ls -la
-          echo "size: $(wc -c < "${{ matrix.archive }}") bytes"
+          cp include/databricks_kernel.h "$OUT/databricks_kernel.h"
+          # SHA-256 over the archive. sha256sum exists on the Linux runners;
+          # shasum on macOS. Windows jobs run under Git-bash (shell: bash) which
+          # ships neither reliably, so fall back to Go-less openssl, which the
+          # runners have.
+          ( cd "$OUT"
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            elif command -v shasum >/dev/null 2>&1; then
+              shasum -a 256 "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            else
+              openssl dgst -sha256 -r "${ARCHIVE}" > "${ARCHIVE}.sha256"
+            fi
+            echo "staged $(pwd):"
+            ls -la
+            echo "archive size: $(wc -c < "${ARCHIVE}") bytes"
+            cat "${ARCHIVE}.sha256"
+          )
 
       - name: Upload archive artifact
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -176,21 +195,50 @@ jobs:
           if-no-files-found: error
           retention-days: 14
 
-      # On a tag build (or when explicitly requested), attach the archive to the
-      # GitHub release for that tag, so the Go driver's sync workflow can pull a
-      # signed, immutable asset by tag rather than a transient CI artifact.
-      - name: Attach to GitHub release
-        if: startsWith(github.ref, 'refs/tags/v') || github.event.inputs.upload_release == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
+  # Attach every platform's archive to the GitHub release for the triggering tag.
+  # Separate job so it runs ONCE (not per-matrix-entry), needs all builds first,
+  # and is the only place that holds contents:write.
+  release-assets:
+    name: Attach archives to release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v') || inputs.upload_release
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    permissions:
+      contents: write   # gh release upload
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download all platform archives
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: kernel-c-abi-*
+          path: archives
+          # keep each artifact in its own subdir: archives/kernel-c-abi-<platform>/
+          merge-multiple: false
+
+      - name: Upload assets to the release
         run: |
           set -euo pipefail
-          TAG="${GITHUB_REF_NAME}"
-          cd "dist/${{ matrix.platform }}"
-          # Namespace the asset by platform so all five archives coexist on one
-          # release without name clashes.
-          ASSET="libdatabricks_sql_kernel-${{ matrix.platform }}.a"
-          cp "${{ matrix.archive }}" "$ASSET"
-          gh release upload "$TAG" \
-            "$ASSET" "${{ matrix.archive }}.sha256" \
-            --repo "$GITHUB_REPOSITORY" --clobber
+          tag="${GITHUB_REF_NAME}"
+          shopt -s nullglob
+          uploaded=0
+          for dir in archives/kernel-c-abi-*; do
+            platform="${dir##*/kernel-c-abi-}"
+            archive="$dir/libdatabricks_sql_kernel.a"
+            sha="$dir/libdatabricks_sql_kernel.a.sha256"
+            if [ ! -f "$archive" ]; then
+              echo "::error::missing archive for ${platform} at ${archive}"
+              exit 1
+            fi
+            # Namespace the asset by platform so all archives coexist on one
+            # release. Keep the .a extension — every platform's archive IS a .a.
+            asset="libdatabricks_sql_kernel-${platform}.a"
+            cp "$archive" "$asset"
+            cp "$sha" "${asset}.sha256"
+            gh release upload "$tag" "$asset" "${asset}.sha256" \
+              --repo "$GITHUB_REPOSITORY" --clobber
+            uploaded=$((uploaded + 1))
+          done
+          echo "uploaded ${uploaded} platform archive(s) to release ${tag}"
