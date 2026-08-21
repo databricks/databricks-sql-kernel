@@ -217,7 +217,7 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
     })
 }
 
-/// Collect a tracing event's message and structured fields into one line.
+/// Collect a tracing event's message and event-local fields into one line.
 #[derive(Default)]
 struct CallbackMessageVisitor {
     message: String,

@@ -350,9 +350,11 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * subscriber was already installed (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
-/* One callback-delivered kernel log record. Delivery is synchronous on the
- * thread that emitted the record: the callback must return promptly, or it will
- * delay that kernel operation. Hosts that need asynchronous logging can copy the
+/* One callback-delivered kernel log record. `message` contains the rendered
+ * event text and fields recorded directly on that event; fields attached only
+ * to enclosing spans are not included. Delivery is synchronous on the thread
+ * that emitted the record: the callback must return promptly, or it will delay
+ * that kernel operation. Hosts that need asynchronous logging can copy the
  * record into their own bounded queue and return. Strings are valid only during
  * the callback. Calls may be concurrent; copy retained strings and synchronize
  * the destination. `user_data` is the pointer supplied at initialization. */

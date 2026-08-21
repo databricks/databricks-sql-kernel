@@ -391,11 +391,10 @@ impl Session {
             .connection()
             .emit_operation(OperationType::CreateSession, create_elapsed, None);
 
-        // 5. Tag the per-session tracing span. Future log lines
-        //    inherit `session_id` automatically. Target is pinned to the
-        //    kernel log target so the span (and any `log` record derived
-        //    from it) maps to the `databricks.sql.kernel` Python logger,
-        //    consistent with `klog` events — see `crate::klog`.
+        // 5. Tag the per-session tracing span. Span-aware subscribers such as
+        //    the file/stderr formatter attach `session_id` automatically;
+        //    host bridges that forward only event-local fields do not. Pin the
+        //    target so span-aware filtering stays consistent with `klog` events.
         let log_span = info_span!(
             target: crate::klog::KERNEL_LOG_TARGET,
             "kernel.session",

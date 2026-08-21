@@ -840,13 +840,14 @@ pub unsafe extern "C" fn kernel_init_logging(
 /// that first call's outcome.
 ///
 /// The callback receives lower-case `level`, the tracing `target`, and the
-/// rendered message including structured fields. Delivery is synchronous on
-/// the thread that emitted the record, so the callback must return promptly;
-/// a host that needs asynchronous delivery can copy the record into its own
-/// queue. String pointers are valid only until the callback returns, and calls
-/// may be concurrent. The callback must not unwind, re-enter the kernel C ABI,
-/// or emit another kernel tracing event. `user_data` is passed through unchanged
-/// and must remain valid for the process lifetime.
+/// rendered event message including fields recorded directly on that event.
+/// Fields attached only to enclosing spans are not included. Delivery is
+/// synchronous on the thread that emitted the record, so the callback must
+/// return promptly; a host that needs asynchronous delivery can copy the record
+/// into its own queue. String pointers are valid only until the callback returns,
+/// and calls may be concurrent. The callback must not unwind, re-enter the kernel
+/// C ABI, or emit another kernel tracing event. `user_data` is passed through
+/// unchanged and must remain valid for the process lifetime.
 ///
 /// Returns `InvalidArgument` when `callback` is NULL. Returns `Internal` when
 /// the first subscriber install fails because another subscriber already owns
