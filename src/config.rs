@@ -354,7 +354,17 @@ pub enum AuthConfig {
         callback_timeout: Option<std::time::Duration>,
         /// On-disk token-cache policy. `None` → [`TokenCacheConfig::default`]
         /// (enabled, which then requires a passphrase — see that type).
+        /// Ignored when `token_store` is `Some` (a caller store fully
+        /// replaces the built-in disk cache).
         token_cache: Option<TokenCacheConfig>,
+        /// Caller-supplied token store. When `Some`, it fully overrides the
+        /// built-in [`token_cache`](Self::OAuthU2M::token_cache) disk policy:
+        /// the kernel calls it to load/persist the U2M token instead of the
+        /// encrypted disk cache. `None` → use the `token_cache` policy. This is
+        /// the injection point the bindings map their `OAuthPersistence` /
+        /// `experimental_oauth_persistence` objects onto. See
+        /// [`crate::auth::oauth::persistence`].
+        token_store: Option<std::sync::Arc<dyn crate::auth::oauth::persistence::TokenPersistence>>,
         /// SP-wide Workload Identity Federation client id. `None` selects
         /// BYOT / account-wide WIF behavior when token exchange is needed.
         identity_federation_client_id: Option<String>,
@@ -507,6 +517,15 @@ impl AuthConfig {
     /// (first free binds). Single-port callers pass a one-element list
     /// (`Some(vec![port])`); `None`/empty falls back to the
     /// `[8030, 8031, 8032, 8033, 8034]` default window.
+    ///
+    /// `token_store` optionally injects a caller-supplied
+    /// [`TokenPersistence`](crate::auth::oauth::persistence::TokenPersistence)
+    /// (a DB / keychain / in-memory store); when `Some` it fully overrides the
+    /// `token_cache` disk policy. Bindings forward it as the last argument
+    /// because [`AuthConfig`] is `#[non_exhaustive]` — cross-crate wrappers
+    /// cannot build the `OAuthU2M` struct literal directly and must go through
+    /// this constructor.
+    #[allow(clippy::too_many_arguments)]
     pub fn oauth_u2m(
         client_id: Option<String>,
         redirect_ports: Option<Vec<u16>>,
@@ -515,6 +534,7 @@ impl AuthConfig {
         callback_timeout: Option<std::time::Duration>,
         token_cache: Option<TokenCacheConfig>,
         identity_federation_client_id: Option<String>,
+        token_store: Option<std::sync::Arc<dyn crate::auth::oauth::persistence::TokenPersistence>>,
     ) -> Self {
         AuthConfig::OAuthU2M {
             client_id,
@@ -523,6 +543,7 @@ impl AuthConfig {
             token_url_override,
             callback_timeout,
             token_cache,
+            token_store,
             identity_federation_client_id,
         }
     }
@@ -2049,6 +2070,7 @@ mod tests {
             None,
             None,
             Some("federation-client".to_string()),
+            None,
         );
 
         assert_eq!(
@@ -2060,7 +2082,7 @@ mod tests {
     #[test]
     fn oauth_u2m_none_ports_stays_none() {
         // No ports supplied → redirect_ports is None (session fills the default).
-        let auth = AuthConfig::oauth_u2m(None, None, None, None, None, None, None);
+        let auth = AuthConfig::oauth_u2m(None, None, None, None, None, None, None, None);
         match auth {
             AuthConfig::OAuthU2M { redirect_ports, .. } => assert_eq!(redirect_ports, None),
             other => panic!("expected OAuthU2M, got {other:?}"),
@@ -2074,6 +2096,7 @@ mod tests {
         let auth = AuthConfig::oauth_u2m(
             None,
             Some(vec![8020, 8021, 8022]),
+            None,
             None,
             None,
             None,
@@ -2109,6 +2132,7 @@ mod tests {
                 token_url_override: None,
                 callback_timeout: None,
                 token_cache: None,
+                token_store: None,
                 identity_federation_client_id: Some("federation-client".to_string()),
             },
         ];

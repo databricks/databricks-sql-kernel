@@ -45,6 +45,7 @@
 //! enabled, they drive real transactions (a Private Preview feature that
 //! requires catalog-managed tables server-side).
 
+use crate::auth::oauth::persistence::{DiskTokenCache, TokenPersistence};
 use crate::auth::{
     AuthProvider, AuthorizationCodeProvider, ClientCredentialsProvider, FederationProvider,
     JwtClientCredentialsProvider, PersonalAccessToken,
@@ -1274,6 +1275,7 @@ async fn build_base_auth_provider(
             token_url_override,
             callback_timeout,
             token_cache,
+            token_store,
             ..
         } => {
             // Fill the coupled kernel default bundle for any unset field
@@ -1287,15 +1289,18 @@ async fn build_base_auth_provider(
                 scopes.as_deref(),
             );
             let timeout = callback_timeout.unwrap_or_else(|| Duration::from_secs(120));
-            // `Some(passphrase)` enables the on-disk cache, `None` disables
-            // it. When the cache is on but the caller supplied no passphrase,
-            // `resolve` substitutes a machine-local derived one rather than
-            // failing or writing plaintext — see `TokenCacheConfig`.
-            let cache_policy = token_cache
-                .clone()
-                .unwrap_or_default()
-                .resolve()
-                .map(|p| p.into_owned());
+            // A caller-supplied `token_store` wins outright; otherwise derive
+            // the built-in encrypted disk cache from the `token_cache` policy.
+            // `resolve()` returns `Some(passphrase)` when caching is enabled
+            // (substituting a machine-local derived key when the caller gave
+            // none, rather than failing or writing plaintext — see
+            // `TokenCacheConfig`) and `None` to disable persistence entirely.
+            let token_persistence: Option<Arc<dyn TokenPersistence>> =
+                token_store.clone().or_else(|| {
+                    token_cache.clone().unwrap_or_default().resolve().map(|p| {
+                        Arc::new(DiskTokenCache::new(p.into_owned())) as Arc<dyn TokenPersistence>
+                    })
+                });
             let provider = AuthorizationCodeProvider::new_with_full_config(
                 host,
                 &client_id,
@@ -1304,7 +1309,7 @@ async fn build_base_auth_provider(
                 callback_ports,
                 timeout,
                 token_url_override.clone(),
-                cache_policy,
+                token_persistence,
             )
             .await?;
             Ok(Arc::new(provider))

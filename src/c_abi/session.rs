@@ -1265,6 +1265,9 @@ fn auth_spec_to_config(
             None,
             Some(token_cache),
             identity_federation_client_id,
+            // No caller token store over the C ABI (no callback surface); the
+            // disk cache above is the only U2M persistence path here.
+            None,
         ),
         AuthSpec::AzureServicePrincipal {
             azure_client_id,
