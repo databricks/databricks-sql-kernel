@@ -6,6 +6,21 @@ The Rust crate and Python binding have their own changelogs under
 [`../CHANGELOG.md`](../CHANGELOG.md) and [`../pyo3/CHANGELOG.md`](../pyo3/CHANGELOG.md);
 they ship on independent cadences.
 
+## [Unreleased]
+
+### Added
+- **Pluggable OAuth token store on `openSession`** — two optional callbacks
+  (`oauthPersistenceRead` / `oauthPersistencePersist`) let a Node caller supply
+  a custom OAuth U2M token store on the kernel path instead of the built-in disk
+  cache. Both must be supplied together; they receive/return the kernel's
+  `OAuthToken` as a JSON string (`KernelPersistArgs`). Wired via
+  `ThreadsafeFunction`, awaiting the JS `Promise`. (PECOBLR-4146)
+
+  The generated native contract (`index.js` / `index.d.ts`) was regenerated
+  with the crate-correct `@napi-rs/cli@3.8.2`; the previously-committed contract
+  was stale `@napi-rs/cli` v2 output, so that diff also migrates the loader to
+  v3 (version-consistency checks, WASI fallback).
+
 ## [v0.2.0] - 2026-06-08
 
 **Beta release of the Databricks SQL Kernel (Node.js binding).**

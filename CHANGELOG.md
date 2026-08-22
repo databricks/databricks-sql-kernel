@@ -9,6 +9,16 @@ cadences and may not move in lockstep with the crate.
 ## [Unreleased]
 
 ### Added
+- **Pluggable OAuth U2M token persistence** — a new
+  `auth::oauth::persistence::TokenPersistence` trait lets a caller supply a
+  custom token store (database, OS keychain, in-memory, …) via
+  `AuthConfig::OAuthU2M { token_store }` instead of the built-in encrypted disk
+  cache. The disk cache becomes the default impl (`DiskTokenCache`), so behavior
+  is unchanged when no store is supplied. Exposed to the bindings — napi
+  (`openSession` persistence callbacks) and pyo3 (`Session(oauth_persistence=…)`)
+  — which exchange the token as its serialized JSON. Load errors fall back to a
+  fresh login; save errors are logged and swallowed. Go / C-ABI is out of scope
+  (no callback surface). See `docs/designs/PECOBLR-4146-oauth-token-persistence-design.md`.
 - **Transaction control on `Session`** — `set_autocommit(bool)` /
   `autocommit()` / `commit()` / `rollback()`, exposed over the C ABI as
   `kernel_session_set_autocommit` / `_get_autocommit` / `_commit` /

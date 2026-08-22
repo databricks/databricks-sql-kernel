@@ -6,6 +6,17 @@ crate and Node.js binding have their own changelogs under
 [`../CHANGELOG.md`](../CHANGELOG.md) and [`../napi/CHANGELOG.md`](../napi/CHANGELOG.md);
 they ship on independent cadences.
 
+## [Unreleased]
+
+### Added
+- **Pluggable OAuth token store via `oauth_persistence`** — `Session(…,
+  oauth_persistence=obj)` lets a caller supply a custom OAuth U2M token store on
+  the kernel path instead of the built-in disk cache. `obj` must expose
+  `read(host) -> Optional[str]` and `persist(host, token_json) -> None`,
+  exchanging the kernel's `OAuthToken` as a JSON string. Invoked under the GIL.
+  The `databricks-sql-python` connector adapts its `experimental_oauth_persistence`
+  onto this (#913). (PECOBLR-4146)
+
 ## [v0.2.0] - 2026-06-08
 
 **Beta release of the Databricks SQL Kernel (Python binding).**
