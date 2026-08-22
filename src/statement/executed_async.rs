@@ -45,8 +45,7 @@
 //! prefers; field availability is identical.
 
 use crate::client::ExecuteResponse;
-use crate::kernel_error::Error;
-use crate::kernel_error::Result;
+use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
@@ -533,12 +532,17 @@ impl ExecutedAsyncStatement {
                             // so the server stops charging DBUs on the
                             // now-orphaned query when we return — same
                             // policy as a caller-initiated future drop.
-                            let error = Error::timeout().message(format!(
-                                "Statement {} did not reach a terminal state within {:?}",
-                                self.statement_id, cfg.poll_timeout
-                            ));
-                            self.statement_telemetry.finalize(Some(&error));
-                            return Err(error);
+                            //
+                            // Do not finalize telemetry here: this timeout
+                            // is resumable, so a later await_result() /
+                            // fetch_result() should still record the true
+                            // terminal outcome.
+                            return Err(Error::timeout()
+                                .message(format!(
+                                    "Statement {} did not reach a terminal state within {:?}",
+                                    self.statement_id, cfg.poll_timeout
+                                ))
+                                .with_query_id(&self.statement_id));
                         }
                         tokio::time::sleep(cfg.poll_interval).await;
                     }
@@ -548,7 +552,11 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
-            self.statement_telemetry.finalize(Some(error));
+            let resumable_await_timeout = error.code == ErrorCode::Timeout
+                && error.query_id.as_deref() == Some(self.statement_id.as_str());
+            if !resumable_await_timeout {
+                self.statement_telemetry.finalize(Some(error));
+            }
         }
         result
     }
@@ -861,6 +869,12 @@ impl AsyncStatementCanceller {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
+        // Ensure submit-and-drop / status-only async statements still
+        // emit one terminal telemetry event. Handles consumed via
+        // await_result() / fetch_result() already finalized; the
+        // statement telemetry guard makes this idempotent.
+        self.statement_telemetry.finalize(None);
+
         // `swap` (not `load`) so the shared `closed` flag — held by the
         // parent `Statement::last_closed` — reflects that Drop is now
         // handling cleanup, preventing a duplicate `CloseStatement`

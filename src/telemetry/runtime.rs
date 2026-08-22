@@ -213,6 +213,18 @@ impl RealConnectionTelemetry {
         error: Option<&KernelError>,
     ) -> TelemetryFrontendLog {
         let event_id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
+        let result_latency = if context.first_batch_latency.is_some()
+            || context.consumption_latency.is_some()
+        {
+            Some(ResultLatency {
+                result_set_ready_latency_millis: context.first_batch_latency.map(duration_millis),
+                result_set_consumption_latency_millis: context
+                    .consumption_latency
+                    .map(duration_millis),
+            })
+        } else {
+            None
+        };
         TelemetryFrontendLog {
             workspace_id: self.session.workspace_id,
             frontend_log_event_id: format!("{}-{event_id}", self.session.session_id),
@@ -238,14 +250,7 @@ impl RealConnectionTelemetry {
                         is_compressed: context.is_compressed,
                         execution_result: context.result_format,
                         retry_count: context.retry_count,
-                        result_latency: Some(ResultLatency {
-                            result_set_ready_latency_millis: context
-                                .first_batch_latency
-                                .map(duration_millis),
-                            result_set_consumption_latency_millis: context
-                                .consumption_latency
-                                .map(duration_millis),
-                        }),
+                        result_latency,
                         operation_detail: Some(OperationDetail {
                             n_operation_status_calls: Some(context.poll_count),
                             operation_status_latency_millis: Some(duration_millis(

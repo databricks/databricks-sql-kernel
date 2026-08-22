@@ -29,8 +29,8 @@ use crate::reader::ResultReaderFactory;
 use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
-    CreateSessionRequest, CreateSessionResponse, ExecuteParams, ExecuteStatementRequest,
-    GetChunksResponse, StatementExecutionResponse, StatementState,
+    CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteParams,
+    ExecuteStatementRequest, GetChunksResponse, StatementExecutionResponse, StatementState,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -561,11 +561,15 @@ impl SeaRestTransport {
     }
 
     fn telemetry_is_compressed(response: &ExecuteResponse) -> bool {
-        response
-            .manifest
-            .as_ref()
-            .and_then(|manifest| manifest.result_compression.as_deref())
-            .is_some_and(|codec| !codec.is_empty())
+        matches!(
+            CompressionCodec::from_manifest(
+                response
+                    .manifest
+                    .as_ref()
+                    .and_then(|manifest| manifest.result_compression.as_deref())
+            ),
+            CompressionCodec::Lz4Frame
+        )
     }
 
     /// Execute a SQL statement end-to-end: call API → poll → create reader.
@@ -1560,6 +1564,52 @@ mod tests {
         let converted = SeaRestTransport::convert_result_data(&result).unwrap();
         assert!(converted.inline_arrow_data.is_some());
         assert_eq!(converted.inline_arrow_data.unwrap(), test_data);
+    }
+
+    #[test]
+    fn telemetry_is_compressed_matches_manifest_codec_parser() {
+        use crate::types::sea::{ResultManifest, ResultSchema, StatementState, StatementStatus};
+
+        let mut response = ExecuteResponse {
+            statement_id: "stmt-compression".to_string(),
+            status: StatementStatus {
+                state: StatementState::Succeeded,
+                error: None,
+                sql_state: None,
+                num_modified_rows: None,
+                display_message: None,
+                diagnostic_info: None,
+                error_details_json: None,
+            },
+            manifest: Some(ResultManifest {
+                format: "ARROW_STREAM".to_string(),
+                schema: ResultSchema {
+                    column_count: 0,
+                    columns: vec![],
+                },
+                total_chunk_count: None,
+                total_row_count: None,
+                total_byte_count: None,
+                truncated: false,
+                chunks: None,
+                result_compression: Some("LZ4_FRAME".to_string()),
+            }),
+            result: None,
+        };
+
+        assert!(SeaRestTransport::telemetry_is_compressed(&response));
+
+        for codec in [None, Some(""), Some("NONE"), Some("UNKNOWN")] {
+            response
+                .manifest
+                .as_mut()
+                .expect("manifest")
+                .result_compression = codec.map(str::to_string);
+            assert!(
+                !SeaRestTransport::telemetry_is_compressed(&response),
+                "codec {codec:?} should match CompressionCodec::None"
+            );
+        }
     }
 
     #[test]

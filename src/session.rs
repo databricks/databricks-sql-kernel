@@ -2274,6 +2274,14 @@ mod is_open_tests {
         );
         assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
         assert_eq!(sql_log["sql_operation"]["is_compressed"], false);
+        assert!(
+            sql_log["sql_operation"].get("retry_count").is_none(),
+            "retry_count should be omitted until the transport reports a real value"
+        );
+        assert!(
+            sql_log["sql_operation"].get("result_latency").is_none(),
+            "Phase 3 should not emit empty result latency placeholders"
+        );
         assert_eq!(
             sql_log["sql_operation"]["operation_detail"]["is_internal_call"],
             false
@@ -2438,6 +2446,38 @@ mod is_open_tests {
         let sql_log = &statement_log["entry"]["sql_driver_log"];
         assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-status-failure");
         assert_eq!(sql_log["error_info"]["stack_trace"], "42000");
+    }
+
+    #[tokio::test]
+    async fn async_statement_drop_exports_terminal_statement_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-async-drop").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-async-drop")).await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-async-drop", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        drop(async_exec);
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported on drop");
+        let sql_log = &statement_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-async-drop");
+        assert!(
+            sql_log.get("error_info").is_none(),
+            "submit-and-drop should finalize as abandoned success, not as a statement error"
+        );
     }
 
     #[tokio::test]

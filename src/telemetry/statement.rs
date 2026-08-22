@@ -116,7 +116,7 @@ impl TelemetryObserver {
                     operation_type,
                     result_format: None,
                     is_compressed: None,
-                    retry_count: Some(0),
+                    retry_count: None,
                     is_internal_call: false,
                     poll_count: 0,
                     poll_latency: Duration::ZERO,
