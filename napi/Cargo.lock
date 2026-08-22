@@ -585,6 +585,7 @@ dependencies = [
  "arrow-array",
  "arrow-ipc",
  "arrow-schema",
+ "async-trait",
  "chrono",
  "databricks-sql-kernel",
  "futures",

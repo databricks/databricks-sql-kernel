@@ -69,6 +69,10 @@ dyn-symbols = ["napi/dyn-symbols"]
 napi = { version = "3", default-features = false, features = ["napi6", "async"] }
 napi-derive = "3"
 
+# Needed to implement the kernel's `#[async_trait] TokenPersistence` for the
+# `ThreadsafeFunction`-backed pluggable OAuth token store (PECOBLR-4146).
+async-trait = "0.1"
+
 # Kernel — path dep on the async-public-api branch worktree. Once the
 # kernel is published this becomes a version dep.
 #
