@@ -458,16 +458,10 @@ pub struct KernelPersistArgs {
 /// serialized token JSON, or `undefined`/`null` on a miss. `CalleeHandled =
 /// false` so the JS callback receives a bare `host` (not the Node error-first
 /// `(err, host)` shape).
-type ReadTsfn =
-    ThreadsafeFunction<String, Promise<Option<String>>, String, napi::Status, false>;
+type ReadTsfn = ThreadsafeFunction<String, Promise<Option<String>>, String, napi::Status, false>;
 /// JS `persist({ host, tokenJson }) => Promise<void>`.
-type PersistTsfn = ThreadsafeFunction<
-    KernelPersistArgs,
-    Promise<()>,
-    KernelPersistArgs,
-    napi::Status,
-    false,
->;
+type PersistTsfn =
+    ThreadsafeFunction<KernelPersistArgs, Promise<()>, KernelPersistArgs, napi::Status, false>;
 
 /// [`TokenPersistence`] backed by two JS callbacks (via `ThreadsafeFunction`),
 /// installed when the caller supplies an `OAuthPersistence` on the kernel path.
@@ -1120,7 +1114,10 @@ mod tests {
         let mut o = base();
         o.auth_mode = Some(AuthMode::AzureSpM2m);
         o.azure_client_id = Some("entra-app-id".to_owned());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "azure_client_secret");
+        assert_invalid_arg(
+            build_auth_config(&o, None).unwrap_err(),
+            "azure_client_secret",
+        );
     }
 
     #[test]
