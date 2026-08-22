@@ -493,9 +493,7 @@ impl ExecutedAsyncStatement {
                             g.defuse();
                         }
                         let result = self.materialise_result().await;
-                        if let Err(error) = &result {
-                            self.statement_telemetry.finalize(Some(error));
-                        } else {
+                        if result.is_ok() {
                             self.statement_telemetry.finalize(None);
                         }
                         return result;
@@ -506,7 +504,6 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        self.statement_telemetry.finalize(Some(&e));
                         return Err(e);
                     }
                     StatementStatus::Cancelled => {
@@ -522,7 +519,6 @@ impl ExecutedAsyncStatement {
                         // OperationalError, not ProgrammingError — see the
                         // sync arm in client/sea.rs for the rationale.
                         let error = self.cancelled_error(&response.status);
-                        self.statement_telemetry.finalize(Some(&error));
                         return Err(error);
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
@@ -572,9 +568,7 @@ impl ExecutedAsyncStatement {
         let result = async {
             self.valid.check()?;
             let result = self.materialise_result().await;
-            if let Err(error) = &result {
-                self.statement_telemetry.finalize(Some(error));
-            } else {
+            if result.is_ok() {
                 self.statement_telemetry.finalize(None);
             }
             result
