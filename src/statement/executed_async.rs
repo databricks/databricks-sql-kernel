@@ -45,7 +45,7 @@
 //! prefers; field availability is identical.
 
 use crate::client::ExecuteResponse;
-use crate::kernel_error::{Error, ErrorCode, Result};
+use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
@@ -439,8 +439,9 @@ impl ExecutedAsyncStatement {
     /// **Polling timeout.** When the transport's
     /// `TransportConfig.poll_timeout` elapses without reaching a
     /// terminal state, returns `Error::timeout()` (same shape the
-    /// sync polling path produces). The caller may issue a fresh
-    /// `status()` or `await_result()` to resume.
+    /// sync polling path produces). For owning handles this also
+    /// drops the armed cancel guard, which sends a best-effort
+    /// server-side cancel; attached read-only handles do not cancel.
     pub async fn await_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         let result = async {
@@ -528,11 +529,6 @@ impl ExecutedAsyncStatement {
                             // so the server stops charging DBUs on the
                             // now-orphaned query when we return — same
                             // policy as a caller-initiated future drop.
-                            //
-                            // Do not finalize telemetry here: this timeout
-                            // is resumable, so a later await_result() /
-                            // fetch_result() should still record the true
-                            // terminal outcome.
                             return Err(Error::timeout()
                                 .message(format!(
                                     "Statement {} did not reach a terminal state within {:?}",
@@ -548,11 +544,7 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
-            let resumable_await_timeout = error.code == ErrorCode::Timeout
-                && error.query_id.as_deref() == Some(self.statement_id.as_str());
-            if !resumable_await_timeout {
-                self.statement_telemetry.finalize(Some(error));
-            }
+            self.statement_telemetry.finalize(Some(error));
         }
         result
     }
