@@ -17,10 +17,9 @@ they ship on independent cadences.
   passphrase with no explicit flag implies enabled. Applies to `OAuthU2m`.
   (PECOBLR-4146)
 
-  The generated native contract (`index.js` / `index.d.ts`) was regenerated
-  with the crate-correct `@napi-rs/cli@3.8.2`; the previously-committed contract
-  was stale `@napi-rs/cli` v2 output, so that diff also migrates the loader to
-  v3 (version-consistency checks, WASI fallback).
+  The generated `index.d.ts` gains the two optional fields; `index.js` (the
+  loader) is unchanged — new `#[napi(object)]` fields don't alter the exported
+  symbol set.
 
 ## [v0.2.0] - 2026-06-08
 
