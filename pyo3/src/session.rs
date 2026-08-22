@@ -218,7 +218,8 @@ impl Session {
         azure_client_secret=None,
         azure_tenant_id=None,
         azure_workspace_resource_id=None,
-        oauth_persistence=None,
+        token_cache_enabled=None,
+        token_cache_passphrase=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
         tls_skip_hostname_verify=false,
@@ -275,10 +276,10 @@ impl Session {
         azure_client_secret: Option<String>,
         azure_tenant_id: Option<String>,
         azure_workspace_resource_id: Option<String>,
-        // Optional pluggable OAuth U2M token store (Python object with
-        // `read(host)->Optional[str]` / `persist(host, token_json)`); overrides
-        // the built-in disk cache. See `crate::auth::py_token_store`.
-        oauth_persistence: Option<Py<PyAny>>,
+        // U2M on-disk token-cache control (kernel path); overrides the kernel
+        // default (enabled). `False` disables on-disk persistence.
+        token_cache_enabled: Option<bool>,
+        token_cache_passphrase: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
         tls_skip_hostname_verify: bool,
@@ -352,9 +353,8 @@ impl Session {
             azure_client_secret,
             azure_tenant_id,
             azure_workspace_resource_id,
-            // Wrap a supplied Python persistence object as a kernel token store
-            // (U2M only; other auth types ignore it).
-            token_store: oauth_persistence.map(crate::auth::py_token_store),
+            token_cache_enabled,
+            token_cache_passphrase,
         };
         let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;
 

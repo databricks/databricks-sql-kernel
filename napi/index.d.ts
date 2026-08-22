@@ -680,6 +680,20 @@ export interface ConnectionOptions {
    */
   tokenUrl?: string
   /**
+   * U2M on-disk token-cache control (kernel path). Omitted ⇒ the kernel
+   * default (cache enabled, encrypted under a machine-local key, survives
+   * restarts). `false` disables on-disk persistence (re-login each fresh
+   * process); `true` keeps it enabled. Applies to [`AuthMode::OAuthU2m`].
+   */
+  tokenCacheEnabled?: boolean
+  /**
+   * Optional passphrase for the U2M on-disk token cache (AES-256 key).
+   * Omitted/blank ⇒ a machine-local derived key. Supplying one is stronger.
+   * A passphrase with no explicit `tokenCacheEnabled` implies enabled.
+   * Applies to [`AuthMode::OAuthU2m`].
+   */
+  tokenCachePassphrase?: string
+  /**
    * Path to the PEM private-key file. Required for
    * [`AuthMode::OAuthM2mJwt`].
    */
@@ -1154,25 +1168,6 @@ export interface KernelLoggingStats {
 }
 
 /**
- * Map the JS `ConnectionOptions` auth fields onto the kernel
- * [`AuthConfig`]. Per-mode required-field validation lives in the
- * kernel's validating constructors ([`AuthConfig::pat`] /
- * [`AuthConfig::oauth_m2m`]); this binding just forwards the JS
- * optionals and maps any kernel `InvalidArgument` onto a napi error.
- * `#[napi(object)]` argument for the persist callback: the workspace host
- * plus the kernel's serialized `OAuthToken` (JSON). The token crosses the
- * boundary as an opaque JSON string — the exact bytes the on-disk cache would
- * store — so the full token (including expiry) round-trips losslessly through
- * the caller's store.
- */
-export interface KernelPersistArgs {
-  /** Workspace host the token is scoped to (the store's key). */
-  host: string
-  /** The kernel's `OAuthToken` serialized as JSON. Opaque to the caller. */
-  tokenJson: string
-}
-
-/**
  * One kernel log event, as handed to JS. `level` is a lower-case string
  * (`error`/`warn`/`info`/`debug`/`trace`) the Node side maps onto its
  * `LogLevel`; `target` is the originating `tracing` target (e.g.
@@ -1205,7 +1200,7 @@ export interface NamedTypedValueInput {
  * The JS-visible name is `openSession` (napi-rs converts snake_case
  * to camelCase for free functions).
  */
-export declare function openSession(options: ConnectionOptions, oauthPersistenceRead?: (((arg: string) => Promise<string | undefined | null>)) | undefined | null, oauthPersistencePersist?: (((arg: KernelPersistArgs) => Promise<undefined>)) | undefined | null): Promise<Connection>
+export declare function openSession(options: ConnectionOptions): Promise<Connection>
 
 /**
  * Programmatic HTTP/HTTPS proxy configuration, mirroring the kernel's

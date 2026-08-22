@@ -18,7 +18,6 @@
 //! allowing us to test the complete U2M refresh flow without requiring a real OAuth server
 //! or browser interaction.
 
-use databricks_sql_kernel::auth::oauth::persistence::{DiskTokenCache, TokenPersistence};
 use databricks_sql_kernel::auth::oauth::u2m::AuthorizationCodeProvider;
 use databricks_sql_kernel::auth::AuthProvider;
 use databricks_sql_kernel::client::http::{DatabricksHttpClient, HttpClientConfig};
@@ -122,10 +121,7 @@ async fn test_u2m_refresh_token_full_flow() {
         vec![8020],
         Duration::from_secs(120),
         None,
-        Some(
-            Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                as Arc<dyn TokenPersistence>,
-        ),
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create AuthorizationCodeProvider");
@@ -199,10 +195,7 @@ async fn test_u2m_refresh_token_stale_immediate_return() {
         vec![8021],
         Duration::from_secs(120),
         None,
-        Some(
-            Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                as Arc<dyn TokenPersistence>,
-        ),
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");
@@ -282,10 +275,7 @@ async fn test_u2m_refresh_token_expired_fallback() {
         vec![0],                // Use port 0 to avoid conflicts
         Duration::from_secs(5), // Short timeout for test
         None,
-        Some(
-            Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                as Arc<dyn TokenPersistence>,
-        ),
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");
@@ -360,10 +350,7 @@ async fn test_u2m_refresh_updates_cache() {
         vec![8023],
         Duration::from_secs(120),
         None,
-        Some(
-            Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                as Arc<dyn TokenPersistence>,
-        ),
+        Some(TEST_CACHE_PASSPHRASE.to_string()),
     )
     .await
     .expect("Failed to create provider");

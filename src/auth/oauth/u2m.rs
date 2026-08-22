@@ -36,9 +36,9 @@
 //! the cache IS enabled the payload is always encrypted under the
 //! configured passphrase, because it carries that long-lived refresh token.
 
+use crate::auth::oauth::cache::TokenCache;
 use crate::auth::oauth::callback::CallbackServer;
 use crate::auth::oauth::oidc::OidcEndpoints;
-use crate::auth::oauth::persistence::TokenPersistence;
 use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
@@ -62,27 +62,23 @@ const DEFAULT_CALLBACK_PORT: u16 = 8030;
 /// Default timeout for waiting for the OAuth callback.
 const DEFAULT_CALLBACK_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Persist `token` via the configured [`TokenPersistence`] store, or do
-/// nothing when no store is configured (`store` is `None`).
+/// Persist `token` to the on-disk cache, or do nothing when disk caching
+/// is disabled (`passphrase` is `None`).
 ///
 /// Exists so the two save sites in the token-acquisition flow (post-refresh
-/// and post-browser-flow) cannot drift apart. Per the [`TokenPersistence`]
-/// contract a save error is logged and swallowed — a failed cache write must
-/// not fail an otherwise-successful authentication.
-async fn persist_token(
-    store: &Option<Arc<dyn TokenPersistence>>,
+/// and post-browser-flow) cannot drift apart, in particular so neither can
+/// accidentally write an unencrypted token or write one when the user asked
+/// for no cache at all.
+fn save_to_cache(
+    passphrase: Option<&str>,
     host: &str,
     client_id: &str,
     scopes: &[String],
     token: &OAuthToken,
 ) {
-    match store {
-        Some(store) => {
-            if let Err(e) = store.save(host, client_id, scopes, token).await {
-                crate::klog::warn!("Failed to persist OAuth token to store: {}", e);
-            }
-        }
-        None => crate::klog::debug!("Token persistence disabled; not saving token"),
+    match passphrase {
+        Some(passphrase) => TokenCache::save(host, client_id, scopes, token, passphrase),
+        None => crate::klog::debug!("Token cache disabled; not persisting token to disk"),
     }
 }
 
@@ -146,13 +142,12 @@ pub struct AuthorizationCodeProvider {
     callback_timeout: Duration,
     /// Whether to open browser automatically (set to false in tests)
     open_browser: bool,
-    /// Token store used to load a cached token before opening a browser and to
-    /// persist after every acquisition/refresh, or `None` when persistence is
-    /// disabled. `Session::open` installs the built-in encrypted disk cache
-    /// ([`DiskTokenCache`](crate::auth::oauth::persistence::DiskTokenCache))
-    /// here by default, or a caller-supplied store. See
-    /// [`crate::auth::oauth::persistence`].
-    token_persistence: Option<Arc<dyn TokenPersistence>>,
+    /// Passphrase for the on-disk token cache, or `None` when disk
+    /// caching is disabled. `Some` implies the cache is enabled: the
+    /// enabled-without-passphrase combination is rejected upstream in
+    /// [`crate::config::TokenCacheConfig::resolve`], so this field carries
+    /// both the "should I cache?" and "with what key?" decisions.
+    cache_passphrase: Option<String>,
     /// Tokio runtime handle captured from the constructing context;
     /// used to drive the async token exchange from the sync
     /// `get_auth_header` trait method safely whether or not the
@@ -247,7 +242,7 @@ impl AuthorizationCodeProvider {
             vec![callback_port],
             callback_timeout,
             None, // No token_endpoint override
-            None, // No token store: persistence disabled
+            None, // On-disk cache disabled: no passphrase available here
         )
         .await
     }
@@ -257,10 +252,9 @@ impl AuthorizationCodeProvider {
     /// This is used by Database when a custom token endpoint is configured.
     /// Most users should use `new()` or `new_with_config()` which use OIDC discovery.
     ///
-    /// `token_persistence` is `Some` to enable token caching (the built-in
-    /// encrypted disk cache or a caller-supplied store) and `None` to disable
-    /// it. `Session::open` resolves it from the `token_store` / `token_cache`
-    /// policy — see [`crate::auth::oauth::persistence`].
+    /// `cache_passphrase` is `Some` to enable the encrypted on-disk token
+    /// cache and `None` to disable it; the enabled-but-passphraseless case is
+    /// rejected upstream by [`crate::config::TokenCacheConfig::resolve`].
     // The "full config" constructor is a flat parameter list by design — it is
     // the single place every U2M knob is threaded in from `Session::open`.
     #[allow(clippy::too_many_arguments)]
@@ -272,7 +266,7 @@ impl AuthorizationCodeProvider {
         callback_ports: Vec<u16>,
         callback_timeout: Duration,
         token_endpoint_override: Option<String>,
-        token_persistence: Option<Arc<dyn TokenPersistence>>,
+        cache_passphrase: Option<String>,
     ) -> Result<Self> {
         // Discover OIDC endpoints (unless token_endpoint is overridden, we still need auth endpoint)
         let endpoints = OidcEndpoints::discover(host, &http_client).await?;
@@ -283,37 +277,27 @@ impl AuthorizationCodeProvider {
         // Create token store
         let token_store = TokenStore::new();
 
-        // Try loading a cached token. A `None` store means persistence is
-        // disabled, so nothing is read — the in-memory TokenStore above still
-        // reuses and refreshes within this process. Per the TokenPersistence
-        // contract a load error is treated as a cache miss (browser flow on
-        // first auth), never fatal.
-        if let Some(store) = &token_persistence {
-            match store.load(host, client_id, &scopes).await {
-                Ok(Some(cached_token)) if cached_token.refresh_token.is_some() => {
-                    crate::klog::debug!("Loaded cached token with refresh_token for U2M flow");
-                    // Seed the in-memory TokenStore; it will refresh if needed.
-                    let _ = token_store.get_or_refresh(move || Ok(cached_token.clone()));
-                }
-                Ok(Some(_)) => {
-                    crate::klog::debug!(
-                        "Cached token has no refresh_token, will trigger browser flow"
-                    );
-                }
-                Ok(None) => {
-                    crate::klog::debug!(
-                        "No cached token found for U2M flow, will trigger browser flow on first auth"
-                    );
-                }
-                Err(e) => {
-                    crate::klog::warn!(
-                        "Failed to load cached OAuth token (treating as cache miss): {}",
-                        e
-                    );
-                }
+        // Try loading cached token. A `None` passphrase means the on-disk
+        // cache is disabled, so the file is never even read — the in-memory
+        // TokenStore above still reuses and refreshes within this process.
+        if let Some(cached_token) = cache_passphrase
+            .as_deref()
+            .and_then(|passphrase| TokenCache::load(host, client_id, &scopes, passphrase))
+        {
+            // Check if the cached token has a refresh token
+            if cached_token.refresh_token.is_some() {
+                crate::klog::debug!("Loaded cached token with refresh_token for U2M flow");
+                // Store the cached token - TokenStore will handle refresh if needed
+                // We need to manually insert it since get_or_refresh expects to call the closure
+                // Let's trigger a get_or_refresh with a closure that returns the cached token
+                let _ = token_store.get_or_refresh(move || Ok(cached_token.clone()));
+            } else {
+                crate::klog::debug!("Cached token has no refresh_token, will trigger browser flow");
             }
         } else {
-            crate::klog::debug!("Token persistence disabled; browser flow on first auth");
+            crate::klog::debug!(
+                "No cached token found for U2M flow, will trigger browser flow on first auth"
+            );
         }
 
         Ok(Self {
@@ -327,7 +311,7 @@ impl AuthorizationCodeProvider {
             callback_ports,
             callback_timeout,
             open_browser: true,
-            token_persistence,
+            cache_passphrase,
             // `new_with_full_config` is `async`, so we're guaranteed
             // to be inside a tokio runtime here. Capture that handle
             // so `get_auth_header` can dispatch correctly later via
@@ -379,7 +363,7 @@ impl AuthProvider for AuthorizationCodeProvider {
         let callback_timeout = self.callback_timeout;
         let open_browser = self.open_browser;
         let http_client = self.http_client.clone();
-        let token_persistence = self.token_persistence.clone();
+        let cache_passphrase = self.cache_passphrase.clone();
 
         // Get or refresh token via TokenStore
         let runtime_handle = self.runtime_handle.clone();
@@ -390,23 +374,12 @@ impl AuthProvider for AuthorizationCodeProvider {
             // inside a runtime, direct `block_on` otherwise. See
             // `crate::util::runtime`.
             block_on_in_runtime(&runtime_handle, async {
-                    // Try loading from the store first (skipped when
-                    // persistence is disabled; a load error is treated as a
-                    // miss and falls through to the browser flow).
-                    let cached_token = match &token_persistence {
-                        Some(store) => match store.load(&host, &client_id, &scopes).await {
-                            Ok(cached) => cached,
-                            Err(e) => {
-                                crate::klog::warn!(
-                                    "Failed to load cached OAuth token (treating as miss): {}",
-                                    e
-                                );
-                                None
-                            }
-                        },
-                        None => None,
-                    };
-                    if let Some(cached_token) = cached_token {
+                    // Try loading from cache first (skipped entirely when
+                    // on-disk caching is disabled).
+                    if let Some(cached_token) = cache_passphrase
+                        .as_deref()
+                        .and_then(|p| TokenCache::load(&host, &client_id, &scopes, p))
+                    {
                         if let Some(ref refresh_token_str) = cached_token.refresh_token {
                             // Try refreshing the token
                             crate::klog::debug!("Attempting to refresh token via refresh_token");
@@ -464,15 +437,14 @@ impl AuthProvider for AuthorizationCodeProvider {
                                         scopes_result,
                                     );
 
-                                    // Save via the store (no-op when disabled)
-                                    persist_token(
-                                        &token_persistence,
+                                    // Save to cache (no-op when disabled)
+                                    save_to_cache(
+                                        cache_passphrase.as_deref(),
                                         &host,
                                         &client_id,
                                         &scopes,
                                         &token,
-                                    )
-                                    .await;
+                                    );
                                     return Ok(token);
                                 }
                                 Err(e) => {
@@ -593,8 +565,14 @@ impl AuthProvider for AuthorizationCodeProvider {
                         scopes_result,
                     );
 
-                    // Save via the store (no-op when disabled)
-                    persist_token(&token_persistence, &host, &client_id, &scopes, &token).await;
+                    // Save to cache (no-op when disabled)
+                    save_to_cache(
+                        cache_passphrase.as_deref(),
+                        &host,
+                        &client_id,
+                        &scopes,
+                        &token,
+                    );
 
                     Ok(token)
             })
@@ -608,8 +586,6 @@ impl AuthProvider for AuthorizationCodeProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::auth::oauth::cache::TokenCache;
-    use crate::auth::oauth::persistence::DiskTokenCache;
     use crate::client::http::HttpClientConfig;
     use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -686,10 +662,7 @@ mod tests {
             vec![8020],
             Duration::from_secs(120),
             None,
-            Some(
-                Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                    as Arc<dyn TokenPersistence>,
-            ),
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");
@@ -742,10 +715,7 @@ mod tests {
             vec![8020],
             Duration::from_secs(120),
             None,
-            Some(
-                Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                    as Arc<dyn TokenPersistence>,
-            ),
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");
@@ -814,10 +784,7 @@ mod tests {
             vec![0],                // Use port 0 to avoid conflicts
             Duration::from_secs(5), // Short timeout for test
             None,
-            Some(
-                Arc::new(DiskTokenCache::new(TEST_CACHE_PASSPHRASE.to_string()))
-                    as Arc<dyn TokenPersistence>,
-            ),
+            Some(TEST_CACHE_PASSPHRASE.to_string()),
         )
         .await
         .expect("Failed to create provider");

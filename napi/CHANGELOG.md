@@ -9,12 +9,13 @@ they ship on independent cadences.
 ## [Unreleased]
 
 ### Added
-- **Pluggable OAuth token store on `openSession`** — two optional callbacks
-  (`oauthPersistenceRead` / `oauthPersistencePersist`) let a Node caller supply
-  a custom OAuth U2M token store on the kernel path instead of the built-in disk
-  cache. Both must be supplied together; they receive/return the kernel's
-  `OAuthToken` as a JSON string (`KernelPersistArgs`). Wired via
-  `ThreadsafeFunction`, awaiting the JS `Promise`. (PECOBLR-4146)
+- **U2M on-disk token-cache control on `openSession`** — `tokenCacheEnabled`
+  and `tokenCachePassphrase` let a Node caller enable/disable (or set the
+  AES-256 passphrase for) the kernel's built-in encrypted disk cache on the
+  kernel path. Omitted keeps the kernel default (enabled, machine-local key,
+  survives restarts); `tokenCacheEnabled: false` re-logins each fresh process; a
+  passphrase with no explicit flag implies enabled. Applies to `OAuthU2m`.
+  (PECOBLR-4146)
 
   The generated native contract (`index.js` / `index.d.ts`) was regenerated
   with the crate-correct `@napi-rs/cli@3.8.2`; the previously-committed contract

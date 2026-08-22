@@ -41,12 +41,9 @@
 //! wrapper rejects unknown `auth_type` values here so the mistake
 //! surfaces at construction time, not deep inside an HTTP retry loop.
 
-use std::sync::Arc;
 use std::time::Duration;
 
-use databricks_sql_kernel::auth::oauth::persistence::TokenPersistence;
-use databricks_sql_kernel::auth::oauth::OAuthToken;
-use databricks_sql_kernel::{AuthConfig, Error as KernelError};
+use databricks_sql_kernel::{AuthConfig, TokenCacheConfig};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -86,93 +83,14 @@ pub(crate) struct OAuthParams {
     pub azure_client_secret: Option<String>,
     pub azure_tenant_id: Option<String>,
     pub azure_workspace_resource_id: Option<String>,
-    /// Caller-supplied U2M token store (from the Python `oauth_persistence`
-    /// object), or `None` for the built-in disk cache. Carried here so it
-    /// flows through the existing `build_auth_config` plumbing without
-    /// changing that signature; the U2M arm forwards it to the kernel. See
-    /// [`py_token_store`].
-    pub token_store: Option<Arc<dyn TokenPersistence>>,
-}
-
-/// Wrap a Python `oauth_persistence` object as a kernel [`TokenPersistence`].
-///
-/// The object must expose `read(host: str) -> Optional[str]` and
-/// `persist(host: str, token_json: str) -> None`, exchanging the kernel's
-/// `OAuthToken` as an opaque JSON string — the same bytes the on-disk cache
-/// stores, so the token (including expiry) round-trips losslessly. The
-/// databricks-sql-python connector adapts its `experimental_oauth_persistence`
-/// onto this. Consistent with the napi binding's JSON-string wire format.
-pub(crate) fn py_token_store(obj: Py<PyAny>) -> Arc<dyn TokenPersistence> {
-    Arc::new(PyTokenStore { obj })
-}
-
-struct PyTokenStore {
-    obj: Py<PyAny>,
-}
-
-impl std::fmt::Debug for PyTokenStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str("PyTokenStore")
-    }
-}
-
-#[async_trait::async_trait]
-impl TokenPersistence for PyTokenStore {
-    async fn load(
-        &self,
-        host: &str,
-        _client_id: &str,
-        _scopes: &[String],
-    ) -> databricks_sql_kernel::Result<Option<OAuthToken>> {
-        // Call the sync Python `read` under the GIL. No `.await` is held across
-        // the GIL, so the async future stays `Send`. The error string is
-        // produced inside the closure (formatting a `PyErr` needs the GIL).
-        let json: Option<String> =
-            Python::attach(|py| -> std::result::Result<Option<String>, String> {
-                let obj = self.obj.bind(py);
-                let ret = obj
-                    .call_method1("read", (host,))
-                    .map_err(|e| e.to_string())?;
-                if ret.is_none() {
-                    Ok(None)
-                } else {
-                    ret.extract::<String>().map(Some).map_err(|e| e.to_string())
-                }
-            })
-            .map_err(|e| {
-                KernelError::io().message(format!("OAuth token store read failed: {e}"))
-            })?;
-        match json {
-            Some(s) => {
-                let token = serde_json::from_str::<OAuthToken>(&s).map_err(|e| {
-                    KernelError::invalid_state()
-                        .message(format!("token store returned malformed token JSON: {e}"))
-                })?;
-                Ok(Some(token))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn save(
-        &self,
-        host: &str,
-        _client_id: &str,
-        _scopes: &[String],
-        token: &OAuthToken,
-    ) -> databricks_sql_kernel::Result<()> {
-        let json = serde_json::to_string(token).map_err(|e| {
-            KernelError::invalid_state().message(format!("failed to serialize OAuth token: {e}"))
-        })?;
-        Python::attach(|py| -> std::result::Result<(), String> {
-            let obj = self.obj.bind(py);
-            obj.call_method1("persist", (host, json))
-                .map_err(|e| e.to_string())?;
-            Ok(())
-        })
-        .map_err(|e| KernelError::io().message(format!("OAuth token store persist failed: {e}")))?;
-        Ok(())
-    }
+    /// U2M on-disk token-cache control. `None` ⇒ kernel default (enabled,
+    /// machine-local key). `Some(false)` disables on-disk persistence;
+    /// `Some(true)` keeps it. A passphrase with no explicit flag implies
+    /// enabled.
+    pub token_cache_enabled: Option<bool>,
+    /// Optional passphrase for the U2M on-disk token cache (AES-256 key).
+    /// `None`/blank ⇒ a machine-local derived key.
+    pub token_cache_passphrase: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -411,19 +329,19 @@ fn build_auth_config_inner(
                 scopes,
                 oauth.token_url,
                 oauth.callback_timeout_secs.map(Duration::from_secs),
-                // `None` takes the kernel default: on-disk cache ENABLED,
-                // encrypted under a machine-local derived key since this
-                // binding exposes no passphrase option. That preserves
-                // cross-connection SSO reuse (the point of the cache) without
-                // ever writing the refresh token in the clear. Surfacing a
-                // passphrase through `OAuthParams` — the equivalent of JDBC's
-                // TokenCachePassPhrase — would strengthen it further. Ignored
-                // when `token_store` below is `Some`.
-                None,
+                // U2M on-disk token-cache control. Both omitted ⇒ kernel
+                // default (enabled, machine-local derived key — preserves
+                // cross-restart SSO reuse without writing the token in the
+                // clear). Otherwise honor the caller's enable flag /
+                // passphrase; a passphrase alone implies enabled.
+                match (oauth.token_cache_enabled, oauth.token_cache_passphrase) {
+                    (None, None) => None,
+                    (enabled, passphrase) => Some(TokenCacheConfig {
+                        enabled: enabled.unwrap_or(true),
+                        passphrase,
+                    }),
+                },
                 oauth.identity_federation_client_id,
-                // Caller-supplied Python token store (`oauth_persistence`),
-                // when provided; overrides the built-in disk cache above.
-                oauth.token_store,
             ))
         }
         "azure-sp-m2m" => {
@@ -714,6 +632,55 @@ mod tests {
                 assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022, 8023, 8024]));
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_token_cache_control_maps_to_config() {
+        // Neither field set → None → the kernel default (enabled, machine key).
+        match build_auth_config_inner("oauth-u2m", None, OAuthParams::default()).unwrap() {
+            AuthConfig::OAuthU2M { token_cache, .. } => assert!(token_cache.is_none()),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+        // Explicit disable → Some(TokenCacheConfig { enabled: false }).
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                token_cache_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(!tc.enabled);
+                assert!(tc.passphrase.is_none());
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
+        }
+        // Passphrase with no explicit flag implies enabled.
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                token_cache_passphrase: Some("s3cret".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(tc.enabled);
+                assert_eq!(tc.passphrase.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
         }
     }
 

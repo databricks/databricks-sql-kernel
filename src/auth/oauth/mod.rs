@@ -31,7 +31,6 @@ pub(crate) mod jwt_key;
 pub mod jwt_m2m;
 pub mod m2m;
 pub mod oidc;
-pub mod persistence;
 #[cfg(test)]
 pub(crate) mod test_keys;
 pub mod token;
@@ -45,6 +44,5 @@ pub use federation::FederationProvider;
 pub use jwt_m2m::JwtClientCredentialsProvider;
 pub use m2m::ClientCredentialsProvider;
 pub use oidc::OidcEndpoints;
-pub use persistence::{DiskTokenCache, TokenPersistence};
 pub use token::OAuthToken;
 pub use u2m::AuthorizationCodeProvider;

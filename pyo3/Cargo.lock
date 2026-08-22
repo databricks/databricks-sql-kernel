@@ -591,13 +591,11 @@ dependencies = [
  "arrow-array",
  "arrow-pyarrow",
  "arrow-schema",
- "async-trait",
  "chrono",
  "databricks-sql-kernel",
  "log",
  "pyo3",
  "pyo3-log",
- "serde_json",
  "tokio",
  "tracing",
 ]

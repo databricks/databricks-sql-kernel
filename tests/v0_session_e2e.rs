@@ -134,7 +134,6 @@ async fn open_with_oauth_u2m_against_live_warehouse() {
                 enabled: false,
                 passphrase: None,
             }),
-            token_store: None,
             identity_federation_client_id: None,
         })
         .open()
@@ -190,7 +189,6 @@ async fn open_with_oauth_u2m_falls_back_past_busy_port() {
                 enabled: false,
                 passphrase: None,
             }),
-            token_store: None,
             identity_federation_client_id: None,
         })
         .open()

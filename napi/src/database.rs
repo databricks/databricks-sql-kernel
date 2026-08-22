@@ -33,14 +33,10 @@ use napi::bindgen_prelude::Buffer;
 #[cfg(test)]
 type Buffer = Vec<u8>;
 
-use databricks_sql_kernel::auth::oauth::persistence::TokenPersistence;
-use databricks_sql_kernel::auth::oauth::OAuthToken;
 use databricks_sql_kernel::{
     AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError, HttpConfig,
-    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig,
+    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig, TokenCacheConfig,
 };
-use napi::bindgen_prelude::Promise;
-use napi::threadsafe_function::ThreadsafeFunction;
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
 ///
@@ -181,6 +177,16 @@ pub struct ConnectionOptions {
     /// which is required when that IdP — not Databricks-native OIDC — is the
     /// authority for [`AuthMode::OAuthM2m`] / [`AuthMode::OAuthM2mJwt`].
     pub token_url: Option<String>,
+    /// U2M on-disk token-cache control (kernel path). Omitted ⇒ the kernel
+    /// default (cache enabled, encrypted under a machine-local key, survives
+    /// restarts). `false` disables on-disk persistence (re-login each fresh
+    /// process); `true` keeps it enabled. Applies to [`AuthMode::OAuthU2m`].
+    pub token_cache_enabled: Option<bool>,
+    /// Optional passphrase for the U2M on-disk token cache (AES-256 key).
+    /// Omitted/blank ⇒ a machine-local derived key. Supplying one is stronger.
+    /// A passphrase with no explicit `tokenCacheEnabled` implies enabled.
+    /// Applies to [`AuthMode::OAuthU2m`].
+    pub token_cache_passphrase: Option<String>,
     /// Path to the PEM private-key file. Required for
     /// [`AuthMode::OAuthM2mJwt`].
     pub jwt_key_file: Option<String>,
@@ -441,112 +447,9 @@ pub struct ConnectionOptions {
 /// kernel's validating constructors ([`AuthConfig::pat`] /
 /// [`AuthConfig::oauth_m2m`]); this binding just forwards the JS
 /// optionals and maps any kernel `InvalidArgument` onto a napi error.
-/// `#[napi(object)]` argument for the persist callback: the workspace host
-/// plus the kernel's serialized `OAuthToken` (JSON). The token crosses the
-/// boundary as an opaque JSON string — the exact bytes the on-disk cache would
-/// store — so the full token (including expiry) round-trips losslessly through
-/// the caller's store.
-#[napi(object)]
-pub struct KernelPersistArgs {
-    /// Workspace host the token is scoped to (the store's key).
-    pub host: String,
-    /// The kernel's `OAuthToken` serialized as JSON. Opaque to the caller.
-    pub token_json: String,
-}
-
-/// JS `read(host) => Promise<string | undefined>` — returns the kernel-
-/// serialized token JSON, or `undefined`/`null` on a miss. `CalleeHandled =
-/// false` so the JS callback receives a bare `host` (not the Node error-first
-/// `(err, host)` shape).
-type ReadTsfn = ThreadsafeFunction<String, Promise<Option<String>>, String, napi::Status, false>;
-/// JS `persist({ host, tokenJson }) => Promise<void>`.
-type PersistTsfn =
-    ThreadsafeFunction<KernelPersistArgs, Promise<()>, KernelPersistArgs, napi::Status, false>;
-
-/// [`TokenPersistence`] backed by two JS callbacks (via `ThreadsafeFunction`),
-/// installed when the caller supplies an `OAuthPersistence` on the kernel path.
-/// `load`/`save` invoke the JS store and await its returned `Promise`.
-struct NapiTokenStore {
-    read: ReadTsfn,
-    persist: PersistTsfn,
-}
-
-impl std::fmt::Debug for NapiTokenStore {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // `ThreadsafeFunction` is not `Debug`; the kernel only needs a name
-        // here (the field is behind `Arc<dyn TokenPersistence>` in `Debug`
-        // output).
-        f.write_str("NapiTokenStore")
-    }
-}
-
-/// Map a napi callback failure into a kernel error. Per the
-/// [`TokenPersistence`] contract the kernel logs and swallows these (load →
-/// cache miss, save → warn), so the category is informational.
-fn kernel_err_from_napi(e: napi::Error) -> KernelError {
-    KernelError::io().message(format!("OAuth token store callback failed: {e}"))
-}
-
-#[async_trait::async_trait]
-impl TokenPersistence for NapiTokenStore {
-    async fn load(
-        &self,
-        host: &str,
-        _client_id: &str,
-        _scopes: &[String],
-    ) -> databricks_sql_kernel::Result<Option<OAuthToken>> {
-        // Two awaits: `call_async` schedules the JS call and resolves once the
-        // JS function *returns* (a Promise); the second await resolves that
-        // Promise to the token JSON.
-        let promise = self
-            .read
-            .call_async(host.to_string())
-            .await
-            .map_err(kernel_err_from_napi)?;
-        let maybe_json: Option<String> = promise.await.map_err(kernel_err_from_napi)?;
-        match maybe_json {
-            Some(json) => {
-                let token: OAuthToken = serde_json::from_str(&json).map_err(|e| {
-                    KernelError::invalid_state()
-                        .message(format!("token store returned malformed token JSON: {e}"))
-                })?;
-                Ok(Some(token))
-            }
-            None => Ok(None),
-        }
-    }
-
-    async fn save(
-        &self,
-        host: &str,
-        _client_id: &str,
-        _scopes: &[String],
-        token: &OAuthToken,
-    ) -> databricks_sql_kernel::Result<()> {
-        let token_json = serde_json::to_string(token).map_err(|e| {
-            KernelError::invalid_state().message(format!("failed to serialize OAuth token: {e}"))
-        })?;
-        let args = KernelPersistArgs {
-            host: host.to_string(),
-            token_json,
-        };
-        let promise = self
-            .persist
-            .call_async(args)
-            .await
-            .map_err(kernel_err_from_napi)?;
-        promise.await.map_err(kernel_err_from_napi)?;
-        Ok(())
-    }
-}
-
 /// Pure (borrows `options`) so it is unit-testable without opening a
-/// session. `token_store`, when `Some`, is threaded into the U2M arm as the
-/// caller-supplied [`TokenPersistence`] (other arms ignore it).
-fn build_auth_config(
-    options: &ConnectionOptions,
-    token_store: Option<Arc<dyn TokenPersistence>>,
-) -> napi::Result<AuthConfig> {
+/// session.
+fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
     match options.auth_mode.unwrap_or_default() {
         AuthMode::Pat => AuthConfig::pat(
             options.token.clone(),
@@ -605,15 +508,18 @@ fn build_auth_config(
                 options.oauth_scopes.clone(),
                 options.token_url.clone(),
                 None,
-                // `None` takes the kernel default: on-disk cache enabled,
-                // encrypted under a machine-local derived key since this
-                // binding exposes no passphrase option. Ignored when
-                // `token_store` below is `Some`.
-                None,
+                // U2M on-disk token-cache control. Both omitted ⇒ kernel
+                // default (enabled, machine-local key). Otherwise honor the
+                // caller's enable flag / passphrase; a passphrase alone
+                // implies enabled.
+                match (options.token_cache_enabled, &options.token_cache_passphrase) {
+                    (None, None) => None,
+                    (enabled, passphrase) => Some(TokenCacheConfig {
+                        enabled: enabled.unwrap_or(true),
+                        passphrase: passphrase.clone(),
+                    }),
+                },
                 options.identity_federation_client_id.clone(),
-                // Caller-supplied JS token store (`OAuthPersistence`), when the
-                // driver passed the persistence callbacks to `openSession`.
-                token_store,
             ))
         }
         // Azure Entra service-principal M2M. The kernel owns Azure
@@ -832,20 +738,7 @@ fn build_driver_system_configuration(
     reason = "exported via napi macro codegen; not called from Rust"
 )]
 #[napi]
-pub async fn open_session(
-    mut options: ConnectionOptions,
-    // Optional pluggable OAuth token store (U2M only). Both callbacks must be
-    // supplied together; when present they override the built-in disk cache.
-    // The driver adapts its `OAuthPersistence` object into these two functions.
-    // Types are inlined (not the `ReadTsfn`/`PersistTsfn` aliases) so napi-rs
-    // emits a concrete TS function signature rather than a dangling alias name.
-    oauth_persistence_read: Option<
-        ThreadsafeFunction<String, Promise<Option<String>>, String, napi::Status, false>,
-    >,
-    oauth_persistence_persist: Option<
-        ThreadsafeFunction<KernelPersistArgs, Promise<()>, KernelPersistArgs, napi::Status, false>,
-    >,
-) -> napi::Result<Connection> {
+pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connection> {
     guarded(async move {
         // Cache the napi-rs tokio Handle on the very first async call
         // so Drop impls (which run on the V8 GC thread, outside any
@@ -853,19 +746,9 @@ pub async fn open_session(
         // runtime that's driving this future.
         let _ = runtime::get_handle();
 
-        // Build the caller-supplied token store when (and only when) both
-        // callbacks were provided; a lone callback is treated as "no store".
-        let token_store: Option<Arc<dyn TokenPersistence>> =
-            match (oauth_persistence_read, oauth_persistence_persist) {
-                (Some(read), Some(persist)) => {
-                    Some(Arc::new(NapiTokenStore { read, persist }) as Arc<dyn TokenPersistence>)
-                }
-                _ => None,
-            };
-
         // Resolve auth before the builder moves `host_name` / `http_path`
         // out of `options` (validation can fail fast, before any network).
-        let auth_config = build_auth_config(&options, token_store)?;
+        let auth_config = build_auth_config(&options)?;
         // Build the TLS config before the builder moves fields out of
         // `options`. Always wired (even at defaults) because the
         // permissive-by-default stance needs the relaxation flags set —
@@ -967,6 +850,8 @@ mod tests {
             oauth_redirect_port: None,
             oauth_scopes: None,
             token_url: None,
+            token_cache_enabled: None,
+            token_cache_passphrase: None,
             jwt_key_file: None,
             jwt_kid: None,
             jwt_passphrase: None,
@@ -1040,12 +925,12 @@ mod tests {
         // No authMode + no token → fail-fast InvalidArgument from the
         // kernel `AuthConfig::pat` ctor.
         assert_invalid_arg(
-            build_auth_config(&o, None).unwrap_err(),
+            build_auth_config(&o).unwrap_err(),
             "requires a non-empty access token",
         );
         o.token = Some("dapi-xxx".to_owned());
         assert!(matches!(
-            build_auth_config(&o, None).unwrap(),
+            build_auth_config(&o).unwrap(),
             AuthConfig::Pat { .. }
         ));
     }
@@ -1061,7 +946,7 @@ mod tests {
         o.azure_tenant_id = Some("tenant-abc".to_owned());
         o.azure_workspace_resource_id =
             Some("/subscriptions/s/resourceGroups/rg/workspace/w".to_owned());
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::AzureServicePrincipal {
                 azure_client_id,
                 azure_client_secret,
@@ -1089,7 +974,7 @@ mod tests {
         o.auth_mode = Some(AuthMode::AzureSpM2m);
         o.azure_client_id = Some("entra-app-id".to_owned());
         o.azure_client_secret = Some("entra-secret".to_owned());
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::AzureServicePrincipal {
                 azure_tenant_id,
                 azure_workspace_resource_id,
@@ -1109,15 +994,12 @@ mod tests {
         let mut o = base();
         o.auth_mode = Some(AuthMode::AzureSpM2m);
         o.azure_client_secret = Some("entra-secret".to_owned());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "azure_client_id");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "azure_client_id");
 
         let mut o = base();
         o.auth_mode = Some(AuthMode::AzureSpM2m);
         o.azure_client_id = Some("entra-app-id".to_owned());
-        assert_invalid_arg(
-            build_auth_config(&o, None).unwrap_err(),
-            "azure_client_secret",
-        );
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "azure_client_secret");
     }
 
     #[test]
@@ -1126,7 +1008,7 @@ mod tests {
         o.auth_mode = Some(AuthMode::Pat);
         o.token = Some(String::new());
         assert_invalid_arg(
-            build_auth_config(&o, None).unwrap_err(),
+            build_auth_config(&o).unwrap_err(),
             "requires a non-empty access token",
         );
     }
@@ -1137,7 +1019,7 @@ mod tests {
         o.token = Some("dapi-xxx".to_owned());
         o.identity_federation_client_id = Some("federation-client".to_owned());
 
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::Pat {
                 identity_federation_client_id,
                 ..
@@ -1162,7 +1044,7 @@ mod tests {
         m2m.oauth_client_id = Some("cid".to_owned());
         m2m.oauth_client_secret = Some("sec".to_owned());
         m2m.token_url = Some(endpoint.to_owned());
-        match build_auth_config(&m2m, None).unwrap() {
+        match build_auth_config(&m2m).unwrap() {
             AuthConfig::OAuthM2M {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
@@ -1172,7 +1054,7 @@ mod tests {
         let mut u2m = base();
         u2m.auth_mode = Some(AuthMode::OAuthU2m);
         u2m.token_url = Some(endpoint.to_owned());
-        match build_auth_config(&u2m, None).unwrap() {
+        match build_auth_config(&u2m).unwrap() {
             AuthConfig::OAuthU2M {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
@@ -1185,7 +1067,7 @@ mod tests {
         jwt.jwt_key_file = Some("/k.pem".to_owned());
         jwt.jwt_kid = Some("kid".to_owned());
         jwt.token_url = Some(endpoint.to_owned());
-        match build_auth_config(&jwt, None).unwrap() {
+        match build_auth_config(&jwt).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(endpoint)),
@@ -1197,7 +1079,7 @@ mod tests {
         none.auth_mode = Some(AuthMode::OAuthM2m);
         none.oauth_client_id = Some("cid".to_owned());
         none.oauth_client_secret = Some("sec".to_owned());
-        match build_auth_config(&none, None).unwrap() {
+        match build_auth_config(&none).unwrap() {
             AuthConfig::OAuthM2M {
                 token_url_override, ..
             } => assert!(token_url_override.is_none()),
@@ -1209,13 +1091,13 @@ mod tests {
     fn m2m_requires_client_id_and_secret() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthM2m);
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "client_id");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_id");
         o.oauth_client_id = Some("cid".to_owned());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "client_secret");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_secret");
         o.oauth_client_secret = Some("sec".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
         o.identity_federation_client_id = Some("federation-client".to_owned());
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2M {
                 client_id,
                 client_secret,
@@ -1239,18 +1121,18 @@ mod tests {
     fn m2m_jwt_requires_client_id_key_file_and_kid() {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthM2mJwt);
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "client_id");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "client_id");
         o.oauth_client_id = Some("cid".to_owned());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "jwt_key_file");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "jwt_key_file");
         o.jwt_key_file = Some("/k.pem".to_owned());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "jwt_kid");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "jwt_kid");
         o.jwt_kid = Some("kid".to_owned());
         o.jwt_passphrase = Some("pass".to_owned());
         o.jwt_algorithm = Some("ES256".to_owned());
         o.oauth_scopes = Some(vec!["all-apis".to_owned()]);
         let token_url = "https://idp.example/token";
         o.token_url = Some(token_url.to_owned());
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthM2MPrivateKey {
                 client_id,
                 jwt_key_file,
@@ -1281,7 +1163,7 @@ mod tests {
         // redirect_port are all None and the kernel fills its default bundle
         // (databricks-sql-connector / sql offline_access / 8030). See
         // PECOBLR-4039.
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_ports,
@@ -1299,7 +1181,7 @@ mod tests {
         o.oauth_client_id = Some("custom-cli".to_owned());
         o.oauth_redirect_port = Some(9000);
         o.identity_federation_client_id = Some("federation-client".to_owned());
-        match build_auth_config(&o, None).unwrap() {
+        match build_auth_config(&o).unwrap() {
             AuthConfig::OAuthU2M {
                 client_id,
                 redirect_ports,
@@ -1318,6 +1200,45 @@ mod tests {
     }
 
     #[test]
+    fn u2m_token_cache_control_maps_to_config() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthU2m);
+
+        // Neither field set → None → the kernel default (enabled, machine key).
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M { token_cache, .. } => assert!(token_cache.is_none()),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+
+        // Explicit disable → Some(TokenCacheConfig { enabled: false }).
+        o.token_cache_enabled = Some(false);
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(!tc.enabled);
+                assert!(tc.passphrase.is_none());
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
+        }
+
+        // Passphrase with no explicit enable flag implies enabled.
+        o.token_cache_enabled = None;
+        o.token_cache_passphrase = Some("s3cret".to_owned());
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(tc.enabled);
+                assert_eq!(tc.passphrase.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn u2m_rejects_explicit_empty_client_id() {
         // Parity with pyo3: an explicit empty oauthClientId is rejected
         // (it would bind an empty client and surface an opaque server
@@ -1325,7 +1246,7 @@ mod tests {
         let mut o = base();
         o.auth_mode = Some(AuthMode::OAuthU2m);
         o.oauth_client_id = Some(String::new());
-        assert_invalid_arg(build_auth_config(&o, None).unwrap_err(), "oauthClientId");
+        assert_invalid_arg(build_auth_config(&o).unwrap_err(), "oauthClientId");
     }
 
     #[test]
