@@ -41,9 +41,12 @@
 //! wrapper rejects unknown `auth_type` values here so the mistake
 //! surfaces at construction time, not deep inside an HTTP retry loop.
 
+use std::sync::Arc;
 use std::time::Duration;
 
-use databricks_sql_kernel::AuthConfig;
+use databricks_sql_kernel::auth::oauth::persistence::TokenPersistence;
+use databricks_sql_kernel::auth::oauth::OAuthToken;
+use databricks_sql_kernel::{AuthConfig, Error as KernelError};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -83,6 +86,93 @@ pub(crate) struct OAuthParams {
     pub azure_client_secret: Option<String>,
     pub azure_tenant_id: Option<String>,
     pub azure_workspace_resource_id: Option<String>,
+    /// Caller-supplied U2M token store (from the Python `oauth_persistence`
+    /// object), or `None` for the built-in disk cache. Carried here so it
+    /// flows through the existing `build_auth_config` plumbing without
+    /// changing that signature; the U2M arm forwards it to the kernel. See
+    /// [`py_token_store`].
+    pub token_store: Option<Arc<dyn TokenPersistence>>,
+}
+
+/// Wrap a Python `oauth_persistence` object as a kernel [`TokenPersistence`].
+///
+/// The object must expose `read(host: str) -> Optional[str]` and
+/// `persist(host: str, token_json: str) -> None`, exchanging the kernel's
+/// `OAuthToken` as an opaque JSON string — the same bytes the on-disk cache
+/// stores, so the token (including expiry) round-trips losslessly. The
+/// databricks-sql-python connector adapts its `experimental_oauth_persistence`
+/// onto this. Consistent with the napi binding's JSON-string wire format.
+pub(crate) fn py_token_store(obj: Py<PyAny>) -> Arc<dyn TokenPersistence> {
+    Arc::new(PyTokenStore { obj })
+}
+
+struct PyTokenStore {
+    obj: Py<PyAny>,
+}
+
+impl std::fmt::Debug for PyTokenStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("PyTokenStore")
+    }
+}
+
+#[async_trait::async_trait]
+impl TokenPersistence for PyTokenStore {
+    async fn load(
+        &self,
+        host: &str,
+        _client_id: &str,
+        _scopes: &[String],
+    ) -> databricks_sql_kernel::Result<Option<OAuthToken>> {
+        // Call the sync Python `read` under the GIL. No `.await` is held across
+        // the GIL, so the async future stays `Send`. The error string is
+        // produced inside the closure (formatting a `PyErr` needs the GIL).
+        let json: Option<String> =
+            Python::attach(|py| -> std::result::Result<Option<String>, String> {
+                let obj = self.obj.bind(py);
+                let ret = obj
+                    .call_method1("read", (host,))
+                    .map_err(|e| e.to_string())?;
+                if ret.is_none() {
+                    Ok(None)
+                } else {
+                    ret.extract::<String>().map(Some).map_err(|e| e.to_string())
+                }
+            })
+            .map_err(|e| {
+                KernelError::io().message(format!("OAuth token store read failed: {e}"))
+            })?;
+        match json {
+            Some(s) => {
+                let token = serde_json::from_str::<OAuthToken>(&s).map_err(|e| {
+                    KernelError::invalid_state()
+                        .message(format!("token store returned malformed token JSON: {e}"))
+                })?;
+                Ok(Some(token))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn save(
+        &self,
+        host: &str,
+        _client_id: &str,
+        _scopes: &[String],
+        token: &OAuthToken,
+    ) -> databricks_sql_kernel::Result<()> {
+        let json = serde_json::to_string(token).map_err(|e| {
+            KernelError::invalid_state().message(format!("failed to serialize OAuth token: {e}"))
+        })?;
+        Python::attach(|py| -> std::result::Result<(), String> {
+            let obj = self.obj.bind(py);
+            obj.call_method1("persist", (host, json))
+                .map_err(|e| e.to_string())?;
+            Ok(())
+        })
+        .map_err(|e| KernelError::io().message(format!("OAuth token store persist failed: {e}")))?;
+        Ok(())
+    }
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -327,9 +417,13 @@ fn build_auth_config_inner(
                 // cross-connection SSO reuse (the point of the cache) without
                 // ever writing the refresh token in the clear. Surfacing a
                 // passphrase through `OAuthParams` — the equivalent of JDBC's
-                // TokenCachePassPhrase — would strengthen it further.
+                // TokenCachePassPhrase — would strengthen it further. Ignored
+                // when `token_store` below is `Some`.
                 None,
                 oauth.identity_federation_client_id,
+                // Caller-supplied Python token store (`oauth_persistence`),
+                // when provided; overrides the built-in disk cache above.
+                oauth.token_store,
             ))
         }
         "azure-sp-m2m" => {
