@@ -2281,8 +2281,8 @@ mod is_open_tests {
             "retry_count should be omitted until the transport reports a real value"
         );
         assert!(
-            sql_log["sql_operation"].get("result_latency").is_none(),
-            "Phase 3 should not emit empty result latency placeholders"
+            sql_log["sql_operation"]["result_latency"].is_object(),
+            "consuming the result stream should record result latency"
         );
         assert_eq!(
             sql_log["sql_operation"]["operation_detail"]["is_internal_call"],
