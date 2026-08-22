@@ -18,9 +18,10 @@ use super::manager::{TelemetryClientLease, TelemetryClientManager};
 use super::models::{
     unix_time_millis, DriverAuthFlow, DriverAuthMech, DriverConnectionParameters, DriverErrorInfo,
     DriverMode, DriverSystemConfiguration, FrontendLogContext, FrontendLogEntry, HostDetails,
-    OperationDetail, OperationType, OssSqlDriverTelemetryLog, SqlExecutionEvent,
-    TelemetryClientContext, TelemetryFrontendLog,
+    OperationDetail, OperationType, OssSqlDriverTelemetryLog, ResultLatency, SqlExecutionEvent,
+    StatementType, TelemetryClientContext, TelemetryFrontendLog,
 };
+use super::statement::{StatementTelemetry, StatementTelemetryContext};
 use crate::client::DatabricksHttpClient;
 use crate::config::{AuthConfig, ConnectionConfig, TelemetryConfig};
 use crate::kernel_error::Error as KernelError;
@@ -84,6 +85,18 @@ impl TelemetryRuntime {
     pub(crate) fn connection(&self) -> Arc<dyn ConnectionTelemetry> {
         Arc::clone(&self.connection)
     }
+
+    pub(crate) fn statement_observer(
+        &self,
+        statement_type: StatementType,
+        operation_type: OperationType,
+    ) -> StatementTelemetry {
+        if self.connection.session().is_some() {
+            StatementTelemetry::new(Arc::clone(&self.connection), statement_type, operation_type)
+        } else {
+            StatementTelemetry::noop()
+        }
+    }
 }
 
 pub(crate) trait ConnectionTelemetry: Send + Sync {
@@ -92,6 +105,13 @@ pub(crate) trait ConnectionTelemetry: Send + Sync {
     fn emit_operation(
         &self,
         operation_type: OperationType,
+        elapsed: Duration,
+        error: Option<&KernelError>,
+    );
+
+    fn emit_statement_operation(
+        &self,
+        context: StatementTelemetryContext,
         elapsed: Duration,
         error: Option<&KernelError>,
     );
@@ -119,6 +139,14 @@ impl ConnectionTelemetry for NoOpConnectionTelemetry {
     fn emit_operation(
         &self,
         _operation_type: OperationType,
+        _elapsed: Duration,
+        _error: Option<&KernelError>,
+    ) {
+    }
+
+    fn emit_statement_operation(
+        &self,
+        _context: StatementTelemetryContext,
         _elapsed: Duration,
         _error: Option<&KernelError>,
     ) {
@@ -177,6 +205,69 @@ impl RealConnectionTelemetry {
             }),
         }
     }
+
+    fn build_statement_log(
+        &self,
+        context: StatementTelemetryContext,
+        elapsed: Duration,
+        error: Option<&KernelError>,
+    ) -> TelemetryFrontendLog {
+        let event_id = self.next_event_id.fetch_add(1, Ordering::Relaxed);
+        let result_latency = if context.first_batch_latency.is_some()
+            || context.consumption_latency.is_some()
+        {
+            Some(ResultLatency {
+                result_set_ready_latency_millis: context.first_batch_latency.map(duration_millis),
+                result_set_consumption_latency_millis: context
+                    .consumption_latency
+                    .map(duration_millis),
+            })
+        } else {
+            None
+        };
+        TelemetryFrontendLog {
+            workspace_id: self.session.workspace_id,
+            frontend_log_event_id: format!("{}-{event_id}", self.session.session_id),
+            context: Some(FrontendLogContext {
+                client_context: Some(TelemetryClientContext {
+                    user_agent: Some(format!(
+                        "{}/{}",
+                        env!("CARGO_PKG_NAME"),
+                        env!("CARGO_PKG_VERSION")
+                    )),
+                }),
+                timestamp_millis: unix_time_millis(),
+            }),
+            entry: Some(FrontendLogEntry {
+                sql_driver_log: Some(OssSqlDriverTelemetryLog {
+                    session_id: Some(self.session.session_id.clone()),
+                    sql_statement_id: context.statement_id,
+                    system_configuration: Some(self.session.system_configuration.clone()),
+                    driver_connection_params: Some(self.session.connection_params.clone()),
+                    auth_type: Some(self.session.auth_type.clone()),
+                    sql_operation: Some(SqlExecutionEvent {
+                        statement_type: Some(context.statement_type),
+                        is_compressed: context.is_compressed,
+                        execution_result: context.result_format,
+                        retry_count: context.retry_count,
+                        result_latency,
+                        operation_detail: Some(OperationDetail {
+                            n_operation_status_calls: Some(context.poll_count),
+                            operation_status_latency_millis: Some(duration_millis(
+                                context.poll_latency,
+                            )),
+                            operation_type: Some(context.operation_type),
+                            is_internal_call: Some(context.is_internal_call),
+                        }),
+                        ..Default::default()
+                    }),
+                    error_info: error.map(sanitize_error),
+                    operation_latency_ms: Some(duration_millis(elapsed)),
+                    ..Default::default()
+                }),
+            }),
+        }
+    }
 }
 
 impl ConnectionTelemetry for RealConnectionTelemetry {
@@ -193,6 +284,17 @@ impl ConnectionTelemetry for RealConnectionTelemetry {
         self.lease
             .client()
             .enqueue(self.build_operation_log(operation_type, elapsed, error));
+    }
+
+    fn emit_statement_operation(
+        &self,
+        context: StatementTelemetryContext,
+        elapsed: Duration,
+        error: Option<&KernelError>,
+    ) {
+        self.lease
+            .client()
+            .enqueue(self.build_statement_log(context, elapsed, error));
     }
 
     fn finish<'a>(&'a self) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
