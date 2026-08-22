@@ -116,6 +116,15 @@ multi-tenant server sharing tokens in a DB). Until then it stays deferred.
 - Wire format: the kernel's `OAuthToken` serialized to JSON (lossless; the exact
   bytes the disk cache stores) — avoids reconstructing expiry from a partial
   token.
+- Store key: the callback boundary MUST carry the full `{host, client_id,
+  scopes}` triple — the same key `TokenPersistence` / `DiskTokenCache` use (the
+  cache filename is a SHA-256 of all three; see `src/auth/oauth/cache.rs`).
+  Keying a caller-supplied store on `host` alone would collide two U2M sessions
+  to the same host with different `client_id`/`scopes` — the second `save`
+  overwrites the first and a `load` can return a token minted for a different
+  client/scope set — silently diverging from the built-in disk cache, which
+  keeps those as distinct entries. So the napi/pyo3 persist/load args must
+  include `client_id` and `scopes`, not just `host` and `token_json`.
 - napi: `openSession` gains two callbacks wrapped as `ThreadsafeFunction`s;
   `load`/`save` `call_async` the JS function and `await` its `Promise`.
 - pyo3: a `PyTokenStore` calling the Python object under the GIL
