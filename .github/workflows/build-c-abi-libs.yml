@@ -28,35 +28,43 @@
 # the kernel-c-abi-<platform> artifact and commit it into lib/<platform>/). No
 # cross-repo token is used here.
 #
-# ── Toolchain correctness (why each target is what it is) ──────────────────────
-# The Go driver links the kernel through cgo. On every platform cgo uses a
-# GNU-family C toolchain (gcc/clang), which links a GNU-style static archive
-# (libNAME.a) — NEVER an MSVC import library (.lib). Therefore:
-#   * We always build with an EXPLICIT `--target` (never host-inferred), so the
-#     output triple is unambiguous and the emitted archive matches what the
-#     driver's cgo LDFLAGS expect.
-#   * Windows is built for the **x86_64-pc-windows-GNU** target (MinGW), NOT the
-#     msvc default of a windows-latest runner. msvc emits `databricks_sql_kernel.lib`,
-#     which cgo/MinGW on Windows cannot consume; the gnu target emits
-#     `libdatabricks_sql_kernel.a`, which it can. See the driver's cgo_windows.go.
-# Net: ALL platforms produce a uniformly named `libdatabricks_sql_kernel.a`.
+# ── Runner reality in the `databricks` org (verified against databricks-odbc) ──
+# The `databricks` org enforces an IP allow list, so GitHub-hosted runners CANNOT
+# be used at all — they get arbitrary Azure IPs and fail `actions/checkout` with
+# 403 before auth even runs (see databricks-odbc/.github/workflows/macos.yml).
+# Every job here therefore runs on `databricks-protected-runner-group`. Only two
+# labels exist in that group today, confirmed across databricks-odbc + this repo:
+#   * linux-ubuntu-latest   (linux/amd64)
+#   * windows-server-latest (windows/amd64)  — used by databricks-odbc/pr.yml
+# There is NO macOS label (self-hosted macOS is expected ~Oct 2026; ODBC's
+# macos.yml is dormant for the same reason) and NO arm64/Graviton label. So:
+#   * linux_amd64   — builds here, now.
+#   * windows_amd64 — builds here, now (see the Windows toolchain note below).
+#   * darwin_arm64 / darwin_amd64 / linux_arm64 — cannot run until the protected
+#     group gains macOS and arm64 labels; they are listed in the matrix but
+#     COMMENTED OUT so they neither fail nor post empty required checks. Uncomment
+#     each once its label exists (one-line change).
 #
-# Build flags mirror the driver's build/kernel-lib.sh exactly
-# (`--release --locked --no-default-features --features tls-rustls`) so the
-# CI-produced archive is the same shape the driver expects (pure-Rust TLS).
+# ── Windows toolchain (UNVERIFIED — flagged, not assumed) ──────────────────────
+# The Go driver links the kernel through Go cgo, which on Windows uses MinGW/gcc
+# and links a GNU archive (libNAME.a), NOT an MSVC import lib (.lib). So this
+# workflow builds Windows for x86_64-pc-windows-GNU. NOTE the divergence from
+# databricks-odbc, which builds Windows as x86_64-pc-windows-MSVC — that is
+# correct for ODBC (a C++ consumer linking with MSVC) but wrong for Go cgo.
+# Whether the `windows-server-latest` protected runner has a working MinGW gcc
+# for the gnu target is UNVERIFIED; the first Windows run will confirm. If MinGW
+# is unavailable there, options are: install it in-job, or reconsider whether the
+# Windows kernel target ships at all (the driver's cgo_windows.go notes Windows
+# "is not yet exercised"). Do not assume this leg is green until CI proves it.
+#
+# ── Build flags ────────────────────────────────────────────────────────────────
+# Explicit `--target` per leg (never host-inferred), so the output triple is
+# unambiguous and lands at target/<triple>/release/libdatabricks_sql_kernel.a
+# (uniform name across gnu/darwin targets). Flags mirror the driver's
+# build/kernel-lib.sh exactly (`--release --locked --no-default-features
+# --features tls-rustls`, pure-Rust TLS).
 #
 # Triggered by a `v*` tag (release path) or manual workflow_dispatch.
-#
-# ── PRE-MERGE NOTE: runner availability (the one thing to confirm on first run) ─
-# Every OTHER workflow in this repo runs on `databricks-protected-runner-group`
-# / `linux-ubuntu-latest`. This workflow is the first to request GitHub-hosted
-# `macos-14`, `macos-13`, `ubuntu-latest`, `ubuntu-24.04-arm`, and
-# `windows-latest` runners (per-platform native builds need them). Before relying
-# on this in a release, confirm the org permits these GitHub-hosted runner
-# labels (some orgs restrict runners to the protected group). If a label is not
-# permitted, that matrix leg will fail to schedule — swap it for the org's
-# equivalent macOS/Windows/ARM label in the matrix `runs-on` below; nothing else
-# changes. `fail-fast: false` keeps a disallowed leg from taking down the others.
 
 name: Build C-ABI Libraries
 
@@ -89,7 +97,9 @@ defaults:
 jobs:
   build:
     name: "C-ABI ${{ matrix.platform }}"
-    runs-on: ${{ matrix.runs-on }}
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: [ "${{ matrix.runner_label }}" ]
     permissions:
       contents: read
       # OIDC token exchange for the .github/actions/setup-jfrog composite (cargo
@@ -99,26 +109,30 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # platform : the GOOS_GOARCH tag the bindings repo keys off
-          #            (lib/<platform>/); target : the explicit Rust triple we
-          #            build (never host-inferred); runs-on : a native runner for
-          #            that OS/arch (no cross-compilation).
-          - platform: darwin_arm64
-            runs-on: macos-14              # Apple Silicon
-            target: aarch64-apple-darwin
-          - platform: darwin_amd64
-            runs-on: macos-13              # Intel
-            target: x86_64-apple-darwin
+          # platform      : the GOOS_GOARCH tag the bindings repo keys off (lib/<platform>/).
+          # target        : the explicit Rust triple we build (never host-inferred).
+          # runner_label  : the label within databricks-protected-runner-group.
+          #
+          # Only linux_amd64 and windows_amd64 run today — those are the only
+          # labels the protected group has (verified against databricks-odbc). The
+          # macOS and arm64 legs are COMMENTED OUT because no such label exists yet
+          # (self-hosted macOS ~Oct 2026; no Graviton label). Uncomment each once
+          # its label lands in the protected group — one line, nothing else changes.
           - platform: linux_amd64
-            runs-on: ubuntu-latest
+            runner_label: linux-ubuntu-latest
             target: x86_64-unknown-linux-gnu
-          - platform: linux_arm64
-            runs-on: ubuntu-24.04-arm      # native ARM runner
-            target: aarch64-unknown-linux-gnu
           - platform: windows_amd64
-            runs-on: windows-latest
-            # GNU (MinGW), NOT msvc — cgo links .a, not .lib. See header.
-            target: x86_64-pc-windows-gnu
+            runner_label: windows-server-latest
+            target: x86_64-pc-windows-gnu   # MinGW .a for Go cgo — see header (UNVERIFIED)
+          # - platform: darwin_arm64
+          #   runner_label: <macos-arm64-label-once-it-exists>
+          #   target: aarch64-apple-darwin
+          # - platform: darwin_amd64
+          #   runner_label: <macos-amd64-label-once-it-exists>
+          #   target: x86_64-apple-darwin
+          # - platform: linux_arm64
+          #   runner_label: <linux-arm64-label-once-it-exists>
+          #   target: aarch64-unknown-linux-gnu
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
