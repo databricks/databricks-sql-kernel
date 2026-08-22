@@ -1853,7 +1853,7 @@ mod is_open_tests {
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
     use crate::ResultBatch;
-    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_array::{Int64Array, RecordBatch, StringArray};
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -2678,6 +2678,146 @@ mod is_open_tests {
         );
     }
 
+    #[tokio::test]
+    async fn metadata_list_catalogs_exports_metadata_telemetry_on_exhaustion() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-metadata-catalogs").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_inline_body(
+                "stmt-telemetry-metadata-catalogs",
+                &string_batch("catalog", vec!["main", "samples"]),
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-metadata-catalogs", telemetry).await;
+
+        let mut stream = session
+            .metadata()
+            .list_catalogs()
+            .await
+            .expect("list_catalogs succeeds");
+        assert!(stream.next_batch().await.expect("first batch").is_some());
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("stream exhausted")
+            .is_none());
+        drop(stream);
+        session.close().await.expect("close succeeds");
+
+        let metadata_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("LIST_CATALOGS"))
+            .expect("metadata event exported");
+        let sql_log = &metadata_log["entry"]["sql_driver_log"];
+        assert_eq!(
+            sql_log["sql_statement_id"],
+            "stmt-telemetry-metadata-catalogs"
+        );
+        assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+        assert!(
+            sql_log["sql_operation"]["result_latency"].is_object(),
+            "metadata stream exhaustion should record result latency"
+        );
+        assert!(
+            sql_log.get("error_info").is_none(),
+            "successful metadata call should not export error telemetry"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_argument_error_exports_sanitized_error_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-metadata-error").await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-metadata-error", telemetry).await;
+
+        let table = crate::metadata_v0::Identifier::new("tbl").expect("valid table id");
+        let error = match session.metadata().primary_keys(None, None, table).await {
+            Ok(_) => panic!("missing catalog/schema should fail"),
+            Err(error) => error,
+        };
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        session.close().await.expect("close succeeds");
+
+        let metadata_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("LIST_PRIMARY_KEYS"))
+            .expect("metadata error event exported");
+        let sql_log = &metadata_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
+        assert!(
+            sql_log.get("sql_statement_id").is_none(),
+            "argument validation failure happens before a server statement exists"
+        );
+        assert_eq!(sql_log["error_info"]["error_name"], "InvalidArgument");
+        assert!(
+            sql_log["error_info"].get("stack_trace").is_none(),
+            "non-SQLSTATE metadata validation errors should not leak messages into stack_trace"
+        );
+        assert!(
+            !serde_json::to_string(&metadata_log)
+                .expect("metadata log json")
+                .contains("primary_keys requires a catalog identifier"),
+            "metadata telemetry should not include raw error messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_static_table_types_finalizes_on_drop() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-metadata-table-types").await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-metadata-table-types", telemetry).await;
+
+        let stream = session
+            .metadata()
+            .table_types()
+            .await
+            .expect("table_types succeeds");
+        drop(stream);
+        session.close().await.expect("close succeeds");
+
+        let metadata_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("LIST_TABLE_TYPES"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            metadata_logs.len(),
+            1,
+            "metadata stream drop should finalize telemetry exactly once"
+        );
+        let sql_log = &metadata_logs[0]["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+        assert!(
+            sql_log.get("sql_statement_id").is_none(),
+            "static metadata has no server statement id"
+        );
+    }
+
     async fn telemetry_test_session(
         server: &MockServer,
         expected_session_id: &str,
@@ -2758,6 +2898,13 @@ mod is_open_tests {
         let schema =
             std::sync::Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
         RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(values))])
+            .expect("valid batch")
+    }
+
+    fn string_batch(name: &str, values: Vec<&str>) -> RecordBatch {
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
+        RecordBatch::try_new(schema, vec![std::sync::Arc::new(StringArray::from(values))])
             .expect("valid batch")
     }
 
