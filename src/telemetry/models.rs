@@ -424,7 +424,7 @@ mod tests {
         assert_eq!(json["context"]["timestamp_millis"], 1000);
         assert_eq!(
             json["context"]["client_context"]["user_agent"],
-            "databricks-sql-kernel/0.2.0"
+            "databricks-sql-kernel/0.2.1"
         );
         assert!(json.get("workspaceId").is_none());
         assert!(json.get("frontendLogEventId").is_none());
@@ -448,7 +448,7 @@ mod tests {
             session_id: Some("session-1".to_string()),
             sql_statement_id: Some("statement-1".to_string()),
             system_configuration: Some(DriverSystemConfiguration {
-                driver_version: Some("0.2.0".to_string()),
+                driver_version: Some("0.2.1".to_string()),
                 runtime_name: Some("rust".to_string()),
                 runtime_version: Some("1.0".to_string()),
                 runtime_vendor: Some("rust-lang".to_string()),
@@ -550,7 +550,7 @@ mod tests {
             frontend_log_event_id: "event-1".to_string(),
             context: Some(FrontendLogContext {
                 client_context: Some(TelemetryClientContext {
-                    user_agent: Some("databricks-sql-kernel/0.2.0".to_string()),
+                    user_agent: Some("databricks-sql-kernel/0.2.1".to_string()),
                 }),
                 timestamp_millis: 1000,
             }),
