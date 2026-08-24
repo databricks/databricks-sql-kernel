@@ -21,6 +21,7 @@
 //!
 //! No live Databricks workspace or committed private key is required.
 
+use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
     kernel_session_config_set_http_path, kernel_session_config_set_retry_config,
@@ -35,7 +36,8 @@ use rcgen::{
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::WebPkiClientVerifier;
 use rustls::{RootCertStore, ServerConfig};
-use std::ffi::CString;
+use std::ffi::{CStr, CString};
+use std::mem::MaybeUninit;
 use std::ptr;
 use std::sync::{mpsc, Arc};
 use std::thread;
@@ -95,7 +97,7 @@ fn test_pki() -> TestPki {
     let (ca, issuer) = certificate_authority();
     let server = leaf_identity(
         &issuer,
-        vec!["localhost".to_string()],
+        vec!["127.0.0.1".to_string()],
         ExtendedKeyUsagePurpose::ServerAuth,
     );
     let client = leaf_identity(&issuer, Vec::new(), ExtendedKeyUsagePurpose::ClientAuth);
@@ -207,7 +209,9 @@ impl MtlsServer {
 
         let address = address_rx.recv_timeout(Duration::from_secs(10)).unwrap();
         Self {
-            host: format!("https://localhost:{}", address.port()),
+            // The listener is IPv4-only. Connecting to the literal address
+            // avoids platform-dependent localhost/IPv6 resolution in CI.
+            host: format!("https://127.0.0.1:{}", address.port()),
             outcome: outcome_rx,
             thread: server_thread,
         }
@@ -227,7 +231,7 @@ unsafe fn open_session(
     host: &str,
     ca_pem: &[u8],
     identity: Option<&Identity>,
-) -> (KernelStatusCode, *mut kernel_session_t) {
+) -> (KernelStatusCode, *mut kernel_session_t, Option<String>) {
     let mut config: *mut KernelSessionConfig = ptr::null_mut();
     assert_eq!(
         unsafe { kernel_session_config_new(&mut config) },
@@ -273,7 +277,22 @@ unsafe fn open_session(
 
     let mut session = ptr::null_mut();
     let status = unsafe { kernel_session_open(config, &mut session) };
-    (status, session)
+    let error = if status == KernelStatusCode::Success {
+        None
+    } else {
+        let mut out = MaybeUninit::<KernelError>::uninit();
+        if unsafe { kernel_get_last_error(out.as_mut_ptr()) } {
+            let error = unsafe { out.assume_init() };
+            Some(
+                unsafe { CStr::from_ptr(error.message) }
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            Some("kernel returned no last-error detail".to_string())
+        }
+    };
+    (status, session, error)
 }
 
 fn assert_handshake_rejected(outcome: ServerOutcome) {
@@ -292,11 +311,17 @@ fn valid_client_certificate_completes_c_abi_mtls_handshake() {
     let pki = test_pki();
     let server = MtlsServer::start(&pki);
 
-    let (status, session) = unsafe { open_session(&server.host, &pki.ca_pem, Some(&pki.client)) };
-    assert_eq!(status, KernelStatusCode::Success);
+    let (status, session, error) =
+        unsafe { open_session(&server.host, &pki.ca_pem, Some(&pki.client)) };
+    let outcome = server.finish();
+    assert_eq!(
+        status,
+        KernelStatusCode::Success,
+        "kernel error: {error:?}; server outcome: {outcome:?}"
+    );
     assert!(!session.is_null());
 
-    match server.finish() {
+    match outcome {
         ServerOutcome::PresentedCertificate(cert) => {
             assert_eq!(cert, pki.client.cert_der);
         }
@@ -316,10 +341,16 @@ fn missing_client_certificate_fails_c_abi_mtls_handshake() {
     let pki = test_pki();
     let server = MtlsServer::start(&pki);
 
-    let (status, session) = unsafe { open_session(&server.host, &pki.ca_pem, None) };
-    assert_ne!(status, KernelStatusCode::Success);
+    let (status, session, error) = unsafe { open_session(&server.host, &pki.ca_pem, None) };
+    let outcome = server.finish();
+    assert_ne!(
+        status,
+        KernelStatusCode::Success,
+        "server outcome: {outcome:?}"
+    );
     assert!(session.is_null());
-    assert_handshake_rejected(server.finish());
+    assert!(error.is_some(), "failed open should record an error");
+    assert_handshake_rejected(outcome);
 }
 
 #[test]
@@ -327,9 +358,15 @@ fn client_certificate_from_wrong_ca_fails_c_abi_mtls_handshake() {
     let pki = test_pki();
     let server = MtlsServer::start(&pki);
 
-    let (status, session) =
+    let (status, session, error) =
         unsafe { open_session(&server.host, &pki.ca_pem, Some(&pki.untrusted_client)) };
-    assert_ne!(status, KernelStatusCode::Success);
+    let outcome = server.finish();
+    assert_ne!(
+        status,
+        KernelStatusCode::Success,
+        "server outcome: {outcome:?}"
+    );
     assert!(session.is_null());
-    assert_handshake_rejected(server.finish());
+    assert!(error.is_some(), "failed open should record an error");
+    assert_handshake_rejected(outcome);
 }
