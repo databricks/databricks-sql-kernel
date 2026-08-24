@@ -1859,8 +1859,10 @@ mod is_open_tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
     use wiremock::matchers::{method, path, path_regex};
-    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use wiremock::{Mock, MockServer, Request, ResponseTemplate};
 
     /// `Session::is_open` reports true for a freshly-opened session and
     /// false once its server-side delete has been initiated. This is the
@@ -2395,6 +2397,97 @@ mod is_open_tests {
                 .as_i64()
                 .unwrap_or_default()
                 >= 0
+        );
+    }
+
+    #[tokio::test]
+    async fn async_statement_retryable_status_error_then_success_exports_one_success_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-transient-status").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-transient-status")).await;
+
+        let status_calls = Arc::new(AtomicUsize::new(0));
+        let status_calls_for_mock = Arc::clone(&status_calls);
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/sql/statements/stmt-telemetry-transient-status",
+            ))
+            .respond_with(move |_request: &Request| {
+                if status_calls_for_mock.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503).set_body_string(
+                        r#"{"error_code":"TEMPORARILY_UNAVAILABLE","message":"retry status"}"#,
+                    )
+                } else {
+                    ResponseTemplate::new(200).set_body_string(succeeded_inline_body(
+                        "stmt-telemetry-transient-status",
+                        &int64_batch("n", vec![1]),
+                    ))
+                }
+            })
+            .mount(&server)
+            .await;
+
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let http = HttpConfig {
+            retry_max_retries: 0,
+            ..Default::default()
+        };
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .http(http)
+            .telemetry(telemetry)
+            .open()
+            .await
+            .expect("session must open");
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let err = async_exec
+            .status()
+            .await
+            .expect_err("first status should surface transient RPC failure");
+        assert!(err.retryable, "status error should be retryable: {err}");
+
+        let status = async_exec.status().await.expect("retry status succeeds");
+        assert!(
+            matches!(status, crate::statement::StatementStatus::Succeeded),
+            "retry should observe terminal success"
+        );
+        let mut stream = async_exec.fetch_result().await.expect("fetch succeeds");
+        while stream.next_batch().await.expect("drain result").is_some() {}
+        session.close().await.expect("close succeeds");
+
+        let async_statement_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            async_statement_logs.len(),
+            1,
+            "transient status failure plus successful retry should export one terminal event"
+        );
+        let sql_log = &async_statement_logs[0]["entry"]["sql_driver_log"];
+        assert_eq!(
+            sql_log["sql_statement_id"],
+            "stmt-telemetry-transient-status"
+        );
+        assert!(
+            sql_log.get("error_info").is_none(),
+            "retryable polling failure must not consume the terminal telemetry event"
         );
     }
 

@@ -378,6 +378,14 @@ impl ExecutedAsyncStatement {
         crate::kernel_error::carry_extended_status(error, status)
     }
 
+    fn should_finalize_poll_error(error: &Error) -> bool {
+        // A retryable status RPC failure is not a terminal statement
+        // outcome. Surface it to the caller, but leave telemetry open
+        // so a later poll/fetch can still emit the actual terminal
+        // statement result.
+        !error.retryable
+    }
+
     /// One-shot status check. Non-blocking. Issues a single
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`
@@ -417,6 +425,9 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            if !Self::should_finalize_poll_error(error) {
+                return result;
+            }
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -444,6 +455,7 @@ impl ExecutedAsyncStatement {
     /// server-side cancel; attached read-only handles do not cancel.
     pub async fn await_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
+        let mut retryable_poll_error = false;
         let result = async {
             self.valid.check()?;
 
@@ -477,11 +489,27 @@ impl ExecutedAsyncStatement {
             loop {
                 self.valid.check()?;
                 let status_started = std::time::Instant::now();
-                let response = self
+                let response = match self
                     .session
                     .transport()
                     .statement_status(&self.statement_id)
-                    .await?;
+                    .await
+                {
+                    Ok(response) => response,
+                    Err(error) => {
+                        retryable_poll_error = error.retryable;
+                        if retryable_poll_error {
+                            // Returning a retryable poll RPC error is
+                            // not caller abandonment; keep the server
+                            // query alive so the caller can retry and
+                            // eventually fetch the real terminal result.
+                            if let Some(g) = cancel_guard.take() {
+                                g.defuse();
+                            }
+                        }
+                        return Err(error);
+                    }
+                };
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
                 // Cache the wire status so the extended-field
@@ -544,6 +572,9 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            if retryable_poll_error && !Self::should_finalize_poll_error(error) {
+                return result;
+            }
             self.statement_telemetry.finalize(Some(error));
         }
         result
