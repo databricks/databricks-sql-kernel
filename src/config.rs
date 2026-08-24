@@ -1390,6 +1390,17 @@ pub struct TelemetryConfig {
     /// telemetry flush. `Drop` never waits.
     pub close_flush_timeout: Duration,
 
+    /// Whether telemetry export should use a circuit breaker to avoid repeated
+    /// export attempts while the telemetry endpoint is unhealthy.
+    pub circuit_breaker_enabled: bool,
+
+    /// Number of consecutive telemetry export failures before the circuit
+    /// opens. A zero threshold is invalid when circuit breaking is enabled.
+    pub circuit_breaker_threshold: u32,
+
+    /// Duration the circuit stays open before allowing a half-open probe.
+    pub circuit_breaker_timeout: Duration,
+
     #[cfg(test)]
     pub(crate) exporter: Option<std::sync::Arc<dyn crate::telemetry::TelemetryExporter>>,
 }
@@ -1403,7 +1414,10 @@ impl std::fmt::Debug for TelemetryConfig {
             .field("flush_interval", &self.flush_interval)
             .field("max_retries", &self.max_retries)
             .field("retry_delay", &self.retry_delay)
-            .field("close_flush_timeout", &self.close_flush_timeout);
+            .field("close_flush_timeout", &self.close_flush_timeout)
+            .field("circuit_breaker_enabled", &self.circuit_breaker_enabled)
+            .field("circuit_breaker_threshold", &self.circuit_breaker_threshold)
+            .field("circuit_breaker_timeout", &self.circuit_breaker_timeout);
         #[cfg(test)]
         debug.field(
             "exporter",
@@ -1422,6 +1436,9 @@ impl Default for TelemetryConfig {
             max_retries: 3,
             retry_delay: Duration::from_millis(100),
             close_flush_timeout: Duration::from_secs(5),
+            circuit_breaker_enabled: true,
+            circuit_breaker_threshold: 5,
+            circuit_breaker_timeout: Duration::from_secs(60),
             #[cfg(test)]
             exporter: None,
         }
