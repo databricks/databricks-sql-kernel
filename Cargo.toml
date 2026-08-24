@@ -137,7 +137,7 @@ jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"]
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
 [dev-dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 wiremock = "0.6"
 tempfile = "3"
 log = "0.4"
@@ -150,6 +150,12 @@ log = "0.4"
 # into the shipped crate.
 rsa = { version = "0.9", features = ["pem"] }
 p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+# Hermetic mTLS C-ABI tests generate a private CA and client/server identities
+# at runtime, then serve HTTPS with mandatory client-certificate verification.
+# This avoids committed credentials, external processes, and live workspaces.
+rcgen = "0.14.9"
+rustls = { version = "0.23.41", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring", "tls12"] }
 
 # TLS backend selection.
 #

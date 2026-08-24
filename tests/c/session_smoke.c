@@ -173,6 +173,20 @@ static void test_proxy_and_tls_setters(void) {
   rc = kernel_session_config_set_tls_skip_hostname_verification(config, true);
   CHECK(rc == KernelStatusCode_Success, "set_tls_skip_hostname_verification succeeds");
 
+  const unsigned char client_cert[] = "client-certificate";
+  const unsigned char client_key[] = "client-private-key";
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, client_cert, sizeof(client_cert) - 1, client_key, sizeof(client_key) - 1);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_client_certificate succeeds");
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, NULL, 0, client_key, sizeof(client_key) - 1);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_tls_client_certificate(NULL cert) → InvalidArgument");
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, client_cert, sizeof(client_cert) - 1, NULL, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_tls_client_certificate(NULL key) → InvalidArgument");
+
   /* Retry config: a valid range (incl. max_retries=0 to disable, overall
    * timeout 0 = keep default) succeeds; a non-zero overall timeout also
    * succeeds; a zero min_wait is rejected; an inverted range (max<min) is a

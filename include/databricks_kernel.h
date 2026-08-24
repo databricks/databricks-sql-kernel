@@ -413,6 +413,18 @@ KernelStatusCode kernel_session_config_set_tls_allow_self_signed(KernelSessionCo
 KernelStatusCode kernel_session_config_set_tls_skip_hostname_verification(KernelSessionConfig* config,
                                                                          bool skip);
 
+/* Configure a client certificate and private key for mutual TLS (mTLS).
+ * Both values are required and configured atomically. `cert_pem` contains
+ * the PEM leaf certificate followed by any intermediate certificates;
+ * `key_pem` contains the matching unencrypted PEM private key. PKCS#8 is
+ * recommended for portability across the kernel's TLS backends.
+ *
+ * A null pointer or zero length for either value returns InvalidArgument.
+ * The input buffers are copied before this function returns. */
+KernelStatusCode kernel_session_config_set_tls_client_certificate(
+    KernelSessionConfig* config, const uint8_t* cert_pem, size_t cert_len,
+    const uint8_t* key_pem, size_t key_len);
+
 /* Configure the HTTP retry / backoff policy. `min_wait_ms` / `max_wait_ms`
  * are the backoff-wait bounds between attempts (the wait is exponential
  * with jitter, clamped to this range); `max_retries` is the number of

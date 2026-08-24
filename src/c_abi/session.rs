@@ -210,6 +210,11 @@ struct TlsSpec {
     custom_ca_cert: Option<Vec<u8>>,
     accept_self_signed: bool,
     skip_hostname_verification: bool,
+    /// PEM-encoded client leaf certificate followed by any intermediates.
+    /// Always configured together with `client_key_pem`.
+    client_cert_pem: Option<Vec<u8>>,
+    /// PEM-encoded private key for the mTLS client certificate. Never log it.
+    client_key_pem: Option<Vec<u8>>,
 }
 
 /// Read a required C string argument into an owned `String`, mapping a
@@ -1070,6 +1075,42 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_skip_hostname_verificatio
     })
 }
 
+/// Configure a client certificate and private key for mutual TLS (mTLS).
+///
+/// Both values are required and copied into Rust-owned memory. Supplying them
+/// through one setter keeps a partially configured client identity
+/// unrepresentable at the C ABI boundary. The existing kernel TLS layer parses
+/// the identity and enforces certificate/key compatibility when the session
+/// opens.
+///
+/// # Safety
+/// `config` must be a live config handle. `cert_pem` must point to
+/// `cert_len` readable bytes and `key_pem` to `key_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
+    config: *mut KernelSessionConfig,
+    cert_pem: *const u8,
+    cert_len: usize,
+    key_pem: *const u8,
+    key_len: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if cert_pem.is_null() || cert_len == 0 {
+            return Err(Error::invalid_argument()
+                .message("mTLS client cert must be a non-empty PEM buffer"));
+        }
+        if key_pem.is_null() || key_len == 0 {
+            return Err(
+                Error::invalid_argument().message("mTLS client key must be a non-empty PEM buffer")
+            );
+        }
+
+        c.tls.client_cert_pem = Some(std::slice::from_raw_parts(cert_pem, cert_len).to_vec());
+        c.tls.client_key_pem = Some(std::slice::from_raw_parts(key_pem, key_len).to_vec());
+        Ok(())
+    })
+}
+
 /// Set whether transaction control is ignored (no-oped). Pass `true`
 /// (the default) for `IgnoreTransactions=1` semantics — `SQLEndTran` /
 /// commit / rollback / autocommit-off become silent no-ops. Pass `false`
@@ -1489,17 +1530,20 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 });
             }
 
-            // TLS relaxations / custom trust. Only build a TlsConfig when a
-            // non-default knob was set, so the strict default is preserved
-            // otherwise.
+            // TLS relaxations / custom trust / mTLS client identity. Only build
+            // a TlsConfig when a non-default knob was set, so the strict
+            // default is preserved otherwise.
             if tls.custom_ca_cert.is_some()
                 || tls.accept_self_signed
                 || tls.skip_hostname_verification
+                || tls.client_cert_pem.is_some()
             {
                 builder = builder.tls(TlsConfig {
                     custom_ca_cert: tls.custom_ca_cert,
                     accept_self_signed: tls.accept_self_signed,
                     skip_hostname_verification: tls.skip_hostname_verification,
+                    client_cert_pem: tls.client_cert_pem,
+                    client_key_pem: tls.client_key_pem,
                     ..TlsConfig::default()
                 });
             }
@@ -1756,6 +1800,126 @@ pub unsafe extern "C" fn kernel_session_rollback(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn tls_client_certificate_setter_stores_both_values() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let cert = b"client-certificate";
+            let key = b"client-private-key";
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let tls = &config.as_ref().unwrap().tls;
+            assert_eq!(tls.client_cert_pem.as_deref(), Some(cert.as_slice()));
+            assert_eq!(tls.client_key_pem.as_deref(), Some(key.as_slice()));
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn tls_client_certificate_setter_rejects_null_or_empty_values() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let cert = b"client-certificate";
+            let key = b"client-private-key";
+            let invalid_values = [
+                (std::ptr::null(), 0, key.as_ptr(), key.len()),
+                (cert.as_ptr(), 0, key.as_ptr(), key.len()),
+                (cert.as_ptr(), cert.len(), std::ptr::null(), 0),
+                (cert.as_ptr(), cert.len(), key.as_ptr(), 0),
+            ];
+
+            for (cert_ptr, cert_len, key_ptr, key_len) in invalid_values {
+                assert_eq!(
+                    kernel_session_config_set_tls_client_certificate(
+                        config, cert_ptr, cert_len, key_ptr, key_len,
+                    ),
+                    KernelStatusCode::InvalidArgument
+                );
+                let tls = &config.as_ref().unwrap().tls;
+                assert!(tls.client_cert_pem.is_none());
+                assert!(tls.client_key_pem.is_none());
+            }
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn mtls_identity_is_forwarded_when_session_opens() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let host = CString::new("https://example.invalid").unwrap();
+            let http_path = CString::new("/sql/1.0/warehouses/test_wh").unwrap();
+            assert_eq!(
+                kernel_session_config_set_http_path(config, host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            let token = CString::new("dapi-test-token").unwrap();
+            assert_eq!(
+                kernel_session_config_set_auth_pat(config, token.as_ptr()),
+                KernelStatusCode::Success
+            );
+
+            // Valid PEM framing with invalid contents makes client construction
+            // fail before network I/O. Reaching this parser error proves both
+            // values travelled from TlsSpec into the kernel's TlsConfig.
+            let cert = b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n";
+            let key = format!(
+                "-----BEGIN {} KEY-----\ninvalid\n-----END {} KEY-----\n",
+                "PRIVATE", "PRIVATE"
+            )
+            .into_bytes();
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let mut session: *mut kernel_session_t = std::ptr::null_mut();
+            let status = kernel_session_open(config, &mut session);
+            assert_ne!(status, KernelStatusCode::Success);
+            assert!(session.is_null());
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
+            let error = out.assume_init();
+            let message = std::ffi::CStr::from_ptr(error.message).to_str().unwrap();
+            assert!(
+                message.contains("Invalid mTLS client certificate/key"),
+                "expected mTLS identity parser error, got: {message}"
+            );
+        }
+    }
 
     #[test]
     fn m2m_carries_scopes_and_token_endpoint_override() {
