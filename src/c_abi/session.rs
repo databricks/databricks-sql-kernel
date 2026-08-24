@@ -749,6 +749,42 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
     })
 }
 
+/// Configure telemetry circuit breaker behavior.
+///
+/// By default the circuit breaker is enabled with a threshold of 5 consecutive
+/// export failures and a 60 second timeout. Use this setter after
+/// `kernel_session_config_set_telemetry_config` to override only the circuit
+/// breaker knobs.
+///
+/// `threshold` must be greater than zero when `enabled` is true.
+/// `timeout_ms` must be greater than zero.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_telemetry_circuit_breaker_config(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+    threshold: u32,
+    timeout_ms: u64,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if enabled && threshold == 0 {
+            return Err(Error::invalid_argument()
+                .message("telemetry circuit breaker threshold must be > 0 when enabled"));
+        }
+        if timeout_ms == 0 {
+            return Err(Error::invalid_argument()
+                .message("telemetry circuit breaker timeout_ms must be > 0"));
+        }
+
+        c.telemetry.circuit_breaker_enabled = enabled;
+        c.telemetry.circuit_breaker_threshold = threshold;
+        c.telemetry.circuit_breaker_timeout = Duration::from_millis(timeout_ms);
+        Ok(())
+    })
+}
+
 /// Configure driver/runtime/system identity supplied by the binding layer.
 ///
 /// Every string argument is optional: pass null for values the binding does
@@ -2634,6 +2670,62 @@ mod tests {
             assert_eq!(telemetry.max_retries, 2);
             assert_eq!(telemetry.retry_delay, Duration::from_millis(50));
             assert_eq!(telemetry.close_flush_timeout, Duration::from_millis(2_500));
+            assert!(
+                telemetry.circuit_breaker_enabled,
+                "base telemetry setter should preserve circuit breaker default"
+            );
+            assert_eq!(telemetry.circuit_breaker_threshold, 5);
+            assert_eq!(telemetry.circuit_breaker_timeout, Duration::from_secs(60));
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_circuit_breaker_config_records_knobs() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_circuit_breaker_config(
+                    config, false, 9, 12_345
+                ),
+                KernelStatusCode::Success
+            );
+
+            let telemetry = &config.as_ref().unwrap().telemetry;
+            assert!(!telemetry.circuit_breaker_enabled);
+            assert_eq!(telemetry.circuit_breaker_threshold, 9);
+            assert_eq!(
+                telemetry.circuit_breaker_timeout,
+                Duration::from_millis(12_345)
+            );
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_circuit_breaker_config_rejects_invalid_knobs() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_circuit_breaker_config(config, true, 0, 1),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(
+                kernel_session_config_set_telemetry_circuit_breaker_config(config, true, 1, 0),
+                KernelStatusCode::InvalidArgument
+            );
 
             kernel_session_config_free(config);
         }

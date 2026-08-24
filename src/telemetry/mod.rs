@@ -21,6 +21,7 @@
 
 #![allow(dead_code)]
 
+mod circuit_breaker;
 mod client;
 mod databricks;
 mod exporter;

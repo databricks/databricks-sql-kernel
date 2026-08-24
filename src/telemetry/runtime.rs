@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::circuit_breaker::maybe_wrap_exporter;
 use super::databricks::{DatabricksTelemetryExporter, TelemetryEndpoint};
 use super::exporter::TelemetryExporter;
 use super::manager::{TelemetryClientLease, TelemetryClientManager};
@@ -310,6 +311,8 @@ fn valid_config(config: &TelemetryConfig) -> bool {
         && config.batch_size > 0
         && !config.flush_interval.is_zero()
         && !config.close_flush_timeout.is_zero()
+        && !config.circuit_breaker_timeout.is_zero()
+        && (!config.circuit_breaker_enabled || config.circuit_breaker_threshold > 0)
 }
 
 fn exporter_for_config(
@@ -324,17 +327,23 @@ fn exporter_for_config(
             // parallel tests commonly reuse the same mock host with different
             // capturing exporters, and cache reuse would route events to the
             // exporter from whichever test created the host client first.
-            return (exporter, true);
+            return (
+                maybe_wrap_exporter(&connection.host, config, exporter),
+                true,
+            );
         }
     }
 
-    let _ = config;
     (
-        Arc::new(DatabricksTelemetryExporter::new(
+        maybe_wrap_exporter(
             &connection.host,
-            http_client,
-            TelemetryEndpoint::Authenticated,
-        )),
+            config,
+            Arc::new(DatabricksTelemetryExporter::new(
+                &connection.host,
+                http_client,
+                TelemetryEndpoint::Authenticated,
+            )),
+        ),
         false,
     )
 }
@@ -462,6 +471,12 @@ mod tests {
     fn telemetry_config_requires_non_zero_flush_interval() {
         let default_config = TelemetryConfig::default();
         assert_eq!(default_config.flush_interval, Duration::from_secs(5));
+        assert!(default_config.circuit_breaker_enabled);
+        assert_eq!(default_config.circuit_breaker_threshold, 5);
+        assert_eq!(
+            default_config.circuit_breaker_timeout,
+            Duration::from_secs(60)
+        );
 
         let enabled = TelemetryConfig {
             enabled: true,
@@ -475,5 +490,20 @@ mod tests {
             ..TelemetryConfig::default()
         };
         assert!(!valid_config(&zero_interval));
+
+        let zero_breaker_threshold = TelemetryConfig {
+            enabled: true,
+            circuit_breaker_enabled: true,
+            circuit_breaker_threshold: 0,
+            ..TelemetryConfig::default()
+        };
+        assert!(!valid_config(&zero_breaker_threshold));
+
+        let zero_breaker_timeout = TelemetryConfig {
+            enabled: true,
+            circuit_breaker_timeout: Duration::ZERO,
+            ..TelemetryConfig::default()
+        };
+        assert!(!valid_config(&zero_breaker_timeout));
     }
 }
