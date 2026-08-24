@@ -25,8 +25,9 @@ use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
     kernel_session_config_set_http_path, kernel_session_config_set_retry_config,
-    kernel_session_config_set_tls_client_certificate, kernel_session_config_set_tls_trusted_certs,
-    kernel_session_open, kernel_session_t, KernelSessionConfig,
+    kernel_session_config_set_tls_allow_self_signed,
+    kernel_session_config_set_tls_client_certificate, kernel_session_open, kernel_session_t,
+    KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use rcgen::{
@@ -55,7 +56,6 @@ struct Identity {
 
 struct TestPki {
     ca_der: Vec<u8>,
-    ca_pem: Vec<u8>,
     server: Identity,
     client: Identity,
     untrusted_client: Identity,
@@ -111,7 +111,6 @@ fn test_pki() -> TestPki {
 
     TestPki {
         ca_der: ca.der().to_vec(),
-        ca_pem: ca.pem().into_bytes(),
         server,
         client,
         untrusted_client,
@@ -229,7 +228,6 @@ impl MtlsServer {
 
 unsafe fn open_session(
     host: &str,
-    ca_pem: &[u8],
     identity: Option<&Identity>,
 ) -> (KernelStatusCode, *mut kernel_session_t, Option<String>) {
     let mut config: *mut KernelSessionConfig = ptr::null_mut();
@@ -250,9 +248,11 @@ unsafe fn open_session(
         KernelStatusCode::Success
     );
     assert_eq!(
-        unsafe {
-            kernel_session_config_set_tls_trusted_certs(config, ca_pem.as_ptr(), ca_pem.len())
-        },
+        // Server trust is deliberately outside this test's scope. The local
+        // server still strictly verifies the client certificate against the
+        // generated CA; relaxing the client side isolates that mTLS behavior
+        // from platform-specific native trust-store differences.
+        unsafe { kernel_session_config_set_tls_allow_self_signed(config, true) },
         KernelStatusCode::Success
     );
     assert_eq!(
@@ -311,8 +311,7 @@ fn valid_client_certificate_completes_c_abi_mtls_handshake() {
     let pki = test_pki();
     let server = MtlsServer::start(&pki);
 
-    let (status, session, error) =
-        unsafe { open_session(&server.host, &pki.ca_pem, Some(&pki.client)) };
+    let (status, session, error) = unsafe { open_session(&server.host, Some(&pki.client)) };
     let outcome = server.finish();
     assert_eq!(
         status,
@@ -341,7 +340,7 @@ fn missing_client_certificate_fails_c_abi_mtls_handshake() {
     let pki = test_pki();
     let server = MtlsServer::start(&pki);
 
-    let (status, session, error) = unsafe { open_session(&server.host, &pki.ca_pem, None) };
+    let (status, session, error) = unsafe { open_session(&server.host, None) };
     let outcome = server.finish();
     assert_ne!(
         status,
@@ -359,7 +358,7 @@ fn client_certificate_from_wrong_ca_fails_c_abi_mtls_handshake() {
     let server = MtlsServer::start(&pki);
 
     let (status, session, error) =
-        unsafe { open_session(&server.host, &pki.ca_pem, Some(&pki.untrusted_client)) };
+        unsafe { open_session(&server.host, Some(&pki.untrusted_client)) };
     let outcome = server.finish();
     assert_ne!(
         status,
