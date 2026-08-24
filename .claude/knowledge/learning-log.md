@@ -96,6 +96,12 @@ author, follow-up, and review runs.
 - **Context:** In PR #272 the async `operation_latency_ms` stamps `started_at` at `submit()` and reads `elapsed()` at `finalize()`; for submit-and-drop / status-only handles `finalize` runs from `Drop`, so the metric measures how long the application held the handle alive, not server execution time.
   **Rule:** Anchor duration/latency telemetry to the terminal observation point (final poll/response), not to `Drop`-time finalization — Drop can be arbitrarily delayed by the caller and turns an execution-latency metric into a handle-lifetime metric.
 
+### 2026-08-24: learnings since 2026-08-23T07:28:02Z
+- **Context:** PR #278 added a `CallbackLogLayer` tracing layer whose `on_event` only calls `event.record(&mut visitor)` and ignores the `Context`, so fields attached to enclosing spans (e.g. query/statement IDs from `info_span!`) are dropped — while the existing `fmt::layer()` file/stderr path DOES surface span context, making the two sinks silently diverge.
+  **Rule:** A custom `tracing` Layer that records only event fields delivers strictly less context than `fmt::layer()`; walk `ctx.event_scope()` to include enclosing-span fields (or explicitly document the sink forwards only "event fields", never "structured fields") so consumers relying on span-scoped IDs aren't misled.
+- **Context:** PR #278's `kernel_init_logging_callback` documents "Success means this exact callback is the installed sink," but the `OFF` level short-circuits and returns `Success` without installing any sink or consuming the once-only init slot — contradicting the stated invariant, which the file/stderr sibling had guarded with an explicit "(or skipped for level OFF)" clause.
+  **Rule:** For process-wide first-call-wins init C-ABI functions where a `Success` code can mean either "installed against your request" OR "intentionally skipped/no-op" (e.g. level OFF), the return-value contract MUST spell out the skip case in every entry point, or a host believes a sink is live when nothing was installed.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
