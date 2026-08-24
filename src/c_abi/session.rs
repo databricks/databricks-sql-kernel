@@ -886,8 +886,9 @@ pub unsafe extern "C" fn kernel_init_logging(
 /// won, or another component owns the process-global tracing slot (in every
 /// case this callback receives no records). Because init is once-per-process,
 /// this reflects the **first** initializer's outcome, so `Success` here means
-/// *this exact* callback + `user_data` is the installed sink — a later call
-/// with the identical callback and `user_data` also succeeds (it is that sink).
+/// either level `OFF` was requested (which installs nothing) or *this exact*
+/// callback + `user_data` is the installed sink — a later call with the
+/// identical callback and `user_data` also succeeds (it is that sink).
 ///
 /// # Safety
 /// `level`, if non-null, must be a NUL-terminated C string. `callback` and

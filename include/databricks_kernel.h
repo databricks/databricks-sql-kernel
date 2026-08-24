@@ -371,8 +371,9 @@ typedef void (*KernelLogCallback)(const char* level, const char* target,
  * was NOT installed because a file/stderr sink from an earlier
  * kernel_init_logging already won, a different callback from an earlier
  * kernel_init_logging_callback already won, or another component owns the global
- * subscriber; Success means this exact callback + user_data is the installed
- * sink (a later call with the identical callback and user_data also succeeds). */
+ * subscriber; Success means level OFF was requested (which installs nothing) or
+ * this exact callback + user_data is the installed sink (a later call with the
+ * identical callback and user_data also succeeds). */
 KernelStatusCode kernel_init_logging_callback(const char* level,
                                               KernelLogCallback callback,
                                               void* user_data);
