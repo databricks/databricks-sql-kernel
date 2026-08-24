@@ -774,7 +774,8 @@ enum LogLevelResolution {
 
 /// Parse the C ABI's best-effort bare log level into the shared subscriber
 /// filter representation. Invalid UTF-8 is treated like NULL and falls back to
-/// `RUST_LOG`; OFF intentionally skips subscriber installation.
+/// `RUST_LOG`; OFF intentionally skips subscriber installation without
+/// consuming the process-wide initialization slot.
 unsafe fn resolve_log_level(level: *const c_char) -> LogLevelResolution {
     let level = unsafe { optional_str(level, "log level") }.ok().flatten();
     if level
@@ -792,25 +793,26 @@ unsafe fn resolve_log_level(level: *const c_char) -> LogLevelResolution {
 /// `RUST_LOG`, default `warn`); `file_path` is a log file (NULL ⇒ stderr).
 ///
 /// Idempotent: the underlying `tracing` subscriber can only be installed
-/// once per process, so the **first** call wins and later calls are
+/// once per process, so the **first non-OFF** call wins and later calls are
 /// no-ops (a driver that opens many connections calls this each time with
-/// the same target — only the first takes effect). Not tied to a session;
-/// call it before/around `kernel_session_open`. Lets an ODBC/Go host route
-/// the kernel's logs into the same file it writes its own logs to.
+/// the same target — only the first takes effect). `OFF` returns `Success`
+/// without installing a subscriber or consuming that once-only slot, so a
+/// later non-OFF initializer can still win. Not tied to a session; call it
+/// before/around `kernel_session_open`. Lets an ODBC/Go host route the kernel's
+/// logs into the same file it writes its own logs to.
 ///
 /// A non-UTF-8 `file_path` returns `InvalidArgument` (the requested path
-/// can't be honoured). Otherwise returns `Success` when the FIRST call
-/// installed file/stderr logging against the requested destination (or was
-/// skipped for level `OFF`), or `Internal` (with a stored last-error) when
-/// that first install did not fully honour the request — the log file
+/// can't be honoured). `OFF` behaves as described above. For a non-OFF call,
+/// returns `Success` when the first non-OFF call installed file/stderr logging
+/// against the requested destination, or `Internal` (with a stored last-error)
+/// when that first install did not fully honour the request — the log file
 /// couldn't be opened (logging fell back to stderr), a callback sink from an
 /// earlier `kernel_init_logging_callback` already won (this file/stderr
 /// request had no effect), or another component already owns the global
 /// subscriber (no kernel subscriber installed). Because init is
-/// once-per-process, the Success/Internal result reflects the **first**
-/// call's outcome, NOT a later call's `level`/`file_path` (which have no
-/// effect). A caller that can't see stderr can use `Internal` to surface
-/// the degradation.
+/// once-per-process, the Success/Internal result reflects the **first non-OFF**
+/// call's outcome, NOT a later call's `level`/`file_path` (which have no effect).
+/// A caller that can't see stderr can use `Internal` to surface the degradation.
 ///
 /// # Safety
 /// `level` / `file_path`, if non-null, must be NUL-terminated C strings.
@@ -865,9 +867,11 @@ pub unsafe extern "C" fn kernel_init_logging(
 ///
 /// This is the callback counterpart to [`kernel_init_logging`]. `level` has
 /// the same OFF/ERROR/WARN/INFO/DEBUG/TRACE semantics (NULL honors `RUST_LOG`,
-/// defaulting to WARN). The first logging initializer in the process wins;
-/// subsequent callback or file/stderr initializer calls are no-ops reporting
-/// that first call's outcome.
+/// defaulting to WARN). The first non-OFF logging initializer in the process
+/// wins; subsequent callback or file/stderr initializer calls are no-ops
+/// reporting that first call's outcome. `OFF` returns `Success` without
+/// installing a subscriber or consuming the once-only slot, so a later non-OFF
+/// initializer can still win.
 ///
 /// The callback receives lower-case `level`, the tracing `target`, and the
 /// rendered event message including fields recorded directly on that event.
@@ -885,10 +889,11 @@ pub unsafe extern "C" fn kernel_init_logging(
 /// *different* callback from an earlier `kernel_init_logging_callback` already
 /// won, or another component owns the process-global tracing slot (in every
 /// case this callback receives no records). Because init is once-per-process,
-/// this reflects the **first** initializer's outcome, so `Success` here means
-/// either level `OFF` was requested (which installs nothing) or *this exact*
-/// callback + `user_data` is the installed sink — a later call with the
-/// identical callback and `user_data` also succeeds (it is that sink).
+/// this reflects the **first non-OFF** initializer's outcome. Thus `Success`
+/// means either level `OFF` was requested (which installs nothing and does not
+/// consume the initialization slot) or *this exact* callback + `user_data` is
+/// the installed sink — a later call with the identical callback and
+/// `user_data` also succeeds (it is that sink).
 ///
 /// # Safety
 /// `level`, if non-null, must be a NUL-terminated C string. `callback` and

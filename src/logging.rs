@@ -52,7 +52,7 @@
 
 #![allow(dead_code)]
 
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use tracing::field::{Field, Visit};
@@ -302,13 +302,6 @@ impl Visit for CallbackMessageVisitor {
     }
 }
 
-fn callback_cstring(value: &str) -> CString {
-    CString::new(value).unwrap_or_else(|_| {
-        let sanitized = value.replace('\0', "?");
-        CString::new(sanitized).expect("replacing NUL produces a valid CString")
-    })
-}
-
 struct CallbackLogLayer {
     callback: crate::c_abi::KernelLogCallback,
     user_data: usize,
@@ -354,9 +347,11 @@ where
             let mut visitor = CallbackMessageVisitor::default();
             event.record(&mut visitor);
 
-            let level = callback_cstring(&metadata.level().to_string().to_ascii_lowercase());
-            let target = callback_cstring(metadata.target());
-            let message = callback_cstring(&visitor.finish());
+            let level = crate::c_abi::error::to_cstring_lossy(
+                &metadata.level().to_string().to_ascii_lowercase(),
+            );
+            let target = crate::c_abi::error::to_cstring_lossy(metadata.target());
+            let message = crate::c_abi::error::to_cstring_lossy(&visitor.finish());
 
             // Deliver inline so hosts that want the same synchronous sink
             // semantics as their native logger do not lose or reorder records.

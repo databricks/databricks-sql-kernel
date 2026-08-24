@@ -76,16 +76,16 @@ thread_local! {
 /// bytes with `?` so a message that happens to contain `\0` can't make
 /// `CString::new` fail (which would lose the error detail entirely).
 ///
-/// Shared by the error-path `KernelError.query_id` and the success-path
-/// `kernel_executed_statement_query_id`, so both accessors have identical
-/// interior-NUL semantics (strip → `?`, never discard the whole value).
+/// Shared by every Rust-to-C string path that accepts arbitrary Rust text,
+/// including errors, statement IDs, and callback-delivered log records, so
+/// they have identical interior-NUL semantics (`\0` → `?`).
 pub(crate) fn to_cstring_lossy(s: &str) -> CString {
     // Fast path: no interior NUL.
     match CString::new(s) {
         Ok(c) => c,
         Err(_) => {
             let sanitised: String = s.chars().map(|c| if c == '\0' { '?' } else { c }).collect();
-            CString::new(sanitised).unwrap_or_else(|_| CString::new("").expect("empty CString"))
+            CString::new(sanitised).unwrap_or_default()
         }
     }
 }

@@ -336,16 +336,18 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
                                                          const char* name, const char* value);
 
-/* Initialize kernel logging, process-wide and ONCE (first call wins;
+/* Initialize kernel logging, process-wide and ONCE (first non-OFF call wins;
  * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
  * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
- * a session — lets a host route kernel logs into its own log file.
+ * a session — lets a host route kernel logs into its own log file. OFF returns
+ * Success without installing a subscriber or consuming the once-only slot, so
+ * a later non-OFF initializer can still win.
  *
- * A non-UTF-8 `file_path` returns InvalidArgument. Otherwise the result
- * reflects the FIRST call's outcome (a later call's level/file have no
- * effect and are not described by its return): Success when logging was
- * installed against the request (or skipped for level OFF); Internal (with
- * a stored last-error) when that install did not fully honour the request
+ * A non-UTF-8 `file_path` returns InvalidArgument. OFF behaves as described
+ * above. For a non-OFF call, the result reflects the first non-OFF call's
+ * outcome (a later call's level/file have no effect and are not described by
+ * its return): Success when logging was installed against the request; Internal
+ * (with a stored last-error) when that install did not fully honour the request
  * — the file could not be opened (falls back to stderr), a callback sink from
  * an earlier kernel_init_logging_callback already won (this file/stderr
  * request had no effect), or another component already owns the global
@@ -363,17 +365,20 @@ KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 typedef void (*KernelLogCallback)(const char* level, const char* target,
                                   const char* message, void* user_data);
 
-/* Initialize kernel logging through a host callback. The level and
- * process-wide first-call-wins behavior match kernel_init_logging. The callback
- * must remain valid for the process lifetime, return promptly, must not unwind,
- * and must not re-enter the kernel C ABI. A NULL callback returns
- * InvalidArgument. Returns Internal (with a stored last-error) when the callback
- * was NOT installed because a file/stderr sink from an earlier
+/* Initialize kernel logging through a host callback. The level and process-wide
+ * first-non-OFF-call-wins behavior match kernel_init_logging. OFF returns
+ * Success without installing a subscriber or consuming the once-only slot, so
+ * a later non-OFF initializer can still win. The callback must remain valid for
+ * the process lifetime, return promptly, must not unwind, and must not re-enter
+ * the kernel C ABI. A NULL callback returns InvalidArgument. Returns Internal
+ * (with a stored last-error) when the callback was NOT installed because a
+ * file/stderr sink from an earlier
  * kernel_init_logging already won, a different callback from an earlier
  * kernel_init_logging_callback already won, or another component owns the global
- * subscriber; Success means level OFF was requested (which installs nothing) or
- * this exact callback + user_data is the installed sink (a later call with the
- * identical callback and user_data also succeeds). */
+ * subscriber; Success means level OFF was requested (which installs nothing and
+ * does not consume the initialization slot) or this exact callback + user_data
+ * is the installed sink (a later call with the identical callback and user_data
+ * also succeeds). */
 KernelStatusCode kernel_init_logging_callback(const char* level,
                                               KernelLogCallback callback,
                                               void* user_data);
