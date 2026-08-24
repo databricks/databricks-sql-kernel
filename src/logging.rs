@@ -52,21 +52,57 @@
 
 #![allow(dead_code)]
 
+use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+use tracing::field::{Field, Visit};
+use tracing::{Event, Subscriber};
 use tracing_subscriber::{
     fmt::{self, time::SystemTime},
-    layer::SubscriberExt,
+    layer::{Context, SubscriberExt},
+    registry::LookupSpan,
     util::SubscriberInitExt,
-    EnvFilter,
+    EnvFilter, Layer,
 };
 
-/// Records the outcome of the first `init_logging` call: `true` if the
-/// subscriber was installed (or intentionally skipped for level=OFF),
-/// `false` if it could not be installed (e.g. the log file failed to
-/// open). Later calls return this same first-call outcome ("first call
-/// wins").
-static LOGGING_INITIALIZED: OnceLock<bool> = OnceLock::new();
+/// Which kind of sink the first `init_*` call installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoggingSink {
+    /// A file (or stderr-fallback) `fmt` subscriber, from [`init_logging`].
+    FileOrStderr,
+    /// A host-callback subscriber, from [`init_callback_logging`]. Carries the
+    /// winning callback's identity — the function-pointer and `user_data`
+    /// addresses — so a *later, different* callback registration can be told it
+    /// did not win (install is first-call-wins) instead of a misleading success
+    /// that would leave a host believing a dropped callback is live. A later
+    /// registration of the *same* identity is the installed sink, so it still
+    /// succeeds.
+    Callback { callback: usize, user_data: usize },
+}
+
+/// Outcome of the process-global logging install, recorded once by the
+/// **first** `init_*` call ("first call wins") and returned verbatim to every
+/// later call. Replaces a lossy `bool` so a later initializer can report
+/// precisely what happened: whether *its* kind of sink won, whether a
+/// *different* kernel sink already won (so its own request had no effect), or
+/// whether another component owns the global tracing slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoggingOutcome {
+    /// The kernel installed a subscriber. `sink` is which kind; `file_honored`
+    /// is false only when a requested log file could not be opened and logging
+    /// fell back to stderr (meaningful for [`LoggingSink::FileOrStderr`]).
+    Installed {
+        sink: LoggingSink,
+        file_honored: bool,
+    },
+    /// No kernel subscriber was installed: another component already owns the
+    /// process-global tracing slot.
+    Foreign,
+}
+
+/// Records the outcome of the first `init_*` call; later calls return this
+/// same first-call outcome ("first call wins").
+static LOGGING_INITIALIZED: OnceLock<LoggingOutcome> = OnceLock::new();
 
 /// Default log file name created inside a destination that names a
 /// directory (see [`resolve_log_file`]).
@@ -106,6 +142,12 @@ pub(crate) fn filter_from_level(level: &str) -> String {
     )
 }
 
+/// Resolve the shared default filter for every logging destination: honor
+/// `RUST_LOG`, then fall back to warnings from the kernel target.
+fn default_env_filter() -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(filter_from_level("warn")))
+}
+
 /// Resolve a configured log destination to the actual file path to open.
 ///
 /// A destination that names an **existing directory**, or that ends with a
@@ -143,23 +185,19 @@ pub(crate) fn resolve_log_file(path: &Path) -> PathBuf {
 /// filter / file — has no effect and its return does not describe its own
 /// arguments).
 ///
-/// Returns `true` if the first call installed the subscriber against the
-/// requested destination. Returns `false` if that install did not fully
-/// honour the request — either the requested log file could not be opened
-/// (logging fell back to stderr) or the global subscriber was already
-/// installed by another component (so no kernel subscriber was installed).
-/// Callers that cannot see stderr (GUI / BI hosts) can use `false` to
-/// surface the degradation.
-pub(crate) fn init_logging(config: &LogConfig) -> bool {
+/// Returns the [`LoggingOutcome`] recorded by the **first** call: the
+/// installed sink kind plus whether a requested file was honoured, or
+/// [`LoggingOutcome::Foreign`] when another component already owns the global
+/// tracing slot (so no kernel subscriber was installed). Callers that cannot
+/// see stderr (GUI / BI hosts) can inspect it to surface a degradation.
+pub(crate) fn init_logging(config: &LogConfig) -> LoggingOutcome {
     *LOGGING_INITIALIZED.get_or_init(|| {
         // Use the caller's full directive verbatim; otherwise fall back to
         // RUST_LOG, then to a warn default on the kernel's own target.
         let filter = if let Some(ref directive) = config.filter {
             EnvFilter::new(directive.clone())
         } else {
-            EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-                EnvFilter::new(format!("{}=warn", crate::klog::KERNEL_LOG_TARGET))
-            })
+            default_env_filter()
         };
 
         // Resolve a directory-form destination to a file inside it, then try
@@ -207,9 +245,167 @@ pub(crate) fn init_logging(config: &LogConfig) -> bool {
                 .try_init()
                 .is_ok()
         };
-        // Success only if the subscriber installed AND the requested file
-        // (if any) was honoured.
-        installed && file_requested_ok
+        if installed {
+            LoggingOutcome::Installed {
+                sink: LoggingSink::FileOrStderr,
+                file_honored: file_requested_ok,
+            }
+        } else {
+            LoggingOutcome::Foreign
+        }
+    })
+}
+
+/// Collect a tracing event's message and event-local fields into one line.
+#[derive(Default)]
+struct CallbackMessageVisitor {
+    message: String,
+    fields: String,
+}
+
+impl CallbackMessageVisitor {
+    fn finish(self) -> String {
+        if self.fields.is_empty() {
+            self.message
+        } else if self.message.is_empty() {
+            self.fields
+        } else {
+            format!("{} {}", self.message, self.fields)
+        }
+    }
+
+    fn push_field(&mut self, name: &str, value: String) {
+        if !self.fields.is_empty() {
+            self.fields.push(' ');
+        }
+        self.fields.push_str(name);
+        self.fields.push('=');
+        self.fields.push_str(&value);
+    }
+}
+
+impl Visit for CallbackMessageVisitor {
+    fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.message = format!("{value:?}");
+        } else {
+            self.push_field(field.name(), format!("{value:?}"));
+        }
+    }
+
+    fn record_str(&mut self, field: &Field, value: &str) {
+        if field.name() == "message" {
+            self.message = value.to_owned();
+        } else {
+            self.push_field(field.name(), value.to_owned());
+        }
+    }
+}
+
+struct CallbackLogLayer {
+    callback: crate::c_abi::KernelLogCallback,
+    user_data: usize,
+}
+
+thread_local! {
+    /// Set while this thread is inside a callback delivery. If the host
+    /// callback re-enters the kernel logging path (emits a kernel tracing
+    /// event — a contract violation), the nested dispatch lands back in
+    /// [`CallbackLogLayer::on_event`] on the same thread; this flag lets it
+    /// drop the nested record instead of recursing without bound.
+    static IN_CALLBACK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl<S> Layer<S> for CallbackLogLayer
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+        // `on_event` runs inline on whatever thread emitted the record —
+        // including tokio workers driving async FFI calls — so an unwind here
+        // (a misbehaving callback, or a field `Debug` impl) would tear through
+        // tracing's dispatch and abort in-flight work. Catch it at this
+        // boundary, mirroring the `catch_ffi` / `block_on_ffi` guards on the
+        // C-ABI entry points. A caught panic is dropped: it cannot be logged
+        // from here without recursing into this same layer.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            // Reentrancy guard (see `IN_CALLBACK`): drop a nested record rather
+            // than recurse. The `Drop` reset runs on the normal path and while
+            // unwinding, so the flag never sticks `true`.
+            if IN_CALLBACK.with(|active| active.replace(true)) {
+                return;
+            }
+            struct ResetOnDrop;
+            impl Drop for ResetOnDrop {
+                fn drop(&mut self) {
+                    IN_CALLBACK.with(|active| active.set(false));
+                }
+            }
+            let _reset = ResetOnDrop;
+
+            let metadata = event.metadata();
+            let mut visitor = CallbackMessageVisitor::default();
+            event.record(&mut visitor);
+
+            let level = crate::c_abi::error::to_cstring_lossy(
+                &metadata.level().to_string().to_ascii_lowercase(),
+            );
+            let target = crate::c_abi::error::to_cstring_lossy(metadata.target());
+            let message = crate::c_abi::error::to_cstring_lossy(&visitor.finish());
+
+            // Deliver inline so hosts that want the same synchronous sink
+            // semantics as their native logger do not lose or reorder records.
+            // A host that prefers asynchronous delivery can enqueue in its
+            // callback. SAFETY: the caller supplied a valid process-lifetime
+            // callback and user-data pointer under `kernel_init_logging_callback`'s
+            // contract. The C strings remain alive until the callback returns.
+            unsafe {
+                (self.callback)(
+                    level.as_ptr(),
+                    target.as_ptr(),
+                    message.as_ptr(),
+                    self.user_data as *mut c_void,
+                );
+            }
+        }));
+    }
+}
+
+/// Install a process-wide subscriber that forwards records to a host callback.
+///
+/// Shares [`LOGGING_INITIALIZED`] with file/stderr logging, preserving the
+/// existing first-call-wins contract across every C and direct-Rust entry
+/// point. Returns the [`LoggingOutcome`] of the **first** initializer: when a
+/// file/stderr sink already won, that outcome names [`LoggingSink::FileOrStderr`]
+/// and this callback was **not** installed (it will receive no records), so the
+/// caller must not report success.
+pub(crate) fn init_callback_logging(
+    filter: Option<String>,
+    callback: crate::c_abi::KernelLogCallback,
+    user_data: *mut c_void,
+) -> LoggingOutcome {
+    *LOGGING_INITIALIZED.get_or_init(|| {
+        let filter = filter.map_or_else(default_env_filter, EnvFilter::new);
+
+        let installed = tracing_subscriber::registry()
+            .with(filter)
+            .with(CallbackLogLayer {
+                callback,
+                user_data: user_data as usize,
+            })
+            .try_init()
+            .is_ok();
+        if installed {
+            LoggingOutcome::Installed {
+                sink: LoggingSink::Callback {
+                    callback: callback as usize,
+                    user_data: user_data as usize,
+                },
+                file_honored: true,
+            }
+        } else {
+            LoggingOutcome::Foreign
+        }
     })
 }
 
@@ -297,7 +493,7 @@ mod tests {
     #[test]
     fn log_target_is_double_colon_delimited() {
         assert_eq!(crate::klog::KERNEL_LOG_TARGET, "databricks::sql::kernel");
-        // The directive we build (see init_logging) must use this exact
+        // The directive we build (see default_env_filter) must use this exact
         // target, not an underscore-joined token.
         let directive = format!("{}=debug", crate::klog::KERNEL_LOG_TARGET);
         assert!(directive.starts_with("databricks::sql::kernel="));
