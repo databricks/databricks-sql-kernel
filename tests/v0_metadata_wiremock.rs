@@ -25,9 +25,9 @@
 //! sorts where the JDBC contract requires. See
 //! `src/metadata/thrift_shape.rs`.
 //!
-//! Static methods (`type_info`, `table_types`) skip the wire entirely
-//! and verify the synthesised JDBC-shape result the kernel
-//! constructs locally.
+//! Static methods (`type_info`, `table_types`) skip the wire entirely.
+//! `type_info` verifies the Thrift-compatible result the kernel constructs
+//! locally; `table_types` verifies its JDBC shape.
 //!
 //! Validation errors (empty identifier, `None` catalog on
 //! `primary_keys`, etc.) are also covered here.
@@ -1293,10 +1293,10 @@ async fn primary_keys_without_schema_errors() {
     }
 }
 
-// ─── Static-method tests (JDBC-shape, synthesised) ──────────────────
+// ─── Static-method tests (synthesised) ─────────────────────────────
 
 #[tokio::test]
-async fn type_info_returns_static_jdbc_rows_without_wire_call() {
+async fn type_info_returns_static_thrift_rows_without_wire_call() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -1305,12 +1305,36 @@ async fn type_info_returns_static_jdbc_rows_without_wire_call() {
     let mut stream = session.metadata().type_info().await.expect("type_info");
 
     let schema = stream.schema();
-    assert_eq!(schema.fields().len(), 19);
-    assert_eq!(schema.field(0).name(), "TYPE_NAME");
-    assert_eq!(schema.field(1).name(), "DATA_TYPE");
+    let expected = [
+        ("TYPE_NAME", DataType::Utf8),
+        ("DATA_TYPE", DataType::Int32),
+        ("PRECISION", DataType::Int32),
+        ("LITERAL_PREFIX", DataType::Utf8),
+        ("LITERAL_SUFFIX", DataType::Utf8),
+        ("CREATE_PARAMS", DataType::Utf8),
+        ("NULLABLE", DataType::Int16),
+        ("CASE_SENSITIVE", DataType::Boolean),
+        ("SEARCHABLE", DataType::Int16),
+        ("UNSIGNED_ATTRIBUTE", DataType::Boolean),
+        ("FIXED_PREC_SCALE", DataType::Boolean),
+        ("AUTO_INCREMENT", DataType::Boolean),
+        ("LOCAL_TYPE_NAME", DataType::Utf8),
+        ("MINIMUM_SCALE", DataType::Int16),
+        ("MAXIMUM_SCALE", DataType::Int16),
+        ("SQL_DATA_TYPE", DataType::Int32),
+        ("SQL_DATETIME_SUB", DataType::Int32),
+        ("NUM_PREC_RADIX", DataType::Int32),
+    ];
+    assert_eq!(schema.fields().len(), expected.len());
+    for (field, (name, data_type)) in schema.fields().iter().zip(expected) {
+        assert_eq!(field.name(), name);
+        assert_eq!(field.data_type(), &data_type);
+        assert!(field.is_nullable(), "{name} must be nullable");
+    }
 
     let batches = drain_stream(&mut stream).await;
-    assert!(batches[0].num_rows() >= 19);
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 20);
 }
 
 #[tokio::test]

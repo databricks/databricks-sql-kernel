@@ -28,15 +28,12 @@ use std::sync::Arc;
 
 // ─── JDBC `Types` integer codes ─────────────────────────────────────
 //
-// Single source of truth for the kernel. Both
-// [`databricks_type_to_xdbc`] (used by `getColumns` per-row mapping)
-// and `metadata::static_data::type_info_rows` (used by `getTypeInfo`)
-// must agree on which Databricks SQL type maps to which JDBC code —
-// drift between the two surfaces produced silent bugs in the past
-// (e.g. Databricks `FLOAT` was reported as `JDBC FLOAT` (6) by
-// `getColumns` but `JDBC REAL` (7) by `getTypeInfo`). Lifting the
-// constants here, and having `static_data` `use` them, makes the
-// drift structurally impossible.
+// Single source of truth for Databricks query-column mappings. The static
+// `getTypeInfo` catalogue reuses these constants where its Thrift contract
+// agrees. One intentional exception is VOID: query columns surface as
+// VARCHAR (12), while Hive's type catalogue reports `java.sql.Types.NULL`
+// (0). The two metadata operations describe different contracts, so do not
+// force structural equality between them.
 //
 // Values are `i16` because JDBC `Types` codes fit in `short`; the
 // `getTypeInfo` Arrow column happens to be `i32` so callers there
@@ -83,6 +80,7 @@ pub(crate) const JDBC_DECIMAL: i16 = 3;
 pub(crate) const JDBC_INTEGER: i16 = 4;
 pub(crate) const JDBC_SMALLINT: i16 = 5;
 pub(crate) const JDBC_FLOAT: i16 = 6;
+#[allow(dead_code)]
 pub(crate) const JDBC_REAL: i16 = 7;
 pub(crate) const JDBC_DOUBLE: i16 = 8;
 pub(crate) const JDBC_VARCHAR: i16 = 12;

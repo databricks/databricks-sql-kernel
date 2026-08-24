@@ -337,8 +337,9 @@ exercises `Session` end-to-end without needing PR 4 to land first.
   JDBC and ODBC drivers already maintain a rename layer
   (`MetadataResultConstants` / `metadata_transformer.cpp`) and
   continue to use it. Two static methods (`type_info` /
-  `table_types`) have no server-native shape and are synthesised
-  in-memory using the JDBC `getTypeInfo` / `getTableTypes` schemas;
+  `table_types`) have no SEA response and are synthesised in memory:
+  `type_info` matches the exact Thrift/HiveServer2 `getTypeInfo`
+  contract, while `table_types` uses the JDBC `getTableTypes` schema;
   see `src/metadata/schemas.rs`.
 - A thin `ResultStream::from_reader(Box<dyn ResultReader>)` adapter
   lands here — metadata results today fit in one batch from inline
