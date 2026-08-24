@@ -268,7 +268,8 @@ impl TlsConfig {
 pub struct HttpClientConfig {
     /// Connection timeout duration.
     pub connect_timeout: Duration,
-    /// Read timeout duration.
+    /// Total request timeout. Despite the historical field name, this is
+    /// passed to [`reqwest::ClientBuilder::timeout`], not `read_timeout`.
     pub read_timeout: Duration,
     /// Maximum number of idle connections per host.
     pub max_connections_per_host: usize,
@@ -511,6 +512,8 @@ impl DatabricksHttpClient {
     ) -> Result<Client> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
+            // `read_timeout` is a historical name; reqwest applies this as
+            // the total deadline from connect through response-body completion.
             .timeout(config.read_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)

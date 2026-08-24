@@ -131,6 +131,9 @@ pub struct KernelSessionConfig {
     /// Extra HTTP headers sent on every request (accumulated by
     /// `..._set_custom_header`, one `(name, value)` pair per call).
     custom_headers: Vec<(String, String)>,
+    /// Total request timeout (populated by `..._set_request_timeout`). `None`
+    /// keeps [`HttpConfig::default`]'s 120-second timeout.
+    request_timeout: Option<Duration>,
     /// HTTP retry / backoff knobs (populated by `..._set_retry_config`).
     /// `None` keeps the kernel default policy (exponential backoff with
     /// jitter; see [`HttpConfig::default`] for the concrete values); `Some`
@@ -193,7 +196,7 @@ struct ProxySpec {
 /// C-side HTTP retry config captured from
 /// `kernel_session_config_set_retry_config`. The JDBC-style backoff/attempt
 /// knobs a host tunes, plus the cumulative retry budget (`overall_timeout`);
-/// every other `HttpConfig` field (per-request timeout, pool size) keeps its
+/// every other `HttpConfig` field (request timeout, pool size) keeps its
 /// default when a retry spec is set. `overall_timeout` is `None` when the host
 /// left it 0, so [`HttpConfig::default`]'s budget is preserved.
 struct RetrySpec {
@@ -259,6 +262,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
+        request_timeout: None,
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
@@ -575,6 +579,26 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
         let name = required_str(name, "header name")?;
         let value = required_str(value, "header value")?;
         c.custom_headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Configure the total timeout for one HTTP request, from connection start
+/// through response-body completion. A separate 30-second connection timeout
+/// also applies, so connection establishment is bounded by the shorter limit.
+/// `request_timeout_ms == 0` clears an earlier override and keeps the kernel
+/// default (120 seconds); a positive value overrides it.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_request_timeout(
+    config: *mut KernelSessionConfig,
+    request_timeout_ms: u64,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.request_timeout =
+            (request_timeout_ms != 0).then(|| Duration::from_millis(request_timeout_ms));
         Ok(())
     })
 }
@@ -1316,23 +1340,25 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
     (!v.is_empty()).then_some(v)
 }
 
-/// Fold the C-side custom headers and optional [`RetrySpec`] onto a fresh
-/// [`HttpConfig`]. Both live on `HttpConfig`, so we start from defaults and set
-/// only the fields a setter populated — every other HTTP default (per-request
-/// timeout, pool size, and the retry knobs when no `RetrySpec` was set) is
-/// preserved.
+/// Fold the C-side HTTP overrides onto a fresh [`HttpConfig`]. We start from
+/// defaults and set only the fields a setter populated, preserving pool size
+/// and any untouched retry or timeout knobs.
 ///
-/// This is the code that actually configures live retries (called from
-/// `build_session` whenever headers or a retry spec were set), so it is a pure
-/// helper kept unit-testable without a live session.
+/// This is the code that actually configures live HTTP behavior (called from
+/// `build_session` whenever an HTTP override was set), so it is a pure helper
+/// kept unit-testable without a live session.
 fn merge_http_config(
     custom_headers: Vec<(String, String)>,
+    request_timeout: Option<Duration>,
     retry: Option<RetrySpec>,
 ) -> HttpConfig {
     let mut http = HttpConfig {
         custom_headers,
         ..HttpConfig::default()
     };
+    if let Some(t) = request_timeout {
+        http.request_timeout = t;
+    }
     if let Some(r) = retry {
         http.retry_min_wait = r.min_wait;
         http.retry_max_wait = r.max_wait;
@@ -1456,6 +1482,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         proxy,
         tls,
         custom_headers,
+        request_timeout,
         retry,
         ignore_transactions,
         identity_federation_client_id,
@@ -1513,10 +1540,10 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 builder = builder.driver_system_configuration(system_configuration);
             }
 
-            // Skip `.http()` when neither headers nor a retry spec was set, so
-            // the kernel's full `HttpConfig::default()` applies untouched.
-            if !custom_headers.is_empty() || retry.is_some() {
-                builder = builder.http(merge_http_config(custom_headers, retry));
+            // Skip `.http()` when no HTTP override was set, so the kernel's
+            // full `HttpConfig::default()` applies untouched.
+            if !custom_headers.is_empty() || request_timeout.is_some() || retry.is_some() {
+                builder = builder.http(merge_http_config(custom_headers, request_timeout, retry));
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
@@ -2359,6 +2386,36 @@ mod tests {
         }
     }
 
+    /// A positive timeout is recorded in milliseconds; zero clears an earlier
+    /// override so the kernel default remains authoritative.
+    #[test]
+    fn set_request_timeout_records_and_clears_override() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().request_timeout.is_none());
+
+            assert_eq!(
+                kernel_session_config_set_request_timeout(config, 45_000),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config.as_ref().unwrap().request_timeout,
+                Some(Duration::from_secs(45))
+            );
+
+            assert_eq!(
+                kernel_session_config_set_request_timeout(config, 0),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().request_timeout.is_none());
+            kernel_session_config_free(config);
+        }
+    }
+
     /// The retry setter rejects a zero min_wait with `InvalidArgument` (a zero
     /// floor is genuinely invalid), but a `max_wait < min_wait` pair is a tuning
     /// typo that is CORRECTED (max raised to min) with a warning rather than
@@ -2736,6 +2793,7 @@ mod tests {
     fn merge_http_config_maps_every_retry_field() {
         let http = merge_http_config(
             Vec::new(),
+            None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(500),
                 max_wait: Duration::from_millis(30_000),
@@ -2757,6 +2815,7 @@ mod tests {
         let default_budget = HttpConfig::default().overall_timeout;
         let http = merge_http_config(
             Vec::new(),
+            None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(1),
                 max_wait: Duration::from_millis(1_000),
@@ -2780,6 +2839,7 @@ mod tests {
         // Retry-only: knobs applied, headers empty.
         let retry_only = merge_http_config(
             Vec::new(),
+            None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(250),
                 max_wait: Duration::from_millis(5_000),
@@ -2793,7 +2853,8 @@ mod tests {
 
         // Headers-only: header carried through, retry knobs untouched from default.
         let default = HttpConfig::default();
-        let headers_only = merge_http_config(vec![("X-Test".to_string(), "1".to_string())], None);
+        let headers_only =
+            merge_http_config(vec![("X-Test".to_string(), "1".to_string())], None, None);
         assert_eq!(
             headers_only.custom_headers,
             vec![("X-Test".to_string(), "1".to_string())]
@@ -2802,5 +2863,14 @@ mod tests {
         assert_eq!(headers_only.retry_max_wait, default.retry_max_wait);
         assert_eq!(headers_only.retry_max_retries, default.retry_max_retries);
         assert_eq!(headers_only.overall_timeout, default.overall_timeout);
+    }
+
+    #[test]
+    fn merge_http_config_maps_request_timeout_and_preserves_other_defaults() {
+        let default = HttpConfig::default();
+        let http = merge_http_config(Vec::new(), Some(Duration::from_millis(4_500)), None);
+        assert_eq!(http.request_timeout, Duration::from_millis(4_500));
+        assert_eq!(http.retry_min_wait, default.retry_min_wait);
+        assert_eq!(http.overall_timeout, default.overall_timeout);
     }
 }

@@ -14,6 +14,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(..., request_timeout_secs=...)` configures the total timeout for one
+  HTTP request; unset or `0` keeps the kernel's 120-second default.
+
 ### Changed
 
 ### Updated

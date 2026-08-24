@@ -741,7 +741,9 @@ impl std::fmt::Debug for AuthConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
-    /// Per-request timeout. Includes connect + body.
+    /// Total timeout for one HTTP request, from connection start through
+    /// response-body completion. A separate 30-second connection timeout also
+    /// applies, so connection establishment is bounded by the shorter limit.
     pub request_timeout: Duration,
 
     /// Maximum total time across retries for a single logical RPC.

@@ -96,6 +96,71 @@ fn build_telemetry_config(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn build_http_config(
+    request_timeout_secs: Option<f64>,
+    retry_min_wait_secs: Option<u64>,
+    retry_max_wait_secs: Option<u64>,
+    retry_max_attempts: Option<u32>,
+    retry_overall_timeout_secs: Option<u64>,
+    http_headers: Option<Vec<(String, String)>>,
+) -> PyResult<Option<databricks_sql_kernel::HttpConfig>> {
+    // Zero means "keep the kernel default", matching the C ABI setter. Use a
+    // float because databricks-sql-python's existing `_socket_timeout` accepts
+    // fractional seconds.
+    let request_timeout = match request_timeout_secs {
+        None => None,
+        Some(s) => {
+            if s == 0.0 {
+                None
+            } else {
+                let timeout = std::time::Duration::try_from_secs_f64(s).map_err(|_| {
+                    pyo3::exceptions::PyValueError::new_err(
+                        "request_timeout_secs must be finite and >= 0",
+                    )
+                })?;
+                if timeout.is_zero() {
+                    return Err(pyo3::exceptions::PyValueError::new_err(
+                        "positive request_timeout_secs must round to at least 1 nanosecond",
+                    ));
+                }
+                Some(timeout)
+            }
+        }
+    };
+    let has_http_headers = http_headers.as_ref().is_some_and(|h| !h.is_empty());
+    if request_timeout.is_none()
+        && retry_min_wait_secs.is_none()
+        && retry_max_wait_secs.is_none()
+        && retry_max_attempts.is_none()
+        && retry_overall_timeout_secs.is_none()
+        && !has_http_headers
+    {
+        return Ok(None);
+    }
+
+    let mut http = databricks_sql_kernel::HttpConfig::default();
+    if let Some(timeout) = request_timeout {
+        http.request_timeout = timeout;
+    }
+    if let Some(s) = retry_min_wait_secs {
+        http.retry_min_wait = std::time::Duration::from_secs(s);
+    }
+    if let Some(s) = retry_max_wait_secs {
+        http.retry_max_wait = std::time::Duration::from_secs(s);
+    }
+    if let Some(attempts) = retry_max_attempts {
+        http.retry_max_retries = attempts.saturating_sub(1);
+    }
+    if let Some(s) = retry_overall_timeout_secs {
+        http.overall_timeout = std::time::Duration::from_secs(s);
+    }
+    if let Some(headers) = http_headers {
+        http.custom_headers = headers;
+    }
+    Ok(Some(http))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn build_driver_system_configuration(
     driver_name: Option<String>,
     driver_version: Option<String>,
@@ -183,6 +248,12 @@ impl Session {
     /// CloudFetch requests; token-endpoint (auth) calls keep a fixed
     /// fast-fail policy.
     ///
+    /// `request_timeout_secs` sets the total timeout for one HTTP request,
+    /// from connection start through response-body completion. A separate
+    /// 30-second connection timeout also applies, so connection establishment
+    /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
+    /// (120 seconds).
+    ///
     /// `http_headers` is a list of `(name, value)` pairs sent on every
     /// request — used to forward the connector's caller headers (which
     /// also carry the composed `User-Agent`). The kernel applies them
@@ -223,6 +294,7 @@ impl Session {
         tls_skip_hostname_verify=false,
         tls_client_cert=None,
         tls_client_key=None,
+        request_timeout_secs=None,
         retry_min_wait_secs=None,
         retry_max_wait_secs=None,
         retry_max_attempts=None,
@@ -279,6 +351,7 @@ impl Session {
         tls_skip_hostname_verify: bool,
         tls_client_cert: Option<Vec<u8>>,
         tls_client_key: Option<Vec<u8>>,
+        request_timeout_secs: Option<f64>,
         retry_min_wait_secs: Option<u64>,
         retry_max_wait_secs: Option<u64>,
         retry_max_attempts: Option<u32>,
@@ -371,9 +444,10 @@ impl Session {
             None
         };
 
-        // Build an HttpConfig only when the caller tuned retry/backoff
-        // or supplied custom headers; otherwise leave the builder on its
-        // defaults (1s/60s/5-retries, no extra headers).
+        // Build an HttpConfig only when the caller tuned the request timeout,
+        // retry/backoff, or supplied custom headers; otherwise leave the
+        // builder on its defaults (120s request timeout,
+        // 1s/60s/5-retries, no extra headers).
         //
         // `retry_max_attempts` is the **total** number of attempts
         // (matching the connector's `_retry_stop_after_attempts_count`
@@ -387,33 +461,14 @@ impl Session {
         // connector forwards its `http_headers`, which also carries the
         // composed `User-Agent`). The kernel applies them before its own
         // `Authorization` / `x-databricks-org-id`, which always win.
-        let has_http_headers = http_headers.as_ref().is_some_and(|h| !h.is_empty());
-        let http_config = if retry_min_wait_secs.is_some()
-            || retry_max_wait_secs.is_some()
-            || retry_max_attempts.is_some()
-            || retry_overall_timeout_secs.is_some()
-            || has_http_headers
-        {
-            let mut http = databricks_sql_kernel::HttpConfig::default();
-            if let Some(s) = retry_min_wait_secs {
-                http.retry_min_wait = std::time::Duration::from_secs(s);
-            }
-            if let Some(s) = retry_max_wait_secs {
-                http.retry_max_wait = std::time::Duration::from_secs(s);
-            }
-            if let Some(attempts) = retry_max_attempts {
-                http.retry_max_retries = attempts.saturating_sub(1);
-            }
-            if let Some(s) = retry_overall_timeout_secs {
-                http.overall_timeout = std::time::Duration::from_secs(s);
-            }
-            if let Some(headers) = http_headers {
-                http.custom_headers = headers;
-            }
-            Some(http)
-        } else {
-            None
-        };
+        let http_config = build_http_config(
+            request_timeout_secs,
+            retry_min_wait_secs,
+            retry_max_wait_secs,
+            retry_max_attempts,
+            retry_overall_timeout_secs,
+            http_headers,
+        )?;
 
         let driver_system_configuration = build_driver_system_configuration(
             driver_name,
@@ -633,6 +688,34 @@ mod send_sync_tests {
         assert!(build_telemetry_config(false, Some(0), None, None, None, None).is_err());
         assert!(build_telemetry_config(false, None, Some(0), None, None, None).is_err());
         assert!(build_telemetry_config(false, None, None, None, None, Some(0)).is_err());
+    }
+
+    #[test]
+    fn request_timeout_kwarg_maps_to_http_config() {
+        let default = databricks_sql_kernel::HttpConfig::default();
+        assert!(build_http_config(None, None, None, None, None, None)
+            .unwrap()
+            .is_none());
+        assert!(build_http_config(Some(0.0), None, None, None, None, None)
+            .unwrap()
+            .is_none());
+
+        let http = build_http_config(Some(0.5), None, None, None, None, None)
+            .unwrap()
+            .expect("positive request timeout should build an HTTP config");
+        assert_eq!(http.request_timeout, std::time::Duration::from_millis(500));
+        assert_eq!(http.retry_min_wait, default.retry_min_wait);
+        assert_eq!(http.overall_timeout, default.overall_timeout);
+
+        let one_ns = std::time::Duration::from_nanos(1).as_secs_f64();
+        assert!(build_http_config(Some(one_ns / 1_000.0), None, None, None, None, None).is_err());
+        let http = build_http_config(Some(one_ns), None, None, None, None, None)
+            .unwrap()
+            .expect("one-nanosecond request timeout should be accepted");
+        assert_eq!(http.request_timeout, std::time::Duration::from_nanos(1));
+
+        assert!(build_http_config(Some(-1.0), None, None, None, None, None).is_err());
+        assert!(build_http_config(Some(f64::NAN), None, None, None, None, None).is_err());
     }
 
     #[test]

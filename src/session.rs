@@ -942,8 +942,8 @@ impl SessionBuilder {
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
     HttpClientConfig {
         connect_timeout: Duration::from_secs(30),
-        // The internal `read_timeout` corresponds to the public
-        // `request_timeout` — both gate a single HTTP round-trip.
+        // The historical internal `read_timeout` field is passed to reqwest's
+        // total request `.timeout()` and corresponds to public `request_timeout`.
         read_timeout: config.http.request_timeout,
         max_connections_per_host: config.http.pool_max_idle_per_host,
         proxy: build_proxy_config(config.proxy.as_ref()),
@@ -1611,10 +1611,10 @@ mod retry_config_tests {
     }
 
     /// The public `request_timeout` becomes the internal HTTP client's
-    /// `read_timeout` (the per-connection socket read timeout the napi
-    /// `socketTimeoutMs` option drives).
+    /// historically named `read_timeout`, which is applied as reqwest's total
+    /// request timeout.
     #[test]
-    fn request_timeout_becomes_internal_read_timeout() {
+    fn request_timeout_becomes_internal_total_request_timeout() {
         let http = HttpConfig {
             request_timeout: Duration::from_millis(4500),
             ..HttpConfig::default()

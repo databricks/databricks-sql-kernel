@@ -57,3 +57,4 @@ dev = [
 
 [tool.maturin]
 module-name = "databricks_sql_kernel"
+features = ["extension-module"]
