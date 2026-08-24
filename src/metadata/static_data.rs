@@ -204,7 +204,7 @@ fn type_info_rows() -> [TypeInfoRow; 20] {
             data_type: JDBC_CHAR,
             precision: None,
             numeric: false,
-            case_sensitive: true,
+            case_sensitive: false,
             searchable: TYPE_SEARCHABLE,
         },
         R {
@@ -212,7 +212,7 @@ fn type_info_rows() -> [TypeInfoRow; 20] {
             data_type: JDBC_VARCHAR,
             precision: None,
             numeric: false,
-            case_sensitive: true,
+            case_sensitive: false,
             searchable: TYPE_SEARCHABLE,
         },
         R {
@@ -529,11 +529,7 @@ mod tests {
             let numeric = (4..=10).contains(&i);
             let complex = (13..=15).contains(&i);
             assert_eq!(nullable.value(i), 1, "NULLABLE row {i}");
-            // Character types (STRING row 2, CHAR row 16, VARCHAR row 17) are
-            // case-sensitive; every other type is not. Matches the Databricks
-            // JDBC driver's TYPE_INFO catalogue and Hive's Type.isCaseSensitive().
-            let char_type = i == 2 || i == 16 || i == 17;
-            assert_eq!(case_sensitive.value(i), char_type, "CASE_SENSITIVE row {i}");
+            assert_eq!(case_sensitive.value(i), i == 2, "CASE_SENSITIVE row {i}");
             assert_eq!(
                 searchable.value(i),
                 if complex { 0 } else { 3 },
