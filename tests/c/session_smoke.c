@@ -278,10 +278,12 @@ static void test_init_logging(void) {
   /* Second call is a no-op (subscriber already installed) but still Success. */
   rc = kernel_init_logging(NULL, NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
-  /* The alternate callback initializer links and shares the same no-op result. */
+  /* A callback initializer AFTER a file/stderr sink already won reports that
+   * the callback was NOT installed (first initializer wins) rather than a
+   * misleading Success, so a host never believes its callback is live. */
   rc = kernel_init_logging_callback(NULL, capture_log, NULL);
-  CHECK(rc == KernelStatusCode_Success,
-        "init_logging_callback after first install is a safe no-op");
+  CHECK(rc == KernelStatusCode_Internal,
+        "init_logging_callback after file/stderr sink won → Internal (callback not installed)");
 }
 
 /* is_open null-guards its args. (The true→false behavior is covered by the

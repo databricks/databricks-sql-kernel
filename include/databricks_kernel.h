@@ -346,8 +346,10 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * effect and are not described by its return): Success when logging was
  * installed against the request (or skipped for level OFF); Internal (with
  * a stored last-error) when that install did not fully honour the request
- * — the file could not be opened (falls back to stderr) or a global
- * subscriber was already installed (no kernel subscriber installed). */
+ * — the file could not be opened (falls back to stderr), a callback sink from
+ * an earlier kernel_init_logging_callback already won (this file/stderr
+ * request had no effect), or another component already owns the global
+ * subscriber (no kernel subscriber installed). */
 KernelStatusCode kernel_init_logging(const char* level, const char* file_path);
 
 /* One callback-delivered kernel log record. `message` contains the rendered
@@ -365,7 +367,12 @@ typedef void (*KernelLogCallback)(const char* level, const char* target,
  * process-wide first-call-wins behavior match kernel_init_logging. The callback
  * must remain valid for the process lifetime, return promptly, must not unwind,
  * and must not re-enter the kernel C ABI. A NULL callback returns
- * InvalidArgument. */
+ * InvalidArgument. Returns Internal (with a stored last-error) when the callback
+ * was NOT installed because a file/stderr sink from an earlier
+ * kernel_init_logging already won, a different callback from an earlier
+ * kernel_init_logging_callback already won, or another component owns the global
+ * subscriber; Success means this exact callback + user_data is the installed
+ * sink (a later call with the identical callback and user_data also succeeds). */
 KernelStatusCode kernel_init_logging_callback(const char* level,
                                               KernelLogCallback callback,
                                               void* user_data);

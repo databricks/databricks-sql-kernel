@@ -31,6 +31,7 @@ use crate::config::{
     TlsConfig, TokenCacheConfig,
 };
 use crate::kernel_error::Error;
+use crate::logging::{LoggingOutcome, LoggingSink};
 use crate::session::Session;
 use crate::telemetry::DriverSystemConfiguration;
 use std::collections::HashMap;
@@ -799,11 +800,13 @@ unsafe fn resolve_log_level(level: *const c_char) -> LogLevelResolution {
 ///
 /// A non-UTF-8 `file_path` returns `InvalidArgument` (the requested path
 /// can't be honoured). Otherwise returns `Success` when the FIRST call
-/// installed logging against the requested destination (or was skipped for
-/// level `OFF`), or `Internal` (with a stored last-error) when that first
-/// install did not fully honour the request — the log file couldn't be
-/// opened (logging fell back to stderr) or a global subscriber was already
-/// installed (no kernel subscriber installed). Because init is
+/// installed file/stderr logging against the requested destination (or was
+/// skipped for level `OFF`), or `Internal` (with a stored last-error) when
+/// that first install did not fully honour the request — the log file
+/// couldn't be opened (logging fell back to stderr), a callback sink from an
+/// earlier `kernel_init_logging_callback` already won (this file/stderr
+/// request had no effect), or another component already owns the global
+/// subscriber (no kernel subscriber installed). Because init is
 /// once-per-process, the Success/Internal result reflects the **first**
 /// call's outcome, NOT a later call's `level`/`file_path` (which have no
 /// effect). A caller that can't see stderr can use `Internal` to surface
@@ -828,15 +831,33 @@ pub unsafe extern "C" fn kernel_init_logging(
         Ok(f) => f.map(std::path::PathBuf::from),
         Err(e) => return crate::c_abi::error::store_and_code(e),
     };
-    if crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
-        KernelStatusCode::Success
-    } else {
-        crate::c_abi::error::store_and_code(Error::new(
+    match crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            file_honored: true,
+        } => KernelStatusCode::Success,
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            file_honored: false,
+        } => crate::c_abi::error::store_and_code(Error::new(
             crate::kernel_error::ErrorCode::Internal,
-            "kernel_init_logging: logging was not fully initialized as requested (the log file \
-             could not be opened, or a global subscriber was already installed); kernel logs may \
-             go to stderr or not flow",
-        ))
+            "kernel_init_logging: the requested log file could not be opened; kernel logs fell \
+             back to stderr",
+        )),
+        LoggingOutcome::Installed {
+            sink: LoggingSink::Callback { .. },
+            ..
+        } => crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel_init_logging: a callback log sink was already installed by an earlier \
+             kernel_init_logging_callback; this file/stderr request had no effect (first \
+             initializer wins)",
+        )),
+        LoggingOutcome::Foreign => crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel_init_logging: a global tracing subscriber was already installed by another \
+             component; no kernel subscriber was installed and kernel logs will not flow",
+        )),
     }
 }
 
@@ -858,9 +879,15 @@ pub unsafe extern "C" fn kernel_init_logging(
 /// C ABI, or emit another kernel tracing event. `user_data` is passed through
 /// unchanged and must remain valid for the process lifetime.
 ///
-/// Returns `InvalidArgument` when `callback` is NULL. Returns `Internal` when
-/// the first subscriber install fails because another subscriber already owns
-/// the process-global tracing slot.
+/// Returns `InvalidArgument` when `callback` is NULL. Returns `Internal`
+/// (with a stored last-error) when the callback was not installed: a
+/// file/stderr sink from an earlier `kernel_init_logging` already won, a
+/// *different* callback from an earlier `kernel_init_logging_callback` already
+/// won, or another component owns the process-global tracing slot (in every
+/// case this callback receives no records). Because init is once-per-process,
+/// this reflects the **first** initializer's outcome, so `Success` here means
+/// *this exact* callback + `user_data` is the installed sink — a later call
+/// with the identical callback and `user_data` also succeeds (it is that sink).
 ///
 /// # Safety
 /// `level`, if non-null, must be a NUL-terminated C string. `callback` and
@@ -883,13 +910,39 @@ pub unsafe extern "C" fn kernel_init_logging_callback(
         LogLevelResolution::Filter(filter) => filter,
     };
 
-    if crate::logging::init_callback_logging(filter, callback, user_data) {
-        KernelStatusCode::Success
-    } else {
-        crate::c_abi::error::store_and_code(Error::internal().message(
-            "kernel_init_logging_callback: logging was not initialized because a global \
-             subscriber was already installed",
-        ))
+    match crate::logging::init_callback_logging(filter, callback, user_data) {
+        // Success only when the installed callback sink is *this* exact
+        // registration (same function pointer + user_data). A later, different
+        // callback loses to the first-call-wins install and must not be told it
+        // is live — otherwise a host believes a callback that will never fire.
+        LoggingOutcome::Installed {
+            sink:
+                LoggingSink::Callback {
+                    callback: won,
+                    user_data: won_ud,
+                },
+            ..
+        } if won == callback as usize && won_ud == user_data as usize => KernelStatusCode::Success,
+        LoggingOutcome::Installed {
+            sink: LoggingSink::Callback { .. },
+            ..
+        } => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a different callback sink was already installed by an \
+             earlier kernel_init_logging_callback; this callback was NOT installed and will \
+             receive no records (first initializer wins)",
+        )),
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            ..
+        } => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a file/stderr log sink was already installed by an \
+             earlier kernel_init_logging; the callback was NOT installed and will receive no \
+             records (first initializer wins)",
+        )),
+        LoggingOutcome::Foreign => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a global tracing subscriber was already installed by \
+             another component; the callback was NOT installed and will receive no records",
+        )),
     }
 }
 
