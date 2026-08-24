@@ -12,6 +12,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- C ABI: expose the kernel's existing mTLS client identity configuration
+  through `kernel_session_config_set_tls_client_certificate()`. The client
+  certificate and private key are supplied atomically and must both be
+  non-empty.
+
 ### Changed
 
 ### Updated
