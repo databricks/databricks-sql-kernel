@@ -204,7 +204,7 @@ fn type_info_rows() -> [TypeInfoRow; 20] {
             data_type: JDBC_CHAR,
             precision: None,
             numeric: false,
-            case_sensitive: false,
+            case_sensitive: true,
             searchable: TYPE_SEARCHABLE,
         },
         R {
@@ -212,7 +212,7 @@ fn type_info_rows() -> [TypeInfoRow; 20] {
             data_type: JDBC_VARCHAR,
             precision: None,
             numeric: false,
-            case_sensitive: false,
+            case_sensitive: true,
             searchable: TYPE_SEARCHABLE,
         },
         R {
@@ -522,9 +522,17 @@ mod tests {
         for i in 0..batch.num_rows() {
             let numeric = (4..=10).contains(&i);
             let complex = (13..=15).contains(&i);
+            // Character types are case-sensitive, matching HiveServer2's
+            // `Type.isCaseSensitive()`: STRING (row 2), CHAR (row 16),
+            // VARCHAR (row 17).
+            let case_sensitive_type = i == 2 || i == 16 || i == 17;
 
             assert_eq!(nullable.value(i), 1, "NULLABLE row {i}");
-            assert_eq!(case_sensitive.value(i), i == 2, "CASE_SENSITIVE row {i}");
+            assert_eq!(
+                case_sensitive.value(i),
+                case_sensitive_type,
+                "CASE_SENSITIVE row {i}"
+            );
             assert_eq!(
                 searchable.value(i),
                 if complex { 0 } else { 3 },
