@@ -329,12 +329,6 @@ mod tests {
     /// self-consistency of that derivation — it does NOT prove parity with a
     /// live Thrift `getTypeInfo` response (both sides share the same
     /// derivation, so a wrong-but-consistent cell would pass here).
-    ///
-    /// Real parity against an actual Thrift `getTypeInfo` response is enforced
-    /// out-of-band by the comparator suite in databricks-driver-test
-    /// (https://github.com/databricks/databricks-driver-test/pull/1399), which
-    /// diffs this driver's output against a reference Thrift result. Keep the
-    /// authoritative "matches Thrift" assertion there.
     #[tokio::test]
     async fn type_info_reader_matches_derived_static_shape() {
         let mut reader = type_info_reader();
