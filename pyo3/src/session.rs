@@ -238,7 +238,7 @@ impl Session {
     /// mutual TLS. The two mTLS fields must be set together.
     ///
     /// Retry/backoff: all optional, default to the kernel's built-in
-    /// policy (1s/60s backoff, 9 total attempts, 900s budget) when
+    /// policy (1s/60s backoff, 6 total attempts, 900s budget) when
     /// unset. `retry_min_wait_secs` / `retry_max_wait_secs` bound the
     /// exponential backoff (and clamp a server `Retry-After`);
     /// `retry_max_attempts` is the **total** number of attempts

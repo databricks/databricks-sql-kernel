@@ -54,7 +54,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::client::retry::DEFAULT_MAX_RETRIES;
 use crate::telemetry::DriverSystemConfiguration;
 
 // ─── Connection identity ────────────────────────────────────────────────────
@@ -773,7 +772,7 @@ pub struct HttpConfig {
 
     /// Maximum number of retries **after** the initial attempt — a
     /// request is attempted at most `retry_max_retries + 1` times.
-    /// Default 8 (→ 9 total attempts).
+    /// Default 5 (→ 6 total attempts).
     ///
     /// Wrappers exposing a "total attempts" knob (the connector's
     /// `_retry_stop_after_attempts_count`, the JDBC driver, …) should
@@ -827,11 +826,12 @@ impl Default for HttpConfig {
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
-            // Mirror `RetryConfig::default()` so stock public and low-level
-            // HTTP clients use the same retry policy.
+            // Mirror `RetryConfig::default()` so a stock `HttpConfig`
+            // produces the same retry behaviour the kernel shipped
+            // before these knobs were configurable.
             retry_min_wait: Duration::from_secs(1),
             retry_max_wait: Duration::from_secs(60),
-            retry_max_retries: DEFAULT_MAX_RETRIES,
+            retry_max_retries: 5,
             custom_headers: Vec::new(),
         }
     }

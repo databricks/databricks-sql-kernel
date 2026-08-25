@@ -26,12 +26,6 @@ use reqwest::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
-/// Default retry count after the initial attempt.
-///
-/// Nine total attempts gives short transport outages more time to recover
-/// while the overall timeout continues to bound retry scheduling.
-pub(crate) const DEFAULT_MAX_RETRIES: u32 = 8;
-
 /// Identifies the type of request being made.
 ///
 /// The HTTP client uses this to look up the correct `RetryConfig` (from category)
@@ -136,7 +130,7 @@ impl Default for RetryConfig {
             min_wait: Duration::from_secs(1),
             max_wait: Duration::from_secs(60),
             overall_timeout: Duration::from_secs(900),
-            max_retries: DEFAULT_MAX_RETRIES,
+            max_retries: 5,
             override_retryable_codes: None,
         }
     }
@@ -802,7 +796,7 @@ mod tests {
         assert_eq!(config.min_wait, Duration::from_secs(1));
         assert_eq!(config.max_wait, Duration::from_secs(60));
         assert_eq!(config.overall_timeout, Duration::from_secs(900));
-        assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(config.max_retries, 5);
         assert!(config.override_retryable_codes.is_none());
     }
 
@@ -831,7 +825,7 @@ mod tests {
 
         // SEA should have global defaults
         let sea = &configs[&RequestCategory::Sea];
-        assert_eq!(sea.max_retries, DEFAULT_MAX_RETRIES);
+        assert_eq!(sea.max_retries, 5);
         assert_eq!(sea.overall_timeout, Duration::from_secs(900));
     }
 

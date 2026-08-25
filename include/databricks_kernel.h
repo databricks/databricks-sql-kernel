@@ -440,7 +440,7 @@ KernelStatusCode kernel_session_config_set_tls_client_certificate(
  * retry budget across all attempts (`0` keeps the kernel default — pass
  * non-zero to override it). Lets a host's RetryWaitMin / RetryWaitMax /
  * RetryMax / retry-timeout surface override the kernel's built-in policy
- * (default 8 retries, 1s..60s, 900s budget) when this setter is not called.
+ * (default 5 retries, 1s..60s, 900s budget) when this setter is not called.
  *
  * The retry budget is ALWAYS bounded — there is no "unlimited" value. A large
  * `max_retries` is still capped by the (default or overridden) budget: if the

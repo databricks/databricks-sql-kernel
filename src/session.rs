@@ -993,9 +993,9 @@ fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
 /// The `CloudFetch` category is capped to **no HTTP-level retries** for
 /// the same reason: chunk downloads already sit inside the CloudFetch
 /// provider's own retry loop (`CloudFetchConfig::max_retries`, default 5).
-/// If the inner HTTP client also inherited the global budget (default 8
+/// If the inner HTTP client also inherited the global budget (default 5
 /// retries / 900s `overall_timeout`) the two budgets would **multiply** —
-/// a permanently-failing chunk gets attempted ~45 times with escalating
+/// a permanently-failing chunk gets attempted ~30 times with escalating
 /// backoff and blocks the consumer well past three minutes instead of
 /// surfacing a bounded terminal error (databricks-odbc#144 / #226: the
 /// `SQLFetch` drain hung 186s, over the 180s conformance bound). Making
@@ -1567,12 +1567,12 @@ mod retry_config_tests {
     }
 
     #[test]
-    fn defaults_match_public_retry_policy() {
+    fn defaults_preserve_legacy_behaviour() {
         let configs = build_retry_configs_for_session(&config_with_http(HttpConfig::default()));
         let sea = &configs[&RequestCategory::Sea];
         assert_eq!(sea.min_wait, Duration::from_secs(1));
         assert_eq!(sea.max_wait, Duration::from_secs(60));
-        assert_eq!(sea.max_retries, crate::client::retry::DEFAULT_MAX_RETRIES);
+        assert_eq!(sea.max_retries, 5);
         assert_eq!(sea.overall_timeout, Duration::from_secs(900));
     }
 
