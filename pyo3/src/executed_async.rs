@@ -51,6 +51,20 @@ impl ExecutedAsyncStatement {
     }
 }
 
+impl Drop for ExecutedAsyncStatement {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            drop_async_inner_on_runtime(inner);
+        }
+    }
+}
+
+fn drop_async_inner_on_runtime(inner: ExecutedAsyncInner) {
+    let runtime = inner.runtime.clone();
+    let _guard = runtime.enter();
+    drop(inner);
+}
+
 #[pymethods]
 impl ExecutedAsyncStatement {
     #[getter]
@@ -129,13 +143,19 @@ impl ExecutedAsyncStatement {
 
     /// Close the statement (server-side `CloseStatement`). Idempotent.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let Some(inner) = self.inner.as_mut() else {
+        let Some(inner) = self.inner.take() else {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, inner.exec.close());
-        self.inner = None;
-        res.map(|_| ())
+        // Drop the kernel handle inside the session runtime regardless
+        // of close() outcome. Its Drop finalizes statement telemetry and
+        // can trigger batch-size flush scheduling.
+        run_kernel!(py, runtime, async move {
+            let res = inner.exec.close().await;
+            drop(inner);
+            res
+        })
+        .map(|_| ())
     }
 
     fn __repr__(&self) -> String {

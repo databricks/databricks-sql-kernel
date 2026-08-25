@@ -318,6 +318,20 @@ impl ExecutedStatement {
     }
 }
 
+impl Drop for ExecutedStatement {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            drop_executed_inner_on_runtime(inner);
+        }
+    }
+}
+
+fn drop_executed_inner_on_runtime(inner: ExecutedInner) {
+    let runtime = inner.runtime.clone();
+    let _guard = runtime.enter();
+    drop(inner);
+}
+
 #[pymethods]
 impl ExecutedStatement {
     #[getter]
@@ -392,16 +406,19 @@ impl ExecutedStatement {
     /// Close the statement (server-side `CloseStatement`). Idempotent.
     /// Subsequent calls on this handle raise `KernelError`.
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
-        let Some(inner) = self.inner.as_mut() else {
+        let Some(inner) = self.inner.take() else {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, inner.exec.close());
-        // Drop the kernel handle regardless of close() outcome — the
-        // kernel's Drop impl runs fire-and-forget cleanup if close()
-        // failed mid-flight.
-        self.inner = None;
-        res.map(|_| ())
+        // Drop the kernel handle inside the session runtime regardless
+        // of close() outcome. Its telemetry finalizers can enqueue and
+        // trigger background Tokio tasks when batch-size flush is hit.
+        run_kernel!(py, runtime, async move {
+            let res = inner.exec.close().await;
+            drop(inner);
+            res
+        })
+        .map(|_| ())
     }
 
     fn __repr__(&self) -> String {

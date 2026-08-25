@@ -62,6 +62,24 @@ impl ResultStream {
     }
 }
 
+impl Drop for ResultStream {
+    fn drop(&mut self) {
+        if let Some(inner) = self.inner.take() {
+            close_inner_on_runtime(inner);
+        }
+    }
+}
+
+fn close_inner_on_runtime(inner: ResultStreamInner) {
+    let ResultStreamInner {
+        stream,
+        runtime,
+        exhausted: _,
+    } = inner;
+    let _guard = runtime.enter();
+    stream.close();
+}
+
 #[pymethods]
 impl ResultStream {
     /// Result schema as a `pyarrow.Schema`. Available even after `close()`.
@@ -100,11 +118,11 @@ impl ResultStream {
     /// on this handle raise `KernelError`.
     fn close(&mut self) {
         if let Some(inner) = self.inner.take() {
-            // ResultStream::close() is sync (no server RPC) and
-            // consumes self; the kernel's Drop performs the same
-            // cleanup, but the explicit call is cheaper to reason
-            // about.
-            inner.stream.close();
+            // ResultStream::close() is sync (no server RPC), but its
+            // telemetry finalizers may enqueue and trigger background
+            // Tokio tasks. Enter the session runtime so Python teardown
+            // paths outside run_kernel! cannot panic on tokio::spawn.
+            close_inner_on_runtime(inner);
         }
     }
 
