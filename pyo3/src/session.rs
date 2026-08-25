@@ -289,6 +289,8 @@ impl Session {
         azure_client_secret=None,
         azure_tenant_id=None,
         azure_workspace_resource_id=None,
+        token_cache_enabled=None,
+        token_cache_passphrase=None,
         tls_ca_cert=None,
         tls_skip_verify=false,
         tls_skip_hostname_verify=false,
@@ -346,6 +348,10 @@ impl Session {
         azure_client_secret: Option<String>,
         azure_tenant_id: Option<String>,
         azure_workspace_resource_id: Option<String>,
+        // U2M on-disk token-cache control (kernel path); overrides the kernel
+        // default (enabled). `False` disables on-disk persistence.
+        token_cache_enabled: Option<bool>,
+        token_cache_passphrase: Option<String>,
         tls_ca_cert: Option<Vec<u8>>,
         tls_skip_verify: bool,
         tls_skip_hostname_verify: bool,
@@ -420,6 +426,8 @@ impl Session {
             azure_client_secret,
             azure_tenant_id,
             azure_workspace_resource_id,
+            token_cache_enabled,
+            token_cache_passphrase,
         };
         let auth_config = build_auth_config(&resolved_auth_type, access_token, oauth)?;
 

@@ -43,7 +43,7 @@
 
 use std::time::Duration;
 
-use databricks_sql_kernel::AuthConfig;
+use databricks_sql_kernel::{AuthConfig, TokenCacheConfig};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 
@@ -83,6 +83,14 @@ pub(crate) struct OAuthParams {
     pub azure_client_secret: Option<String>,
     pub azure_tenant_id: Option<String>,
     pub azure_workspace_resource_id: Option<String>,
+    /// U2M on-disk token-cache control. `None` ⇒ kernel default (enabled,
+    /// machine-local key). `Some(false)` disables on-disk persistence;
+    /// `Some(true)` keeps it. A passphrase with no explicit flag implies
+    /// enabled.
+    pub token_cache_enabled: Option<bool>,
+    /// Optional passphrase for the U2M on-disk token cache (AES-256 key).
+    /// `None`/blank ⇒ a machine-local derived key.
+    pub token_cache_passphrase: Option<String>,
 }
 
 /// Default U2M OAuth client id for the **Python** binding.
@@ -321,14 +329,18 @@ fn build_auth_config_inner(
                 scopes,
                 oauth.token_url,
                 oauth.callback_timeout_secs.map(Duration::from_secs),
-                // `None` takes the kernel default: on-disk cache ENABLED,
-                // encrypted under a machine-local derived key since this
-                // binding exposes no passphrase option. That preserves
-                // cross-connection SSO reuse (the point of the cache) without
-                // ever writing the refresh token in the clear. Surfacing a
-                // passphrase through `OAuthParams` — the equivalent of JDBC's
-                // TokenCachePassPhrase — would strengthen it further.
-                None,
+                // U2M on-disk token-cache control. Both omitted ⇒ kernel
+                // default (enabled, machine-local derived key — preserves
+                // cross-restart SSO reuse without writing the token in the
+                // clear). Otherwise honor the caller's enable flag /
+                // passphrase; a passphrase alone implies enabled.
+                match (oauth.token_cache_enabled, oauth.token_cache_passphrase) {
+                    (None, None) => None,
+                    (enabled, passphrase) => Some(TokenCacheConfig {
+                        enabled: enabled.unwrap_or(true),
+                        passphrase,
+                    }),
+                },
                 oauth.identity_federation_client_id,
             ))
         }
@@ -620,6 +632,55 @@ mod tests {
                 assert_eq!(redirect_ports, Some(vec![8020, 8021, 8022, 8023, 8024]));
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_token_cache_control_maps_to_config() {
+        // Neither field set → None → the kernel default (enabled, machine key).
+        match build_auth_config_inner("oauth-u2m", None, OAuthParams::default()).unwrap() {
+            AuthConfig::OAuthU2M { token_cache, .. } => assert!(token_cache.is_none()),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+        // Explicit disable → Some(TokenCacheConfig { enabled: false }).
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                token_cache_enabled: Some(false),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(!tc.enabled);
+                assert!(tc.passphrase.is_none());
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
+        }
+        // Passphrase with no explicit flag implies enabled.
+        let cfg = build_auth_config_inner(
+            "oauth-u2m",
+            None,
+            OAuthParams {
+                token_cache_passphrase: Some("s3cret".to_string()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        match cfg {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(tc.enabled);
+                assert_eq!(tc.passphrase.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
         }
     }
 

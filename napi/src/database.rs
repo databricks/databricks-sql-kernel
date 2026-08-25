@@ -35,7 +35,7 @@ type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
     AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError, HttpConfig,
-    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig,
+    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig, TokenCacheConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -177,6 +177,16 @@ pub struct ConnectionOptions {
     /// which is required when that IdP — not Databricks-native OIDC — is the
     /// authority for [`AuthMode::OAuthM2m`] / [`AuthMode::OAuthM2mJwt`].
     pub token_url: Option<String>,
+    /// U2M on-disk token-cache control (kernel path). Omitted ⇒ the kernel
+    /// default (cache enabled, encrypted under a machine-local key, survives
+    /// restarts). `false` disables on-disk persistence (re-login each fresh
+    /// process); `true` keeps it enabled. Applies to [`AuthMode::OAuthU2m`].
+    pub token_cache_enabled: Option<bool>,
+    /// Optional passphrase for the U2M on-disk token cache (AES-256 key).
+    /// Omitted/blank ⇒ a machine-local derived key. Supplying one is stronger.
+    /// A passphrase with no explicit `tokenCacheEnabled` implies enabled.
+    /// Applies to [`AuthMode::OAuthU2m`].
+    pub token_cache_passphrase: Option<String>,
     /// Path to the PEM private-key file. Required for
     /// [`AuthMode::OAuthM2mJwt`].
     pub jwt_key_file: Option<String>,
@@ -498,11 +508,17 @@ fn build_auth_config(options: &ConnectionOptions) -> napi::Result<AuthConfig> {
                 options.oauth_scopes.clone(),
                 options.token_url.clone(),
                 None,
-                // `None` takes the kernel default: on-disk cache enabled,
-                // encrypted under a machine-local derived key since this
-                // binding exposes no passphrase option. Surfacing one through
-                // `options` would strengthen it further.
-                None,
+                // U2M on-disk token-cache control. Both omitted ⇒ kernel
+                // default (enabled, machine-local key). Otherwise honor the
+                // caller's enable flag / passphrase; a passphrase alone
+                // implies enabled.
+                match (options.token_cache_enabled, &options.token_cache_passphrase) {
+                    (None, None) => None,
+                    (enabled, passphrase) => Some(TokenCacheConfig {
+                        enabled: enabled.unwrap_or(true),
+                        passphrase: passphrase.clone(),
+                    }),
+                },
                 options.identity_federation_client_id.clone(),
             ))
         }
@@ -834,6 +850,8 @@ mod tests {
             oauth_redirect_port: None,
             oauth_scopes: None,
             token_url: None,
+            token_cache_enabled: None,
+            token_cache_passphrase: None,
             jwt_key_file: None,
             jwt_kid: None,
             jwt_passphrase: None,
@@ -1178,6 +1196,45 @@ mod tests {
                 );
             }
             other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn u2m_token_cache_control_maps_to_config() {
+        let mut o = base();
+        o.auth_mode = Some(AuthMode::OAuthU2m);
+
+        // Neither field set → None → the kernel default (enabled, machine key).
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M { token_cache, .. } => assert!(token_cache.is_none()),
+            other => panic!("expected OAuthU2M, got {other:?}"),
+        }
+
+        // Explicit disable → Some(TokenCacheConfig { enabled: false }).
+        o.token_cache_enabled = Some(false);
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(!tc.enabled);
+                assert!(tc.passphrase.is_none());
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
+        }
+
+        // Passphrase with no explicit enable flag implies enabled.
+        o.token_cache_enabled = None;
+        o.token_cache_passphrase = Some("s3cret".to_owned());
+        match build_auth_config(&o).unwrap() {
+            AuthConfig::OAuthU2M {
+                token_cache: Some(tc),
+                ..
+            } => {
+                assert!(tc.enabled);
+                assert_eq!(tc.passphrase.as_deref(), Some("s3cret"));
+            }
+            other => panic!("expected OAuthU2M with token_cache, got {other:?}"),
         }
     }
 
