@@ -716,6 +716,11 @@ impl Metadata {
                     .map_err(|e| Error::data_loss().message(format!("merge tables: {e}")))?;
             Some(thrift_shape::sort_tables_batch(&concatenated)?)
         };
+        // The fan-out performs real per-catalog server statements, but the
+        // caller receives one merged in-memory result and there is no single
+        // statement id to attribute. Record that aggregate as one synthetic
+        // inline LIST_TABLES event; the internal catalog enumeration uses
+        // noop telemetry to avoid double-counting a LIST_CATALOGS operation.
         Self::observe_inline_result(telemetry);
         ResultStream::from_reader(Box::new(InMemoryReader::new(
             GET_TABLES_SCHEMA.clone(),
