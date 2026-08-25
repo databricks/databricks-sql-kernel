@@ -102,6 +102,12 @@ author, follow-up, and review runs.
 - **Context:** PR #278's `kernel_init_logging_callback` documents "Success means this exact callback is the installed sink," but the `OFF` level short-circuits and returns `Success` without installing any sink or consuming the once-only init slot — contradicting the stated invariant, which the file/stderr sibling had guarded with an explicit "(or skipped for level OFF)" clause.
   **Rule:** For process-wide first-call-wins init C-ABI functions where a `Success` code can mean either "installed against your request" OR "intentionally skipped/no-op" (e.g. level OFF), the return-value contract MUST spell out the skip case in every entry point, or a host believes a sink is live when nothing was installed.
 
+### 2026-08-25: learnings since 2026-08-24T07:40:03Z
+- **Context:** PR #289 added `kernel_session_config_set_tls_client_certificate()` to the C ABI, taking the mTLS client cert and private key through a single setter (both required, both copied before return, either null/empty → InvalidArgument) rather than two independent setters.
+  **Rule:** For C-ABI config values that are only valid together (cert+key, id+secret, endpoint+scope pairs), expose them through one atomic setter so a partially-configured state is unrepresentable at the FFI boundary; validate all parts non-null/non-empty before mutating the config.
+- **Context:** PR #289 verified the full C-ABI mTLS path without a live workspace or committed credentials: a hermetic E2E test generates a CA + server + client identities at runtime (rcgen/rustls), and a unit test passes PEM with valid framing but invalid contents so client construction fails at the parser — proving both values traversed C ABI setter → TlsConfig → reqwest without any network I/O.
+  **Rule:** Test TLS/credential-forwarding paths hermetically — generate CA/identities at runtime instead of committing keys, and prove config reached the client by feeding framing-valid/content-invalid PEM so the failure lands in the parser (before network I/O), asserting on that specific error rather than requiring a live endpoint.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
