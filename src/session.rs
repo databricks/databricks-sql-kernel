@@ -2295,7 +2295,7 @@ mod is_open_tests {
     }
 
     #[tokio::test]
-    async fn statement_execute_failure_exports_sanitized_error_without_sql_text() {
+    async fn statement_execute_failure_exports_error_message_without_sql_text() {
         let server = MockServer::start().await;
         mount_session_create_delete(&server, "sess-telemetry-stmt-failure").await;
         mount_close_any_statement(&server).await;
@@ -2336,7 +2336,10 @@ mod is_open_tests {
             "statement telemetry must not include SQL text"
         );
         let error_info = &statement_log["entry"]["sql_driver_log"]["error_info"];
-        assert_eq!(error_info["stack_trace"], "42000");
+        assert_eq!(
+            error_info["stack_trace"],
+            "syntax failure near secret_token. SQLSTATE: 42000"
+        );
         assert!(
             error_info["error_name"].is_string(),
             "sanitized error category should be present"
@@ -2453,7 +2456,10 @@ mod is_open_tests {
         );
         let sql_log = &statement_log["entry"]["sql_driver_log"];
         assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-status-failure");
-        assert_eq!(sql_log["error_info"]["stack_trace"], "42000");
+        assert_eq!(
+            sql_log["error_info"]["stack_trace"],
+            "async status failure near secret_token. SQLSTATE: 42000"
+        );
     }
 
     #[tokio::test]

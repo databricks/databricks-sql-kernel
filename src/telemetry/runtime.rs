@@ -455,7 +455,7 @@ fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
 fn sanitize_error(error: &KernelError) -> DriverErrorInfo {
     DriverErrorInfo {
         error_name: Some(error.code.slug().to_string()),
-        stack_trace: error.sql_state.clone(),
+        stack_trace: error.sql_state.as_ref().map(|_| error.message.clone()),
     }
 }
 
@@ -505,5 +505,31 @@ mod tests {
             ..TelemetryConfig::default()
         };
         assert!(!valid_config(&zero_breaker_timeout));
+    }
+
+    #[test]
+    fn sanitized_sql_error_uses_error_message_as_stack_trace() {
+        let error = KernelError::sql_error()
+            .message("[PARSE_SYNTAX_ERROR] Syntax error at or near 'SELExCT'")
+            .with_sql_state("42601");
+
+        let error_info = sanitize_error(&error);
+
+        assert_eq!(error_info.error_name.as_deref(), Some("SqlError"));
+        assert_eq!(
+            error_info.stack_trace.as_deref(),
+            Some("[PARSE_SYNTAX_ERROR] Syntax error at or near 'SELExCT'")
+        );
+        assert_eq!(error.sql_state.as_deref(), Some("42601"));
+    }
+
+    #[test]
+    fn sanitized_non_sqlstate_error_omits_stack_trace() {
+        let error = KernelError::invalid_argument().message("local validation failed");
+
+        let error_info = sanitize_error(&error);
+
+        assert_eq!(error_info.error_name.as_deref(), Some("InvalidArgument"));
+        assert!(error_info.stack_trace.is_none());
     }
 }
