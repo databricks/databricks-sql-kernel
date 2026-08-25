@@ -685,14 +685,15 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
     if matches!(options.telemetry_circuit_breaker_threshold, Some(0))
         && options.telemetry_circuit_breaker_enabled.unwrap_or(true)
     {
-        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
-            "telemetryCircuitBreakerThreshold must be > 0 when enabled",
-        )));
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument()
+                .message("telemetryCircuitBreakerThreshold must be > 0 when enabled"),
+        ));
     }
     if matches!(options.telemetry_circuit_breaker_timeout_ms, Some(0)) {
-        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
-            "telemetryCircuitBreakerTimeoutMs must be > 0",
-        )));
+        return Err(napi_err_from_kernel(
+            KernelError::invalid_argument().message("telemetryCircuitBreakerTimeoutMs must be > 0"),
+        ));
     }
 
     let mut telemetry = TelemetryConfig::default();
