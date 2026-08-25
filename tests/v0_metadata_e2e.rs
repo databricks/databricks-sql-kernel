@@ -29,7 +29,7 @@
 //!    columns (the kernel does not rename).
 //! 3. Where applicable, the result has at least one row.
 //!
-//! Static methods (`type_info`, `table_types`) assert the JDBC-shape
+//! Static methods (`type_info`, `table_types`) assert the metadata shapes
 //! the kernel synthesises locally.
 
 use arrow_array::cast::AsArray;
@@ -624,19 +624,38 @@ async fn procedure_columns_returns_jdbc_columns() {
 
 #[tokio::test]
 #[ignore]
-async fn type_info_returns_static_jdbc_shape() {
+async fn type_info_returns_static_thrift_shape() {
     let session = live_session().await;
     let stream = session.metadata().type_info().await.expect("type_info");
 
-    // type_info is synthesised — kernel returns the JDBC shape since
-    // there's no server-native shape to mirror.
+    // type_info is synthesised to mirror the established Thrift response.
     let names = col_names(&stream.schema());
-    assert_eq!(names[0], "TYPE_NAME");
-    assert_eq!(names[1], "DATA_TYPE");
-    assert_eq!(stream.schema().fields().len(), 19);
+    assert_eq!(
+        names,
+        vec![
+            "TYPE_NAME",
+            "DATA_TYPE",
+            "PRECISION",
+            "LITERAL_PREFIX",
+            "LITERAL_SUFFIX",
+            "CREATE_PARAMS",
+            "NULLABLE",
+            "CASE_SENSITIVE",
+            "SEARCHABLE",
+            "UNSIGNED_ATTRIBUTE",
+            "FIXED_PREC_SCALE",
+            "AUTO_INCREMENT",
+            "LOCAL_TYPE_NAME",
+            "MINIMUM_SCALE",
+            "MAXIMUM_SCALE",
+            "SQL_DATA_TYPE",
+            "SQL_DATETIME_SUB",
+            "NUM_PREC_RADIX",
+        ]
+    );
 
     let (_, rows) = collect(stream).await;
-    assert!(rows >= 19, "type_info should have ≥19 rows, got {rows}");
+    assert_eq!(rows, 20);
 
     session.close().await.expect("close");
 }

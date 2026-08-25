@@ -17,11 +17,19 @@ changes go in their respective binding's NEXT_CHANGELOG.
   certificate and private key are supplied atomically and must both be
   non-empty.
 
+- C ABI: `kernel_session_config_set_request_timeout()` configures the total
+  timeout for one HTTP request in milliseconds; `0` keeps the kernel's
+  120-second default. This enables Go and other C-ABI consumers to expose
+  request-timeout configuration.
+
 ### Changed
 
 ### Updated
 
 ### Fixed
+
+- Metadata: `Metadata::type_info()` now matches the established Thrift
+  `getTypeInfo` result shape and current 20-row type catalogue.
 
 ---
 *Note: When making changes, please add your change under the appropriate
