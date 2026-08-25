@@ -187,6 +187,11 @@ static void test_proxy_and_tls_setters(void) {
   CHECK(rc == KernelStatusCode_InvalidArgument,
         "set_tls_client_certificate(NULL key) → InvalidArgument");
 
+  rc = kernel_session_config_set_request_timeout(config, 45000);
+  CHECK(rc == KernelStatusCode_Success, "set_request_timeout (45s) succeeds");
+  rc = kernel_session_config_set_request_timeout(config, 0);
+  CHECK(rc == KernelStatusCode_Success, "set_request_timeout (default) succeeds");
+
   /* Retry config: a valid range (incl. max_retries=0 to disable, overall
    * timeout 0 = keep default) succeeds; a non-zero overall timeout also
    * succeeds; a zero min_wait is rejected; an inverted range (max<min) is a

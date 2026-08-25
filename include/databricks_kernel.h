@@ -336,6 +336,13 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
                                                          const char* name, const char* value);
 
+/* Configure the total timeout for one HTTP request, from connection start
+ * through response-body completion. A separate 30s connection timeout also
+ * applies, so connection establishment is bounded by the shorter limit.
+ * `request_timeout_ms == 0` keeps the kernel default (120s). */
+KernelStatusCode kernel_session_config_set_request_timeout(KernelSessionConfig* config,
+                                                           uint64_t request_timeout_ms);
+
 /* Initialize kernel logging, process-wide and ONCE (first non-OFF call wins;
  * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
  * (NULL → RUST_LOG, default warn); `file_path` NULL → stderr. Not tied to
