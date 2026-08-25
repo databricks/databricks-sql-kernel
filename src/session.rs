@@ -2337,6 +2337,10 @@ mod is_open_tests {
         );
         let error_info = &statement_log["entry"]["sql_driver_log"]["error_info"];
         assert_eq!(
+            statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-failure"
+        );
+        assert_eq!(
             error_info["stack_trace"],
             "syntax failure near secret_token. SQLSTATE: 42000"
         );

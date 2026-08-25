@@ -222,7 +222,7 @@ impl StatementOperationObserver for TelemetryObserver {
             return;
         }
 
-        let Some((context, elapsed)) = self
+        let Some((mut context, elapsed)) = self
             .state
             .lock()
             .ok()
@@ -230,6 +230,10 @@ impl StatementOperationObserver for TelemetryObserver {
         else {
             return;
         };
+
+        if context.statement_id.is_none() {
+            context.statement_id = error.and_then(|error| error.query_id.clone());
+        }
 
         self.connection
             .emit_statement_operation(context, elapsed, error);
