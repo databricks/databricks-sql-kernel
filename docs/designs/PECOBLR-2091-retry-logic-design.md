@@ -355,7 +355,7 @@ pub struct RetryConfig {
     /// max_retries has not been reached.
     pub overall_timeout: Duration,
 
-    /// Maximum number of retry attempts (default: 5).
+    /// Maximum number of retry attempts (default: 8).
     /// A request is attempted at most max_retries + 1 times.
     pub max_retries: u32,
 
@@ -374,7 +374,7 @@ pub struct RetryConfig {
 | `min_wait` | 1s | 1s |
 | `max_wait` | 60s | 60s |
 | `overall_timeout` | 900s | 900s |
-| `max_retries` | 5 | — |
+| `max_retries` | 8 | — |
 
 ### Per-Category Configuration with Global Defaults
 
@@ -386,7 +386,7 @@ classDiagram
         +min_wait: 1s
         +max_wait: 60s
         +overall_timeout: 900s
-        +max_retries: 5
+        +max_retries: 8
     }
 
     class SeaRetryConfig {
@@ -425,7 +425,7 @@ classDiagram
 | `databricks.retry.min_wait_ms` | Global | 1000 |
 | `databricks.retry.max_wait_ms` | Global | 60000 |
 | `databricks.retry.overall_timeout_ms` | Global | 900000 |
-| `databricks.retry.max_retries` | Global | 5 |
+| `databricks.retry.max_retries` | Global | 8 |
 | `databricks.retry.retryable_codes` | Global | (strategy default) |
 | `databricks.retry.sea.min_wait_ms` | SEA | (global) |
 | `databricks.retry.sea.max_wait_ms` | SEA | (global) |

@@ -1668,13 +1668,14 @@ lGrv15pBcePj
         };
         use std::collections::HashSet;
         use std::sync::atomic::{AtomicU32, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::{TcpListener, TcpStream};
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        /// Build a client pointed at the mock server with short retry waits for fast tests.
-        fn test_client(
-            mock_server: &MockServer,
+        fn test_client_with_http_config(
             retry_config: RetryConfig,
+            http_config: HttpClientConfig,
         ) -> DatabricksHttpClient {
             let mut overrides = HashMap::new();
             let ovr = RetryConfigOverrides {
@@ -1691,15 +1692,20 @@ lGrv15pBcePj
 
             let global = RetryConfig::default();
             let retry_configs = build_retry_configs(&global, &overrides);
-
-            let config = HttpClientConfig::default();
-            let client = DatabricksHttpClient::new(config, retry_configs).unwrap();
+            let client = DatabricksHttpClient::new(http_config, retry_configs).unwrap();
             let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
             client.set_auth_provider(auth);
+            client
+        }
 
+        /// Build a client pointed at the mock server with short retry waits for fast tests.
+        fn test_client(
+            mock_server: &MockServer,
+            retry_config: RetryConfig,
+        ) -> DatabricksHttpClient {
             // Override the client's base URL by using the mock_server URI directly in requests
             let _ = mock_server; // used by caller to build request URLs
-            client
+            test_client_with_http_config(retry_config, HttpClientConfig::default())
         }
 
         /// Short retry config for fast tests (10ms waits instead of 1s).
@@ -1711,6 +1717,136 @@ lGrv15pBcePj
                 max_retries,
                 override_retryable_codes: None,
             }
+        }
+
+        async fn read_request_head(stream: &mut TcpStream) {
+            let mut received = Vec::new();
+            let mut buffer = [0_u8; 1024];
+            loop {
+                let read = stream.read(&mut buffer).await.unwrap();
+                if read == 0 {
+                    return;
+                }
+                received.extend_from_slice(&buffer[..read]);
+                if received.windows(4).any(|window| window == b"\r\n\r\n") {
+                    return;
+                }
+            }
+        }
+
+        async fn write_ok_response(stream: &mut TcpStream) {
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok")
+                .await
+                .unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_connection_refused_retries_until_attempt_limit() {
+            // Reserve an ephemeral port and release it so every connection is
+            // refused. The final error records the number of attempts made.
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            drop(listener);
+
+            let client =
+                test_client_with_http_config(fast_retry_config(2), HttpClientConfig::default());
+            let request = client
+                .inner()
+                .get(format!("http://{address}/test"))
+                .build()
+                .unwrap();
+
+            let error = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect_err("closed port must fail");
+            assert!(
+                error.message.contains("after 3 attempts"),
+                "connection refusal should consume the retry budget: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_connection_closed_before_response_is_retried() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicU32::new(0));
+            let server_accepted = Arc::clone(&accepted);
+
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    read_request_head(&mut stream).await;
+                    if attempt == 0 {
+                        // EOF before any response bytes simulates a connection
+                        // dropped/reset after the request reached the peer.
+                        continue;
+                    }
+                    write_ok_response(&mut stream).await;
+                }
+            });
+
+            let client =
+                test_client_with_http_config(fast_retry_config(2), HttpClientConfig::default());
+            let request = client
+                .inner()
+                .get(format!("http://{address}/test"))
+                .build()
+                .unwrap();
+
+            let response = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect("idempotent request should recover after a dropped connection");
+            assert_eq!(response.text().await.unwrap(), "ok");
+            server.await.unwrap();
+            assert_eq!(accepted.load(Ordering::SeqCst), 2);
+        }
+
+        #[tokio::test]
+        async fn test_per_request_timeout_is_retried() {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accepted = Arc::new(AtomicU32::new(0));
+            let server_accepted = Arc::clone(&accepted);
+
+            let server = tokio::spawn(async move {
+                for attempt in 0..2 {
+                    let (mut stream, _) = listener.accept().await.unwrap();
+                    server_accepted.fetch_add(1, Ordering::SeqCst);
+                    if attempt == 0 {
+                        tokio::spawn(async move {
+                            read_request_head(&mut stream).await;
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                        });
+                    } else {
+                        read_request_head(&mut stream).await;
+                        write_ok_response(&mut stream).await;
+                    }
+                }
+            });
+
+            let http_config = HttpClientConfig {
+                connect_timeout: Duration::from_millis(100),
+                read_timeout: Duration::from_millis(75),
+                ..HttpClientConfig::default()
+            };
+            let client = test_client_with_http_config(fast_retry_config(2), http_config);
+            let request = client
+                .inner()
+                .get(format!("http://{address}/test"))
+                .build()
+                .unwrap();
+
+            let response = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect("idempotent request should recover after its deadline");
+            assert_eq!(response.text().await.unwrap(), "ok");
+            server.await.unwrap();
+            assert_eq!(accepted.load(Ordering::SeqCst), 2);
         }
 
         #[tokio::test]

@@ -369,7 +369,7 @@ pub struct ConnectionOptions {
     pub custom_headers: Option<Vec<HeaderEntry>>,
 
     /// Retry/backoff tuning — all optional. An unset field keeps the kernel's
-    /// built-in policy (1s/60s exponential backoff, 6 total attempts, 900s
+    /// built-in policy (1s/60s exponential backoff, 9 total attempts, 900s
     /// budget). Mirrors the pyo3 binding's `retry_*` kwargs so the Node.js
     /// driver can forward the same retry knobs the Python connector does.
     ///

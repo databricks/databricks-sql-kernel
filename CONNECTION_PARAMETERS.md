@@ -131,7 +131,7 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 | `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |
 | `retry_min_wait` | Minimum backoff between retries; also the floor for a server `Retry-After` and the base of exponential backoff (`min_wait × 2^attempt`). | `1s` |
 | `retry_max_wait` | Maximum backoff between retries; caps both the exponential backoff and a server `Retry-After`. | `60s` |
-| `retry_max_retries` | Max retries **after** the first attempt — a request is tried at most `retry_max_retries + 1` times. | `5` (→ 6 total attempts) |
+| `retry_max_retries` | Max retries **after** the first attempt — a request is tried at most `retry_max_retries + 1` times. | `8` (→ 9 total attempts) |
 | `custom_headers` | Extra headers on every request; an ordered `Vec<(String, String)>` (duplicates allowed). `Authorization` / `x-databricks-org-id` are silently dropped (reserved); a `User-Agent` is folded into the effective UA. | `[]` |
 
 ## `ProxyConfig` — HTTP/HTTPS proxy (optional)

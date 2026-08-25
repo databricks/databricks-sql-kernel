@@ -26,6 +26,12 @@ use reqwest::StatusCode;
 use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
+/// Default retry count after the initial attempt.
+///
+/// Nine total attempts gives short transport outages more time to recover
+/// while the overall timeout continues to bound retry scheduling.
+pub(crate) const DEFAULT_MAX_RETRIES: u32 = 8;
+
 /// Identifies the type of request being made.
 ///
 /// The HTTP client uses this to look up the correct `RetryConfig` (from category)
@@ -130,7 +136,7 @@ impl Default for RetryConfig {
             min_wait: Duration::from_secs(1),
             max_wait: Duration::from_secs(60),
             overall_timeout: Duration::from_secs(900),
-            max_retries: 5,
+            max_retries: DEFAULT_MAX_RETRIES,
             override_retryable_codes: None,
         }
     }
@@ -241,12 +247,10 @@ impl RetryStrategy {
 
     /// Whether the given network/client error is retryable.
     pub fn is_retryable_error(&self, error: &reqwest::Error) -> bool {
-        // A DNS *resolution* failure (the host name does not resolve) is
-        // permanent — retrying it just burns the whole retry budget on a host
-        // that will never come back. reqwest reports it as a "connect" error,
-        // which the branches below would otherwise treat as retryable, so
-        // short-circuit it here regardless of idempotency.
-        if is_dns_resolution_failure(error) {
+        // A permanent DNS lookup failure (for example NXDOMAIN) cannot recover
+        // through retry. Temporary resolver failures remain ordinary connect
+        // errors and follow the request's idempotency policy below.
+        if is_permanent_dns_resolution_failure(error) {
             return false;
         }
         match self.idempotency {
@@ -260,35 +264,31 @@ impl RetryStrategy {
     }
 }
 
-/// Heuristic: is this network error a DNS *resolution* failure (the host name
-/// does not resolve), as opposed to a transient connect/timeout error?
+/// Heuristic: is this network error a permanent DNS lookup failure (the host
+/// name does not exist), as opposed to a temporary resolver/connect error?
 ///
 /// A non-existent host (NXDOMAIN) will never resolve, so it must not be
 /// retried. reqwest does not expose a typed DNS-error variant, so we walk the
-/// error's source chain and match the resolver's message. Matching is broad
-/// and lowercased to cover the common phrasings across platforms/resolvers:
-/// libc/getaddrinfo (`Name or service not known`), macOS
-/// (`nodename nor servname provided`), and hyper/hickory
-/// (`dns error`, `failed to lookup address information`).
-fn is_dns_resolution_failure(error: &reqwest::Error) -> bool {
-    error_chain_indicates_dns_failure(error)
+/// error's source chain and match only messages that identify an unknown host.
+/// Generic markers such as `dns error` and `name resolution` are deliberately
+/// excluded because they also describe temporary resolver failures.
+fn is_permanent_dns_resolution_failure(error: &reqwest::Error) -> bool {
+    error_chain_indicates_permanent_dns_failure(error)
 }
 
-/// Walk an error's `source()` chain looking for a DNS-resolution marker.
+/// Walk an error's `source()` chain looking for a permanent DNS marker.
 ///
-/// Split out from [`is_dns_resolution_failure`] so it can be unit-tested with a
-/// synthetic error chain — `reqwest::Error` has no public constructor, so the
-/// matching logic can't be exercised through the typed wrapper directly.
-fn error_chain_indicates_dns_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+/// Split out from [`is_permanent_dns_resolution_failure`] so it can be tested
+/// with a synthetic error chain; `reqwest::Error` has no public constructor.
+fn error_chain_indicates_permanent_dns_failure(error: &(dyn std::error::Error + 'static)) -> bool {
     let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
     while let Some(err) = source {
         let msg = err.to_string().to_ascii_lowercase();
-        if msg.contains("dns error")
-            || msg.contains("failed to lookup address")
-            || msg.contains("name or service not known")
+        if msg.contains("name or service not known")
             || msg.contains("nodename nor servname")
-            || msg.contains("name resolution")
             || msg.contains("no such host")
+            || msg.contains("non-existent domain")
+            || msg.contains("nxdomain")
         {
             return true;
         }
@@ -370,18 +370,36 @@ mod tests {
     // --- DNS-resolution detection tests ---
 
     #[test]
-    fn dns_marker_detected_for_common_resolver_phrasings() {
+    fn permanent_dns_marker_detected_for_unknown_host_phrasings() {
         use std::io::Error as IoError;
         for msg in [
             "failed to lookup address information: Name or service not known",
-            "dns error: failed to lookup address information",
             "nodename nor servname provided, or not known",
             "No such host is known. (os error 11001)",
+            "dns error: NXDOMAIN",
+            "non-existent domain",
         ] {
             let err = IoError::other(msg);
             assert!(
-                error_chain_indicates_dns_failure(&err),
-                "expected DNS marker in: {msg}"
+                error_chain_indicates_permanent_dns_failure(&err),
+                "expected permanent DNS marker in: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn temporary_dns_failures_are_not_classified_as_permanent() {
+        use std::io::Error as IoError;
+        for msg in [
+            "dns error: temporary failure in name resolution",
+            "failed to lookup address information: Try again",
+            "temporary failure in name resolution",
+            "server failure",
+        ] {
+            let err = IoError::other(msg);
+            assert!(
+                !error_chain_indicates_permanent_dns_failure(&err),
+                "temporary DNS failure must not be classified as permanent: {msg}"
             );
         }
     }
@@ -393,9 +411,9 @@ mod tests {
             ErrorKind::ConnectionRefused,
             "Connection refused (os error 111)",
         );
-        assert!(!error_chain_indicates_dns_failure(&refused));
+        assert!(!error_chain_indicates_permanent_dns_failure(&refused));
         let reset = IoError::new(ErrorKind::ConnectionReset, "connection reset by peer");
-        assert!(!error_chain_indicates_dns_failure(&reset));
+        assert!(!error_chain_indicates_permanent_dns_failure(&reset));
     }
 
     #[test]
@@ -414,8 +432,8 @@ mod tests {
                 Some(&self.0)
             }
         }
-        let inner = std::io::Error::other("dns error");
-        assert!(error_chain_indicates_dns_failure(&Wrapper(inner)));
+        let inner = std::io::Error::other("dns error: NXDOMAIN");
+        assert!(error_chain_indicates_permanent_dns_failure(&Wrapper(inner)));
     }
 
     // --- RequestType mapping tests ---
@@ -784,7 +802,7 @@ mod tests {
         assert_eq!(config.min_wait, Duration::from_secs(1));
         assert_eq!(config.max_wait, Duration::from_secs(60));
         assert_eq!(config.overall_timeout, Duration::from_secs(900));
-        assert_eq!(config.max_retries, 5);
+        assert_eq!(config.max_retries, DEFAULT_MAX_RETRIES);
         assert!(config.override_retryable_codes.is_none());
     }
 
@@ -813,7 +831,7 @@ mod tests {
 
         // SEA should have global defaults
         let sea = &configs[&RequestCategory::Sea];
-        assert_eq!(sea.max_retries, 5);
+        assert_eq!(sea.max_retries, DEFAULT_MAX_RETRIES);
         assert_eq!(sea.overall_timeout, Duration::from_secs(900));
     }
 
