@@ -417,6 +417,12 @@ KernelStatusCode kernel_session_config_set_telemetry_config(KernelSessionConfig*
                                                             uint64_t retry_delay_ms,
                                                             uint64_t close_flush_timeout_ms);
 
+/* Configure telemetry circuit-breaker behavior. `threshold` and `timeout_ms`
+ * must be > 0 when circuit breaking is enabled. If this setter is not called,
+ * the kernel keeps its default circuit-breaker policy. */
+KernelStatusCode kernel_session_config_set_telemetry_circuit_breaker_config(
+    KernelSessionConfig* config, bool enabled, uint32_t threshold, uint64_t timeout_ms);
+
 /* Configure driver/runtime/system identity supplied by the binding layer.
  * Every string argument is optional: pass NULL for values the binding does not
  * know. The kernel fills any missing fields it can derive before emitting
