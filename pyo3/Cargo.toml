@@ -55,6 +55,13 @@ repository = "https://github.com/databricks/databricks-sql-kernel"
 name = "databricks_sql_kernel_pyo3"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+# Keep `extension-module` off for plain `cargo test`: PyO3 intentionally
+# suppresses libpython linking for extension modules on Unix, which breaks the
+# Rust test binary. `pyo3/pyproject.toml` enables this feature for maturin wheel
+# builds, where the symbols are resolved by the loading Python interpreter.
+extension-module = ["pyo3/extension-module"]
+
 [dependencies]
 # Disable the kernel's `default` feature (which selects `tls-native`)
 # and opt into `tls-rustls` instead — same as the napi crate. The
@@ -72,7 +79,7 @@ databricks-sql-kernel = { path = "..", default-features = false, features = ["tl
 # step with `requires-python = ">=3.9"` in pyproject.toml; bumping
 # both together avoids shipping a wheel whose ABI tag advertises an
 # interpreter the package no longer claims to support.
-pyo3 = { version = "0.29", features = ["extension-module", "abi3-py39"] }
+pyo3 = { version = "0.29", features = ["abi3-py39"] }
 
 # Multi-thread runtime — one per Session, owned on the Rust side.
 tokio = { version = "1", features = ["rt-multi-thread"] }
