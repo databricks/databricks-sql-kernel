@@ -493,11 +493,7 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        let result = self.materialise_result().await;
-                        if result.is_ok() {
-                            self.statement_telemetry.finalize(None);
-                        }
-                        return result;
+                        return self.materialise_result().await;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
@@ -559,11 +555,7 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.valid.check()?;
-            let result = self.materialise_result().await;
-            if result.is_ok() {
-                self.statement_telemetry.finalize(None);
-            }
-            result
+            self.materialise_result().await
         }
         .instrument(span)
         .await;
