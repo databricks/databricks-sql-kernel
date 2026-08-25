@@ -417,6 +417,16 @@ pub struct ConnectionOptions {
     /// milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
     /// supplied.
     pub telemetry_close_flush_timeout_ms: Option<u32>,
+    /// Enable telemetry circuit-breaker protection. Omitted ⇒ kernel default.
+    pub telemetry_circuit_breaker_enabled: Option<bool>,
+    /// Consecutive telemetry export failures before opening the circuit.
+    /// Omitted ⇒ kernel default. Must be greater than zero when the circuit
+    /// breaker is enabled.
+    pub telemetry_circuit_breaker_threshold: Option<u32>,
+    /// Time the telemetry circuit stays open before a half-open probe, in
+    /// milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
+    /// supplied.
+    pub telemetry_circuit_breaker_timeout_ms: Option<u32>,
     /// Programmatic HTTP/HTTPS proxy ([`ProxyInput`]) to route all kernel
     /// traffic through. Carries the proxy `url`, optional basic-auth
     /// `username` / `password`, and an optional `bypassHosts` list — mapped
@@ -649,7 +659,10 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
         || options.telemetry_flush_interval_ms.is_some()
         || options.telemetry_max_retries.is_some()
         || options.telemetry_retry_delay_ms.is_some()
-        || options.telemetry_close_flush_timeout_ms.is_some();
+        || options.telemetry_close_flush_timeout_ms.is_some()
+        || options.telemetry_circuit_breaker_enabled.is_some()
+        || options.telemetry_circuit_breaker_threshold.is_some()
+        || options.telemetry_circuit_breaker_timeout_ms.is_some();
     if !mentioned {
         return Ok(None);
     }
@@ -669,6 +682,18 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
             KernelError::invalid_argument().message("telemetryCloseFlushTimeoutMs must be > 0"),
         ));
     }
+    if matches!(options.telemetry_circuit_breaker_threshold, Some(0))
+        && options.telemetry_circuit_breaker_enabled.unwrap_or(true)
+    {
+        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
+            "telemetryCircuitBreakerThreshold must be > 0 when enabled",
+        )));
+    }
+    if matches!(options.telemetry_circuit_breaker_timeout_ms, Some(0)) {
+        return Err(napi_err_from_kernel(KernelError::invalid_argument().message(
+            "telemetryCircuitBreakerTimeoutMs must be > 0",
+        )));
+    }
 
     let mut telemetry = TelemetryConfig::default();
     telemetry.enabled = options.telemetry_enabled.unwrap_or(false);
@@ -686,6 +711,15 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
     }
     if let Some(v) = options.telemetry_close_flush_timeout_ms {
         telemetry.close_flush_timeout = std::time::Duration::from_millis(u64::from(v));
+    }
+    if let Some(v) = options.telemetry_circuit_breaker_enabled {
+        telemetry.circuit_breaker_enabled = v;
+    }
+    if let Some(v) = options.telemetry_circuit_breaker_threshold {
+        telemetry.circuit_breaker_threshold = v;
+    }
+    if let Some(v) = options.telemetry_circuit_breaker_timeout_ms {
+        telemetry.circuit_breaker_timeout = std::time::Duration::from_millis(u64::from(v));
     }
     Ok(Some(telemetry))
 }
@@ -895,6 +929,9 @@ mod tests {
             telemetry_max_retries: None,
             telemetry_retry_delay_ms: None,
             telemetry_close_flush_timeout_ms: None,
+            telemetry_circuit_breaker_enabled: None,
+            telemetry_circuit_breaker_threshold: None,
+            telemetry_circuit_breaker_timeout_ms: None,
             proxy: None,
             socket_timeout_ms: None,
         }
@@ -1530,6 +1567,9 @@ mod tests {
         o.telemetry_max_retries = Some(2);
         o.telemetry_retry_delay_ms = Some(50);
         o.telemetry_close_flush_timeout_ms = Some(2_500);
+        o.telemetry_circuit_breaker_enabled = Some(false);
+        o.telemetry_circuit_breaker_threshold = Some(9);
+        o.telemetry_circuit_breaker_timeout_ms = Some(60_000);
 
         let telemetry = build_telemetry_config(&o)
             .expect("valid telemetry config")
@@ -1546,6 +1586,12 @@ mod tests {
         assert_eq!(
             telemetry.close_flush_timeout,
             std::time::Duration::from_millis(2_500)
+        );
+        assert!(!telemetry.circuit_breaker_enabled);
+        assert_eq!(telemetry.circuit_breaker_threshold, 9);
+        assert_eq!(
+            telemetry.circuit_breaker_timeout,
+            std::time::Duration::from_millis(60_000)
         );
     }
 
@@ -1576,6 +1622,25 @@ mod tests {
             build_telemetry_config(&o).unwrap_err(),
             "telemetryCloseFlushTimeoutMs must be > 0",
         );
+
+        let mut o = base();
+        o.telemetry_circuit_breaker_threshold = Some(0);
+        assert_invalid_arg(
+            build_telemetry_config(&o).unwrap_err(),
+            "telemetryCircuitBreakerThreshold must be > 0 when enabled",
+        );
+
+        let mut o = base();
+        o.telemetry_circuit_breaker_timeout_ms = Some(0);
+        assert_invalid_arg(
+            build_telemetry_config(&o).unwrap_err(),
+            "telemetryCircuitBreakerTimeoutMs must be > 0",
+        );
+
+        let mut o = base();
+        o.telemetry_circuit_breaker_enabled = Some(false);
+        o.telemetry_circuit_breaker_threshold = Some(0);
+        assert!(build_telemetry_config(&o).is_ok());
     }
 
     #[test]
