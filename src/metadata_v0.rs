@@ -52,9 +52,10 @@
 //! pass server shape through unchanged — those reshapes are not yet
 //! implemented and remain a wrapper responsibility.
 //!
-//! `type_info` / `table_types` have no server-native shape; the
-//! kernel synthesises results using the JDBC `getTypeInfo` /
-//! `getTableTypes` schemas (see [`crate::metadata::schemas`]).
+//! `type_info` / `table_types` have no SEA response to reshape. The
+//! kernel synthesises `type_info` to match the established Thrift
+//! `getTypeInfo` columns and rows, and uses the JDBC `getTableTypes`
+//! schema for `table_types` (see [`crate::metadata::schemas`]).
 //!
 //! ## Identifier vs LIKE pattern
 //!
@@ -1100,8 +1101,8 @@ impl Metadata {
         .await
     }
 
-    /// SQL data types supported by the workspace. No filters. No wire
-    /// call — returns a static in-memory result.
+    /// Static SQL type catalogue matching Thrift `getTypeInfo`. No filters and
+    /// no wire call.
     pub async fn type_info(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {

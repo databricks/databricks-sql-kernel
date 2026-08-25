@@ -23,6 +23,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Metadata: `Metadata::type_info()` now matches the established Thrift
+  `getTypeInfo` result shape and current 20-row type catalogue.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

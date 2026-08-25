@@ -15,685 +15,277 @@
 //! In-memory data sources for static [`Metadata`](crate::Metadata)
 //! methods — `type_info` and `table_types`.
 //!
-//! Both methods return a fixed answer that doesn't change between
-//! calls or between workspaces, so the kernel synthesises a
-//! `RecordBatch` once and serves it through an
-//! [`InMemoryReader`](crate::reader::InMemoryReader). No wire call.
-//!
-//! `type_info` rows are derived from the Databricks SQL type
-//! catalogue (matches the JDBC driver's `getTypeInfo()`); `JDBC_TYPE`
-//! codes come from [`java.sql.Types`](https://docs.oracle.com/javase/8/docs/api/java/sql/Types.html)
-//! and stay aligned with [`crate::metadata::type_mapping::databricks_type_to_xdbc`].
+//! Neither method has a Statement Execution API response to reshape, so the
+//! kernel synthesises a `RecordBatch` locally. `type_info` reproduces the
+//! established Thrift/HiveServer2 response's 18-column schema, 20-row type
+//! corpus, and every cell value. This lets a driver switch from Thrift to the
+//! kernel without changing its public `getTypeInfo()` result.
 
 use crate::metadata::schemas::{TABLE_TYPES_SCHEMA, TYPE_INFO_SCHEMA};
 use crate::reader::{InMemoryReader, ResultReader};
-use arrow_array::{ArrayRef, BooleanArray, Int32Array, RecordBatch, StringArray};
+use arrow_array::{ArrayRef, BooleanArray, Int16Array, Int32Array, RecordBatch, StringArray};
 use std::sync::Arc;
-
-// ─── JDBC `Types` integer codes used in TYPE_INFO ───────────────────
-//
-// Single source of truth lives in `metadata::type_mapping`. The
-// canonical mapping function `databricks_type_to_xdbc` (used by
-// `getColumns` per-row mapping) references the same constants — so
-// the `getTypeInfo` static table and the `getColumns` derivation
-// agree by construction. Drift between the two surfaces caused
-// silent bugs before unification (Databricks `FLOAT` reported as
-// JDBC `FLOAT` (6) by `getColumns` but `REAL` (7) by `getTypeInfo`,
-// `STRING` reported as `LONGVARCHAR` (-1) here while Thrift's
-// `getColumns` returns `VARCHAR` (12)).
-//
-// The underlying JDBC `Types` codes are `i16` (JDBC spec types them
-// as `short`); the `getTypeInfo` Arrow column is `i32`, so we widen
-// once per constant here.
 
 use crate::metadata::type_mapping as tm;
 
-#[allow(dead_code)]
-const JDBC_BIT: i32 = tm::JDBC_BIT as i32;
+// `java.sql.Types.NULL`. The general Databricks column mapper intentionally
+// maps VOID query columns to VARCHAR, but Thrift's getTypeInfo catalogue uses
+// the Type enum's NULL code for its VOID row.
+const JDBC_NULL: i32 = 0;
 const JDBC_TINYINT: i32 = tm::JDBC_TINYINT as i32;
 const JDBC_SMALLINT: i32 = tm::JDBC_SMALLINT as i32;
 const JDBC_INTEGER: i32 = tm::JDBC_INTEGER as i32;
 const JDBC_BIGINT: i32 = tm::JDBC_BIGINT as i32;
 const JDBC_FLOAT: i32 = tm::JDBC_FLOAT as i32;
-#[allow(dead_code)]
-const JDBC_REAL: i32 = tm::JDBC_REAL as i32;
 const JDBC_DOUBLE: i32 = tm::JDBC_DOUBLE as i32;
 const JDBC_DECIMAL: i32 = tm::JDBC_DECIMAL as i32;
-#[allow(dead_code)]
-const JDBC_NUMERIC: i32 = tm::JDBC_NUMERIC as i32;
 const JDBC_VARCHAR: i32 = tm::JDBC_VARCHAR as i32;
-#[allow(dead_code)]
-const JDBC_LONGVARCHAR: i32 = tm::JDBC_LONGVARCHAR as i32;
 const JDBC_CHAR: i32 = tm::JDBC_CHAR as i32;
 const JDBC_BINARY: i32 = tm::JDBC_BINARY as i32;
-#[allow(dead_code)]
-const JDBC_VARBINARY: i32 = tm::JDBC_VARBINARY as i32;
-#[allow(dead_code)]
-const JDBC_LONGVARBINARY: i32 = tm::JDBC_LONGVARBINARY as i32;
 const JDBC_DATE: i32 = tm::JDBC_DATE as i32;
 const JDBC_TIMESTAMP: i32 = tm::JDBC_TIMESTAMP as i32;
 const JDBC_OTHER: i32 = tm::JDBC_OTHER as i32;
 const JDBC_JAVA_OBJECT: i32 = tm::JDBC_JAVA_OBJECT as i32;
 const JDBC_STRUCT: i32 = tm::JDBC_STRUCT as i32;
 const JDBC_ARRAY: i32 = tm::JDBC_ARRAY as i32;
-/// JDBC `BOOLEAN` (4.0). Databricks `BOOLEAN` maps here; the older
-/// `JDBC_BIT` (-7) is retained above for any caller that asks for it
-/// explicitly.
 const JDBC_BOOLEAN: i32 = tm::JDBC_BOOLEAN as i32;
 
-// JDBC nullability codes for TYPE_INFO.NULLABLE
-const TYPE_NULLABLE_UNKNOWN: i32 = 2;
+const TYPE_NULLABLE: i16 = 1;
+const TYPE_PRED_NONE: i16 = 0;
+const TYPE_SEARCHABLE: i16 = 3;
 
-// JDBC searchability for TYPE_INFO.SEARCHABLE
-const TYPE_PRED_NONE: i32 = 0;
-#[allow(dead_code)]
-const TYPE_PRED_CHAR: i32 = 1;
-const TYPE_PRED_BASIC: i32 = 2;
-const TYPE_SEARCHABLE: i32 = 3;
-
-/// One row of the JDBC `getTypeInfo` result. Authored for readability;
-/// converted into Arrow columns by [`type_info_reader`].
+/// The values that vary across rows in Hive's `Type` enum. All other
+/// `getTypeInfo` cells are derived from these properties in
+/// [`type_info_reader`].
 struct TypeInfoRow {
     type_name: &'static str,
     data_type: i32,
-    column_size: Option<i32>,
-    literal_prefix: Option<&'static str>,
-    literal_suffix: Option<&'static str>,
-    create_params: Option<&'static str>,
-    nullable: i32,
+    precision: Option<i32>,
+    numeric: bool,
     case_sensitive: bool,
-    searchable: i32,
-    unsigned_attribute: Option<bool>,
-    fixed_prec_scale: bool,
-    auto_unique_value: Option<bool>,
-    local_type_name: Option<&'static str>,
-    minimum_scale: Option<i32>,
-    maximum_scale: Option<i32>,
-    sql_data_type: Option<i32>,
-    sql_datetime_sub: Option<i32>,
-    num_prec_radix: Option<i32>,
+    searchable: i16,
 }
 
-/// Static catalogue of Databricks SQL types as JDBC `getTypeInfo`
-/// rows.
-///
-/// Values follow the conventions used by other JDBC drivers:
-///
-/// - `NULLABLE = 2` (unknown) — Databricks doesn't surface a per-type
-///   nullable hint at this layer.
-/// - `CASE_SENSITIVE` — true for character types only.
-/// - `SEARCHABLE` — `3` for primitives that support `LIKE`,
-///   `2` (basic) for non-character types, `0` for unsearchable
-///   complex types (`ARRAY`/`MAP`/`STRUCT`).
-/// - `UNSIGNED_ATTRIBUTE = false` for numerics (Databricks has no
-///   unsigned types), `NULL` for non-numeric.
-///
-/// `LOCAL_TYPE_NAME` mirrors `TYPE_NAME` — Databricks doesn't have a
-/// localised name distinct from the canonical SQL identifier.
-fn type_info_rows() -> Vec<TypeInfoRow> {
+/// Exact order used by `SparkGetTypeInfoUtil.supportedType`.
+fn type_info_rows() -> [TypeInfoRow; 20] {
     use TypeInfoRow as R;
-    vec![
+
+    [
+        R {
+            type_name: "VOID",
+            data_type: JDBC_NULL,
+            precision: None,
+            numeric: false,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
         R {
             type_name: "BOOLEAN",
-            // Match Thrift's `getColumns` surface: JDBC `BOOLEAN`
-            // (16), not the older `BIT` (-7). Pre-fix the kernel was
-            // emitting -7 here while `getColumns` emitted -7 too —
-            // both wrong relative to Thrift's 16. Unified at the
-            // `databricks_type_to_xdbc("BOOLEAN")` site too.
             data_type: JDBC_BOOLEAN,
-            column_size: Some(1),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("BOOLEAN"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_BOOLEAN),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "TINYINT",
-            data_type: JDBC_TINYINT,
-            column_size: Some(3),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("TINYINT"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(0),
-            sql_data_type: Some(JDBC_TINYINT),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
-        },
-        R {
-            type_name: "SMALLINT",
-            data_type: JDBC_SMALLINT,
-            column_size: Some(5),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("SMALLINT"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(0),
-            sql_data_type: Some(JDBC_SMALLINT),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
-        },
-        R {
-            type_name: "INT",
-            data_type: JDBC_INTEGER,
-            column_size: Some(10),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("INT"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(0),
-            sql_data_type: Some(JDBC_INTEGER),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
-        },
-        R {
-            type_name: "BIGINT",
-            data_type: JDBC_BIGINT,
-            column_size: Some(19),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("BIGINT"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(0),
-            sql_data_type: Some(JDBC_BIGINT),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
-        },
-        R {
-            type_name: "FLOAT",
-            // Match Thrift: JDBC `FLOAT` (6), not `REAL` (7). The
-            // distinction matters per JDBC spec (FLOAT is at least
-            // 7 decimal digits, REAL is implementation-defined) and
-            // pre-fix the kernel was returning `REAL` here while
-            // `getColumns` returned `FLOAT` — silent drift between
-            // the two surfaces.
-            data_type: JDBC_FLOAT,
-            column_size: Some(7),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("FLOAT"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_FLOAT),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(2),
-        },
-        R {
-            type_name: "DOUBLE",
-            data_type: JDBC_DOUBLE,
-            column_size: Some(15),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("DOUBLE"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_DOUBLE),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(2),
-        },
-        R {
-            type_name: "DECIMAL",
-            data_type: JDBC_DECIMAL,
-            column_size: Some(38),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: Some("precision,scale"),
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("DECIMAL"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(38),
-            sql_data_type: Some(JDBC_DECIMAL),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
+            searchable: TYPE_SEARCHABLE,
         },
         R {
             type_name: "STRING",
-            // Match Thrift: JDBC `VARCHAR` (12), not `LONGVARCHAR`
-            // (-1). Databricks `STRING` is unbounded so `LONGVARCHAR`
-            // is technically more accurate, but Thrift emits 12 and
-            // existing Python clients (SQLAlchemy column
-            // introspection, pandas-read-sql) have been built against
-            // that.
             data_type: JDBC_VARCHAR,
-            column_size: Some(i32::MAX),
-            literal_prefix: Some("'"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: true,
             searchable: TYPE_SEARCHABLE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("STRING"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_VARCHAR),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "VARCHAR",
-            data_type: JDBC_VARCHAR,
-            column_size: Some(i32::MAX),
-            literal_prefix: Some("'"),
-            literal_suffix: Some("'"),
-            create_params: Some("length"),
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: true,
-            searchable: TYPE_SEARCHABLE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("VARCHAR"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_VARCHAR),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "CHAR",
-            data_type: JDBC_CHAR,
-            column_size: Some(255),
-            literal_prefix: Some("'"),
-            literal_suffix: Some("'"),
-            create_params: Some("length"),
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: true,
-            searchable: TYPE_SEARCHABLE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("CHAR"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_CHAR),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
         },
         R {
             type_name: "BINARY",
             data_type: JDBC_BINARY,
-            column_size: Some(i32::MAX),
-            literal_prefix: Some("X'"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("BINARY"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_BINARY),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "TINYINT",
+            data_type: JDBC_TINYINT,
+            precision: Some(3),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "SMALLINT",
+            data_type: JDBC_SMALLINT,
+            precision: Some(5),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "INT",
+            data_type: JDBC_INTEGER,
+            precision: Some(10),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "BIGINT",
+            data_type: JDBC_BIGINT,
+            precision: Some(19),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "FLOAT",
+            data_type: JDBC_FLOAT,
+            precision: Some(7),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "DOUBLE",
+            data_type: JDBC_DOUBLE,
+            precision: Some(15),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "DECIMAL",
+            data_type: JDBC_DECIMAL,
+            precision: Some(38),
+            numeric: true,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
         },
         R {
             type_name: "DATE",
             data_type: JDBC_DATE,
-            column_size: Some(10),
-            literal_prefix: Some("DATE '"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("DATE"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_DATE),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
+            searchable: TYPE_SEARCHABLE,
         },
         R {
             type_name: "TIMESTAMP",
             data_type: JDBC_TIMESTAMP,
-            column_size: Some(29),
-            literal_prefix: Some("TIMESTAMP '"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("TIMESTAMP"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(9),
-            sql_data_type: Some(JDBC_TIMESTAMP),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "TIMESTAMP_NTZ",
-            data_type: JDBC_TIMESTAMP,
-            column_size: Some(29),
-            literal_prefix: Some("TIMESTAMP_NTZ '"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("TIMESTAMP_NTZ"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(9),
-            sql_data_type: Some(JDBC_TIMESTAMP),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "INTERVAL DAY TO SECOND",
-            data_type: JDBC_OTHER,
-            column_size: None,
-            literal_prefix: Some("INTERVAL '"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("INTERVAL DAY TO SECOND"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_OTHER),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        R {
-            type_name: "INTERVAL YEAR TO MONTH",
-            data_type: JDBC_OTHER,
-            column_size: None,
-            literal_prefix: Some("INTERVAL '"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("INTERVAL YEAR TO MONTH"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_OTHER),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
+            searchable: TYPE_SEARCHABLE,
         },
         R {
             type_name: "ARRAY",
             data_type: JDBC_ARRAY,
-            column_size: None,
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
             searchable: TYPE_PRED_NONE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("ARRAY"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_ARRAY),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
         },
         R {
             type_name: "MAP",
             data_type: JDBC_JAVA_OBJECT,
-            column_size: None,
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
             searchable: TYPE_PRED_NONE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("MAP"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_JAVA_OBJECT),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
         },
         R {
             type_name: "STRUCT",
             data_type: JDBC_STRUCT,
-            column_size: None,
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
             searchable: TYPE_PRED_NONE,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("STRUCT"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_STRUCT),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
         },
         R {
-            type_name: "VARIANT",
+            type_name: "CHAR",
+            data_type: JDBC_CHAR,
+            precision: None,
+            numeric: false,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "VARCHAR",
+            data_type: JDBC_VARCHAR,
+            precision: None,
+            numeric: false,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
+        },
+        R {
+            type_name: "INTERVAL_YEAR_MONTH",
             data_type: JDBC_OTHER,
-            column_size: None,
-            literal_prefix: Some("'"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: true,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("VARIANT"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_OTHER),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
+            precision: None,
+            numeric: false,
+            case_sensitive: false,
+            searchable: TYPE_SEARCHABLE,
         },
         R {
-            type_name: "VARBINARY",
-            // Databricks doesn't have a distinct VARBINARY type;
-            // `databricks_type_to_xdbc("VARBINARY")` resolves to
-            // `JDBC_BINARY` (-2) because the underlying storage is
-            // identical to `BINARY` and that's what Thrift's
-            // `getColumns` reports. The row is kept here so SQL
-            // parsers that look up the alias find an answer; the
-            // answer is the same JDBC code as plain `BINARY`.
-            data_type: JDBC_BINARY,
-            column_size: Some(i32::MAX),
-            literal_prefix: Some("X'"),
-            literal_suffix: Some("'"),
-            create_params: None,
-            nullable: TYPE_NULLABLE_UNKNOWN,
+            type_name: "INTERVAL_DAY_TIME",
+            data_type: JDBC_OTHER,
+            precision: None,
+            numeric: false,
             case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: None,
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("VARBINARY"),
-            minimum_scale: None,
-            maximum_scale: None,
-            sql_data_type: Some(JDBC_BINARY),
-            sql_datetime_sub: None,
-            num_prec_radix: None,
-        },
-        // (no LONGVARBINARY row — Databricks has no separate
-        // LONGVARBINARY storage type; all binary data goes through
-        // `BINARY`. The row was previously listed as a separate JDBC
-        // type with code -4 but no `databricks_type_to_xdbc` arm
-        // recognised "LONGVARBINARY", so the two surfaces disagreed.
-        // Dropped rather than fabricated.)
-        R {
-            type_name: "NUMERIC",
-            // Databricks `NUMERIC` is an alias for `DECIMAL`; Thrift's
-            // `getColumns` reports both as `JDBC_DECIMAL` (3), and the
-            // canonical mapper does the same. The row used to claim
-            // `JDBC_NUMERIC` (2) here, which diverged from `getColumns`.
-            data_type: JDBC_DECIMAL,
-            column_size: Some(38),
-            literal_prefix: None,
-            literal_suffix: None,
-            create_params: Some("precision,scale"),
-            nullable: TYPE_NULLABLE_UNKNOWN,
-            case_sensitive: false,
-            searchable: TYPE_PRED_BASIC,
-            unsigned_attribute: Some(false),
-            fixed_prec_scale: false,
-            auto_unique_value: Some(false),
-            local_type_name: Some("NUMERIC"),
-            minimum_scale: Some(0),
-            maximum_scale: Some(38),
-            sql_data_type: Some(JDBC_DECIMAL),
-            sql_datetime_sub: None,
-            num_prec_radix: Some(10),
+            searchable: TYPE_SEARCHABLE,
         },
     ]
 }
 
-/// Build the `type_info` `RecordBatch` and return a reader yielding
-/// it once. Public to the crate via [`type_info_reader`]; the batch
-/// is constructed fresh per call so we don't have to keep a
-/// shared-mutable handle alive.
+/// Build the exact Thrift `getTypeInfo` batch and return a reader yielding it
+/// once.
 pub(crate) fn type_info_reader() -> Box<dyn ResultReader + Send> {
     let rows = type_info_rows();
     let schema = TYPE_INFO_SCHEMA.clone();
 
     let type_name: ArrayRef = Arc::new(StringArray::from_iter_values(
-        rows.iter().map(|r| r.type_name),
+        rows.iter().map(|row| row.type_name),
     ));
     let data_type: ArrayRef = Arc::new(Int32Array::from_iter_values(
-        rows.iter().map(|r| r.data_type),
+        rows.iter().map(|row| row.data_type),
     ));
-    let column_size: ArrayRef = Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.column_size)));
-    let literal_prefix: ArrayRef = Arc::new(StringArray::from_iter(
-        rows.iter().map(|r| r.literal_prefix),
-    ));
-    let literal_suffix: ArrayRef = Arc::new(StringArray::from_iter(
-        rows.iter().map(|r| r.literal_suffix),
-    ));
+    let precision: ArrayRef = Arc::new(Int32Array::from_iter(rows.iter().map(|row| row.precision)));
+    let literal_prefix: ArrayRef =
+        Arc::new(StringArray::from_iter(rows.iter().map(|_| None::<&str>)));
+    let literal_suffix: ArrayRef =
+        Arc::new(StringArray::from_iter(rows.iter().map(|_| None::<&str>)));
     let create_params: ArrayRef =
-        Arc::new(StringArray::from_iter(rows.iter().map(|r| r.create_params)));
-    let nullable: ArrayRef = Arc::new(Int32Array::from_iter_values(
-        rows.iter().map(|r| r.nullable),
+        Arc::new(StringArray::from_iter(rows.iter().map(|_| None::<&str>)));
+    let nullable: ArrayRef = Arc::new(Int16Array::from_iter_values(
+        rows.iter().map(|_| TYPE_NULLABLE),
     ));
     let case_sensitive: ArrayRef = Arc::new(BooleanArray::from_iter(
-        rows.iter().map(|r| Some(r.case_sensitive)),
+        rows.iter().map(|row| Some(row.case_sensitive)),
     ));
-    let searchable: ArrayRef = Arc::new(Int32Array::from_iter_values(
-        rows.iter().map(|r| r.searchable),
+    let searchable: ArrayRef = Arc::new(Int16Array::from_iter_values(
+        rows.iter().map(|row| row.searchable),
     ));
     let unsigned_attribute: ArrayRef = Arc::new(BooleanArray::from_iter(
-        rows.iter().map(|r| r.unsigned_attribute),
+        rows.iter().map(|row| Some(!row.numeric)),
     ));
-    let fixed_prec_scale: ArrayRef = Arc::new(BooleanArray::from_iter(
-        rows.iter().map(|r| Some(r.fixed_prec_scale)),
-    ));
-    let auto_unique_value: ArrayRef = Arc::new(BooleanArray::from_iter(
-        rows.iter().map(|r| r.auto_unique_value),
-    ));
-    let local_type_name: ArrayRef = Arc::new(StringArray::from_iter(
-        rows.iter().map(|r| r.local_type_name),
-    ));
-    let minimum_scale: ArrayRef =
-        Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.minimum_scale)));
-    let maximum_scale: ArrayRef =
-        Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.maximum_scale)));
-    let sql_data_type: ArrayRef =
-        Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.sql_data_type)));
-    let sql_datetime_sub: ArrayRef = Arc::new(Int32Array::from_iter(
-        rows.iter().map(|r| r.sql_datetime_sub),
-    ));
-    let num_prec_radix: ArrayRef =
-        Arc::new(Int32Array::from_iter(rows.iter().map(|r| r.num_prec_radix)));
-    let interval_precision: ArrayRef =
+    let fixed_prec_scale: ArrayRef =
+        Arc::new(BooleanArray::from_iter(rows.iter().map(|_| Some(false))));
+    let auto_increment: ArrayRef =
+        Arc::new(BooleanArray::from_iter(rows.iter().map(|_| Some(false))));
+    let local_type_name: ArrayRef =
+        Arc::new(StringArray::from_iter(rows.iter().map(|_| None::<&str>)));
+    let minimum_scale: ArrayRef = Arc::new(Int16Array::from_iter_values(rows.iter().map(|_| 0)));
+    let maximum_scale: ArrayRef = Arc::new(Int16Array::from_iter_values(rows.iter().map(|_| 0)));
+    let sql_data_type: ArrayRef = Arc::new(Int32Array::from_iter(rows.iter().map(|_| None::<i32>)));
+    let sql_datetime_sub: ArrayRef =
         Arc::new(Int32Array::from_iter(rows.iter().map(|_| None::<i32>)));
+    let num_prec_radix: ArrayRef = Arc::new(Int32Array::from_iter(
+        rows.iter().map(|row| row.numeric.then_some(10)),
+    ));
 
     let batch = RecordBatch::try_new(
         schema.clone(),
         vec![
             type_name,
             data_type,
-            column_size,
+            precision,
             literal_prefix,
             literal_suffix,
             create_params,
@@ -702,24 +294,22 @@ pub(crate) fn type_info_reader() -> Box<dyn ResultReader + Send> {
             searchable,
             unsigned_attribute,
             fixed_prec_scale,
-            auto_unique_value,
+            auto_increment,
             local_type_name,
             minimum_scale,
             maximum_scale,
             sql_data_type,
             sql_datetime_sub,
             num_prec_radix,
-            interval_precision,
         ],
     )
-    .expect("type_info batch construction must succeed (static schema + arrays)");
+    .expect("type_info batch construction must match its static schema");
 
     Box::new(InMemoryReader::new(schema, vec![batch]))
 }
 
-/// Build the `table_types` `RecordBatch` from a list of supported
-/// types (sourced from the session's transport), and return a
-/// reader yielding it once.
+/// Build the `table_types` `RecordBatch` from a list of supported types
+/// sourced from the session transport.
 pub(crate) fn table_types_reader(types: &[String]) -> Box<dyn ResultReader + Send> {
     let schema = TABLE_TYPES_SCHEMA.clone();
     let array: ArrayRef = Arc::new(StringArray::from_iter_values(types.iter()));
@@ -733,132 +323,257 @@ mod tests {
     use super::*;
     use arrow_array::Array;
 
+    /// Pins the *derived* shape of the static `getTypeInfo` result: row
+    /// count, ordering, and the per-column values produced by our
+    /// `SparkGetTypeInfoUtil`-equivalent derivation logic. This locks
+    /// self-consistency of that derivation — it does NOT prove parity with a
+    /// live Thrift `getTypeInfo` response (both sides share the same
+    /// derivation, so a wrong-but-consistent cell would pass here).
     #[tokio::test]
-    async fn type_info_reader_yields_expected_shape() {
-        let mut r = type_info_reader();
-        let rb = r.next_batch().await.unwrap().expect("one batch");
-        assert_eq!(rb.schema(), *TYPE_INFO_SCHEMA);
-        assert!(rb.num_rows() >= 19, "{} rows", rb.num_rows());
-        // Stream is exhausted after the first batch.
-        assert!(r.next_batch().await.unwrap().is_none());
-    }
+    async fn type_info_reader_matches_derived_static_shape() {
+        let mut reader = type_info_reader();
+        let batch = reader.next_batch().await.unwrap().expect("one batch");
 
-    #[tokio::test]
-    async fn type_info_includes_required_databricks_types() {
-        let mut r = type_info_reader();
-        let rb = r.next_batch().await.unwrap().unwrap();
-        let names = rb
+        assert_eq!(batch.schema(), *TYPE_INFO_SCHEMA);
+        assert_eq!(batch.num_columns(), 18);
+        assert_eq!(batch.num_rows(), 20);
+        assert!(reader.next_batch().await.unwrap().is_none());
+
+        let names = batch
             .column_by_name("TYPE_NAME")
             .unwrap()
             .as_any()
             .downcast_ref::<StringArray>()
             .unwrap();
-        let collected: std::collections::HashSet<&str> =
-            (0..names.len()).map(|i| names.value(i)).collect();
-        for required in [
-            "BOOLEAN",
-            "INT",
-            "BIGINT",
-            "DOUBLE",
-            "DECIMAL",
-            "STRING",
-            "BINARY",
-            "DATE",
-            "TIMESTAMP",
-            "TIMESTAMP_NTZ",
-            "ARRAY",
-            "MAP",
-            "STRUCT",
-            "VARIANT",
-        ] {
-            assert!(collected.contains(required), "missing {required}");
-        }
-    }
+        let actual_names: Vec<&str> = (0..names.len()).map(|i| names.value(i)).collect();
+        assert_eq!(
+            actual_names,
+            vec![
+                "VOID",
+                "BOOLEAN",
+                "STRING",
+                "BINARY",
+                "TINYINT",
+                "SMALLINT",
+                "INT",
+                "BIGINT",
+                "FLOAT",
+                "DOUBLE",
+                "DECIMAL",
+                "DATE",
+                "TIMESTAMP",
+                "ARRAY",
+                "MAP",
+                "STRUCT",
+                "CHAR",
+                "VARCHAR",
+                "INTERVAL_YEAR_MONTH",
+                "INTERVAL_DAY_TIME",
+            ]
+        );
 
-    #[tokio::test]
-    async fn type_info_data_type_matches_canonical_mapper() {
-        // The `getTypeInfo` table and the `getColumns` per-row mapper
-        // must agree on JDBC codes — the unification is the entire
-        // point of having `metadata::type_mapping::JDBC_*` as the
-        // single source of truth. This test pins the contract: for
-        // every type registered in `type_info_rows`, calling
-        // `databricks_type_to_xdbc(TYPE_NAME)` returns the same code
-        // that appears in the row's `DATA_TYPE` column.
-        use crate::metadata::type_mapping::databricks_type_to_xdbc;
-        use arrow_array::Int32Array;
-
-        let mut r = type_info_reader();
-        let rb = r.next_batch().await.unwrap().unwrap();
-        let names = rb
-            .column_by_name("TYPE_NAME")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .unwrap();
-        let data_types = rb
+        let data_types = batch
             .column_by_name("DATA_TYPE")
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
+        let actual_data_types: Vec<i32> =
+            (0..data_types.len()).map(|i| data_types.value(i)).collect();
+        assert_eq!(
+            actual_data_types,
+            vec![
+                0, 16, 12, -2, -6, 5, 4, -5, 6, 8, 3, 91, 93, 2003, 2000, 2002, 1, 12, 1111, 1111,
+            ]
+        );
 
-        for i in 0..rb.num_rows() {
-            let type_name = names.value(i);
-            let static_code = data_types.value(i);
-            let mapper_code = databricks_type_to_xdbc(type_name) as i32;
+        let precision = batch
+            .column_by_name("PRECISION")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let actual_precision: Vec<Option<i32>> = (0..precision.len())
+            .map(|i| {
+                if precision.is_null(i) {
+                    None
+                } else {
+                    Some(precision.value(i))
+                }
+            })
+            .collect();
+        assert_eq!(
+            actual_precision,
+            vec![
+                None,
+                None,
+                None,
+                None,
+                Some(3),
+                Some(5),
+                Some(10),
+                Some(19),
+                Some(7),
+                Some(15),
+                Some(38),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ]
+        );
+
+        for column_name in [
+            "LITERAL_PREFIX",
+            "LITERAL_SUFFIX",
+            "CREATE_PARAMS",
+            "LOCAL_TYPE_NAME",
+        ] {
+            let column = batch
+                .column_by_name(column_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap();
+            assert_eq!(column.null_count(), 20, "{column_name}");
+        }
+        for column_name in ["SQL_DATA_TYPE", "SQL_DATETIME_SUB"] {
+            let column = batch
+                .column_by_name(column_name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(column.null_count(), 20, "{column_name}");
+        }
+        for column_name in [
+            "TYPE_NAME",
+            "DATA_TYPE",
+            "NULLABLE",
+            "CASE_SENSITIVE",
+            "SEARCHABLE",
+            "UNSIGNED_ATTRIBUTE",
+            "FIXED_PREC_SCALE",
+            "AUTO_INCREMENT",
+            "MINIMUM_SCALE",
+            "MAXIMUM_SCALE",
+        ] {
             assert_eq!(
-                static_code, mapper_code,
-                "drift on {type_name}: getTypeInfo says {static_code}, \
-                 databricks_type_to_xdbc says {mapper_code}"
+                batch.column_by_name(column_name).unwrap().null_count(),
+                0,
+                "{column_name}"
             );
         }
-    }
 
-    #[tokio::test]
-    async fn type_info_post_unification_codes() {
-        // Lock in the policy choices that flipped during the
-        // unification work. If any of these regress, both the
-        // static table and the canonical mapper need to move
-        // together.
-        use arrow_array::Int32Array;
-
-        let mut r = type_info_reader();
-        let rb = r.next_batch().await.unwrap().unwrap();
-        let names = rb
-            .column_by_name("TYPE_NAME")
+        let nullable = batch
+            .column_by_name("NULLABLE")
             .unwrap()
             .as_any()
-            .downcast_ref::<StringArray>()
+            .downcast_ref::<Int16Array>()
             .unwrap();
-        let data_types = rb
-            .column_by_name("DATA_TYPE")
+        let case_sensitive = batch
+            .column_by_name("CASE_SENSITIVE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let searchable = batch
+            .column_by_name("SEARCHABLE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let unsigned_attribute = batch
+            .column_by_name("UNSIGNED_ATTRIBUTE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let fixed_prec_scale = batch
+            .column_by_name("FIXED_PREC_SCALE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let auto_increment = batch
+            .column_by_name("AUTO_INCREMENT")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BooleanArray>()
+            .unwrap();
+        let minimum_scale = batch
+            .column_by_name("MINIMUM_SCALE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let maximum_scale = batch
+            .column_by_name("MAXIMUM_SCALE")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+        let num_prec_radix = batch
+            .column_by_name("NUM_PREC_RADIX")
             .unwrap()
             .as_any()
             .downcast_ref::<Int32Array>()
             .unwrap();
 
-        let mut by_name: std::collections::HashMap<&str, i32> = std::collections::HashMap::new();
-        for i in 0..rb.num_rows() {
-            by_name.insert(names.value(i), data_types.value(i));
+        for i in 0..batch.num_rows() {
+            let numeric = (4..=10).contains(&i);
+            let complex = (13..=15).contains(&i);
+            assert_eq!(nullable.value(i), 1, "NULLABLE row {i}");
+            assert_eq!(case_sensitive.value(i), i == 2, "CASE_SENSITIVE row {i}");
+            assert_eq!(
+                searchable.value(i),
+                if complex { 0 } else { 3 },
+                "SEARCHABLE row {i}"
+            );
+            assert_eq!(
+                unsigned_attribute.value(i),
+                !numeric,
+                "UNSIGNED_ATTRIBUTE row {i}"
+            );
+            assert!(!fixed_prec_scale.value(i), "FIXED_PREC_SCALE row {i}");
+            assert!(!auto_increment.value(i), "AUTO_INCREMENT row {i}");
+            assert_eq!(minimum_scale.value(i), 0, "MINIMUM_SCALE row {i}");
+            assert_eq!(maximum_scale.value(i), 0, "MAXIMUM_SCALE row {i}");
+            if numeric {
+                assert!(!num_prec_radix.is_null(i), "NUM_PREC_RADIX row {i}");
+                assert_eq!(num_prec_radix.value(i), 10, "NUM_PREC_RADIX row {i}");
+            } else {
+                assert!(num_prec_radix.is_null(i), "NUM_PREC_RADIX row {i}");
+            }
         }
+    }
 
-        // Matches Thrift's released contract: BOOLEAN → 16,
-        // STRING → 12, FLOAT → 6, BINARY → -2.
-        assert_eq!(by_name["BOOLEAN"], 16, "BOOLEAN must be JDBC_BOOLEAN");
-        assert_eq!(by_name["STRING"], 12, "STRING must be JDBC_VARCHAR");
-        assert_eq!(by_name["FLOAT"], 6, "FLOAT must be JDBC_FLOAT");
-        assert_eq!(by_name["BINARY"], -2, "BINARY must be JDBC_BINARY");
+    #[test]
+    fn type_info_void_code_is_distinct_from_column_mapping() {
+        use crate::metadata::type_mapping::databricks_type_to_xdbc;
+
+        assert_eq!(type_info_rows()[0].data_type, JDBC_NULL);
+        assert_eq!(databricks_type_to_xdbc("VOID") as i32, JDBC_VARCHAR);
     }
 
     #[tokio::test]
     async fn table_types_reader_yields_provided_types() {
         let types = vec!["TABLE".to_string(), "VIEW".to_string()];
-        let mut r = table_types_reader(&types);
-        let rb = r.next_batch().await.unwrap().expect("one batch");
-        assert_eq!(rb.num_rows(), 2);
-        let arr = rb.column(0).as_any().downcast_ref::<StringArray>().unwrap();
-        assert_eq!(arr.value(0), "TABLE");
-        assert_eq!(arr.value(1), "VIEW");
-        assert!(r.next_batch().await.unwrap().is_none());
+        let mut reader = table_types_reader(&types);
+        let batch = reader.next_batch().await.unwrap().expect("one batch");
+        assert_eq!(batch.num_rows(), 2);
+        let values = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(values.value(0), "TABLE");
+        assert_eq!(values.value(1), "VIEW");
+        assert!(reader.next_batch().await.unwrap().is_none());
     }
 }
