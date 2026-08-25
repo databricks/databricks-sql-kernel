@@ -51,46 +51,89 @@ pub(crate) struct SessionInner {
     pub(crate) runtime: Arc<Runtime>,
 }
 
-fn build_telemetry_config(
+#[derive(Default)]
+struct TelemetryKwargs {
     enabled: bool,
     batch_size: Option<usize>,
     flush_interval_ms: Option<u64>,
     max_retries: Option<u32>,
     retry_delay_ms: Option<u64>,
     close_flush_timeout_ms: Option<u64>,
+    circuit_breaker_enabled: Option<bool>,
+    circuit_breaker_threshold: Option<u32>,
+    circuit_breaker_timeout_ms: Option<u64>,
+}
+
+impl TelemetryKwargs {
+    fn is_mentioned(&self) -> bool {
+        self.enabled
+            || self.batch_size.is_some()
+            || self.flush_interval_ms.is_some()
+            || self.max_retries.is_some()
+            || self.retry_delay_ms.is_some()
+            || self.close_flush_timeout_ms.is_some()
+            || self.circuit_breaker_enabled.is_some()
+            || self.circuit_breaker_threshold.is_some()
+            || self.circuit_breaker_timeout_ms.is_some()
+    }
+}
+
+fn build_telemetry_config(
+    options: TelemetryKwargs,
 ) -> PyResult<databricks_sql_kernel::TelemetryConfig> {
-    if matches!(batch_size, Some(0)) {
+    if matches!(options.batch_size, Some(0)) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "telemetry_batch_size must be > 0",
         ));
     }
-    if matches!(flush_interval_ms, Some(0)) {
+    if matches!(options.flush_interval_ms, Some(0)) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "telemetry_flush_interval_ms must be > 0",
         ));
     }
-    if matches!(close_flush_timeout_ms, Some(0)) {
+    if matches!(options.close_flush_timeout_ms, Some(0)) {
         return Err(pyo3::exceptions::PyValueError::new_err(
             "telemetry_close_flush_timeout_ms must be > 0",
         ));
     }
+    if matches!(options.circuit_breaker_threshold, Some(0))
+        && options.circuit_breaker_enabled.unwrap_or(true)
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "telemetry_circuit_breaker_threshold must be > 0 when enabled",
+        ));
+    }
+    if matches!(options.circuit_breaker_timeout_ms, Some(0)) {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "telemetry_circuit_breaker_timeout_ms must be > 0",
+        ));
+    }
 
     let mut telemetry = databricks_sql_kernel::TelemetryConfig::default();
-    telemetry.enabled = enabled;
-    if let Some(v) = batch_size {
+    telemetry.enabled = options.enabled;
+    if let Some(v) = options.batch_size {
         telemetry.batch_size = v;
     }
-    if let Some(v) = flush_interval_ms {
+    if let Some(v) = options.flush_interval_ms {
         telemetry.flush_interval = std::time::Duration::from_millis(v);
     }
-    if let Some(v) = max_retries {
+    if let Some(v) = options.max_retries {
         telemetry.max_retries = v;
     }
-    if let Some(v) = retry_delay_ms {
+    if let Some(v) = options.retry_delay_ms {
         telemetry.retry_delay = std::time::Duration::from_millis(v);
     }
-    if let Some(v) = close_flush_timeout_ms {
+    if let Some(v) = options.close_flush_timeout_ms {
         telemetry.close_flush_timeout = std::time::Duration::from_millis(v);
+    }
+    if let Some(v) = options.circuit_breaker_enabled {
+        telemetry.circuit_breaker_enabled = v;
+    }
+    if let Some(v) = options.circuit_breaker_threshold {
+        telemetry.circuit_breaker_threshold = v;
+    }
+    if let Some(v) = options.circuit_breaker_timeout_ms {
+        telemetry.circuit_breaker_timeout = std::time::Duration::from_millis(v);
     }
     Ok(telemetry)
 }
@@ -325,6 +368,9 @@ impl Session {
         telemetry_max_retries=None,
         telemetry_retry_delay_ms=None,
         telemetry_close_flush_timeout_ms=None,
+        telemetry_circuit_breaker_enabled=None,
+        telemetry_circuit_breaker_threshold=None,
+        telemetry_circuit_breaker_timeout_ms=None,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -386,6 +432,9 @@ impl Session {
         telemetry_max_retries: Option<u32>,
         telemetry_retry_delay_ms: Option<u64>,
         telemetry_close_flush_timeout_ms: Option<u64>,
+        telemetry_circuit_breaker_enabled: Option<bool>,
+        telemetry_circuit_breaker_threshold: Option<u32>,
+        telemetry_circuit_breaker_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
         // Resolve auth_type. Explicit `auth_type` always wins. When
         // omitted, default to "pat" if `access_token` was passed
@@ -493,21 +542,19 @@ impl Session {
             process_name,
         );
 
-        let telemetry_config = if telemetry_enabled
-            || telemetry_batch_size.is_some()
-            || telemetry_flush_interval_ms.is_some()
-            || telemetry_max_retries.is_some()
-            || telemetry_retry_delay_ms.is_some()
-            || telemetry_close_flush_timeout_ms.is_some()
-        {
-            Some(build_telemetry_config(
-                telemetry_enabled,
-                telemetry_batch_size,
-                telemetry_flush_interval_ms,
-                telemetry_max_retries,
-                telemetry_retry_delay_ms,
-                telemetry_close_flush_timeout_ms,
-            )?)
+        let telemetry_kwargs = TelemetryKwargs {
+            enabled: telemetry_enabled,
+            batch_size: telemetry_batch_size,
+            flush_interval_ms: telemetry_flush_interval_ms,
+            max_retries: telemetry_max_retries,
+            retry_delay_ms: telemetry_retry_delay_ms,
+            close_flush_timeout_ms: telemetry_close_flush_timeout_ms,
+            circuit_breaker_enabled: telemetry_circuit_breaker_enabled,
+            circuit_breaker_threshold: telemetry_circuit_breaker_threshold,
+            circuit_breaker_timeout_ms: telemetry_circuit_breaker_timeout_ms,
+        };
+        let telemetry_config = if telemetry_kwargs.is_mentioned() {
+            Some(build_telemetry_config(telemetry_kwargs)?)
         } else {
             None
         };
@@ -673,9 +720,18 @@ mod send_sync_tests {
 
     #[test]
     fn telemetry_kwargs_map_to_kernel_config() {
-        let telemetry =
-            build_telemetry_config(true, Some(25), Some(1_000), Some(2), Some(50), Some(2_500))
-                .expect("valid telemetry config");
+        let telemetry = build_telemetry_config(TelemetryKwargs {
+            enabled: true,
+            batch_size: Some(25),
+            flush_interval_ms: Some(1_000),
+            max_retries: Some(2),
+            retry_delay_ms: Some(50),
+            close_flush_timeout_ms: Some(2_500),
+            circuit_breaker_enabled: Some(false),
+            circuit_breaker_threshold: Some(9),
+            circuit_breaker_timeout_ms: Some(60_000),
+        })
+        .expect("valid telemetry config");
 
         assert!(telemetry.enabled);
         assert_eq!(telemetry.batch_size, 25);
@@ -689,13 +745,47 @@ mod send_sync_tests {
             telemetry.close_flush_timeout,
             std::time::Duration::from_millis(2_500)
         );
+        assert!(!telemetry.circuit_breaker_enabled);
+        assert_eq!(telemetry.circuit_breaker_threshold, 9);
+        assert_eq!(
+            telemetry.circuit_breaker_timeout,
+            std::time::Duration::from_millis(60_000)
+        );
     }
 
     #[test]
     fn telemetry_kwargs_reject_zero_required_fields() {
-        assert!(build_telemetry_config(false, Some(0), None, None, None, None).is_err());
-        assert!(build_telemetry_config(false, None, Some(0), None, None, None).is_err());
-        assert!(build_telemetry_config(false, None, None, None, None, Some(0)).is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            batch_size: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            flush_interval_ms: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            close_flush_timeout_ms: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            circuit_breaker_threshold: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            circuit_breaker_timeout_ms: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_err());
+        assert!(build_telemetry_config(TelemetryKwargs {
+            circuit_breaker_enabled: Some(false),
+            circuit_breaker_threshold: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_ok());
     }
 
     #[test]
