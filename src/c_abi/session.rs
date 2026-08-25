@@ -31,6 +31,7 @@ use crate::config::{
     TlsConfig, TokenCacheConfig,
 };
 use crate::kernel_error::Error;
+use crate::logging::{LoggingOutcome, LoggingSink};
 use crate::session::Session;
 use crate::telemetry::DriverSystemConfiguration;
 use std::collections::HashMap;
@@ -209,6 +210,11 @@ struct TlsSpec {
     custom_ca_cert: Option<Vec<u8>>,
     accept_self_signed: bool,
     skip_hostname_verification: bool,
+    /// PEM-encoded client leaf certificate followed by any intermediates.
+    /// Always configured together with `client_key_pem`.
+    client_cert_pem: Option<Vec<u8>>,
+    /// PEM-encoded private key for the mTLS client certificate. Never log it.
+    client_key_pem: Option<Vec<u8>>,
 }
 
 /// Read a required C string argument into an owned `String`, mapping a
@@ -765,28 +771,53 @@ pub unsafe extern "C" fn kernel_session_config_set_driver_system_configuration(
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum LogLevelResolution {
+    Off,
+    Filter(Option<String>),
+}
+
+/// Parse the C ABI's best-effort bare log level into the shared subscriber
+/// filter representation. Invalid UTF-8 is treated like NULL and falls back to
+/// `RUST_LOG`; OFF intentionally skips subscriber installation without
+/// consuming the process-wide initialization slot.
+unsafe fn resolve_log_level(level: *const c_char) -> LogLevelResolution {
+    let level = unsafe { optional_str(level, "log level") }.ok().flatten();
+    if level
+        .as_deref()
+        .is_some_and(|value| value.eq_ignore_ascii_case("off"))
+    {
+        LogLevelResolution::Off
+    } else {
+        LogLevelResolution::Filter(level.as_deref().map(crate::logging::filter_from_level))
+    }
+}
+
 /// Initialize kernel logging, **process-wide and once**. `level` is one
 /// of "OFF"/"ERROR"/"WARN"/"INFO"/"DEBUG"/"TRACE" (NULL ⇒ honour
 /// `RUST_LOG`, default `warn`); `file_path` is a log file (NULL ⇒ stderr).
 ///
 /// Idempotent: the underlying `tracing` subscriber can only be installed
-/// once per process, so the **first** call wins and later calls are
+/// once per process, so the **first non-OFF** call wins and later calls are
 /// no-ops (a driver that opens many connections calls this each time with
-/// the same target — only the first takes effect). Not tied to a session;
-/// call it before/around `kernel_session_open`. Lets an ODBC/Go host route
-/// the kernel's logs into the same file it writes its own logs to.
+/// the same target — only the first takes effect). `OFF` returns `Success`
+/// without installing a subscriber or consuming that once-only slot, so a
+/// later non-OFF initializer can still win. Not tied to a session; call it
+/// before/around `kernel_session_open`. Lets an ODBC/Go host route the kernel's
+/// logs into the same file it writes its own logs to.
 ///
 /// A non-UTF-8 `file_path` returns `InvalidArgument` (the requested path
-/// can't be honoured). Otherwise returns `Success` when the FIRST call
-/// installed logging against the requested destination (or was skipped for
-/// level `OFF`), or `Internal` (with a stored last-error) when that first
-/// install did not fully honour the request — the log file couldn't be
-/// opened (logging fell back to stderr) or a global subscriber was already
-/// installed (no kernel subscriber installed). Because init is
-/// once-per-process, the Success/Internal result reflects the **first**
-/// call's outcome, NOT a later call's `level`/`file_path` (which have no
-/// effect). A caller that can't see stderr can use `Internal` to surface
-/// the degradation.
+/// can't be honoured). `OFF` behaves as described above. For a non-OFF call,
+/// returns `Success` when the first non-OFF call installed file/stderr logging
+/// against the requested destination, or `Internal` (with a stored last-error)
+/// when that first install did not fully honour the request — the log file
+/// couldn't be opened (logging fell back to stderr), a callback sink from an
+/// earlier `kernel_init_logging_callback` already won (this file/stderr
+/// request had no effect), or another component already owns the global
+/// subscriber (no kernel subscriber installed). Because init is
+/// once-per-process, the Success/Internal result reflects the **first non-OFF**
+/// call's outcome, NOT a later call's `level`/`file_path` (which have no effect).
+/// A caller that can't see stderr can use `Internal` to surface the degradation.
 ///
 /// # Safety
 /// `level` / `file_path`, if non-null, must be NUL-terminated C strings.
@@ -796,22 +827,10 @@ pub unsafe extern "C" fn kernel_init_logging(
     file_path: *const c_char,
 ) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
-    // `level` is best-effort: a non-UTF-8 or unrecognized value falls back
-    // to RUST_LOG / the default, so treat a bad level as absent.
-    let level = optional_str(level, "log level").ok().flatten();
-    // Level "OFF" means "do not install a subscriber", but that is still an
-    // intentional, successful outcome. `init_logging` no longer special-cases
-    // it (it works on full EnvFilter directives), so honour OFF here before
-    // touching the file path.
-    if level
-        .as_deref()
-        .is_some_and(|l| l.eq_ignore_ascii_case("off"))
-    {
-        return KernelStatusCode::Success;
-    }
-    // The C ABI takes a BARE level; expand it to the full directive the
-    // shared installer expects (targeting the kernel's own log target).
-    let filter = level.as_deref().map(crate::logging::filter_from_level);
+    let filter = match unsafe { resolve_log_level(level) } {
+        LogLevelResolution::Off => return KernelStatusCode::Success,
+        LogLevelResolution::Filter(filter) => filter,
+    };
     // `file_path` is NOT best-effort: a non-UTF-8 path is a real error (the
     // caller asked us to write there and we can't), so surface it rather
     // than silently dropping the path and reporting Success.
@@ -819,15 +838,122 @@ pub unsafe extern "C" fn kernel_init_logging(
         Ok(f) => f.map(std::path::PathBuf::from),
         Err(e) => return crate::c_abi::error::store_and_code(e),
     };
-    if crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
-        KernelStatusCode::Success
-    } else {
-        crate::c_abi::error::store_and_code(Error::new(
+    match crate::logging::init_logging(&crate::logging::LogConfig { filter, file }) {
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            file_honored: true,
+        } => KernelStatusCode::Success,
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            file_honored: false,
+        } => crate::c_abi::error::store_and_code(Error::new(
             crate::kernel_error::ErrorCode::Internal,
-            "kernel_init_logging: logging was not fully initialized as requested (the log file \
-             could not be opened, or a global subscriber was already installed); kernel logs may \
-             go to stderr or not flow",
-        ))
+            "kernel_init_logging: the requested log file could not be opened; kernel logs fell \
+             back to stderr",
+        )),
+        LoggingOutcome::Installed {
+            sink: LoggingSink::Callback { .. },
+            ..
+        } => crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel_init_logging: a callback log sink was already installed by an earlier \
+             kernel_init_logging_callback; this file/stderr request had no effect (first \
+             initializer wins)",
+        )),
+        LoggingOutcome::Foreign => crate::c_abi::error::store_and_code(Error::new(
+            crate::kernel_error::ErrorCode::Internal,
+            "kernel_init_logging: a global tracing subscriber was already installed by another \
+             component; no kernel subscriber was installed and kernel logs will not flow",
+        )),
+    }
+}
+
+/// Initialize process-wide kernel logging through a host callback.
+///
+/// This is the callback counterpart to [`kernel_init_logging`]. `level` has
+/// the same OFF/ERROR/WARN/INFO/DEBUG/TRACE semantics (NULL honors `RUST_LOG`,
+/// defaulting to WARN). The first non-OFF logging initializer in the process
+/// wins; subsequent callback or file/stderr initializer calls are no-ops
+/// reporting that first call's outcome. `OFF` returns `Success` without
+/// installing a subscriber or consuming the once-only slot, so a later non-OFF
+/// initializer can still win.
+///
+/// The callback receives lower-case `level`, the tracing `target`, and the
+/// rendered event message including fields recorded directly on that event.
+/// Fields attached only to enclosing spans are not included. Delivery is
+/// synchronous on the thread that emitted the record, so the callback must
+/// return promptly; a host that needs asynchronous delivery can copy the record
+/// into its own queue. String pointers are valid only until the callback returns,
+/// and calls may be concurrent. The callback must not unwind, re-enter the kernel
+/// C ABI, or emit another kernel tracing event. `user_data` is passed through
+/// unchanged and must remain valid for the process lifetime.
+///
+/// Returns `InvalidArgument` when `callback` is NULL. Returns `Internal`
+/// (with a stored last-error) when the callback was not installed: a
+/// file/stderr sink from an earlier `kernel_init_logging` already won, a
+/// *different* callback from an earlier `kernel_init_logging_callback` already
+/// won, or another component owns the process-global tracing slot (in every
+/// case this callback receives no records). Because init is once-per-process,
+/// this reflects the **first non-OFF** initializer's outcome. Thus `Success`
+/// means either level `OFF` was requested (which installs nothing and does not
+/// consume the initialization slot) or *this exact* callback + `user_data` is
+/// the installed sink — a later call with the identical callback and
+/// `user_data` also succeeds (it is that sink).
+///
+/// # Safety
+/// `level`, if non-null, must be a NUL-terminated C string. `callback` and
+/// `user_data` must satisfy the lifetime and threading contract above.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_init_logging_callback(
+    level: *const c_char,
+    callback: Option<crate::c_abi::KernelLogCallback>,
+    user_data: *mut std::ffi::c_void,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(callback) = callback else {
+        return crate::c_abi::error::store_and_code(
+            Error::invalid_argument().message("kernel log callback must not be NULL"),
+        );
+    };
+
+    let filter = match unsafe { resolve_log_level(level) } {
+        LogLevelResolution::Off => return KernelStatusCode::Success,
+        LogLevelResolution::Filter(filter) => filter,
+    };
+
+    match crate::logging::init_callback_logging(filter, callback, user_data) {
+        // Success only when the installed callback sink is *this* exact
+        // registration (same function pointer + user_data). A later, different
+        // callback loses to the first-call-wins install and must not be told it
+        // is live — otherwise a host believes a callback that will never fire.
+        LoggingOutcome::Installed {
+            sink:
+                LoggingSink::Callback {
+                    callback: won,
+                    user_data: won_ud,
+                },
+            ..
+        } if won == callback as usize && won_ud == user_data as usize => KernelStatusCode::Success,
+        LoggingOutcome::Installed {
+            sink: LoggingSink::Callback { .. },
+            ..
+        } => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a different callback sink was already installed by an \
+             earlier kernel_init_logging_callback; this callback was NOT installed and will \
+             receive no records (first initializer wins)",
+        )),
+        LoggingOutcome::Installed {
+            sink: LoggingSink::FileOrStderr,
+            ..
+        } => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a file/stderr log sink was already installed by an \
+             earlier kernel_init_logging; the callback was NOT installed and will receive no \
+             records (first initializer wins)",
+        )),
+        LoggingOutcome::Foreign => crate::c_abi::error::store_and_code(Error::internal().message(
+            "kernel_init_logging_callback: a global tracing subscriber was already installed by \
+             another component; the callback was NOT installed and will receive no records",
+        )),
     }
 }
 
@@ -945,6 +1071,42 @@ pub unsafe extern "C" fn kernel_session_config_set_tls_skip_hostname_verificatio
 ) -> KernelStatusCode {
     set_on_config(config, |c| {
         c.tls.skip_hostname_verification = skip;
+        Ok(())
+    })
+}
+
+/// Configure a client certificate and private key for mutual TLS (mTLS).
+///
+/// Both values are required and copied into Rust-owned memory. Supplying them
+/// through one setter keeps a partially configured client identity
+/// unrepresentable at the C ABI boundary. The existing kernel TLS layer parses
+/// the identity and enforces certificate/key compatibility when the session
+/// opens.
+///
+/// # Safety
+/// `config` must be a live config handle. `cert_pem` must point to
+/// `cert_len` readable bytes and `key_pem` to `key_len` readable bytes.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_tls_client_certificate(
+    config: *mut KernelSessionConfig,
+    cert_pem: *const u8,
+    cert_len: usize,
+    key_pem: *const u8,
+    key_len: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if cert_pem.is_null() || cert_len == 0 {
+            return Err(Error::invalid_argument()
+                .message("mTLS client cert must be a non-empty PEM buffer"));
+        }
+        if key_pem.is_null() || key_len == 0 {
+            return Err(
+                Error::invalid_argument().message("mTLS client key must be a non-empty PEM buffer")
+            );
+        }
+
+        c.tls.client_cert_pem = Some(std::slice::from_raw_parts(cert_pem, cert_len).to_vec());
+        c.tls.client_key_pem = Some(std::slice::from_raw_parts(key_pem, key_len).to_vec());
         Ok(())
     })
 }
@@ -1368,17 +1530,20 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 });
             }
 
-            // TLS relaxations / custom trust. Only build a TlsConfig when a
-            // non-default knob was set, so the strict default is preserved
-            // otherwise.
+            // TLS relaxations / custom trust / mTLS client identity. Only build
+            // a TlsConfig when a non-default knob was set, so the strict
+            // default is preserved otherwise.
             if tls.custom_ca_cert.is_some()
                 || tls.accept_self_signed
                 || tls.skip_hostname_verification
+                || tls.client_cert_pem.is_some()
             {
                 builder = builder.tls(TlsConfig {
                     custom_ca_cert: tls.custom_ca_cert,
                     accept_self_signed: tls.accept_self_signed,
                     skip_hostname_verification: tls.skip_hostname_verification,
+                    client_cert_pem: tls.client_cert_pem,
+                    client_key_pem: tls.client_key_pem,
                     ..TlsConfig::default()
                 });
             }
@@ -1637,6 +1802,126 @@ mod tests {
     use std::ffi::CString;
 
     #[test]
+    fn tls_client_certificate_setter_stores_both_values() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let cert = b"client-certificate";
+            let key = b"client-private-key";
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let tls = &config.as_ref().unwrap().tls;
+            assert_eq!(tls.client_cert_pem.as_deref(), Some(cert.as_slice()));
+            assert_eq!(tls.client_key_pem.as_deref(), Some(key.as_slice()));
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn tls_client_certificate_setter_rejects_null_or_empty_values() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let cert = b"client-certificate";
+            let key = b"client-private-key";
+            let invalid_values = [
+                (std::ptr::null(), 0, key.as_ptr(), key.len()),
+                (cert.as_ptr(), 0, key.as_ptr(), key.len()),
+                (cert.as_ptr(), cert.len(), std::ptr::null(), 0),
+                (cert.as_ptr(), cert.len(), key.as_ptr(), 0),
+            ];
+
+            for (cert_ptr, cert_len, key_ptr, key_len) in invalid_values {
+                assert_eq!(
+                    kernel_session_config_set_tls_client_certificate(
+                        config, cert_ptr, cert_len, key_ptr, key_len,
+                    ),
+                    KernelStatusCode::InvalidArgument
+                );
+                let tls = &config.as_ref().unwrap().tls;
+                assert!(tls.client_cert_pem.is_none());
+                assert!(tls.client_key_pem.is_none());
+            }
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn mtls_identity_is_forwarded_when_session_opens() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            let host = CString::new("https://example.invalid").unwrap();
+            let http_path = CString::new("/sql/1.0/warehouses/test_wh").unwrap();
+            assert_eq!(
+                kernel_session_config_set_http_path(config, host.as_ptr(), http_path.as_ptr()),
+                KernelStatusCode::Success
+            );
+            let token = CString::new("dapi-test-token").unwrap();
+            assert_eq!(
+                kernel_session_config_set_auth_pat(config, token.as_ptr()),
+                KernelStatusCode::Success
+            );
+
+            // Valid PEM framing with invalid contents makes client construction
+            // fail before network I/O. Reaching this parser error proves both
+            // values travelled from TlsSpec into the kernel's TlsConfig.
+            let cert = b"-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n";
+            let key = format!(
+                "-----BEGIN {} KEY-----\ninvalid\n-----END {} KEY-----\n",
+                "PRIVATE", "PRIVATE"
+            )
+            .into_bytes();
+            assert_eq!(
+                kernel_session_config_set_tls_client_certificate(
+                    config,
+                    cert.as_ptr(),
+                    cert.len(),
+                    key.as_ptr(),
+                    key.len(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let mut session: *mut kernel_session_t = std::ptr::null_mut();
+            let status = kernel_session_open(config, &mut session);
+            assert_ne!(status, KernelStatusCode::Success);
+            assert!(session.is_null());
+
+            let mut out = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+            assert!(crate::c_abi::error::kernel_get_last_error(out.as_mut_ptr()));
+            let error = out.assume_init();
+            let message = std::ffi::CStr::from_ptr(error.message).to_str().unwrap();
+            assert!(
+                message.contains("Invalid mTLS client certificate/key"),
+                "expected mTLS identity parser error, got: {message}"
+            );
+        }
+    }
+
+    #[test]
     fn m2m_carries_scopes_and_token_endpoint_override() {
         // The additive setters must reach the built AuthConfig so an Azure SP
         // M2M config can point the client-credentials exchange at the Entra
@@ -1892,6 +2177,29 @@ mod tests {
                 token_url_override, ..
             } => assert_eq!(token_url_override.as_deref(), Some(positional)),
             other => panic!("expected OAuthM2MPrivateKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_log_level_preserves_shared_c_abi_semantics() {
+        let off = CString::new("oFf").unwrap();
+        let debug = CString::new("DEBUG").unwrap();
+        let invalid_utf8 = [0xff_u8, 0];
+
+        unsafe {
+            assert_eq!(resolve_log_level(off.as_ptr()), LogLevelResolution::Off);
+            assert_eq!(
+                resolve_log_level(debug.as_ptr()),
+                LogLevelResolution::Filter(Some("databricks::sql::kernel=debug".to_string()))
+            );
+            assert_eq!(
+                resolve_log_level(std::ptr::null()),
+                LogLevelResolution::Filter(None)
+            );
+            assert_eq!(
+                resolve_log_level(invalid_utf8.as_ptr().cast()),
+                LogLevelResolution::Filter(None)
+            );
         }
     }
 

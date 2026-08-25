@@ -1141,6 +1141,8 @@ mod tests {
                 statement_id: "mock-statement".to_string(),
                 reader: Box::new(EmptyReader::new(StdArc::new(Schema::empty()))),
                 manifest: None,
+                telemetry_result_format: crate::telemetry::ExecutionResultFormat::FormatUnspecified,
+                telemetry_is_compressed: false,
                 status: StatementStatus {
                     state: StatementState::Succeeded,
                     error: None,

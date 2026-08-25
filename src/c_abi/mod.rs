@@ -51,7 +51,24 @@ pub mod result;
 pub mod session;
 pub mod statement;
 
+use std::ffi::{c_char, c_void};
 use std::sync::OnceLock;
+
+/// Host callback invoked for one kernel log record.
+///
+/// The message contains the rendered event text and fields recorded directly
+/// on that event, not fields attached only to enclosing spans. String pointers
+/// are non-null and valid only for the duration of the callback. Delivery is
+/// synchronous on the emitting thread, and callbacks may run concurrently on
+/// multiple kernel threads. Consumers must return promptly, copy any strings
+/// they retain, and synchronize their sink. A consumer that needs asynchronous
+/// delivery can enqueue its own owned record before returning.
+pub type KernelLogCallback = unsafe extern "C" fn(
+    level: *const c_char,
+    target: *const c_char,
+    message: *const c_char,
+    user_data: *mut c_void,
+);
 
 /// Process-wide tokio runtime owned by the C ABI.
 ///

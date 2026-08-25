@@ -26,6 +26,7 @@
 
 use crate::kernel_error::Result;
 use crate::reader::ResultReader;
+use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{ExecuteParams, ResultManifest, StatementStatus};
 use async_trait::async_trait;
@@ -97,6 +98,8 @@ pub(crate) struct ExecuteResult {
     pub statement_id: String,
     pub reader: Box<dyn ResultReader + Send>,
     pub manifest: Option<ResultManifest>,
+    pub telemetry_result_format: ExecutionResultFormat,
+    pub telemetry_is_compressed: bool,
     /// Terminal status the server reported in its final response.
     ///
     /// `status.state == Closed` means the server has already cleaned
@@ -122,6 +125,8 @@ impl std::fmt::Debug for ExecuteResult {
             .field("statement_id", &self.statement_id)
             .field("reader", &"<dyn ResultReader>")
             .field("manifest", &self.manifest)
+            .field("telemetry_result_format", &self.telemetry_result_format)
+            .field("telemetry_is_compressed", &self.telemetry_is_compressed)
             .field("status", &self.status)
             .finish()
     }

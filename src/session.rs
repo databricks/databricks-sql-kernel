@@ -166,6 +166,15 @@ impl SessionInner {
         &self.runtime_handle
     }
 
+    pub(crate) fn statement_telemetry_observer(
+        &self,
+        statement_type: crate::telemetry::StatementType,
+        operation_type: OperationType,
+    ) -> crate::telemetry::StatementTelemetry {
+        self.telemetry
+            .statement_observer(statement_type, operation_type)
+    }
+
     /// Initiate the fire-and-forget server-side `DeleteSession` now,
     /// idempotently. Flips `closed` first (via a compare-and-swap) so at
     /// most one delete is ever spawned — a later `Drop` (or a second
@@ -382,11 +391,10 @@ impl Session {
             .connection()
             .emit_operation(OperationType::CreateSession, create_elapsed, None);
 
-        // 5. Tag the per-session tracing span. Future log lines
-        //    inherit `session_id` automatically. Target is pinned to the
-        //    kernel log target so the span (and any `log` record derived
-        //    from it) maps to the `databricks.sql.kernel` Python logger,
-        //    consistent with `klog` events — see `crate::klog`.
+        // 5. Tag the per-session tracing span. Span-aware subscribers such as
+        //    the file/stderr formatter attach `session_id` automatically;
+        //    host bridges that forward only event-local fields do not. Pin the
+        //    target so span-aware filtering stays consistent with `klog` events.
         let log_span = info_span!(
             target: crate::klog::KERNEL_LOG_TARGET,
             "kernel.session",
@@ -1843,10 +1851,15 @@ mod is_open_tests {
     use super::*;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{DataType, Field, Schema};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde_json::json;
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// `Session::is_open` reports true for a freshly-opened session and
@@ -2223,6 +2236,298 @@ mod is_open_tests {
             .expect("telemetry export failure must be fail-open");
     }
 
+    #[tokio::test]
+    async fn statement_execute_success_exports_terminal_statement_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-stmt-success").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_inline_body("stmt-telemetry-success", &int64_batch("n", vec![1])),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-stmt-success", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let _exec = stmt.execute().await.expect("execute succeeds");
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .expect("statement event exported");
+        let sql_log = &statement_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["session_id"], "sess-telemetry-stmt-success");
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-success");
+        assert_eq!(
+            sql_log["sql_operation"]["statement_type"], "SQL",
+            "statement telemetry should classify user SQL"
+        );
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+        assert_eq!(sql_log["sql_operation"]["is_compressed"], false);
+        assert!(
+            sql_log["sql_operation"].get("retry_count").is_none(),
+            "retry_count should be omitted until the transport reports a real value"
+        );
+        assert!(
+            sql_log["sql_operation"].get("result_latency").is_none(),
+            "Phase 3 should not emit empty result latency placeholders"
+        );
+        assert_eq!(
+            sql_log["sql_operation"]["operation_detail"]["is_internal_call"],
+            false
+        );
+        assert!(
+            sql_log["operation_latency_ms"].as_i64().unwrap_or_default() >= 0,
+            "statement event should include operation latency"
+        );
+    }
+
+    #[tokio::test]
+    async fn statement_execute_failure_exports_sanitized_error_without_sql_text() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-stmt-failure").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            failed_body(
+                "stmt-telemetry-failure",
+                "syntax failure near secret_token",
+                "42000",
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-stmt-failure", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT secret_token FROM sensitive_table");
+        let err = match stmt.execute().await {
+            Ok(_) => panic!("execute should fail"),
+            Err(err) => err,
+        };
+        assert_eq!(err.sql_state.as_deref(), Some("42000"));
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .expect("statement event exported");
+        let encoded = serde_json::to_string(&statement_log).expect("json stringify");
+        assert!(
+            !encoded.contains("SELECT secret_token FROM sensitive_table"),
+            "statement telemetry must not include SQL text"
+        );
+        let error_info = &statement_log["entry"]["sql_driver_log"]["error_info"];
+        assert_eq!(error_info["stack_trace"], "42000");
+        assert!(
+            error_info["error_name"].is_string(),
+            "sanitized error category should be present"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_statement_status_and_await_records_poll_count() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-async").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-async")).await;
+        mount_status(
+            &server,
+            "stmt-telemetry-async",
+            succeeded_inline_body("stmt-telemetry-async", &int64_batch("n", vec![1])),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-async", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let _ = async_exec.status().await.expect("status succeeds");
+        let _stream = async_exec.await_result().await.expect("await succeeds");
+        let _again = async_exec.fetch_result().await.expect("fetch succeeds");
+        session.close().await.expect("close succeeds");
+
+        let async_statement_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            async_statement_logs.len(),
+            1,
+            "repeated terminal async calls should finalize telemetry once"
+        );
+        let statement_log = &async_statement_logs[0];
+        let detail = &statement_log["entry"]["sql_driver_log"]["sql_operation"]["operation_detail"];
+        assert_eq!(
+            statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-async"
+        );
+        assert!(
+            detail["n_operation_status_calls"]
+                .as_i64()
+                .unwrap_or_default()
+                >= 2,
+            "status() plus await_result() should record status polls"
+        );
+        assert!(
+            detail["operation_status_latency_millis"]
+                .as_i64()
+                .unwrap_or_default()
+                >= 0
+        );
+    }
+
+    #[tokio::test]
+    async fn async_statement_status_failure_exports_error_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-status-failure").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-status-failure")).await;
+        mount_status(
+            &server,
+            "stmt-telemetry-status-failure",
+            failed_body(
+                "stmt-telemetry-status-failure",
+                "async status failure near secret_token",
+                "42000",
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-status-failure", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT secret_token FROM sensitive_table");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let status = async_exec.status().await.expect("status succeeds");
+        assert!(
+            matches!(status, crate::statement::StatementStatus::Failed(_)),
+            "status should surface terminal failure"
+        );
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported");
+        let encoded = serde_json::to_string(&statement_log).expect("json stringify");
+        assert!(
+            !encoded.contains("SELECT secret_token FROM sensitive_table"),
+            "statement telemetry must not include SQL text"
+        );
+        let sql_log = &statement_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-status-failure");
+        assert_eq!(sql_log["error_info"]["stack_trace"], "42000");
+    }
+
+    #[tokio::test]
+    async fn async_statement_drop_exports_terminal_statement_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-async-drop").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-async-drop")).await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session = telemetry_test_session(&server, "sess-telemetry-async-drop", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        drop(async_exec);
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported on drop");
+        let sql_log = &statement_log["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-async-drop");
+        assert!(
+            sql_log.get("error_info").is_none(),
+            "submit-and-drop should finalize as abandoned success, not as a statement error"
+        );
+    }
+
+    #[tokio::test]
+    async fn async_statement_await_poll_error_exports_error_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-await-poll-error").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-await-poll-error")).await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/sql/statements/stmt-telemetry-await-poll-error",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-await-poll-error", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let async_exec = stmt.submit().await.expect("submit succeeds");
+        let err = match async_exec.await_result().await {
+            Ok(_) => panic!("await should fail while polling status"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("Failed to parse status response"),
+            "unexpected polling error: {err}"
+        );
+        session.close().await.expect("close succeeds");
+
+        let statement_log = exported_logs(&exporter)
+            .into_iter()
+            .find(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .expect("async statement event exported");
+        assert_eq!(
+            statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-await-poll-error"
+        );
+        assert!(
+            statement_log["entry"]["sql_driver_log"]["error_info"].is_object(),
+            "polling error should be exported as statement telemetry"
+        );
+    }
+
     async fn telemetry_test_session(
         server: &MockServer,
         expected_session_id: &str,
@@ -2259,6 +2564,127 @@ mod is_open_tests {
             .respond_with(ResponseTemplate::new(200))
             .mount(server)
             .await;
+    }
+
+    async fn mount_close_any_statement(server: &MockServer) {
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/api/2\.0/sql/statements/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_execute(server: &MockServer, body: String) {
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    async fn mount_status(server: &MockServer, statement_id: &str, body: String) {
+        Mock::given(method("GET"))
+            .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
+    fn exported_logs(exporter: &CapturingTelemetryExporter) -> Vec<Value> {
+        exporter
+            .requests()
+            .into_iter()
+            .flat_map(|request| request.proto_logs)
+            .map(|log| serde_json::from_str(&log).expect("valid frontend log json"))
+            .collect()
+    }
+
+    fn operation_type(log: &Value) -> Option<&str> {
+        log["entry"]["sql_driver_log"]["sql_operation"]["operation_detail"]["operation_type"]
+            .as_str()
+    }
+
+    fn int64_batch(name: &str, values: Vec<i64>) -> RecordBatch {
+        let schema =
+            std::sync::Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+        RecordBatch::try_new(schema, vec![std::sync::Arc::new(Int64Array::from(values))])
+            .expect("valid batch")
+    }
+
+    fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
+            writer.write(batch).unwrap();
+            writer.finish().unwrap();
+        }
+        buf
+    }
+
+    fn succeeded_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+        let ipc = arrow_ipc_bytes(batch);
+        let attachment = STANDARD.encode(&ipc);
+        let columns: Vec<_> = batch
+            .schema()
+            .fields()
+            .iter()
+            .enumerate()
+            .map(|(i, f)| {
+                json!({
+                    "name": f.name(),
+                    "type_name": "BIGINT",
+                    "type_text": "BIGINT",
+                    "position": i as i32,
+                })
+            })
+            .collect();
+
+        json!({
+            "statement_id": statement_id,
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": batch.num_columns() as i32,
+                    "columns": columns,
+                },
+                "total_chunk_count": 1,
+                "total_row_count": batch.num_rows() as i64,
+                "total_byte_count": ipc.len() as i64,
+                "truncated": false,
+            },
+            "result": {
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": batch.num_rows() as i64,
+                "byte_count": ipc.len() as i64,
+                "attachment": attachment,
+            },
+        })
+        .to_string()
+    }
+
+    fn running_body(statement_id: &str) -> String {
+        json!({
+            "statement_id": statement_id,
+            "status": { "state": "RUNNING" },
+        })
+        .to_string()
+    }
+
+    fn failed_body(statement_id: &str, message: &str, sql_state: &str) -> String {
+        json!({
+            "statement_id": statement_id,
+            "status": {
+                "state": "FAILED",
+                "sql_state": sql_state,
+                "error": {
+                    "error_code": "INVALID_PARAMETER_VALUE",
+                    "message": format!("{message}. SQLSTATE: {sql_state}"),
+                }
+            },
+        })
+        .to_string()
     }
 
     #[derive(Debug)]

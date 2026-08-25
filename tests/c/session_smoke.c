@@ -173,6 +173,20 @@ static void test_proxy_and_tls_setters(void) {
   rc = kernel_session_config_set_tls_skip_hostname_verification(config, true);
   CHECK(rc == KernelStatusCode_Success, "set_tls_skip_hostname_verification succeeds");
 
+  const unsigned char client_cert[] = "client-certificate";
+  const unsigned char client_key[] = "client-private-key";
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, client_cert, sizeof(client_cert) - 1, client_key, sizeof(client_key) - 1);
+  CHECK(rc == KernelStatusCode_Success, "set_tls_client_certificate succeeds");
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, NULL, 0, client_key, sizeof(client_key) - 1);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_tls_client_certificate(NULL cert) → InvalidArgument");
+  rc = kernel_session_config_set_tls_client_certificate(
+      config, client_cert, sizeof(client_cert) - 1, NULL, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_tls_client_certificate(NULL key) → InvalidArgument");
+
   /* Retry config: a valid range (incl. max_retries=0 to disable, overall
    * timeout 0 = keep default) succeeds; a non-zero overall timeout also
    * succeeds; a zero min_wait is rejected; an inverted range (max<min) is a
@@ -259,13 +273,31 @@ static void test_client_conf_setter(void) {
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(NULL cfg) → InvalidArgument");
 }
 
-/* kernel_init_logging is idempotent and null-tolerant. */
+static void capture_log(const char* level, const char* target,
+                        const char* message, void* user_data) {
+  (void)level;
+  (void)target;
+  (void)message;
+  (void)user_data;
+}
+
+/* Logging initialization is idempotent; callback registration rejects NULL. */
 static void test_init_logging(void) {
-  KernelStatusCode rc = kernel_init_logging("WARN", NULL);
+  KernelStatusCode rc = kernel_init_logging_callback("WARN", NULL, NULL);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "init_logging_callback(NULL callback) rejects invalid input");
+
+  rc = kernel_init_logging("WARN", NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging(level, NULL file) succeeds");
   /* Second call is a no-op (subscriber already installed) but still Success. */
   rc = kernel_init_logging(NULL, NULL);
   CHECK(rc == KernelStatusCode_Success, "init_logging twice is safe");
+  /* A callback initializer AFTER a file/stderr sink already won reports that
+   * the callback was NOT installed (first initializer wins) rather than a
+   * misleading Success, so a host never believes its callback is live. */
+  rc = kernel_init_logging_callback(NULL, capture_log, NULL);
+  CHECK(rc == KernelStatusCode_Internal,
+        "init_logging_callback after file/stderr sink won → Internal (callback not installed)");
 }
 
 /* is_open null-guards its args. (The true→false behavior is covered by the
