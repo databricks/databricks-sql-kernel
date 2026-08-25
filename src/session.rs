@@ -1852,7 +1852,7 @@ mod is_open_tests {
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
     use crate::ResultBatch;
-    use arrow_array::{Int64Array, RecordBatch, StringArray};
+    use arrow_array::{BooleanArray, Int64Array, RecordBatch, StringArray};
     use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field, Schema};
     use base64::{engine::general_purpose::STANDARD, Engine};
@@ -1860,7 +1860,7 @@ mod is_open_tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::matchers::{body_string_contains, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     /// `Session::is_open` reports true for a freshly-opened session and
@@ -2735,6 +2735,139 @@ mod is_open_tests {
     }
 
     #[tokio::test]
+    async fn metadata_list_tables_fanout_exports_one_synthetic_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-tables-fanout").await;
+        mount_close_any_statement(&server).await;
+        mount_execute_for_sql(
+            &server,
+            "SHOW CATALOGS",
+            succeeded_typed_inline_body(
+                "stmt-telemetry-tables-catalogs",
+                &string_batch("catalog", vec!["cat_a", "cat_b", "other"]),
+            ),
+        )
+        .await;
+        mount_execute_for_sql(
+            &server,
+            "SHOW TABLES IN CATALOG `cat_a`",
+            succeeded_typed_inline_body(
+                "stmt-telemetry-tables-cat-a",
+                &server_tables_batch(vec![("s1", "t1", "cat_a", "TABLE")]),
+            ),
+        )
+        .await;
+        mount_execute_for_sql(
+            &server,
+            "SHOW TABLES IN CATALOG `cat_b`",
+            succeeded_typed_inline_body(
+                "stmt-telemetry-tables-cat-b",
+                &server_tables_batch(vec![("s2", "v1", "cat_b", "VIEW")]),
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-tables-fanout", telemetry).await;
+
+        let catalog_pattern =
+            crate::metadata_v0::LikePattern::new("cat\\_%").expect("valid catalog pattern");
+        let mut stream = session
+            .metadata()
+            .list_tables(Some(catalog_pattern), None, None, None)
+            .await
+            .expect("list_tables fan-out succeeds");
+        assert!(stream.next_batch().await.expect("first batch").is_some());
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("stream exhausted")
+            .is_none());
+        drop(stream);
+        session.close().await.expect("close succeeds");
+
+        let logs = exported_logs(&exporter);
+        let list_tables_logs = logs
+            .iter()
+            .filter(|log| operation_type(log) == Some("LIST_TABLES"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            list_tables_logs.len(),
+            1,
+            "fan-out should export exactly one synthetic LIST_TABLES event"
+        );
+        assert!(
+            logs.iter()
+                .all(|log| operation_type(log) != Some("LIST_CATALOGS")),
+            "internal catalog enumeration should use noop telemetry"
+        );
+        let sql_log = &list_tables_logs[0]["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+        assert!(
+            sql_log.get("sql_statement_id").is_none(),
+            "merged fan-out result has no single server statement id"
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_list_tables_single_catalog_exports_server_result_metadata() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-tables-single").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_typed_inline_body(
+                "stmt-telemetry-tables-single",
+                &server_tables_batch(vec![("default", "t1", "main", "TABLE")]),
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-tables-single", telemetry).await;
+
+        let catalog = crate::metadata_v0::LikePattern::new("main").expect("valid catalog pattern");
+        let mut stream = session
+            .metadata()
+            .list_tables(Some(catalog), None, None, None)
+            .await
+            .expect("list_tables single catalog succeeds");
+        assert!(stream.next_batch().await.expect("first batch").is_some());
+        assert!(stream
+            .next_batch()
+            .await
+            .expect("stream exhausted")
+            .is_none());
+        drop(stream);
+        session.close().await.expect("close succeeds");
+
+        let list_tables_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("LIST_TABLES"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            list_tables_logs.len(),
+            1,
+            "single-catalog path should export one LIST_TABLES event"
+        );
+        let sql_log = &list_tables_logs[0]["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-tables-single");
+        assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+    }
+
+    #[tokio::test]
     async fn metadata_argument_error_exports_sanitized_error_telemetry() {
         let server = MockServer::start().await;
         mount_session_create_delete(&server, "sess-telemetry-metadata-error").await;
@@ -2871,6 +3004,15 @@ mod is_open_tests {
             .await;
     }
 
+    async fn mount_execute_for_sql(server: &MockServer, sql_substr: &str, body: String) {
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_string_contains(sql_substr))
+            .respond_with(ResponseTemplate::new(200).set_body_string(body))
+            .mount(server)
+            .await;
+    }
+
     async fn mount_status(server: &MockServer, statement_id: &str, body: String) {
         Mock::given(method("GET"))
             .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
@@ -2907,6 +3049,36 @@ mod is_open_tests {
             .expect("valid batch")
     }
 
+    fn server_tables_batch(rows: Vec<(&str, &str, &str, &str)>) -> RecordBatch {
+        let schema = std::sync::Arc::new(Schema::new(vec![
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("tableName", DataType::Utf8, false),
+            Field::new("isTemporary", DataType::Boolean, false),
+            Field::new("information", DataType::Utf8, true),
+            Field::new("catalogName", DataType::Utf8, false),
+            Field::new("tableType", DataType::Utf8, false),
+            Field::new("remarks", DataType::Utf8, true),
+        ]));
+        let namespaces = rows.iter().map(|row| row.0).collect::<Vec<_>>();
+        let table_names = rows.iter().map(|row| row.1).collect::<Vec<_>>();
+        let catalog_names = rows.iter().map(|row| row.2).collect::<Vec<_>>();
+        let table_types = rows.iter().map(|row| row.3).collect::<Vec<_>>();
+        let row_count = rows.len();
+        RecordBatch::try_new(
+            schema,
+            vec![
+                std::sync::Arc::new(StringArray::from(namespaces)),
+                std::sync::Arc::new(StringArray::from(table_names)),
+                std::sync::Arc::new(BooleanArray::from(vec![false; row_count])),
+                std::sync::Arc::new(StringArray::from(vec![Some(""); row_count])),
+                std::sync::Arc::new(StringArray::from(catalog_names)),
+                std::sync::Arc::new(StringArray::from(table_types)),
+                std::sync::Arc::new(StringArray::from(vec![Some(""); row_count])),
+            ],
+        )
+        .expect("valid server tables batch")
+    }
+
     fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
         let mut buf = Vec::new();
         {
@@ -2918,6 +3090,23 @@ mod is_open_tests {
     }
 
     fn succeeded_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+        succeeded_inline_body_with_column_types(statement_id, batch, |_| ("BIGINT", "BIGINT"))
+    }
+
+    fn succeeded_typed_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+        succeeded_inline_body_with_column_types(statement_id, batch, |data_type| match data_type {
+            DataType::Boolean => ("BOOLEAN", "BOOLEAN"),
+            DataType::Int64 => ("BIGINT", "BIGINT"),
+            DataType::Utf8 => ("STRING", "STRING"),
+            other => panic!("test helper does not map Arrow type {other:?}"),
+        })
+    }
+
+    fn succeeded_inline_body_with_column_types(
+        statement_id: &str,
+        batch: &RecordBatch,
+        column_type: impl Fn(&DataType) -> (&'static str, &'static str),
+    ) -> String {
         let ipc = arrow_ipc_bytes(batch);
         let attachment = STANDARD.encode(&ipc);
         let columns: Vec<_> = batch
@@ -2926,10 +3115,11 @@ mod is_open_tests {
             .iter()
             .enumerate()
             .map(|(i, f)| {
+                let (type_name, type_text) = column_type(f.data_type());
                 json!({
                     "name": f.name(),
-                    "type_name": "BIGINT",
-                    "type_text": "BIGINT",
+                    "type_name": type_name,
+                    "type_text": type_text,
                     "position": i as i32,
                 })
             })
