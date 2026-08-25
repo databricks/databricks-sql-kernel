@@ -39,11 +39,6 @@ license = "Apache-2.0"
 description = "PyO3 Python bindings for the Databricks SQL Kernel"
 repository = "https://github.com/databricks/databricks-sql-kernel"
 
-[features]
-# Unit-test binaries must link libpython. Maturin enables this feature only
-# when building the extension module, where Python provides the symbols.
-extension-module = ["pyo3/extension-module"]
-
 # Built as a Python extension module by maturin. The lib basename here
 # only affects the intermediate `.so` cargo produces; maturin renames
 # the wheel artifact to `databricks_sql_kernel.<abi>.so` per
@@ -59,6 +54,13 @@ extension-module = ["pyo3/extension-module"]
 [lib]
 name = "databricks_sql_kernel_pyo3"
 crate-type = ["cdylib", "rlib"]
+
+[features]
+# Keep `extension-module` off for plain `cargo test`: PyO3 intentionally
+# suppresses libpython linking for extension modules on Unix, which breaks the
+# Rust test binary. `pyo3/pyproject.toml` enables this feature for maturin wheel
+# builds, where the symbols are resolved by the loading Python interpreter.
+extension-module = ["pyo3/extension-module"]
 
 [dependencies]
 # Disable the kernel's `default` feature (which selects `tls-native`)
