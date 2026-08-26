@@ -602,8 +602,6 @@ impl ExecutedAsyncStatement {
                 }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
-                self.result_stream_owns_success_telemetry
-                    .store(true, Ordering::Release);
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
@@ -617,6 +615,8 @@ impl ExecutedAsyncStatement {
                         }
                     }
                 }
+                self.result_stream_owns_success_telemetry
+                    .store(true, Ordering::Release);
                 Ok(stream)
             }
             None => {
