@@ -69,10 +69,6 @@ pub struct TypedValueInput {
 
 /// A pre-marshalled SEA parameter that preserves `sql_type` verbatim.
 /// Omit `name` for positional markers; the kernel assigns their ordinals.
-#[allow(
-    dead_code,
-    reason = "exported via napi macro codegen; not called from Rust"
-)]
 #[napi(object)]
 pub struct RawParameterInput {
     /// Named marker name. Omit for a positional marker.
