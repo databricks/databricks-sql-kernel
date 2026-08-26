@@ -1801,8 +1801,12 @@ lGrv15pBcePj
                 .await
                 .expect("idempotent request should recover after a dropped connection");
             assert_eq!(response.text().await.unwrap(), "ok");
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                2,
+                "server must observe the retry before its task is awaited"
+            );
             server.await.unwrap();
-            assert_eq!(accepted.load(Ordering::SeqCst), 2);
         }
 
         #[tokio::test]
@@ -1845,8 +1849,12 @@ lGrv15pBcePj
                 .await
                 .expect("idempotent request should recover after its deadline");
             assert_eq!(response.text().await.unwrap(), "ok");
+            assert_eq!(
+                accepted.load(Ordering::SeqCst),
+                2,
+                "server must observe the retry before its task is awaited"
+            );
             server.await.unwrap();
-            assert_eq!(accepted.load(Ordering::SeqCst), 2);
         }
 
         #[tokio::test]
