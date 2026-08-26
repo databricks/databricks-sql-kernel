@@ -264,10 +264,13 @@ mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
     use crate::reader::test_utils::ErrorReader;
+    use crate::reader::{ResultReader, ResultReaderMetrics};
     use crate::result_stream::ResultStream;
     use crate::telemetry::models::OperationType;
     use crate::telemetry::runtime::{ConnectionTelemetry, TelemetrySessionContext};
+    use arrow_array::RecordBatch;
     use arrow_schema::Schema;
+    use async_trait::async_trait;
     use std::future::Future;
     use std::pin::Pin;
 
@@ -316,6 +319,25 @@ mod tests {
         }
     }
 
+    struct MetricsReader {
+        metrics: ResultReaderMetrics,
+    }
+
+    #[async_trait]
+    impl ResultReader for MetricsReader {
+        async fn schema(&self) -> crate::Result<crate::result_stream::SchemaRef> {
+            Ok(Arc::new(Schema::empty()))
+        }
+
+        async fn next_batch(&mut self) -> crate::Result<Option<RecordBatch>> {
+            Ok(None)
+        }
+
+        fn metrics(&self) -> Option<ResultReaderMetrics> {
+            Some(self.metrics)
+        }
+    }
+
     #[tokio::test]
     async fn peek_first_batch_error_finalizes_statement_with_error_before_drop() {
         let connection = Arc::new(CapturingConnectionTelemetry::default());
@@ -353,6 +375,55 @@ mod tests {
         assert!(
             event.context.consumption_latency.is_some(),
             "failed consumption should still record result-consumption latency"
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_result_stream_finalizes_with_reader_metrics() {
+        let connection = Arc::new(CapturingConnectionTelemetry::default());
+        let telemetry = StatementTelemetry::new(
+            connection.clone(),
+            StatementType::Sql,
+            OperationType::ExecuteStatement,
+        );
+        let metrics = ResultReaderMetrics {
+            total_chunks_present: Some(5),
+            total_chunks_iterated: Some(2),
+            initial_chunk_latency: Some(Duration::from_millis(11)),
+            slowest_chunk_latency: Some(Duration::from_millis(29)),
+            sum_chunks_download_time: Some(Duration::from_millis(40)),
+        };
+        let mut stream = ResultStream::from_reader(Box::new(MetricsReader { metrics }))
+            .await
+            .expect("schema succeeds");
+        stream.attach_telemetry(telemetry);
+
+        drop(stream);
+
+        let events = connection.statement_events.lock().expect("events mutex");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        let chunk_metrics = event
+            .context
+            .chunk_metrics
+            .expect("drop should include reader metrics");
+        assert_eq!(chunk_metrics.total_chunks_present, Some(5));
+        assert_eq!(chunk_metrics.total_chunks_iterated, Some(2));
+        assert_eq!(
+            chunk_metrics.initial_chunk_latency,
+            Some(Duration::from_millis(11))
+        );
+        assert_eq!(
+            chunk_metrics.slowest_chunk_latency,
+            Some(Duration::from_millis(29))
+        );
+        assert_eq!(
+            chunk_metrics.sum_chunks_download_time,
+            Some(Duration::from_millis(40))
+        );
+        assert!(
+            event.context.consumption_latency.is_some(),
+            "drop should still record consumption latency"
         );
     }
 }

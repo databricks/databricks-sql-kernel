@@ -440,7 +440,7 @@ pub struct ResultStream {
     /// directly. No `block_on` is performed anywhere on this path, so
     /// `ResultStream::next_batch` is safe to `.await` from any tokio
     /// runtime (including napi-rs's).
-    reader: Box<dyn ResultReader>,
+    reader: Option<Box<dyn ResultReader>>,
 
     /// Cached schema. Filled in eagerly by
     /// [`ResultStream::from_reader`] (which is `async` because pulling
@@ -532,12 +532,6 @@ impl ResultStreamTelemetry {
     }
 }
 
-impl Drop for ResultStreamTelemetry {
-    fn drop(&mut self) {
-        self.finish(None, None);
-    }
-}
-
 /// Fire-and-forget `CloseStatement`-on-Drop for a server statement that
 /// no other handle owns (the metadata path). Mirrors the
 /// `ExecutedStatement` Drop cleanup, scoped to the bare-stream case.
@@ -584,7 +578,7 @@ impl ResultStream {
     pub(crate) async fn from_reader(reader: Box<dyn ResultReader>) -> Result<Self> {
         let schema = reader.schema().await?;
         Ok(Self {
-            reader,
+            reader: Some(reader),
             schema,
             current: None,
             prefetched: None,
@@ -626,6 +620,10 @@ impl ResultStream {
         self.telemetry = Some(ResultStreamTelemetry::new(telemetry));
     }
 
+    fn reader_metrics(&self) -> Option<ResultReaderMetrics> {
+        self.reader.as_ref().and_then(|reader| reader.metrics())
+    }
+
     /// Result schema. Available before any batches have been pulled.
     /// Returns a cheap-clone `Arc<Schema>` so callers can hold the
     /// schema independently of the stream (the FFI layer needs this
@@ -665,12 +663,17 @@ impl ResultStream {
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
+            let metrics = self.reader_metrics();
             if let Some(telemetry) = &mut self.telemetry {
-                telemetry.finish(self.reader.metrics(), None);
+                telemetry.finish(metrics, None);
             }
             return Ok(None);
         }
-        match self.reader.next_batch().await {
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("ResultStream reader is present until into_owned_batches consumes it");
+        match reader.next_batch().await {
             Ok(Some(rb)) => {
                 self.current = Some(ResultBatch::Arrow(rb));
                 self.current_row_idx = 0;
@@ -683,14 +686,16 @@ impl ResultStream {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
+                let metrics = self.reader_metrics();
                 if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.finish(self.reader.metrics(), None);
+                    telemetry.finish(metrics, None);
                 }
                 Ok(None)
             }
             Err(e) => {
+                let metrics = self.reader_metrics();
                 if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.finish(self.reader.metrics(), Some(&e));
+                    telemetry.finish(metrics, Some(&e));
                 }
                 Err(e)
             }
@@ -708,12 +713,17 @@ impl ResultStream {
     /// terminal result at statement-construction time.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
-            match self.reader.next_batch().await {
+            let reader = self
+                .reader
+                .as_mut()
+                .expect("ResultStream reader is present until into_owned_batches consumes it");
+            match reader.next_batch().await {
                 Ok(Some(rb)) => self.prefetched = Some(ResultBatch::Arrow(rb)),
                 Ok(None) => self.exhausted = true,
                 Err(e) => {
+                    let metrics = self.reader_metrics();
                     if let Some(telemetry) = &mut self.telemetry {
-                        telemetry.finish(self.reader.metrics(), Some(&e));
+                        telemetry.finish(metrics, Some(&e));
                     }
                     return Err(e);
                 }
@@ -807,16 +817,28 @@ impl ResultStream {
     /// while still letting in-memory readers iterate without a tokio
     /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
-    pub fn into_owned_batches(self) -> OwnedBatchIter {
+    pub fn into_owned_batches(mut self) -> OwnedBatchIter {
         // Preserve a peeked-but-not-yet-consumed first batch: it was
         // pulled from the reader, so it must be yielded ahead of the
         // reader's remaining batches or it would be silently dropped.
-        let prefetched = self.prefetched.map(|ResultBatch::Arrow(rb)| rb);
+        let prefetched = self.prefetched.take().map(|ResultBatch::Arrow(rb)| rb);
         OwnedBatchIter {
-            reader: self.reader,
+            reader: self
+                .reader
+                .take()
+                .expect("ResultStream reader is present until into_owned_batches consumes it"),
             prefetched,
-            telemetry: self.telemetry,
+            telemetry: self.telemetry.take(),
             done: false,
+        }
+    }
+}
+
+impl Drop for ResultStream {
+    fn drop(&mut self) {
+        let metrics = self.reader_metrics();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(metrics, None);
         }
     }
 }
