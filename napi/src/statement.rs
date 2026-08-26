@@ -486,8 +486,10 @@ impl Statement {
                 guard.take()
             };
             match inner_state {
-                Some(AnyInner::Executed(s)) => {
-                    s.executed.close().await.map_err(napi_err_from_kernel)?;
+                Some(AnyInner::Executed(mut s)) => {
+                    ExecutedStatement::close(&mut s.executed)
+                        .await
+                        .map_err(napi_err_from_kernel)?;
                     // _parent drops here, after close has resolved.
                 }
                 // Metadata stream: just drop it.

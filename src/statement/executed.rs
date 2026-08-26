@@ -151,6 +151,46 @@ impl ExecutedStatement {
         Ok(None)
     }
 
+    /// Explicit close for concrete sync statements.
+    ///
+    /// This finalizes result-stream telemetry before the server-side
+    /// `CloseStatement` RPC so partial-result closes emit the same terminal
+    /// statement event as full result exhaustion.
+    pub async fn close(&mut self) -> Result<()> {
+        self.result_stream.finish_telemetry();
+        self.close_server_statement().await
+    }
+
+    async fn close_server_statement(&self) -> Result<()> {
+        // Idempotent on success: a prior successful close sets
+        // `closed=true` and subsequent calls short-circuit.
+        //
+        // On wire failure we deliberately keep `closed=false` so that
+        // `Drop`'s fire-and-forget retry path runs as a fallback —
+        // otherwise a transient close failure would silently leak the
+        // server-side statement until session expiry. Mirrors
+        // `Session::close`.
+        //
+        // The `&self` signature allows two callers to race and both
+        // hit the wire. The server-side close is idempotent (it
+        // returns the same Ok for duplicate close_statement calls),
+        // so the only cost of the race is one redundant RPC — far
+        // better than dropping the retry contract.
+        async {
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            self.session
+                .transport()
+                .close_statement(&self.statement_id)
+                .await?;
+            self.closed.store(true, Ordering::Release);
+            Ok(())
+        }
+        .instrument(self.session.log_span().clone())
+        .await
+    }
+
     /// Spawn a fire-and-forget `CloseStatement` unless the statement is
     /// already closed (`closed` flag). Shared by [`Self::next_batch`]'s
     /// auto-close-on-drain and `Drop`. The `swap` makes whichever fires
@@ -297,33 +337,7 @@ impl ExecutedStatementHandle for ExecutedStatement {
     }
 
     async fn close(&self) -> Result<()> {
-        // Idempotent on success: a prior successful close sets
-        // `closed=true` and subsequent calls short-circuit.
-        //
-        // On wire failure we deliberately keep `closed=false` so that
-        // `Drop`'s fire-and-forget retry path runs as a fallback —
-        // otherwise a transient close failure would silently leak the
-        // server-side statement until session expiry. Mirrors
-        // `Session::close`.
-        //
-        // The `&self` signature allows two callers to race and both
-        // hit the wire. The server-side close is idempotent (it
-        // returns the same Ok for duplicate close_statement calls),
-        // so the only cost of the race is one redundant RPC — far
-        // better than dropping the retry contract.
-        async {
-            if self.closed.load(Ordering::Acquire) {
-                return Ok(());
-            }
-            self.session
-                .transport()
-                .close_statement(&self.statement_id)
-                .await?;
-            self.closed.store(true, Ordering::Release);
-            Ok(())
-        }
-        .instrument(self.session.log_span().clone())
-        .await
+        self.close_server_statement().await
     }
 }
 

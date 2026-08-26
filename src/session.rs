@@ -2274,6 +2274,50 @@ mod is_open_tests {
     }
 
     #[tokio::test]
+    async fn statement_close_after_partial_fetch_exports_terminal_statement_event() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-stmt-partial-close").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            succeeded_inline_body("stmt-telemetry-partial-close", &int64_batch("n", vec![1])),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-stmt-partial-close", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute succeeds");
+        assert!(exec.next_batch().await.expect("first batch").is_some());
+        exec.close().await.expect("statement close succeeds");
+        session.close().await.expect("close succeeds");
+
+        let statement_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("EXECUTE_STATEMENT"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            statement_logs.len(),
+            1,
+            "partial close should emit exactly one statement telemetry event"
+        );
+        let sql_log = &statement_logs[0]["entry"]["sql_driver_log"];
+        assert_eq!(sql_log["sql_statement_id"], "stmt-telemetry-partial-close");
+        assert_eq!(sql_log["sql_operation"]["execution_result"], "INLINE_ARROW");
+        assert!(
+            sql_log["sql_operation"]["result_latency"].is_object(),
+            "partial close should record result latency"
+        );
+    }
+
+    #[tokio::test]
     async fn statement_execute_failure_exports_sanitized_error_without_sql_text() {
         let server = MockServer::start().await;
         mount_session_create_delete(&server, "sess-telemetry-stmt-failure").await;
