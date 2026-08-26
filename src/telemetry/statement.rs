@@ -62,8 +62,8 @@ impl StatementTelemetry {
         self.observer.record_poll(elapsed);
     }
 
-    pub(crate) fn record_result_batch(&self, rows: usize) {
-        self.observer.record_result_batch(rows);
+    pub(crate) fn record_result_batch(&self) {
+        self.observer.record_result_batch();
     }
 
     pub(crate) fn record_result_consumed(&self) {
@@ -83,7 +83,7 @@ pub(super) trait StatementOperationObserver: Send + Sync {
     fn on_statement_submitted(&self, statement_id: &str);
     fn on_result_metadata(&self, result_format: ExecutionResultFormat, is_compressed: bool);
     fn record_poll(&self, elapsed: Duration);
-    fn record_result_batch(&self, rows: usize);
+    fn record_result_batch(&self);
     fn record_result_consumed(&self);
     fn record_chunk_metrics(&self, metrics: ChunkMetrics);
     fn finalize(&self, error: Option<&KernelError>);
@@ -123,8 +123,6 @@ pub(crate) struct StatementTelemetryContext {
     pub poll_latency: Duration,
     pub first_batch_latency: Option<Duration>,
     pub consumption_latency: Option<Duration>,
-    pub result_batch_count: i32,
-    pub result_row_count: i64,
     pub chunk_metrics: Option<ChunkMetrics>,
 }
 
@@ -161,8 +159,6 @@ impl TelemetryObserver {
                     poll_latency: Duration::ZERO,
                     first_batch_latency: None,
                     consumption_latency: None,
-                    result_batch_count: 0,
-                    result_row_count: 0,
                     chunk_metrics: None,
                 },
             }),
@@ -192,16 +188,11 @@ impl StatementOperationObserver for TelemetryObserver {
         }
     }
 
-    fn record_result_batch(&self, rows: usize) {
+    fn record_result_batch(&self) {
         if let Ok(mut state) = self.state.lock() {
             if state.context.first_batch_latency.is_none() {
                 state.context.first_batch_latency = Some(state.started_at.elapsed());
             }
-            state.context.result_batch_count = state.context.result_batch_count.saturating_add(1);
-            state.context.result_row_count = state
-                .context
-                .result_row_count
-                .saturating_add(rows.try_into().unwrap_or(i64::MAX));
         }
     }
 
@@ -246,7 +237,7 @@ impl StatementOperationObserver for NoOpObserver {
 
     fn record_poll(&self, _elapsed: Duration) {}
 
-    fn record_result_batch(&self, _rows: usize) {}
+    fn record_result_batch(&self) {}
 
     fn record_result_consumed(&self) {}
 

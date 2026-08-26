@@ -506,12 +506,12 @@ impl ResultStreamTelemetry {
 
     fn record_batch(&self, batch: &ResultBatch) {
         match batch {
-            ResultBatch::Arrow(batch) => self.record_rows(batch.num_rows()),
+            ResultBatch::Arrow(_) => self.record_result_batch(),
         }
     }
 
-    fn record_rows(&self, rows: usize) {
-        self.telemetry.record_result_batch(rows);
+    fn record_result_batch(&self) {
+        self.telemetry.record_result_batch();
     }
 
     fn finish(&mut self, metrics: Option<ResultReaderMetrics>, error: Option<&Error>) {
@@ -872,7 +872,7 @@ impl Iterator for OwnedBatchIter {
         }
         if let Some(batch) = self.prefetched.take() {
             if let Some(telemetry) = &self.telemetry {
-                telemetry.record_rows(batch.num_rows());
+                telemetry.record_result_batch();
             }
             return Some(Ok(batch));
         }
@@ -886,7 +886,7 @@ impl Iterator for OwnedBatchIter {
         match crate::util::runtime::block_on_current_runtime(self.reader.next_batch()) {
             Ok(Some(batch)) => {
                 if let Some(telemetry) = &self.telemetry {
-                    telemetry.record_rows(batch.num_rows());
+                    telemetry.record_result_batch();
                 }
                 Some(Ok(batch))
             }
