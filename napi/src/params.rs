@@ -66,3 +66,15 @@ pub struct TypedValueInput {
     /// `VoidParameter` shape and the pyo3 binding's contract.
     pub value: Option<String>,
 }
+
+/// A pre-marshalled SEA parameter that preserves `sql_type` verbatim.
+/// Omit `name` for positional markers; the kernel assigns their ordinals.
+#[napi(object)]
+pub struct RawParameterInput {
+    /// Named marker name. Omit for a positional marker.
+    pub name: Option<String>,
+    /// Databricks SQL type name sent verbatim to SEA.
+    pub sql_type: String,
+    /// String-encoded value. `None` represents SQL NULL.
+    pub value: Option<String>,
+}

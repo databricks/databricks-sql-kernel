@@ -35,7 +35,7 @@ use databricks_sql_kernel::{Error as KernelError, Session, TypedValue};
 
 use crate::async_statement::AsyncStatement;
 use crate::error::napi_err_from_kernel;
-use crate::params::{parse_typed_value, TypedValueInput};
+use crate::params::{parse_typed_value, RawParameterInput, TypedValueInput};
 use crate::runtime;
 use crate::statement::Statement;
 use crate::util::guarded;
@@ -56,6 +56,7 @@ use crate::util::guarded;
 /// `rowLimit` (SEA `row_limit`) is exposed here and threaded onto the kernel
 /// `StatementSpec`. `positionalParams` (`?`) and `namedParams` (`:name`)
 /// carry bound query parameters, decoded via `params::parse_typed_value`.
+/// `rawParams` forwards pre-marshalled SEA parameters unchanged.
 /// (There is no `queryTimeoutSecs`: it abused the SEA `wait_timeout` inline-hold
 /// window and was removed — a real per-statement timeout is `STATEMENT_TIMEOUT`.)
 ///
@@ -115,6 +116,10 @@ pub struct ExecuteOptions {
     /// positional is the documented-undocumented variant. The two are
     /// mutually exclusive at the SQL level (`?` vs `:name`).
     pub named_params: Option<Vec<NamedTypedValueInput>>,
+    /// Pre-marshalled parameters passed through `StatementSpec::param_raw`.
+    /// Omit `name` for positional values. Raw parameters cannot be mixed with
+    /// typed parameters or combine named and positional markers.
+    pub raw_params: Option<Vec<RawParameterInput>>,
 }
 
 /// A named bound parameter — a [`TypedValueInput`] plus its `:name`. Kept a
@@ -187,6 +192,7 @@ fn build_statement(
     row_limit: Option<i64>,
     positional_params: Vec<TypedValue>,
     named_params: Vec<(String, TypedValue)>,
+    raw_params: Vec<RawParameterInput>,
 ) -> napi::Result<databricks_sql_kernel::Statement> {
     // Positional/named mutual-exclusivity is enforced in the kernel's
     // `build_execute_params` (StatementSpec dispatch), so every binding
@@ -220,6 +226,10 @@ fn build_statement(
         stmt.spec()
             .param_named(name, value)
             .map_err(napi_err_from_kernel)?;
+    }
+    // Preserve exact SQL types through the raw binder.
+    for raw in raw_params {
+        stmt.spec().param_raw(raw.name, raw.sql_type, raw.value);
     }
     Ok(stmt)
 }
@@ -300,6 +310,10 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
+        let raw_params = options
+            .as_mut()
+            .and_then(|o| o.raw_params.take())
+            .unwrap_or_default();
         // Pull the explicit `statement_conf` map and the `query_tags`
         // convenience map out of `options`. The kernel `StatementSpec`
         // owns the merge + serialisation: set the explicit conf first,
@@ -330,6 +344,7 @@ impl Connection {
                     row_limit,
                     positional_params,
                     named_params,
+                    raw_params,
                 )?
                 // session lock released here
             };
@@ -384,6 +399,10 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
+        let raw_params = options
+            .as_mut()
+            .and_then(|o| o.raw_params.take())
+            .unwrap_or_default();
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
         guarded(async move {
@@ -398,6 +417,7 @@ impl Connection {
                     row_limit,
                     positional_params,
                     named_params,
+                    raw_params,
                 )?
             };
 
@@ -452,6 +472,10 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
+        let raw_params = options
+            .as_mut()
+            .and_then(|o| o.raw_params.take())
+            .unwrap_or_default();
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
         guarded(async move {
@@ -473,6 +497,7 @@ impl Connection {
                     row_limit,
                     positional_params,
                     named_params,
+                    raw_params,
                 )?
                 // session lock released here
             };
@@ -520,6 +545,10 @@ impl Connection {
             .map(decode_named_params)
             .transpose()?
             .unwrap_or_default();
+        let raw_params = options
+            .as_mut()
+            .and_then(|o| o.raw_params.take())
+            .unwrap_or_default();
         // Same conf + query_tags plumbing as `execute_statement`: the
         // kernel `StatementSpec` owns the merge + serialisation.
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
@@ -546,6 +575,7 @@ impl Connection {
                     row_limit,
                     positional_params,
                     named_params,
+                    raw_params,
                 )?
                 // session lock released here
             };
@@ -621,6 +651,10 @@ impl Drop for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // The closed-state error shape pins the TS adapter's reviver
     // contract — a future maintainer who switches back to raw
@@ -666,5 +700,120 @@ mod tests {
             session_id: "session-survives-close".to_owned(),
         };
         assert_eq!(conn.session_id(), "session-survives-close");
+    }
+
+    #[tokio::test]
+    async fn build_statement_forwards_raw_params_and_rejects_mixed_binding() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({ "session_id": "sess-napi-raw" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "status": {
+                    "state": "FAILED",
+                    "sql_state": "22023",
+                    "error": {
+                        "error_code": "INVALID_PARAMETER_VALUE",
+                        "message": "expected test failure. SQLSTATE: 22023"
+                    }
+                }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-napi-raw"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid HTTP path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session opens against mock server");
+
+        let raw = || RawParameterInput {
+            name: None,
+            sql_type: "INTERVAL MONTH".into(),
+            value: Some("13".into()),
+        };
+        let mut raw_stmt = build_statement(
+            &session,
+            "SELECT ?".into(),
+            None,
+            None,
+            None,
+            vec![],
+            vec![],
+            vec![raw()],
+        )
+        .expect("raw statement builds");
+        let dispatched_err = raw_stmt
+            .execute()
+            .await
+            .err()
+            .expect("mock returns a terminal SQL error");
+        assert_eq!(dispatched_err.code, ErrorCode::SqlError);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let statement_requests: Vec<_> = requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/statements"
+            })
+            .collect();
+        assert_eq!(statement_requests.len(), 1);
+        let body: serde_json::Value =
+            serde_json::from_slice(&statement_requests[0].body).expect("statement request is JSON");
+        assert_eq!(
+            body["parameters"],
+            json!([{ "ordinal": 1, "type": "INTERVAL MONTH", "value": "13" }])
+        );
+
+        let mut mixed_stmt = build_statement(
+            &session,
+            "SELECT ?".into(),
+            None,
+            None,
+            None,
+            vec![TypedValue::Int32(1)],
+            vec![],
+            vec![raw()],
+        )
+        .expect("mixed statement builds before dispatch validation");
+        let mixed_err = mixed_stmt
+            .execute()
+            .await
+            .err()
+            .expect("raw and typed params must be rejected");
+        assert_eq!(mixed_err.code, ErrorCode::InvalidArgument);
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path() == "/api/2.0/sql/statements"
+                })
+                .count(),
+            1,
+            "mixed binding must fail before a second request"
+        );
+
+        session.close().await.expect("session closes");
     }
 }

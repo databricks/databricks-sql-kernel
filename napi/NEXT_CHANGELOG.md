@@ -15,6 +15,10 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- Added `ExecuteOptions.rawParams`, allowing Node.js callers to preserve
+  pre-marshalled SQL type names such as `INTERVAL MONTH` and `INTERVAL DAY`
+  instead of collapsing them through `TypedValue::Interval`.
+
 ### Changed
 
 ### Updated
