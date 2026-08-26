@@ -516,11 +516,10 @@ impl Session {
     }
 
     /// Initiate the fire-and-forget server-side `DeleteSession` now,
-    /// without awaiting it or consuming `self`. Idempotent. Used by the C
-    /// ABI's `kernel_session_close` so the delete is initiated on close
-    /// even when child handles still hold `Arc<SessionInner>` clones
-    /// (otherwise it would be deferred until the last handle drops). For
-    /// an awaitable close that surfaces failure, use [`Session::close`].
+    /// without awaiting it or consuming `self`. Idempotent. Used by `Drop`
+    /// paths so cleanup is initiated even when close cannot be awaited. For an
+    /// awaitable close that surfaces failure and flushes telemetry, use
+    /// [`Session::close`].
     pub(crate) fn initiate_delete(&self) {
         self.inner.initiate_delete();
     }

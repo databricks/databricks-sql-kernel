@@ -56,12 +56,11 @@
  * - **A result stream borrows its executed handle.** Closing the executed
  *   handle invalidates any stream obtained from it: subsequent stream
  *   calls return `InvalidStatementHandle` (a defined error, not UB).
- * - **Close is best-effort async.** `kernel_session_close` initiates the
- *   server-side delete before returning — a detached task runs it on the
- *   kernel's process-wide runtime — but does not wait for completion. A
- *   process that exits immediately after `kernel_session_close` may drop
- *   the detached task before it runs, leaving the server session to expire
- *   on its own idle timeout.
+ * - **Close is awaited.** `kernel_session_close` waits for the server-side
+ *   delete to complete and flushes close-session telemetry before returning.
+ *   If close fails, the kernel still schedules best-effort cleanup when the
+ *   consumed session handle is dropped, but the status code reports the
+ *   awaited close failure to the caller.
  * - **Close the session LAST.** Because close initiates the server-side
  *   delete, any handle still open against that session — a statement /
  *   executed handle, or a metadata result stream (which holds its own

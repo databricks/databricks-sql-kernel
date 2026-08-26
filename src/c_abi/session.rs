@@ -1624,9 +1624,8 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
     })
 }
 
-/// Close a session. Initiates the fire-and-forget server-side
-/// `DeleteSession` immediately and releases the underlying Rust
-/// [`Session`]. Does not block on the delete completing.
+/// Close a session. Awaits the server-side `DeleteSession`, emits and flushes
+/// delete-session telemetry, then releases the underlying Rust [`Session`].
 ///
 /// Close the session **last**: because the delete is initiated eagerly,
 /// any still-open handle against this session — a statement / executed
@@ -1650,20 +1649,14 @@ pub unsafe extern "C" fn kernel_session_close(session: *mut kernel_session_t) ->
         );
         return KernelStatusCode::InvalidArgument;
     }
-    // Reclaim the box and initiate the fire-and-forget `DeleteSession`
-    // right now. We call `initiate_delete()` explicitly rather than
-    // relying on `Drop`: a still-live statement / executed handle holds
-    // its own `Arc<SessionInner>` clone, so `SessionInner::Drop` (which
-    // only fires when the *last* Arc drops) would otherwise defer the
-    // server-side delete until those handles are released — contradicting
-    // the header's "close initiates the delete" contract. `initiate_delete`
-    // is idempotent, so the eventual `Drop` becomes a no-op. We still don't
-    // `block_on` an awaited close — that would make close block on the
-    // network for no caller benefit.
-    let session = Box::from_raw(session as *mut Session);
-    session.initiate_delete();
-    drop(session);
-    KernelStatusCode::Success
+    // Reclaim the box and move the `Session` into the awaited close. On close
+    // failure, `Session::close` leaves the closed flag unset; dropping the
+    // consumed session still triggers the fire-and-forget fallback delete.
+    let session = *Box::from_raw(session as *mut Session);
+    match block_on_ffi(move || session.close()) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
 }
 
 /// Report whether a session is still **open** (its server-side delete has
@@ -2813,6 +2806,82 @@ mod tests {
 
             kernel_session_config_free(config);
         }
+    }
+
+    #[test]
+    fn kernel_session_close_exports_delete_session_telemetry() {
+        use crate::telemetry::test_support::CapturingTelemetryExporter;
+        use serde_json::Value;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (server, session, exporter) = rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-cabi-telemetry-close","warehouse_id":"test_wh"}"#,
+                ))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/2.0/sql/sessions/sess-cabi-telemetry-close"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let exporter = CapturingTelemetryExporter::default();
+            let telemetry = TelemetryConfig {
+                enabled: true,
+                ..Default::default()
+            }
+            .with_exporter(std::sync::Arc::new(exporter.clone()));
+            let session = Session::builder()
+                .connection(
+                    ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                        .expect("valid http_path"),
+                )
+                .auth(AuthConfig::Pat {
+                    token: "dapi_test_token".into(),
+                    identity_federation_client_id: None,
+                })
+                .telemetry(telemetry)
+                .open()
+                .await
+                .expect("session must open");
+            (server, session, exporter)
+        });
+
+        let session = Box::into_raw(Box::new(session)) as *mut kernel_session_t;
+        assert_eq!(
+            unsafe { kernel_session_close(session) },
+            KernelStatusCode::Success
+        );
+
+        let operations = exporter
+            .requests()
+            .into_iter()
+            .flat_map(|request| request.proto_logs)
+            .map(|log| {
+                let value: Value = serde_json::from_str(&log).expect("valid frontend log json");
+                assert_eq!(
+                    value["entry"]["sql_driver_log"]["session_id"],
+                    "sess-cabi-telemetry-close"
+                );
+                value["entry"]["sql_driver_log"]["sql_operation"]["operation_detail"]
+                    ["operation_type"]
+                    .as_str()
+                    .expect("operation_type string")
+                    .to_string()
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(operations, vec!["CREATE_SESSION", "DELETE_SESSION"]);
+        drop(server);
     }
 
     #[test]
