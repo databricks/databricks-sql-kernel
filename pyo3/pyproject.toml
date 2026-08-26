@@ -57,4 +57,7 @@ dev = [
 
 [tool.maturin]
 module-name = "databricks_sql_kernel"
+# The pyo3 `extension-module` feature is opt-in (see pyo3/Cargo.toml) so plain
+# `cargo test` can link libpython for the unit-test binaries. Maturin builds the
+# real wheel, where the interpreter supplies those symbols, so enable it here.
 features = ["extension-module"]
