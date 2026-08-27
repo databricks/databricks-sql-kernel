@@ -736,6 +736,10 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
             );
         }
 
+        // Preserve any circuit breaker knobs already set on this config so the
+        // two telemetry setters are order-independent: calling
+        // `set_telemetry_circuit_breaker_config` before this setter no longer
+        // silently discards the breaker configuration.
         c.telemetry = TelemetryConfig {
             enabled,
             batch_size,
@@ -743,6 +747,9 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
             max_retries,
             retry_delay: Duration::from_millis(retry_delay_ms),
             close_flush_timeout: Duration::from_millis(close_flush_timeout_ms),
+            circuit_breaker_enabled: c.telemetry.circuit_breaker_enabled,
+            circuit_breaker_threshold: c.telemetry.circuit_breaker_threshold,
+            circuit_breaker_timeout: c.telemetry.circuit_breaker_timeout,
             ..Default::default()
         };
         Ok(())
@@ -752,9 +759,10 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
 /// Configure telemetry circuit breaker behavior.
 ///
 /// By default the circuit breaker is enabled with a threshold of 5 consecutive
-/// export failures and a 60 second timeout. Use this setter after
-/// `kernel_session_config_set_telemetry_config` to override only the circuit
-/// breaker knobs.
+/// export failures and a 60 second timeout. Use this setter to override only the
+/// circuit breaker knobs; it may be called before or after
+/// `kernel_session_config_set_telemetry_config` without either setter clobbering
+/// the other's fields.
 ///
 /// `threshold` must be greater than zero when `enabled` is true.
 /// `timeout_ms` must be greater than zero.
@@ -2698,6 +2706,45 @@ mod tests {
 
             let telemetry = &config.as_ref().unwrap().telemetry;
             assert!(!telemetry.circuit_breaker_enabled);
+            assert_eq!(telemetry.circuit_breaker_threshold, 9);
+            assert_eq!(
+                telemetry.circuit_breaker_timeout,
+                Duration::from_millis(12_345)
+            );
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_preserves_prior_circuit_breaker_knobs() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            // Configure the breaker FIRST, then the base telemetry setter. The
+            // base setter must not clobber the breaker knobs back to defaults.
+            assert_eq!(
+                kernel_session_config_set_telemetry_circuit_breaker_config(
+                    config, false, 9, 12_345
+                ),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_telemetry_config(config, true, 10, 1, 0, 0, 1),
+                KernelStatusCode::Success
+            );
+
+            let telemetry = &config.as_ref().unwrap().telemetry;
+            assert!(telemetry.enabled);
+            assert_eq!(telemetry.batch_size, 10);
+            assert!(
+                !telemetry.circuit_breaker_enabled,
+                "base setter must preserve breaker enabled flag set beforehand"
+            );
             assert_eq!(telemetry.circuit_breaker_threshold, 9);
             assert_eq!(
                 telemetry.circuit_breaker_timeout,
