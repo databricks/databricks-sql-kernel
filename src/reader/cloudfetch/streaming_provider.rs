@@ -928,10 +928,21 @@ impl StreamingCloudFetchProvider {
 
     pub(crate) fn metrics(&self) -> Option<ResultReaderMetrics> {
         let snapshot = self.metrics.snapshot();
-        snapshot
-            .total_chunks_iterated
-            .is_some_and(|count| count > 0)
-            .then_some(snapshot)
+        // Surface metrics whenever *any* datum was captured, not just
+        // once a chunk has been iterated (released from the buffer).
+        // `total_chunks_present` is known from the manifest at
+        // construction and `initial_chunk_latency` is stamped at
+        // chunk-0 download completion — both fire before the first
+        // `record_chunk_iterated`. Gating strictly on `iterated > 0`
+        // would drop this data for a stream that downloads but is
+        // dropped/errors before releasing any chunk, losing useful
+        // telemetry for partial/failed consumption.
+        let has_data = snapshot.total_chunks_present.is_some()
+            || snapshot
+                .total_chunks_iterated
+                .is_some_and(|count| count > 0)
+            || snapshot.initial_chunk_latency.is_some();
+        has_data.then_some(snapshot)
     }
 
     /// Refresh presigned-URL links for `chunk_index` and every
