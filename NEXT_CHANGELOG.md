@@ -28,6 +28,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Metadata: empty schema/column patterns now return typed empty results without
+  issuing a server statement.
+
 - Metadata: `Metadata::type_info()` now matches the established Thrift
   `getTypeInfo` result shape and current 20-row type catalogue.
 

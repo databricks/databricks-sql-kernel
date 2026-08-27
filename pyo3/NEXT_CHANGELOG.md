@@ -23,6 +23,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Fixed
 
+- Empty catalog filters for `list_schemas()` and `list_columns()` now match
+  nothing instead of raising `InvalidArgument`; non-empty catalogs stay exact.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

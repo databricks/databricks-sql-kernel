@@ -25,6 +25,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Fixed
 
+- Empty catalog filters for `listSchemas()` and `listColumns()` now match
+  nothing instead of returning `InvalidArgument`; non-empty catalogs stay exact.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

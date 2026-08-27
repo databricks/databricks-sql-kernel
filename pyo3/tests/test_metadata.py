@@ -100,14 +100,16 @@ def test_table_types_is_static(session):
 
 
 @live
-def test_empty_identifier_rejected(session):
-    try:
-        session.metadata().list_schemas(catalog="")
-    except k.KernelError as e:
-        assert e.code == "InvalidArgument", e.code
-        assert "identifier" in e.message.lower(), e.message
-    else:
-        raise AssertionError("expected KernelError for empty catalog")
+def test_empty_catalog_matches_nothing(session):
+    metadata = session.metadata()
+    for result in (
+        metadata.list_schemas(catalog=""),
+        metadata.list_columns(catalog=""),
+    ):
+        try:
+            assert result.fetch_all_arrow().num_rows == 0
+        finally:
+            result.close()
 
 
 @live

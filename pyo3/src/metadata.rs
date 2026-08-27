@@ -22,9 +22,9 @@
 //! patterns (`LikePattern`) at the type level. The Python surface
 //! collapses both back to `Option[str]` because Python lacks a
 //! convenient way to express two distinct string-flavoured types at
-//! a call site. The kernel's runtime checks (empty, NUL, backticks
-//! for identifiers; length caps for both) still apply; bad input
-//! surfaces as `KernelError(code='InvalidArgument', ...)`.
+//! a call site. Empty exact catalog filters are adapted to an empty
+//! pattern (match nothing); other identifier and pattern validation
+//! still surfaces as `KernelError(code='InvalidArgument', ...)`.
 //!
 //! ## Why the methods aren't fully macro-ised
 //!
@@ -42,6 +42,7 @@
 //! conversions stay explicit and grep-able.
 
 use crate::result_stream::ResultStream;
+use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{Identifier, LikePattern, Metadata as KMetadata};
 use pyo3::prelude::*;
 use std::sync::Arc;
@@ -64,11 +65,8 @@ impl Metadata {
     }
 }
 
-// The `Option<String>` → `Option<Identifier>` / `Option<LikePattern>`
-// conversion lives on the kernel newtypes as `Identifier::from_opt` /
-// `LikePattern::from_opt` (one home shared by all bindings, with empty /
-// NUL / backtick / whitespace rejection kernel-side surfacing as
-// `InvalidArgument`). Call sites below use those directly.
+// Optional-string conversion lives in the kernel crate so pyo3 and napi
+// share validation and empty exact-catalog semantics.
 
 #[pymethods]
 impl Metadata {
@@ -78,7 +76,8 @@ impl Metadata {
         Ok(ResultStream::new(stream, self.runtime.clone()))
     }
 
-    /// Schemas filtered by catalog (exact) and schema name pattern.
+    /// Schemas filtered by catalog (exact) and schema name pattern. An empty
+    /// catalog matches nothing; non-empty catalogs remain exact identifiers.
     #[pyo3(signature = (*, catalog=None, schema_pattern=None))]
     fn list_schemas(
         &self,
@@ -87,8 +86,7 @@ impl Metadata {
         schema_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = Identifier::from_opt(&catalog)?;
-            let pat = LikePattern::from_opt(&schema_pattern)?;
+            let (cat, pat) = exact_catalog_and_pattern(&catalog, &schema_pattern)?;
             self.inner.list_schemas(cat, pat).await
         })?;
         Ok(ResultStream::new(stream, self.runtime.clone()))
@@ -127,8 +125,9 @@ impl Metadata {
     }
 
     /// Columns of tables matching the filter. `catalog = None` emits
-    /// `SHOW COLUMNS IN ALL CATALOGS`; otherwise scoped to the named
-    /// catalog. Schema / table / column patterns are SQL LIKE.
+    /// `SHOW COLUMNS IN ALL CATALOGS`; an empty catalog matches nothing;
+    /// otherwise the catalog is exact. Schema / table / column patterns are
+    /// SQL LIKE.
     #[pyo3(signature = (*, catalog=None, schema_pattern=None, table_pattern=None, column_pattern=None))]
     fn list_columns(
         &self,
@@ -139,11 +138,7 @@ impl Metadata {
         column_pattern: Option<String>,
     ) -> PyResult<ResultStream> {
         let stream = run_kernel_block!(py, self.runtime, {
-            let cat = match catalog.as_deref() {
-                Some(s) => Some(Identifier::new(s)?),
-                None => None,
-            };
-            let sch = LikePattern::from_opt(&schema_pattern)?;
+            let (cat, sch) = exact_catalog_and_pattern(&catalog, &schema_pattern)?;
             let tbl = LikePattern::from_opt(&table_pattern)?;
             let col = LikePattern::from_opt(&column_pattern)?;
             self.inner.list_columns(cat, sch, tbl, col).await
