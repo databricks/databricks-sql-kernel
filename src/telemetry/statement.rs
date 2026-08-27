@@ -224,11 +224,13 @@ impl StatementOperationObserver for TelemetryObserver {
     fn record_result_consumed(&self) {
         if let Ok(mut state) = self.state.lock() {
             // Measure from when the first batch became available. If no
-            // batch was ever recorded (empty/errored-before-first-batch
-            // result), fall back to statement start.
+            // batch was ever recorded (empty result, or errored before the
+            // first batch), there was nothing to consume, so report zero
+            // rather than statement start — the latter would conflate
+            // execution/polling time with consumption time.
             let consumption = match state.first_batch_at {
                 Some(first_batch_at) => first_batch_at.elapsed(),
-                None => state.started_at.elapsed(),
+                None => Duration::ZERO,
             };
             state.context.consumption_latency = Some(consumption);
         }
@@ -485,6 +487,36 @@ mod tests {
             consumption < first_batch,
             "consumption latency ({consumption:?}) should exclude the \
              pre-first-batch execution/polling time ({first_batch:?})"
+        );
+    }
+
+    #[test]
+    fn consumption_latency_is_zero_when_no_batch_was_recorded() {
+        let connection = Arc::new(CapturingConnectionTelemetry::default());
+        let telemetry = StatementTelemetry::new(
+            connection.clone(),
+            StatementType::Sql,
+            OperationType::ExecuteStatement,
+        );
+
+        // Empty result: execution/polling time elapses but no batch is ever
+        // recorded, so there is nothing to consume.
+        std::thread::sleep(Duration::from_millis(20));
+        telemetry.record_result_consumed();
+        telemetry.finalize(None);
+
+        let events = connection.statement_events.lock().expect("events mutex");
+        assert_eq!(events.len(), 1);
+        let context = &events[0].context;
+        assert!(
+            context.first_batch_latency.is_none(),
+            "no batch was recorded"
+        );
+        assert_eq!(
+            context.consumption_latency,
+            Some(Duration::ZERO),
+            "with no batch recorded, consumption latency must be zero, not \
+             statement lifetime"
         );
     }
 }
