@@ -93,6 +93,7 @@ use crate::metadata::thrift_shape::{
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
+use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
 use arrow_array::Array;
 use arrow_schema::SchemaRef;
@@ -124,11 +125,17 @@ fn close_id(raw: &ExecuteResult) -> String {
 /// an empty stream typed to the operation's JDBC schema; pass other
 /// errors through. Matches the JDBC driver's
 /// `isObjectNotFoundException → empty getXResult` pattern.
-async fn not_found_or<F>(err: Error, schema: SchemaRef, otherwise: F) -> Result<ResultStream>
+async fn not_found_or<F>(
+    err: Error,
+    schema: SchemaRef,
+    telemetry: &StatementTelemetry,
+    otherwise: F,
+) -> Result<ResultStream>
 where
     F: FnOnce(Error) -> Result<ResultStream>,
 {
     if is_object_not_found(&err) {
+        telemetry.on_result_metadata(ExecutionResultFormat::InlineArrow, false);
         ResultStream::from_reader(Box::new(EmptyReader::new(schema))).await
     } else {
         otherwise(err)
@@ -331,32 +338,67 @@ impl Metadata {
         Self { session }
     }
 
+    fn metadata_telemetry(&self, operation_type: OperationType) -> StatementTelemetry {
+        self.session
+            .statement_telemetry_observer(StatementType::Metadata, operation_type)
+    }
+
+    fn observe_raw_result(telemetry: &StatementTelemetry, raw: &ExecuteResult) {
+        telemetry.on_statement_submitted(&raw.statement_id);
+        telemetry.on_result_metadata(raw.telemetry_result_format, raw.telemetry_is_compressed);
+    }
+
+    fn observe_inline_result(telemetry: &StatementTelemetry) {
+        telemetry.on_result_metadata(ExecutionResultFormat::InlineArrow, false);
+    }
+
+    fn finish_metadata_call(
+        telemetry: StatementTelemetry,
+        result: Result<ResultStream>,
+    ) -> Result<ResultStream> {
+        match result {
+            Ok(mut stream) => {
+                stream.attach_telemetry(telemetry);
+                Ok(stream)
+            }
+            Err(error) => {
+                telemetry.finalize(Some(&error));
+                Err(error)
+            }
+        }
+    }
+
     /// All catalogs visible to the session.
     ///
     /// JDBC `getCatalogs` shape: `TABLE_CAT: Utf8`.
     pub async fn list_catalogs(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
-            let raw = self
-                .session
-                .transport()
-                .list_catalogs(self.session.session_id())
-                .await?;
-            let stmt_id = close_id(&raw);
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
-                GET_CATALOGS_SCHEMA.clone(),
-                Box::new(thrift_shape::reshape_catalogs),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
-            )
+        let telemetry = self.metadata_telemetry(OperationType::ListCatalogs);
+        let telemetry_for_body = telemetry.clone();
+        let result = async { self.list_catalogs_uninstrumented(&telemetry_for_body).await }
+            .instrument(span)
+            .await;
+        Self::finish_metadata_call(telemetry, result)
+    }
+
+    async fn list_catalogs_uninstrumented(
+        &self,
+        telemetry: &StatementTelemetry,
+    ) -> Result<ResultStream> {
+        let raw = self
+            .session
+            .transport()
+            .list_catalogs(self.session.session_id())
+            .await?;
+        Self::observe_raw_result(telemetry, &raw);
+        let stmt_id = close_id(&raw);
+        let reshaped = ThriftReshapingReader::new(
+            raw.reader,
+            GET_CATALOGS_SCHEMA.clone(),
+            Box::new(thrift_shape::reshape_catalogs),
+        );
+        ResultStream::from_reader_with_close(Box::new(reshaped), Arc::clone(&self.session), stmt_id)
             .await
-        }
-        .instrument(span)
-        .await
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
@@ -372,11 +414,14 @@ impl Metadata {
         schema_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListSchemas);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             if schema_pattern
                 .as_ref()
                 .is_some_and(|pattern| pattern.as_str().is_empty())
             {
+                Self::observe_inline_result(&telemetry_for_body);
                 return ResultStream::from_reader(Box::new(EmptyReader::new(
                     GET_SCHEMAS_SCHEMA.clone(),
                 )))
@@ -394,8 +439,12 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(e, GET_SCHEMAS_SCHEMA.clone(), &telemetry_for_body, Err)
+                        .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -410,7 +459,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Tables filtered by catalog (**pattern**), schema (pattern),
@@ -477,7 +527,9 @@ impl Metadata {
         table_types: Option<&[&str]>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListTables);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             // Route the catalog argument. The SEA `SHOW` grammar has no
             // catalog-pattern position, so a wildcard catalog can't be
             // scoped server-side. Rather than `SHOW TABLES IN ALL
@@ -499,6 +551,7 @@ impl Metadata {
                         schema_pattern,
                         table_pattern,
                         table_types,
+                        &telemetry_for_body,
                     )
                     .await
                 }
@@ -508,6 +561,7 @@ impl Metadata {
                         schema_pattern,
                         table_pattern,
                         table_types,
+                        &telemetry_for_body,
                     )
                     .await
                 }
@@ -515,6 +569,7 @@ impl Metadata {
                 // (mirrors the schema/table `LIKE ''` convention). Emit an
                 // empty result without a wire call.
                 Some("") => {
+                    Self::observe_inline_result(&telemetry_for_body);
                     ResultStream::from_reader(Box::new(EmptyReader::new(GET_TABLES_SCHEMA.clone())))
                         .await
                 }
@@ -534,6 +589,7 @@ impl Metadata {
                         schema_pattern,
                         table_pattern,
                         table_types,
+                        &telemetry_for_body,
                     )
                     .await
                 }
@@ -546,13 +602,15 @@ impl Metadata {
                         schema_pattern,
                         table_pattern,
                         table_types,
+                        &telemetry_for_body,
                     )
                     .await
                 }
             }
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Enumerate catalogs, keep those matching `pattern`
@@ -568,12 +626,14 @@ impl Metadata {
         schema_pattern: Option<LikePattern<'_>>,
         table_pattern: Option<LikePattern<'_>>,
         table_types: Option<&[&str]>,
+        telemetry: &StatementTelemetry,
     ) -> Result<ResultStream> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // 1. Enumerate + filter catalog names client-side.
         let matcher = LikeMatcher::new(pattern);
-        let mut catalogs = self.list_catalogs().await?;
+        let noop = StatementTelemetry::noop();
+        let mut catalogs = self.list_catalogs_uninstrumented(&noop).await?;
         let mut names: Vec<String> = Vec::new();
         let mut enumerated = 0usize;
         while let Some(batch) = catalogs.next_batch().await? {
@@ -606,6 +666,7 @@ impl Metadata {
 
         // No catalog matched → typed empty result, no further wire calls.
         if names.is_empty() {
+            Self::observe_inline_result(telemetry);
             return ResultStream::from_reader(Box::new(EmptyReader::new(
                 GET_TABLES_SCHEMA.clone(),
             )))
@@ -655,6 +716,12 @@ impl Metadata {
                     .map_err(|e| Error::data_loss().message(format!("merge tables: {e}")))?;
             Some(thrift_shape::sort_tables_batch(&concatenated)?)
         };
+        // The fan-out performs real per-catalog server statements, but the
+        // caller receives one merged in-memory result and there is no single
+        // statement id to attribute. Record that aggregate as one synthetic
+        // inline LIST_TABLES event; the internal catalog enumeration uses
+        // noop telemetry to avoid double-counting a LIST_CATALOGS operation.
+        Self::observe_inline_result(telemetry);
         ResultStream::from_reader(Box::new(InMemoryReader::new(
             GET_TABLES_SCHEMA.clone(),
             merged.into_iter().collect(),
@@ -739,6 +806,7 @@ impl Metadata {
         schema_pattern: Option<LikePattern<'_>>,
         table_pattern: Option<LikePattern<'_>>,
         table_types: Option<&[&str]>,
+        telemetry: &StatementTelemetry,
     ) -> Result<ResultStream> {
         let requested_catalog = catalog.map(|c| c.to_owned());
         let types_owned: Option<Vec<String>> =
@@ -756,8 +824,9 @@ impl Metadata {
             .await
         {
             Ok(r) => r,
-            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), Err).await,
+            Err(e) => return not_found_or(e, GET_TABLES_SCHEMA.clone(), telemetry, Err).await,
         };
+        Self::observe_raw_result(telemetry, &raw);
         let stmt_id = close_id(&raw);
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
@@ -807,7 +876,9 @@ impl Metadata {
         column_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListColumns);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             if [&schema_pattern, &table_pattern, &column_pattern]
                 .into_iter()
                 .any(|pattern| {
@@ -816,6 +887,7 @@ impl Metadata {
                         .is_some_and(|pattern| pattern.as_str().is_empty())
                 })
             {
+                Self::observe_inline_result(&telemetry_for_body);
                 return ResultStream::from_reader(Box::new(EmptyReader::new(
                     GET_COLUMNS_SCHEMA.clone(),
                 )))
@@ -835,8 +907,12 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(e, GET_COLUMNS_SCHEMA.clone(), &telemetry_for_body, Err)
+                        .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -851,7 +927,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Primary keys for the given table. All three identifiers are
@@ -878,7 +955,9 @@ impl Metadata {
         table: Identifier<'_>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListPrimaryKeys);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             let catalog = catalog.ok_or_else(|| {
                 Error::invalid_argument().message("primary_keys requires a catalog identifier")
             })?;
@@ -897,8 +976,17 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_PRIMARY_KEYS_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(
+                        e,
+                        GET_PRIMARY_KEYS_SCHEMA.clone(),
+                        &telemetry_for_body,
+                        Err,
+                    )
+                    .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -913,7 +1001,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Foreign-key relationships. Both parent and foreign sides are
@@ -954,7 +1043,9 @@ impl Metadata {
         foreign_table: Option<Identifier<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListCrossReferences);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             // Unspecified foreign table → "nothing to look up": empty
             // result, no wire call (JDBC SEA `listCrossReferences`
             // contract; also the ODBC PK-only `SQLForeignKeys` form and
@@ -962,6 +1053,7 @@ impl Metadata {
             // catalog/schema requirements so a null foreign table never
             // surfaces as an argument error.
             let Some(foreign_table) = foreign_table else {
+                Self::observe_inline_result(&telemetry_for_body);
                 return ResultStream::from_reader(Box::new(EmptyReader::new(
                     GET_CROSS_REFERENCE_SCHEMA.clone(),
                 )))
@@ -991,8 +1083,17 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_CROSS_REFERENCE_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(
+                        e,
+                        GET_CROSS_REFERENCE_SCHEMA.clone(),
+                        &telemetry_for_body,
+                        Err,
+                    )
+                    .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -1007,7 +1108,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Functions visible to the session. Catalog is exact; schema /
@@ -1024,7 +1126,9 @@ impl Metadata {
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             let raw = match self
                 .session
                 .transport()
@@ -1037,8 +1141,12 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_FUNCTIONS_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(e, GET_FUNCTIONS_SCHEMA.clone(), &telemetry_for_body, Err)
+                        .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -1053,7 +1161,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Procedures visible to the session. Catalog is exact; schema /
@@ -1069,7 +1178,11 @@ impl Metadata {
         name_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        // The backend telemetry enum does not have procedure-specific
+        // operation types, so match JDBC and fall back to TYPE_UNSPECIFIED.
+        let telemetry = self.metadata_telemetry(OperationType::TypeUnspecified);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             let raw = match self
                 .session
                 .transport()
@@ -1082,8 +1195,12 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_PROCEDURES_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(e, GET_PROCEDURES_SCHEMA.clone(), &telemetry_for_body, Err)
+                        .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -1098,7 +1215,8 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Procedure parameter / return columns. Catalog is exact; schema /
@@ -1117,7 +1235,11 @@ impl Metadata {
         column_pattern: Option<LikePattern<'_>>,
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        // The backend telemetry enum does not have procedure-specific
+        // operation types, so match JDBC and fall back to TYPE_UNSPECIFIED.
+        let telemetry = self.metadata_telemetry(OperationType::TypeUnspecified);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
             let raw = match self
                 .session
                 .transport()
@@ -1131,8 +1253,17 @@ impl Metadata {
                 .await
             {
                 Ok(r) => r,
-                Err(e) => return not_found_or(e, GET_PROCEDURE_COLUMNS_SCHEMA.clone(), Err).await,
+                Err(e) => {
+                    return not_found_or(
+                        e,
+                        GET_PROCEDURE_COLUMNS_SCHEMA.clone(),
+                        &telemetry_for_body,
+                        Err,
+                    )
+                    .await
+                }
             };
+            Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
@@ -1147,19 +1278,24 @@ impl Metadata {
             .await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// Static SQL type catalogue matching Thrift `getTypeInfo`. No filters and
     /// no wire call.
     pub async fn type_info(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListTypeInfo);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
+            Self::observe_inline_result(&telemetry_for_body);
             let reader = static_data::type_info_reader();
             ResultStream::from_reader(reader).await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 
     /// All table types (`TABLE`, `VIEW`, `SYSTEM TABLE`, …). No
@@ -1168,13 +1304,17 @@ impl Metadata {
     /// [`Transport::list_table_types`](crate::client::Transport::list_table_types)).
     pub async fn table_types(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        async {
+        let telemetry = self.metadata_telemetry(OperationType::ListTableTypes);
+        let telemetry_for_body = telemetry.clone();
+        let result = async {
+            Self::observe_inline_result(&telemetry_for_body);
             let types = self.session.transport().list_table_types();
             let reader = static_data::table_types_reader(&types);
             ResultStream::from_reader(reader).await
         }
         .instrument(span)
-        .await
+        .await;
+        Self::finish_metadata_call(telemetry, result)
     }
 }
 
