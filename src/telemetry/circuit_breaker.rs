@@ -123,10 +123,19 @@ impl CircuitBreaker {
                     };
                 }
             }
-            CircuitState::Open { .. } | CircuitState::HalfOpen => {
+            CircuitState::HalfOpen => {
+                // A failed half-open probe reopens the circuit, arming a fresh
+                // recovery timeout from now.
                 *state = CircuitState::Open {
                     opened_at: Instant::now(),
                 };
+            }
+            CircuitState::Open { .. } => {
+                // Already open — a late outcome from a guard admitted while the
+                // circuit was still `Closed` (before a concurrent failure opened
+                // it) must NOT rewrite `opened_at`, or a burst of concurrent
+                // failing exports would each push the recovery timer forward.
+                // Leave the existing open window untouched.
             }
         }
     }
