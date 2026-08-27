@@ -46,8 +46,9 @@
 //! batch.
 
 use crate::kernel_error::{Error, Result};
-use crate::reader::ResultReader;
+use crate::reader::{ResultReader, ResultReaderMetrics};
 use crate::session::SessionInner;
+use crate::telemetry::StatementTelemetry;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, DecimalType, Float32Type, Float64Type,
@@ -439,7 +440,7 @@ pub struct ResultStream {
     /// directly. No `block_on` is performed anywhere on this path, so
     /// `ResultStream::next_batch` is safe to `.await` from any tokio
     /// runtime (including napi-rs's).
-    reader: Box<dyn ResultReader>,
+    reader: Option<Box<dyn ResultReader>>,
 
     /// Cached schema. Filled in eagerly by
     /// [`ResultStream::from_reader`] (which is `async` because pulling
@@ -484,6 +485,67 @@ pub struct ResultStream {
     /// owning `ExecutedStatement` (or its `Drop`) issues the close, so
     /// a second guard here would double-fire.
     close_guard: Option<StatementCloseGuard>,
+
+    telemetry: Option<ResultStreamTelemetry>,
+}
+
+struct ResultStreamTelemetry {
+    telemetry: StatementTelemetry,
+    finalized: bool,
+    consumed_recorded: bool,
+}
+
+impl ResultStreamTelemetry {
+    fn new(telemetry: StatementTelemetry) -> Self {
+        Self {
+            telemetry,
+            finalized: false,
+            consumed_recorded: false,
+        }
+    }
+
+    fn record_batch(&self, batch: &ResultBatch) {
+        match batch {
+            ResultBatch::Arrow(_) => self.record_result_batch(),
+        }
+    }
+
+    fn record_result_batch(&self) {
+        self.telemetry.record_result_batch();
+    }
+
+    /// Finalize telemetry exactly once.
+    ///
+    /// `consumed` gates the consumption-latency stamp: it must be
+    /// `true` only on a terminal read path — the stream reaching its
+    /// natural end (`Ok(None)`) or erroring — and `false` on the
+    /// `Drop` path. `record_result_consumed` sets
+    /// `consumption_latency = started_at.elapsed()`, so stamping it on
+    /// a stream that was abandoned (or only partially read) and then
+    /// dropped would report caller think-time from statement start to
+    /// handle drop rather than the latency to actually consume the
+    /// result set, skewing `result_set_consumption_latency_millis`.
+    /// Chunk metrics and the terminal `finalize` still fire on every
+    /// path so a dropped stream is always reported.
+    fn finish(
+        &mut self,
+        metrics: Option<ResultReaderMetrics>,
+        error: Option<&Error>,
+        consumed: bool,
+    ) {
+        if self.finalized {
+            return;
+        }
+        if let Some(metrics) = metrics {
+            self.telemetry.record_chunk_metrics(metrics.into());
+        }
+        if consumed && !self.consumed_recorded {
+            self.telemetry.record_result_consumed();
+            self.consumed_recorded = true;
+        }
+        self.telemetry.finalize(error);
+        self.finalized = true;
+    }
 }
 
 /// Fire-and-forget `CloseStatement`-on-Drop for a server statement that
@@ -532,13 +594,14 @@ impl ResultStream {
     pub(crate) async fn from_reader(reader: Box<dyn ResultReader>) -> Result<Self> {
         let schema = reader.schema().await?;
         Ok(Self {
-            reader,
+            reader: Some(reader),
             schema,
             current: None,
             prefetched: None,
             current_row_idx: 0,
             exhausted: false,
             close_guard: None,
+            telemetry: None,
         })
     }
 
@@ -567,6 +630,32 @@ impl ResultStream {
             });
         }
         Ok(stream)
+    }
+
+    pub(crate) fn attach_telemetry(&mut self, telemetry: StatementTelemetry) {
+        self.telemetry = Some(ResultStreamTelemetry::new(telemetry));
+    }
+
+    fn reader_metrics(&self) -> Option<ResultReaderMetrics> {
+        self.reader.as_ref().and_then(|reader| reader.metrics())
+    }
+
+    /// Finalize telemetry once, passing the reader's terminal metrics.
+    /// `reader` and `telemetry` are disjoint fields, so this borrows
+    /// cleanly under `&mut self`. `ResultStreamTelemetry::finish` is
+    /// idempotent, so redundant calls are no-ops.
+    ///
+    /// This is the **read-path** finalizer — it fires when the stream
+    /// reaches its natural end or errors, both of which count as
+    /// consuming the result set, so it always stamps consumption
+    /// latency. The `Drop` path calls `finish` directly with
+    /// `consumed = false` so an abandoned stream doesn't report
+    /// think-time as consumption latency.
+    fn finalize_telemetry(&mut self, error: Option<&Error>) {
+        let metrics = self.reader_metrics();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(metrics, error, true);
+        }
     }
 
     /// Result schema. Available before any batches have been pulled.
@@ -602,22 +691,38 @@ impl ResultStream {
         if let Some(batch) = self.prefetched.take() {
             self.current = Some(batch);
             self.current_row_idx = 0;
+            if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
+                telemetry.record_batch(batch);
+            }
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
+            self.finalize_telemetry(None);
             return Ok(None);
         }
-        match self.reader.next_batch().await? {
-            Some(rb) => {
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("ResultStream reader is present until into_owned_batches consumes it");
+        match reader.next_batch().await {
+            Ok(Some(rb)) => {
                 self.current = Some(ResultBatch::Arrow(rb));
                 self.current_row_idx = 0;
+                if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
+                    telemetry.record_batch(batch);
+                }
                 Ok(self.current.as_ref())
             }
-            None => {
+            Ok(None) => {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
+                self.finalize_telemetry(None);
                 Ok(None)
+            }
+            Err(e) => {
+                self.finalize_telemetry(Some(&e));
+                Err(e)
             }
         }
     }
@@ -633,9 +738,32 @@ impl ResultStream {
     /// terminal result at statement-construction time.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
-            match self.reader.next_batch().await? {
-                Some(rb) => self.prefetched = Some(ResultBatch::Arrow(rb)),
-                None => self.exhausted = true,
+            let reader = self
+                .reader
+                .as_mut()
+                .expect("ResultStream reader is present until into_owned_batches consumes it");
+            match reader.next_batch().await {
+                Ok(Some(rb)) => {
+                    self.prefetched = Some(ResultBatch::Arrow(rb));
+                    // Stamp first-batch (result-set-ready) latency at fetch
+                    // time, not when the caller later consumes the prefetched
+                    // batch via `next_batch`. `record_result_batch` is
+                    // idempotent (only stamps while unset), so the replay in
+                    // `next_batch` is a no-op. This keeps
+                    // `result_set_ready_latency_millis` reflecting when the
+                    // result set became ready rather than the caller's
+                    // think-time before the first `next_batch` pull.
+                    if let (Some(telemetry), Some(batch)) =
+                        (&self.telemetry, self.prefetched.as_ref())
+                    {
+                        telemetry.record_batch(batch);
+                    }
+                }
+                Ok(None) => self.exhausted = true,
+                Err(e) => {
+                    self.finalize_telemetry(Some(&e));
+                    return Err(e);
+                }
             }
         }
         Ok(self.prefetched.as_ref())
@@ -726,15 +854,33 @@ impl ResultStream {
     /// while still letting in-memory readers iterate without a tokio
     /// runtime at all. Errors are surfaced once; subsequent calls
     /// after an `Err` keep returning `None`.
-    pub fn into_owned_batches(self) -> OwnedBatchIter {
+    pub fn into_owned_batches(mut self) -> OwnedBatchIter {
         // Preserve a peeked-but-not-yet-consumed first batch: it was
         // pulled from the reader, so it must be yielded ahead of the
         // reader's remaining batches or it would be silently dropped.
-        let prefetched = self.prefetched.map(|ResultBatch::Arrow(rb)| rb);
+        let prefetched = self.prefetched.take().map(|ResultBatch::Arrow(rb)| rb);
         OwnedBatchIter {
-            reader: self.reader,
+            reader: self
+                .reader
+                .take()
+                .expect("ResultStream reader is present until into_owned_batches consumes it"),
             prefetched,
+            telemetry: self.telemetry.take(),
             done: false,
+        }
+    }
+}
+
+impl Drop for ResultStream {
+    fn drop(&mut self) {
+        // Drop is not a consumption path: the stream may have been
+        // abandoned before exhaustion (or never read at all), so pass
+        // `consumed = false` to avoid stamping caller think-time as
+        // consumption latency. `finish` still records chunk metrics
+        // and finalizes, so a dropped stream is always reported.
+        let metrics = self.reader_metrics();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(metrics, None, false);
         }
     }
 }
@@ -751,6 +897,7 @@ pub struct OwnedBatchIter {
     /// [`ResultStream::peek_first_batch`]); yielded before the reader's
     /// own batches so it isn't lost.
     prefetched: Option<RecordBatch>,
+    telemetry: Option<ResultStreamTelemetry>,
     done: bool,
 }
 
@@ -762,6 +909,9 @@ impl Iterator for OwnedBatchIter {
             return None;
         }
         if let Some(batch) = self.prefetched.take() {
+            if let Some(telemetry) = &self.telemetry {
+                telemetry.record_result_batch();
+            }
             return Some(Ok(batch));
         }
         // Runtime-aware blocking poll: uses block_in_place + the
@@ -772,15 +922,42 @@ impl Iterator for OwnedBatchIter {
         // the nested-block_on panic from issue #19 on the sync
         // iterator path.
         match crate::util::runtime::block_on_current_runtime(self.reader.next_batch()) {
-            Ok(Some(batch)) => Some(Ok(batch)),
+            Ok(Some(batch)) => {
+                if let Some(telemetry) = &self.telemetry {
+                    telemetry.record_result_batch();
+                }
+                Some(Ok(batch))
+            }
             Ok(None) => {
                 self.done = true;
+                // Natural end of stream — the result set was fully
+                // consumed, so stamp consumption latency.
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), None, true);
+                }
                 None
             }
             Err(e) => {
                 self.done = true;
+                // Terminal error path also counts as consumption
+                // ending, so stamp consumption latency.
+                if let Some(telemetry) = &mut self.telemetry {
+                    telemetry.finish(self.reader.metrics(), Some(&e), true);
+                }
                 Some(Err(e))
             }
+        }
+    }
+}
+
+impl Drop for OwnedBatchIter {
+    fn drop(&mut self) {
+        // Drop without draining the iterator is not a consumption
+        // path (see `ResultStream`'s Drop): pass `consumed = false`.
+        // If iteration reached its natural end / error, `next` already
+        // finalized with `consumed = true` and this is a no-op.
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(self.reader.metrics(), None, false);
         }
     }
 }

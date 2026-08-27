@@ -21,7 +21,7 @@ use super::models::{
     OperationDetail, OperationType, OssSqlDriverTelemetryLog, ResultLatency, SqlExecutionEvent,
     StatementType, TelemetryClientContext, TelemetryFrontendLog,
 };
-use super::statement::{StatementTelemetry, StatementTelemetryContext};
+use super::statement::{ChunkMetrics, StatementTelemetry, StatementTelemetryContext};
 use crate::client::DatabricksHttpClient;
 use crate::config::{AuthConfig, ConnectionConfig, TelemetryConfig};
 use crate::kernel_error::Error as KernelError;
@@ -251,6 +251,7 @@ impl RealConnectionTelemetry {
                         execution_result: context.result_format,
                         retry_count: context.retry_count,
                         result_latency,
+                        chunk_details: context.chunk_metrics.map(ChunkMetrics::into_details),
                         operation_detail: Some(OperationDetail {
                             n_operation_status_calls: Some(context.poll_count),
                             operation_status_latency_millis: Some(duration_millis(

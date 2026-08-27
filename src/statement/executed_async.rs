@@ -219,6 +219,9 @@ pub struct ExecutedAsyncStatement {
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
     statement_telemetry: StatementTelemetry,
+    /// Set once result materialisation hands success finalization to
+    /// the returned `ResultStream`.
+    result_stream_owns_success_telemetry: AtomicBool,
 }
 
 impl ExecutedAsyncStatement {
@@ -254,6 +257,7 @@ impl ExecutedAsyncStatement {
             owning: true,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
+            result_stream_owns_success_telemetry: AtomicBool::new(false),
         }
     }
 
@@ -287,6 +291,7 @@ impl ExecutedAsyncStatement {
             owning: false,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
+            result_stream_owns_success_telemetry: AtomicBool::new(false),
         }
     }
 
@@ -493,11 +498,7 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        let result = self.materialise_result().await;
-                        if result.is_ok() {
-                            self.statement_telemetry.finalize(None);
-                        }
-                        return result;
+                        return self.materialise_result().await;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
@@ -559,11 +560,7 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.valid.check()?;
-            let result = self.materialise_result().await;
-            if result.is_ok() {
-                self.statement_telemetry.finalize(None);
-            }
-            result
+            self.materialise_result().await
         }
         .instrument(span)
         .await;
@@ -604,6 +601,7 @@ impl ExecutedAsyncStatement {
                     self.closed.store(true, Ordering::Release);
                 }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
+                stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
@@ -617,6 +615,8 @@ impl ExecutedAsyncStatement {
                         }
                     }
                 }
+                self.result_stream_owns_success_telemetry
+                    .store(true, Ordering::Release);
                 Ok(stream)
             }
             None => {
@@ -856,10 +856,16 @@ impl AsyncStatementCanceller {
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
         // Ensure submit-and-drop / status-only async statements still
-        // emit one terminal telemetry event. Handles consumed via
-        // await_result() / fetch_result() already finalized; the
-        // statement telemetry guard makes this idempotent.
-        self.statement_telemetry.finalize(None);
+        // emit one terminal telemetry event. Once a result stream has
+        // been returned, that stream owns success finalization so it can
+        // include result/chunk metrics even if this handle is dropped
+        // before the stream is consumed.
+        if !self
+            .result_stream_owns_success_telemetry
+            .load(Ordering::Acquire)
+        {
+            self.statement_telemetry.finalize(None);
+        }
 
         // `swap` (not `load`) so the shared `closed` flag — held by the
         // parent `Statement::last_closed` — reflects that Drop is now
