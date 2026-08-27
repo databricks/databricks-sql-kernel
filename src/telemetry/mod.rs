@@ -39,4 +39,4 @@ pub use models::DriverSystemConfiguration;
 pub(crate) use models::TelemetryRequest;
 pub(crate) use models::{ExecutionResultFormat, OperationType, StatementType};
 pub(crate) use runtime::TelemetryRuntime;
-pub(crate) use statement::{ChunkMetrics, StatementTelemetry};
+pub(crate) use statement::StatementTelemetry;

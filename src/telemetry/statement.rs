@@ -98,6 +98,18 @@ pub(crate) struct ChunkMetrics {
     pub sum_chunks_download_time: Option<Duration>,
 }
 
+impl From<crate::reader::ResultReaderMetrics> for ChunkMetrics {
+    fn from(metrics: crate::reader::ResultReaderMetrics) -> Self {
+        Self {
+            total_chunks_present: metrics.total_chunks_present,
+            total_chunks_iterated: metrics.total_chunks_iterated,
+            initial_chunk_latency: metrics.initial_chunk_latency,
+            slowest_chunk_latency: metrics.slowest_chunk_latency,
+            sum_chunks_download_time: metrics.sum_chunks_download_time,
+        }
+    }
+}
+
 impl ChunkMetrics {
     pub(crate) fn into_details(self) -> ChunkDetails {
         ChunkDetails {

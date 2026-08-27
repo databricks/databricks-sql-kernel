@@ -48,7 +48,7 @@
 use crate::kernel_error::{Error, Result};
 use crate::reader::{ResultReader, ResultReaderMetrics};
 use crate::session::SessionInner;
-use crate::telemetry::{ChunkMetrics, StatementTelemetry};
+use crate::telemetry::StatementTelemetry;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{
     Date32Type, Date64Type, Decimal128Type, Decimal256Type, DecimalType, Float32Type, Float64Type,
@@ -519,13 +519,7 @@ impl ResultStreamTelemetry {
             return;
         }
         if let Some(metrics) = metrics {
-            self.telemetry.record_chunk_metrics(ChunkMetrics {
-                total_chunks_present: metrics.total_chunks_present,
-                total_chunks_iterated: metrics.total_chunks_iterated,
-                initial_chunk_latency: metrics.initial_chunk_latency,
-                slowest_chunk_latency: metrics.slowest_chunk_latency,
-                sum_chunks_download_time: metrics.sum_chunks_download_time,
-            });
+            self.telemetry.record_chunk_metrics(metrics.into());
         }
         if !self.consumed_recorded {
             self.telemetry.record_result_consumed();
@@ -628,6 +622,17 @@ impl ResultStream {
         self.reader.as_ref().and_then(|reader| reader.metrics())
     }
 
+    /// Finalize telemetry once, passing the reader's terminal metrics.
+    /// `reader` and `telemetry` are disjoint fields, so this borrows
+    /// cleanly under `&mut self`. `ResultStreamTelemetry::finish` is
+    /// idempotent, so redundant calls are no-ops.
+    fn finalize_telemetry(&mut self, error: Option<&Error>) {
+        let metrics = self.reader_metrics();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(metrics, error);
+        }
+    }
+
     /// Result schema. Available before any batches have been pulled.
     /// Returns a cheap-clone `Arc<Schema>` so callers can hold the
     /// schema independently of the stream (the FFI layer needs this
@@ -667,10 +672,7 @@ impl ResultStream {
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
-            let metrics = self.reader_metrics();
-            if let Some(telemetry) = &mut self.telemetry {
-                telemetry.finish(metrics, None);
-            }
+            self.finalize_telemetry(None);
             return Ok(None);
         }
         let reader = self
@@ -690,17 +692,11 @@ impl ResultStream {
                 self.current = None;
                 self.current_row_idx = 0;
                 self.exhausted = true;
-                let metrics = self.reader_metrics();
-                if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.finish(metrics, None);
-                }
+                self.finalize_telemetry(None);
                 Ok(None)
             }
             Err(e) => {
-                let metrics = self.reader_metrics();
-                if let Some(telemetry) = &mut self.telemetry {
-                    telemetry.finish(metrics, Some(&e));
-                }
+                self.finalize_telemetry(Some(&e));
                 Err(e)
             }
         }
@@ -740,10 +736,7 @@ impl ResultStream {
                 }
                 Ok(None) => self.exhausted = true,
                 Err(e) => {
-                    let metrics = self.reader_metrics();
-                    if let Some(telemetry) = &mut self.telemetry {
-                        telemetry.finish(metrics, Some(&e));
-                    }
+                    self.finalize_telemetry(Some(&e));
                     return Err(e);
                 }
             }
