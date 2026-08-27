@@ -229,14 +229,18 @@ impl CloudFetchMetrics {
         }
     }
 
-    fn record_chunk_download(&self, elapsed: std::time::Duration) {
+    fn record_chunk_download(&self, chunk_index: i64, elapsed: std::time::Duration) {
         let millis = elapsed.as_millis().try_into().unwrap_or(i64::MAX);
-        let _ = self.initial_chunk_latency_ms.compare_exchange(
-            -1,
-            millis,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        // `initial_chunk_latency` is the time to download chunk 0
+        // specifically, not the first download to *complete*. Under
+        // concurrency the fastest/smallest chunk often finishes first,
+        // so a first-to-complete gate would report a misleading value.
+        // Gate strictly on `chunk_index == 0` to match the JDBC/C#
+        // drivers' `initialChunkLatency` semantic.
+        if chunk_index == 0 {
+            self.initial_chunk_latency_ms
+                .store(millis, Ordering::Release);
+        }
         self.slowest_chunk_latency_ms
             .fetch_max(millis, Ordering::AcqRel);
         self.sum_chunks_download_time_ms
@@ -833,7 +837,7 @@ impl StreamingCloudFetchProvider {
             match ctx.downloader.download(&link).await {
                 Ok(batches) => {
                     ctx.metrics
-                        .record_chunk_download(download_started.elapsed());
+                        .record_chunk_download(chunk_index, download_started.elapsed());
                     return Ok(batches);
                 }
                 Err(e) => {
