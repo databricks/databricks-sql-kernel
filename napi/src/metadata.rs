@@ -56,7 +56,6 @@ use databricks_sql_kernel::{
 
 use crate::connection::{connection_closed_err, Connection};
 use crate::error::napi_err_from_kernel;
-use crate::runtime::get_handle;
 use crate::statement::Statement;
 use crate::util::guarded;
 
@@ -81,10 +80,14 @@ where
     F: FnOnce() -> Fut + Send + 'static,
     Fut: std::future::Future<Output = KResult<ResultStream>>,
 {
-    // Capture the handle before entering spawn_blocking; get_handle()
-    // must be called from inside an async context (it snapshots
-    // Handle::current() on first call).
-    let handle = get_handle().clone();
+    // Capture the handle before entering spawn_blocking. Production uses the
+    // process-global napi runtime captured by the first async entry point.
+    // Hostless Rust tests use their current test runtime so they do not mutate
+    // that global and race the cold-cache runtime test.
+    #[cfg(not(test))]
+    let handle = crate::runtime::get_handle().clone();
+    #[cfg(test)]
+    let handle = tokio::runtime::Handle::current();
     // Each metadata RPC parks one blocking-pool thread for the whole wire
     // round-trip (the kernel futures are `!Send`; see the doc above). Bracket
     // it with debug breadcrumbs so a "metadata hangs under load" incident — a
@@ -351,7 +354,11 @@ impl Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databricks_sql_kernel::ErrorCode;
+    use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode, Session};
+    use serde_json::json;
+    use tokio::sync::Mutex;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // The `Option<String>` → kernel-newtype conversion now lives on the
     // kernel as `Identifier::from_opt` / `LikePattern::from_opt` (tested
@@ -383,5 +390,74 @@ mod tests {
     fn like_pattern_from_opt_none_is_ok_none() {
         let input: Option<String> = None;
         assert!(LikePattern::from_opt(&input).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn empty_catalog_metadata_calls_return_empty_without_statement_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({ "session_id": "sess-napi-metadata" })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-napi-metadata"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid HTTP path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session opens against mock server");
+        let connection = Connection {
+            inner: Arc::new(Mutex::new(Some(session))),
+            session_id: "sess-napi-metadata".to_owned(),
+        };
+
+        let statements = [
+            connection
+                .list_schemas(Some(String::new()), None)
+                .await
+                .expect("empty catalog returns empty schemas"),
+            connection
+                .list_columns(Some(String::new()), None, None, None)
+                .await
+                .expect("empty catalog returns empty columns"),
+        ];
+        for statement in statements {
+            assert!(statement
+                .fetch_next_batch()
+                .await
+                .expect("empty metadata stream fetch succeeds")
+                .is_none());
+            statement.close().await.expect("statement closes");
+        }
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path() == "/api/2.0/sql/statements"
+                })
+                .count(),
+            0,
+            "empty catalog must short-circuit before statement execution"
+        );
+
+        connection.close().await.expect("connection closes");
     }
 }
