@@ -722,7 +722,22 @@ impl ResultStream {
                 .as_mut()
                 .expect("ResultStream reader is present until into_owned_batches consumes it");
             match reader.next_batch().await {
-                Ok(Some(rb)) => self.prefetched = Some(ResultBatch::Arrow(rb)),
+                Ok(Some(rb)) => {
+                    self.prefetched = Some(ResultBatch::Arrow(rb));
+                    // Stamp first-batch (result-set-ready) latency at fetch
+                    // time, not when the caller later consumes the prefetched
+                    // batch via `next_batch`. `record_result_batch` is
+                    // idempotent (only stamps while unset), so the replay in
+                    // `next_batch` is a no-op. This keeps
+                    // `result_set_ready_latency_millis` reflecting when the
+                    // result set became ready rather than the caller's
+                    // think-time before the first `next_batch` pull.
+                    if let (Some(telemetry), Some(batch)) =
+                        (&self.telemetry, self.prefetched.as_ref())
+                    {
+                        telemetry.record_batch(batch);
+                    }
+                }
                 Ok(None) => self.exhausted = true,
                 Err(e) => {
                     let metrics = self.reader_metrics();
