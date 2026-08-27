@@ -690,9 +690,12 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
                 .message("telemetryCircuitBreakerThreshold must be > 0 when enabled"),
         ));
     }
-    if matches!(options.telemetry_circuit_breaker_timeout_ms, Some(0)) {
+    if matches!(options.telemetry_circuit_breaker_timeout_ms, Some(0))
+        && options.telemetry_circuit_breaker_enabled.unwrap_or(true)
+    {
         return Err(napi_err_from_kernel(
-            KernelError::invalid_argument().message("telemetryCircuitBreakerTimeoutMs must be > 0"),
+            KernelError::invalid_argument()
+                .message("telemetryCircuitBreakerTimeoutMs must be > 0 when enabled"),
         ));
     }
 
@@ -1635,12 +1638,19 @@ mod tests {
         o.telemetry_circuit_breaker_timeout_ms = Some(0);
         assert_invalid_arg(
             build_telemetry_config(&o).unwrap_err(),
-            "telemetryCircuitBreakerTimeoutMs must be > 0",
+            "telemetryCircuitBreakerTimeoutMs must be > 0 when enabled",
         );
 
         let mut o = base();
         o.telemetry_circuit_breaker_enabled = Some(false);
         o.telemetry_circuit_breaker_threshold = Some(0);
+        assert!(build_telemetry_config(&o).is_ok());
+
+        // A disabled breaker ignores the timeout knob too, so a zero timeout
+        // is accepted rather than rejected.
+        let mut o = base();
+        o.telemetry_circuit_breaker_enabled = Some(false);
+        o.telemetry_circuit_breaker_timeout_ms = Some(0);
         assert!(build_telemetry_config(&o).is_ok());
     }
 

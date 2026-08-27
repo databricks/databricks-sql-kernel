@@ -103,9 +103,11 @@ fn build_telemetry_config(
             "telemetry_circuit_breaker_threshold must be > 0 when enabled",
         ));
     }
-    if matches!(options.circuit_breaker_timeout_ms, Some(0)) {
+    if matches!(options.circuit_breaker_timeout_ms, Some(0))
+        && options.circuit_breaker_enabled.unwrap_or(true)
+    {
         return Err(pyo3::exceptions::PyValueError::new_err(
-            "telemetry_circuit_breaker_timeout_ms must be > 0",
+            "telemetry_circuit_breaker_timeout_ms must be > 0 when enabled",
         ));
     }
 
@@ -783,6 +785,13 @@ mod send_sync_tests {
         assert!(build_telemetry_config(TelemetryKwargs {
             circuit_breaker_enabled: Some(false),
             circuit_breaker_threshold: Some(0),
+            ..TelemetryKwargs::default()
+        })
+        .is_ok());
+        // A disabled breaker ignores the timeout knob too.
+        assert!(build_telemetry_config(TelemetryKwargs {
+            circuit_breaker_enabled: Some(false),
+            circuit_breaker_timeout_ms: Some(0),
             ..TelemetryKwargs::default()
         })
         .is_ok());

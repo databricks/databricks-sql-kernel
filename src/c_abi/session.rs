@@ -764,8 +764,9 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
 /// `kernel_session_config_set_telemetry_config` without either setter clobbering
 /// the other's fields.
 ///
-/// `threshold` must be greater than zero when `enabled` is true.
-/// `timeout_ms` must be greater than zero.
+/// When `enabled` is true, `threshold` and `timeout_ms` must both be greater
+/// than zero. When `enabled` is false both knobs are ignored (the breaker is
+/// off regardless), so neither is validated.
 ///
 /// # Safety
 /// `config` must be a live config handle.
@@ -781,9 +782,9 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_circuit_breaker_con
             return Err(Error::invalid_argument()
                 .message("telemetry circuit breaker threshold must be > 0 when enabled"));
         }
-        if timeout_ms == 0 {
+        if enabled && timeout_ms == 0 {
             return Err(Error::invalid_argument()
-                .message("telemetry circuit breaker timeout_ms must be > 0"));
+                .message("telemetry circuit breaker timeout_ms must be > 0 when enabled"));
         }
 
         c.telemetry.circuit_breaker_enabled = enabled;
@@ -2771,6 +2772,13 @@ mod tests {
             assert_eq!(
                 kernel_session_config_set_telemetry_circuit_breaker_config(config, true, 1, 0),
                 KernelStatusCode::InvalidArgument
+            );
+
+            // When the breaker is disabled, neither knob is consulted, so a
+            // zero threshold or timeout is accepted rather than rejected.
+            assert_eq!(
+                kernel_session_config_set_telemetry_circuit_breaker_config(config, false, 0, 0),
+                KernelStatusCode::Success
             );
 
             kernel_session_config_free(config);
