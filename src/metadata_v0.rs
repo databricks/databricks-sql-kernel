@@ -306,6 +306,9 @@ pub fn exact_catalog_and_pattern<'a>(
     pattern: &'a Option<String>,
 ) -> Result<(Option<Identifier<'a>>, Option<LikePattern<'a>>)> {
     if catalog.as_deref() == Some("") {
+        // `None` alone means all catalogs. It is safe here only because the
+        // paired empty pattern is checked before list_schemas/list_columns
+        // reach the transport; keep that short-circuit ahead of any wire call.
         return Ok((None, Some(LikePattern::new("")?)));
     }
     Ok((
