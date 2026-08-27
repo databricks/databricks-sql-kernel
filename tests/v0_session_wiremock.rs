@@ -354,9 +354,8 @@ async fn open_session_with_result_cfg(
 
 /// Assert that the recorded CreateSession request carries no
 /// `can_cloud_download`-shaped key under any casing. Shared by the tests
-/// below, which each drive a different `cloudfetch_enabled` /
-/// `session_conf` combination — all of which must keep this key off the
-/// CreateSession wire (issue #196: SEA has no such session conf).
+/// below which prove the typed CloudFetch toggle does not synthesize this
+/// session conf.
 async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
     let recorded = server
         .received_requests()
@@ -379,6 +378,18 @@ async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
             );
         }
     }
+}
+
+async fn create_session_body(server: &MockServer) -> serde_json::Value {
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("server must have request log enabled");
+    let create = recorded
+        .iter()
+        .find(|r| r.url.path() == "/api/2.0/sql/sessions" && r.method.as_str() == "POST")
+        .expect("a POST /sessions request was made");
+    serde_json::from_slice(&create.body).expect("create-session body must be valid JSON")
 }
 
 #[tokio::test]
@@ -413,12 +424,10 @@ async fn create_session_with_cloudfetch_disabled_omits_can_cloud_download() {
 }
 
 #[tokio::test]
-async fn create_session_drops_user_supplied_can_cloud_download() {
-    // A caller-supplied `can_cloud_download` (any value, any casing) is
-    // NOT a valid SEA session conf, so `filter_session_conf` drops it —
-    // it must never reach the CreateSession wire where it would poison
-    // every subsequent ExecuteStatement (issue #196). The session still
-    // opens; the stray key is silently dropped with a warn.
+async fn create_session_forwards_user_supplied_session_conf_unchanged() {
+    // Caller-supplied server-bound session_conf is no longer filtered or
+    // normalized by the kernel. Even keys the server may reject later pass
+    // through unchanged; validation belongs to the server.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/sessions"))
@@ -431,8 +440,8 @@ async fn create_session_drops_user_supplied_can_cloud_download() {
         .await;
 
     let mut session_conf = std::collections::HashMap::new();
-    // Non-canonical casing to also exercise the case-insensitive match.
     session_conf.insert("Can_Cloud_Download".to_string(), "true".to_string());
+    session_conf.insert("unknown.MixedCase".to_string(), "value".to_string());
     let session = Session::builder()
         .connection(
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
@@ -445,10 +454,22 @@ async fn create_session_drops_user_supplied_can_cloud_download() {
         .session_conf(session_conf)
         .open()
         .await
-        .expect("session must open even with a stray can_cloud_download");
+        .expect("session must open with caller-supplied session_conf");
     assert_eq!(session.session_id(), "sess-dropped");
 
-    assert_no_can_cloud_download_on_create(&server).await;
+    let body = create_session_body(&server).await;
+    let obj = body
+        .get("session_confs")
+        .and_then(|v| v.as_object())
+        .expect("session_confs object");
+    assert_eq!(
+        obj.get("Can_Cloud_Download").and_then(|v| v.as_str()),
+        Some("true")
+    );
+    assert_eq!(
+        obj.get("unknown.MixedCase").and_then(|v| v.as_str()),
+        Some("value")
+    );
 }
 
 #[tokio::test]

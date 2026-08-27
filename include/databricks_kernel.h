@@ -317,7 +317,7 @@ kernel_session_config_set_oauth_scopes(KernelSessionConfig* config,
                                        const char* scopes);
 
 /* Add (or overwrite) one session-conf entry. Keys are normally server SET
- * parameters forwarded on the SEA wire (allowlist-filtered). A small set of
+ * parameters forwarded unchanged on the SEA wire. A small set of
  * reserved keys are instead CLIENT-ONLY: they tune the kernel locally, are
  * consumed before session creation, and NEVER reach the wire. Client-only keys
  * (matched case-insensitively):

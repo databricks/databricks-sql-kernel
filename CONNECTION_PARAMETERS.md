@@ -195,33 +195,14 @@ Default: `SeaRest`.
 
 `session_conf: HashMap<String, String>` carries **server-bound** SQL /
 Spark configuration, forwarded to SEA `session_confs` and applied for
-every statement on the session. Keys are matched **case-insensitively**
-against an allowlist and **uppercased** before being sent; keys not in
-the allowlist are **dropped with a warning**.
+every statement on the session. The kernel does not validate,
+normalize, uppercase, or drop server-bound keys; caller-supplied entries
+are forwarded unchanged. Server-side validation errors, if any, come
+from Databricks.
 
-Allowlisted keys (see the [Databricks SQL configuration-parameters
+See the [Databricks SQL configuration-parameters
 reference](https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters)
-for per-parameter meaning and accepted values):
-
-| Key | Notes |
-|-----|-------|
-| `ANSI_MODE` | Enable/disable ANSI SQL behaviour. |
-| `COLLATION` | Default collation. |
-| `ENABLE_PHOTON` | Toggle the Photon engine. |
-| `LEGACY_TIME_PARSER_POLICY` | Legacy datetime parsing behaviour. |
-| `MAX_FILE_PARTITION_BYTES` | Max bytes per file partition. |
-| `QUERY_TAGS` | Query tags (comma-separated `key:value`). |
-| `READ_ONLY_EXTERNAL_METASTORE` | Treat the external metastore as read-only. |
-| `STATEMENT_TIMEOUT` | Server-side per-statement timeout (seconds). This is the real query-timeout knob. |
-| `TIMEZONE` | Session time zone, e.g. `UTC`. |
-| `USE_CACHED_RESULT` | Toggle result caching. |
-
-Dotted `spark.*` confs are matched case-insensitively but sent
-**verbatim** (Spark conf keys are case-sensitive):
-
-| Key | Notes |
-|-----|-------|
-| `spark.sql.thriftserver.metadata.metricview.enabled` | When `"true"`, `SHOW TABLES` returns `METRIC_VIEW` rows and `getColumns` surfaces `measure` columns. Mirrors JDBC `EnableMetricViewMetadata` (default off). |
+for supported SQL parameter names and accepted values.
 
 Boolean-valued keys should use the exact strings `"true"` / `"false"`;
 the kernel does not pre-validate values and forwards them as-is.
@@ -231,11 +212,10 @@ the kernel does not pre-validate values and forwards them as-is.
 Some keys carried in the same `session_conf` map are **client-side**
 tuning knobs: the kernel reads them at session creation, applies them to
 the typed config above, and then strips them so they never reach the SEA
-wire (they are deliberately *not* in the allowlist). They exist so C ABI
-(Go / ODBC) consumers can set them through the existing
-`session_conf` entry point without a dedicated symbol.
+wire. They exist so C ABI (Go / ODBC) consumers can set them through the
+existing `session_conf` entry point without a dedicated symbol.
 
-Each key mirrors a field of [`ResultConfig`](#resultconfig--result-handling-optional) and is matched **case-insensitively**. Boolean keys accept exactly `"true"` / `"false"` (case-insensitive); the integer window keys require a positive integer. An unrecognised value is rejected with `InvalidArgument` at session creation.
+Each key mirrors a field of [`ResultConfig`](#resultconfig--result-handling-optional) and is matched **case-insensitively**. Boolean keys accept exactly `"true"` / `"false"` (case-insensitive); the integer window keys require a positive integer. When supplied through `session_conf`, an invalid value is ignored with a warning and the key is still stripped from the wire. The typed client-conf setters reject invalid values with `InvalidArgument`.
 
 | Key | Description | Default |
 |-----|-------------|---------|
