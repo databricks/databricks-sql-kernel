@@ -357,6 +357,7 @@ impl Metadata {
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
+    /// An empty schema pattern returns an empty result without a wire call.
     ///
     /// JDBC `getSchemas` shape: `TABLE_SCHEM: Utf8 (not null),
     /// TABLE_CATALOG: Utf8`. When the underlying server response omits
@@ -771,6 +772,8 @@ impl Metadata {
 
     /// Columns of tables matching the filter. Catalog is optional and
     /// exact; schema / table / column are patterns.
+    /// An empty schema, table, or column pattern returns an empty result
+    /// without a wire call.
     ///
     /// `catalog = None` emits `SHOW COLUMNS IN ALL CATALOGS` and
     /// returns rows from every catalog visible to the session. The
