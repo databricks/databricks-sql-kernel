@@ -146,6 +146,12 @@ struct TelemetryObserver {
 
 struct StatementTelemetryState {
     started_at: Instant,
+    /// Instant the first result batch became available (set once by
+    /// `record_result_batch`). Consumption latency is measured from
+    /// here, not from `started_at`, so it reflects time spent
+    /// iterating the result set rather than execution + polling +
+    /// result-ready time.
+    first_batch_at: Option<Instant>,
     context: StatementTelemetryContext,
 }
 
@@ -159,6 +165,7 @@ impl TelemetryObserver {
             connection,
             state: Mutex::new(StatementTelemetryState {
                 started_at: Instant::now(),
+                first_batch_at: None,
                 context: StatementTelemetryContext {
                     statement_id: None,
                     statement_type,
@@ -203,14 +210,27 @@ impl StatementOperationObserver for TelemetryObserver {
     fn record_result_batch(&self) {
         if let Ok(mut state) = self.state.lock() {
             if state.context.first_batch_latency.is_none() {
-                state.context.first_batch_latency = Some(state.started_at.elapsed());
+                let now = state.started_at.elapsed();
+                state.context.first_batch_latency = Some(now);
+                // Anchor consumption timing to the moment the result set
+                // became ready, matching `result_set_consumption_latency`
+                // semantics (time to iterate the result set, not time
+                // since statement start).
+                state.first_batch_at = Some(state.started_at + now);
             }
         }
     }
 
     fn record_result_consumed(&self) {
         if let Ok(mut state) = self.state.lock() {
-            state.context.consumption_latency = Some(state.started_at.elapsed());
+            // Measure from when the first batch became available. If no
+            // batch was ever recorded (empty/errored-before-first-batch
+            // result), fall back to statement start.
+            let consumption = match state.first_batch_at {
+                Some(first_batch_at) => first_batch_at.elapsed(),
+                None => state.started_at.elapsed(),
+            };
+            state.context.consumption_latency = Some(consumption);
         }
     }
 
@@ -428,6 +448,43 @@ mod tests {
             event.context.consumption_latency.is_none(),
             "drop without consumption must NOT stamp consumption latency \
              (would report caller think-time, not time to consume the result set)"
+        );
+    }
+
+    #[test]
+    fn consumption_latency_is_measured_from_first_batch_not_statement_start() {
+        let connection = Arc::new(CapturingConnectionTelemetry::default());
+        let telemetry = StatementTelemetry::new(
+            connection.clone(),
+            StatementType::Sql,
+            OperationType::ExecuteStatement,
+        );
+
+        // Simulate meaningful execution/polling/result-ready time before
+        // the first batch is available, then a much shorter consumption
+        // window after it.
+        std::thread::sleep(Duration::from_millis(40));
+        telemetry.record_result_batch();
+        std::thread::sleep(Duration::from_millis(5));
+        telemetry.record_result_consumed();
+        telemetry.finalize(None);
+
+        let events = connection.statement_events.lock().expect("events mutex");
+        assert_eq!(events.len(), 1);
+        let context = &events[0].context;
+        let first_batch = context
+            .first_batch_latency
+            .expect("first-batch latency recorded");
+        let consumption = context
+            .consumption_latency
+            .expect("consumption latency recorded");
+        // If consumption were measured from statement start it would be
+        // >= first_batch_latency. Anchored to the first batch, it only
+        // covers the post-ready window and is strictly smaller.
+        assert!(
+            consumption < first_batch,
+            "consumption latency ({consumption:?}) should exclude the \
+             pre-first-batch execution/polling time ({first_batch:?})"
         );
     }
 }
