@@ -213,6 +213,7 @@ struct DownloadCtx {
 struct CloudFetchMetrics {
     total_chunks_present: Option<i32>,
     total_chunks_iterated: AtomicI32,
+    chunks_downloaded: AtomicI32,
     initial_chunk_latency_ms: AtomicI64,
     slowest_chunk_latency_ms: AtomicI64,
     sum_chunks_download_time_ms: AtomicI64,
@@ -223,6 +224,7 @@ impl CloudFetchMetrics {
         Self {
             total_chunks_present,
             total_chunks_iterated: AtomicI32::new(0),
+            chunks_downloaded: AtomicI32::new(0),
             initial_chunk_latency_ms: AtomicI64::new(-1),
             slowest_chunk_latency_ms: AtomicI64::new(0),
             sum_chunks_download_time_ms: AtomicI64::new(0),
@@ -245,6 +247,13 @@ impl CloudFetchMetrics {
             .fetch_max(millis, Ordering::AcqRel);
         self.sum_chunks_download_time_ms
             .fetch_add(millis, Ordering::AcqRel);
+        // Count completed downloads so `snapshot` can distinguish a
+        // real ~0ms download from "no download ever completed". Both
+        // `slowest`/`sum` atomics initialize to 0, so without this
+        // counter a stream dropped/errored before any download finished
+        // would report `Some(0)` — indistinguishable from a genuine
+        // 0ms download and skewing server-side latency aggregates.
+        self.chunks_downloaded.fetch_add(1, Ordering::AcqRel);
     }
 
     fn record_chunk_iterated(&self) {
@@ -254,17 +263,27 @@ impl CloudFetchMetrics {
     fn snapshot(&self) -> ResultReaderMetrics {
         let initial = self.initial_chunk_latency_ms.load(Ordering::Acquire);
         let iterated = self.total_chunks_iterated.load(Ordering::Acquire);
+        // Only emit `slowest`/`sum` once at least one download has
+        // completed. Both atomics initialize to 0, so gating on this
+        // counter keeps a no-download snapshot reporting `None` rather
+        // than a misleading `Some(0)` — mirroring the `-1` sentinel /
+        // `None` treatment of `initial_chunk_latency` above.
+        let downloaded = self.chunks_downloaded.load(Ordering::Acquire) > 0;
         ResultReaderMetrics {
             total_chunks_present: self.total_chunks_present,
             total_chunks_iterated: Some(iterated),
             initial_chunk_latency: (initial >= 0)
                 .then(|| std::time::Duration::from_millis(initial as u64)),
-            slowest_chunk_latency: Some(std::time::Duration::from_millis(
-                self.slowest_chunk_latency_ms.load(Ordering::Acquire) as u64,
-            )),
-            sum_chunks_download_time: Some(std::time::Duration::from_millis(
-                self.sum_chunks_download_time_ms.load(Ordering::Acquire) as u64,
-            )),
+            slowest_chunk_latency: downloaded.then(|| {
+                std::time::Duration::from_millis(
+                    self.slowest_chunk_latency_ms.load(Ordering::Acquire) as u64,
+                )
+            }),
+            sum_chunks_download_time: downloaded.then(|| {
+                std::time::Duration::from_millis(
+                    self.sum_chunks_download_time_ms.load(Ordering::Acquire) as u64,
+                )
+            }),
         }
     }
 }
@@ -941,7 +960,8 @@ impl StreamingCloudFetchProvider {
             || snapshot
                 .total_chunks_iterated
                 .is_some_and(|count| count > 0)
-            || snapshot.initial_chunk_latency.is_some();
+            || snapshot.initial_chunk_latency.is_some()
+            || snapshot.slowest_chunk_latency.is_some();
         has_data.then_some(snapshot)
     }
 
