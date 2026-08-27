@@ -21,7 +21,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct CircuitBreakerConfig {
     failure_threshold: u32,
     open_timeout: Duration,
@@ -135,9 +135,19 @@ enum CircuitBreakerState {
     HalfOpen,
 }
 
+/// Process-global registry of per-host circuit breakers.
+///
+/// The `breakers` map is keyed by `(host, config)` and holds one entry per
+/// distinct host a process talks to. Entries are never evicted, so the map
+/// grows monotonically for the process lifetime. This is intentional and
+/// bounded in practice: a kernel process connects to a small, stable set of
+/// Databricks workspaces, and each entry is tiny (a `String` key plus an
+/// `Arc<CircuitBreaker>` holding a `Mutex<CircuitState>`). If a future
+/// deployment ever exhibits high host cardinality, add an LRU bound or
+/// idle-based eviction here.
 #[derive(Default)]
 struct CircuitBreakerManager {
-    breakers: Mutex<HashMap<String, Arc<CircuitBreaker>>>,
+    breakers: Mutex<HashMap<(String, CircuitBreakerConfig), Arc<CircuitBreaker>>>,
 }
 
 impl CircuitBreakerManager {
@@ -153,7 +163,7 @@ impl CircuitBreakerManager {
             .expect("poisoned telemetry circuit breakers");
         Arc::clone(
             breakers
-                .entry(host.to_string())
+                .entry((host.to_string(), config))
                 .or_insert_with(|| Arc::new(CircuitBreaker::new(config))),
         )
     }

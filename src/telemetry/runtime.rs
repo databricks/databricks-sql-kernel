@@ -311,8 +311,8 @@ fn valid_config(config: &TelemetryConfig) -> bool {
         && config.batch_size > 0
         && !config.flush_interval.is_zero()
         && !config.close_flush_timeout.is_zero()
-        && !config.circuit_breaker_timeout.is_zero()
-        && (!config.circuit_breaker_enabled || config.circuit_breaker_threshold > 0)
+        && (!config.circuit_breaker_enabled
+            || (config.circuit_breaker_threshold > 0 && !config.circuit_breaker_timeout.is_zero()))
 }
 
 fn exporter_for_config(

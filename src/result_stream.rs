@@ -658,6 +658,18 @@ impl ResultStream {
         }
     }
 
+    /// Install `batch` as the current batch: buffer it, reset the row
+    /// cursor, and record it to telemetry exactly once. Consolidates the
+    /// prefetch-replay and fresh-fetch arms of [`next_batch`](Self::next_batch)
+    /// so the telemetry/cursor bookkeeping lives in one place.
+    fn set_current_batch(&mut self, batch: ResultBatch) {
+        self.current = Some(batch);
+        self.current_row_idx = 0;
+        if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
+            telemetry.record_batch(batch);
+        }
+    }
+
     /// Result schema. Available before any batches have been pulled.
     /// Returns a cheap-clone `Arc<Schema>` so callers can hold the
     /// schema independently of the stream (the FFI layer needs this
@@ -689,11 +701,7 @@ impl ResultStream {
         // A batch buffered by `peek_first_batch` is replayed here first,
         // so a non-consuming peek doesn't steal it from the caller.
         if let Some(batch) = self.prefetched.take() {
-            self.current = Some(batch);
-            self.current_row_idx = 0;
-            if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
-                telemetry.record_batch(batch);
-            }
+            self.set_current_batch(batch);
             return Ok(self.current.as_ref());
         }
         if self.exhausted {
@@ -706,11 +714,7 @@ impl ResultStream {
             .expect("ResultStream reader is present until into_owned_batches consumes it");
         match reader.next_batch().await {
             Ok(Some(rb)) => {
-                self.current = Some(ResultBatch::Arrow(rb));
-                self.current_row_idx = 0;
-                if let (Some(telemetry), Some(batch)) = (&self.telemetry, self.current.as_ref()) {
-                    telemetry.record_batch(batch);
-                }
+                self.set_current_batch(ResultBatch::Arrow(rb));
                 Ok(self.current.as_ref())
             }
             Ok(None) => {
