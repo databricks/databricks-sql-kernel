@@ -122,6 +122,10 @@ author, follow-up, and review runs.
 - **Context:** PR #283 (U2M OAuth token-cache control); a reviewer flagged that caller-supplied token stores keyed on `host` alone would diverge from the built-in `DiskTokenCache`, whose cache filename is a SHA-256 of `{host, client_id, scopes}`.
   **Rule:** OAuth token persistence must be keyed on the full `{host, client_id, scopes}` triple — keying on `host` alone collides U2M sessions that share a host but differ in `client_id`/`scopes`, letting a `save` overwrite another session's token and a `load` return a token minted for a different client/scope set.
 
+### 2026-08-27: learnings since 2026-08-26T07:33:08Z
+- **Context:** PR #298 added `ExecuteOptions.rawParams` (napi) → `StatementSpec::param_raw` so callers can preserve pre-marshalled SEA type names like `INTERVAL MONTH` / `INTERVAL DAY`; routing them through `TypedValue::Interval` collapses the qualifier and loses the exact SQL type.
+  **Rule:** `TypedValue` marshalling is lossy for qualified SQL types (e.g. interval qualifiers like `INTERVAL MONTH` vs `INTERVAL DAY` collapse to a single `Interval`) — when a caller must preserve the verbatim SEA `sql_type`, bind through the raw param path (`param_raw`), not the typed enum. Raw params cannot be mixed with typed params or combine named+positional markers; that mix must surface `InvalidArgument` before dispatch.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
