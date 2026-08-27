@@ -301,7 +301,8 @@ impl Session {
         // Fold client-only result knobs (e.g. cloudfetch_max_chunks_in_memory)
         // carried in session_conf into the typed ResultConfig and strip them
         // from session_conf, before either the reader factory reads
-        // config.result (below) or filter_session_conf runs on the wire body.
+        // config.result (below) or the remaining server-bound session_conf
+        // is sent on the wire.
         apply_client_result_overrides(&mut config);
 
         let host = config.connection.host.clone();
@@ -363,18 +364,15 @@ impl Session {
         );
 
         // CloudFetch-disable is expressed per-statement via the SEA
-        // `disposition` (threaded onto `TransportConfig` above), NOT via a
-        // session conf: SEA has no `CAN_CLOUD_DOWNLOAD` conf — sending one
-        // is accepted at CreateSession but rejected at the first
-        // ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue #196). So the
-        // user's `session_conf` flows to CreateSession untouched; the
-        // kernel synthesises nothing here.
+        // `disposition` (threaded onto `TransportConfig` above), not via a
+        // session conf. The kernel synthesises no session_conf entries;
+        // caller-supplied server-bound entries pass through unchanged.
         let create_started = Instant::now();
         let session_info = transport
             .create_session(
                 defaults.catalog.as_deref(),
                 defaults.schema.as_deref(),
-                crate::config::filter_session_conf(config.session_conf.clone()),
+                config.session_conf.clone(),
             )
             .await?;
         let create_elapsed = create_started.elapsed();
@@ -1077,8 +1075,7 @@ fn build_retry_configs_for_session(
 /// `cloudfetch_max_chunks_in_memory` in there and have it applied. Any key
 /// recognised by [`ResultConfig::apply_client_conf`] (see
 /// [`ClientConfKey`](crate::config::ClientConfKey)) is consumed here;
-/// unrecognised keys are left for [`filter_session_conf`] to handle as
-/// server confs.
+/// unrecognised keys are left in `session_conf` as server-bound confs.
 ///
 /// **Best-effort, never fatal.** A recognised key with an unparseable value
 /// is logged at `warn` and skipped (the field keeps its current value)
@@ -1087,7 +1084,7 @@ fn build_retry_configs_for_session(
 /// *does* reject bad values, because there the caller asked for that key
 /// explicitly; here the key is ambient in a mixed bag.) Every recognised
 /// key is removed regardless of parse outcome, so no client-only key
-/// survives into `filter_session_conf` / the wire.
+/// survives onto the wire.
 ///
 /// Matched case-insensitively. If a host sets two spellings of the same key
 /// differing only in case, the lexicographically-last spelling wins
@@ -1684,7 +1681,7 @@ mod retry_config_tests {
                 "cloudfetch_max_chunks_in_memory".to_string(),
                 "200".to_string(),
             ),
-            // A benign, allowlisted server param that must NOT be removed.
+            // A benign server param that must NOT be removed.
             ("ansi_mode".to_string(), "true".to_string()),
         ]));
         apply_client_result_overrides(&mut cfg);
@@ -1825,24 +1822,6 @@ mod retry_config_tests {
             cfg.session_conf
         );
         assert_eq!(cfg.session_conf.len(), 1, "got {:?}", cfg.session_conf);
-    }
-
-    /// The client knob is NOT in the server allowlist, so even if it were
-    /// left in session_conf it would be filtered before the wire. This
-    /// pins that invariant so a future allowlist edit can't accidentally
-    /// promote it to a server SET parameter.
-    #[test]
-    fn cloudfetch_max_chunks_key_is_not_server_allowlisted() {
-        let filtered = crate::config::filter_session_conf(HashMap::from([(
-            crate::config::ClientConfKey::CloudfetchMaxChunksInMemory
-                .as_str()
-                .to_string(),
-            "4".to_string(),
-        )]));
-        assert!(
-            filtered.is_empty(),
-            "client knob must not survive the server allowlist, got {filtered:?}",
-        );
     }
 }
 

@@ -1245,9 +1245,9 @@ impl ResultConfig {
     ///
     /// Unlike the server `session_conf` map, these knobs are **client-side**
     /// and never reach the SEA wire — so this deliberately does NOT accept
-    /// server conf keys (`ANSI_MODE`, `TIMEZONE`, …); those go through
-    /// [`filter_session_conf`] instead. Keeping the two channels separate is
-    /// the point (see #226).
+    /// server conf keys (`ANSI_MODE`, `TIMEZONE`, …); those remain in
+    /// `session_conf` and pass through unchanged. Keeping the two channels
+    /// separate is the point (see #226).
     ///
     /// # Errors
     /// Returns `ErrorCode::InvalidArgument` when:
@@ -1482,9 +1482,7 @@ pub struct SessionConfig {
     /// Thrift `configuration`. Typed sub-structs above translate
     /// the *client-side* knobs; this map carries everything else.
     ///
-    /// The kernel passes user-supplied entries through unchanged,
-    /// after filtering them against the kernel allowlist (see
-    /// [`filter_session_conf`] / [`SESSION_CONF_ALLOWLIST`]). The
+    /// The kernel passes user-supplied entries through unchanged. The
     /// kernel does not synthesise any entries here from typed
     /// client-side knobs.
     ///
@@ -1494,8 +1492,9 @@ pub struct SessionConfig {
     /// ExecuteStatement with `CONFIG_NOT_AVAILABLE`, issue #196).
     /// CloudFetch-disable is instead applied per-statement via the SEA
     /// `disposition` field, matching the JDBC / Thrift reference
-    /// drivers. A stray caller-supplied `can_cloud_download` is dropped
-    /// by [`filter_session_conf`] (it is not allowlisted).
+    /// drivers. A caller-supplied `can_cloud_download` is still forwarded
+    /// unchanged because the kernel does not validate server-bound
+    /// `session_conf` keys.
     ///
     /// **Boolean-valued conf keys** should use the exact strings
     /// `"true"` / `"false"`. SEA accepts these literally; other forms
@@ -1514,96 +1513,6 @@ pub struct SessionConfig {
 
     /// `None` = kernel picks the default (`SeaRest` today).
     pub transport: Option<TransportMode>,
-}
-
-// ─── session_conf allowlist ─────────────────────────────────────────────────
-
-/// Known session-conf keys, sourced from
-/// <https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters>
-/// plus the additional keys the Java driver accepts (`ENABLE_PHOTON`,
-/// `QUERY_TAGS`). Keys are matched case-insensitively against this list
-/// and uppercased before being sent.
-pub(crate) const SESSION_CONF_ALLOWLIST: &[&str] = &[
-    "ANSI_MODE",
-    // NOTE: `CAN_CLOUD_DOWNLOAD` is deliberately NOT allowlisted. SEA has
-    // no such session conf — it is accepted at CreateSession but rejected
-    // at the first ExecuteStatement with `CONFIG_NOT_AVAILABLE` (issue
-    // #196). CloudFetch-disable is expressed per-statement via the SEA
-    // `disposition` (see `SeaRestTransport::call_execute_api` and
-    // `TransportConfig::cloudfetch_enabled`), matching both the JDBC and
-    // Thrift reference drivers. A stray caller-supplied `can_cloud_download`
-    // is therefore dropped by `filter_session_conf` (with a warn) rather
-    // than forwarded to the wire where it would break the session.
-    "COLLATION",
-    "ENABLE_PHOTON",
-    "LEGACY_TIME_PARSER_POLICY",
-    "MAX_FILE_PARTITION_BYTES",
-    "QUERY_TAGS",
-    "READ_ONLY_EXTERNAL_METASTORE",
-    "STATEMENT_TIMEOUT",
-    "TIMEZONE",
-    "USE_CACHED_RESULT",
-];
-
-/// Case-sensitive session-conf keys that must be sent **verbatim**
-/// rather than uppercased. These are dotted `spark.*` Spark confs (as
-/// opposed to the short SET-style SQL parameters in
-/// [`SESSION_CONF_ALLOWLIST`], which Databricks echoes uppercase).
-/// Spark stores `SQLConf` entries under their exact registered
-/// lowercase-dotted key, so uppercasing would address the wrong entry.
-///
-/// Each tuple is `(uppercased_lookup_key, canonical_verbatim_key)`:
-/// callers are matched case-insensitively (via the uppercased lookup)
-/// but the canonical form is what we send on the wire.
-///
-/// `spark.sql.thriftserver.metadata.metricview.enabled` enables UC
-/// Metric View metadata — when set to `"true"`, `SHOW TABLES`
-/// (`Metadata::tables`) returns `METRIC_VIEW` rows and `getColumns`
-/// surfaces `measure` columns. Opt-in: the connector sets it from its
-/// `enable_metric_view_metadata` kwarg (default off), matching the
-/// JDBC driver's `EnableMetricViewMetadata` (default `0`). The kernel
-/// already lists `METRIC_VIEW` among its table types; this lets the
-/// enabling conf through so the server actually emits the rows.
-pub(crate) const SESSION_CONF_CASE_SENSITIVE_ALLOWLIST: &[(&str, &str)] = &[(
-    "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED",
-    "spark.sql.thriftserver.metadata.metricview.enabled",
-)];
-
-/// Filter a caller-supplied `session_conf` map against the allowlists.
-/// Unknown keys are dropped with a `tracing::warn!`.
-///
-/// - Keys in [`SESSION_CONF_ALLOWLIST`] are normalized to **uppercase**
-///   (the server echoes uppercase for these SET-style params, so
-///   SET-readback matches).
-/// - Keys in [`SESSION_CONF_CASE_SENSITIVE_ALLOWLIST`] (dotted
-///   `spark.*` confs) are matched case-insensitively but emitted in
-///   their **canonical verbatim** form — Spark conf keys are
-///   case-sensitive and must not be uppercased.
-pub(crate) fn filter_session_conf(
-    raw: std::collections::HashMap<String, String>,
-) -> std::collections::HashMap<String, String> {
-    use std::collections::HashMap;
-    let mut out: HashMap<String, String> = HashMap::with_capacity(raw.len());
-    for (k, v) in raw {
-        let upper = k.to_ascii_uppercase();
-        if SESSION_CONF_ALLOWLIST.contains(&upper.as_str()) {
-            out.insert(upper, v);
-        } else if let Some((_, canonical)) = SESSION_CONF_CASE_SENSITIVE_ALLOWLIST
-            .iter()
-            .find(|(lookup, _)| *lookup == upper.as_str())
-        {
-            // Send the canonical lowercase-dotted form verbatim, not
-            // the caller's casing and not uppercased.
-            out.insert((*canonical).to_string(), v);
-        } else {
-            crate::klog::warn!(
-                key = %k,
-                "dropping unknown session_conf key (not in kernel allowlist); \
-                 see https://docs.databricks.com/aws/en/sql/language-manual/sql-ref-parameters"
-            );
-        }
-    }
-    out
 }
 
 #[cfg(test)]
@@ -1711,120 +1620,6 @@ mod tests {
             passphrase: Some("ignored".to_string()),
         };
         assert_eq!(cfg.resolve(), None);
-    }
-
-    // ─── session_conf allowlist ────────────────────────────────────
-
-    #[test]
-    fn session_conf_filter_keeps_known_keys_uppercased() {
-        let mut raw = std::collections::HashMap::new();
-        raw.insert("use_cached_result".to_string(), "false".to_string());
-        raw.insert("ANSI_MODE".to_string(), "true".to_string());
-        let out = filter_session_conf(raw);
-        assert_eq!(
-            out.get("USE_CACHED_RESULT").map(String::as_str),
-            Some("false")
-        );
-        assert_eq!(out.get("ANSI_MODE").map(String::as_str), Some("true"));
-        assert_eq!(out.len(), 2);
-    }
-
-    #[test]
-    fn session_conf_filter_drops_unknown_keys() {
-        let mut raw = std::collections::HashMap::new();
-        raw.insert("ANSI_MOD".to_string(), "true".to_string()); // typo
-        raw.insert("NOT_A_REAL_PARAM".to_string(), "x".to_string());
-        raw.insert("TIMEZONE".to_string(), "UTC".to_string());
-        let out = filter_session_conf(raw);
-        assert_eq!(out.len(), 1);
-        assert_eq!(out.get("TIMEZONE").map(String::as_str), Some("UTC"));
-    }
-
-    #[test]
-    fn session_conf_filter_drops_can_cloud_download() {
-        // Regression tripwire for issue #196: `can_cloud_download` is NOT a
-        // valid SEA session conf (the server rejects it at ExecuteStatement
-        // with CONFIG_NOT_AVAILABLE). It must be dropped by the allowlist
-        // filter — never forwarded to the wire — regardless of casing.
-        // CloudFetch-disable is applied per-statement via the SEA
-        // disposition instead. If someone re-adds it to the allowlist, this
-        // test flips RED.
-        for spelling in [
-            "can_cloud_download",
-            "CAN_CLOUD_DOWNLOAD",
-            "Can_Cloud_Download",
-        ] {
-            let mut raw = std::collections::HashMap::new();
-            raw.insert(spelling.to_string(), "false".to_string());
-            let out = filter_session_conf(raw);
-            assert!(
-                out.is_empty(),
-                "can_cloud_download ({spelling:?}) must be dropped, got {out:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn session_conf_filter_passes_metricview_conf_verbatim() {
-        // The metric-view conf is a dotted spark.* key: it must survive
-        // the allowlist AND be emitted lowercase-verbatim (NOT
-        // uppercased like the SET-style params), because Spark conf
-        // keys are case-sensitive.
-        let mut raw = std::collections::HashMap::new();
-        raw.insert(
-            "spark.sql.thriftserver.metadata.metricview.enabled".to_string(),
-            "true".to_string(),
-        );
-        let out = filter_session_conf(raw);
-        assert_eq!(
-            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
-                .map(String::as_str),
-            Some("true"),
-        );
-        // It must NOT have been uppercased.
-        assert!(!out.contains_key("SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED"));
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn session_conf_filter_metricview_match_is_case_insensitive() {
-        // A caller passing the key in any casing is recognised, but the
-        // canonical lowercase form is always what we send.
-        let mut raw = std::collections::HashMap::new();
-        raw.insert(
-            "SPARK.SQL.THRIFTSERVER.METADATA.METRICVIEW.ENABLED".to_string(),
-            "true".to_string(),
-        );
-        let out = filter_session_conf(raw);
-        assert_eq!(
-            out.get("spark.sql.thriftserver.metadata.metricview.enabled")
-                .map(String::as_str),
-            Some("true"),
-        );
-        assert_eq!(out.len(), 1);
-    }
-
-    #[test]
-    fn session_conf_allowlist_covers_jdbc_set() {
-        // Parity check: every key the Java driver accepts must be
-        // accepted here too (we add COLLATION which JDBC currently
-        // lacks but the docs list).
-        for jdbc_key in [
-            "ANSI_MODE",
-            "ENABLE_PHOTON",
-            "LEGACY_TIME_PARSER_POLICY",
-            "MAX_FILE_PARTITION_BYTES",
-            "READ_ONLY_EXTERNAL_METASTORE",
-            "STATEMENT_TIMEOUT",
-            "TIMEZONE",
-            "USE_CACHED_RESULT",
-            "QUERY_TAGS",
-        ] {
-            assert!(
-                SESSION_CONF_ALLOWLIST.contains(&jdbc_key),
-                "missing JDBC-compatible key: {jdbc_key}"
-            );
-        }
     }
 
     // ─── AuthConfig validating constructors ───────────────────────

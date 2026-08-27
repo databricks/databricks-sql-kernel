@@ -981,9 +981,8 @@ pub unsafe extern "C" fn kernel_init_logging_callback(
     }
 }
 
-/// Add (or overwrite) one server-bound session-conf entry. Unknown keys
-/// are filtered against the kernel allowlist at `open()` time, matching
-/// the Rust-crate path.
+/// Add (or overwrite) one server-bound session-conf entry. Entries pass
+/// through unchanged at `open()` time, matching the Rust-crate path.
 ///
 /// # Safety
 /// `config` must be a live config handle; `key` / `value` must be
