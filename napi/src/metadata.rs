@@ -49,10 +49,10 @@
 
 use std::sync::Arc;
 
+use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{
     Error as KernelError, Identifier, LikePattern, Metadata, Result as KResult, ResultStream,
 };
-use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 
 use crate::connection::{connection_closed_err, Connection};
 use crate::error::napi_err_from_kernel;
