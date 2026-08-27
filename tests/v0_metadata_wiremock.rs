@@ -1069,6 +1069,52 @@ async fn list_columns_empty_catalog_matches_nothing_without_wire_call() {
 }
 
 #[tokio::test]
+async fn list_columns_empty_table_pattern_matches_nothing_without_wire_call() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_columns(
+            Some(Identifier::new("main").unwrap()),
+            None,
+            Some(LikePattern::new("").unwrap()),
+            None,
+        )
+        .await
+        .expect("empty table pattern returns empty columns");
+
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn list_columns_empty_column_pattern_matches_nothing_without_wire_call() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_columns(
+            Some(Identifier::new("main").unwrap()),
+            None,
+            None,
+            Some(LikePattern::new("").unwrap()),
+        )
+        .await
+        .expect("empty column pattern returns empty columns");
+
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
 async fn primary_keys_reshaped_to_jdbc_columns() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
