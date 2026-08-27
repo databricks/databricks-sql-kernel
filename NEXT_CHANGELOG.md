@@ -24,6 +24,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- HTTP retries now treat temporary DNS resolver failures as transient while
+  permanent unknown-host failures still fail immediately.
+
 ### Updated
 
 ### Fixed
