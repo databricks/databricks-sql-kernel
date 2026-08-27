@@ -29,7 +29,13 @@ struct CircuitBreakerConfig {
 
 impl CircuitBreakerConfig {
     fn from_telemetry_config(config: &TelemetryConfig) -> Option<Self> {
-        if !config.circuit_breaker_enabled || config.circuit_breaker_threshold == 0 {
+        // Degrade a misconfigured breaker (threshold == 0 or timeout == 0) to
+        // "no breaker" rather than disabling telemetry entirely. This mirrors
+        // `valid_config`, which deliberately does not reject these knobs.
+        if !config.circuit_breaker_enabled
+            || config.circuit_breaker_threshold == 0
+            || config.circuit_breaker_timeout.is_zero()
+        {
             return None;
         }
 
@@ -56,19 +62,40 @@ impl CircuitBreaker {
         }
     }
 
-    fn before_export(&self) -> ExportPermit {
+    /// Acquire a permit for one export attempt.
+    ///
+    /// Returns `Some(guard)` when the export is allowed and `None` when the
+    /// circuit is open (or already probing in half-open). The returned
+    /// [`ExportGuard`] must be resolved with `record_success`/`record_failure`;
+    /// if it is dropped without an outcome — e.g. the flush future is cancelled
+    /// by a `tokio::time::timeout` or an aborted timer task — a half-open probe
+    /// re-arms the open timeout on drop instead of wedging the shared breaker in
+    /// `HalfOpen` forever.
+    fn before_export(&self) -> Option<ExportGuard<'_>> {
         let mut state = self.state.lock().expect("poisoned circuit breaker");
         match *state {
-            CircuitState::Closed { .. } => ExportPermit::Allowed,
+            CircuitState::Closed { .. } => Some(ExportGuard::new(self, false)),
             CircuitState::Open { opened_at } => {
                 if opened_at.elapsed() >= self.config.open_timeout {
                     *state = CircuitState::HalfOpen;
-                    ExportPermit::Allowed
+                    Some(ExportGuard::new(self, true))
                 } else {
-                    ExportPermit::Dropped
+                    None
                 }
             }
-            CircuitState::HalfOpen => ExportPermit::Dropped,
+            CircuitState::HalfOpen => None,
+        }
+    }
+
+    /// Re-arm the open timeout after a half-open probe was abandoned without an
+    /// outcome (a cancelled/dropped export future). Only acts while the breaker
+    /// is still `HalfOpen`, so a concurrently-recorded outcome wins.
+    fn rearm_cancelled_probe(&self) {
+        let mut state = self.state.lock().expect("poisoned circuit breaker");
+        if matches!(*state, CircuitState::HalfOpen) {
+            *state = CircuitState::Open {
+                opened_at: Instant::now(),
+            };
         }
     }
 
@@ -121,10 +148,45 @@ enum CircuitState {
     HalfOpen,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ExportPermit {
-    Allowed,
-    Dropped,
+/// RAII permit for a single in-flight export.
+///
+/// Resolve it with [`ExportGuard::record_success`] / [`ExportGuard::record_failure`]
+/// once the export completes. If the guard is dropped without an explicit
+/// outcome (the export future was cancelled mid-`await`) and it was a half-open
+/// probe, the drop re-arms the open timeout so the shared breaker cannot be
+/// pinned in `HalfOpen` forever.
+struct ExportGuard<'a> {
+    breaker: &'a CircuitBreaker,
+    is_probe: bool,
+    resolved: bool,
+}
+
+impl<'a> ExportGuard<'a> {
+    fn new(breaker: &'a CircuitBreaker, is_probe: bool) -> Self {
+        Self {
+            breaker,
+            is_probe,
+            resolved: false,
+        }
+    }
+
+    fn record_success(mut self) {
+        self.resolved = true;
+        self.breaker.record_success();
+    }
+
+    fn record_failure(mut self) {
+        self.resolved = true;
+        self.breaker.record_failure();
+    }
+}
+
+impl Drop for ExportGuard<'_> {
+    fn drop(&mut self) {
+        if !self.resolved && self.is_probe {
+            self.breaker.rearm_cancelled_probe();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -207,21 +269,21 @@ impl TelemetryExporter for CircuitBreakerTelemetryExporter {
         request: TelemetryRequest,
     ) -> Pin<Box<dyn Future<Output = TelemetryExportResult> + Send + 'a>> {
         Box::pin(async move {
-            if self.breaker.before_export() == ExportPermit::Dropped {
+            let Some(guard) = self.breaker.before_export() else {
                 tracing::debug!(
                     host = %self.host,
                     "telemetry circuit breaker open; dropping telemetry batch"
                 );
                 return Ok(());
-            }
+            };
 
             match self.inner.export(request).await {
                 Ok(()) => {
-                    self.breaker.record_success();
+                    guard.record_success();
                     Ok(())
                 }
                 Err(error) => {
-                    self.breaker.record_failure();
+                    guard.record_failure();
                     Err(error)
                 }
             }
@@ -307,6 +369,54 @@ mod tests {
 
         assert_eq!(exporter.breaker.state_for_test(), CircuitBreakerState::Open);
         assert_eq!(inner.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn cancelled_half_open_probe_rearms_open_timeout() {
+        // Regression: a half-open probe future dropped mid-`await` (e.g. a
+        // flush cancelled by `tokio::time::timeout` or an aborted timer task)
+        // must not wedge the shared, process-global breaker in HalfOpen forever.
+        let host = unique_host("cancelled-probe");
+        let config = CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_timeout: Duration::from_millis(10),
+        };
+
+        // Trip the breaker open through a failing exporter.
+        let failing = Arc::new(FailingExporter::default());
+        let failing_exporter = CircuitBreakerTelemetryExporter::new(failing.clone(), host, config);
+        assert!(failing_exporter.export(sample_request()).await.is_err());
+        assert_eq!(
+            failing_exporter.breaker.state_for_test(),
+            CircuitBreakerState::Open
+        );
+
+        // A second exporter to the same host+config shares the same breaker.
+        let slow = Arc::new(SlowExporter::default());
+        let slow_exporter = CircuitBreakerTelemetryExporter::new(slow.clone(), host, config);
+
+        // After the timeout, drive a half-open probe and cancel it mid-flight via
+        // `timeout` — this transitions the breaker to HalfOpen and then drops the
+        // export future while it awaits the inner exporter, exactly like the
+        // flush-timeout / aborted-timer paths.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let cancelled = tokio::time::timeout(
+            Duration::from_millis(10),
+            slow_exporter.export(sample_request()),
+        )
+        .await;
+        assert!(cancelled.is_err(), "probe should have been cancelled");
+
+        // The breaker must be back to Open (timeout re-armed), not stuck HalfOpen.
+        assert_eq!(
+            slow_exporter.breaker.state_for_test(),
+            CircuitBreakerState::Open
+        );
+        assert_eq!(
+            slow.calls.load(Ordering::SeqCst),
+            1,
+            "slow probe should have started exactly once"
+        );
     }
 
     #[tokio::test]
@@ -399,6 +509,26 @@ mod tests {
                 } else {
                     Err(TelemetryExportError::Export("boom".to_string()))
                 }
+            })
+        }
+    }
+
+    /// Records that it started, then never resolves — used to hold a half-open
+    /// probe open across a cancellation boundary.
+    #[derive(Default)]
+    struct SlowExporter {
+        calls: AtomicUsize,
+    }
+
+    impl TelemetryExporter for SlowExporter {
+        fn export<'a>(
+            &'a self,
+            _request: TelemetryRequest,
+        ) -> Pin<Box<dyn Future<Output = TelemetryExportResult> + Send + 'a>> {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+                Ok(())
             })
         }
     }

@@ -307,12 +307,15 @@ impl ConnectionTelemetry for RealConnectionTelemetry {
 }
 
 fn valid_config(config: &TelemetryConfig) -> bool {
+    // A misconfigured circuit breaker (threshold == 0 or timeout == 0) is NOT
+    // treated as an invalid telemetry config: doing so would disable *all*
+    // telemetry, whereas `CircuitBreakerConfig::from_telemetry_config` degrades
+    // the same state to "breaker off" and lets telemetry flow unwrapped. Keep
+    // the two paths consistent by only validating the core telemetry knobs here.
     config.enabled
         && config.batch_size > 0
         && !config.flush_interval.is_zero()
         && !config.close_flush_timeout.is_zero()
-        && (!config.circuit_breaker_enabled
-            || (config.circuit_breaker_threshold > 0 && !config.circuit_breaker_timeout.is_zero()))
 }
 
 fn exporter_for_config(
@@ -491,19 +494,22 @@ mod tests {
         };
         assert!(!valid_config(&zero_interval));
 
+        // A misconfigured circuit breaker must NOT invalidate the whole
+        // telemetry config: it degrades to "breaker off" (see
+        // `CircuitBreakerConfig::from_telemetry_config`), so telemetry stays on.
         let zero_breaker_threshold = TelemetryConfig {
             enabled: true,
             circuit_breaker_enabled: true,
             circuit_breaker_threshold: 0,
             ..TelemetryConfig::default()
         };
-        assert!(!valid_config(&zero_breaker_threshold));
+        assert!(valid_config(&zero_breaker_threshold));
 
         let zero_breaker_timeout = TelemetryConfig {
             enabled: true,
             circuit_breaker_timeout: Duration::ZERO,
             ..TelemetryConfig::default()
         };
-        assert!(!valid_config(&zero_breaker_timeout));
+        assert!(valid_config(&zero_breaker_timeout));
     }
 }
