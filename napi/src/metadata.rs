@@ -23,10 +23,9 @@
 //! involved (metadata calls don't use the mutable `Statement` path).
 //!
 //! Parameter mapping from JS strings to kernel newtypes follows the
-//! pyo3 binding pattern: `Option<String>` → `Option<Identifier<'_>>`
-//! or `Option<LikePattern<'_>>`, with runtime validation left to the
-//! kernel. Rejected inputs surface as `InvalidArgument` via the
-//! standard kernel-error envelope.
+//! pyo3 binding pattern. Empty exact catalog filters become empty
+//! patterns (match nothing); other validation remains kernel-owned and
+//! surfaces as `InvalidArgument` through the standard error envelope.
 //!
 //! ## `!Send` future workaround
 //!
@@ -53,6 +52,7 @@ use std::sync::Arc;
 use databricks_sql_kernel::{
     Error as KernelError, Identifier, LikePattern, Metadata, Result as KResult, ResultStream,
 };
+use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 
 use crate::connection::{connection_closed_err, Connection};
 use crate::error::napi_err_from_kernel;
@@ -130,7 +130,8 @@ impl Connection {
         .await
     }
 
-    /// Schemas filtered by catalog (exact) and schema name pattern.
+    /// Schemas filtered by catalog (exact) and schema name pattern. An empty
+    /// catalog matches nothing; non-empty catalogs remain exact identifiers.
     ///
     /// JDBC `getSchemas` shape: `TABLE_SCHEM, TABLE_CATALOG`.
     #[napi]
@@ -142,8 +143,7 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = Identifier::from_opt(&catalog)?;
-                let pat = LikePattern::from_opt(&schema_pattern)?;
+                let (cat, pat) = exact_catalog_and_pattern(&catalog, &schema_pattern)?;
                 meta.list_schemas(cat, pat).await
             })
             .await?;
@@ -197,7 +197,8 @@ impl Connection {
         .await
     }
 
-    /// Columns of tables matching the filter.
+    /// Columns of tables matching the filter. An empty catalog matches
+    /// nothing; non-empty catalogs remain exact identifiers.
     ///
     /// JDBC `getColumns` shape: 23 columns.
     #[napi]
@@ -211,8 +212,7 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = Identifier::from_opt(&catalog)?;
-                let sch = LikePattern::from_opt(&schema_pattern)?;
+                let (cat, sch) = exact_catalog_and_pattern(&catalog, &schema_pattern)?;
                 let tbl = LikePattern::from_opt(&table_pattern)?;
                 let col = LikePattern::from_opt(&column_pattern)?;
                 meta.list_columns(cat, sch, tbl, col).await

@@ -293,6 +293,27 @@ impl<'a> LikePattern<'a> {
     }
 }
 
+/// Convert binding-layer optional strings for an exact catalog plus a
+/// pattern filter.
+///
+/// Non-empty catalogs remain exact [`Identifier`]s. An empty catalog cannot
+/// be represented as an `Identifier`, but JDBC metadata semantics require it
+/// to match nothing rather than fail validation. Encode that case as an empty
+/// [`LikePattern`] on the accompanying pattern dimension; metadata methods
+/// short-circuit empty patterns to a typed empty result before any wire call.
+pub fn exact_catalog_and_pattern<'a>(
+    catalog: &'a Option<String>,
+    pattern: &'a Option<String>,
+) -> Result<(Option<Identifier<'a>>, Option<LikePattern<'a>>)> {
+    if catalog.as_deref() == Some("") {
+        return Ok((None, Some(LikePattern::new("")?)));
+    }
+    Ok((
+        Identifier::from_opt(catalog)?,
+        LikePattern::from_opt(pattern)?,
+    ))
+}
+
 // ─── Metadata API ───────────────────────────────────────────────────────────
 
 /// Flat catalog-metadata API bound to a session.
@@ -348,6 +369,15 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
+            if schema_pattern
+                .as_ref()
+                .is_some_and(|pattern| pattern.as_str().is_empty())
+            {
+                return ResultStream::from_reader(Box::new(EmptyReader::new(
+                    GET_SCHEMAS_SCHEMA.clone(),
+                )))
+                .await;
+            }
             let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
             let raw = match self
                 .session
@@ -772,6 +802,19 @@ impl Metadata {
     ) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         async {
+            if [&schema_pattern, &table_pattern, &column_pattern]
+                .into_iter()
+                .any(|pattern| {
+                    pattern
+                        .as_ref()
+                        .is_some_and(|pattern| pattern.as_str().is_empty())
+                })
+            {
+                return ResultStream::from_reader(Box::new(EmptyReader::new(
+                    GET_COLUMNS_SCHEMA.clone(),
+                )))
+                .await;
+            }
             let catalog_str = catalog.as_ref().map(|i| i.as_str().to_owned());
             let raw = match self
                 .session
@@ -1187,6 +1230,26 @@ mod tests {
         // still rejected (see like_pattern_rejects_whitespace_only).
         let p = LikePattern::new("").expect("empty pattern accepted");
         assert_eq!(p.as_str(), "");
+    }
+
+    #[test]
+    fn exact_catalog_and_pattern_keeps_non_empty_catalog_exact() {
+        let catalog = Some("my_catalog".to_owned());
+        let pattern = Some("schema%".to_owned());
+        let (catalog, pattern) = exact_catalog_and_pattern(&catalog, &pattern).unwrap();
+
+        assert_eq!(catalog.unwrap().as_str(), "my_catalog");
+        assert_eq!(pattern.unwrap().as_str(), "schema%");
+    }
+
+    #[test]
+    fn exact_catalog_and_pattern_routes_empty_catalog_to_empty_pattern() {
+        let catalog = Some(String::new());
+        let original_pattern = Some("ignored%".to_owned());
+        let (catalog, pattern) = exact_catalog_and_pattern(&catalog, &original_pattern).unwrap();
+
+        assert!(catalog.is_none());
+        assert_eq!(pattern.unwrap().as_str(), "");
     }
 
     #[test]

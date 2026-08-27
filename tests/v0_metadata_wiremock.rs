@@ -37,6 +37,7 @@ use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{
     AuthConfig, ConnectionConfig, Identifier, LikePattern, ResultBatch, Session,
 };
@@ -373,6 +374,28 @@ async fn list_schemas_literal_percent_catalog_scopes_verbatim_and_empties() {
         .await
         .expect("list_schemas literal % catalog maps not-found to empty");
     // Still the JDBC getSchemas shape, zero rows.
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_SCHEM");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+}
+
+#[tokio::test]
+async fn list_schemas_empty_catalog_matches_nothing_without_wire_call() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let catalog = Some(String::new());
+    let requested_pattern = Some("ignored%".to_owned());
+    let (catalog, schema_pattern) =
+        exact_catalog_and_pattern(&catalog, &requested_pattern).unwrap();
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_schemas(catalog, schema_pattern)
+        .await
+        .expect("empty catalog returns empty schemas");
+
     assert_eq!(col_names(&stream.schema())[0], "TABLE_SCHEM");
     let batches = drain_stream(&mut stream).await;
     assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
@@ -1021,6 +1044,28 @@ async fn list_columns_without_catalog_emits_all_catalogs_query() {
         "hive_metastore",
         "TABLE_CAT is populated from the server's catalogName column"
     );
+}
+
+#[tokio::test]
+async fn list_columns_empty_catalog_matches_nothing_without_wire_call() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let catalog = Some(String::new());
+    let requested_pattern = Some("ignored%".to_owned());
+    let (catalog, schema_pattern) =
+        exact_catalog_and_pattern(&catalog, &requested_pattern).unwrap();
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_columns(catalog, schema_pattern, None, None)
+        .await
+        .expect("empty catalog returns empty columns");
+
+    assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
 }
 
 #[tokio::test]
