@@ -425,8 +425,9 @@ mod tests {
             Some(Duration::from_millis(40))
         );
         assert!(
-            event.context.consumption_latency.is_some(),
-            "drop should still record consumption latency"
+            event.context.consumption_latency.is_none(),
+            "drop without consumption must NOT stamp consumption latency \
+             (would report caller think-time, not time to consume the result set)"
         );
     }
 }
