@@ -238,6 +238,18 @@ enum CircuitBreakerState {
 /// `Arc<CircuitBreaker>` holding a `Mutex<CircuitState>`). If a future
 /// deployment ever exhibits high host cardinality, add an LRU bound or
 /// idle-based eviction here.
+///
+/// Note on the `config` component of the key: telemetry config is effectively
+/// **first-writer-wins per host** because `TelemetryClientManager` caches the
+/// `TelemetryClient` (and thus its wrapped exporter) by host alone. A second
+/// session to an already-connected host reuses the first session's client, so
+/// its freshly-built exporter — and the breaker it would have created — is
+/// discarded. In practice, then, only one `(host, config)` breaker is reached
+/// per host (matching the first-writer-wins behavior of other telemetry knobs
+/// such as `batch_size` and `flush_interval`). The `config` in the key is not
+/// dead code, though: it still differentiates breakers for `bypass_cache`
+/// (test-injected) exporters, which create unmanaged clients that skip the
+/// host-only cache.
 #[derive(Default)]
 struct CircuitBreakerManager {
     breakers: Mutex<HashMap<(String, CircuitBreakerConfig), Arc<CircuitBreaker>>>,
