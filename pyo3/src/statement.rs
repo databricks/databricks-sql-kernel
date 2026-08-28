@@ -396,7 +396,7 @@ impl ExecutedStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, inner.exec.close());
+        let res = run_kernel!(py, runtime, KExecutedStatement::close(&mut inner.exec));
         // Drop the kernel handle regardless of close() outcome — the
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.

@@ -640,6 +640,13 @@ impl ResultStream {
         self.reader.as_ref().and_then(|reader| reader.metrics())
     }
 
+    pub(crate) fn finish_telemetry(&mut self) {
+        let metrics = self.reader_metrics();
+        if let Some(telemetry) = &mut self.telemetry {
+            telemetry.finish(metrics, None, false);
+        }
+    }
+
     /// Finalize telemetry once, passing the reader's terminal metrics.
     /// `reader` and `telemetry` are disjoint fields, so this borrows
     /// cleanly under `&mut self`. `ResultStreamTelemetry::finish` is
