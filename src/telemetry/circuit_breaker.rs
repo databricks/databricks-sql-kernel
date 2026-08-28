@@ -99,11 +99,31 @@ impl CircuitBreaker {
         }
     }
 
-    fn record_success(&self) {
+    fn record_success(&self, is_probe: bool) {
         let mut state = self.state.lock().expect("poisoned circuit breaker");
-        *state = CircuitState::Closed {
-            consecutive_failures: 0,
-        };
+        match *state {
+            CircuitState::Closed { .. } => {
+                // A success from a closed-era guard confirms health; clear any
+                // accumulated consecutive-failure count.
+                *state = CircuitState::Closed {
+                    consecutive_failures: 0,
+                };
+            }
+            CircuitState::HalfOpen if is_probe => {
+                // The half-open probe succeeded; the endpoint is healthy again.
+                *state = CircuitState::Closed {
+                    consecutive_failures: 0,
+                };
+            }
+            // Mirror `record_failure`'s guard against late outcomes: a
+            // non-probe success arriving while the circuit is `Open` (or a
+            // probe is already in flight in `HalfOpen`) is a stale outcome from
+            // a guard admitted while `Closed`, before a concurrent failure
+            // burst opened the circuit. Closing here would clobber the open
+            // window and bypass the half-open single-probe recovery gate, so
+            // leave the current state untouched.
+            CircuitState::HalfOpen | CircuitState::Open { .. } => {}
+        }
     }
 
     fn record_failure(&self) {
@@ -181,7 +201,7 @@ impl<'a> ExportGuard<'a> {
 
     fn record_success(mut self) {
         self.resolved = true;
-        self.breaker.record_success();
+        self.breaker.record_success(self.is_probe);
     }
 
     fn record_failure(mut self) {
@@ -426,6 +446,56 @@ mod tests {
             1,
             "slow probe should have started exactly once"
         );
+    }
+
+    #[test]
+    fn late_closed_era_success_does_not_clobber_open_circuit() {
+        // A guard admitted while `Closed` can still be in flight when a
+        // concurrent failure burst opens the circuit. If that stale guard then
+        // succeeds late, closing the breaker would re-admit full traffic and
+        // bypass the half-open single-probe gate. It must be ignored while Open.
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_timeout: Duration::from_secs(60),
+        });
+
+        // A closed-era (non-probe) guard is admitted, then a failure opens the
+        // circuit before that guard resolves.
+        let stale = breaker.before_export().expect("closed admits export");
+        assert!(!stale.is_probe);
+        breaker.record_failure();
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::Open);
+
+        // The stale guard now succeeds late; the breaker must stay Open.
+        stale.record_success();
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::Open);
+    }
+
+    #[test]
+    fn late_probe_success_does_not_reset_freshly_reopened_circuit() {
+        // A half-open probe is admitted, the circuit reopens (e.g. a failed
+        // second probe or a re-arm), and only then the first probe succeeds
+        // late. That stale success must not reset the fresh open window.
+        let breaker = CircuitBreaker::new(CircuitBreakerConfig {
+            failure_threshold: 1,
+            open_timeout: Duration::from_millis(1),
+        });
+
+        breaker.record_failure();
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::Open);
+
+        std::thread::sleep(Duration::from_millis(5));
+        let probe = breaker.before_export().expect("half-open admits one probe");
+        assert!(probe.is_probe);
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::HalfOpen);
+
+        // The circuit reopens underneath the in-flight probe.
+        breaker.rearm_cancelled_probe();
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::Open);
+
+        // The stale probe's late success must not clobber the fresh open window.
+        probe.record_success();
+        assert_eq!(breaker.state_for_test(), CircuitBreakerState::Open);
     }
 
     #[tokio::test]
