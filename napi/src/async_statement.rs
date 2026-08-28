@@ -44,9 +44,8 @@
 //!   wrapper applied to every entry here covers the
 //!   V8-panic-across-boundary case on top of both.
 //!
-//! `close()` routes through the `ExecutedStatementHandle` trait the
-//! kernel implements for both `ExecutedStatement` and
-//! `ExecutedAsyncStatement`, holding `inner.lock()` like the sync path.
+//! `close()` routes through the kernel's concrete async handle close,
+//! holding `inner.lock()` like the sync path.
 //! `cancel()` is the one method that does *not* take the lock — it
 //! fires through a detached `AsyncStatementCanceller` (session +
 //! statement_id) so it can interrupt an in-flight `awaitResult()`
@@ -362,16 +361,14 @@ impl AsyncStatement {
                 let mut guard = inner.lock().await;
                 guard.take()
             };
-            let Some(inner_state) = taken else {
+            let Some(mut inner_state) = taken else {
                 return Ok(());
             };
             // Flip the lock-free flag once we own the close so a racing
             // lock-free `cancel()` short-circuits to InvalidStatementHandle
             // rather than firing a wire cancel on a closing statement.
             closed.store(true, Ordering::Release);
-            inner_state
-                .executed_async
-                .close()
+            ExecutedAsyncStatement::close(&mut inner_state.executed_async)
                 .await
                 .map_err(napi_err_from_kernel)
         })

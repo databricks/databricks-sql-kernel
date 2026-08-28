@@ -133,7 +133,7 @@ impl ExecutedAsyncStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, inner.exec.close());
+        let res = run_kernel!(py, runtime, KExecutedAsyncStatement::close(&mut inner.exec));
         self.inner = None;
         res.map(|_| ())
     }
