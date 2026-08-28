@@ -515,23 +515,13 @@ impl Session {
         .await
     }
 
-    /// Initiate the fire-and-forget server-side `DeleteSession` now,
-    /// without awaiting it or consuming `self`. Idempotent. Used by the C
-    /// ABI's `kernel_session_close` so the delete is initiated on close
-    /// even when child handles still hold `Arc<SessionInner>` clones
-    /// (otherwise it would be deferred until the last handle drops). For
-    /// an awaitable close that surfaces failure, use [`Session::close`].
-    pub(crate) fn initiate_delete(&self) {
-        self.inner.initiate_delete();
-    }
-
     /// Whether this session is still open — i.e. its server-side delete
-    /// has not been initiated (via [`Session::close`] or
-    /// [`Session::initiate_delete`]). This is a **local** check, not a
-    /// server round-trip: it reports whether the handle has been
-    /// closed/superseded, so a caller doesn't drive an already-deleted
-    /// session. It does **not** detect a server-side idle timeout or a
-    /// dropped network link. Backs the C ABI's `kernel_session_is_open`.
+    /// has not been initiated via [`Session::close`] or drop cleanup. This is
+    /// a **local** check, not a server round-trip: it reports whether the
+    /// handle has been closed/superseded, so a caller doesn't drive an
+    /// already-deleted session. It does **not** detect a server-side idle
+    /// timeout or a dropped network link. Backs the C ABI's
+    /// `kernel_session_is_open`.
     pub(crate) fn is_open(&self) -> bool {
         !self.inner.closed.load(std::sync::atomic::Ordering::Acquire)
     }
@@ -1884,7 +1874,7 @@ mod is_open_tests {
             session.is_open(),
             "a freshly-opened session must report open"
         );
-        session.initiate_delete();
+        session.inner.initiate_delete();
         assert!(
             !session.is_open(),
             "after initiate_delete the session must report not-open"
