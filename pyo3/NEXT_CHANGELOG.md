@@ -11,20 +11,13 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ## [Unreleased]
 
-
 ### Added
-
-- `Session(..., request_timeout_secs=...)` configures the total timeout for one
-  HTTP request; unset or `0` keeps the kernel's 120-second default.
 
 ### Changed
 
 ### Updated
 
 ### Fixed
-
-- Empty catalog filters for `list_schemas()` and `list_columns()` now match
-  nothing instead of raising `InvalidArgument`; non-empty catalogs stay exact.
 
 ---
 *Note: When making changes, please add your change under the appropriate

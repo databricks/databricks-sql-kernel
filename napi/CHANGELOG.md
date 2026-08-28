@@ -9,21 +9,26 @@ they ship on independent cadences.
 ## [Unreleased]
 
 ### Added
-- **U2M on-disk token-cache control on `openSession`** — `tokenCacheEnabled`
-  and `tokenCachePassphrase` let a Node caller enable/disable (or set the
-  AES-256 passphrase for) the kernel's built-in encrypted disk cache on the
-  kernel path. Omitted keeps the kernel default (enabled, machine-local key,
-  survives restarts); `tokenCacheEnabled: false` re-logins each fresh process; a
-  passphrase with no explicit flag implies enabled. Applies to `OAuthU2m`.
-  (PECOBLR-4146)
-
-  The generated `index.d.ts` gains the two optional fields; `index.js` (the
-  loader) is unchanged — new `#[napi(object)]` fields don't alter the exported
-  symbol set.
 
 ### Changed
 
 ### Fixed
+
+## [v0.3.0] - 2026-08-28
+
+### Added
+- `tokenCacheEnabled` and `tokenCachePassphrase` on `openSession` control the
+  encrypted U2M disk cache.
+- `ExecuteOptions.rawParams` preserves pre-marshalled SQL type names such as
+  `INTERVAL MONTH` and `INTERVAL DAY`.
+- `telemetryCircuitBreakerEnabled`, `telemetryCircuitBreakerThreshold`, and
+  `telemetryCircuitBreakerTimeoutMs` configure telemetry failure isolation.
+
+### Fixed
+- Empty catalog filters for `listSchemas()` and `listColumns()` return empty
+  results instead of `InvalidArgument`.
+- Explicit synchronous statement close finalizes telemetry after partial
+  result consumption.
 
 ## [v0.2.1] - 2026-08-24
 
