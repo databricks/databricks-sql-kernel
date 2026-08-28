@@ -425,7 +425,7 @@ pub struct ConnectionOptions {
     pub telemetry_circuit_breaker_threshold: Option<u32>,
     /// Time the telemetry circuit stays open before a half-open probe, in
     /// milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
-    /// supplied.
+    /// the circuit breaker is enabled.
     pub telemetry_circuit_breaker_timeout_ms: Option<u32>,
     /// Programmatic HTTP/HTTPS proxy ([`ProxyInput`]) to route all kernel
     /// traffic through. Carries the proxy `url`, optional basic-auth

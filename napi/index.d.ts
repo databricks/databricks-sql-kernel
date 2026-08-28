@@ -572,7 +572,7 @@ export interface ConnectionOptions {
   /**
    * Time the telemetry circuit stays open before a half-open probe, in
    * milliseconds. Omitted ⇒ kernel default. Must be greater than zero when
-   * supplied.
+   * the circuit breaker is enabled.
    */
   telemetryCircuitBreakerTimeoutMs?: number
   /**
