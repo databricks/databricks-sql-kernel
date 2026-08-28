@@ -17,6 +17,7 @@ use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use tokio::runtime::Handle;
 
 const STATE_ACTIVE: u8 = 0;
 const STATE_CLOSING: u8 = 1;
@@ -32,6 +33,7 @@ pub(super) struct TelemetryClient {
     flush_lock: tokio::sync::Mutex<()>,
     state: AtomicU8,
     timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    runtime_handle: Handle,
 }
 
 impl TelemetryClient {
@@ -50,6 +52,7 @@ impl TelemetryClient {
             flush_lock: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
+            runtime_handle: Handle::current(),
         });
         client.start_timer();
         client
@@ -68,7 +71,7 @@ impl TelemetryClient {
 
         if count >= self.batch_size {
             let client = Arc::clone(self);
-            tokio::spawn(async move {
+            self.runtime_handle.spawn(async move {
                 client.flush_once_if_idle().await;
             });
         }
@@ -139,7 +142,7 @@ impl TelemetryClient {
     fn start_timer(self: &Arc<Self>) {
         let client = Arc::downgrade(self);
         let interval = self.flush_interval;
-        let handle = tokio::spawn(async move {
+        let handle = self.runtime_handle.spawn(async move {
             loop {
                 tokio::time::sleep(interval).await;
                 let Some(client) = client.upgrade() else {
@@ -189,6 +192,39 @@ mod tests {
         .expect("batch flush should complete");
 
         assert_eq!(exporter.requests()[0].proto_logs.len(), 2);
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn enqueue_from_non_runtime_thread_uses_client_runtime() {
+        let exporter = CapturingTelemetryExporter::default();
+        let config = TelemetryConfig {
+            enabled: true,
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+
+        let worker_client = Arc::clone(&client);
+        std::thread::spawn(move || {
+            worker_client.enqueue(sample_log("one"));
+        })
+        .join()
+        .expect("enqueue from plain thread should not panic");
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if !exporter.requests().is_empty() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("batch flush should complete");
+
+        assert_eq!(exporter.requests()[0].proto_logs.len(), 1);
         client.close().await;
     }
 
