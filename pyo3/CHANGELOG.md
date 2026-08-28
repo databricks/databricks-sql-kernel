@@ -9,18 +9,27 @@ they ship on independent cadences.
 ## [Unreleased]
 
 ### Added
-- **U2M on-disk token-cache control** — `Session(…, token_cache_enabled=…,
-  token_cache_passphrase=…)` lets a caller enable/disable (or set the AES-256
-  passphrase for) the kernel's built-in encrypted disk cache on the kernel path.
-  Omitted keeps the kernel default (enabled, machine-local key, survives
-  restarts); `token_cache_enabled=False` re-logins each fresh process; a
-  passphrase with no explicit flag implies enabled. Applies to `oauth-u2m`.
-  The `databricks-sql-python` connector maps its `experimental_oauth_persistence`
-  presence onto this enable flag (#913). (PECOBLR-4146)
 
 ### Changed
 
 ### Fixed
+
+## [v0.3.0] - 2026-08-28
+
+### Added
+- `Session(..., token_cache_enabled=..., token_cache_passphrase=...)` controls
+  the encrypted U2M disk cache.
+- `Session(..., request_timeout_secs=...)` configures the per-request timeout;
+  unset or `0` keeps the kernel default.
+- `telemetry_circuit_breaker_enabled`, `telemetry_circuit_breaker_threshold`,
+  and `telemetry_circuit_breaker_timeout_ms` configure telemetry failure
+  isolation.
+
+### Fixed
+- Empty catalog filters for `list_schemas()` and `list_columns()` return empty
+  results instead of `InvalidArgument`.
+- Explicit synchronous statement close finalizes telemetry after partial
+  result consumption.
 
 ## [v0.2.1] - 2026-08-24
 

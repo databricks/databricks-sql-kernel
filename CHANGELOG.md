@@ -14,6 +14,31 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v0.3.0] - 2026-08-28
+
+### Added
+- C ABI mTLS client-certificate and private-key configuration via
+  `kernel_session_config_set_tls_client_certificate()`.
+- C ABI request-timeout configuration via
+  `kernel_session_config_set_request_timeout()`.
+- Result-stream and metadata lifecycle telemetry, including first-batch,
+  consumption, and CloudFetch metrics.
+- Per-host telemetry circuit breaker, configurable through Rust, C ABI, PyO3,
+  and napi.
+
+### Changed
+- Caller-supplied server session configuration now passes through unchanged;
+  client-only result options are still stripped before the SEA request.
+- Temporary DNS resolution failures are retried; permanent unknown hosts fail
+  immediately.
+
+### Fixed
+- Empty schema and column catalog filters return typed empty results without a
+  server statement.
+- Type-info metadata matches the Thrift `getTypeInfo` 20-row result shape.
+- Telemetry preserves error query IDs, flushes on the kernel runtime, finalizes
+  on explicit statement close, and emits `DELETE_SESSION` from C ABI close.
+
 ## [v0.2.1] - 2026-08-24
 
 ### Added
