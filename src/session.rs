@@ -2425,6 +2425,55 @@ mod is_open_tests {
     }
 
     #[tokio::test]
+    async fn async_statement_close_finalizes_partial_result_telemetry() {
+        let server = MockServer::start().await;
+        mount_session_create_delete(&server, "sess-telemetry-async-partial-close").await;
+        mount_close_any_statement(&server).await;
+        mount_execute(&server, running_body("stmt-telemetry-async-partial-close")).await;
+        mount_status(
+            &server,
+            "stmt-telemetry-async-partial-close",
+            succeeded_inline_body(
+                "stmt-telemetry-async-partial-close",
+                &int64_batch("n", vec![1]),
+            ),
+        )
+        .await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry = TelemetryConfig {
+            enabled: true,
+            ..Default::default()
+        }
+        .with_exporter(std::sync::Arc::new(exporter.clone()));
+        let session =
+            telemetry_test_session(&server, "sess-telemetry-async-partial-close", telemetry).await;
+
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut async_exec = stmt.submit().await.expect("submit succeeds");
+        let mut stream = async_exec.await_result().await.expect("await succeeds");
+        assert!(stream.next_batch().await.expect("first batch").is_some());
+
+        async_exec.close().await.expect("close succeeds");
+        session.close().await.expect("close succeeds");
+
+        let async_statement_logs = exported_logs(&exporter)
+            .into_iter()
+            .filter(|log| operation_type(log) == Some("EXECUTE_STATEMENT_ASYNC"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            async_statement_logs.len(),
+            1,
+            "partial async result close should finalize telemetry once even while \
+             the result stream is still live"
+        );
+        assert_eq!(
+            async_statement_logs[0]["entry"]["sql_driver_log"]["sql_statement_id"],
+            "stmt-telemetry-async-partial-close"
+        );
+    }
+
+    #[tokio::test]
     async fn async_statement_status_failure_exports_error_telemetry() {
         let server = MockServer::start().await;
         mount_session_create_delete(&server, "sess-telemetry-status-failure").await;

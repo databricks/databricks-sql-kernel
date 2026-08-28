@@ -731,6 +731,25 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
     }
 
     async fn close(&self) -> Result<()> {
+        self.close_server_statement().await
+    }
+}
+
+impl ExecutedAsyncStatement {
+    /// Explicit close for concrete async statements.
+    ///
+    /// Once [`await_result`](Self::await_result) / [`fetch_result`](Self::fetch_result)
+    /// returns a [`ResultStream`], that stream owns success finalization so full
+    /// result consumption can include result metrics. Explicitly closing the owning
+    /// async statement is the binding-visible lifecycle boundary, though, so finalize
+    /// here as a deterministic backstop for partial-fetch callers that keep the stream
+    /// alive past session close.
+    pub async fn close(&mut self) -> Result<()> {
+        self.statement_telemetry.finalize(None);
+        self.close_server_statement().await
+    }
+
+    async fn close_server_statement(&self) -> Result<()> {
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
         //
@@ -767,9 +786,7 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
         .instrument(self.session.log_span().clone())
         .await
     }
-}
 
-impl ExecutedAsyncStatement {
     /// Produce a detached [`AsyncStatementCanceller`] that can fire a
     /// server-side cancel for this statement *without borrowing the
     /// handle*.
