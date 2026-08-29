@@ -148,6 +148,14 @@ author, follow-up, and review runs.
 - **Context:** PR #274 records CloudFetch `initial_chunk_latency` from concurrently-downloaded chunks.
   **Rule:** Under concurrent chunk downloads a first-to-complete gate (e.g. `compare_exchange(-1, …)`) records the fastest/smallest chunk's latency, not chunk 0 — gate `initial_chunk_latency` strictly on `chunk_index == 0` to match the JDBC/C# `initialChunkLatency` semantic. Also keep an explicit completed-download counter so a stream dropped before any download finishes reports `None`, not a misleading `Some(0)` (both `slowest`/`sum` atomics init to 0).
 
+### 2026-08-29: learnings since 2026-08-28T10:54:51Z
+- **Context:** PR #299 and PR #306 added telemetry-finalizing `close(&mut self)` inherent methods on `ExecutedStatement`/`ExecutedAsyncStatement` alongside the existing `ExecutedStatementHandle::close(&self)` trait method; the reviewer showed that with the trait in scope (or via `Box<dyn ExecutedStatementHandle>`), `exec.close()` silently resolves to the non-finalizing `&self` trait method, reintroducing the telemetry gap — the napi/pyo3 sites only worked because they used UFCS (`Type::close(&mut …)`).
+  **Rule:** Never rely on an inherent `&mut self` method to shadow a same-named `&self` trait method — Rust method resolution tries the `&self` receiver first and trait-object callers can only reach the trait method; give the two methods distinct names or route all callers through UFCS, and doc-note the divergence.
+- **Context:** PR #297 fixed telemetry batch/timer flushes that used ambient `tokio::spawn`, which panics or drops the task when `enqueue` is called from a plain (non-runtime) thread — reachable because the pyo3/napi bindings may invoke the kernel off the runtime.
+  **Rule:** Capture a `tokio::runtime::Handle` at construction (`Handle::current()`) and spawn background work via that stored handle, never bare `tokio::spawn`, in any kernel code reachable from FFI/binding threads that may not be on a runtime.
+- **Context:** PRs #299 and #300 established the close-failure fallback contract for statement and session close: on a wire failure the `closed` flag is deliberately left unset so `Drop`'s fire-and-forget retry runs as a backstop, relying on the server-side close/delete being idempotent.
+  **Rule:** On an explicit close/delete RPC failure, keep the `closed` flag unset so Drop's fire-and-forget cleanup retries — only set it on success; this depends on the server operation being idempotent, so a redundant duplicate close is harmless while a leaked server resource is not.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
