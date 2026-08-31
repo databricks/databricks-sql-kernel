@@ -14,6 +14,12 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.0.0] - 2026-08-31
+
+### Fixed
+- `ExecutedAsyncStatement.close()` now finalizes async statement telemetry in
+  partial-fetch flows.
+
 ## [v0.3.0] - 2026-08-28
 
 ### Added

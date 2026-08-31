@@ -14,6 +14,12 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.0.0] - 2026-08-31
+
+### Fixed
+- Explicit async statement close finalizes telemetry when a partially consumed
+  result stream remains alive.
+
 ## [v0.3.0] - 2026-08-28
 
 ### Added
