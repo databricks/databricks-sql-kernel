@@ -491,26 +491,32 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_new(
     stream: *mut kernel_result_stream_t,
     out: *mut *mut kernel_result_stream_canceller_t,
 ) -> KernelStatusCode {
-    crate::c_abi::error::clear_error();
-    if stream.is_null() {
-        return store_invalid_arg("kernel_result_stream_canceller_new: stream must not be null");
-    }
-    if out.is_null() {
-        return store_invalid_arg("kernel_result_stream_canceller_new: out must not be null");
-    }
-    // Read ONLY the `cancel` field through a raw-pointer projection — never a
-    // reference over the whole struct — so this is sound even while another
-    // thread holds `&mut (*p).shape` inside next_batch (disjoint fields; `cancel`
-    // is a `Sync` atomic). SAFETY: `stream` is a live box (non-null checked).
-    let p = stream as *mut ResultStreamInner;
-    let handle = ResultStreamCanceller {
-        cancel: (*std::ptr::addr_of!((*p).cancel)).clone(),
-    };
-    std::ptr::write(
-        out,
-        Box::into_raw(Box::new(handle)) as *mut kernel_result_stream_canceller_t,
-    );
-    KernelStatusCode::Success
+    // Wrap the body in catch_ffi (like _cancel / _free) so a panic — e.g. from the
+    // Box allocation — cannot unwind across the extern "C" boundary (UB); catch_ffi
+    // also clears the thread-local error up front (odbc#355 review).
+    catch_ffi(|| {
+        if stream.is_null() {
+            return store_invalid_arg(
+                "kernel_result_stream_canceller_new: stream must not be null",
+            );
+        }
+        if out.is_null() {
+            return store_invalid_arg("kernel_result_stream_canceller_new: out must not be null");
+        }
+        // Read ONLY the `cancel` field through a raw-pointer projection — never a
+        // reference over the whole struct — so this is sound even while another
+        // thread holds `&mut (*p).shape` inside next_batch (disjoint fields; `cancel`
+        // is a `Sync` atomic). SAFETY: `stream` is a live box (non-null checked).
+        let p = stream as *mut ResultStreamInner;
+        let handle = ResultStreamCanceller {
+            cancel: (*std::ptr::addr_of!((*p).cancel)).clone(),
+        };
+        std::ptr::write(
+            out,
+            Box::into_raw(Box::new(handle)) as *mut kernel_result_stream_canceller_t,
+        );
+        KernelStatusCode::Success
+    })
 }
 
 /// Fire the cancellation of the result stream this canceller was created for
