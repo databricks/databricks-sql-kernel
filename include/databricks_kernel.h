@@ -212,6 +212,16 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  * cancels the LATER query. Use one per execute (new before execute, free after
  * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
+/* Detached canceller for a result stream, returned by
+ * kernel_result_stream_canceller_new. Firing it interrupts an in-flight
+ * kernel_result_stream_next_batch so it returns KernelStatusCode_Cancelled
+ * promptly instead of blocking until the (possibly slow / CloudFetch-link)
+ * batch fetch finishes. Unlike the statement canceller it holds ONLY a shared
+ * client-side cancellation token (no server RPC, no borrow of the stream's
+ * mutable state), so — see its doc — it is safe to obtain and to fire
+ * concurrently with a next_batch/close on the owning thread. Once fired, the
+ * stream is permanently aborted (every later next_batch returns Cancelled). */
+typedef struct kernel_result_stream_canceller_t kernel_result_stream_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -824,6 +834,39 @@ KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
 KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
+
+/* ─── Result-stream cancellation (detached canceller) ─────────────────
+ *
+ * Interrupt an in-flight `kernel_result_stream_next_batch` (odbc#355-B). A
+ * host that fetches on a background thread and wants a bounded teardown
+ * (SQLCancel / SQLCloseCursor / statement or connection close) fires this to
+ * make a parked `next_batch` return promptly instead of waiting for the
+ * batch's own (possibly slow, CloudFetch-link) request to finish.
+ *
+ * `kernel_result_stream_canceller_new` clones the stream's cancellation token
+ * into a detached handle. Unlike the statement canceller, this borrows none of
+ * the stream's mutable state and issues no server RPC, so it may be obtained
+ * WHILE a `next_batch` is already in flight on another thread, and
+ * `kernel_result_stream_canceller_cancel` may be called concurrently with a
+ * `next_batch`/`kernel_result_stream_close` on the owning thread. `_cancel` is
+ * non-blocking and idempotent; it returns Success once the signal is delivered
+ * (it is the interrupted `next_batch` that returns
+ * `KernelStatusCode_Cancelled`). After a cancel the stream is permanently
+ * aborted: every later `next_batch` returns `Cancelled`, so the host must not
+ * expect to resume it — close it.
+ *
+ * The canceller shares the token's lifetime independently of the stream, so
+ * its free order is unconstrained: firing it after `kernel_result_stream_close`
+ * is a harmless no-op. Free it with `kernel_result_stream_canceller_free`
+ * (drives no RPC — drops the box). Do not free it while another thread is
+ * inside `_cancel` on the same handle.
+ */
+KernelStatusCode kernel_result_stream_canceller_new(kernel_result_stream_t* stream,
+                                                    kernel_result_stream_canceller_t** out);
+KernelStatusCode kernel_result_stream_canceller_cancel(
+    kernel_result_stream_canceller_t* canceller);
+KernelStatusCode kernel_result_stream_canceller_free(
+    kernel_result_stream_canceller_t* canceller);
 
 /* ─── Metadata ────────────────────────────────────────────────────────
  *
