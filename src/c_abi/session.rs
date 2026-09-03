@@ -134,6 +134,9 @@ pub struct KernelSessionConfig {
     /// Total request timeout (populated by `..._set_request_timeout`). `None`
     /// keeps [`HttpConfig::default`]'s 120-second timeout.
     request_timeout: Option<Duration>,
+    /// Maximum idle connections retained per host. `None` keeps the kernel
+    /// default; populated by `..._set_max_connections`.
+    max_connections: Option<usize>,
     /// HTTP retry / backoff knobs (populated by `..._set_retry_config`).
     /// `None` keeps the kernel default policy (exponential backoff with
     /// jitter; see [`HttpConfig::default`] for the concrete values); `Some`
@@ -263,6 +266,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
         request_timeout: None,
+        max_connections: None,
         retry: None,
         // Default to ignoring transactions, matching IgnoreTransactions=1.
         ignore_transactions: true,
@@ -599,6 +603,26 @@ pub unsafe extern "C" fn kernel_session_config_set_request_timeout(
     set_on_config(config, |c| {
         c.request_timeout =
             (request_timeout_ms != 0).then(|| Duration::from_millis(request_timeout_ms));
+        Ok(())
+    })
+}
+
+/// Configure the maximum number of idle HTTP connections retained per host.
+/// The value must be greater than zero; omitting this setter keeps the kernel
+/// default (100).
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_max_connections(
+    config: *mut KernelSessionConfig,
+    max_connections: usize,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        if max_connections == 0 {
+            return Err(Error::invalid_argument().message("max_connections must be greater than 0"));
+        }
+        c.max_connections = Some(max_connections);
         Ok(())
     })
 }
@@ -1385,8 +1409,8 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
 }
 
 /// Fold the C-side HTTP overrides onto a fresh [`HttpConfig`]. We start from
-/// defaults and set only the fields a setter populated, preserving pool size
-/// and any untouched retry or timeout knobs.
+/// defaults and set only the fields a setter populated, preserving untouched
+/// pool, retry, and timeout knobs.
 ///
 /// This is the code that actually configures live HTTP behavior (called from
 /// `build_session` whenever an HTTP override was set), so it is a pure helper
@@ -1394,6 +1418,7 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
 fn merge_http_config(
     custom_headers: Vec<(String, String)>,
     request_timeout: Option<Duration>,
+    max_connections: Option<usize>,
     retry: Option<RetrySpec>,
 ) -> HttpConfig {
     let mut http = HttpConfig {
@@ -1402,6 +1427,9 @@ fn merge_http_config(
     };
     if let Some(t) = request_timeout {
         http.request_timeout = t;
+    }
+    if let Some(max) = max_connections {
+        http.pool_max_idle_per_host = max;
     }
     if let Some(r) = retry {
         http.retry_min_wait = r.min_wait;
@@ -1527,6 +1555,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         tls,
         custom_headers,
         request_timeout,
+        max_connections,
         retry,
         ignore_transactions,
         identity_federation_client_id,
@@ -1586,8 +1615,17 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
 
             // Skip `.http()` when no HTTP override was set, so the kernel's
             // full `HttpConfig::default()` applies untouched.
-            if !custom_headers.is_empty() || request_timeout.is_some() || retry.is_some() {
-                builder = builder.http(merge_http_config(custom_headers, request_timeout, retry));
+            if !custom_headers.is_empty()
+                || request_timeout.is_some()
+                || max_connections.is_some()
+                || retry.is_some()
+            {
+                builder = builder.http(merge_http_config(
+                    custom_headers,
+                    request_timeout,
+                    max_connections,
+                    retry,
+                ));
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).
@@ -2468,6 +2506,31 @@ mod tests {
         }
     }
 
+    #[test]
+    fn set_max_connections_records_positive_value_and_rejects_zero() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().max_connections.is_none());
+
+            assert_eq!(
+                kernel_session_config_set_max_connections(config, 37),
+                KernelStatusCode::Success
+            );
+            assert_eq!(config.as_ref().unwrap().max_connections, Some(37));
+
+            assert_eq!(
+                kernel_session_config_set_max_connections(config, 0),
+                KernelStatusCode::InvalidArgument
+            );
+            assert_eq!(config.as_ref().unwrap().max_connections, Some(37));
+            kernel_session_config_free(config);
+        }
+    }
+
     /// The retry setter rejects a zero min_wait with `InvalidArgument` (a zero
     /// floor is genuinely invalid), but a `max_wait < min_wait` pair is a tuning
     /// typo that is CORRECTED (max raised to min) with a warning rather than
@@ -3024,6 +3087,7 @@ mod tests {
         let http = merge_http_config(
             Vec::new(),
             None,
+            None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(500),
                 max_wait: Duration::from_millis(30_000),
@@ -3045,6 +3109,7 @@ mod tests {
         let default_budget = HttpConfig::default().overall_timeout;
         let http = merge_http_config(
             Vec::new(),
+            None,
             None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(1),
@@ -3070,6 +3135,7 @@ mod tests {
         let retry_only = merge_http_config(
             Vec::new(),
             None,
+            None,
             Some(RetrySpec {
                 min_wait: Duration::from_millis(250),
                 max_wait: Duration::from_millis(5_000),
@@ -3083,8 +3149,12 @@ mod tests {
 
         // Headers-only: header carried through, retry knobs untouched from default.
         let default = HttpConfig::default();
-        let headers_only =
-            merge_http_config(vec![("X-Test".to_string(), "1".to_string())], None, None);
+        let headers_only = merge_http_config(
+            vec![("X-Test".to_string(), "1".to_string())],
+            None,
+            None,
+            None,
+        );
         assert_eq!(
             headers_only.custom_headers,
             vec![("X-Test".to_string(), "1".to_string())]
@@ -3098,9 +3168,18 @@ mod tests {
     #[test]
     fn merge_http_config_maps_request_timeout_and_preserves_other_defaults() {
         let default = HttpConfig::default();
-        let http = merge_http_config(Vec::new(), Some(Duration::from_millis(4_500)), None);
+        let http = merge_http_config(Vec::new(), Some(Duration::from_millis(4_500)), None, None);
         assert_eq!(http.request_timeout, Duration::from_millis(4_500));
         assert_eq!(http.retry_min_wait, default.retry_min_wait);
         assert_eq!(http.overall_timeout, default.overall_timeout);
+    }
+
+    #[test]
+    fn merge_http_config_maps_max_connections_and_preserves_other_defaults() {
+        let default = HttpConfig::default();
+        let http = merge_http_config(Vec::new(), None, Some(23), None);
+        assert_eq!(http.pool_max_idle_per_host, 23);
+        assert_eq!(http.request_timeout, default.request_timeout);
+        assert_eq!(http.retry_max_retries, default.retry_max_retries);
     }
 }

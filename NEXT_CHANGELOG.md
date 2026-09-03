@@ -11,6 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Add a C ABI setter for the maximum idle HTTP connections retained per host.
+
 ### Changed
 
 ### Updated
