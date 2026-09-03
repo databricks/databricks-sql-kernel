@@ -73,6 +73,18 @@ pub struct kernel_result_stream_canceller_t {
 /// and touches none of the stream's `&mut` state, so a cancel racing a
 /// `next_batch`/`close` on the owning thread is well-defined: it only flips an
 /// atomic the fetch's `select!` observes.
+///
+/// SCOPE (odbc#355 review): firing this token bounds the CALLER'S wait — the
+/// `next_batch` future is dropped at its await point and the C call returns
+/// promptly — but it does NOT abort the underlying request. For a CloudFetch
+/// download the provider runs the fetch on a spawned task and awaits its
+/// `JoinHandle`; dropping the `next_batch` future drops that await, not the
+/// detached download, which keeps a runtime worker + connection busy until it
+/// finishes or hits its own timeout. This token is intentionally not wired into
+/// the provider's own `cancel_token`. A host using this for bounded TEARDOWN
+/// gets a bounded caller-return, not immediate reclamation of the in-flight
+/// download — close the stream (and, for a sync-executed statement, the executed
+/// handle) to release those on their own completion.
 struct ResultStreamInner {
     /// Fired by a cloned [`ResultStreamCanceller`] to interrupt an in-flight
     /// `next_batch`. Once fired the stream is permanently aborted: `next_batch`
@@ -190,6 +202,55 @@ unsafe fn executed_ref<'a>(
     Ok(e)
 }
 
+/// Shared cancellation wrapper for a single batch fetch (odbc#355-B, review F1).
+///
+/// Runs `fetch` (the backing shape's `next_batch` future — the owned
+/// `ResultStream`'s or the executed handle's) inside a `tokio::select!` against
+/// `cancel.cancelled()`, and maps the fetched batch to an owned `RecordBatch`
+/// for FFI export. BOTH C ABI stream shapes route their fetch through this one
+/// function, so the cancellation/select logic is a single code path (rather than
+/// duplicated per arm): the Owned unit test that fires a cancel mid-fetch
+/// therefore exercises the exact `select!` the Executed arm uses too.
+///
+/// `fetch` yields `Result<Option<B>>` where `B` borrows a `ResultBatch` — the
+/// owned arm's `next_batch` yields `Option<ResultBatch>` (B = ResultBatch), the
+/// executed arm's yields `Option<&ResultBatch>` (B = &ResultBatch); both are
+/// `.borrow()`ed and cloned here. `kind` names the shape for the non-Arrow error.
+///
+/// `biased` prefers the fetch: if a batch and a cancel are both ready, the
+/// completed batch is returned rather than discarded by a same-instant cancel.
+async fn select_next_batch<B, Fut>(
+    fetch: Fut,
+    cancel: CancellationToken,
+    kind: &str,
+) -> crate::kernel_error::Result<Option<RecordBatch>>
+where
+    B: std::borrow::Borrow<ResultBatch>,
+    Fut: std::future::Future<Output = crate::kernel_error::Result<Option<B>>>,
+{
+    tokio::select! {
+        biased;
+        fetched = fetch => {
+            #[allow(
+                unreachable_patterns,
+                reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
+            )]
+            match fetched? {
+                Some(b) => match b.borrow() {
+                    ResultBatch::Arrow(rb) => Ok(Some(rb.clone())),
+                    _ => Err(Error::not_implemented().message(
+                        format!("{kind} yielded a non-Arrow batch; the C ABI exports Arrow only"),
+                    )),
+                },
+                None => Ok(None),
+            }
+        }
+        _ = cancel.cancelled() => Err(Error::cancelled()
+            .message("result stream cancelled during next_batch")
+            .with_retryable(false)),
+    }
+}
+
 /// Export the schema as an `FFI_ArrowSchema`.
 ///
 /// On success, `*out` holds an `FFI_ArrowSchema` the caller releases via
@@ -296,13 +357,19 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
             );
         }
 
-        // Pull the next owned batch from whichever backing shape this is. Each
-        // fetch runs inside a `tokio::select!` against a clone of the stream's
-        // cancellation token, so a cancel fired from another thread while the
-        // fetch is in flight wins the race and unwinds the fetch (dropping its
-        // future at the await point) instead of waiting for it to complete. The
-        // token clone shares the same atomic state as the canceller's clone, so
-        // this observes a cancel fired at any instant.
+        // Pull the next owned batch from whichever backing shape this is. Both
+        // shapes run their batch fetch through the SAME cancellation wrapper
+        // (`select_next_batch`): a `tokio::select!` against a clone of the
+        // stream's cancellation token, so a cancel fired from another thread
+        // while the fetch is in flight wins the race and unwinds the fetch
+        // (dropping its future at the await point) instead of waiting for it to
+        // complete. Sharing one wrapper is deliberate (odbc#355 review F1): the
+        // cancellation/`select!` logic — the part under test — is then a single
+        // code path exercised by the Owned unit test, not duplicated per arm; the
+        // arms differ only in HOW they produce the batch future (the owned
+        // ResultStream vs the executed handle's drain-driven / lazy-CloudFetch
+        // next_batch) and the Executed arm's extra `executed_ref` stale-handle
+        // guard.
         let next: Option<Result<RecordBatch, Error>> = match shape {
             // Owned (metadata): drive the owned ResultStream lazily on the
             // runtime, one batch at a time, so an unbounded result streams
@@ -312,31 +379,11 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
             ResultStreamShape::Owned { stream, .. } => {
                 match block_on_ffi(move || {
                     let stream: &mut crate::result_stream::ResultStream = stream;
-                    Box::pin(async move {
-                        tokio::select! {
-                            // Bias the fetch: if both are ready, prefer the batch
-                            // so a completed fetch is not discarded by a cancel
-                            // that arrived at the same instant.
-                            biased;
-                            fetched = stream.next_batch() => {
-                                #[allow(
-                                    unreachable_patterns,
-                                    reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
-                                )]
-                                match fetched? {
-                                    Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
-                                    Some(_) => Err(Error::not_implemented().message(
-                                        "metadata stream yielded a non-Arrow batch; the C ABI \
-                                         exports Arrow only",
-                                    )),
-                                    None => Ok(None),
-                                }
-                            }
-                            _ = cancel.cancelled() => Err(Error::cancelled()
-                                .message("result stream cancelled during next_batch")
-                                .with_retryable(false)),
-                        }
-                    })
+                    Box::pin(select_next_batch(
+                        stream.next_batch(),
+                        cancel,
+                        "metadata stream",
+                    ))
                 }) {
                     Ok(Some(rb)) => Some(Ok(rb)),
                     Ok(None) => None,
@@ -348,37 +395,16 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
                     Ok(e) => e,
                     Err(code) => return code,
                 };
-                // Drive the executed handle's own next_batch so the
-                // drain-driven auto-close and lazy CloudFetch link fetches
-                // keep working. Convert the borrowed batch into an owned
-                // RecordBatch for FFI export. Explicit match on the
-                // #[non_exhaustive] ResultBatch so a future non-Arrow
-                // variant surfaces as a defined error, not a compile break
-                // with no fallback.
+                // Drive the executed handle's own next_batch so the drain-driven
+                // auto-close and lazy CloudFetch link fetches keep working. Same
+                // cancellation wrapper as the Owned arm above.
                 match block_on_ffi(move || {
                     let exec: &mut ExecutedStatement = exec;
-                    Box::pin(async move {
-                        tokio::select! {
-                            biased;
-                            fetched = exec.next_batch() => {
-                                #[allow(
-                                    unreachable_patterns,
-                                    reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
-                                )]
-                                match fetched? {
-                                    Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
-                                    Some(_) => Err(Error::not_implemented().message(
-                                        "result stream yielded a non-Arrow batch; the C ABI \
-                                         exports Arrow only",
-                                    )),
-                                    None => Ok(None),
-                                }
-                            }
-                            _ = cancel.cancelled() => Err(Error::cancelled()
-                                .message("result stream cancelled during next_batch")
-                                .with_retryable(false)),
-                        }
-                    })
+                    Box::pin(select_next_batch(
+                        exec.next_batch(),
+                        cancel,
+                        "result stream",
+                    ))
                 }) {
                     Ok(Some(rb)) => Some(Ok(rb)),
                     Ok(None) => None,
