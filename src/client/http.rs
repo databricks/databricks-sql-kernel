@@ -298,11 +298,10 @@ impl Default for HttpClientConfig {
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
             max_connections_per_host: 100,
-            // TODO: Update user agent to properly identify as Rust ADBC driver.
-            // Currently using JDBC user agent to enable INLINE_OR_EXTERNAL_LINKS disposition
-            // which returns all chunk links in a single response, enabling true parallel downloads.
-            // See: https://github.com/databricks-eng/universe/pull/909153
-            user_agent: format!("DatabricksJDBCDriverOSS/{}", env!("CARGO_PKG_VERSION")),
+            // This kernel-specific prefix is allow-listed by
+            // databricks.sqlexecapi.known_driver_prefixes, which enables
+            // INLINE_OR_EXTERNAL_LINKS while preserving accurate attribution.
+            user_agent: format!("DatabricksSQLKernel/{}", env!("CARGO_PKG_VERSION")),
             proxy: ProxyConfig::default(),
             tls: TlsConfig::default(),
             org_id: None,
@@ -402,7 +401,7 @@ impl DatabricksHttpClient {
         // A caller `User-Agent` **replaces** the kernel's base UA
         // entirely: the effective UA becomes the caller string verbatim
         // (e.g. the connector's composed `PyDatabricksSqlConnector/x
-        // (entry)`), with no `DatabricksJDBCDriverOSS/...` prefix. This is
+        // (entry)`), with no `DatabricksSQLKernel/...` prefix. This is
         // intentional — it gives the SEA server an accurate driver
         // identity for query-source attribution (the appended-prefix shape
         // matched none of the gateway's `parseUserAgent` patterns and was
@@ -416,7 +415,7 @@ impl DatabricksHttpClient {
         // of that flag; a UA whose prefix is not allow-listed is rejected
         // with HTTP 400 "not a supported disposition" / redirected to
         // Thrift. `PyDatabricksSqlConnector` is allow-listed for this
-        // reason. The base UA below remains `DatabricksJDBCDriverOSS/...`
+        // reason. The base UA below remains `DatabricksSQLKernel/...`
         // so requests with NO caller UA still pass the gate.
         //
         // Last UA wins if a caller somehow set several.
@@ -1053,6 +1052,10 @@ mod tests {
         assert_eq!(config.connect_timeout, Duration::from_secs(30));
         assert_eq!(config.read_timeout, Duration::from_secs(60));
         assert_eq!(config.max_connections_per_host, 100);
+        assert_eq!(
+            config.user_agent,
+            format!("DatabricksSQLKernel/{}", env!("CARGO_PKG_VERSION"))
+        );
     }
 
     #[tokio::test]
@@ -1161,7 +1164,7 @@ mod tests {
         // from the custom-header list (so it isn't re-applied per request;
         // it becomes reqwest's default UA instead).
         let config = HttpClientConfig {
-            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            user_agent: "DatabricksSQLKernel/9.9".to_string(),
             custom_headers: vec![
                 ("x-keep".to_string(), "v".to_string()),
                 (
@@ -1196,24 +1199,24 @@ mod tests {
     fn test_empty_caller_user_agent_keeps_base() {
         // A whitespace-only caller UA is ignored — the base UA stays so
         // the request still carries an identity (and the
-        // disposition-gating prefix when the base is the JDBC token).
+        // disposition-gating prefix when the base is allow-listed).
         let config = HttpClientConfig {
-            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            user_agent: "DatabricksSQLKernel/9.9".to_string(),
             custom_headers: vec![("User-Agent".to_string(), "   ".to_string())],
             ..HttpClientConfig::default()
         };
         let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
-        assert_eq!(client.config().user_agent, "DatabricksJDBCDriverOSS/9.9");
+        assert_eq!(client.config().user_agent, "DatabricksSQLKernel/9.9");
     }
 
     #[test]
     fn test_no_caller_user_agent_keeps_base() {
         let config = HttpClientConfig {
-            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            user_agent: "DatabricksSQLKernel/9.9".to_string(),
             ..HttpClientConfig::default()
         };
         let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
-        assert_eq!(client.config().user_agent, "DatabricksJDBCDriverOSS/9.9");
+        assert_eq!(client.config().user_agent, "DatabricksSQLKernel/9.9");
     }
 
     #[test]
@@ -1223,7 +1226,7 @@ mod tests {
         let mut ua = "x".repeat(1023);
         ua.push('é'); // 2 bytes straddling the 1024-byte limit
         let config = HttpClientConfig {
-            user_agent: "DatabricksJDBCDriverOSS/9.9".to_string(),
+            user_agent: "DatabricksSQLKernel/9.9".to_string(),
             custom_headers: vec![("User-Agent".to_string(), ua)],
             ..HttpClientConfig::default()
         };

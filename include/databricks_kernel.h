@@ -588,9 +588,20 @@ KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* o
  * alive); on failure returns the mapped status (a transport/availability
  * failure surfaces as Unavailable / NetworkError / Timeout — treat as
  * "connection dead" when backing SQL_ATTR_CONNECTION_DEAD; the full error
- * is in kernel_get_last_error). Runs SQL, so it MUST be called from a
- * native (non-async-runtime) thread. No ownership. */
-KernelStatusCode kernel_session_test(const kernel_session_t* session);
+ * is in kernel_get_last_error).
+ *
+ * `timeout_secs` bounds the WHOLE probe (every retry and HTTP round-trip
+ * included) to that many seconds; 0 means no per-call deadline (the probe
+ * runs on the session's own retry/timeout budget — the historical
+ * behaviour). This is the per-call deadline a host backs
+ * `ConnectionTestTimeout` with: with 0 the configured value has no effect.
+ * When the probe exceeds the deadline the call returns Timeout (typed error
+ * in kernel_get_last_error). The bound is scoped to this probe and cannot
+ * alter the timeout of later requests on the session.
+ *
+ * Runs SQL, so it MUST be called from a native (non-async-runtime) thread.
+ * No ownership. */
+KernelStatusCode kernel_session_test(const kernel_session_t* session, uint64_t timeout_secs);
 
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
