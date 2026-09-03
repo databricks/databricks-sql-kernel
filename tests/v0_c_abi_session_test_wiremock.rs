@@ -146,7 +146,7 @@ fn session_test_returns_success_when_server_reachable() {
 
         // The probe reaches the server and succeeds.
         assert_eq!(
-            kernel_session_test(session),
+            kernel_session_test(session, 0),
             KernelStatusCode::Success,
             "kernel_session_test must return Success against a reachable server"
         );
@@ -195,11 +195,67 @@ fn session_test_returns_error_when_server_unreachable() {
         // Kill the server: the statement round-trip now fails.
         drop(server);
 
-        let rc = kernel_session_test(session);
+        let rc = kernel_session_test(session, 0);
         assert_ne!(
             rc,
             KernelStatusCode::Success,
             "kernel_session_test must return an error status when the server is unreachable"
+        );
+
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+// odbc#347-C: a non-zero `timeout_secs` bounds the whole probe. When the SELECT 1
+// round-trip is slower than the deadline, the probe returns Timeout promptly —
+// it does not block for the full server delay (nor the session's retry budget).
+#[test]
+fn session_test_honours_per_call_timeout() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server =
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-c-abi-slow","warehouse_id":"test_wh"}"#,
+                ))
+                .mount(&server)
+                .await;
+            // The SELECT 1 statement POST is delayed well beyond the 1s probe
+            // deadline, so the probe must give up on its own deadline rather than
+            // wait for this response.
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(std::time::Duration::from_secs(20))
+                        .set_body_string(select_1_succeeded_body("stmt-slow")),
+                )
+                .mount(&server)
+                .await;
+            server
+        });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session(&uri);
+
+        // With a 1-second deadline against a 20-second response, the probe must
+        // return Timeout within a small multiple of the deadline (not ~20s).
+        let start = std::time::Instant::now();
+        let rc = kernel_session_test(session, 1);
+        let elapsed = start.elapsed();
+
+        assert_eq!(
+            rc,
+            KernelStatusCode::Timeout,
+            "a probe slower than its per-call deadline must return Timeout"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(10),
+            "the probe blocked for {:?}, far longer than its 1s deadline",
+            elapsed
         );
 
         assert_eq!(kernel_session_close(session), KernelStatusCode::Success);

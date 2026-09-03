@@ -567,6 +567,43 @@ impl Session {
         .await
     }
 
+    /// Like [`test_connection`](Self::test_connection), but bounds the whole
+    /// probe — every retry and HTTP round-trip included — to `deadline`. This
+    /// is the per-call deadline a host backs `ConnectionTestTimeout` with
+    /// (odbc#347-C): without it the probe runs on the session's own
+    /// retry/timeout budget, so `ConnectionTestTimeout=1` and `=30` behave
+    /// identically and a `SQL_ATTR_CONNECTION_DEAD` read during an outage can
+    /// block for the session's unrelated retry budget rather than the
+    /// customer-selected duration.
+    ///
+    /// A `None` deadline is exactly [`test_connection`] (no per-call bound).
+    /// When the probe does not complete within `deadline`, returns a
+    /// `Timeout`-category error (distinct wording so a host can tell "probe
+    /// deadline hit" from a transport failure) — the caller decides what
+    /// `SQL_ATTR_CONNECTION_DEAD` reports for that case. The bound is scoped to
+    /// this future only: it wraps the probe in `tokio::time::timeout`, so it
+    /// cannot alter the timeout of any other request on the session.
+    pub async fn test_connection_with_timeout(&self, deadline: Option<Duration>) -> Result<()> {
+        match deadline {
+            None => self.test_connection().await,
+            Some(d) => match tokio::time::timeout(d, self.test_connection()).await {
+                Ok(result) => result,
+                // Build via the categorised `Error::timeout()` constructor (repo
+                // convention), but mark it non-retryable: unlike a transport
+                // timeout, this deadline was deliberately set by the caller
+                // (e.g. ConnectionTestTimeout), so re-running the probe would
+                // just hit the same bound again. Retrying is the caller's
+                // decision, not something a retry wrapper should do implicitly.
+                Err(_elapsed) => Err(Error::timeout()
+                    .message(format!(
+                        "connection test did not complete within {} second(s)",
+                        d.as_secs()
+                    ))
+                    .with_retryable(false)),
+            },
+        }
+    }
+
     /// Adopt an already-submitted server statement by its id, producing
     /// an [`ExecutedAsyncStatement`] that can poll [`status`] / await
     /// results / cancel — without having been the handle that submitted
