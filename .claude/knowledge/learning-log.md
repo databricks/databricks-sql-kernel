@@ -156,6 +156,12 @@ author, follow-up, and review runs.
 - **Context:** PRs #299 and #300 established the close-failure fallback contract for statement and session close: on a wire failure the `closed` flag is deliberately left unset so `Drop`'s fire-and-forget retry runs as a backstop, relying on the server-side close/delete being idempotent.
   **Rule:** On an explicit close/delete RPC failure, keep the `closed` flag unset so Drop's fire-and-forget cleanup retries — only set it on success; this depends on the server operation being idempotent, so a redundant duplicate close is harmless while a leaked server resource is not.
 
+### 2026-09-03: learnings since 2026-09-02T07:30:13Z
+- **Context:** PR #310 added a per-call deadline to `kernel_session_test`; a reviewer caught the deadline-elapsed error being built with `Error::new(ErrorCode::Timeout, …)` instead of the categorised `Error::timeout()` constructor. `Error::new` defaults `retryable = false`, whereas every other kernel `Timeout` (`Error::timeout()`, `Error::from_http_status(504)`) is `retryable = true`, so retry wrappers that branch on `Error::retryable` would treat it inconsistently.
+  **Rule:** Build typed errors via the categorised constructors (`Error::timeout()`, etc.), not `Error::new(ErrorCode::…, …)` — the constructors set the correct `retryable` flag; if you deliberately deviate (e.g. a caller-set deadline like `ConnectionTestTimeout` that must NOT auto-retry), make it explicit with `.with_retryable(false)` plus a comment explaining why.
+- **Context:** PR #309 changed the HTTP client base `User-Agent` from `DatabricksJDBCDriverOSS/…` to `DatabricksSQLKernel/…`. The UA prefix is not just attribution: the SEA gateway does a `startsWith` prefix match against the `databricks.sqlexecapi.known_driver_prefixes` SAFE flag to enable the `INLINE_OR_EXTERNAL_LINKS` disposition; a prefix not on that allow-list is rejected with HTTP 400 ("not a supported disposition") or redirected to Thrift.
+  **Rule:** The outbound `User-Agent` prefix is functionally load-bearing — the SEA server gates response disposition on it via a prefix allow-list, so any change to the base UA (or a caller-supplied UA that replaces it) must use a prefix registered in `known_driver_prefixes`, or requests silently lose parallel chunk downloads / fall back to Thrift.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
