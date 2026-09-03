@@ -205,13 +205,20 @@ pub unsafe extern "C" fn kernel_result_stream_get_schema(
     out: *mut FFI_ArrowSchema,
 ) -> KernelStatusCode {
     catch_ffi(|| {
-        let Some(inner) = (stream as *mut ResultStreamInner).as_mut() else {
+        if stream.is_null() {
             return store_invalid_arg("kernel_result_stream_get_schema: stream must not be null");
-        };
+        }
         if out.is_null() {
             return store_invalid_arg("kernel_result_stream_get_schema: out must not be null");
         }
-        let schema = match &mut inner.shape {
+        // Project to `&mut (*p).shape` only, never a whole-struct `&mut` — so a
+        // concurrent `kernel_result_stream_canceller_new` (which reads only the
+        // disjoint `cancel` field) does not alias it (odbc#355 review F1).
+        // SAFETY: live box (non-null checked); `shape` has a single accessor per
+        // the no-concurrent-next_batch/get_schema contract.
+        let p = stream as *mut ResultStreamInner;
+        let shape: &mut ResultStreamShape = &mut *std::ptr::addr_of_mut!((*p).shape);
+        let schema = match shape {
             ResultStreamShape::Owned { schema, .. } => schema.clone(),
             ResultStreamShape::Executed { exec, valid } => match executed_ref(*exec, valid) {
                 Ok(e) => e.schema(),
@@ -245,14 +252,32 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
     out_schema: *mut FFI_ArrowSchema,
 ) -> KernelStatusCode {
     catch_ffi(|| {
-        let Some(inner) = (stream as *mut ResultStreamInner).as_mut() else {
+        if stream.is_null() {
             return store_invalid_arg("kernel_result_stream_next_batch: stream must not be null");
-        };
+        }
         if out_array.is_null() || out_schema.is_null() {
             return store_invalid_arg(
                 "kernel_result_stream_next_batch: out pointers must not be null",
             );
         }
+
+        // Borrow the two fields SEPARATELY through raw-pointer projection rather
+        // than forming a single `&mut ResultStreamInner` over the whole struct
+        // (odbc#355 review F1). A whole-struct `&mut` carries a noalias guarantee
+        // over the ENTIRE allocation, so holding it across the fetch below would
+        // be UB the instant another thread calls `kernel_result_stream_canceller
+        // _new` — which reads `cancel` and which this API's docs explicitly bless
+        // calling while a `next_batch` is in flight. Projecting to `&mut (*p).shape`
+        // and `&(*p).cancel` yields references over DISJOINT fields: the fetch's
+        // live borrow covers only `shape`, and a concurrent `canceller_new`'s read
+        // covers only `cancel` (a `Sync` atomic), so they never alias.
+        let p = stream as *mut ResultStreamInner;
+        // SAFETY: `p` is a live result-stream box (non-null checked above); the
+        // caller's contract forbids a *second* next_batch/close on the same handle
+        // concurrently, so `shape` has a single mutable accessor. `cancel` is only
+        // read here (clone) and by a concurrent canceller — a disjoint, Sync field.
+        let cancel: CancellationToken = (*std::ptr::addr_of!((*p).cancel)).clone();
+        let shape: &mut ResultStreamShape = &mut *std::ptr::addr_of_mut!((*p).shape);
 
         // Abort hook (odbc#355-B). If the stream's cancellation token was fired
         // — either before this call or, below, DURING the fetch — the batch
@@ -263,14 +288,13 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
         // indeterminate, so re-driving it is not sound. A pre-check short-circuits
         // the already-cancelled case without touching the runtime; the in-flight
         // case is handled by the `select!` inside each fetch future below.
-        if inner.cancel.is_cancelled() {
+        if cancel.is_cancelled() {
             return store_and_code(
                 Error::cancelled()
                     .message("result stream was cancelled")
                     .with_retryable(false),
             );
         }
-        let cancel = inner.cancel.clone();
 
         // Pull the next owned batch from whichever backing shape this is. Each
         // fetch runs inside a `tokio::select!` against a clone of the stream's
@@ -279,7 +303,7 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
         // future at the await point) instead of waiting for it to complete. The
         // token clone shares the same atomic state as the canceller's clone, so
         // this observes a cancel fired at any instant.
-        let next: Option<Result<RecordBatch, Error>> = match &mut inner.shape {
+        let next: Option<Result<RecordBatch, Error>> = match shape {
             // Owned (metadata): drive the owned ResultStream lazily on the
             // runtime, one batch at a time, so an unbounded result streams
             // with bounded memory. Running through block_on_ffi keeps the
@@ -431,21 +455,30 @@ pub unsafe extern "C" fn kernel_result_stream_close(
 /// `stream` must be a live result-stream handle from a `kernel_*` call that
 /// produces one; `out` must be a valid, writable pointer. Unlike the statement
 /// canceller, a `next_batch` MAY be in flight on another thread when this is
-/// called — it reads only the shared token, not the stream's mutable state.
+/// called — it reads ONLY the shared `cancel` token field, via raw-pointer
+/// projection, and never forms a reference over the whole `ResultStreamInner`.
+/// That is what keeps it sound against a concurrent `next_batch`, which borrows
+/// only the disjoint `shape` field (a whole-struct `&`/`&mut` would alias even
+/// though the fields touched differ — odbc#355 review F1).
 #[no_mangle]
 pub unsafe extern "C" fn kernel_result_stream_canceller_new(
     stream: *mut kernel_result_stream_t,
     out: *mut *mut kernel_result_stream_canceller_t,
 ) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
-    let Some(inner) = (stream as *mut ResultStreamInner).as_ref() else {
+    if stream.is_null() {
         return store_invalid_arg("kernel_result_stream_canceller_new: stream must not be null");
-    };
+    }
     if out.is_null() {
         return store_invalid_arg("kernel_result_stream_canceller_new: out must not be null");
     }
+    // Read ONLY the `cancel` field through a raw-pointer projection — never a
+    // reference over the whole struct — so this is sound even while another
+    // thread holds `&mut (*p).shape` inside next_batch (disjoint fields; `cancel`
+    // is a `Sync` atomic). SAFETY: `stream` is a live box (non-null checked).
+    let p = stream as *mut ResultStreamInner;
     let handle = ResultStreamCanceller {
-        cancel: inner.cancel.clone(),
+        cancel: (*std::ptr::addr_of!((*p).cancel)).clone(),
     };
     std::ptr::write(
         out,
@@ -641,6 +674,13 @@ mod tests {
     /// and returns `Cancelled` promptly rather than waiting for the fetch (which
     /// this test never releases). Without the `select!` against the token, the
     /// consumer thread would block forever on the reader.
+    ///
+    /// This also exercises the blessed CONCURRENT path (odbc#355 review F1): the
+    /// canceller is obtained via `kernel_result_stream_canceller_new` AFTER the
+    /// fetch thread has parked inside `next_batch`, i.e. while a `next_batch` is
+    /// in flight — the exact race the field-projection soundness fix protects.
+    /// Run under `cargo +nightly miri test` / ThreadSanitizer to check the
+    /// aliasing at the reference level, not just the observable outcome.
     #[test]
     fn cancel_interrupts_an_in_flight_next_batch() {
         use crate::reader::test_utils::BlockingReader;
@@ -668,18 +708,13 @@ mod tests {
         };
 
         // Build the owned stream over the blocking reader on a throwaway runtime
-        // (from_reader is async), then obtain a canceller before driving it.
+        // (from_reader is async).
         let rt = tokio::runtime::Runtime::new().unwrap();
         let stream_ptr = {
             let stream =
                 rt.block_on(async { ResultStream::from_reader(Box::new(reader)).await.unwrap() });
             into_raw_result_stream(schema, stream)
         };
-        let mut canceller: *mut kernel_result_stream_canceller_t = std::ptr::null_mut();
-        assert_eq!(
-            unsafe { kernel_result_stream_canceller_new(stream_ptr, &mut canceller) },
-            KernelStatusCode::Success
-        );
 
         // Drive next_batch on a worker thread; it parks inside the reader.
         let stream_send = SendPtr(stream_ptr);
@@ -700,6 +735,16 @@ mod tests {
                 .await
                 .expect("reader did not enter next_batch within 5s");
         });
+
+        // Obtain the canceller NOW — while next_batch is in flight on the other
+        // thread. This is the concurrent-`canceller_new`-during-`next_batch` path
+        // the docs bless; it must be sound (disjoint field projection) and must
+        // succeed here.
+        let mut canceller: *mut kernel_result_stream_canceller_t = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kernel_result_stream_canceller_new(stream_ptr, &mut canceller) },
+            KernelStatusCode::Success
+        );
 
         // Fire the cancel from this (different) thread; the parked next_batch
         // must unwind. Bound the join so a regression (no interrupt) fails the
