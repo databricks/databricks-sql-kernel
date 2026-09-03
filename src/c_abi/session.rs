@@ -1709,6 +1709,17 @@ pub unsafe extern "C" fn kernel_session_is_open(
 /// `kernel_get_last_error`. Mirrors the reference / JDBC drivers'
 /// connection-test probe.
 ///
+/// `timeout_secs` bounds the WHOLE probe — every retry and HTTP round-trip
+/// included — to that many seconds; `0` means no per-call deadline (the probe
+/// runs on the session's own retry/timeout budget, the historical behaviour).
+/// This is the per-call deadline a host backs `ConnectionTestTimeout` with
+/// (odbc#347-C): without it `ConnectionTestTimeout=1` and `=30` behave
+/// identically. When the probe exceeds the deadline the call returns
+/// `KernelStatusCode::Timeout` (the typed error is in `kernel_get_last_error`);
+/// a host may treat that as "connection dead" or surface it distinctly. The
+/// bound is scoped to this probe and cannot alter the timeout of later requests
+/// on the session.
+///
 /// Runs SQL, so — like the transaction-control entry points — it MUST be
 /// invoked from a native (non-async-runtime) thread. Does not borrow
 /// ownership; the caller still owns `session`.
@@ -1717,7 +1728,10 @@ pub unsafe extern "C" fn kernel_session_is_open(
 /// `session` must be a live handle from [`kernel_session_open`] (not yet
 /// closed via [`kernel_session_close`]).
 #[no_mangle]
-pub unsafe extern "C" fn kernel_session_test(session: *const kernel_session_t) -> KernelStatusCode {
+pub unsafe extern "C" fn kernel_session_test(
+    session: *const kernel_session_t,
+    timeout_secs: u64,
+) -> KernelStatusCode {
     crate::c_abi::error::clear_error();
     let Some(session) = (session as *const Session).as_ref() else {
         crate::c_abi::error::store_error(
@@ -1725,7 +1739,8 @@ pub unsafe extern "C" fn kernel_session_test(session: *const kernel_session_t) -
         );
         return KernelStatusCode::InvalidArgument;
     };
-    match block_on_ffi(|| session.test_connection()) {
+    let deadline = (timeout_secs > 0).then(|| std::time::Duration::from_secs(timeout_secs));
+    match block_on_ffi(|| session.test_connection_with_timeout(deadline)) {
         Ok(()) => KernelStatusCode::Success,
         Err(code) => code,
     }
