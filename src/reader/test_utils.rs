@@ -20,6 +20,7 @@ use arrow_array::RecordBatch;
 use arrow_schema::{Schema, SchemaRef};
 use async_trait::async_trait;
 use std::sync::Arc;
+use tokio::sync::Notify;
 
 /// A simple mock reader that returns predefined batches.
 pub struct MockReader {
@@ -97,6 +98,40 @@ impl ResultReader for BatchThenErrorReader {
             Some(b) => Ok(Some(b)),
             None => Err(Error::io().message("simulated read error after first batch")),
         }
+    }
+}
+
+/// A reader whose `next_batch()` blocks indefinitely until explicitly
+/// released, and signals when it has actually entered the blocked await. Used
+/// to prove that a result-stream cancellation interrupts an in-flight fetch
+/// (odbc#355-B): a consumer starts `next_batch`, waits on `entered` until the
+/// reader is definitely parked inside the await, then cancels — and the fetch
+/// must unwind promptly rather than waiting on `release`, which the test never
+/// fires.
+///
+/// `entered` is notified once the reader parks; `release` is awaited to unblock
+/// it. Both are `Arc<Notify>` so the test thread holds its own clones. If a
+/// cancellation drops the future while it is parked here, `release` is simply
+/// never awaited to completion — no batch is produced.
+pub struct BlockingReader {
+    pub schema: SchemaRef,
+    pub entered: Arc<Notify>,
+    pub release: Arc<Notify>,
+}
+
+#[async_trait]
+impl ResultReader for BlockingReader {
+    async fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        // Announce that the fetch is now parked, then block until released.
+        // A cancellation that drops this future while it is awaiting `release`
+        // is exactly the in-flight-interrupt path under test.
+        self.entered.notify_one();
+        self.release.notified().await;
+        Ok(None)
     }
 }
 
