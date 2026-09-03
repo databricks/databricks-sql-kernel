@@ -364,6 +364,59 @@ fn check_ordinal(ordinal: usize) -> Result<(), Error> {
     Ok(())
 }
 
+/// Set per-statement query tags — key/value annotations sent with this
+/// statement's execution for cost attribution and tracking. `query_tags` is the
+/// serialized wire form: comma-separated `key:value` pairs, with a bare `key`
+/// (no colon) for a valueless tag, e.g. `team:eng,job:etl,production`; backslash
+/// escapes the separators in a value (`\:`, `\,`, `\\`). This is the same string
+/// [`crate::statement::spec::serialize_query_tags`] produces, so a host that
+/// already serializes tags for the Thrift `confOverlay` path (e.g. the Go/Node
+/// connectors) passes it through unchanged. The kernel re-parses it into the
+/// native SEA `query_tags` array at execute time (see
+/// [`crate::statement::mutable`]).
+///
+/// A non-empty value **replaces** the statement's query tags; an **empty string
+/// clears** any previously-set tags. Clearing matters because query tags persist
+/// across [`kernel_statement_set_sql`] (which resets bound parameters but not the
+/// statement conf), so a reused statement handle would otherwise carry an earlier
+/// query's tags into later executions — passing `""` before re-executing resets
+/// them. (This is a deliberate divergence from the typed
+/// [`crate::statement::spec::StatementSpec::query_tags`], whose empty **map** is a
+/// no-op: this single C entry point makes empty = clear so the C surface can both
+/// set and reset without a second function.)
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `query_tags` must be a NUL-terminated
+/// UTF-8 C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_set_query_tags(
+    stmt: *mut kernel_statement_t,
+    query_tags: *const c_char,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if query_tags.is_null() {
+            return Err(Error::invalid_argument().message("query_tags must not be null"));
+        }
+        let tags = CStr::from_ptr(query_tags)
+            .to_str()
+            .map_err(|_| Error::invalid_argument().message("query_tags is not valid UTF-8"))?;
+        // Empty → clear. statement_conf survives set_sql, so a reused handle would
+        // otherwise leak a prior query's tags; an explicit empty string is the C
+        // ABI's way to reset them before re-executing.
+        if tags.is_empty() {
+            stmt.spec().statement_conf.remove("query_tags");
+            return Ok(());
+        }
+        // The value is already in the wire form the SEA execute path reads back
+        // from `statement_conf["query_tags"]`, so store it verbatim rather than
+        // round-tripping through the typed `query_tags(map)` builder.
+        stmt.spec()
+            .statement_conf
+            .insert("query_tags".to_string(), tags.to_string());
+        Ok(())
+    })
+}
+
 // ─── Execute (sync) ──────────────────────────────────────────────────────────
 
 /// Wait-for-result execution. Auto-cancels + closes any prior executed
@@ -801,6 +854,18 @@ mod tests {
     // crash. The success + concurrent-cancel-during-execute paths are covered by
     // tests/v0_c_abi_canceller_wiremock.rs, which drives these entry points
     // against a mock SEA server.
+    #[test]
+    fn set_query_tags_null_handle_returns_invalid_argument() {
+        // A null statement handle is rejected before the tags are read, so this
+        // never crashes. (The happy path — a live handle — is covered where the
+        // serialized string reaches the wire array: see the
+        // `build_execute_params_reads_raw_query_tags_conf` test in
+        // `statement::mutable`.)
+        let rc =
+            unsafe { kernel_statement_set_query_tags(std::ptr::null_mut(), c"team:eng".as_ptr()) };
+        assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
     #[test]
     fn canceller_null_guards_return_invalid_argument() {
         let mut out: *mut kernel_statement_canceller_t = std::ptr::null_mut();
