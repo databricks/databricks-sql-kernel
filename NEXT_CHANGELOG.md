@@ -12,6 +12,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Added
 
 - Add a C ABI setter for the maximum idle HTTP connections retained per host.
+- C ABI: `kernel_statement_set_query_tags()` attaches per-statement query tags
+  (serialized `key:value` wire form) to a statement's execution, letting C ABI
+  consumers (ODBC, Go's kernel backend) reach parity with the Rust/PyO3/napi
+  `query_tags` surface.
 
 ### Changed
 
