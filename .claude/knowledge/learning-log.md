@@ -170,6 +170,12 @@ author, follow-up, and review runs.
 - **Context:** PR #312's per-stream `CancellationToken` interrupts an in-flight `next_batch` via `tokio::select!`, but it is intentionally not wired into the CloudFetch provider's own `cancel_token`; the provider awaits a spawned download's `JoinHandle`, so firing the token drops the `next_batch` future at its await point without aborting the detached download.
   **Rule:** Dropping a future at an await point only bounds the CALLER'S wait — it does not abort work the future was merely awaiting on a spawned task (`JoinHandle`); a client-side cancellation signal gives a bounded caller-return, not reclamation of the in-flight request/connection, so for true bounded teardown either wire the signal into the underlying provider's cancel token or close the resource to release it on its own completion, and document the distinction.
 
+### 2026-09-05: learnings since 2026-09-04T07:28:17Z
+- **Context:** PR #314 added the C ABI `kernel_statement_set_query_tags`; a reviewer noted that `statement_conf` (which holds `query_tags`) survives `StatementSpec::sql()`/`kernel_statement_set_sql` — unlike bound parameters, which reset — so a reused statement handle silently carries a prior query's tags/conf into later executions. The fix made an empty string mean "clear" so a reused handle can be reset.
+  **Rule:** Statement-level conf (e.g. `query_tags` in `statement_conf`) persists across `set_sql` even though bound parameters are reset; any single-entry-point setter on a reusable handle must offer an explicit clear path (empty = clear) or state-leak across executions is inevitable.
+- **Context:** In PR #314 a reviewer caught that the public FFI fn's Rustdoc linked to `crate::statement::spec::serialize_query_tags`, a private (non-`pub`) item — a public→private intra-doc link trips rustdoc's warn-by-default `private_intra_doc_links` lint, which surfaces only during `cargo doc`, not the `cargo fmt`/`clippy`/`test` CI gates.
+  **Rule:** Intra-doc links from a public item to a private item fail under `cargo doc`/`RUSTDOCFLAGS=-D warnings` but pass fmt/clippy/test; in Rustdoc on `pub` items link only to public anchors or use plain code font for private names.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
