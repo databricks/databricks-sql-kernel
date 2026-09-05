@@ -479,9 +479,11 @@ impl DatabricksHttpClient {
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
-        // this binary is on native-tls (system CA store) or rustls
-        // (Mozilla webpki-roots). The two stacks differ on cert
-        // validation behavior, OCSP, and TLS 1.3 quirks.
+        // this binary is on native-tls or rustls. Both read the OS system
+        // CA store (rustls via `rustls-tls-native-roots`, which also keeps
+        // the Mozilla webpki-roots as a fallback — see odbc#323), but the
+        // two stacks still differ on cert validation behavior, OCSP, and
+        // TLS 1.3 quirks.
         debug!(
             tls_backend = if cfg!(feature = "tls-rustls") {
                 "rustls"
