@@ -224,6 +224,11 @@ struct DownloadCtx {
     metrics: Arc<CloudFetchMetrics>,
     max_retries: u32,
     retry_delay: std::time::Duration,
+    /// Absolute end-to-end wall-clock budget for downloading one chunk,
+    /// spanning every retry, the backoff sleeps, and each HTTP attempt.
+    /// See [`CloudFetchConfig::download_timeout`]. Enforced in
+    /// [`StreamingCloudFetchProvider::download_chunk_with_retry`].
+    download_timeout: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -393,6 +398,41 @@ impl StreamingCloudFetchProvider {
         });
 
         provider
+    }
+
+    /// Test-only constructor: build a provider around a pre-seeded
+    /// `chunks` map WITHOUT spawning the background `initialize`
+    /// task. Lets consumer-path tests (`wait_for_chunk`) observe the
+    /// exact `ChunkState` they seed. The injected `link_fetcher` /
+    /// `chunk_downloader` are never exercised by these tests.
+    #[cfg(test)]
+    fn for_test_with_chunks(
+        link_fetcher: Arc<dyn ChunkLinkFetcher>,
+        chunk_downloader: Arc<ChunkDownloader>,
+        chunks: Arc<DashMap<i64, ChunkEntry>>,
+        end_of_stream: bool,
+    ) -> Arc<Self> {
+        let config = CloudFetchConfig::default();
+        Arc::new(Self {
+            link_fetcher,
+            chunk_downloader,
+            max_chunks_in_memory: config.max_chunks_in_memory,
+            config,
+            schema: OnceLock::new(),
+            current_chunk_index: AtomicI64::new(0),
+            current_batch_buffer: Mutex::new(VecDeque::new()),
+            next_download_index: AtomicI64::new(0),
+            end_of_stream: AtomicBool::new(end_of_stream),
+            chunks,
+            chunks_in_memory: AtomicUsize::new(0),
+            chunk_state_changed: Arc::new(Notify::new()),
+            terminal_error: Mutex::new(None),
+            cancel_token: CancellationToken::new(),
+            runtime_handle: tokio::runtime::Handle::current(),
+            statement_id: None,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            metrics: Arc::new(CloudFetchMetrics::new(None)),
+        })
     }
 
     /// Initialize the provider by fetching initial links and starting downloads.
@@ -716,6 +756,7 @@ impl StreamingCloudFetchProvider {
                 metrics: Arc::clone(&self.metrics),
                 max_retries: self.config.max_retries,
                 retry_delay: self.config.retry_delay,
+                download_timeout: self.config.download_timeout,
             };
             let chunk_state_changed = Arc::clone(&self.chunk_state_changed);
             let chunks = self.chunks.clone();
@@ -769,9 +810,13 @@ impl StreamingCloudFetchProvider {
                     Err(e) => {
                         error!("Failed to download chunk {}: {}", chunk_index, e);
                         if let Some(mut entry) = chunks.get_mut(&chunk_index) {
-                            let msg = e.to_string();
-                            entry.state = ChunkState::DownloadFailed(msg.clone());
-                            entry.last_failure_reason = Some(msg);
+                            // Preserve the full typed error in the state so
+                            // its `ErrorCode` (e.g. `Timeout` for a deadline)
+                            // survives to the consumer path — see H05. Keep a
+                            // stringified copy in `last_failure_reason` for the
+                            // operator breadcrumb that outlives the state.
+                            entry.last_failure_reason = Some(e.to_string());
+                            entry.state = ChunkState::DownloadFailed(e);
                         }
                     }
                 }
@@ -781,16 +826,51 @@ impl StreamingCloudFetchProvider {
         }
     }
 
-    /// Download a single chunk with retry and link refresh on expiry.
+    /// Stable terminal error for a chunk whose end-to-end download budget
+    /// ([`CloudFetchConfig::download_timeout`]) was exhausted. Classified as
+    /// [`Error::timeout`] so consumers (and the C ABI / ODBC bridge) get a
+    /// consistent, retryable timeout classification rather than an opaque
+    /// I/O error (audit H05).
+    fn download_deadline_error(chunk_index: i64, budget: std::time::Duration) -> Error {
+        Error::timeout().message(format!(
+            "CloudFetch chunk {} download exceeded the {:.1}s end-to-end deadline",
+            chunk_index,
+            budget.as_secs_f64()
+        ))
+    }
+
+    /// Download a single chunk with retry and link refresh on expiry,
+    /// bounded end-to-end by [`CloudFetchConfig::download_timeout`].
     async fn download_chunk_with_retry(
         chunk_index: i64,
         ctx: &DownloadCtx,
     ) -> Result<Vec<RecordBatch>> {
         let mut attempts = 0;
 
+        // Absolute end-to-end deadline for this chunk. Bounds the whole
+        // retry loop — every HTTP attempt, link refresh, and backoff sleep
+        // — so a permanently-stalled chunk surfaces a terminal timeout in
+        // bounded time instead of stacking `max_retries × request_timeout`
+        // into minutes (audit H05). A zero budget disables the deadline
+        // (falls back to attempt-count bounding only).
+        let deadline = (!ctx.download_timeout.is_zero())
+            .then(|| std::time::Instant::now() + ctx.download_timeout);
+
         loop {
             if ctx.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Download cancelled"));
+            }
+
+            // Hard deadline check at the top of every attempt: if the
+            // budget is spent, stop promptly with a stable timeout error
+            // rather than starting another attempt or refresh.
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Self::download_deadline_error(
+                        chunk_index,
+                        ctx.download_timeout,
+                    ));
+                }
             }
 
             // Get link (may need to refresh the whole forward batch
@@ -813,15 +893,32 @@ impl StreamingCloudFetchProvider {
                              triggering batched refresh",
                             chunk_index
                         );
-                        Self::refresh_links_batch(
+                        // Bound the refresh RPC by the remaining chunk
+                        // budget so a stalled refresh can't overshoot the
+                        // end-to-end deadline by its own (much larger)
+                        // per-request `request_timeout` (audit H05). This
+                        // keeps the deadline genuinely end-to-end across
+                        // the link-refresh step, matching the loop-level
+                        // comment above.
+                        let refresh = Self::refresh_links_batch(
                             chunk_index,
                             &ctx.link_fetcher,
                             &ctx.chunks,
                             &ctx.refresh_coordinator,
                             &ctx.cancel_token,
                             ctx.statement_id.as_deref(),
-                        )
-                        .await
+                        );
+                        match deadline {
+                            Some(d) => tokio::time::timeout(
+                                d.saturating_duration_since(std::time::Instant::now()),
+                                refresh,
+                            )
+                            .await
+                            .map_err(|_| {
+                                Self::download_deadline_error(chunk_index, ctx.download_timeout)
+                            })?,
+                            None => refresh.await,
+                        }
                         .map_err(|e| {
                             // Wrap with chunk_index breadcrumb so the
                             // downstream `error!("Failed to download
@@ -914,9 +1011,13 @@ impl StreamingCloudFetchProvider {
                 }
             };
 
-            // Attempt download
+            // Attempt download. Cap this attempt at the remaining budget so
+            // a stalled connect / headers / body can't outrun the deadline
+            // (reqwest's per-request timeout spans all three). `None` when no
+            // deadline is configured.
             let download_started = std::time::Instant::now();
-            match ctx.downloader.download(&link).await {
+            let attempt_timeout = deadline.map(|d| d.saturating_duration_since(download_started));
+            match ctx.downloader.download(&link, attempt_timeout).await {
                 Ok(batches) => {
                     ctx.metrics
                         .record_chunk_download(chunk_index, download_started.elapsed());
@@ -1002,7 +1103,17 @@ impl StreamingCloudFetchProvider {
                         entry.last_failure_reason = Some(e.to_string());
                     }
 
-                    tokio::time::sleep(ctx.retry_delay).await;
+                    // Never sleep past the deadline: cap the backoff at the
+                    // remaining budget so the next iteration's deadline check
+                    // fires promptly instead of after a full `retry_delay`
+                    // overshoot.
+                    let sleep_for = match deadline {
+                        Some(d) => ctx
+                            .retry_delay
+                            .min(d.saturating_duration_since(std::time::Instant::now())),
+                        None => ctx.retry_delay,
+                    };
+                    tokio::time::sleep(sleep_for).await;
                 }
             }
         }
@@ -1425,7 +1536,11 @@ impl StreamingCloudFetchProvider {
             if let Some(entry) = self.chunks.get(&chunk_index) {
                 match &entry.state {
                     ChunkState::Downloaded => return Ok(()),
-                    ChunkState::DownloadFailed(e) => return Err(Error::io().message(e.clone())),
+                    // Return the preserved typed error verbatim so the
+                    // consumer (including the C ABI / ODBC bridge) sees the
+                    // original `ErrorCode` — e.g. `Timeout` for a deadline —
+                    // rather than an opaque re-wrapped `Io` error (H05).
+                    ChunkState::DownloadFailed(e) => return Err(e.clone()),
                     ChunkState::ProcessingFailed(e) => return Err(Error::io().message(e.clone())),
                     ChunkState::Cancelled => {
                         return Err(Error::invalid_state().message("Operation cancelled"))
@@ -1716,6 +1831,9 @@ mod tests {
             metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
             max_retries: MAX_DOWNLOAD_ATTEMPTS,
             retry_delay: std::time::Duration::ZERO,
+            // This test isolates the attempt-count budget; disable the
+            // wall-clock deadline (0 = disabled) so it doesn't interfere.
+            download_timeout: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
@@ -1735,6 +1853,319 @@ mod tests {
             MAX_DOWNLOAD_ATTEMPTS as usize,
             "in-flight link expiry must not bypass the download attempt budget",
         );
+    }
+
+    // ─── End-to-end download deadline (issue #321 / audit H05) ───────────
+    //
+    // These tests exercise `download_chunk_with_retry`'s absolute
+    // `download_timeout` deadline: a stalled connection / headers / body
+    // and repeated failures must not let a single chunk outrun the budget.
+    // Each drives the real `ChunkDownloader` against a `wiremock` server so
+    // reqwest's per-request timeout (the actual cap) is genuinely exercised,
+    // not mocked away.
+    mod download_deadline {
+        use super::*;
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::kernel_error::ErrorCode;
+        use crate::types::sea::CompressionCodec;
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A link fetcher that only ever serves chunk 0's link pointing at
+        /// `url`. Refresh paths are unreachable — the link never expires
+        /// (1h out), so these tests isolate the download deadline from any
+        /// refresh behaviour.
+        #[derive(Debug)]
+        struct SingleLinkFetcher {
+            url: String,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for SingleLinkFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!("deadline tests seed the chunks map directly")
+            }
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!("link never expires in these tests")
+            }
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                unreachable!("link never expires in these tests")
+            }
+        }
+
+        impl SingleLinkFetcher {
+            fn link(&self) -> CloudFetchLink {
+                CloudFetchLink {
+                    url: self.url.clone(),
+                    ..create_test_link(0)
+                }
+            }
+        }
+
+        /// Build a `DownloadCtx` whose downloader targets `server`, with the
+        /// given end-to-end `download_timeout` and (large) `max_retries` so
+        /// the wall-clock deadline — not the attempt count — is what bounds
+        /// the loop. The inner HTTP client's own retries are disabled so the
+        /// provider is the sole retry authority (mirrors production).
+        fn ctx_for(
+            server: &MockServer,
+            download_timeout: Duration,
+            cancel_token: CancellationToken,
+        ) -> DownloadCtx {
+            let http_client = Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(
+                        &RetryConfig {
+                            max_retries: 0,
+                            ..RetryConfig::default()
+                        },
+                        &HashMap::new(),
+                    ),
+                )
+                .unwrap(),
+            );
+            let downloader = Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            ));
+            let fetcher = Arc::new(SingleLinkFetcher {
+                url: format!("{}/chunk-0.arrow", server.uri()),
+            });
+            let chunks = Arc::new(DashMap::new());
+            chunks.insert(0, entry_with_state(fetcher.link(), ChunkState::Downloading));
+            DownloadCtx {
+                downloader,
+                link_fetcher: fetcher,
+                chunks,
+                refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+                cancel_token,
+                statement_id: None,
+                metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+                // Large attempt budget so ONLY the wall-clock deadline can
+                // stop the loop — proves the deadline, not the counter.
+                max_retries: 10_000,
+                retry_delay: Duration::from_millis(20),
+                download_timeout,
+            }
+        }
+
+        /// A stalled response body (headers arrive, body never completes)
+        /// must be cut off by the deadline, not the static request_timeout.
+        /// Without the per-attempt cap this hangs for the client's
+        /// `request_timeout` (default 120s) per attempt.
+        #[tokio::test]
+        async fn stalled_body_is_bounded_by_deadline() {
+            let server = MockServer::start().await;
+            // Delay far beyond the budget: stands in for a body that never
+            // makes progress. The per-attempt timeout must fire first.
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+
+            let budget = Duration::from_millis(300);
+            let ctx = ctx_for(&server, budget, CancellationToken::new());
+
+            let started = Instant::now();
+            // Outer guard is ~10x the budget: if the deadline is NOT
+            // enforced this trips and fails loudly instead of hanging CI.
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("a stalled body must be bounded by the download deadline, not hang");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("a stalled body must surface a terminal error");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "deadline expiry must be classified as a timeout, got: {err}"
+            );
+            assert!(
+                err.message.contains("deadline"),
+                "unexpected error message: {err}"
+            );
+            // Elapsed stays within a documented scheduling tolerance of the
+            // budget (≤ budget + generous slack for scheduler/backoff).
+            assert!(
+                elapsed < budget + Duration::from_secs(1),
+                "elapsed {elapsed:?} should stay within tolerance of the {budget:?} budget"
+            );
+        }
+
+        /// Repeated failures (persistent HTTP 500, each returned promptly)
+        /// must stop at the wall-clock deadline rather than running the full
+        /// attempt count. Proves the deadline bounds the retry/backoff loop.
+        #[tokio::test]
+        async fn retry_exhaustion_is_bounded_by_deadline() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let budget = Duration::from_millis(250);
+            let ctx = ctx_for(&server, budget, CancellationToken::new());
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("retry loop must stop at the deadline, not run 10k attempts");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("persistent 500 within the budget must be terminal");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "budget exhaustion must be classified as a timeout, got: {err}"
+            );
+            assert!(
+                elapsed < budget + Duration::from_secs(1),
+                "elapsed {elapsed:?} should stay within tolerance of the {budget:?} budget"
+            );
+            // Far fewer than max_retries attempts — the deadline, not the
+            // 10k counter, stopped the loop.
+            let attempts = server.received_requests().await.unwrap().len();
+            assert!(
+                attempts < 100,
+                "deadline should stop the loop well before the 10k attempt cap, got {attempts}"
+            );
+        }
+
+        /// A cancellation while a chunk is retrying under a live deadline
+        /// must be observed promptly (at the next loop boundary) and win —
+        /// the loop must not run out the remaining budget once cancelled.
+        /// The chunk keeps failing fast (HTTP 500 returned immediately), so
+        /// attempts turn over quickly and the loop-top cancel check fires
+        /// well before the multi-second budget would.
+        #[tokio::test]
+        async fn cancel_under_live_deadline_returns_promptly() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            // Long budget: only cancellation, not the deadline, should end
+            // this loop. If cancel is NOT observed, the loop would spin on
+            // fast 500s until the 10s budget — the outer 3s guard catches
+            // that regression.
+            let cancel = CancellationToken::new();
+            let ctx = ctx_for(&server, Duration::from_secs(10), cancel.clone());
+
+            let canceller = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                canceller.cancel();
+            });
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("cancellation must be observed promptly, not run out the budget");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("a cancelled download must be an error");
+            // The "Download cancelled" arm uses `Error::invalid_state()`,
+            // which maps to `ErrorCode::InvalidArgument`.
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "cancel should win over the (far-off) deadline, got: {err}"
+            );
+            assert!(
+                err.message.contains("cancelled"),
+                "unexpected error message: {err}"
+            );
+            // Returned near the cancel time, nowhere near the 10s budget.
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "cancel should return promptly (~50ms), got {elapsed:?}"
+            );
+        }
+
+        /// H05 end-to-end: the deadline error's `ErrorCode::Timeout`
+        /// classification must survive the chunk-state machine and reach
+        /// the *consumer* path (`wait_for_chunk`), not just the direct
+        /// return of `download_chunk_with_retry`. Before the fix,
+        /// `ChunkState::DownloadFailed(String)` dropped the code and
+        /// `wait_for_chunk` re-wrapped it as `Error::io()`
+        /// (`ErrorCode::Internal`) — the very "opaque I/O error" the doc
+        /// promised consumers would not see.
+        #[tokio::test]
+        async fn deadline_timeout_classification_survives_to_consumer() {
+            // Minimal dummy deps — never exercised, `wait_for_chunk`
+            // only reads the seeded chunk state.
+            let http_client = Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(&RetryConfig::default(), &HashMap::new()),
+                )
+                .unwrap(),
+            );
+            let downloader = Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            ));
+            let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(SingleLinkFetcher {
+                url: "https://unused.example.com/chunk-0.arrow".to_string(),
+            });
+
+            // Seed chunk 0 exactly as the download task would on a
+            // deadline expiry: DownloadFailed carrying the typed
+            // timeout error.
+            let deadline_err =
+                StreamingCloudFetchProvider::download_deadline_error(0, Duration::from_millis(300));
+            assert_eq!(deadline_err.code, ErrorCode::Timeout);
+            let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+            chunks.insert(
+                0,
+                ChunkEntry {
+                    link: None,
+                    state: ChunkState::DownloadFailed(deadline_err),
+                    batches: None,
+                    last_failure_reason: None,
+                },
+            );
+
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                fetcher, downloader, chunks, true,
+            );
+
+            let err = provider
+                .wait_for_chunk(0)
+                .await
+                .expect_err("a deadline-failed chunk must surface an error to the consumer");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "consumer path must preserve the Timeout classification, got: {err}"
+            );
+            assert!(
+                err.retryable,
+                "a preserved timeout error must keep its retryable=true flag"
+            );
+            assert!(
+                err.message.contains("deadline"),
+                "the original deadline message must be preserved: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2103,7 +2534,7 @@ mod tests {
             7,
             entry_with_state(
                 expired_link(7),
-                ChunkState::DownloadFailed("network glitch".into()),
+                ChunkState::DownloadFailed(Error::network_error().message("network glitch")),
             ),
         );
         chunks.insert(

@@ -44,6 +44,23 @@ pub struct CloudFetchConfig {
     pub max_retries: u32,
     /// Delay between retry attempts.
     pub retry_delay: Duration,
+    /// Absolute end-to-end wall-clock budget for downloading a single
+    /// chunk, spanning every retry, the backoff sleeps between them,
+    /// and each individual HTTP attempt (connect, response headers, and
+    /// response body).
+    ///
+    /// Enforced as a hard deadline in
+    /// `StreamingCloudFetchProvider::download_chunk_with_retry`: the
+    /// remaining budget caps each HTTP attempt (via reqwest's
+    /// per-request timeout) so a stalled connection, stalled headers, or
+    /// stalled body can never exceed it, and the loop stops retrying
+    /// once the deadline passes — returning a stable timeout error
+    /// promptly rather than blocking the consumer for minutes.
+    ///
+    /// Without this bound the per-attempt HTTP timeout (`request_timeout`,
+    /// default 120s) multiplied by `max_retries` let a permanently-stuck
+    /// chunk block for ~10 minutes on a nominal budget (audit H05).
+    pub download_timeout: Duration,
     /// Timeout for waiting for a chunk to be ready.
     pub chunk_ready_timeout: Option<Duration>,
     /// Log warning if download speed falls below this threshold (MB/s).
@@ -71,6 +88,13 @@ impl Default for CloudFetchConfig {
             max_chunks_in_memory: 16,
             max_retries: 5,
             retry_delay: Duration::from_millis(1500),
+            // End-to-end per-chunk download budget. Matches the CloudFetch
+            // HTTP-retry `overall_timeout` set in
+            // `session::build_retry_configs_for_session`, so the provider
+            // retry loop and the inner HTTP client share one budget instead
+            // of stacking multiplicatively (audit H05). `session` re-projects
+            // this from the same source so the two can't drift.
+            download_timeout: Duration::from_secs(20),
             chunk_ready_timeout: Some(Duration::from_secs(30)),
             speed_threshold_mbps: 0.1,
             enabled: true,
@@ -170,8 +194,14 @@ pub enum ChunkState {
     Downloading,
     /// Downloaded successfully.
     Downloaded,
-    /// Download failed (will retry).
-    DownloadFailed(String),
+    /// Download failed (will retry). Carries the full [`Error`] —
+    /// not a stringified message — so the terminal classification
+    /// (`ErrorCode`, `retryable`, cause chain) survives to the
+    /// consumer path (`wait_for_chunk`). Stringifying here would
+    /// collapse an `ErrorCode::Timeout` deadline error into an
+    /// opaque `ErrorCode::Internal` when the consumer re-wrapped it
+    /// (audit H05).
+    DownloadFailed(Error),
     /// Retrying after failure.
     DownloadRetry,
     /// Arrow parse failed (terminal).
@@ -238,6 +268,9 @@ mod tests {
         assert_eq!(config.max_retries, 5);
         assert!(config.enabled);
         assert_eq!(config.batch_merge_target_rows, 0); // Disabled by default
+                                                       // End-to-end per-chunk download budget (audit H05). Matches the
+                                                       // CloudFetch HTTP-retry overall_timeout so the two layers can't drift.
+        assert_eq!(config.download_timeout, Duration::from_secs(20));
     }
 
     #[test]
