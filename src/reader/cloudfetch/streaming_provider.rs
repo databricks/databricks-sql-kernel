@@ -134,6 +134,23 @@ pub struct StreamingCloudFetchProvider {
     // Coordination signals
     chunk_state_changed: Arc<Notify>,
 
+    // First terminal provider failure, if any.
+    //
+    // Link-fetch failures (initial or incremental) surface here
+    // once the transport's retry budget is exhausted. Unlike a
+    // per-chunk download/processing failure — which lives on the
+    // `ChunkEntry` a waiter can find in `chunks` — a link fetch
+    // fails *before* any entry for the requested chunk exists, so
+    // there is nothing in `chunks` for `wait_for_chunk` to key
+    // off. Without a provider-level record, a woken waiter finds
+    // neither data nor a terminal state (`end_of_stream` is also
+    // still unset) and loops forever. Persisting the first such
+    // error here gives every current and future waiter a
+    // deterministic terminal result. First writer wins so the
+    // original error context (SQLSTATE, source, etc.) is
+    // preserved; later failures are dropped.
+    terminal_error: Mutex<Option<Error>>,
+
     // Cancellation
     cancel_token: CancellationToken,
 
@@ -361,6 +378,7 @@ impl StreamingCloudFetchProvider {
             chunks_in_memory: AtomicUsize::new(0),
             max_chunks_in_memory: config.max_chunks_in_memory,
             chunk_state_changed: Arc::new(Notify::new()),
+            terminal_error: Mutex::new(None),
             cancel_token: CancellationToken::new(),
             runtime_handle,
             statement_id,
@@ -412,7 +430,11 @@ impl StreamingCloudFetchProvider {
             }
             Err(e) => {
                 error!("Failed to fetch initial links: {}", e);
-                self.chunk_state_changed.notify_one();
+                // Persist as a terminal provider failure: no chunk
+                // entry exists for the initial links, so a waiter has
+                // nothing in `chunks` to observe. Without this it
+                // would loop forever (see `terminal_error`).
+                self.set_terminal_error(e);
             }
         }
     }
@@ -486,6 +508,13 @@ impl StreamingCloudFetchProvider {
             return Ok(None);
         }
 
+        // A terminal link-fetch failure that landed after the wait
+        // returned takes precedence over the generic "not found"
+        // message, so callers see the real cause deterministically.
+        if let Some(err) = self.terminal_error() {
+            return Err(err);
+        }
+
         Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
     }
 
@@ -497,6 +526,35 @@ impl StreamingCloudFetchProvider {
     }
 
     // --- Internal methods ---
+
+    /// Record the first terminal link-fetch failure and wake every waiter.
+    ///
+    /// Called from the link-fetch error paths once the transport's
+    /// retry budget is exhausted. First writer wins, so the original
+    /// error (with its SQLSTATE / source chain intact) is preserved
+    /// and any later failure is dropped. Uses `notify_waiters()`
+    /// rather than `notify_one()` so *every* consumer currently
+    /// blocked in `wait_for_chunk` is released, not just one — a
+    /// terminal failure must not leave sibling waiters stuck.
+    fn set_terminal_error(&self, error: Error) {
+        {
+            let mut slot = self.terminal_error.lock().unwrap();
+            if slot.is_none() {
+                error!("CloudFetch provider entering terminal error state: {error}");
+                *slot = Some(error);
+            }
+            // else: keep the first error; drop this one.
+        }
+        // Wake all current waiters so they observe the terminal state.
+        // A waiter that registers *after* this checks `terminal_error`
+        // on entry, so it never misses the signal.
+        self.chunk_state_changed.notify_waiters();
+    }
+
+    /// Return a clone of the terminal link-fetch error, if one is set.
+    fn terminal_error(&self) -> Option<Error> {
+        self.terminal_error.lock().unwrap().clone()
+    }
 
     /// Fetch links from the link fetcher and store them in the chunks map.
     ///
@@ -519,7 +577,12 @@ impl StreamingCloudFetchProvider {
             }
             Err(e) => {
                 error!("Failed to fetch links for chunk {}: {}", start_index, e);
-                self.chunk_state_changed.notify_one();
+                // Persist as a terminal provider failure. The chunk
+                // whose link we failed to fetch has no entry in
+                // `chunks`, so a consumer blocked in `wait_for_chunk`
+                // on `start_index` would otherwise loop forever
+                // (see `terminal_error`).
+                self.set_terminal_error(e);
                 false
             }
         }
@@ -1327,12 +1390,38 @@ impl StreamingCloudFetchProvider {
     /// Wait for a specific chunk to be ready (Downloaded state).
     async fn wait_for_chunk(&self, chunk_index: i64) -> Result<()> {
         loop {
+            // Register the state-change waiter *before* the readiness /
+            // terminal-error checks below. `notify_waiters()` (used by
+            // `set_terminal_error` and the download tasks) only wakes
+            // waiters that are already registered when it fires, so a
+            // future constructed inline in the `select!` — i.e. after the
+            // checks — could miss a wakeup that lands in that window and
+            // stall until `chunk_ready_timeout`. `enable()` registers the
+            // future with the `Notify` now, so any notification arriving
+            // after the checks is captured and resolves the arm
+            // immediately on the next poll. Mirrors the pre-registration
+            // done for the refresh-coordinator wait.
+            let state_changed = self.chunk_state_changed.notified();
+            tokio::pin!(state_changed);
+            state_changed.as_mut().enable();
+
             // Check cancellation
             if self.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Operation cancelled"));
             }
 
-            // Check if chunk is ready
+            // Check if the requested chunk is ready FIRST. A terminal
+            // link-fetch failure only ever fails a page at or beyond
+            // the download frontier, which runs ahead of the consumer
+            // by up to `max_chunks_in_memory` chunks. Chunks between
+            // the consumer's current position and the failed page may
+            // already be downloaded and ready — checking readiness
+            // before the terminal error preserves in-order delivery of
+            // that buffered data, matching the per-chunk failure path
+            // (which is keyed on the specific chunk entry). The
+            // consumer only observes the terminal error once it reaches
+            // the chunk whose link failed, at which point no entry
+            // exists in `chunks` and the check below returns it.
             if let Some(entry) = self.chunks.get(&chunk_index) {
                 match &entry.state {
                     ChunkState::Downloaded => return Ok(()),
@@ -1348,6 +1437,14 @@ impl StreamingCloudFetchProvider {
                 return Err(
                     Error::invalid_state().message(format!("Chunk {} not available", chunk_index))
                 );
+            } else if let Some(err) = self.terminal_error() {
+                // The requested chunk has no entry (its link fetch is
+                // what failed) and we are not at a clean end of stream:
+                // surface the persisted terminal error rather than
+                // looping forever. Placed after the ready-chunk check
+                // so already-downloaded in-order chunks are still
+                // delivered before the failure is reported.
+                return Err(err);
             }
 
             // Wait for any chunk state change with timeout
@@ -1362,7 +1459,7 @@ impl StreamingCloudFetchProvider {
                 _ = self.cancel_token.cancelled() => {
                     return Err(Error::invalid_state().message("Operation cancelled"));
                 }
-                _ = self.chunk_state_changed.notified() => {
+                _ = &mut state_changed => {
                     // State changed, loop to check
                 }
                 _ = tokio::time::sleep(timeout) => {
@@ -2823,6 +2920,451 @@ mod tests {
         assert!(
             matches!(observed_state, ChunkState::Downloading),
             "in-flight task observes the chunk as still Downloading (owns the state machine)",
+        );
+    }
+
+    // --- Terminal link-fetch failure propagation (issue #319 / audit H03) ---
+    //
+    // A CloudFetch link-fetch failure fails *before* any `ChunkEntry`
+    // for the requested chunk exists and leaves `end_of_stream`
+    // unset, so `wait_for_chunk` has nothing to observe. Before the
+    // fix a woken consumer looped forever. These tests inject
+    // link-fetch faults and prove the provider now surfaces a
+    // deterministic terminal error to every current and future
+    // waiter without hanging.
+
+    /// A `ChunkDownloader` that never actually gets exercised in these
+    /// tests (link fetch fails first), but `StreamingCloudFetchProvider::new`
+    /// requires one. Points at an unroutable URL so any accidental
+    /// download attempt fails fast rather than reaching the network.
+    fn noop_downloader() -> Arc<ChunkDownloader> {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ))
+    }
+
+    /// Configurable link fetcher that fails `fetch_links` for a chosen
+    /// `start_chunk_index` and otherwise serves a fixed set of links.
+    ///
+    /// Failure is keyed on the requested `start_chunk_index`, not a
+    /// call counter, so it is deterministic no matter how many times a
+    /// page is (re)fetched:
+    ///
+    /// - `fail_at_start_index == 0`: the initial link fetch in
+    ///   `initialize` (which requests `start_chunk_index == 0`) fails.
+    /// - `fail_at_start_index == n > 0`: earlier pages serve
+    ///   `links_per_call` links each; the fetch that would supply
+    ///   chunk `n` fails — modelling an incremental / pagination-refill
+    ///   failure.
+    #[derive(Debug)]
+    struct FailingLinkFetcher {
+        total_chunks: i64,
+        links_per_call: i64,
+        fail_at_start_index: i64,
+        error_message: String,
+        /// When set, served links point at `{url_base}/chunk-{i}.arrow`
+        /// so a real downloader can fetch them; otherwise the default
+        /// unroutable `create_test_link` URL is used.
+        url_base: Option<String>,
+    }
+
+    impl FailingLinkFetcher {
+        fn new(total_chunks: i64, links_per_call: i64, fail_at_start_index: i64) -> Arc<Self> {
+            Arc::new(Self {
+                total_chunks,
+                links_per_call,
+                fail_at_start_index,
+                error_message: "injected link-fetch failure".to_string(),
+                url_base: None,
+            })
+        }
+
+        fn with_url_base(
+            total_chunks: i64,
+            links_per_call: i64,
+            fail_at_start_index: i64,
+            url_base: String,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                total_chunks,
+                links_per_call,
+                fail_at_start_index,
+                error_message: "injected link-fetch failure".to_string(),
+                url_base: Some(url_base),
+            })
+        }
+
+        fn link_for(&self, chunk_index: i64) -> CloudFetchLink {
+            match &self.url_base {
+                Some(base) => CloudFetchLink {
+                    url: format!("{base}/chunk-{chunk_index}.arrow"),
+                    ..create_test_link(chunk_index)
+                },
+                None => create_test_link(chunk_index),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkLinkFetcher for FailingLinkFetcher {
+        async fn fetch_links(
+            &self,
+            start_chunk_index: i64,
+            _start_row_offset: i64,
+        ) -> Result<ChunkLinkFetchResult> {
+            if start_chunk_index == self.fail_at_start_index {
+                // Preserve a distinctive SQLSTATE so the test can
+                // assert the original error context survives. Keyed on
+                // the requested index so retries of the same page fail
+                // deterministically.
+                return Err(Error::io()
+                    .message(self.error_message.clone())
+                    .with_sql_state("08001"));
+            }
+
+            if start_chunk_index >= self.total_chunks {
+                return Ok(ChunkLinkFetchResult::end_of_stream());
+            }
+
+            let links: Vec<CloudFetchLink> = (start_chunk_index
+                ..(start_chunk_index + self.links_per_call).min(self.total_chunks))
+                .map(|i| self.link_for(i))
+                .collect();
+            let next_index = start_chunk_index + links.len() as i64;
+            let has_more = next_index < self.total_chunks;
+            Ok(ChunkLinkFetchResult {
+                links,
+                has_more,
+                next_chunk_index: has_more.then_some(next_index),
+                next_row_offset: None,
+            })
+        }
+
+        async fn refetch_link(&self, chunk_index: i64, _row_offset: i64) -> Result<CloudFetchLink> {
+            Ok(create_test_link(chunk_index))
+        }
+
+        async fn refetch_links_from(
+            &self,
+            chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<Vec<CloudFetchLink>> {
+            Ok(vec![create_test_link(chunk_index)])
+        }
+    }
+
+    /// Build a provider wired to a failing fetcher, with a short
+    /// chunk-ready timeout so a *regression* (a hang) still resolves
+    /// within the outer `tokio::time::timeout` guard rather than
+    /// wedging the whole test run.
+    fn provider_with_failing_fetcher(
+        fetcher: Arc<FailingLinkFetcher>,
+        total_chunks_present: Option<i32>,
+    ) -> Arc<StreamingCloudFetchProvider> {
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_millis(50)),
+            ..CloudFetchConfig::default()
+        };
+        StreamingCloudFetchProvider::new(
+            config,
+            fetcher,
+            noop_downloader(),
+            total_chunks_present,
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    /// The outer guard: any `next_batch` that has not resolved within
+    /// this window is treated as the indefinite-hang regression.
+    const NO_HANG: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Initial link fetch fails → the first `next_batch` returns the
+    /// terminal error instead of hanging, and the original error
+    /// context (message + SQLSTATE) is preserved.
+    #[tokio::test]
+    async fn initial_link_fetch_failure_is_terminal() {
+        let fetcher = FailingLinkFetcher::new(4, 2, /* fail_at_start_index */ 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("next_batch must not hang after an initial link-fetch failure")
+            .expect_err("a terminal link-fetch failure must surface as an error");
+
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "original error message must be preserved; got: {err}"
+        );
+        assert_eq!(
+            err.sql_state.as_deref(),
+            Some("08001"),
+            "original SQLSTATE context must be preserved",
+        );
+    }
+
+    /// Incremental link fetch fails after the first page succeeds and
+    /// is consumed. This test isolates the incremental link-fetch path:
+    /// chunk 0's link is served and its bytes download successfully
+    /// (from a mock HTTP server), so the *only* failure source is the
+    /// second `fetch_links` call. It asserts both that (a) chunk 0's
+    /// rows are delivered in order before the failure — proving the
+    /// terminal error does not discard already-downloaded chunks — and
+    /// (b) the surfaced error carries the injected incremental
+    /// link-fetch message + SQLSTATE, not some other failure.
+    #[tokio::test]
+    async fn incremental_link_fetch_failure_is_terminal() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_array::Int32Array;
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid single-column Arrow IPC stream for chunk 0.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut ipc_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk-0.arrow"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc_bytes))
+            .mount(&server)
+            .await;
+
+        // Serve 1 link per call so chunk 0's link comes back on the
+        // first fetch and its bytes download from the mock server;
+        // the fetch supplying chunk 1 fails (deterministically, on
+        // every retry of that page).
+        let fetcher =
+            FailingLinkFetcher::with_url_base(4, 1, /* fail_at_start_index */ 1, server.uri());
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(
+                    &RetryConfig {
+                        max_retries: 0,
+                        ..RetryConfig::default()
+                    },
+                    &HashMap::new(),
+                ),
+            )
+            .unwrap(),
+        );
+        let downloader = Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ));
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_millis(50)),
+            ..CloudFetchConfig::default()
+        };
+        let provider = StreamingCloudFetchProvider::new(
+            config,
+            fetcher,
+            downloader,
+            Some(4),
+            tokio::runtime::Handle::current(),
+        );
+
+        // First read must deliver chunk 0's rows — the terminal error
+        // from the failed chunk-1 link fetch must not discard the
+        // already-downloaded chunk 0.
+        let first = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("first read must not hang")
+            .expect("chunk 0 downloaded successfully; its rows must be delivered")
+            .expect("chunk 0 must yield a batch, not clean EOS");
+        assert_eq!(
+            first.num_rows(),
+            3,
+            "chunk 0's rows must be delivered in order"
+        );
+
+        // The next read reaches chunk 1, whose link fetch failed, and
+        // must surface the injected incremental link-fetch error.
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("next_batch must not hang after an incremental link-fetch failure")
+            .expect_err("the incremental link-fetch failure must be terminal");
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "surfaced error must be the incremental link-fetch failure, not a download error; got: {err}"
+        );
+        assert_eq!(
+            err.sql_state.as_deref(),
+            Some("08001"),
+            "incremental link-fetch error must preserve its SQLSTATE context",
+        );
+    }
+
+    /// A waiter already parked in `next_batch` when the initial link
+    /// fetch fails is woken and returns the terminal error — proving
+    /// `set_terminal_error` wakes pre-registered waiters.
+    #[tokio::test]
+    async fn waiter_registered_before_failure_is_woken() {
+        // A fetcher whose initial fetch blocks briefly, then fails —
+        // guaranteeing the consumer is parked in `wait_for_chunk`
+        // before the terminal state is set.
+        #[derive(Debug)]
+        struct SlowFailFetcher {
+            gate: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for SlowFailFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                // Wait until the test signals the consumer is parked.
+                self.gate.notified().await;
+                Err(Error::io().message("delayed link-fetch failure"))
+            }
+            async fn refetch_link(&self, i: i64, _: i64) -> Result<CloudFetchLink> {
+                Ok(create_test_link(i))
+            }
+            async fn refetch_links_from(&self, i: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                Ok(vec![create_test_link(i)])
+            }
+        }
+
+        let gate = Arc::new(Notify::new());
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_secs(30)),
+            ..CloudFetchConfig::default()
+        };
+        let provider = StreamingCloudFetchProvider::new(
+            config,
+            Arc::new(SlowFailFetcher {
+                gate: Arc::clone(&gate),
+            }),
+            noop_downloader(),
+            Some(1),
+            tokio::runtime::Handle::current(),
+        );
+
+        // Start the consumer; it will park in wait_for_chunk because
+        // the fetch is blocked on the gate.
+        let consumer = {
+            let p = Arc::clone(&provider);
+            tokio::spawn(async move { p.next_batch().await })
+        };
+
+        // Give the consumer a moment to reach the wait loop, then
+        // release the fetch so it fails.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        gate.notify_waiters();
+
+        let result = tokio::time::timeout(NO_HANG, consumer)
+            .await
+            .expect("a pre-registered waiter must be woken by the terminal failure")
+            .expect("consumer task must not panic");
+        let err = result.expect_err("the woken waiter must return the terminal error");
+        assert!(
+            err.message.contains("delayed link-fetch failure"),
+            "woken waiter must see the original error; got: {err}"
+        );
+    }
+
+    /// A read started *after* the provider is already terminal returns
+    /// the error immediately (no wait, no hang) — future consumers see
+    /// the persisted terminal state.
+    #[tokio::test]
+    async fn read_started_after_failure_returns_terminal_error() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        // First read drives the provider into the terminal state.
+        let _ = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("first next_batch must not hang")
+            .expect_err("first read establishes the terminal error");
+
+        // A subsequent read must also return the error, promptly.
+        let err =
+            tokio::time::timeout(std::time::Duration::from_millis(200), provider.next_batch())
+                .await
+                .expect("a read after the terminal state must return immediately, not wait")
+                .expect_err("future reads must keep returning the terminal error");
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "future reads must see the same persisted error; got: {err}"
+        );
+    }
+
+    /// Cancellation racing with a terminal link-fetch failure: whichever
+    /// fires, no waiter stays blocked and `next_batch` returns an error
+    /// rather than hanging.
+    #[tokio::test]
+    async fn cancel_racing_terminal_failure_leaves_no_waiter_blocked() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        // Cancel concurrently with the failing initialize().
+        let canceller = {
+            let p = Arc::clone(&provider);
+            tokio::spawn(async move {
+                p.cancel();
+            })
+        };
+
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("cancel racing a terminal failure must not leave the waiter blocked")
+            .expect_err("next_batch must return an error (cancelled or terminal)");
+        // Either outcome is acceptable; the invariant is "no hang".
+        let msg = err.message.to_lowercase();
+        assert!(
+            msg.contains("cancel") || msg.contains("injected link-fetch failure"),
+            "error must be the cancellation or the terminal link-fetch failure; got: {err}"
+        );
+
+        canceller.await.expect("canceller task must not panic");
+    }
+
+    /// The first terminal error wins: a later, different link-fetch
+    /// failure does not overwrite the originally-persisted error.
+    #[tokio::test]
+    async fn first_terminal_error_wins() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        provider.set_terminal_error(Error::io().message("first error"));
+        provider.set_terminal_error(Error::io().message("second error"));
+
+        let stored = provider
+            .terminal_error()
+            .expect("a terminal error must be recorded");
+        assert!(
+            stored.message.contains("first error"),
+            "first writer must win; got: {stored}"
         );
     }
 }
