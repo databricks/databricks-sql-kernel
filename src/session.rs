@@ -1003,6 +1003,22 @@ fn build_proxy_config(proxy: Option<&ProxyConfig>) -> HttpProxyConfig {
     }
 }
 
+/// End-to-end wall-clock budget for downloading a single CloudFetch
+/// chunk. This is the single source of truth shared by two layers so they
+/// can't drift:
+///
+/// - the CloudFetch HTTP category's `overall_timeout` in
+///   [`build_retry_configs_for_session`] (bounds the inner HTTP client), and
+/// - the provider's [`CloudFetchConfig::download_timeout`] in
+///   [`result_to_cloudfetch_config`] (bounds the provider retry loop and
+///   caps each HTTP attempt at the remaining budget).
+///
+/// Before both layers shared this budget, the per-attempt HTTP timeout
+/// (`request_timeout`, default 120s) times the provider's `max_retries`
+/// let a permanently-stuck chunk block the consumer for ~10 minutes on a
+/// nominal budget (audit H05).
+const CLOUDFETCH_DOWNLOAD_BUDGET: Duration = Duration::from_secs(20);
+
 /// Build the per-category retry config for the HTTP client.
 ///
 /// The global config is driven by the public [`HttpConfig`] retry
@@ -1072,7 +1088,7 @@ fn build_retry_configs_for_session(
     overrides.insert(
         RequestCategory::CloudFetch,
         RetryConfigOverrides {
-            overall_timeout: Some(Duration::from_secs(20)),
+            overall_timeout: Some(CLOUDFETCH_DOWNLOAD_BUDGET),
             max_retries: Some(0),
             ..Default::default()
         },
@@ -1163,6 +1179,10 @@ fn result_to_cloudfetch_config(
         link_prefetch_window: result.cloudfetch_link_prefetch_window,
         max_chunks_in_memory: result.cloudfetch_max_chunks_in_memory,
         inline_max_chunks_in_memory: result.inline_max_chunks_in_memory,
+        // Share one budget with the CloudFetch HTTP category
+        // (see CLOUDFETCH_DOWNLOAD_BUDGET) so the provider retry loop and
+        // the inner HTTP client can't drift (audit H05).
+        download_timeout: CLOUDFETCH_DOWNLOAD_BUDGET,
         ..Default::default()
     }
 }
@@ -1554,6 +1574,32 @@ mod retry_config_tests {
             cf.overall_timeout,
             Duration::from_secs(20),
             "CloudFetch keeps its tight wall-clock bound"
+        );
+        assert_eq!(
+            cf.overall_timeout, CLOUDFETCH_DOWNLOAD_BUDGET,
+            "HTTP CloudFetch budget must be the shared constant"
+        );
+    }
+
+    #[test]
+    fn cloudfetch_provider_and_http_budgets_are_unified() {
+        // The provider retry loop (CloudFetchConfig::download_timeout) and
+        // the inner HTTP client (CloudFetch overall_timeout) must both be
+        // the single shared budget so a stuck chunk is bounded end-to-end
+        // and the two layers can't drift (audit H05).
+        let result = ResultConfig::default();
+        let cf = result_to_cloudfetch_config(&result);
+        assert_eq!(
+            cf.download_timeout, CLOUDFETCH_DOWNLOAD_BUDGET,
+            "provider download_timeout must be the shared budget"
+        );
+
+        let http_cf = build_retry_configs_for_session(&config_with_http(HttpConfig::default()))
+            [&RequestCategory::CloudFetch]
+            .overall_timeout;
+        assert_eq!(
+            cf.download_timeout, http_cf,
+            "provider and HTTP CloudFetch budgets must match"
         );
     }
 

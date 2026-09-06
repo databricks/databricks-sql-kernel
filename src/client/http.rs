@@ -829,6 +829,12 @@ impl DatabricksHttpClient {
         let method = request.method().clone();
         let url = request.url().clone();
         let headers = request.headers().clone();
+        // Preserve any per-request timeout the caller set on the incoming
+        // request (e.g. the CloudFetch download path caps each attempt at
+        // the remaining chunk budget). Rebuilding the request per attempt
+        // below would otherwise silently drop it and fall back to the
+        // client-wide `.timeout()`, defeating the deadline (audit H05).
+        let per_request_timeout = request.timeout().copied();
         let body_bytes = request
             .body()
             .and_then(|b| b.as_bytes())
@@ -894,6 +900,12 @@ impl DatabricksHttpClient {
 
             if let Some(ref body) = body_bytes {
                 req_builder = req_builder.body(body.clone());
+            }
+
+            // Re-apply the caller's per-request timeout on every rebuilt
+            // attempt so it survives the per-attempt request reconstruction.
+            if let Some(timeout) = per_request_timeout {
+                req_builder = req_builder.timeout(timeout);
             }
 
             let request = req_builder.build().map_err(|e| {
