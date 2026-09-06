@@ -1390,6 +1390,21 @@ impl StreamingCloudFetchProvider {
     /// Wait for a specific chunk to be ready (Downloaded state).
     async fn wait_for_chunk(&self, chunk_index: i64) -> Result<()> {
         loop {
+            // Register the state-change waiter *before* the readiness /
+            // terminal-error checks below. `notify_waiters()` (used by
+            // `set_terminal_error` and the download tasks) only wakes
+            // waiters that are already registered when it fires, so a
+            // future constructed inline in the `select!` — i.e. after the
+            // checks — could miss a wakeup that lands in that window and
+            // stall until `chunk_ready_timeout`. `enable()` registers the
+            // future with the `Notify` now, so any notification arriving
+            // after the checks is captured and resolves the arm
+            // immediately on the next poll. Mirrors the pre-registration
+            // done for the refresh-coordinator wait.
+            let state_changed = self.chunk_state_changed.notified();
+            tokio::pin!(state_changed);
+            state_changed.as_mut().enable();
+
             // Check cancellation
             if self.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Operation cancelled"));
@@ -1444,7 +1459,7 @@ impl StreamingCloudFetchProvider {
                 _ = self.cancel_token.cancelled() => {
                     return Err(Error::invalid_state().message("Operation cancelled"));
                 }
-                _ = self.chunk_state_changed.notified() => {
+                _ = &mut state_changed => {
                     // State changed, loop to check
                 }
                 _ = tokio::time::sleep(timeout) => {
