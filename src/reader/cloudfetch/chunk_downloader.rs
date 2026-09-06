@@ -71,11 +71,13 @@ impl ChunkDownloader {
     ///   attempt, applied via reqwest's per-request timeout. It bounds
     ///   the whole attempt — connect, waiting for response headers, and
     ///   consuming the response body — so a stall in any phase can't
-    ///   exceed it. `None` falls back to the HTTP client's static
-    ///   `request_timeout`. The caller
-    ///   ([`download_chunk_with_retry`](crate::reader::cloudfetch)) passes
-    ///   the remaining end-to-end chunk budget here so no attempt outruns
-    ///   the deadline (audit H05).
+    ///   exceed it. Because reqwest's per-request timeout *overrides* the
+    ///   client-wide one, we apply `min(request_timeout, attempt_timeout)`
+    ///   so the static per-request safety net is never loosened. `None`
+    ///   falls back to the HTTP client's static `request_timeout`. The
+    ///   caller ([`download_chunk_with_retry`](crate::reader::cloudfetch))
+    ///   passes the remaining end-to-end chunk budget here so no attempt
+    ///   outruns the deadline (audit H05).
     ///
     /// # Returns
     /// Parsed RecordBatches from the downloaded Arrow IPC data
@@ -99,11 +101,16 @@ impl ChunkDownloader {
         }
 
         // Cap this single attempt at the remaining chunk budget. reqwest's
-        // per-request timeout overrides the client-wide `.timeout()` and
-        // spans connect → headers → body, so a stall at any phase is
-        // bounded by the deadline rather than the static request_timeout.
+        // per-request timeout spans connect → headers → body, so a stall at
+        // any phase is bounded rather than the static request_timeout. It
+        // *overrides* (does not compose with) the client-wide `.timeout()`,
+        // so take `min(request_timeout, remaining)`: the remaining budget is
+        // the tighter bound with today's defaults, but the min preserves the
+        // static per-request safety net if `download_timeout` is ever
+        // configured larger than `request_timeout`.
         if let Some(timeout) = attempt_timeout {
-            request_builder = request_builder.timeout(timeout);
+            let request_timeout = self.http_client.config().read_timeout;
+            request_builder = request_builder.timeout(timeout.min(request_timeout));
         }
 
         let request = request_builder

@@ -1013,7 +1013,9 @@ impl StreamingCloudFetchProvider {
 
             // Attempt download. Cap this attempt at the remaining budget so
             // a stalled connect / headers / body can't outrun the deadline
-            // (reqwest's per-request timeout spans all three). `None` when no
+            // (reqwest's per-request timeout spans all three). The downloader
+            // applies `min(request_timeout, remaining)` so the static
+            // per-request safety net is never loosened. `None` when no
             // deadline is configured.
             let download_started = std::time::Instant::now();
             let attempt_timeout = deadline.map(|d| d.saturating_duration_since(download_started));
