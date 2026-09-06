@@ -192,7 +192,17 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 [features]
 default = ["tls-native"]
 tls-native = ["reqwest/native-tls"]
-tls-rustls = ["reqwest/rustls-tls"]
+# `rustls-tls` alone is `reqwest/rustls-tls-webpki-roots` — the bundled Mozilla
+# root set only, which does NOT read the OS system trust store. `tls-native`
+# (native-tls → OpenSSL) DOES read `/etc/ssl/...`, so a `tls-rustls` build behind
+# a private/internal CA installed only in the OS store fails a handshake that the
+# `tls-native` build completes. Enabling `rustls-tls-native-roots` alongside makes
+# reqwest load the OS trust store AND the Mozilla bundled roots into one
+# `RootCertStore` (both `tls_built_in_certs_*` default true → additive, no
+# fallback lost). This gives the aarch64 cross-build — the only Linux arch on
+# `tls-rustls` — system-CA parity with the x86_64/i686 OpenSSL builds. See
+# odbc#323.
+tls-rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
 
 [lib]
 name = "databricks_sql_kernel"
