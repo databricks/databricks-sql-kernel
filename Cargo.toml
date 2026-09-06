@@ -65,7 +65,7 @@ tokio = { version = "1", features = ["full", "sync"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-base64 = "0.22"
+base64 = "0.23"
 hex = "0.4"          # Hex encoding (binary param literals, token cache key)
 
 # Date/time handling
