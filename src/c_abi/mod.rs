@@ -81,6 +81,12 @@ pub type KernelLogCallback = unsafe extern "C" fn(
 /// process (matches the migration-plan §5.2 contract).
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+// Tokio normally gives runtime workers a 2 MiB stack, but without an explicit
+// override its thread builder honours the embedding process's RUST_MIN_STACK.
+// Native consumers may set that variable for their own thread pools; keep it
+// from shrinking the kernel-owned workers below Tokio's supported default.
+const C_ABI_RUNTIME_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+
 /// Fetch (initialising on first use) the process-wide C-ABI runtime.
 ///
 /// A multi-thread runtime so concurrent FFI calls from different host
@@ -101,6 +107,7 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
     let built = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kernel-c-abi")
+        .thread_stack_size(C_ABI_RUNTIME_THREAD_STACK_SIZE)
         .build()
         .map_err(|e| {
             crate::kernel_error::Error::internal()
@@ -428,6 +435,63 @@ impl From<crate::kernel_error::ErrorCode> for KernelStatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SMALL_STACK_CHILD: &str = "DATABRICKS_KERNEL_SMALL_STACK_CHILD";
+
+    /// The C ABI owns its runtime, so an embedding process's `RUST_MIN_STACK`
+    /// setting must not be able to shrink the runtime workers below Tokio's
+    /// supported default. Run the actual probe in a subprocess because
+    /// `RUST_MIN_STACK` is process-global and the C-ABI runtime is a
+    /// process-wide `OnceLock`.
+    #[test]
+    fn c_abi_runtime_ignores_ambient_rust_min_stack() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "c_abi::tests::c_abi_runtime_small_stack_child",
+                "--nocapture",
+            ])
+            .env(SMALL_STACK_CHILD, "1")
+            .env("RUST_MIN_STACK", "16384")
+            .env("RUST_TEST_THREADS", "1")
+            .output()
+            .expect("launch small-stack subprocess");
+
+        assert!(
+            output.status.success(),
+            "C-ABI runtime failed under ambient RUST_MIN_STACK=16384 (status {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn c_abi_runtime_small_stack_child() {
+        if std::env::var_os(SMALL_STACK_CHILD).is_none() {
+            return;
+        }
+
+        // libtest's own worker also inherits RUST_MIN_STACK. Move the probe
+        // immediately to an explicitly-sized caller thread so only the
+        // kernel-owned Tokio workers remain intentionally constrained.
+        std::thread::Builder::new()
+            .name("small-stack-test-driver".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                block_on_ffi(|| async {
+                    reqwest::Client::builder().build().map_err(|e| {
+                        crate::kernel_error::Error::internal()
+                            .message(format!("failed to build HTTP client: {e}"))
+                    })?;
+                    Ok(())
+                })
+                .expect("HTTP client builds on a C-ABI runtime worker");
+            })
+            .expect("spawn explicit-stack test driver")
+            .join()
+            .expect("small-stack test driver must not panic");
+    }
 
     /// `block_on_ffi` must reject a reentrant call (one made from a thread
     /// already inside a Tokio runtime) with a typed `Internal` error and a
