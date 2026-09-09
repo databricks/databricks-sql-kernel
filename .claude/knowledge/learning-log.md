@@ -200,6 +200,12 @@ author, follow-up, and review runs.
 - **Context:** PR #316 added trust-store crates via a feature change but regenerated only the root and `napi/` `Cargo.lock`, leaving `pyo3/Cargo.lock` drifted (CI hid it by running `cargo test` without `--locked`).
   **Rule:** A dependency/feature change in a workspace with multiple committed lockfiles (root, `napi/`, `pyo3/`) must regenerate ALL of them — CI steps that build without `--locked` silently regenerate at build time and mask the drift.
 
+### 2026-09-09: learnings since 2026-09-08T07:28:35Z
+- **Context:** PR #326 gave the process-wide C-ABI Tokio runtime an explicit `thread_stack_size(2 MiB)` because, without an override, Tokio's thread builder honours the embedding process's `RUST_MIN_STACK`, letting a native consumer's env var (or `ulimit -s`) shrink kernel-owned workers below Tokio's supported default and cause stack overflows in library code.
+  **Rule:** When a kernel/FFI library owns its own async runtime, pin worker `thread_stack_size` explicitly — never inherit the embedding process's `RUST_MIN_STACK`/ulimit, which the host controls and can set arbitrarily small.
+- **Context:** PR #326 verified the runtime's stack-size isolation by re-launching the test binary as a subprocess (`current_exe` + `--exact` + `RUST_MIN_STACK=16384`), because the setting is process-global and the C-ABI runtime is a process-wide `OnceLock` — an in-process test could neither set the ambient variable cleanly nor re-init the singleton.
+  **Rule:** To test behaviour that depends on process-global state (env vars like `RUST_MIN_STACK`) against a process-wide singleton (`OnceLock` runtime), spawn a child process via `current_exe` with the env set, rather than trying to mutate it in-process.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
