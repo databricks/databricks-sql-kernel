@@ -56,7 +56,7 @@ use crate::client::retry::{
 use crate::client::transport::TransportConfig;
 use crate::client::{
     DatabricksHttpClient, HttpClientConfig, ProxyConfig as HttpProxyConfig, SeaRestTransport,
-    Transport,
+    SessionAttribution, Transport,
 };
 use crate::config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
@@ -653,7 +653,7 @@ impl Session {
             let response = self
                 .inner
                 .transport()
-                .statement_status(&statement_id)
+                .statement_status(&statement_id, SessionAttribution::Detached)
                 .await
                 .map_err(|e| e.with_query_id(&statement_id))?;
             // NON-OWNING read-only adopt: `new_attached` gives the handle
@@ -1912,8 +1912,44 @@ mod is_open_tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use wiremock::matchers::{body_string_contains, method, path, path_regex};
+    use wiremock::matchers::{body_json, body_string_contains, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[tokio::test]
+    async fn sessions_enable_version_exchange_on_standard_path() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(json!({
+                "warehouse_id": "test_wh",
+                "execution_mode": "FAST",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "session_id": "sess-fast",
+                "session_version": { "version_id": 1 },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-fast"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("FAST session must open on the standard path");
+
+        session.close().await.expect("FAST session must close");
+    }
 
     /// `Session::is_open` reports true for a freshly-opened session and
     /// false once its server-side delete has been initiated. This is the
