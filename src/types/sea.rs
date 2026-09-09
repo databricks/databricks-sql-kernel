@@ -68,6 +68,8 @@ pub struct StatementStatus {
     /// wire location used by Reyden and newer DBSQL responses.
     #[serde(default)]
     pub sql_state: Option<String>,
+    #[serde(default)]
+    pub session_version: Option<SessionVersion>,
     /// Number of rows modified by the statement (UPDATE / INSERT /
     /// DELETE / MERGE). Absent on SELECT and on warehouses that don't
     /// surface the counter.
@@ -128,6 +130,7 @@ impl std::fmt::Debug for StatementStatus {
             .field("state", &self.state)
             .field("error", &self.error)
             .field("sql_state", &self.sql_state)
+            .field("session_version", &self.session_version)
             .field("num_modified_rows", &self.num_modified_rows)
             .field("display_message", &summarise(&self.display_message))
             .field("diagnostic_info", &summarise(&self.diagnostic_info))
@@ -327,6 +330,8 @@ pub struct ExecuteStatementRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_version: Option<SessionVersion>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub schema: Option<String>,
@@ -397,6 +402,17 @@ impl CompressionCodec {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum SessionExecutionMode {
+    Fast,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionVersion {
+    pub version_id: i64,
+}
+
 /// Request body for session creation.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateSessionRequest {
@@ -407,12 +423,15 @@ pub struct CreateSessionRequest {
     pub schema: Option<String>,
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub session_confs: HashMap<String, String>,
+    pub execution_mode: SessionExecutionMode,
 }
 
 /// Response from session creation.
 #[derive(Debug, Clone, Deserialize)]
 pub struct CreateSessionResponse {
     pub session_id: String,
+    #[serde(default)]
+    pub session_version: Option<SessionVersion>,
 }
 
 /// Response from fetching result chunks.
@@ -484,11 +503,25 @@ mod tests {
             catalog: None,
             schema: None,
             session_confs: confs,
+            execution_mode: SessionExecutionMode::Fast,
         };
         let json = serde_json::to_string(&req).unwrap();
         assert!(
             json.contains("\"session_confs\""),
             "expected `session_confs` on the wire, got: {json}"
+        );
+        assert!(json.contains("\"execution_mode\":\"FAST\""));
+    }
+
+    #[test]
+    fn test_create_session_response_deserializes_session_version() {
+        let response: CreateSessionResponse = serde_json::from_str(
+            r#"{"session_id":"session-1","session_version":{"version_id":7}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            response.session_version,
+            Some(SessionVersion { version_id: 7 })
         );
     }
 
@@ -498,6 +531,7 @@ mod tests {
             warehouse_id: "abc123".to_string(),
             statement: "SELECT 1".to_string(),
             session_id: Some("session-1".to_string()),
+            session_version: None,
             catalog: None,
             schema: None,
             disposition: "EXTERNAL_LINKS".to_string(),
@@ -513,6 +547,7 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("\"warehouse_id\":\"abc123\""));
         assert!(json.contains("\"session_id\":\"session-1\""));
+        assert!(!json.contains("\"session_version\""));
         assert!(!json.contains("\"catalog\"")); // None should be skipped
         assert!(!json.contains("\"query_tags\"")); // empty should be skipped
     }
@@ -523,6 +558,7 @@ mod tests {
             warehouse_id: "abc123".to_string(),
             statement: "SELECT 1".to_string(),
             session_id: Some("session-1".to_string()),
+            session_version: None,
             catalog: None,
             schema: None,
             disposition: "ARROW_STREAM".to_string(),

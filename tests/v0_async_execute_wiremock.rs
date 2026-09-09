@@ -33,7 +33,7 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{body_json, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -369,6 +369,86 @@ async fn submit_returns_pending_handle_without_polling() {
 
     let status = async_exec.status().await.expect("status");
     assert!(matches!(status, StatementStatus::Pending), "{status:?}");
+}
+
+#[tokio::test]
+async fn owning_async_status_advances_session_version_for_next_execute() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .and(body_json(json!({
+            "warehouse_id": "test_wh",
+            "execution_mode": "FAST",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "session_id": "sess-test",
+            "session_version": { "version_id": 7 },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_json(json!({
+            "warehouse_id": "test_wh",
+            "statement": "SELECT 1",
+            "session_id": "sess-test",
+            "session_version": { "version_id": 7 },
+            "disposition": "INLINE_OR_EXTERNAL_LINKS",
+            "format": "ARROW_STREAM",
+            "wait_timeout": "0s",
+            "on_wait_timeout": "CONTINUE",
+            "result_compression": "LZ4_FRAME",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("stmt-first")))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-first"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "statement_id": "stmt-first",
+            "status": {
+                "state": "SUCCEEDED",
+                "session_version": { "version_id": 9 },
+            },
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_json(json!({
+            "warehouse_id": "test_wh",
+            "statement": "SELECT 2",
+            "session_id": "sess-test",
+            "session_version": { "version_id": 9 },
+            "disposition": "INLINE_OR_EXTERNAL_LINKS",
+            "format": "ARROW_STREAM",
+            "wait_timeout": "0s",
+            "on_wait_timeout": "CONTINUE",
+            "result_compression": "LZ4_FRAME",
+        })))
+        .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("stmt-second")))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut first = session.statement();
+    first.spec().sql("SELECT 1");
+    let first_execution = first.submit().await.expect("first submit");
+    assert!(matches!(
+        first_execution.status().await.expect("terminal status"),
+        StatementStatus::Succeeded
+    ));
+
+    let mut second = session.statement();
+    second.spec().sql("SELECT 2");
+    second.submit().await.expect("second submit");
 }
 
 #[tokio::test]
