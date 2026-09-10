@@ -52,14 +52,14 @@ function Find-AsciiMatch {
     return $null
 }
 
-$profile = "release-with-debuginfo"
+$profileName = "release-with-debuginfo"
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot "../..")).Path
 $targetRoot = if ($env:CARGO_TARGET_DIR) {
     [System.IO.Path]::GetFullPath($env:CARGO_TARGET_DIR, $repoRoot)
 } else {
     Join-Path $repoRoot "target"
 }
-$profileDir = Join-Path $targetRoot $profile
+$profileDir = Join-Path $targetRoot $profileName
 $source = Join-Path $repoRoot "tests/symbols/staticlib_consumer.c"
 $includeDir = Join-Path $repoRoot "include"
 $archive = Join-Path $profileDir "databricks_sql_kernel.lib"
@@ -75,7 +75,7 @@ try {
     # The toolchain action enables color globally; disable it here so ANSI reset
     # bytes cannot become part of the parsed final library argument.
     $env:CARGO_TERM_COLOR = "never"
-    $buildLines = @(& cargo rustc --locked --profile $profile --lib -- --print=native-static-libs 2>&1)
+    $buildLines = @(& cargo rustc --locked --profile $profileName --lib -- --print=native-static-libs 2>&1)
     $buildExit = $LASTEXITCODE
     $buildLines | ForEach-Object { Write-Host $_ }
     if ($buildExit -ne 0) {
