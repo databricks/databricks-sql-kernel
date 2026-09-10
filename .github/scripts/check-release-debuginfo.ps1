@@ -72,6 +72,9 @@ Push-Location $repoRoot
 try {
     # Build the exact static archive under test and capture the MSVC system
     # libraries that rustc says its final native linker must receive.
+    # The toolchain action enables color globally; disable it here so ANSI reset
+    # bytes cannot become part of the parsed final library argument.
+    $env:CARGO_TERM_COLOR = "never"
     $buildLines = @(& cargo rustc --locked --profile $profile --lib -- --print=native-static-libs 2>&1)
     $buildExit = $LASTEXITCODE
     $buildLines | ForEach-Object { Write-Host $_ }
