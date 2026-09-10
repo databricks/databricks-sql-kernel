@@ -222,3 +222,11 @@ crate-type = ["lib", "cdylib", "staticlib"]
 # workspace views (kernel root, pyo3, napi).
 [workspace]
 members = ["."]
+
+# Opt-in profile for native consumers that split private crash symbols from the
+# shipped driver. Inheriting `release` is intentional: `debug` is the only
+# override, so optimization, LTO, codegen units, panic behavior, overflow
+# checks, and debug assertions remain identical to an ordinary release build.
+[profile.release-with-debuginfo]
+inherits = "release"
+debug = 2

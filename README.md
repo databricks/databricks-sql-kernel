@@ -37,6 +37,11 @@ cargo test
 make check    # fmt + clippy + tests
 ```
 
+Native consumers that statically link the kernel and publish separate crash
+symbols can use the opt-in `release-with-debuginfo` profile. See
+[`docs/release-debuginfo.md`](docs/release-debuginfo.md) for build, symbol
+splitting, packaging, and binary-identity guidance.
+
 ## Configuration
 
 See [CONNECTION_PARAMETERS.md](CONNECTION_PARAMETERS.md) for every connection, auth, and session parameter the kernel accepts — its meaning, default value, and the config struct it lives on.
