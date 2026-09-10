@@ -206,6 +206,10 @@ author, follow-up, and review runs.
 - **Context:** PR #326 verified the runtime's stack-size isolation by re-launching the test binary as a subprocess (`current_exe` + `--exact` + `RUST_MIN_STACK=16384`), because the setting is process-global and the C-ABI runtime is a process-wide `OnceLock` — an in-process test could neither set the ambient variable cleanly nor re-init the singleton.
   **Rule:** To test behaviour that depends on process-global state (env vars like `RUST_MIN_STACK`) against a process-wide singleton (`OnceLock` runtime), spawn a child process via `current_exe` with the env set, rather than trying to mutate it in-process.
 
+### 2026-09-10: learnings since 2026-09-09T07:29:33Z
+- **Context:** PR #329 fixed the C-ABI Tokio runtime in `src/c_abi/mod.rs`, which called `.thread_stack_size(CONST)` with a fixed 2 MiB value. `thread_stack_size` is an *absolute* setting that makes the underlying std thread builder ignore `RUST_MIN_STACK` entirely, so a host with a larger ambient `RUST_MIN_STACK` (e.g. the databricks-odbc partner at 3194880) had its worker stacks silently *shrunk* to 2 MiB — the opposite of the earlier #326 intent.
+  **Rule:** When pinning a resource limit that overrides an ambient/env-driven default (e.g. Tokio `thread_stack_size` vs `RUST_MIN_STACK`), decide explicitly whether the constant is a floor or a cap, and compute `max(ambient, floor)` rather than assigning the constant unconditionally — an absolute override both raises small values and shrinks larger ones.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
