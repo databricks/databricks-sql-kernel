@@ -133,7 +133,7 @@ zeroize = "1.9"                                                                 
 # path, which the kernel never exercises (it only signs), so it is
 # suppressed with justification in `osv-scanner.toml` rather than paying
 # the 10.x cost. Revisit if jsonwebtoken ships a ring-backed 10.x.
-jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
+jsonwebtoken = { version = "10", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
 [dev-dependencies]
