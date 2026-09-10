@@ -446,7 +446,7 @@ fn auth_mech(auth: &AuthConfig) -> DriverAuthMech {
 
 fn auth_flow(auth: &AuthConfig) -> Option<DriverAuthFlow> {
     match auth {
-        AuthConfig::Pat { .. } => Some(DriverAuthFlow::TokenPassthrough),
+        AuthConfig::Pat { .. } => None,
         AuthConfig::OAuthM2M { .. }
         | AuthConfig::OAuthM2MPrivateKey { .. }
         | AuthConfig::AzureServicePrincipal { .. } => Some(DriverAuthFlow::ClientCredentials),
@@ -469,6 +469,43 @@ fn duration_millis(duration: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pat_auth_has_no_driver_auth_flow() {
+        let auth = AuthConfig::Pat {
+            token: "dapi-token".to_string(),
+            identity_federation_client_id: None,
+        };
+
+        assert_eq!(auth_mech(&auth), DriverAuthMech::Pat);
+        assert_eq!(auth_flow(&auth), None);
+    }
+
+    #[test]
+    fn oauth_auth_configs_report_driver_auth_flow() {
+        let m2m = AuthConfig::OAuthM2M {
+            client_id: "client-id".to_string(),
+            client_secret: "client-secret".to_string(),
+            scopes: None,
+            token_url_override: None,
+            identity_federation_client_id: None,
+        };
+        let u2m = AuthConfig::OAuthU2M {
+            client_id: None,
+            redirect_ports: None,
+            scopes: None,
+            token_url_override: None,
+            callback_timeout: None,
+            token_cache: None,
+            identity_federation_client_id: None,
+        };
+
+        assert_eq!(auth_flow(&m2m), Some(DriverAuthFlow::ClientCredentials));
+        assert_eq!(
+            auth_flow(&u2m),
+            Some(DriverAuthFlow::BrowserBasedAuthentication)
+        );
+    }
 
     #[test]
     fn telemetry_config_requires_non_zero_flush_interval() {
