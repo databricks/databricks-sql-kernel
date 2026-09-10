@@ -110,7 +110,7 @@ case "$(uname -s)" in
     echo "ok: executable and .debug share build ID ${binary_id}"
     ;;
   Darwin)
-    for command in dsymutil otool strip strings xcrun; do
+    for command in dsymutil otool strip xcrun; do
       if ! command -v "${command}" >/dev/null 2>&1; then
         echo "FAIL: required command not found: ${command}" >&2
         exit 1
@@ -130,20 +130,18 @@ case "$(uname -s)" in
     fi
 
     dwarf_dump="${PROFILE_DIR}/kernel-symbol-smoke.dwarf.txt"
-    source_dump="${PROFILE_DIR}/kernel-symbol-smoke.sources.txt"
     dwarf_file="${dsym}/Contents/Resources/DWARF/$(basename "${CONSUMER}")"
     if [[ ! -f "${dwarf_file}" ]]; then
       echo "FAIL: dsymutil did not produce ${dwarf_file}" >&2
       exit 1
     fi
     xcrun dwarfdump --name kernel_get_last_error "${dsym}" >"${dwarf_dump}"
-    strings "${dwarf_file}" >"${source_dump}"
     if ! grep -Fq 'kernel_get_last_error' "${dwarf_dump}"; then
       echo "FAIL: dSYM does not describe kernel_get_last_error" >&2
       exit 1
     fi
-    if ! grep -Fq 'src/c_abi/error.rs' "${source_dump}"; then
-      echo "FAIL: dSYM does not name src/c_abi/error.rs" >&2
+    if ! grep -Eq 'DW_AT_decl_file.*error\.rs' "${dwarf_dump}"; then
+      echo "FAIL: kernel_get_last_error has no error.rs source record in the dSYM" >&2
       exit 1
     fi
 
