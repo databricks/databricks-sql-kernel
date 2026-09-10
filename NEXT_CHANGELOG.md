@@ -11,6 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Add an opt-in `release-with-debuginfo` Cargo profile and cross-platform
+  symbol smoke checks for statically linked native consumers.
 - Add a C ABI setter for the maximum idle HTTP connections retained per host.
 - C ABI: `kernel_statement_set_query_tags()` attaches per-statement query tags
   (serialized `key:value` wire form) to a statement's execution, letting C ABI
