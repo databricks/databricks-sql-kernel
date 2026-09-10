@@ -196,7 +196,7 @@ fn pin_containing_module() {
     unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            pin_containing_module as usize as *const u16,
+            pin_containing_module as *const () as usize as *const u16,
             &mut module,
         );
     }
