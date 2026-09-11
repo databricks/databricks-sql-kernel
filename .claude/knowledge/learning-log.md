@@ -210,6 +210,12 @@ author, follow-up, and review runs.
 - **Context:** PR #329 fixed the C-ABI Tokio runtime in `src/c_abi/mod.rs`, which called `.thread_stack_size(CONST)` with a fixed 2 MiB value. `thread_stack_size` is an *absolute* setting that makes the underlying std thread builder ignore `RUST_MIN_STACK` entirely, so a host with a larger ambient `RUST_MIN_STACK` (e.g. the databricks-odbc partner at 3194880) had its worker stacks silently *shrunk* to 2 MiB — the opposite of the earlier #326 intent.
   **Rule:** When pinning a resource limit that overrides an ambient/env-driven default (e.g. Tokio `thread_stack_size` vs `RUST_MIN_STACK`), decide explicitly whether the constant is a floor or a cap, and compute `max(ambient, floor)` rather than assigning the constant unconditionally — an absolute override both raises small values and shrinks larger ones.
 
+### 2026-09-11: learnings since 2026-09-10T07:29:06Z
+- **Context:** PR #333 added a PowerShell CI script (`check-release-debuginfo.ps1`) that used `$profile = "release-with-debuginfo"`; a reviewer flagged the collision with PowerShell's built-in automatic variable `$PROFILE` (variable names are case-insensitive), fixed by renaming to `$profileName`.
+  **Rule:** In PowerShell scripts, never reuse reserved automatic-variable names (`$profile`, `$host`, `$error`, `$input`, `$args`, `$pwd`, etc.) for locals — the shadowing works by accident until it doesn't; pick a distinct name like `$profileName`.
+- **Context:** PR #333 added a required cross-platform CI workflow (`release-debuginfo.yml`) and deliberately left it ungated; the author's rationale was that a top-level `paths:` filter on a required check can leave the check stuck **pending** in the merge queue when the path filter skips it, breaking required-check gating.
+  **Rule:** Do not add a top-level `paths:`/`paths-ignore:` filter to a GitHub Actions workflow whose jobs are required merge checks — a skipped required check stays permanently pending; instead use an always-present change-detector job plus a no-op path when you need to bound CI cost.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
