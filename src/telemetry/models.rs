@@ -470,7 +470,7 @@ mod tests {
                     proxy_auth_type: Some(DriverProxyAuth::None),
                 }),
                 auth_mech: Some(DriverAuthMech::Pat),
-                auth_flow: Some(DriverAuthFlow::ClientCredentials),
+                auth_flow: None,
                 enable_direct_results: Some(true),
                 async_poll_interval_millis: Some(1000),
                 auto_commit: Some(true),
