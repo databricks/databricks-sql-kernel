@@ -988,6 +988,58 @@ mod tests {
     }
 
     #[test]
+    fn build_execute_params_reads_raw_query_tags_conf() {
+        // The C ABI `kernel_statement_set_query_tags` stores the pre-serialized
+        // wire string directly under `statement_conf["query_tags"]` (rather than
+        // going through the typed `Statement::query_tags` builder). It must reach
+        // `ExecuteParams.query_tags` as the native array just the same — this is
+        // the seam the C ABI relies on. Includes a bare key (None value) and an
+        // escaped colon in a value.
+        use std::collections::{HashMap, HashSet};
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT 1");
+        spec.statement_conf(HashMap::from([(
+            "query_tags".to_string(),
+            "team:eng,prod,url:http\\://h".to_string(),
+        )]));
+
+        let (_sql, params) = build_execute_params(&spec, None).unwrap();
+        let got: HashSet<(String, Option<String>)> = params
+            .query_tags
+            .iter()
+            .map(|t| (t.key.clone(), t.value.clone()))
+            .collect();
+        let expected: HashSet<(String, Option<String>)> = [
+            ("team".to_string(), Some("eng".to_string())),
+            ("prod".to_string(), None),
+            ("url".to_string(), Some("http://h".to_string())),
+        ]
+        .into_iter()
+        .collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn build_execute_params_clears_query_tags_when_conf_removed() {
+        // The C ABI `kernel_statement_set_query_tags(stmt, "")` clears tags by
+        // removing statement_conf["query_tags"] — needed because the conf survives
+        // set_sql, so a reused handle would otherwise leak a prior query's tags.
+        // After removal, no query_tags reach the wire.
+        use std::collections::HashMap;
+        let mut spec = StatementSpec::new();
+        spec.sql("SELECT 1");
+        spec.statement_conf(HashMap::from([(
+            "query_tags".to_string(),
+            "team:eng".to_string(),
+        )]));
+        // Simulate the empty-string clear path.
+        spec.statement_conf.remove("query_tags");
+
+        let (_sql, params) = build_execute_params(&spec, None).unwrap();
+        assert!(params.query_tags.is_empty());
+    }
+
+    #[test]
     fn build_execute_params_binds_positional_params_one_based() {
         let mut spec = StatementSpec::new();
         spec.sql("SELECT ?, ?");

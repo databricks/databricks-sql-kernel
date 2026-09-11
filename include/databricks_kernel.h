@@ -212,6 +212,16 @@ typedef struct kernel_result_stream_t kernel_result_stream_t;
  * cancels the LATER query. Use one per execute (new before execute, free after
  * it returns). */
 typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
+/* Detached canceller for a result stream, returned by
+ * kernel_result_stream_canceller_new. Firing it interrupts an in-flight
+ * kernel_result_stream_next_batch so it returns KernelStatusCode_Cancelled
+ * promptly instead of blocking until the (possibly slow / CloudFetch-link)
+ * batch fetch finishes. Unlike the statement canceller it holds ONLY a shared
+ * client-side cancellation token (no server RPC, no borrow of the stream's
+ * mutable state), so — see its doc — it is safe to obtain and to fire
+ * concurrently with a next_batch/close on the owning thread. Once fired, the
+ * stream is permanently aborted (every later next_batch returns Cancelled). */
+typedef struct kernel_result_stream_canceller_t kernel_result_stream_canceller_t;
 
 /* ─── Session config ──────────────────────────────────────────────────
  *
@@ -341,6 +351,12 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
  * `request_timeout_ms == 0` keeps the kernel default (120s). */
 KernelStatusCode kernel_session_config_set_request_timeout(KernelSessionConfig* config,
                                                            uint64_t request_timeout_ms);
+
+/* Configure the maximum number of idle HTTP connections retained per host.
+ * `max_connections` must be greater than zero. Omitting this setter keeps the
+ * kernel default (100). */
+KernelStatusCode kernel_session_config_set_max_connections(KernelSessionConfig* config,
+                                                            size_t max_connections);
 
 /* Initialize kernel logging, process-wide and ONCE (first non-OFF call wins;
  * later calls are no-ops). `level` is OFF/ERROR/WARN/INFO/DEBUG/TRACE
@@ -582,9 +598,20 @@ KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* o
  * alive); on failure returns the mapped status (a transport/availability
  * failure surfaces as Unavailable / NetworkError / Timeout — treat as
  * "connection dead" when backing SQL_ATTR_CONNECTION_DEAD; the full error
- * is in kernel_get_last_error). Runs SQL, so it MUST be called from a
- * native (non-async-runtime) thread. No ownership. */
-KernelStatusCode kernel_session_test(const kernel_session_t* session);
+ * is in kernel_get_last_error).
+ *
+ * `timeout_secs` bounds the WHOLE probe (every retry and HTTP round-trip
+ * included) to that many seconds; 0 means no per-call deadline (the probe
+ * runs on the session's own retry/timeout budget — the historical
+ * behaviour). This is the per-call deadline a host backs
+ * `ConnectionTestTimeout` with: with 0 the configured value has no effect.
+ * When the probe exceeds the deadline the call returns Timeout (typed error
+ * in kernel_get_last_error). The bound is scoped to this probe and cannot
+ * alter the timeout of later requests on the session.
+ *
+ * Runs SQL, so it MUST be called from a native (non-async-runtime) thread.
+ * No ownership. */
+KernelStatusCode kernel_session_test(const kernel_session_t* session, uint64_t timeout_secs);
 
 /* Construct a new mutable statement bound to this session. */
 KernelStatusCode kernel_session_new_statement(kernel_session_t* session,
@@ -660,6 +687,22 @@ KernelStatusCode kernel_statement_bind_parameter(kernel_statement_t* stmt,
                                                  const char* name,
                                                  const char* sql_type,
                                                  const char* value);
+
+/*
+ * Set per-statement query tags — key/value annotations sent with this
+ * statement's execution for cost attribution and tracking. `query_tags` is the
+ * serialized wire form: comma-separated `key:value` pairs, with a bare `key`
+ * (no colon) for a valueless tag, e.g. "team:eng,job:etl,production"; backslash
+ * escapes the separators in a value ("\:", "\,", "\\"). This is the same string
+ * a host already builds for the Thrift `confOverlay` path (Go/Node connectors),
+ * so it is passed through unchanged and re-parsed into the native SEA query_tags
+ * array at execute time. A non-empty value replaces the statement's tags; an
+ * empty string clears any previously-set tags (they otherwise persist across
+ * kernel_statement_set_sql, so pass "" to reset a reused statement handle).
+ * `query_tags` must be a NUL-terminated UTF-8 string.
+ */
+KernelStatusCode kernel_statement_set_query_tags(kernel_statement_t* stmt,
+                                                 const char* query_tags);
 
 /*
  * Wait-for-result execution. On success, `*out` holds an executed handle
@@ -813,6 +856,39 @@ KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
 KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
+
+/* ─── Result-stream cancellation (detached canceller) ─────────────────
+ *
+ * Interrupt an in-flight `kernel_result_stream_next_batch` (odbc#355-B). A
+ * host that fetches on a background thread and wants a bounded teardown
+ * (SQLCancel / SQLCloseCursor / statement or connection close) fires this to
+ * make a parked `next_batch` return promptly instead of waiting for the
+ * batch's own (possibly slow, CloudFetch-link) request to finish.
+ *
+ * `kernel_result_stream_canceller_new` clones the stream's cancellation token
+ * into a detached handle. Unlike the statement canceller, this borrows none of
+ * the stream's mutable state and issues no server RPC, so it may be obtained
+ * WHILE a `next_batch` is already in flight on another thread, and
+ * `kernel_result_stream_canceller_cancel` may be called concurrently with a
+ * `next_batch`/`kernel_result_stream_close` on the owning thread. `_cancel` is
+ * non-blocking and idempotent; it returns Success once the signal is delivered
+ * (it is the interrupted `next_batch` that returns
+ * `KernelStatusCode_Cancelled`). After a cancel the stream is permanently
+ * aborted: every later `next_batch` returns `Cancelled`, so the host must not
+ * expect to resume it — close it.
+ *
+ * The canceller shares the token's lifetime independently of the stream, so
+ * its free order is unconstrained: firing it after `kernel_result_stream_close`
+ * is a harmless no-op. Free it with `kernel_result_stream_canceller_free`
+ * (drives no RPC — drops the box). Do not free it while another thread is
+ * inside `_cancel` on the same handle.
+ */
+KernelStatusCode kernel_result_stream_canceller_new(kernel_result_stream_t* stream,
+                                                    kernel_result_stream_canceller_t** out);
+KernelStatusCode kernel_result_stream_canceller_cancel(
+    kernel_result_stream_canceller_t* canceller);
+KernelStatusCode kernel_result_stream_canceller_free(
+    kernel_result_stream_canceller_t* canceller);
 
 /* ─── Metadata ────────────────────────────────────────────────────────
  *

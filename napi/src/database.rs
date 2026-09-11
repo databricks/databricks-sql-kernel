@@ -362,8 +362,8 @@ pub struct ConnectionOptions {
     /// An **ordered list** of `(name, value)` pairs, mirroring the kernel
     /// core's `Vec<(String, String)>` and the pyo3 binding's
     /// `http_headers` — order is preserved and duplicate names are
-    /// allowed (the kernel emits each entry, and for `User-Agent` folds
-    /// the **last** one into its base UA).
+    /// allowed (the kernel emits each entry, and uses the **last**
+    /// `User-Agent` as its effective UA).
     ///
     /// Three names are handled specially by the kernel:
     /// - `Authorization` / `x-databricks-org-id` are **reserved** — a
@@ -371,10 +371,9 @@ pub struct ConnectionOptions {
     ///   auth and multi-tenant routing can't be hijacked by a custom
     ///   header. (The NodeJS driver also drops these before they cross
     ///   the FFI, matching the Python connector's double-wall.)
-    /// - `User-Agent` is **appended** to the kernel base UA (rather than
-    ///   replacing it), preserving the `DatabricksJDBCDriverOSS/...`
-    ///   token the SEA server keys on while still surfacing the caller's
-    ///   identity. The NodeJS driver folds its `userAgentEntry` into a
+    /// - `User-Agent` **replaces** the `DatabricksSQLKernel/...` base.
+    ///   Its leading prefix must therefore be allow-listed by the SEA
+    ///   server. The NodeJS driver folds its `userAgentEntry` into a
     ///   `User-Agent` entry here.
     pub custom_headers: Option<Vec<HeaderEntry>>,
 

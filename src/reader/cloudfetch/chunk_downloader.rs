@@ -28,7 +28,7 @@ use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
 use reqwest::Method;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Downloads Arrow data from cloud storage presigned URLs.
 ///
@@ -67,15 +67,30 @@ impl ChunkDownloader {
     ///
     /// # Arguments
     /// * `link` - CloudFetch link containing URL and headers
+    /// * `attempt_timeout` - Optional hard cap for this single HTTP
+    ///   attempt, applied via reqwest's per-request timeout. It bounds
+    ///   the whole attempt — connect, waiting for response headers, and
+    ///   consuming the response body — so a stall in any phase can't
+    ///   exceed it. Because reqwest's per-request timeout *overrides* the
+    ///   client-wide one, we apply `min(request_timeout, attempt_timeout)`
+    ///   so the static per-request safety net is never loosened. `None`
+    ///   falls back to the HTTP client's static `request_timeout`. The
+    ///   caller ([`download_chunk_with_retry`](crate::reader::cloudfetch))
+    ///   passes the remaining end-to-end chunk budget here so no attempt
+    ///   outruns the deadline (audit H05).
     ///
     /// # Returns
     /// Parsed RecordBatches from the downloaded Arrow IPC data
-    pub async fn download(&self, link: &CloudFetchLink) -> Result<Vec<RecordBatch>> {
+    pub async fn download(
+        &self,
+        link: &CloudFetchLink,
+        attempt_timeout: Option<Duration>,
+    ) -> Result<Vec<RecordBatch>> {
         let start = Instant::now();
 
         debug!(
-            "Downloading chunk {} from {} ({} bytes expected)",
-            link.chunk_index, link.url, link.byte_count
+            "Downloading chunk {} from {} ({} bytes expected, attempt_timeout {:?})",
+            link.chunk_index, link.url, link.byte_count, attempt_timeout
         );
 
         // Build request with custom headers from the link
@@ -83,6 +98,19 @@ impl ChunkDownloader {
 
         for (key, value) in &link.http_headers {
             request_builder = request_builder.header(key, value);
+        }
+
+        // Cap this single attempt at the remaining chunk budget. reqwest's
+        // per-request timeout spans connect → headers → body, so a stall at
+        // any phase is bounded rather than the static request_timeout. It
+        // *overrides* (does not compose with) the client-wide `.timeout()`,
+        // so take `min(request_timeout, remaining)`: the remaining budget is
+        // the tighter bound with today's defaults, but the min preserves the
+        // static per-request safety net if `download_timeout` is ever
+        // configured larger than `request_timeout`.
+        if let Some(timeout) = attempt_timeout {
+            let request_timeout = self.http_client.config().read_timeout;
+            request_builder = request_builder.timeout(timeout.min(request_timeout));
         }
 
         let request = request_builder

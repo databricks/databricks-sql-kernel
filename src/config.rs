@@ -799,7 +799,7 @@ pub struct HttpConfig {
     /// removed from this list. This gives the SEA server an accurate
     /// driver identity for query-source attribution (e.g. the connector's
     /// `PyDatabricksSqlConnector/x (entry)`), instead of the
-    /// `DatabricksJDBCDriverOSS/...` base.
+    /// `DatabricksSQLKernel/...` base.
     ///
     /// PRECONDITION: the caller UA's leading prefix MUST be in the
     /// gateway's `databricks.sqlexecapi.known_driver_prefixes` SAFE flag.
@@ -808,7 +808,7 @@ pub struct HttpConfig {
     /// `startsWith` prefix match of that flag; a non-allow-listed prefix
     /// is rejected (HTTP 400 / Thrift redirect). `PyDatabricksSqlConnector`
     /// is allow-listed for this reason. When NO caller `User-Agent` is
-    /// supplied, the base UA stays `DatabricksJDBCDriverOSS/...` so the
+    /// supplied, the base UA stays `DatabricksSQLKernel/...` so the
     /// gate still passes.
     ///
     /// **All other headers are sent as supplied.** A `Vec` (not a map)

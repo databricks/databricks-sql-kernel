@@ -75,6 +75,9 @@ static void test_null_guards(void) {
   rc = kernel_statement_close(NULL);
   CHECK(rc == KernelStatusCode_InvalidArgument, "statement_close(NULL) → InvalidArgument");
 
+  rc = kernel_statement_set_query_tags(NULL, "team:eng");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "statement_set_query_tags(NULL) → InvalidArgument");
+
   rc = kernel_result_stream_close(NULL);
   CHECK(rc == KernelStatusCode_InvalidArgument, "result_stream_close(NULL) → InvalidArgument");
 
@@ -191,6 +194,11 @@ static void test_proxy_and_tls_setters(void) {
   CHECK(rc == KernelStatusCode_Success, "set_request_timeout (45s) succeeds");
   rc = kernel_session_config_set_request_timeout(config, 0);
   CHECK(rc == KernelStatusCode_Success, "set_request_timeout (default) succeeds");
+
+  rc = kernel_session_config_set_max_connections(config, 64);
+  CHECK(rc == KernelStatusCode_Success, "set_max_connections succeeds");
+  rc = kernel_session_config_set_max_connections(config, 0);
+  CHECK(rc == KernelStatusCode_InvalidArgument, "set_max_connections (zero) is rejected");
 
   /* Retry config: a valid range (incl. max_retries=0 to disable, overall
    * timeout 0 = keep default) succeeds; a non-zero overall timeout also

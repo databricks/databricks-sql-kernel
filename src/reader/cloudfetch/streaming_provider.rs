@@ -134,6 +134,23 @@ pub struct StreamingCloudFetchProvider {
     // Coordination signals
     chunk_state_changed: Arc<Notify>,
 
+    // First terminal provider failure, if any.
+    //
+    // Link-fetch failures (initial or incremental) surface here
+    // once the transport's retry budget is exhausted. Unlike a
+    // per-chunk download/processing failure — which lives on the
+    // `ChunkEntry` a waiter can find in `chunks` — a link fetch
+    // fails *before* any entry for the requested chunk exists, so
+    // there is nothing in `chunks` for `wait_for_chunk` to key
+    // off. Without a provider-level record, a woken waiter finds
+    // neither data nor a terminal state (`end_of_stream` is also
+    // still unset) and loops forever. Persisting the first such
+    // error here gives every current and future waiter a
+    // deterministic terminal result. First writer wins so the
+    // original error context (SQLSTATE, source, etc.) is
+    // preserved; later failures are dropped.
+    terminal_error: Mutex<Option<Error>>,
+
     // Cancellation
     cancel_token: CancellationToken,
 
@@ -207,6 +224,11 @@ struct DownloadCtx {
     metrics: Arc<CloudFetchMetrics>,
     max_retries: u32,
     retry_delay: std::time::Duration,
+    /// Absolute end-to-end wall-clock budget for downloading one chunk,
+    /// spanning every retry, the backoff sleeps, and each HTTP attempt.
+    /// See [`CloudFetchConfig::download_timeout`]. Enforced in
+    /// [`StreamingCloudFetchProvider::download_chunk_with_retry`].
+    download_timeout: std::time::Duration,
 }
 
 #[derive(Debug)]
@@ -361,6 +383,7 @@ impl StreamingCloudFetchProvider {
             chunks_in_memory: AtomicUsize::new(0),
             max_chunks_in_memory: config.max_chunks_in_memory,
             chunk_state_changed: Arc::new(Notify::new()),
+            terminal_error: Mutex::new(None),
             cancel_token: CancellationToken::new(),
             runtime_handle,
             statement_id,
@@ -375,6 +398,41 @@ impl StreamingCloudFetchProvider {
         });
 
         provider
+    }
+
+    /// Test-only constructor: build a provider around a pre-seeded
+    /// `chunks` map WITHOUT spawning the background `initialize`
+    /// task. Lets consumer-path tests (`wait_for_chunk`) observe the
+    /// exact `ChunkState` they seed. The injected `link_fetcher` /
+    /// `chunk_downloader` are never exercised by these tests.
+    #[cfg(test)]
+    fn for_test_with_chunks(
+        link_fetcher: Arc<dyn ChunkLinkFetcher>,
+        chunk_downloader: Arc<ChunkDownloader>,
+        chunks: Arc<DashMap<i64, ChunkEntry>>,
+        end_of_stream: bool,
+    ) -> Arc<Self> {
+        let config = CloudFetchConfig::default();
+        Arc::new(Self {
+            link_fetcher,
+            chunk_downloader,
+            max_chunks_in_memory: config.max_chunks_in_memory,
+            config,
+            schema: OnceLock::new(),
+            current_chunk_index: AtomicI64::new(0),
+            current_batch_buffer: Mutex::new(VecDeque::new()),
+            next_download_index: AtomicI64::new(0),
+            end_of_stream: AtomicBool::new(end_of_stream),
+            chunks,
+            chunks_in_memory: AtomicUsize::new(0),
+            chunk_state_changed: Arc::new(Notify::new()),
+            terminal_error: Mutex::new(None),
+            cancel_token: CancellationToken::new(),
+            runtime_handle: tokio::runtime::Handle::current(),
+            statement_id: None,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            metrics: Arc::new(CloudFetchMetrics::new(None)),
+        })
     }
 
     /// Initialize the provider by fetching initial links and starting downloads.
@@ -412,7 +470,11 @@ impl StreamingCloudFetchProvider {
             }
             Err(e) => {
                 error!("Failed to fetch initial links: {}", e);
-                self.chunk_state_changed.notify_one();
+                // Persist as a terminal provider failure: no chunk
+                // entry exists for the initial links, so a waiter has
+                // nothing in `chunks` to observe. Without this it
+                // would loop forever (see `terminal_error`).
+                self.set_terminal_error(e);
             }
         }
     }
@@ -486,6 +548,13 @@ impl StreamingCloudFetchProvider {
             return Ok(None);
         }
 
+        // A terminal link-fetch failure that landed after the wait
+        // returned takes precedence over the generic "not found"
+        // message, so callers see the real cause deterministically.
+        if let Some(err) = self.terminal_error() {
+            return Err(err);
+        }
+
         Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
     }
 
@@ -497,6 +566,35 @@ impl StreamingCloudFetchProvider {
     }
 
     // --- Internal methods ---
+
+    /// Record the first terminal link-fetch failure and wake every waiter.
+    ///
+    /// Called from the link-fetch error paths once the transport's
+    /// retry budget is exhausted. First writer wins, so the original
+    /// error (with its SQLSTATE / source chain intact) is preserved
+    /// and any later failure is dropped. Uses `notify_waiters()`
+    /// rather than `notify_one()` so *every* consumer currently
+    /// blocked in `wait_for_chunk` is released, not just one — a
+    /// terminal failure must not leave sibling waiters stuck.
+    fn set_terminal_error(&self, error: Error) {
+        {
+            let mut slot = self.terminal_error.lock().unwrap();
+            if slot.is_none() {
+                error!("CloudFetch provider entering terminal error state: {error}");
+                *slot = Some(error);
+            }
+            // else: keep the first error; drop this one.
+        }
+        // Wake all current waiters so they observe the terminal state.
+        // A waiter that registers *after* this checks `terminal_error`
+        // on entry, so it never misses the signal.
+        self.chunk_state_changed.notify_waiters();
+    }
+
+    /// Return a clone of the terminal link-fetch error, if one is set.
+    fn terminal_error(&self) -> Option<Error> {
+        self.terminal_error.lock().unwrap().clone()
+    }
 
     /// Fetch links from the link fetcher and store them in the chunks map.
     ///
@@ -519,7 +617,12 @@ impl StreamingCloudFetchProvider {
             }
             Err(e) => {
                 error!("Failed to fetch links for chunk {}: {}", start_index, e);
-                self.chunk_state_changed.notify_one();
+                // Persist as a terminal provider failure. The chunk
+                // whose link we failed to fetch has no entry in
+                // `chunks`, so a consumer blocked in `wait_for_chunk`
+                // on `start_index` would otherwise loop forever
+                // (see `terminal_error`).
+                self.set_terminal_error(e);
                 false
             }
         }
@@ -653,6 +756,7 @@ impl StreamingCloudFetchProvider {
                 metrics: Arc::clone(&self.metrics),
                 max_retries: self.config.max_retries,
                 retry_delay: self.config.retry_delay,
+                download_timeout: self.config.download_timeout,
             };
             let chunk_state_changed = Arc::clone(&self.chunk_state_changed);
             let chunks = self.chunks.clone();
@@ -706,9 +810,13 @@ impl StreamingCloudFetchProvider {
                     Err(e) => {
                         error!("Failed to download chunk {}: {}", chunk_index, e);
                         if let Some(mut entry) = chunks.get_mut(&chunk_index) {
-                            let msg = e.to_string();
-                            entry.state = ChunkState::DownloadFailed(msg.clone());
-                            entry.last_failure_reason = Some(msg);
+                            // Preserve the full typed error in the state so
+                            // its `ErrorCode` (e.g. `Timeout` for a deadline)
+                            // survives to the consumer path — see H05. Keep a
+                            // stringified copy in `last_failure_reason` for the
+                            // operator breadcrumb that outlives the state.
+                            entry.last_failure_reason = Some(e.to_string());
+                            entry.state = ChunkState::DownloadFailed(e);
                         }
                     }
                 }
@@ -718,16 +826,51 @@ impl StreamingCloudFetchProvider {
         }
     }
 
-    /// Download a single chunk with retry and link refresh on expiry.
+    /// Stable terminal error for a chunk whose end-to-end download budget
+    /// ([`CloudFetchConfig::download_timeout`]) was exhausted. Classified as
+    /// [`Error::timeout`] so consumers (and the C ABI / ODBC bridge) get a
+    /// consistent, retryable timeout classification rather than an opaque
+    /// I/O error (audit H05).
+    fn download_deadline_error(chunk_index: i64, budget: std::time::Duration) -> Error {
+        Error::timeout().message(format!(
+            "CloudFetch chunk {} download exceeded the {:.1}s end-to-end deadline",
+            chunk_index,
+            budget.as_secs_f64()
+        ))
+    }
+
+    /// Download a single chunk with retry and link refresh on expiry,
+    /// bounded end-to-end by [`CloudFetchConfig::download_timeout`].
     async fn download_chunk_with_retry(
         chunk_index: i64,
         ctx: &DownloadCtx,
     ) -> Result<Vec<RecordBatch>> {
         let mut attempts = 0;
 
+        // Absolute end-to-end deadline for this chunk. Bounds the whole
+        // retry loop — every HTTP attempt, link refresh, and backoff sleep
+        // — so a permanently-stalled chunk surfaces a terminal timeout in
+        // bounded time instead of stacking `max_retries × request_timeout`
+        // into minutes (audit H05). A zero budget disables the deadline
+        // (falls back to attempt-count bounding only).
+        let deadline = (!ctx.download_timeout.is_zero())
+            .then(|| std::time::Instant::now() + ctx.download_timeout);
+
         loop {
             if ctx.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Download cancelled"));
+            }
+
+            // Hard deadline check at the top of every attempt: if the
+            // budget is spent, stop promptly with a stable timeout error
+            // rather than starting another attempt or refresh.
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Self::download_deadline_error(
+                        chunk_index,
+                        ctx.download_timeout,
+                    ));
+                }
             }
 
             // Get link (may need to refresh the whole forward batch
@@ -750,15 +893,32 @@ impl StreamingCloudFetchProvider {
                              triggering batched refresh",
                             chunk_index
                         );
-                        Self::refresh_links_batch(
+                        // Bound the refresh RPC by the remaining chunk
+                        // budget so a stalled refresh can't overshoot the
+                        // end-to-end deadline by its own (much larger)
+                        // per-request `request_timeout` (audit H05). This
+                        // keeps the deadline genuinely end-to-end across
+                        // the link-refresh step, matching the loop-level
+                        // comment above.
+                        let refresh = Self::refresh_links_batch(
                             chunk_index,
                             &ctx.link_fetcher,
                             &ctx.chunks,
                             &ctx.refresh_coordinator,
                             &ctx.cancel_token,
                             ctx.statement_id.as_deref(),
-                        )
-                        .await
+                        );
+                        match deadline {
+                            Some(d) => tokio::time::timeout(
+                                d.saturating_duration_since(std::time::Instant::now()),
+                                refresh,
+                            )
+                            .await
+                            .map_err(|_| {
+                                Self::download_deadline_error(chunk_index, ctx.download_timeout)
+                            })?,
+                            None => refresh.await,
+                        }
                         .map_err(|e| {
                             // Wrap with chunk_index breadcrumb so the
                             // downstream `error!("Failed to download
@@ -851,9 +1011,15 @@ impl StreamingCloudFetchProvider {
                 }
             };
 
-            // Attempt download
+            // Attempt download. Cap this attempt at the remaining budget so
+            // a stalled connect / headers / body can't outrun the deadline
+            // (reqwest's per-request timeout spans all three). The downloader
+            // applies `min(request_timeout, remaining)` so the static
+            // per-request safety net is never loosened. `None` when no
+            // deadline is configured.
             let download_started = std::time::Instant::now();
-            match ctx.downloader.download(&link).await {
+            let attempt_timeout = deadline.map(|d| d.saturating_duration_since(download_started));
+            match ctx.downloader.download(&link, attempt_timeout).await {
                 Ok(batches) => {
                     ctx.metrics
                         .record_chunk_download(chunk_index, download_started.elapsed());
@@ -939,7 +1105,17 @@ impl StreamingCloudFetchProvider {
                         entry.last_failure_reason = Some(e.to_string());
                     }
 
-                    tokio::time::sleep(ctx.retry_delay).await;
+                    // Never sleep past the deadline: cap the backoff at the
+                    // remaining budget so the next iteration's deadline check
+                    // fires promptly instead of after a full `retry_delay`
+                    // overshoot.
+                    let sleep_for = match deadline {
+                        Some(d) => ctx
+                            .retry_delay
+                            .min(d.saturating_duration_since(std::time::Instant::now())),
+                        None => ctx.retry_delay,
+                    };
+                    tokio::time::sleep(sleep_for).await;
                 }
             }
         }
@@ -1327,16 +1503,46 @@ impl StreamingCloudFetchProvider {
     /// Wait for a specific chunk to be ready (Downloaded state).
     async fn wait_for_chunk(&self, chunk_index: i64) -> Result<()> {
         loop {
+            // Register the state-change waiter *before* the readiness /
+            // terminal-error checks below. `notify_waiters()` (used by
+            // `set_terminal_error` and the download tasks) only wakes
+            // waiters that are already registered when it fires, so a
+            // future constructed inline in the `select!` — i.e. after the
+            // checks — could miss a wakeup that lands in that window and
+            // stall until `chunk_ready_timeout`. `enable()` registers the
+            // future with the `Notify` now, so any notification arriving
+            // after the checks is captured and resolves the arm
+            // immediately on the next poll. Mirrors the pre-registration
+            // done for the refresh-coordinator wait.
+            let state_changed = self.chunk_state_changed.notified();
+            tokio::pin!(state_changed);
+            state_changed.as_mut().enable();
+
             // Check cancellation
             if self.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Operation cancelled"));
             }
 
-            // Check if chunk is ready
+            // Check if the requested chunk is ready FIRST. A terminal
+            // link-fetch failure only ever fails a page at or beyond
+            // the download frontier, which runs ahead of the consumer
+            // by up to `max_chunks_in_memory` chunks. Chunks between
+            // the consumer's current position and the failed page may
+            // already be downloaded and ready — checking readiness
+            // before the terminal error preserves in-order delivery of
+            // that buffered data, matching the per-chunk failure path
+            // (which is keyed on the specific chunk entry). The
+            // consumer only observes the terminal error once it reaches
+            // the chunk whose link failed, at which point no entry
+            // exists in `chunks` and the check below returns it.
             if let Some(entry) = self.chunks.get(&chunk_index) {
                 match &entry.state {
                     ChunkState::Downloaded => return Ok(()),
-                    ChunkState::DownloadFailed(e) => return Err(Error::io().message(e.clone())),
+                    // Return the preserved typed error verbatim so the
+                    // consumer (including the C ABI / ODBC bridge) sees the
+                    // original `ErrorCode` — e.g. `Timeout` for a deadline —
+                    // rather than an opaque re-wrapped `Io` error (H05).
+                    ChunkState::DownloadFailed(e) => return Err(e.clone()),
                     ChunkState::ProcessingFailed(e) => return Err(Error::io().message(e.clone())),
                     ChunkState::Cancelled => {
                         return Err(Error::invalid_state().message("Operation cancelled"))
@@ -1348,6 +1554,14 @@ impl StreamingCloudFetchProvider {
                 return Err(
                     Error::invalid_state().message(format!("Chunk {} not available", chunk_index))
                 );
+            } else if let Some(err) = self.terminal_error() {
+                // The requested chunk has no entry (its link fetch is
+                // what failed) and we are not at a clean end of stream:
+                // surface the persisted terminal error rather than
+                // looping forever. Placed after the ready-chunk check
+                // so already-downloaded in-order chunks are still
+                // delivered before the failure is reported.
+                return Err(err);
             }
 
             // Wait for any chunk state change with timeout
@@ -1362,7 +1576,7 @@ impl StreamingCloudFetchProvider {
                 _ = self.cancel_token.cancelled() => {
                     return Err(Error::invalid_state().message("Operation cancelled"));
                 }
-                _ = self.chunk_state_changed.notified() => {
+                _ = &mut state_changed => {
                     // State changed, loop to check
                 }
                 _ = tokio::time::sleep(timeout) => {
@@ -1619,6 +1833,9 @@ mod tests {
             metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
             max_retries: MAX_DOWNLOAD_ATTEMPTS,
             retry_delay: std::time::Duration::ZERO,
+            // This test isolates the attempt-count budget; disable the
+            // wall-clock deadline (0 = disabled) so it doesn't interfere.
+            download_timeout: std::time::Duration::ZERO,
         };
 
         let result = tokio::time::timeout(
@@ -1638,6 +1855,319 @@ mod tests {
             MAX_DOWNLOAD_ATTEMPTS as usize,
             "in-flight link expiry must not bypass the download attempt budget",
         );
+    }
+
+    // ─── End-to-end download deadline (issue #321 / audit H05) ───────────
+    //
+    // These tests exercise `download_chunk_with_retry`'s absolute
+    // `download_timeout` deadline: a stalled connection / headers / body
+    // and repeated failures must not let a single chunk outrun the budget.
+    // Each drives the real `ChunkDownloader` against a `wiremock` server so
+    // reqwest's per-request timeout (the actual cap) is genuinely exercised,
+    // not mocked away.
+    mod download_deadline {
+        use super::*;
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::kernel_error::ErrorCode;
+        use crate::types::sea::CompressionCodec;
+        use std::time::{Duration, Instant};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        /// A link fetcher that only ever serves chunk 0's link pointing at
+        /// `url`. Refresh paths are unreachable — the link never expires
+        /// (1h out), so these tests isolate the download deadline from any
+        /// refresh behaviour.
+        #[derive(Debug)]
+        struct SingleLinkFetcher {
+            url: String,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for SingleLinkFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!("deadline tests seed the chunks map directly")
+            }
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!("link never expires in these tests")
+            }
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                unreachable!("link never expires in these tests")
+            }
+        }
+
+        impl SingleLinkFetcher {
+            fn link(&self) -> CloudFetchLink {
+                CloudFetchLink {
+                    url: self.url.clone(),
+                    ..create_test_link(0)
+                }
+            }
+        }
+
+        /// Build a `DownloadCtx` whose downloader targets `server`, with the
+        /// given end-to-end `download_timeout` and (large) `max_retries` so
+        /// the wall-clock deadline — not the attempt count — is what bounds
+        /// the loop. The inner HTTP client's own retries are disabled so the
+        /// provider is the sole retry authority (mirrors production).
+        fn ctx_for(
+            server: &MockServer,
+            download_timeout: Duration,
+            cancel_token: CancellationToken,
+        ) -> DownloadCtx {
+            let http_client = Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(
+                        &RetryConfig {
+                            max_retries: 0,
+                            ..RetryConfig::default()
+                        },
+                        &HashMap::new(),
+                    ),
+                )
+                .unwrap(),
+            );
+            let downloader = Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            ));
+            let fetcher = Arc::new(SingleLinkFetcher {
+                url: format!("{}/chunk-0.arrow", server.uri()),
+            });
+            let chunks = Arc::new(DashMap::new());
+            chunks.insert(0, entry_with_state(fetcher.link(), ChunkState::Downloading));
+            DownloadCtx {
+                downloader,
+                link_fetcher: fetcher,
+                chunks,
+                refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+                cancel_token,
+                statement_id: None,
+                metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+                // Large attempt budget so ONLY the wall-clock deadline can
+                // stop the loop — proves the deadline, not the counter.
+                max_retries: 10_000,
+                retry_delay: Duration::from_millis(20),
+                download_timeout,
+            }
+        }
+
+        /// A stalled response body (headers arrive, body never completes)
+        /// must be cut off by the deadline, not the static request_timeout.
+        /// Without the per-attempt cap this hangs for the client's
+        /// `request_timeout` (default 120s) per attempt.
+        #[tokio::test]
+        async fn stalled_body_is_bounded_by_deadline() {
+            let server = MockServer::start().await;
+            // Delay far beyond the budget: stands in for a body that never
+            // makes progress. The per-attempt timeout must fire first.
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(30)))
+                .mount(&server)
+                .await;
+
+            let budget = Duration::from_millis(300);
+            let ctx = ctx_for(&server, budget, CancellationToken::new());
+
+            let started = Instant::now();
+            // Outer guard is ~10x the budget: if the deadline is NOT
+            // enforced this trips and fails loudly instead of hanging CI.
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("a stalled body must be bounded by the download deadline, not hang");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("a stalled body must surface a terminal error");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "deadline expiry must be classified as a timeout, got: {err}"
+            );
+            assert!(
+                err.message.contains("deadline"),
+                "unexpected error message: {err}"
+            );
+            // Elapsed stays within a documented scheduling tolerance of the
+            // budget (≤ budget + generous slack for scheduler/backoff).
+            assert!(
+                elapsed < budget + Duration::from_secs(1),
+                "elapsed {elapsed:?} should stay within tolerance of the {budget:?} budget"
+            );
+        }
+
+        /// Repeated failures (persistent HTTP 500, each returned promptly)
+        /// must stop at the wall-clock deadline rather than running the full
+        /// attempt count. Proves the deadline bounds the retry/backoff loop.
+        #[tokio::test]
+        async fn retry_exhaustion_is_bounded_by_deadline() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            let budget = Duration::from_millis(250);
+            let ctx = ctx_for(&server, budget, CancellationToken::new());
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("retry loop must stop at the deadline, not run 10k attempts");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("persistent 500 within the budget must be terminal");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "budget exhaustion must be classified as a timeout, got: {err}"
+            );
+            assert!(
+                elapsed < budget + Duration::from_secs(1),
+                "elapsed {elapsed:?} should stay within tolerance of the {budget:?} budget"
+            );
+            // Far fewer than max_retries attempts — the deadline, not the
+            // 10k counter, stopped the loop.
+            let attempts = server.received_requests().await.unwrap().len();
+            assert!(
+                attempts < 100,
+                "deadline should stop the loop well before the 10k attempt cap, got {attempts}"
+            );
+        }
+
+        /// A cancellation while a chunk is retrying under a live deadline
+        /// must be observed promptly (at the next loop boundary) and win —
+        /// the loop must not run out the remaining budget once cancelled.
+        /// The chunk keeps failing fast (HTTP 500 returned immediately), so
+        /// attempts turn over quickly and the loop-top cancel check fires
+        /// well before the multi-second budget would.
+        #[tokio::test]
+        async fn cancel_under_live_deadline_returns_promptly() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/chunk-0.arrow"))
+                .respond_with(ResponseTemplate::new(500))
+                .mount(&server)
+                .await;
+
+            // Long budget: only cancellation, not the deadline, should end
+            // this loop. If cancel is NOT observed, the loop would spin on
+            // fast 500s until the 10s budget — the outer 3s guard catches
+            // that regression.
+            let cancel = CancellationToken::new();
+            let ctx = ctx_for(&server, Duration::from_secs(10), cancel.clone());
+
+            let canceller = cancel.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                canceller.cancel();
+            });
+
+            let started = Instant::now();
+            let result = tokio::time::timeout(
+                Duration::from_secs(3),
+                StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx),
+            )
+            .await
+            .expect("cancellation must be observed promptly, not run out the budget");
+            let elapsed = started.elapsed();
+
+            let err = result.expect_err("a cancelled download must be an error");
+            // The "Download cancelled" arm uses `Error::invalid_state()`,
+            // which maps to `ErrorCode::InvalidArgument`.
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidArgument,
+                "cancel should win over the (far-off) deadline, got: {err}"
+            );
+            assert!(
+                err.message.contains("cancelled"),
+                "unexpected error message: {err}"
+            );
+            // Returned near the cancel time, nowhere near the 10s budget.
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "cancel should return promptly (~50ms), got {elapsed:?}"
+            );
+        }
+
+        /// H05 end-to-end: the deadline error's `ErrorCode::Timeout`
+        /// classification must survive the chunk-state machine and reach
+        /// the *consumer* path (`wait_for_chunk`), not just the direct
+        /// return of `download_chunk_with_retry`. Before the fix,
+        /// `ChunkState::DownloadFailed(String)` dropped the code and
+        /// `wait_for_chunk` re-wrapped it as `Error::io()`
+        /// (`ErrorCode::Internal`) — the very "opaque I/O error" the doc
+        /// promised consumers would not see.
+        #[tokio::test]
+        async fn deadline_timeout_classification_survives_to_consumer() {
+            // Minimal dummy deps — never exercised, `wait_for_chunk`
+            // only reads the seeded chunk state.
+            let http_client = Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(&RetryConfig::default(), &HashMap::new()),
+                )
+                .unwrap(),
+            );
+            let downloader = Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            ));
+            let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(SingleLinkFetcher {
+                url: "https://unused.example.com/chunk-0.arrow".to_string(),
+            });
+
+            // Seed chunk 0 exactly as the download task would on a
+            // deadline expiry: DownloadFailed carrying the typed
+            // timeout error.
+            let deadline_err =
+                StreamingCloudFetchProvider::download_deadline_error(0, Duration::from_millis(300));
+            assert_eq!(deadline_err.code, ErrorCode::Timeout);
+            let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+            chunks.insert(
+                0,
+                ChunkEntry {
+                    link: None,
+                    state: ChunkState::DownloadFailed(deadline_err),
+                    batches: None,
+                    last_failure_reason: None,
+                },
+            );
+
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                fetcher, downloader, chunks, true,
+            );
+
+            let err = provider
+                .wait_for_chunk(0)
+                .await
+                .expect_err("a deadline-failed chunk must surface an error to the consumer");
+            assert_eq!(
+                err.code,
+                ErrorCode::Timeout,
+                "consumer path must preserve the Timeout classification, got: {err}"
+            );
+            assert!(
+                err.retryable,
+                "a preserved timeout error must keep its retryable=true flag"
+            );
+            assert!(
+                err.message.contains("deadline"),
+                "the original deadline message must be preserved: {err}"
+            );
+        }
     }
 
     #[test]
@@ -2006,7 +2536,7 @@ mod tests {
             7,
             entry_with_state(
                 expired_link(7),
-                ChunkState::DownloadFailed("network glitch".into()),
+                ChunkState::DownloadFailed(Error::network_error().message("network glitch")),
             ),
         );
         chunks.insert(
@@ -2823,6 +3353,451 @@ mod tests {
         assert!(
             matches!(observed_state, ChunkState::Downloading),
             "in-flight task observes the chunk as still Downloading (owns the state machine)",
+        );
+    }
+
+    // --- Terminal link-fetch failure propagation (issue #319 / audit H03) ---
+    //
+    // A CloudFetch link-fetch failure fails *before* any `ChunkEntry`
+    // for the requested chunk exists and leaves `end_of_stream`
+    // unset, so `wait_for_chunk` has nothing to observe. Before the
+    // fix a woken consumer looped forever. These tests inject
+    // link-fetch faults and prove the provider now surfaces a
+    // deterministic terminal error to every current and future
+    // waiter without hanging.
+
+    /// A `ChunkDownloader` that never actually gets exercised in these
+    /// tests (link fetch fails first), but `StreamingCloudFetchProvider::new`
+    /// requires one. Points at an unroutable URL so any accidental
+    /// download attempt fails fast rather than reaching the network.
+    fn noop_downloader() -> Arc<ChunkDownloader> {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ))
+    }
+
+    /// Configurable link fetcher that fails `fetch_links` for a chosen
+    /// `start_chunk_index` and otherwise serves a fixed set of links.
+    ///
+    /// Failure is keyed on the requested `start_chunk_index`, not a
+    /// call counter, so it is deterministic no matter how many times a
+    /// page is (re)fetched:
+    ///
+    /// - `fail_at_start_index == 0`: the initial link fetch in
+    ///   `initialize` (which requests `start_chunk_index == 0`) fails.
+    /// - `fail_at_start_index == n > 0`: earlier pages serve
+    ///   `links_per_call` links each; the fetch that would supply
+    ///   chunk `n` fails — modelling an incremental / pagination-refill
+    ///   failure.
+    #[derive(Debug)]
+    struct FailingLinkFetcher {
+        total_chunks: i64,
+        links_per_call: i64,
+        fail_at_start_index: i64,
+        error_message: String,
+        /// When set, served links point at `{url_base}/chunk-{i}.arrow`
+        /// so a real downloader can fetch them; otherwise the default
+        /// unroutable `create_test_link` URL is used.
+        url_base: Option<String>,
+    }
+
+    impl FailingLinkFetcher {
+        fn new(total_chunks: i64, links_per_call: i64, fail_at_start_index: i64) -> Arc<Self> {
+            Arc::new(Self {
+                total_chunks,
+                links_per_call,
+                fail_at_start_index,
+                error_message: "injected link-fetch failure".to_string(),
+                url_base: None,
+            })
+        }
+
+        fn with_url_base(
+            total_chunks: i64,
+            links_per_call: i64,
+            fail_at_start_index: i64,
+            url_base: String,
+        ) -> Arc<Self> {
+            Arc::new(Self {
+                total_chunks,
+                links_per_call,
+                fail_at_start_index,
+                error_message: "injected link-fetch failure".to_string(),
+                url_base: Some(url_base),
+            })
+        }
+
+        fn link_for(&self, chunk_index: i64) -> CloudFetchLink {
+            match &self.url_base {
+                Some(base) => CloudFetchLink {
+                    url: format!("{base}/chunk-{chunk_index}.arrow"),
+                    ..create_test_link(chunk_index)
+                },
+                None => create_test_link(chunk_index),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ChunkLinkFetcher for FailingLinkFetcher {
+        async fn fetch_links(
+            &self,
+            start_chunk_index: i64,
+            _start_row_offset: i64,
+        ) -> Result<ChunkLinkFetchResult> {
+            if start_chunk_index == self.fail_at_start_index {
+                // Preserve a distinctive SQLSTATE so the test can
+                // assert the original error context survives. Keyed on
+                // the requested index so retries of the same page fail
+                // deterministically.
+                return Err(Error::io()
+                    .message(self.error_message.clone())
+                    .with_sql_state("08001"));
+            }
+
+            if start_chunk_index >= self.total_chunks {
+                return Ok(ChunkLinkFetchResult::end_of_stream());
+            }
+
+            let links: Vec<CloudFetchLink> = (start_chunk_index
+                ..(start_chunk_index + self.links_per_call).min(self.total_chunks))
+                .map(|i| self.link_for(i))
+                .collect();
+            let next_index = start_chunk_index + links.len() as i64;
+            let has_more = next_index < self.total_chunks;
+            Ok(ChunkLinkFetchResult {
+                links,
+                has_more,
+                next_chunk_index: has_more.then_some(next_index),
+                next_row_offset: None,
+            })
+        }
+
+        async fn refetch_link(&self, chunk_index: i64, _row_offset: i64) -> Result<CloudFetchLink> {
+            Ok(create_test_link(chunk_index))
+        }
+
+        async fn refetch_links_from(
+            &self,
+            chunk_index: i64,
+            _row_offset: i64,
+        ) -> Result<Vec<CloudFetchLink>> {
+            Ok(vec![create_test_link(chunk_index)])
+        }
+    }
+
+    /// Build a provider wired to a failing fetcher, with a short
+    /// chunk-ready timeout so a *regression* (a hang) still resolves
+    /// within the outer `tokio::time::timeout` guard rather than
+    /// wedging the whole test run.
+    fn provider_with_failing_fetcher(
+        fetcher: Arc<FailingLinkFetcher>,
+        total_chunks_present: Option<i32>,
+    ) -> Arc<StreamingCloudFetchProvider> {
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_millis(50)),
+            ..CloudFetchConfig::default()
+        };
+        StreamingCloudFetchProvider::new(
+            config,
+            fetcher,
+            noop_downloader(),
+            total_chunks_present,
+            tokio::runtime::Handle::current(),
+        )
+    }
+
+    /// The outer guard: any `next_batch` that has not resolved within
+    /// this window is treated as the indefinite-hang regression.
+    const NO_HANG: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// Initial link fetch fails → the first `next_batch` returns the
+    /// terminal error instead of hanging, and the original error
+    /// context (message + SQLSTATE) is preserved.
+    #[tokio::test]
+    async fn initial_link_fetch_failure_is_terminal() {
+        let fetcher = FailingLinkFetcher::new(4, 2, /* fail_at_start_index */ 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("next_batch must not hang after an initial link-fetch failure")
+            .expect_err("a terminal link-fetch failure must surface as an error");
+
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "original error message must be preserved; got: {err}"
+        );
+        assert_eq!(
+            err.sql_state.as_deref(),
+            Some("08001"),
+            "original SQLSTATE context must be preserved",
+        );
+    }
+
+    /// Incremental link fetch fails after the first page succeeds and
+    /// is consumed. This test isolates the incremental link-fetch path:
+    /// chunk 0's link is served and its bytes download successfully
+    /// (from a mock HTTP server), so the *only* failure source is the
+    /// second `fetch_links` call. It asserts both that (a) chunk 0's
+    /// rows are delivered in order before the failure — proving the
+    /// terminal error does not discard already-downloaded chunks — and
+    /// (b) the surfaced error carries the injected incremental
+    /// link-fetch message + SQLSTATE, not some other failure.
+    #[tokio::test]
+    async fn incremental_link_fetch_failure_is_terminal() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_array::Int32Array;
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // A valid single-column Arrow IPC stream for chunk 0.
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut ipc_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk-0.arrow"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc_bytes))
+            .mount(&server)
+            .await;
+
+        // Serve 1 link per call so chunk 0's link comes back on the
+        // first fetch and its bytes download from the mock server;
+        // the fetch supplying chunk 1 fails (deterministically, on
+        // every retry of that page).
+        let fetcher =
+            FailingLinkFetcher::with_url_base(4, 1, /* fail_at_start_index */ 1, server.uri());
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(
+                    &RetryConfig {
+                        max_retries: 0,
+                        ..RetryConfig::default()
+                    },
+                    &HashMap::new(),
+                ),
+            )
+            .unwrap(),
+        );
+        let downloader = Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ));
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_millis(50)),
+            ..CloudFetchConfig::default()
+        };
+        let provider = StreamingCloudFetchProvider::new(
+            config,
+            fetcher,
+            downloader,
+            Some(4),
+            tokio::runtime::Handle::current(),
+        );
+
+        // First read must deliver chunk 0's rows — the terminal error
+        // from the failed chunk-1 link fetch must not discard the
+        // already-downloaded chunk 0.
+        let first = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("first read must not hang")
+            .expect("chunk 0 downloaded successfully; its rows must be delivered")
+            .expect("chunk 0 must yield a batch, not clean EOS");
+        assert_eq!(
+            first.num_rows(),
+            3,
+            "chunk 0's rows must be delivered in order"
+        );
+
+        // The next read reaches chunk 1, whose link fetch failed, and
+        // must surface the injected incremental link-fetch error.
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("next_batch must not hang after an incremental link-fetch failure")
+            .expect_err("the incremental link-fetch failure must be terminal");
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "surfaced error must be the incremental link-fetch failure, not a download error; got: {err}"
+        );
+        assert_eq!(
+            err.sql_state.as_deref(),
+            Some("08001"),
+            "incremental link-fetch error must preserve its SQLSTATE context",
+        );
+    }
+
+    /// A waiter already parked in `next_batch` when the initial link
+    /// fetch fails is woken and returns the terminal error — proving
+    /// `set_terminal_error` wakes pre-registered waiters.
+    #[tokio::test]
+    async fn waiter_registered_before_failure_is_woken() {
+        // A fetcher whose initial fetch blocks briefly, then fails —
+        // guaranteeing the consumer is parked in `wait_for_chunk`
+        // before the terminal state is set.
+        #[derive(Debug)]
+        struct SlowFailFetcher {
+            gate: Arc<Notify>,
+        }
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for SlowFailFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                // Wait until the test signals the consumer is parked.
+                self.gate.notified().await;
+                Err(Error::io().message("delayed link-fetch failure"))
+            }
+            async fn refetch_link(&self, i: i64, _: i64) -> Result<CloudFetchLink> {
+                Ok(create_test_link(i))
+            }
+            async fn refetch_links_from(&self, i: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                Ok(vec![create_test_link(i)])
+            }
+        }
+
+        let gate = Arc::new(Notify::new());
+        let config = CloudFetchConfig {
+            chunk_ready_timeout: Some(std::time::Duration::from_secs(30)),
+            ..CloudFetchConfig::default()
+        };
+        let provider = StreamingCloudFetchProvider::new(
+            config,
+            Arc::new(SlowFailFetcher {
+                gate: Arc::clone(&gate),
+            }),
+            noop_downloader(),
+            Some(1),
+            tokio::runtime::Handle::current(),
+        );
+
+        // Start the consumer; it will park in wait_for_chunk because
+        // the fetch is blocked on the gate.
+        let consumer = {
+            let p = Arc::clone(&provider);
+            tokio::spawn(async move { p.next_batch().await })
+        };
+
+        // Give the consumer a moment to reach the wait loop, then
+        // release the fetch so it fails.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        gate.notify_waiters();
+
+        let result = tokio::time::timeout(NO_HANG, consumer)
+            .await
+            .expect("a pre-registered waiter must be woken by the terminal failure")
+            .expect("consumer task must not panic");
+        let err = result.expect_err("the woken waiter must return the terminal error");
+        assert!(
+            err.message.contains("delayed link-fetch failure"),
+            "woken waiter must see the original error; got: {err}"
+        );
+    }
+
+    /// A read started *after* the provider is already terminal returns
+    /// the error immediately (no wait, no hang) — future consumers see
+    /// the persisted terminal state.
+    #[tokio::test]
+    async fn read_started_after_failure_returns_terminal_error() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        // First read drives the provider into the terminal state.
+        let _ = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("first next_batch must not hang")
+            .expect_err("first read establishes the terminal error");
+
+        // A subsequent read must also return the error, promptly.
+        let err =
+            tokio::time::timeout(std::time::Duration::from_millis(200), provider.next_batch())
+                .await
+                .expect("a read after the terminal state must return immediately, not wait")
+                .expect_err("future reads must keep returning the terminal error");
+        assert!(
+            err.message.contains("injected link-fetch failure"),
+            "future reads must see the same persisted error; got: {err}"
+        );
+    }
+
+    /// Cancellation racing with a terminal link-fetch failure: whichever
+    /// fires, no waiter stays blocked and `next_batch` returns an error
+    /// rather than hanging.
+    #[tokio::test]
+    async fn cancel_racing_terminal_failure_leaves_no_waiter_blocked() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        // Cancel concurrently with the failing initialize().
+        let canceller = {
+            let p = Arc::clone(&provider);
+            tokio::spawn(async move {
+                p.cancel();
+            })
+        };
+
+        let err = tokio::time::timeout(NO_HANG, provider.next_batch())
+            .await
+            .expect("cancel racing a terminal failure must not leave the waiter blocked")
+            .expect_err("next_batch must return an error (cancelled or terminal)");
+        // Either outcome is acceptable; the invariant is "no hang".
+        let msg = err.message.to_lowercase();
+        assert!(
+            msg.contains("cancel") || msg.contains("injected link-fetch failure"),
+            "error must be the cancellation or the terminal link-fetch failure; got: {err}"
+        );
+
+        canceller.await.expect("canceller task must not panic");
+    }
+
+    /// The first terminal error wins: a later, different link-fetch
+    /// failure does not overwrite the originally-persisted error.
+    #[tokio::test]
+    async fn first_terminal_error_wins() {
+        let fetcher = FailingLinkFetcher::new(4, 2, 0);
+        let provider = provider_with_failing_fetcher(fetcher, Some(4));
+
+        provider.set_terminal_error(Error::io().message("first error"));
+        provider.set_terminal_error(Error::io().message("second error"));
+
+        let stored = provider
+            .terminal_error()
+            .expect("a terminal error must be recorded");
+        assert!(
+            stored.message.contains("first error"),
+            "first writer must win; got: {stored}"
         );
     }
 }

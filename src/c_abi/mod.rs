@@ -81,6 +81,35 @@ pub type KernelLogCallback = unsafe extern "C" fn(
 /// process (matches the migration-plan §5.2 contract).
 static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
+// Tokio normally gives runtime workers a 2 MiB stack, but without an explicit
+// override its thread builder honours the embedding process's RUST_MIN_STACK.
+// Native consumers may set that variable for their own thread pools; keep it
+// from shrinking the kernel-owned workers below Tokio's supported default.
+const C_ABI_RUNTIME_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Resolve the worker-thread stack size for the C-ABI runtime from the ambient
+/// `RUST_MIN_STACK` value (parsed to `Some(bytes)`, or `None` when unset or
+/// unparseable).
+///
+/// [`C_ABI_RUNTIME_THREAD_STACK_SIZE`] (2 MiB) is a **floor, not a cap**: a
+/// too-small ambient `RUST_MIN_STACK` is clamped up to the floor (preserving
+/// databricks/databricks-sql-kernel#326), while a host that deliberately asked
+/// for *more* than 2 MiB keeps its larger stack rather than being silently
+/// shrunk.
+fn c_abi_runtime_thread_stack_size(ambient_rust_min_stack: Option<usize>) -> usize {
+    ambient_rust_min_stack
+        .unwrap_or(0)
+        .max(C_ABI_RUNTIME_THREAD_STACK_SIZE)
+}
+
+/// Read and parse the ambient `RUST_MIN_STACK` env var into `Some(bytes)`, or
+/// `None` when it is unset or not a valid `usize`.
+fn ambient_rust_min_stack() -> Option<usize> {
+    std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
 /// Fetch (initialising on first use) the process-wide C-ABI runtime.
 ///
 /// A multi-thread runtime so concurrent FFI calls from different host
@@ -101,6 +130,7 @@ pub(crate) fn runtime() -> crate::kernel_error::Result<&'static tokio::runtime::
     let built = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("kernel-c-abi")
+        .thread_stack_size(c_abi_runtime_thread_stack_size(ambient_rust_min_stack()))
         .build()
         .map_err(|e| {
             crate::kernel_error::Error::internal()
@@ -166,7 +196,7 @@ fn pin_containing_module() {
     unsafe {
         GetModuleHandleExW(
             GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
-            pin_containing_module as usize as *const u16,
+            pin_containing_module as *const () as usize as *const u16,
             &mut module,
         );
     }
@@ -428,6 +458,95 @@ impl From<crate::kernel_error::ErrorCode> for KernelStatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const SMALL_STACK_CHILD: &str = "DATABRICKS_KERNEL_SMALL_STACK_CHILD";
+
+    /// Floor-not-cap (the bug in #328): when the ambient `RUST_MIN_STACK` is
+    /// LARGER than the 2 MiB floor, the resolved worker stack size must
+    /// preserve the larger value rather than shrinking workers to 2 MiB. The
+    /// databricks-odbc partner runs with `RUST_MIN_STACK=3194880` and must not
+    /// have its C-ABI workers silently reduced.
+    #[test]
+    fn c_abi_runtime_stack_size_preserves_larger_rust_min_stack() {
+        let ambient = 3_194_880; // ulimit -s 3120 * 1024, the partner's value
+        assert!(ambient > C_ABI_RUNTIME_THREAD_STACK_SIZE);
+        assert_eq!(
+            c_abi_runtime_thread_stack_size(Some(ambient)),
+            ambient,
+            "a RUST_MIN_STACK larger than the 2 MiB floor must be preserved, not shrunk"
+        );
+    }
+
+    /// Floor preserved (the #326 behavior the fix must keep): a too-small or
+    /// unset ambient `RUST_MIN_STACK` is clamped UP to the 2 MiB floor.
+    #[test]
+    fn c_abi_runtime_stack_size_clamps_small_rust_min_stack_up_to_floor() {
+        assert_eq!(
+            c_abi_runtime_thread_stack_size(Some(16_384)),
+            C_ABI_RUNTIME_THREAD_STACK_SIZE,
+            "a RUST_MIN_STACK below the floor must clamp up to 2 MiB"
+        );
+        assert_eq!(
+            c_abi_runtime_thread_stack_size(None),
+            C_ABI_RUNTIME_THREAD_STACK_SIZE,
+            "an unset RUST_MIN_STACK must default to the 2 MiB floor"
+        );
+    }
+
+    /// The C ABI owns its runtime, so an embedding process's `RUST_MIN_STACK`
+    /// setting must not be able to shrink the runtime workers below Tokio's
+    /// supported default. Run the actual probe in a subprocess because
+    /// `RUST_MIN_STACK` is process-global and the C-ABI runtime is a
+    /// process-wide `OnceLock`.
+    #[test]
+    fn c_abi_runtime_ignores_ambient_rust_min_stack() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .args([
+                "--exact",
+                "c_abi::tests::c_abi_runtime_small_stack_child",
+                "--nocapture",
+            ])
+            .env(SMALL_STACK_CHILD, "1")
+            .env("RUST_MIN_STACK", "16384")
+            .env("RUST_TEST_THREADS", "1")
+            .output()
+            .expect("launch small-stack subprocess");
+
+        assert!(
+            output.status.success(),
+            "C-ABI runtime failed under ambient RUST_MIN_STACK=16384 (status {}):\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    #[test]
+    fn c_abi_runtime_small_stack_child() {
+        if std::env::var_os(SMALL_STACK_CHILD).is_none() {
+            return;
+        }
+
+        // libtest's own worker also inherits RUST_MIN_STACK. Move the probe
+        // immediately to an explicitly-sized caller thread so only the
+        // kernel-owned Tokio workers remain intentionally constrained.
+        std::thread::Builder::new()
+            .name("small-stack-test-driver".into())
+            .stack_size(2 * 1024 * 1024)
+            .spawn(|| {
+                block_on_ffi(|| async {
+                    reqwest::Client::builder().build().map_err(|e| {
+                        crate::kernel_error::Error::internal()
+                            .message(format!("failed to build HTTP client: {e}"))
+                    })?;
+                    Ok(())
+                })
+                .expect("HTTP client builds on a C-ABI runtime worker");
+            })
+            .expect("spawn explicit-stack test driver")
+            .join()
+            .expect("small-stack test driver must not panic");
+    }
 
     /// `block_on_ffi` must reject a reentrant call (one made from a thread
     /// already inside a Tokio runtime) with a typed `Internal` error and a
