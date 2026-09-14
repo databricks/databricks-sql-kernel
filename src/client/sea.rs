@@ -69,6 +69,19 @@ enum StatementOutcome {
     Err(Error),
 }
 
+/// Raw terminal response from the synchronous execution phase.
+///
+/// `statement_id` is captured from the initial execute response for cleanup;
+/// `response` is the final unmaterialised response returned by the server.
+struct TerminalExecution {
+    statement_id: String,
+    response: ExecuteResponse,
+    /// Whether the terminal response came from GetStatementStatus. The old
+    /// synchronous path enriched those responses with a DML count, but not an
+    /// initial terminal ExecuteStatement response.
+    response_from_poll: bool,
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -248,8 +261,11 @@ impl SeaRestTransport {
         })
     }
 
-    /// Poll for statement status (private — used by wait_for_completion).
-    async fn get_statement_status(
+    /// Fetch and decode a statement status without materialising any result data.
+    ///
+    /// The synchronous execution loop uses this raw response so observing a terminal
+    /// server state is a distinct phase from reader creation and DML-count extraction.
+    async fn get_statement_status_raw(
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
@@ -292,7 +308,21 @@ impl SeaRestTransport {
             sea_response.statement_id, sea_response.status.state
         );
 
-        let mut response = Self::convert_response(sea_response)?;
+        Self::convert_response(sea_response)
+    }
+
+    /// Fetch statement status for callers that expose the status directly.
+    ///
+    /// Unlike the synchronous execution loop, async status callers need the DML row
+    /// count before fetching the result, so this path retains the existing enrichment.
+    async fn get_statement_status(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<ExecuteResponse> {
+        let mut response = self
+            .get_statement_status_raw(statement_id, session_attribution)
+            .await?;
         self.enrich_num_modified_rows(&mut response).await;
         Ok(response)
     }
@@ -342,9 +372,9 @@ impl SeaRestTransport {
 
     /// Decode a single SEA `ExecuteResponse` into a terminal outcome.
     ///
-    /// Shared by `wait_for_completion` (sync poll loop) and
-    /// [`Transport::fetch_completed_result`] (async one-shot fetch)
-    /// so both paths produce identical errors for `FAILED` / `CANCELLED`.
+    /// Shared by synchronous execution after it observes a raw terminal state and
+    /// [`Transport::fetch_completed_result`] (async one-shot fetch), so both paths
+    /// produce identical errors for `FAILED` / `CANCELLED`.
     /// `CLOSED` (with or without result data) is a terminal success — JDBC
     /// parity; an empty `CLOSED` materialises an empty result downstream.
     fn terminal_outcome(response: ExecuteResponse) -> StatementOutcome {
@@ -425,29 +455,45 @@ impl SeaRestTransport {
         }
     }
 
-    /// Wait for statement to complete, polling status.
-    async fn wait_for_completion(&self, response: ExecuteResponse) -> Result<ExecuteResponse> {
+    /// Poll until the server reports a raw terminal statement state.
+    ///
+    /// This phase deliberately stops before terminal error mapping, reader creation,
+    /// schema extraction, or DML-count materialisation. The existing polling budget is
+    /// retained here; client-configurable execution deadlines are a separate change.
+    async fn wait_for_terminal(
+        &self,
+        response: ExecuteResponse,
+    ) -> Result<(ExecuteResponse, bool)> {
         let start = std::time::Instant::now();
         let mut current_response = response;
+        let mut response_from_poll = false;
 
         loop {
-            match Self::terminal_outcome(current_response) {
-                StatementOutcome::Done(r) => return Ok(r),
-                StatementOutcome::Err(e) => return Err(e),
-                StatementOutcome::NotReady(r) => {
+            match current_response.status.state {
+                StatementState::Pending | StatementState::Running => {
                     if start.elapsed() > self.config.poll_timeout {
                         return Err(Error::timeout().message("Statement execution timed out"));
                     }
 
                     tokio::time::sleep(self.config.poll_interval).await;
                     debug!(
-                        statement_id = %r.statement_id,
-                        state = ?r.status.state,
+                        statement_id = %current_response.statement_id,
+                        state = ?current_response.status.state,
                         "Polling statement status"
                     );
                     current_response = self
-                        .get_statement_status(&r.statement_id, SessionAttribution::Current)
+                        .get_statement_status_raw(
+                            &current_response.statement_id,
+                            SessionAttribution::Current,
+                        )
                         .await?;
+                    response_from_poll = true;
+                }
+                StatementState::Succeeded
+                | StatementState::Failed
+                | StatementState::Canceled
+                | StatementState::Closed => {
+                    return Ok((current_response, response_from_poll));
                 }
             }
         }
@@ -605,7 +651,79 @@ impl SeaRestTransport {
         )
     }
 
-    /// Execute a SQL statement end-to-end: call API → poll → create reader.
+    /// Execute through the first raw terminal response, without creating a reader.
+    async fn execute_to_terminal(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+        request_type: RequestType,
+    ) -> Result<TerminalExecution> {
+        let response = self
+            .call_execute_api(session_id, sql, params, request_type)
+            .await?;
+        let statement_id = response.statement_id.clone();
+
+        // Publish the server statement id to the caller's canceller slot before
+        // polling so a concurrent canceller can target a running sync query.
+        if let Some(observer) = params.inflight_id_observer.as_ref() {
+            if let Ok(mut slot) = observer.lock() {
+                *slot = Some(statement_id.clone());
+            }
+        }
+
+        let (response, response_from_poll) = match self.wait_for_terminal(response).await {
+            Ok(terminal) => terminal,
+            Err(error) => {
+                self.close_orphaned_statement(&statement_id, "wait_for_terminal")
+                    .await;
+                return Err(error);
+            }
+        };
+
+        Ok(TerminalExecution {
+            statement_id,
+            response,
+            response_from_poll,
+        })
+    }
+
+    /// Materialise a successful terminal response into a ready-to-read result.
+    async fn materialise_response(
+        &self,
+        reader_factory: &ResultReaderFactory,
+        response: ExecuteResponse,
+    ) -> Result<ExecuteResult> {
+        // `create_reader` wraps in a `ResultPostProcessor` internally, so the
+        // reader returned here already carries the server-reported per-column
+        // metadata (`databricks.type_name` etc.) on its schema and on every
+        // emitted batch. Bindings (PySQL, future ADBC) read those attributes to
+        // recover the precise type for columns whose Arrow shape collapses
+        // (VARIANT → Utf8, intervals → Interval, GEOMETRY/GEOGRAPHY → Utf8).
+        // The post-processor also handles the optional complex-types-as-JSON
+        // rewrite in the same pass and can eagerly download CloudFetch chunk 0
+        // to extract its schema.
+        let reader = reader_factory
+            .create_reader(&response.statement_id, &response)
+            .await?;
+
+        // Carry the full status forward so the executed handle can skip a
+        // redundant CloseStatement when the server already cleaned up
+        // (state=Closed) and expose extended status fields without another
+        // GetStatementStatus round-trip.
+        let telemetry_result_format = Self::telemetry_result_format(&response);
+        let telemetry_is_compressed = Self::telemetry_is_compressed(&response);
+        Ok(ExecuteResult {
+            statement_id: response.statement_id,
+            reader,
+            manifest: response.manifest,
+            telemetry_result_format,
+            telemetry_is_compressed,
+            status: response.status,
+        })
+    }
+
+    /// Execute a SQL statement end-to-end: raw execution → result materialisation.
     ///
     /// Shared implementation for both user queries (`ExecuteStatement`) and
     /// metadata queries (`ExecuteMetadataQuery`). The `request_type` controls
@@ -625,7 +743,7 @@ impl SeaRestTransport {
         // CommandInactivityTimeout (~1h) reclaims it. Two known
         // paths into that gap:
         //
-        //   - wait_for_completion times out (`Error::timeout`) while
+        //   - wait_for_terminal times out (`Error::timeout`) while
         //     the server still considers the statement live in
         //     PENDING / RUNNING. (Terminal FAILED / CANCELED is the
         //     server's own cleanup signal — no CloseStatement
@@ -636,78 +754,48 @@ impl SeaRestTransport {
         //     downloading chunk 0 to extract the result schema; a
         //     non-retriable 4xx / 5xx on that GET propagates up.
         //
-        // Capture the statement_id from the initial response so we
-        // can issue a best-effort close on either path.
-        let response = self
-            .call_execute_api(session_id, sql, params, request_type)
+        let mut terminal = self
+            .execute_to_terminal(session_id, sql, params, request_type)
             .await?;
-        let statement_id = response.statement_id.clone();
-
-        // Publish the server statement id to the caller's canceller
-        // slot NOW — before polling — so a concurrent
-        // `StatementCanceller::cancel()` can target a still-running
-        // sync query. (The initial POST returns within the server
-        // wait_timeout, ~10s, even for a long query.)
-        if let Some(observer) = params.inflight_id_observer.as_ref() {
-            if let Ok(mut slot) = observer.lock() {
-                *slot = Some(statement_id.clone());
-            }
+        // Preserve the old sync behavior: a terminal GetStatementStatus response
+        // is DML-enriched before the result reader is handed off. It now happens
+        // after the raw terminal boundary, keeping this work out of the execution
+        // phase without shifting it onto the public result stream.
+        if terminal.response_from_poll {
+            self.enrich_num_modified_rows(&mut terminal.response).await;
         }
-
-        let response = match self.wait_for_completion(response).await {
-            Ok(r) => r,
-            Err(e) => {
-                self.close_orphaned_statement(&statement_id, "wait_for_completion")
+        let statement_id = terminal.statement_id;
+        let response = match Self::terminal_outcome(terminal.response) {
+            StatementOutcome::Done(response) => response,
+            StatementOutcome::Err(error) => {
+                self.close_orphaned_statement(&statement_id, "terminal_outcome")
                     .await;
-                return Err(e);
+                return Err(error);
+            }
+            StatementOutcome::NotReady(_) => {
+                unreachable!("execute_to_terminal returned a non-terminal response")
             }
         };
+
         let reader_factory = self.reader_factory()?;
-        // `create_reader` wraps in a `ResultPostProcessor`
-        // internally, so the reader returned here already carries
-        // the server-reported per-column metadata
-        // (`databricks.type_name` etc.) on its schema and on every
-        // emitted batch. Bindings (PySQL, future ADBC) read those
-        // attributes to recover the precise type for columns whose
-        // Arrow shape collapses (VARIANT → Utf8, intervals → Interval,
-        // GEOMETRY/GEOGRAPHY → Utf8). The post-processor also handles
-        // the optional complex-types-as-JSON rewrite in the same pass.
-        let reader = match reader_factory
-            .create_reader(&response.statement_id, &response)
-            .await
-        {
-            Ok(r) => r,
-            Err(e) => {
+        match self.materialise_response(reader_factory, response).await {
+            Ok(result) => Ok(result),
+            Err(error) => {
                 self.close_orphaned_statement(&statement_id, "create_reader")
                     .await;
-                return Err(e);
+                Err(error)
             }
-        };
-
-        // The full `status` is carried forward so the executed handle
-        // can skip a redundant CloseStatement when the server already
-        // cleaned up (status.state=Closed) AND expose
-        // num_modified_rows / display_message / etc. without a second
-        // GetStatementStatus round-trip.
-        let telemetry_result_format = Self::telemetry_result_format(&response);
-        let telemetry_is_compressed = Self::telemetry_is_compressed(&response);
-        Ok(ExecuteResult {
-            statement_id: response.statement_id,
-            reader,
-            manifest: response.manifest,
-            telemetry_result_format,
-            telemetry_is_compressed,
-            status: response.status,
-        })
+        }
     }
 
     /// Best-effort close for a server-side statement we opened but
     /// can't hand off to an `ExecutedStatement` because of a failure
-    /// in `wait_for_completion` or `create_reader`. The trait method
+    /// in `wait_for_terminal`, terminal outcome handling, or `create_reader`.
+    /// The trait method
     /// `close_statement` already swallows its own errors (line 797);
     /// the wrapper here is just a logging seam so a future failure
     /// to clean up shows up in traces with the failing-phase
-    /// attribution (`wait_for_completion` vs `create_reader`).
+    /// attribution (`wait_for_terminal` vs `terminal_outcome` vs `create_reader`).
     async fn close_orphaned_statement(&self, statement_id: &str, phase: &str) {
         // A synchronously-rejected request (e.g. a `BAD_REQUEST`
         // parameter-binding failure) returns FAILED with no
@@ -959,7 +1047,7 @@ impl Transport for SeaRestTransport {
         // result). Setting `wait_timeout=10s` explicitly instead yields
         // `SUCCEEDED` (statement still alive → needs an explicit cancel+close),
         // which is both slower and breaks fire-and-forget. We just DON'T run the
-        // `wait_for_completion` poll loop: a query that outlasts the inline wait
+        // internal poll loop: a query that outlasts the inline wait
         // comes back `Running` for the caller to poll/cancel.
         let response = self
             .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement)
@@ -1489,6 +1577,14 @@ mod tests {
     use crate::auth::PersonalAccessToken;
     use crate::client::retry::{build_retry_configs, RetryConfig};
     use crate::client::HttpClientConfig;
+    use crate::reader::post_processor::PostProcessOptions;
+    use crate::result_stream::{ResultBatch, ResultStream};
+    use crate::types::cloudfetch::CloudFetchConfig;
+    use arrow_array::{Int64Array, RecordBatch};
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{DataType, Field, Schema};
+    use base64::{engine::general_purpose::STANDARD, Engine as _};
+    use serde_json::json;
 
     fn create_test_client() -> SeaRestTransport {
         let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
@@ -1503,6 +1599,213 @@ mod tests {
             "warehouse-123",
             TransportConfig::default(),
         )
+    }
+
+    fn create_ready_test_client_against(
+        host: &str,
+        config: TransportConfig,
+    ) -> Arc<SeaRestTransport> {
+        let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(HttpClientConfig::default(), retry_configs).unwrap(),
+        );
+        let auth = Arc::new(PersonalAccessToken::new("test-token".to_string()));
+        http_client.set_auth_provider(auth);
+
+        let transport = Arc::new(SeaRestTransport::new(
+            http_client.clone(),
+            host,
+            "warehouse-123",
+            config,
+        ));
+        let runtime_handle = tokio::runtime::Handle::current();
+        let reader_factory = ResultReaderFactory::new(
+            transport.clone() as Arc<dyn Transport>,
+            http_client,
+            CloudFetchConfig::default(),
+            PostProcessOptions::default(),
+            runtime_handle.clone(),
+        );
+        transport.set_reader_factory(reader_factory, runtime_handle);
+        transport
+    }
+
+    fn succeeded_inline_dml_body(statement_id: &str, affected_rows: i64) -> String {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "num_affected_rows",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int64Array::from(vec![affected_rows]))],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        json!({
+            "statement_id": statement_id,
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": 1,
+                    "columns": [{
+                        "name": "num_affected_rows",
+                        "type_name": "BIGINT",
+                        "type_text": "BIGINT",
+                        "position": 0,
+                    }],
+                },
+                "total_chunk_count": 1,
+                "total_row_count": 1,
+                "total_byte_count": ipc.len() as i64,
+                "truncated": false,
+            },
+            "result": {
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": ipc.len() as i64,
+                "attachment": STANDARD.encode(&ipc),
+            },
+        })
+        .to_string()
+    }
+
+    #[tokio::test]
+    async fn execute_statement_enriches_polled_dml_before_result_handoff() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "stmt-polled-dml",
+                "status": { "state": "RUNNING" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-polled-dml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(succeeded_inline_dml_body("stmt-polled-dml", 9)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-polled-dml"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_ready_test_client_against(
+            &server.uri(),
+            TransportConfig {
+                poll_interval: std::time::Duration::ZERO,
+                ..TransportConfig::default()
+            },
+        );
+        let result = transport
+            .execute_and_read(
+                "sess-test",
+                "UPDATE t SET x = x + 1",
+                &ExecuteParams::default(),
+                RequestType::ExecuteStatement,
+            )
+            .await
+            .expect("polled DML execution must succeed");
+
+        // Assert at the transport boundary, before Statement::execute can
+        // derive the same value from its public ResultStream fallback.
+        assert_eq!(result.status.num_modified_rows, Some(9));
+
+        // Enrichment uses an independent throwaway reader. The reader handed
+        // to the caller must still contain the DML summary row.
+        let mut stream = ResultStream::from_reader(result.reader)
+            .await
+            .expect("result reader must initialise");
+        let ResultBatch::Arrow(batch) = stream
+            .next_batch()
+            .await
+            .expect("DML result read must succeed")
+            .expect("DML result must contain one batch");
+        let affected = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("num_affected_rows must be Int64");
+        assert_eq!(affected.value(0), 9);
+
+        transport
+            .close_statement("stmt-polled-dml")
+            .await
+            .expect("test statement close must succeed");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn execute_to_terminal_timeout_preserves_error_and_cleanup() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let running = json!({
+            "statement_id": "stmt-timeout",
+            "status": { "state": "RUNNING" },
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running.clone()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_ready_test_client_against(
+            &server.uri(),
+            TransportConfig {
+                poll_timeout: std::time::Duration::ZERO,
+                poll_interval: std::time::Duration::ZERO,
+                ..TransportConfig::default()
+            },
+        );
+        let error = match transport
+            .execute_to_terminal(
+                "sess-test",
+                "SELECT 1",
+                &ExecuteParams::default(),
+                RequestType::ExecuteStatement,
+            )
+            .await
+        {
+            Ok(_) => panic!("perpetually running statement must time out"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::Timeout);
+        assert_eq!(error.message, "Statement execution timed out");
+        server.verify().await;
     }
 
     #[test]

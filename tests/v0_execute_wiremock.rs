@@ -290,6 +290,25 @@ fn int64_batch(name: &str, values: Vec<i64>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(values))]).unwrap()
 }
 
+fn dml_count_batch(affected: i64, inserted: i64, updated: i64, deleted: i64) -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("num_affected_rows", DataType::Int64, false),
+        Field::new("num_inserted_rows", DataType::Int64, false),
+        Field::new("num_updated_rows", DataType::Int64, false),
+        Field::new("num_deleted_rows", DataType::Int64, false),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![affected])),
+            Arc::new(Int64Array::from(vec![inserted])),
+            Arc::new(Int64Array::from(vec![updated])),
+            Arc::new(Int64Array::from(vec![deleted])),
+        ],
+    )
+    .unwrap()
+}
+
 fn str_batch(name: &str, values: Vec<&str>) -> RecordBatch {
     let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Utf8, false)]));
     RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
@@ -908,7 +927,7 @@ async fn polling_path_carries_terminal_status_not_initial() {
     // Setup: the POST /statements returns RUNNING with no extended
     // fields. The polling GET /statements/{id} then returns SUCCEEDED
     // with all 5 extended fields populated. The kernel's
-    // `wait_for_completion` loop must hand the **terminal** status
+    // synchronous poll loop must hand the **terminal** status
     // (the final GET) to `ExecutedStatement::new`, not the initial
     // POST response. If the kernel ever regresses to carrying forward
     // the first response, this test fails because the accessors will
@@ -961,7 +980,51 @@ async fn polling_path_carries_terminal_status_not_initial() {
 }
 
 #[tokio::test]
-async fn execute_failed_carries_extended_status_fields_onto_error() {
+async fn polling_path_materializes_dml_count_after_terminal_state() {
+    // The synchronous poll loop deliberately reads raw status responses. DML
+    // count extraction belongs to result materialisation, but the public
+    // ExecutedStatement must still expose the same count before this refactor.
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-polled-dml")).await;
+    let batch = dml_count_batch(9, 4, 3, 2);
+    mount_status(
+        &server,
+        "stmt-polled-dml",
+        succeeded_inline_body("stmt-polled-dml", &batch),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET x = x + 1");
+    let mut exec = stmt
+        .execute()
+        .await
+        .expect("execute should poll and materialize the DML result");
+
+    assert_eq!(exec.num_modified_rows(), Some(9));
+
+    // DML extraction peeks rather than consumes: the summary row remains
+    // available through the normal result stream.
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        9
+    );
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_polled_failure_carries_extended_status_fields_onto_error() {
     // Pins the sync polling path's terminal-error contract: when the
     // SEA wire response on a FAILED statement includes
     // `display_message` / `diagnostic_info` / `error_details_json`,
@@ -985,7 +1048,8 @@ async fn execute_failed_carries_extended_status_fields_onto_error() {
         "operator=Scan; stage=Analyze; full stack ...",
         r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#,
     );
-    mount_execute(&server, body).await;
+    mount_execute(&server, running_body("stmt-fail-ext")).await;
+    mount_status(&server, "stmt-fail-ext", body).await;
 
     let session = open_session(&server).await;
     let mut stmt = session.statement();
@@ -996,6 +1060,7 @@ async fn execute_failed_carries_extended_status_fields_onto_error() {
     };
 
     assert_eq!(err.code, ErrorCode::SqlError);
+    assert_eq!(err.query_id.as_deref(), Some("stmt-fail-ext"));
     assert_eq!(err.sql_state.as_deref(), Some("42P01"));
     assert_eq!(
         err.display_message.as_deref(),
@@ -1009,6 +1074,18 @@ async fn execute_failed_carries_extended_status_fields_onto_error() {
     assert_eq!(
         err.error_details_json.as_deref(),
         Some(r#"{"errorClass":"TABLE_OR_VIEW_NOT_FOUND","messageTemplate":"..."}"#)
+    );
+
+    let recorded = server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available");
+    assert!(
+        recorded.iter().any(|request| {
+            request.method == wiremock::http::Method::DELETE
+                && request.url.path() == "/api/2.0/sql/statements/stmt-fail-ext"
+        }),
+        "polled terminal failure must preserve the existing orphan-close behavior",
     );
 }
 
