@@ -21,7 +21,7 @@ use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
     ExecuteResultData, InlineChunkFetchResult, SessionAttribution, SessionInfo, Transport,
-    TransportConfig,
+    TransportConfig, DIRECT_ROUTING_HEADER,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -80,6 +80,8 @@ pub(crate) struct SeaRestTransport {
     host: String,
     warehouse_id: String,
     config: TransportConfig,
+    direct_routing_eligible: bool,
+    direct_routing_enabled: OnceLock<bool>,
     session_version: AtomicI64,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
@@ -91,6 +93,7 @@ impl std::fmt::Debug for SeaRestTransport {
             .field("host", &self.host)
             .field("warehouse_id", &self.warehouse_id)
             .field("config", &self.config)
+            .field("direct_routing_enabled", &self.should_direct_route())
             .field("session_version", &self.current_session_version())
             .field(
                 "reader_factory",
@@ -115,12 +118,15 @@ impl SeaRestTransport {
         host: impl Into<String>,
         warehouse_id: impl Into<String>,
         config: TransportConfig,
+        direct_routing_eligible: bool,
     ) -> Self {
         Self {
             http_client,
             host: host.into(),
             warehouse_id: warehouse_id.into(),
             config,
+            direct_routing_eligible,
+            direct_routing_enabled: OnceLock::new(),
             session_version: AtomicI64::new(NO_SESSION_VERSION),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
@@ -146,6 +152,24 @@ impl SeaRestTransport {
     /// Build the base URL for API requests.
     fn base_url(&self) -> String {
         format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
+    }
+
+    fn should_direct_route(&self) -> bool {
+        self.direct_routing_eligible && self.direct_routing_enabled.get().copied().unwrap_or(false)
+    }
+
+    fn follow_up_request(
+        &self,
+        method: Method,
+        url: &str,
+        session_attribution: SessionAttribution,
+    ) -> reqwest::RequestBuilder {
+        let builder = self.http_client.inner().request(method, url);
+        if session_attribution == SessionAttribution::Current && self.should_direct_route() {
+            builder.header(DIRECT_ROUTING_HEADER, "true")
+        } else {
+            builder
+        }
     }
 
     fn current_session_version(&self) -> Option<SessionVersion> {
@@ -259,9 +283,7 @@ impl SeaRestTransport {
         debug!("Getting statement status at {}", url);
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::GET, &url)
+            .follow_up_request(Method::GET, &url, session_attribution)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -293,7 +315,8 @@ impl SeaRestTransport {
         );
 
         let mut response = Self::convert_response(sea_response)?;
-        self.enrich_num_modified_rows(&mut response).await;
+        self.enrich_num_modified_rows(&mut response, session_attribution)
+            .await;
         Ok(response)
     }
 
@@ -309,7 +332,11 @@ impl SeaRestTransport {
     ///
     /// Gated on the manifest's column signature so SELECTs (real columns) never
     /// hit the decode path; a DML-count result is always tiny and inline.
-    async fn enrich_num_modified_rows(&self, response: &mut ExecuteResponse) {
+    async fn enrich_num_modified_rows(
+        &self,
+        response: &mut ExecuteResponse,
+        session_attribution: SessionAttribution,
+    ) {
         if response.status.num_modified_rows.is_some() {
             return;
         }
@@ -324,7 +351,7 @@ impl SeaRestTransport {
         // any later fetch the caller makes (a fresh GetStatement builds its own
         // reader), so result consumption is unaffected.
         let reader = match factory
-            .create_reader(&response.statement_id, response)
+            .create_reader(&response.statement_id, response, session_attribution)
             .await
         {
             Ok(r) => r,
@@ -507,9 +534,7 @@ impl SeaRestTransport {
         debug!("Executing statement at {}: {}", url, sql);
 
         let mut builder = self
-            .http_client
-            .inner()
-            .request(Method::POST, &url)
+            .follow_up_request(Method::POST, &url, SessionAttribution::Current)
             .header("Content-Type", "application/json");
 
         // Signal that a metadata query may be served fully synchronously, so
@@ -673,7 +698,11 @@ impl SeaRestTransport {
         // GEOMETRY/GEOGRAPHY → Utf8). The post-processor also handles
         // the optional complex-types-as-JSON rewrite in the same pass.
         let reader = match reader_factory
-            .create_reader(&response.statement_id, &response)
+            .create_reader(
+                &response.statement_id,
+                &response,
+                SessionAttribution::Current,
+            )
             .await
         {
             Ok(r) => r,
@@ -854,6 +883,11 @@ impl Transport for SeaRestTransport {
             ))
         })?;
 
+        self.direct_routing_enabled
+            .set(session_response.direct_routing_enabled)
+            .map_err(|_| {
+                Error::invalid_state().message("SEA transport already created a session")
+            })?;
         self.observe_session_version(session_response.session_version);
 
         debug!("Created session: {}", session_response.session_id);
@@ -880,9 +914,7 @@ impl Transport for SeaRestTransport {
         debug!("Deleting session at {}", url);
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::DELETE, &url)
+            .follow_up_request(Method::DELETE, &url, SessionAttribution::Current)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -981,7 +1013,10 @@ impl Transport for SeaRestTransport {
             // reader from the inline result (no extra GetStatementResult).
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
-                let reader = match reader_factory.create_reader(&r.statement_id, &r).await {
+                let reader = match reader_factory
+                    .create_reader(&r.statement_id, &r, SessionAttribution::Current)
+                    .await
+                {
                     Ok(reader) => reader,
                     Err(e) => {
                         self.close_orphaned_statement(&statement_id, "create_reader (direct)")
@@ -1023,7 +1058,9 @@ impl Transport for SeaRestTransport {
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
-                let reader = reader_factory.create_reader(&r.statement_id, &r).await?;
+                let reader = reader_factory
+                    .create_reader(&r.statement_id, &r, session_attribution)
+                    .await?;
                 let telemetry_result_format = Self::telemetry_result_format(&r);
                 let telemetry_is_compressed = Self::telemetry_is_compressed(&r);
                 Ok(Some(ExecuteResult {
@@ -1054,15 +1091,14 @@ impl Transport for SeaRestTransport {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
+        session_attribution: SessionAttribution,
     ) -> Result<ChunkLinkFetchResult> {
         let url = self.result_chunks_url(statement_id, chunk_index, row_offset);
 
         debug!("Getting result chunks at {}", url);
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::GET, &url)
+            .follow_up_request(Method::GET, &url, session_attribution)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1099,6 +1135,7 @@ impl Transport for SeaRestTransport {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
+        session_attribution: SessionAttribution,
     ) -> Result<InlineChunkFetchResult> {
         // Same endpoint as CloudFetch chunk-link fetching, but on
         // the inline-Arrow path the response carries Arrow IPC bytes
@@ -1129,9 +1166,7 @@ impl Transport for SeaRestTransport {
         );
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::GET, &url)
+            .follow_up_request(Method::GET, &url, session_attribution)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1220,9 +1255,7 @@ impl Transport for SeaRestTransport {
         debug!("Canceling statement at {}", url);
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::POST, &url)
+            .follow_up_request(Method::POST, &url, SessionAttribution::Current)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1243,9 +1276,7 @@ impl Transport for SeaRestTransport {
         debug!("Closing statement at {}", url);
 
         let request = self
-            .http_client
-            .inner()
-            .request(Method::DELETE, &url)
+            .follow_up_request(Method::DELETE, &url, SessionAttribution::Current)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1502,6 +1533,7 @@ mod tests {
             "https://test.databricks.com",
             "warehouse-123",
             TransportConfig::default(),
+            false,
         )
     }
 
@@ -1571,6 +1603,7 @@ mod tests {
             "https://test.databricks.com/",
             "warehouse-123",
             TransportConfig::default(),
+            false,
         );
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
     }
@@ -1879,6 +1912,13 @@ mod tests {
     /// host so we can assert wire-level behaviour rather than just
     /// URL-string output.
     fn create_test_client_against(host: &str) -> SeaRestTransport {
+        create_test_client_against_with_eligibility(host, false)
+    }
+
+    fn create_test_client_against_with_eligibility(
+        host: &str,
+        direct_routing_eligible: bool,
+    ) -> SeaRestTransport {
         let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
         let http_client = Arc::new(
             DatabricksHttpClient::new(HttpClientConfig::default(), retry_configs).unwrap(),
@@ -1890,7 +1930,279 @@ mod tests {
             host,
             "warehouse-123",
             TransportConfig::default(),
+            direct_routing_eligible,
         )
+    }
+
+    #[tokio::test]
+    async fn direct_routing_header_covers_owned_follow_up_lifecycle() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, header, method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "session_id": "session-1",
+                "session_version": { "version_id": 7 },
+                "direct_routing_enabled": true,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .and(body_json(json!({
+                "warehouse_id": "warehouse-123",
+                "statement": "SELECT 1",
+                "session_id": "session-1",
+                "session_version": { "version_id": 7 },
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-1",
+                "status": { "state": "PENDING" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/statement-1"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-1",
+                "status": { "state": "RUNNING" },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/statement-1/result/chunks/0"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "external_links": [],
+                "next_chunk_index": null,
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/sql/statements/inline-statement/result/chunks/1",
+            ))
+            .and(query_param("row_offset", "3"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk_index": 1,
+                "row_offset": 3,
+                "row_count": 1,
+                "next_chunk_index": null,
+                "attachment": "AQ==",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/statement-1/cancel"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/statement-1"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/session-1"))
+            .and(header(DIRECT_ROUTING_HEADER, "true"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against_with_eligibility(&server.uri(), true);
+        let session = transport
+            .create_session(None, None, HashMap::new())
+            .await
+            .expect("session creation must succeed");
+        transport
+            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .await
+            .expect("execute must succeed");
+        transport
+            .get_statement_status("statement-1", SessionAttribution::Current)
+            .await
+            .expect("owned status must succeed");
+        transport
+            .get_result_chunks("statement-1", 0, 0, SessionAttribution::Current)
+            .await
+            .expect("owned chunk fetch must succeed");
+        transport
+            .get_inline_chunk("inline-statement", 1, 3, SessionAttribution::Current)
+            .await
+            .expect("owned inline chunk fetch must succeed");
+        transport
+            .cancel_statement("statement-1")
+            .await
+            .expect("cancel must succeed");
+        transport
+            .close_statement("statement-1")
+            .await
+            .expect("statement close must succeed");
+        transport
+            .delete_session(&session.session_id)
+            .await
+            .expect("session close must succeed");
+
+        server.verify().await;
+        let requests = server.received_requests().await.unwrap();
+        let create = requests
+            .iter()
+            .find(|request| request.url.path() == "/api/2.0/sql/sessions")
+            .expect("CreateSession request must be recorded");
+        assert!(create.headers.get(DIRECT_ROUTING_HEADER).is_none());
+    }
+
+    #[tokio::test]
+    async fn direct_routing_header_requires_both_negotiation_and_client_eligibility() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let cases = [
+            (json!({ "session_id": "session-1" }), true),
+            (
+                json!({
+                    "session_id": "session-1",
+                    "direct_routing_enabled": false,
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "session_id": "session-1",
+                    "direct_routing_enabled": true,
+                }),
+                false,
+            ),
+        ];
+
+        for (create_response, direct_routing_eligible) in cases {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(create_response))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "statement_id": "statement-1",
+                    "status": { "state": "PENDING" },
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let transport =
+                create_test_client_against_with_eligibility(&server.uri(), direct_routing_eligible);
+            let session = transport
+                .create_session(None, None, HashMap::new())
+                .await
+                .expect("session creation must succeed");
+            transport
+                .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+                .await
+                .expect("execute must succeed");
+
+            let requests = server.received_requests().await.unwrap();
+            assert_eq!(requests.len(), 2);
+            assert!(requests
+                .iter()
+                .all(|request| request.headers.get(DIRECT_ROUTING_HEADER).is_none()));
+        }
+    }
+
+    #[tokio::test]
+    async fn detached_statement_requests_ignore_the_session_route() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path, query_param};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "session_id": "session-1",
+                "direct_routing_enabled": true,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/detached"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "detached",
+                "status": { "state": "RUNNING" },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/detached/result/chunks/0"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "external_links": [],
+                "next_chunk_index": null,
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/sql/statements/inline-detached/result/chunks/1",
+            ))
+            .and(query_param("row_offset", "3"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk_index": 1,
+                "row_offset": 3,
+                "row_count": 1,
+                "next_chunk_index": null,
+                "attachment": "AQ==",
+            })))
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against_with_eligibility(&server.uri(), true);
+        transport
+            .create_session(None, None, HashMap::new())
+            .await
+            .expect("session creation must succeed");
+        transport
+            .get_statement_status("detached", SessionAttribution::Detached)
+            .await
+            .expect("detached status must succeed");
+        transport
+            .get_result_chunks("detached", 0, 0, SessionAttribution::Detached)
+            .await
+            .expect("detached chunk fetch must succeed");
+        transport
+            .get_inline_chunk("inline-detached", 1, 3, SessionAttribution::Detached)
+            .await
+            .expect("detached inline chunk fetch must succeed");
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 4);
+        assert!(requests
+            .iter()
+            .all(|request| request.headers.get(DIRECT_ROUTING_HEADER).is_none()));
     }
 
     #[tokio::test]
@@ -2124,7 +2436,7 @@ mod tests {
 
         let transport = create_test_client_against(&server.uri());
         let _ = transport
-            .get_result_chunks("01abc", 3, 100)
+            .get_result_chunks("01abc", 3, 100, SessionAttribution::Current)
             .await
             .expect("get_result_chunks must succeed against the mock");
 
@@ -2162,7 +2474,7 @@ mod tests {
 
         let transport = create_test_client_against(&server.uri());
         let _ = transport
-            .get_result_chunks("01abc", 3, 0)
+            .get_result_chunks("01abc", 3, 0, SessionAttribution::Current)
             .await
             .expect("get_result_chunks must succeed against the mock");
 

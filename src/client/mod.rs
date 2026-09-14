@@ -36,6 +36,8 @@ pub mod retry;
 pub mod sea;
 pub(crate) mod transport;
 
+pub(crate) const DIRECT_ROUTING_HEADER: &str = "x-databricks-direct-routing";
+
 // Public surface — kept stable for advanced wrappers that tune HTTP.
 pub use http::{DatabricksHttpClient, HttpClientConfig, ProxyConfig};
 pub use retry::{

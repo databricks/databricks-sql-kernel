@@ -432,6 +432,8 @@ pub struct CreateSessionResponse {
     pub session_id: String,
     #[serde(default)]
     pub session_version: Option<SessionVersion>,
+    #[serde(default)]
+    pub direct_routing_enabled: bool,
 }
 
 /// Response from fetching result chunks.
@@ -523,6 +525,12 @@ mod tests {
             response.session_version,
             Some(SessionVersion { version_id: 7 })
         );
+        assert!(!response.direct_routing_enabled);
+
+        let response: CreateSessionResponse =
+            serde_json::from_str(r#"{"session_id":"session-1","direct_routing_enabled":true}"#)
+                .unwrap();
+        assert!(response.direct_routing_enabled);
     }
 
     #[test]

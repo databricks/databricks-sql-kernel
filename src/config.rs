@@ -444,6 +444,13 @@ pub enum AuthConfig {
 }
 
 impl AuthConfig {
+    pub(crate) fn is_direct_routing_eligible(&self) -> bool {
+        matches!(
+            self,
+            Self::OAuthM2M { .. } | Self::OAuthM2MPrivateKey { .. }
+        )
+    }
+
     /// Construct a [`AuthConfig::Pat`] from an optional token, validating
     /// that it is present and non-empty.
     ///
@@ -784,14 +791,10 @@ pub struct HttpConfig {
     /// which also carries the composed `User-Agent`) onto the kernel's
     /// HTTP stack.
     ///
-    /// **`Authorization` / `x-databricks-org-id` are reserved:** a
-    /// caller entry for either name is **silently dropped (with a
-    /// `warn!`)** — it never reaches the wire. The kernel always adds
-    /// its own `Authorization` (from the auth provider) and, when set,
-    /// `x-databricks-org-id`, so auth and multi-tenant routing can't be
-    /// hijacked by a caller header. (This mirrors the Thrift connector,
-    /// where `auth_provider.add_headers` runs after the custom-header
-    /// dict and overwrites those names.)
+    /// **`Authorization`, `x-databricks-org-id`, and
+    /// `x-databricks-direct-routing` are reserved.** Caller entries for
+    /// these names are silently dropped with a `warn!`. The kernel owns
+    /// their values so callers cannot override authentication or routing.
     ///
     /// **`User-Agent` is special-cased:** a caller `User-Agent` here
     /// **replaces** the kernel's base UA entirely — it is folded into the
@@ -1740,6 +1743,52 @@ mod tests {
             }
             other => panic!("expected OAuthM2M, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn direct_routing_eligibility_is_limited_to_databricks_oauth_m2m() {
+        let eligible = [
+            AuthConfig::OAuthM2M {
+                client_id: "client-id".to_string(),
+                client_secret: "client-secret".to_string(),
+                scopes: None,
+                token_url_override: None,
+                identity_federation_client_id: None,
+            },
+            AuthConfig::OAuthM2MPrivateKey {
+                client_id: "client-id".to_string(),
+                jwt_key_file: "/key.pem".to_string(),
+                jwt_kid: "key-id".to_string(),
+                jwt_passphrase: None,
+                jwt_algorithm: None,
+                scopes: None,
+                token_url_override: None,
+            },
+        ];
+        assert!(eligible.iter().all(AuthConfig::is_direct_routing_eligible));
+
+        let ineligible = [
+            AuthConfig::Pat {
+                token: "token".to_string(),
+                identity_federation_client_id: None,
+            },
+            AuthConfig::oauth_u2m(None, None, None, None, None, None, None),
+            AuthConfig::AzureServicePrincipal {
+                azure_client_id: "client-id".to_string(),
+                azure_client_secret: "client-secret".to_string(),
+                azure_tenant_id: None,
+                azure_workspace_resource_id: None,
+                identity_federation_client_id: None,
+            },
+            AuthConfig::OAuthFederation {
+                subject_token: "token".to_string(),
+                subject_token_type: "type".to_string(),
+                audience: "audience".to_string(),
+            },
+        ];
+        assert!(ineligible
+            .iter()
+            .all(|auth| !auth.is_direct_routing_eligible()));
     }
 
     // ─── OAuthM2MPrivateKey (JWT) constructor ──────────────────────

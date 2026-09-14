@@ -345,6 +345,7 @@ impl Session {
             host.clone(),
             warehouse_id.clone(),
             transport_config,
+            config.auth.is_direct_routing_eligible(),
         ));
         let reader_factory = ResultReaderFactory::new(
             sea.clone() as Arc<dyn Transport>,
