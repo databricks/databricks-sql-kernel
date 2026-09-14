@@ -437,9 +437,9 @@ impl ExecutedAsyncStatement {
 
     /// Block until the server reaches a terminal state, then return
     /// the result stream. Internally polls with backoff using the
-    /// session's [`crate::client::TransportConfig`] cadence (the
-    /// same `poll_interval` / `poll_timeout` the sync `execute()`
-    /// path uses).
+    /// session's [`crate::client::TransportConfig`] cadence. This async-handle
+    /// ceiling is separate from the optional per-call client deadline on
+    /// synchronous `Statement::execute_with_timeout()`.
     ///
     /// **Drop-cancellation.** Dropping the returned future before
     /// it resolves to a terminal state (e.g. a winning branch in
@@ -451,8 +451,7 @@ impl ExecutedAsyncStatement {
     ///
     /// **Polling timeout.** When the transport's
     /// `TransportConfig.poll_timeout` elapses without reaching a
-    /// terminal state, returns `Error::timeout()` (same shape the
-    /// sync polling path produces). For owning handles this also
+    /// terminal state, returns `Error::timeout()`. For owning handles this also
     /// drops the armed cancel guard, which sends a best-effort
     /// server-side cancel; attached read-only handles do not cancel.
     pub async fn await_result(&self) -> Result<ResultStream> {
@@ -460,9 +459,8 @@ impl ExecutedAsyncStatement {
         let result = async {
             self.valid.check()?;
 
-            // Poll cadence + ceiling come from the transport's config —
-            // same source the sync `wait_for_completion` path uses, so
-            // a caller's `SessionBuilder` tuning applies to both modes.
+            // Poll cadence + ceiling come from the transport's config. The sync
+            // execute path instead takes an optional execution-scoped deadline.
             let cfg = self.session.transport().poll_config();
             let start = std::time::Instant::now();
 

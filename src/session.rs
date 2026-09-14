@@ -68,6 +68,7 @@ use crate::metadata_v0::Metadata;
 use crate::reader::ResultReaderFactory;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::mutable::Statement;
+use crate::statement::timeout::TimeoutCleanupManager;
 use crate::telemetry::{DriverSystemConfiguration, OperationType, TelemetryRuntime};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -99,6 +100,10 @@ pub(crate) struct SessionInner {
     /// every child handle so they can `block_on` if they need to
     /// (e.g. the [`Drop`] impl below).
     runtime_handle: tokio::runtime::Handle,
+
+    /// Bounded, non-blocking admission for best-effort cancel/close work after
+    /// a client query deadline expires.
+    timeout_cleanup: TimeoutCleanupManager,
 
     /// Tracing span tagged with `session_id`. Every public method
     /// enters this span via `let _g = self.inner.log_span.enter();`
@@ -164,6 +169,14 @@ impl SessionInner {
     /// fire-and-forget `close_statement` clean-up.
     pub(crate) fn runtime_handle(&self) -> &tokio::runtime::Handle {
         &self.runtime_handle
+    }
+
+    pub(crate) fn dispatch_timeout_cleanup(&self, statement_id: Option<String>) {
+        self.timeout_cleanup.dispatch(
+            &self.runtime_handle,
+            Arc::clone(&self.transport),
+            statement_id,
+        );
     }
 
     pub(crate) fn statement_telemetry_observer(
@@ -412,6 +425,7 @@ impl Session {
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,
+                timeout_cleanup: TimeoutCleanupManager::default(),
                 log_span,
                 telemetry,
                 closed: std::sync::atomic::AtomicBool::new(false),

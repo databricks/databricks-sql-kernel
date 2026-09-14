@@ -12,11 +12,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Wiremock tests for the C ABI's detached statement canceller
-//! (`kernel_statement_canceller_new` / `_cancel` / `_free`). The null-guard
-//! unit test in `src/c_abi/statement.rs` only pins the bad-pointer paths; these
-//! tests drive the entry points against a mock SEA server to cover the behavior
-//! that actually matters:
+//! Wiremock tests for the C ABI's statement execution controls: the detached
+//! statement canceller (`kernel_statement_canceller_new` / `_cancel` / `_free`)
+//! and the execution-scoped client query timeout. The null-guard unit test in
+//! `src/c_abi/statement.rs` only pins the bad-pointer paths; these tests drive
+//! the entry points against a mock SEA server to cover the behavior that
+//! actually matters:
 //!
 //! - `canceller_cancels_a_running_execute_from_another_thread`: the headline
 //!   contract — one thread blocks in `kernel_statement_execute` while another
@@ -34,6 +35,8 @@
 //!   after its statement AND session are closed — the cancel still dispatches
 //!   (`dispatched == true`) and its POST reaches the server, proving the cloned
 //!   session `Arc` keeps the client-side session alive past `kernel_session_close`.
+//! - `client_timeout_c_abi_contract_and_reuse`: timeout status/error fields,
+//!   null output, finite-range validation, unlimited values, cleanup, and reuse.
 //!
 //! The C ABI drives its own process-wide tokio runtime inside `block_on_ffi`,
 //! so the entry points must be called from plain (non-async) threads — hence
@@ -44,7 +47,7 @@
 use std::ffi::CString;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
 use databricks_sql_kernel::c_abi::session::{
@@ -57,7 +60,8 @@ use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_statement_t, kernel_statement_bind_parameter,
     kernel_statement_canceller_cancel, kernel_statement_canceller_free,
     kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
-    kernel_statement_execute, kernel_statement_set_sql, kernel_statement_t,
+    kernel_statement_execute, kernel_statement_execute_with_timeout_ms, kernel_statement_set_sql,
+    kernel_statement_t, MAX_CLIENT_QUERY_TIMEOUT_MS,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -129,8 +133,7 @@ fn succeeded_empty_body(statement_id: &str) -> String {
 /// on a fixed timer. `cancelled` is shared with the cancel POST mock, which sets
 /// it when the cancel RPC arrives. A poll cap is a safety valve: if a broken
 /// cancel never fires, the responder still flips to `CANCELED` after `max_running`
-/// polls so the test fails its causal assertion instead of hanging on the
-/// kernel's 600s poll timeout.
+/// polls so the test fails its causal assertion instead of hanging indefinitely.
 struct CancelAwareStatus {
     statement_id: String,
     cancelled: Arc<AtomicBool>,
@@ -1624,5 +1627,125 @@ fn retained_canceller_noops_in_the_reexecute_handoff_window() {
         !saw_stmt_a_cancel,
         "no cancel may be POSTed against the prior (finished) statement id during \
          the re-execute handoff"
+    );
+}
+
+#[test]
+fn client_timeout_c_abi_contract_and_reuse() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let second_started = Arc::new(AtomicBool::new(false));
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(SequencedExecute {
+                first: running_body("stmt-c-timeout"),
+                rest: succeeded_empty_body("stmt-c-reused"),
+                calls: AtomicUsize::new(0),
+                second_started: Arc::clone(&second_started),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-c-timeout/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        // The initial response publishes an id and enters the 500ms poll sleep.
+        // A 75ms client deadline must return promptly and null a non-null sentinel.
+        let mut out = std::ptr::dangling_mut::<kernel_executed_statement_t>();
+        let started = Instant::now();
+        assert_eq!(
+            kernel_statement_execute_with_timeout_ms(stmt, 75, &mut out),
+            KernelStatusCode::Timeout
+        );
+        assert!(out.is_null(), "the C output must be null on timeout");
+        assert!(
+            started.elapsed() < Duration::from_millis(400),
+            "background timeout cleanup must not delay the native call"
+        );
+
+        let mut raw_error = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(kernel_get_last_error(raw_error.as_mut_ptr()));
+        let raw_error = raw_error.assume_init();
+        assert_eq!(raw_error.code, KernelStatusCode::Timeout as i32);
+        assert!(!raw_error.retryable);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.sql_state)
+                .to_str()
+                .unwrap(),
+            "HYT00"
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.query_id)
+                .to_str()
+                .unwrap(),
+            "stmt-c-timeout"
+        );
+
+        // Out-of-range values fail before any RPC and still clear the output.
+        out = std::ptr::dangling_mut::<kernel_executed_statement_t>();
+        assert_eq!(
+            kernel_statement_execute_with_timeout_ms(
+                stmt,
+                MAX_CLIENT_QUERY_TIMEOUT_MS + 1,
+                &mut out,
+            ),
+            KernelStatusCode::InvalidArgument
+        );
+        assert!(out.is_null());
+
+        // The maximum finite value and zero (unlimited) are both accepted, and
+        // the same statement is reusable immediately after its timed execution.
+        for timeout_ms in [MAX_CLIENT_QUERY_TIMEOUT_MS, 0] {
+            let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+            assert_eq!(
+                kernel_statement_execute_with_timeout_ms(stmt, timeout_ms, &mut exec),
+                KernelStatusCode::Success
+            );
+            assert!(!exec.is_null());
+            assert_eq!(
+                kernel_executed_statement_close(exec),
+                KernelStatusCode::Success
+            );
+        }
+
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    let execute_posts = rt.block_on(async {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/statements"
+            })
+            .count()
+    });
+    assert_eq!(
+        execute_posts, 3,
+        "the oversized timeout must be rejected without an execute RPC"
     );
 }

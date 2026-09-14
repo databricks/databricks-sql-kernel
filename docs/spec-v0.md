@@ -644,9 +644,17 @@ impl Statement {
     /// Read-only access (for logging or assertion).
     pub fn spec_ref(&self) -> &StatementSpec;
 
-    /// Wait-for-result execution. Auto-cancels + closes any prior handle.
-    /// Spec is unchanged after the call; can be re-executed.
+    /// Wait-for-result execution with no client query deadline. Auto-cancels
+    /// + closes any prior handle. Spec is unchanged; can be re-executed.
     pub async fn execute(&mut self) -> Result<ExecutedStatement>;
+
+    /// As execute(), with one client-side deadline through terminal-state
+    /// mapping. Zero and Duration::MAX disable the deadline; result
+    /// materialisation and fetching are outside it.
+    pub async fn execute_with_timeout(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<ExecutedStatement>;
 
     /// Submit-and-return. Auto-cancels + closes any prior handle.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement>;
@@ -950,4 +958,3 @@ string (`[error_code STATEMENT_NOT_FOUND]`) since
 `adbc_core::error::Error` has no string-shaped slot for it. Lossy
 bridge — wrappers that consume `kernel_error::Error` directly
 (PyO3, napi-rs, the C ABI) get the structured field.
-

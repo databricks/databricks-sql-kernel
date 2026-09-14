@@ -1136,6 +1136,7 @@ mod tests {
             _session_id: &str,
             _sql: &str,
             _params: &ExecuteParams,
+            _client_deadline: Option<std::time::Instant>,
         ) -> Result<ExecuteResult> {
             Ok(ExecuteResult {
                 statement_id: "mock-statement".to_string(),
@@ -1238,7 +1239,7 @@ mod tests {
         }
 
         async fn list_catalogs(&self, _session_id: &str) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1248,7 +1249,7 @@ mod tests {
             _catalog: Option<&str>,
             _schema_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1260,7 +1261,7 @@ mod tests {
             _table_pattern: Option<&str>,
             _table_types: Option<&[&str]>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1272,7 +1273,7 @@ mod tests {
             _table_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1283,7 +1284,7 @@ mod tests {
             _schema_pattern: Option<&str>,
             _procedure_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1294,7 +1295,7 @@ mod tests {
             _schema_pattern: Option<&str>,
             _function_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1306,7 +1307,7 @@ mod tests {
             _procedure_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1317,7 +1318,7 @@ mod tests {
             _schema: &str,
             _table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 
@@ -1331,7 +1332,7 @@ mod tests {
             _foreign_schema: &str,
             _foreign_table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default())
+            self.execute_statement("", "", &ExecuteParams::default(), None)
                 .await
         }
 

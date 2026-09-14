@@ -95,6 +95,17 @@ enum TerminalExecutionOutcome {
     Failed(Error),
 }
 
+/// Failure while reaching a terminal response, plus the statement id when the
+/// initial execute response had already published one. Keeping the id beside
+/// the error lets the caller run orphan cleanup after the timed execution phase
+/// has ended, so cleanup latency can neither consume the client deadline nor
+/// replace the originating error with a client timeout.
+#[derive(Debug)]
+struct TerminalExecutionFailure {
+    statement_id: Option<String>,
+    error: Error,
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -471,23 +482,18 @@ impl SeaRestTransport {
     /// Poll until the server reports a raw terminal statement state.
     ///
     /// This phase deliberately stops before terminal error mapping, reader creation,
-    /// schema extraction, or DML-count materialisation. The existing polling budget is
-    /// retained here; client-configurable execution deadlines are a separate change.
+    /// schema extraction, or DML-count materialisation. Its caller applies the one
+    /// per-execution client deadline around the whole execute-and-poll future.
     async fn wait_for_terminal(
         &self,
         response: ExecuteResponse,
     ) -> Result<(ExecuteResponse, bool)> {
-        let start = std::time::Instant::now();
         let mut current_response = response;
         let mut response_from_poll = false;
 
         loop {
             match current_response.status.state {
                 StatementState::Pending | StatementState::Running => {
-                    if start.elapsed() > self.config.poll_timeout {
-                        return Err(Error::timeout().message("Statement execution timed out"));
-                    }
-
                     tokio::time::sleep(self.config.poll_interval).await;
                     debug!(
                         statement_id = %current_response.statement_id,
@@ -671,10 +677,14 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
-    ) -> Result<TerminalExecution> {
+    ) -> std::result::Result<TerminalExecution, TerminalExecutionFailure> {
         let response = self
             .call_execute_api(session_id, sql, params, request_type)
-            .await?;
+            .await
+            .map_err(|error| TerminalExecutionFailure {
+                statement_id: None,
+                error,
+            })?;
         let statement_id = response.statement_id.clone();
 
         // Publish the server statement id to the caller's canceller slot before
@@ -685,14 +695,13 @@ impl SeaRestTransport {
             }
         }
 
-        let (response, response_from_poll) = match self.wait_for_terminal(response).await {
-            Ok(terminal) => terminal,
-            Err(error) => {
-                self.close_orphaned_statement(&statement_id, "wait_for_terminal")
-                    .await;
-                return Err(error);
-            }
-        };
+        let (response, response_from_poll) =
+            self.wait_for_terminal(response)
+                .await
+                .map_err(|error| TerminalExecutionFailure {
+                    statement_id: Some(statement_id.clone()),
+                    error,
+                })?;
 
         let outcome = match Self::terminal_outcome(response) {
             StatementOutcome::Done(response) => TerminalExecutionOutcome::Succeeded(response),
@@ -755,6 +764,7 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
+        client_deadline: Option<std::time::Instant>,
     ) -> Result<ExecuteResult> {
         // After call_execute_api succeeds, the SEA statement is open
         // on the server. Any subsequent failure before we hand back
@@ -775,9 +785,40 @@ impl SeaRestTransport {
         //     downloading chunk 0 to extract the result schema; a
         //     non-retriable 4xx / 5xx on that GET propagates up.
         //
-        let terminal = self
-            .execute_to_terminal(session_id, sql, params, request_type)
-            .await?;
+        let execution = self.execute_to_terminal(session_id, sql, params, request_type);
+        let execution_result = match client_deadline {
+            Some(deadline) => {
+                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), execution)
+                    .await
+                {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let query_id = params
+                            .inflight_id_observer
+                            .as_ref()
+                            .and_then(|slot| slot.try_lock().ok().and_then(|id| id.clone()));
+                        return Err(crate::statement::timeout::client_query_timeout_error(
+                            query_id.as_deref(),
+                        ));
+                    }
+                }
+            }
+            None => execution.await,
+        };
+        let terminal = match execution_result {
+            Ok(terminal) => terminal,
+            Err(TerminalExecutionFailure {
+                statement_id,
+                error,
+            }) => {
+                if let Some(statement_id) = statement_id {
+                    self.close_orphaned_statement(&statement_id, "wait_for_terminal")
+                        .await;
+                }
+                return Err(error);
+            }
+        };
+
         let TerminalExecution {
             statement_id,
             outcome,
@@ -1027,9 +1068,16 @@ impl Transport for SeaRestTransport {
         session_id: &str,
         sql: &str,
         params: &ExecuteParams,
+        client_deadline: Option<std::time::Instant>,
     ) -> Result<ExecuteResult> {
-        self.execute_and_read(session_id, sql, params, RequestType::ExecuteStatement)
-            .await
+        self.execute_and_read(
+            session_id,
+            sql,
+            params,
+            RequestType::ExecuteStatement,
+            client_deadline,
+        )
+        .await
     }
 
     async fn submit_statement(
@@ -1397,6 +1445,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1417,6 +1466,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1441,6 +1491,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1464,6 +1515,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1483,6 +1535,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1501,6 +1554,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1525,6 +1579,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1543,6 +1598,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1579,6 +1635,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            None,
         )
         .await
     }
@@ -1744,6 +1801,7 @@ mod tests {
                 "UPDATE t SET x = x + 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                None,
             )
             .await
             .expect("polled DML execution must succeed");
@@ -1825,7 +1883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_to_terminal_timeout_preserves_error_and_cleanup() {
+    async fn synchronous_execute_has_no_hidden_poll_timeout() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1842,12 +1900,10 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/stmt-timeout"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(running))
-            .mount(&server)
-            .await;
-        Mock::given(method("DELETE"))
-            .and(path("/api/2.0/sql/statements/stmt-timeout"))
-            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(succeeded_inline_dml_body("stmt-timeout", 1)),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -1860,7 +1916,7 @@ mod tests {
                 ..TransportConfig::default()
             },
         );
-        let error = match transport
+        let terminal = transport
             .execute_to_terminal(
                 "sess-test",
                 "SELECT 1",
@@ -1868,13 +1924,12 @@ mod tests {
                 RequestType::ExecuteStatement,
             )
             .await
-        {
-            Ok(_) => panic!("perpetually running statement must time out"),
-            Err(error) => error,
-        };
+            .expect("sync execution must not inherit the async handle's poll timeout");
 
-        assert_eq!(error.code, crate::kernel_error::ErrorCode::Timeout);
-        assert_eq!(error.message, "Statement execution timed out");
+        assert!(matches!(
+            terminal.outcome,
+            TerminalExecutionOutcome::Succeeded(_)
+        ));
         server.verify().await;
     }
 

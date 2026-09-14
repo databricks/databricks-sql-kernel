@@ -33,6 +33,7 @@ pub mod params;
 pub mod params_codec;
 pub mod spec;
 
+pub(crate) mod timeout;
 pub(crate) mod validity;
 
 // Re-exports so wrappers can write `crate::statement::Statement` instead
@@ -43,3 +44,4 @@ pub use executed_async::{AsyncStatementCanceller, ExecutedAsyncStatement, Statem
 pub use handle::ExecutedStatementHandle;
 pub use mutable::{DirectStatement, Statement, StatementCanceller};
 pub use spec::{ResultFormat, StatementSpec, TypedValue};
+pub use timeout::{MAX_CLIENT_QUERY_TIMEOUT, MAX_CLIENT_QUERY_TIMEOUT_MS};

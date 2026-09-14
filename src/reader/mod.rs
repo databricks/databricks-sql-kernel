@@ -1480,6 +1480,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &ExecuteParams,
+            _: Option<std::time::Instant>,
         ) -> Result<ExecuteResult> {
             unreachable!()
         }

@@ -45,6 +45,8 @@ use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
 use std::ffi::{c_char, CStr, CString};
 
+pub use crate::statement::timeout::MAX_CLIENT_QUERY_TIMEOUT_MS;
+
 /// Upper bound on a positional parameter ordinal accepted over the C ABI.
 ///
 /// `StatementSpec::param` grows `positional_params` with
@@ -450,6 +452,66 @@ pub unsafe extern "C" fn kernel_statement_execute(
         return store_invalid_arg("kernel_statement_execute: out must not be null");
     }
 
+    execute_with_deadline(stmt, None, out)
+}
+
+/// Wait-for-result execution with an execution-scoped client deadline.
+///
+/// `timeout_ms == 0` disables the client deadline. A positive timeout covers
+/// C-ABI runtime admission, the initial ExecuteStatement request, retries and
+/// backoff, poll sleeps, status requests, and terminal-state mapping. Reader /
+/// schema materialisation and result fetching are outside it. The absolute
+/// deadline is captured on this native entry thread before work is queued onto
+/// the kernel runtime.
+///
+/// On expiry this returns [`KernelStatusCode::Timeout`], stores a non-retryable
+/// `HYT00` error (including the query id when already known), leaves `*out`
+/// null, and admits best-effort cancel/close work without waiting for it.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
+    stmt: *mut kernel_statement_t,
+    timeout_ms: u64,
+    out: *mut *mut kernel_executed_statement_t,
+) -> KernelStatusCode {
+    // Capture the monotonic origin at native entry, before validation, runtime
+    // initialisation, or queueing. Validation remains synchronous and RPC-free,
+    // but any time it consumes is still part of a positive caller budget.
+    let entered_at = std::time::Instant::now();
+    crate::c_abi::error::clear_error();
+    if out.is_null() {
+        return store_invalid_arg("kernel_statement_execute_with_timeout_ms: out must not be null");
+    }
+    std::ptr::write(out, std::ptr::null_mut());
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_invalid_arg(
+            "kernel_statement_execute_with_timeout_ms: stmt must not be null",
+        );
+    };
+    // Validate against the same finite range as the Rust surface, then derive
+    // from the instant captured above. No runtime work or RPC precedes this.
+    let deadline = match crate::statement::timeout::deadline_from_timeout_at(
+        std::time::Duration::from_millis(timeout_ms),
+        entered_at,
+    ) {
+        Ok(deadline) => deadline,
+        Err(error) => return store_and_code(error),
+    };
+
+    execute_with_deadline(stmt, deadline, out)
+}
+
+/// Shared sync-execute bridge after pointer/range validation and optional
+/// deadline capture. The timeout entry point initializes `out` to null before
+/// calling this helper; the legacy entry point deliberately preserves its
+/// existing failure-path out-parameter behavior.
+unsafe fn execute_with_deadline(
+    stmt: &mut Statement,
+    deadline: Option<std::time::Instant>,
+    out: *mut *mut kernel_executed_statement_t,
+) -> KernelStatusCode {
     // `Statement::execute` borrows `&mut self`; we need that borrow to
     // live across the `block_on`. Raw-pointer the statement so the
     // closure can re-borrow it inside the runtime without entangling
@@ -458,7 +520,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
     let stmt_ptr: *mut Statement = stmt;
     let executed = block_on_ffi(move || {
         let stmt: &mut Statement = unsafe { &mut *stmt_ptr };
-        Box::pin(async move { stmt.execute().await })
+        Box::pin(async move { stmt.execute_with_deadline(deadline).await })
     });
     match executed {
         Ok(exec) => {
