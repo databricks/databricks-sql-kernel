@@ -69,17 +69,30 @@ enum StatementOutcome {
     Err(Error),
 }
 
-/// Raw terminal response from the synchronous execution phase.
+/// Mapped terminal outcome from the synchronous execution phase.
 ///
 /// `statement_id` is captured from the initial execute response for cleanup;
-/// `response` is the final unmaterialised response returned by the server.
+/// the outcome still carries the unmaterialised response on success.
 struct TerminalExecution {
     statement_id: String,
-    response: ExecuteResponse,
+    outcome: TerminalExecutionOutcome,
     /// Whether the terminal response came from GetStatementStatus. The old
     /// synchronous path enriched those responses with a DML count, but not an
     /// initial terminal ExecuteStatement response.
     response_from_poll: bool,
+}
+
+/// Terminal-state mapping belongs to execution, while reader/schema creation
+/// and DML-result enrichment belong to result materialisation. Keeping the
+/// boundary explicit lets a later execution deadline cover success/error/cancel
+/// mapping without also covering result work.
+#[allow(
+    clippy::large_enum_variant,
+    reason = "ephemeral per-execution handoff; boxing would add a heap allocation to every successful query"
+)]
+enum TerminalExecutionOutcome {
+    Succeeded(ExecuteResponse),
+    Failed(Error),
 }
 
 /// SEA client for the Databricks SQL Statement Execution API.
@@ -651,7 +664,7 @@ impl SeaRestTransport {
         )
     }
 
-    /// Execute through the first raw terminal response, without creating a reader.
+    /// Execute through terminal-state mapping, without creating a reader.
     async fn execute_to_terminal(
         &self,
         session_id: &str,
@@ -681,9 +694,17 @@ impl SeaRestTransport {
             }
         };
 
+        let outcome = match Self::terminal_outcome(response) {
+            StatementOutcome::Done(response) => TerminalExecutionOutcome::Succeeded(response),
+            StatementOutcome::Err(error) => TerminalExecutionOutcome::Failed(error),
+            StatementOutcome::NotReady(_) => {
+                unreachable!("wait_for_terminal returned a non-terminal response")
+            }
+        };
+
         Ok(TerminalExecution {
             statement_id,
-            response,
+            outcome,
             response_from_poll,
         })
     }
@@ -754,28 +775,29 @@ impl SeaRestTransport {
         //     downloading chunk 0 to extract the result schema; a
         //     non-retriable 4xx / 5xx on that GET propagates up.
         //
-        let mut terminal = self
+        let terminal = self
             .execute_to_terminal(session_id, sql, params, request_type)
             .await?;
-        // Preserve the old sync behavior: a terminal GetStatementStatus response
-        // is DML-enriched before the result reader is handed off. It now happens
-        // after the raw terminal boundary, keeping this work out of the execution
-        // phase without shifting it onto the public result stream.
-        if terminal.response_from_poll {
-            self.enrich_num_modified_rows(&mut terminal.response).await;
-        }
-        let statement_id = terminal.statement_id;
-        let response = match Self::terminal_outcome(terminal.response) {
-            StatementOutcome::Done(response) => response,
-            StatementOutcome::Err(error) => {
+        let TerminalExecution {
+            statement_id,
+            outcome,
+            response_from_poll,
+        } = terminal;
+        let mut response = match outcome {
+            TerminalExecutionOutcome::Succeeded(response) => response,
+            TerminalExecutionOutcome::Failed(error) => {
                 self.close_orphaned_statement(&statement_id, "terminal_outcome")
                     .await;
                 return Err(error);
             }
-            StatementOutcome::NotReady(_) => {
-                unreachable!("execute_to_terminal returned a non-terminal response")
-            }
         };
+        // Preserve the old sync behavior: a terminal GetStatementStatus response
+        // is DML-enriched before the result reader is handed off. It now happens
+        // after terminal mapping, keeping this result work out of the execution
+        // phase without shifting it onto the public result stream.
+        if response_from_poll {
+            self.enrich_num_modified_rows(&mut response).await;
+        }
 
         let reader_factory = self.reader_factory()?;
         match self.materialise_response(reader_factory, response).await {
@@ -1751,6 +1773,54 @@ mod tests {
             .close_statement("stmt-polled-dml")
             .await
             .expect("test statement close must succeed");
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn execute_to_terminal_includes_terminal_error_mapping() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "stmt-mapped-failure",
+                "status": {
+                    "state": "FAILED",
+                    "sql_state": "42601",
+                    "error": {
+                        "error_code": "PARSE_SYNTAX_ERROR",
+                        "message": "syntax error. SQLSTATE: 42601",
+                    },
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_ready_test_client_against(&server.uri(), TransportConfig::default());
+        let terminal = transport
+            .execute_to_terminal(
+                "sess-test",
+                "SELEKT 1",
+                &ExecuteParams::default(),
+                RequestType::ExecuteStatement,
+            )
+            .await
+            .expect("terminal server failure is a mapped execution outcome");
+
+        assert_eq!(terminal.statement_id, "stmt-mapped-failure");
+        match terminal.outcome {
+            TerminalExecutionOutcome::Failed(error) => {
+                assert_eq!(error.code, crate::kernel_error::ErrorCode::SqlError);
+                assert_eq!(error.sql_state.as_deref(), Some("42601"));
+                assert_eq!(error.query_id.as_deref(), Some("stmt-mapped-failure"));
+            }
+            TerminalExecutionOutcome::Succeeded(_) => {
+                panic!("FAILED must be mapped before execute_to_terminal returns")
+            }
+        }
         server.verify().await;
     }
 
