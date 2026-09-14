@@ -1036,6 +1036,84 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
         .map_err(|e| Error::data_loss().message(format!("filter_tables_by_type: {e}")))
 }
 
+/// Apply the JDBC filters that the native metadata backend does not reliably
+/// enforce, then restore the established Thrift row order.
+pub(crate) fn process_native_tables(
+    batch: &RecordBatch,
+    catalog: Option<&str>,
+    table_types: Option<&[&str]>,
+) -> Result<RecordBatch> {
+    let catalog_filtered = if let Some(catalog) = catalog {
+        let catalog_idx = column_index(batch.schema_ref(), "TABLE_CAT").ok_or_else(|| {
+            Error::data_loss().message("process_native_tables: missing TABLE_CAT")
+        })?;
+        let catalogs = batch
+            .column(catalog_idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::data_loss().message("TABLE_CAT is not Utf8"))?;
+        let keep = arrow_array::BooleanArray::from(
+            (0..batch.num_rows())
+                .map(|i| !catalogs.is_null(i) && catalogs.value(i).eq_ignore_ascii_case(catalog))
+                .collect::<Vec<_>>(),
+        );
+        arrow_select::filter::filter_record_batch(batch, &keep).map_err(|e| {
+            Error::data_loss().message(format!("process_native_tables catalog filter: {e}"))
+        })?
+    } else {
+        batch.clone()
+    };
+
+    let type_filtered = match table_types {
+        Some(types) => filter_tables_by_type(&catalog_filtered, types)?,
+        None => catalog_filtered,
+    };
+    sort_tables(&type_filtered)
+}
+
+/// Native GetCrossReference narrows only the foreign side. Apply any parent
+/// identifiers supplied by the caller to the already canonical Thrift shape.
+pub(crate) fn filter_cross_reference_by_parent(
+    batch: &RecordBatch,
+    catalog: Option<&str>,
+    schema: Option<&str>,
+    table: Option<&str>,
+) -> Result<RecordBatch> {
+    if catalog.is_none() && schema.is_none() && table.is_none() {
+        return Ok(batch.clone());
+    }
+
+    let string_column = |name: &str| -> Result<&StringArray> {
+        let idx = column_index(batch.schema_ref(), name).ok_or_else(|| {
+            Error::data_loss().message(format!("filter_cross_reference: missing {name}"))
+        })?;
+        batch
+            .column(idx)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .ok_or_else(|| Error::data_loss().message(format!("{name} is not Utf8")))
+    };
+    let catalogs = string_column("PKTABLE_CAT")?;
+    let schemas = string_column("PKTABLE_SCHEM")?;
+    let tables = string_column("PKTABLE_NAME")?;
+    let matches = |values: &StringArray, i: usize, expected: Option<&str>| {
+        expected.is_none_or(|expected| {
+            !values.is_null(i) && values.value(i).eq_ignore_ascii_case(expected)
+        })
+    };
+    let keep = arrow_array::BooleanArray::from(
+        (0..batch.num_rows())
+            .map(|i| {
+                matches(catalogs, i, catalog)
+                    && matches(schemas, i, schema)
+                    && matches(tables, i, table)
+            })
+            .collect::<Vec<_>>(),
+    );
+    arrow_select::filter::filter_record_batch(batch, &keep)
+        .map_err(|e| Error::data_loss().message(format!("filter_cross_reference by parent: {e}")))
+}
+
 /// Reshape Databricks `SHOW KEYS` output into the JDBC
 /// `getPrimaryKeys` shape.
 ///
@@ -1360,6 +1438,29 @@ mod tests {
         let b = server_tables_full();
         let out = reshape_tables(&b, Some("main"), None).unwrap();
         assert_eq!(out.num_rows(), 3);
+    }
+
+    #[test]
+    fn native_tables_apply_case_insensitive_catalog_and_type_filters() {
+        let native = reshape_tables(&server_tables_full(), Some("main"), None).unwrap();
+
+        let views = process_native_tables(&native, Some("MAIN"), Some(&["view"])).unwrap();
+        assert_eq!(views.num_rows(), 1);
+        assert_eq!(
+            views
+                .column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "v1"
+        );
+        assert_eq!(
+            process_native_tables(&native, Some("other"), None)
+                .unwrap()
+                .num_rows(),
+            0
+        );
     }
 
     #[test]
@@ -1829,6 +1930,23 @@ mod tests {
         assert!(out.column(9).is_null(0)); // UPDATE_RULE
         assert!(out.column(10).is_null(0)); // DELETE_RULE
         assert!(out.column(12).is_null(0)); // PK_NAME
+    }
+
+    #[test]
+    fn native_cross_reference_filters_parent_case_insensitively() {
+        let native = reshape_foreign_keys(&server_show_foreign_keys()).unwrap();
+        assert_eq!(
+            filter_cross_reference_by_parent(&native, Some("MAIN"), Some("S"), Some("PARENT"))
+                .unwrap()
+                .num_rows(),
+            1
+        );
+        assert_eq!(
+            filter_cross_reference_by_parent(&native, None, None, Some("other"))
+                .unwrap()
+                .num_rows(),
+            0
+        );
     }
     // ─── filter_tables_by_type tests ───────────────────────────────
 

@@ -183,6 +183,10 @@ pub struct ResultManifest {
     /// Compression codec used for result data ("LZ4_FRAME" or absent for none)
     #[serde(default)]
     pub result_compression: Option<String>,
+    /// Whether the server returned the canonical Thrift metadata shape
+    /// instead of the SQL statement's raw `SHOW` / information-schema shape.
+    #[serde(default)]
+    pub is_native_metadata_result: Option<bool>,
 }
 
 /// Schema of the result set.
@@ -601,7 +605,8 @@ mod tests {
                     "columns": [{"name": "id", "type_name": "INT", "type_text": "INT", "position": 0}]
                 },
                 "total_chunk_count": 1,
-                "total_row_count": 100
+                "total_row_count": 100,
+                "is_native_metadata_result": true
             }
         }"#;
 
@@ -611,6 +616,7 @@ mod tests {
         assert!(response.manifest.is_some());
         let manifest = response.manifest.unwrap();
         assert_eq!(manifest.total_row_count, Some(100));
+        assert_eq!(manifest.is_native_metadata_result, Some(true));
     }
 
     #[test]
