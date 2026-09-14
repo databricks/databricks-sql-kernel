@@ -43,9 +43,7 @@ use std::time::{Duration, Instant};
 /// never reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConfig {
-    /// Maximum time an async handle's `await_result` waits for statement
-    /// completion (default: 600s). Synchronous `Statement::execute()` has no
-    /// hidden ceiling; its optional client deadline is supplied per execution.
+    /// Maximum wait for async-handle and metadata completion (default: 600s).
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,

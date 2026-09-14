@@ -213,9 +213,7 @@ fn running_body(statement_id: &str) -> String {
     .to_string()
 }
 
-/// Return a delayed response on the first execute and an immediate response on
-/// later calls. This lets timeout tests prove the same mutable Statement can be
-/// reused after its initial POST future is abandoned.
+/// Delay only the first execute response.
 struct DelayedFirstExecute {
     first: String,
     later: String,
@@ -1425,8 +1423,6 @@ async fn client_timeout_covers_initial_post_and_statement_is_immediately_reusabl
         "the 500ms POST must be abandoned near the 75ms deadline"
     );
 
-    // Both public unlimited sentinels and the largest finite value remain usable
-    // after the timed future was dropped before a statement id was observed.
     for timeout in [Duration::ZERO, Duration::MAX, MAX_CLIENT_QUERY_TIMEOUT] {
         let exec = stmt
             .execute_with_timeout(timeout)
@@ -1512,7 +1508,6 @@ async fn client_timeout_covers_poll_sleep_and_cleanup_does_not_delay_return() {
     drop(no_status_poll);
     drop(running);
 
-    // Reuse while cleanup for the timed-out id is still in flight.
     let batch = int64_batch("n", vec![2]);
     mount_execute(&server, closed_inline_body("stmt-after-timeout", &batch)).await;
     let exec = stmt

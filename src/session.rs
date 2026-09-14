@@ -101,8 +101,7 @@ pub(crate) struct SessionInner {
     /// (e.g. the [`Drop`] impl below).
     runtime_handle: tokio::runtime::Handle,
 
-    /// Bounded, non-blocking admission for best-effort cancel/close work after
-    /// a client query deadline expires.
+    /// Admission control for timeout cleanup.
     timeout_cleanup: TimeoutCleanupManager,
 
     /// Tracing span tagged with `session_id`. Every public method

@@ -95,11 +95,7 @@ enum TerminalExecutionOutcome {
     Failed(Error),
 }
 
-/// Failure while reaching a terminal response, plus the statement id when the
-/// initial execute response had already published one. Keeping the id beside
-/// the error lets the caller run orphan cleanup after the timed execution phase
-/// has ended, so cleanup latency can neither consume the client deadline nor
-/// replace the originating error with a client timeout.
+/// Execution failure and any statement id available for cleanup.
 #[derive(Debug)]
 struct TerminalExecutionFailure {
     statement_id: Option<String>,
@@ -479,21 +475,22 @@ impl SeaRestTransport {
         }
     }
 
-    /// Poll until the server reports a raw terminal statement state.
-    ///
-    /// This phase deliberately stops before terminal error mapping, reader creation,
-    /// schema extraction, or DML-count materialisation. Its caller applies the one
-    /// per-execution client deadline around the whole execute-and-poll future.
+    /// Poll until the server reports a raw terminal state.
     async fn wait_for_terminal(
         &self,
         response: ExecuteResponse,
+        poll_timeout: Option<std::time::Duration>,
     ) -> Result<(ExecuteResponse, bool)> {
+        let started = std::time::Instant::now();
         let mut current_response = response;
         let mut response_from_poll = false;
 
         loop {
             match current_response.status.state {
                 StatementState::Pending | StatementState::Running => {
+                    if poll_timeout.is_some_and(|timeout| started.elapsed() > timeout) {
+                        return Err(Error::timeout().message("Statement execution timed out"));
+                    }
                     tokio::time::sleep(self.config.poll_interval).await;
                     debug!(
                         statement_id = %current_response.statement_id,
@@ -695,13 +692,15 @@ impl SeaRestTransport {
             }
         }
 
-        let (response, response_from_poll) =
-            self.wait_for_terminal(response)
-                .await
-                .map_err(|error| TerminalExecutionFailure {
-                    statement_id: Some(statement_id.clone()),
-                    error,
-                })?;
+        let poll_timeout =
+            (request_type == RequestType::ExecuteMetadataQuery).then_some(self.config.poll_timeout);
+        let (response, response_from_poll) = self
+            .wait_for_terminal(response, poll_timeout)
+            .await
+            .map_err(|error| TerminalExecutionFailure {
+            statement_id: Some(statement_id.clone()),
+            error,
+        })?;
 
         let outcome = match Self::terminal_outcome(response) {
             StatementOutcome::Done(response) => TerminalExecutionOutcome::Succeeded(response),
@@ -1930,6 +1929,62 @@ mod tests {
             terminal.outcome,
             TerminalExecutionOutcome::Succeeded(_)
         ));
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_execute_retains_poll_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let running = json!({
+            "statement_id": "stmt-metadata-timeout",
+            "status": { "state": "RUNNING" },
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-metadata-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-metadata-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_ready_test_client_against(
+            &server.uri(),
+            TransportConfig {
+                poll_timeout: std::time::Duration::ZERO,
+                poll_interval: std::time::Duration::ZERO,
+                ..TransportConfig::default()
+            },
+        );
+        let error = match transport
+            .execute_and_read(
+                "sess-test",
+                "SHOW CATALOGS",
+                &ExecuteParams::default(),
+                RequestType::ExecuteMetadataQuery,
+                None,
+            )
+            .await
+        {
+            Ok(_) => panic!("metadata execution must retain its poll timeout"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::Timeout);
+        assert_eq!(error.message, "Statement execution timed out");
         server.verify().await;
     }
 

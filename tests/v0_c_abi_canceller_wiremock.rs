@@ -12,12 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Wiremock tests for the C ABI's statement execution controls: the detached
-//! statement canceller (`kernel_statement_canceller_new` / `_cancel` / `_free`)
-//! and the execution-scoped client query timeout. The null-guard unit test in
-//! `src/c_abi/statement.rs` only pins the bad-pointer paths; these tests drive
-//! the entry points against a mock SEA server to cover the behavior that
-//! actually matters:
+//! Wiremock tests for the C ABI's detached statement canceller and client query
+//! timeout. The tests drive the native entry points against a mock SEA server:
 //!
 //! - `canceller_cancels_a_running_execute_from_another_thread`: the headline
 //!   contract — one thread blocks in `kernel_statement_execute` while another
@@ -35,8 +31,7 @@
 //!   after its statement AND session are closed — the cancel still dispatches
 //!   (`dispatched == true`) and its POST reaches the server, proving the cloned
 //!   session `Arc` keeps the client-side session alive past `kernel_session_close`.
-//! - `client_timeout_c_abi_contract_and_reuse`: timeout status/error fields,
-//!   null output, finite-range validation, unlimited values, cleanup, and reuse.
+//! - `client_timeout_c_abi_contract_and_reuse`: timeout contract and reuse.
 //!
 //! The C ABI drives its own process-wide tokio runtime inside `block_on_ffi`,
 //! so the entry points must be called from plain (non-async) threads — hence
@@ -1670,8 +1665,6 @@ fn client_timeout_c_abi_contract_and_reuse() {
             KernelStatusCode::Success
         );
 
-        // The initial response publishes an id and enters the 500ms poll sleep.
-        // A 75ms client deadline must return promptly and null a non-null sentinel.
         let mut out = std::ptr::dangling_mut::<kernel_executed_statement_t>();
         let started = Instant::now();
         assert_eq!(
@@ -1702,7 +1695,6 @@ fn client_timeout_c_abi_contract_and_reuse() {
             "stmt-c-timeout"
         );
 
-        // Out-of-range values fail before any RPC and still clear the output.
         out = std::ptr::dangling_mut::<kernel_executed_statement_t>();
         assert_eq!(
             kernel_statement_execute_with_timeout_ms(
@@ -1714,8 +1706,6 @@ fn client_timeout_c_abi_contract_and_reuse() {
         );
         assert!(out.is_null());
 
-        // The maximum finite value and zero (unlimited) are both accepted, and
-        // the same statement is reusable immediately after its timed execution.
         for timeout_ms in [MAX_CLIENT_QUERY_TIMEOUT_MS, 0] {
             let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
             assert_eq!(

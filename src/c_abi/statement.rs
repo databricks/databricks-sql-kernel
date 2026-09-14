@@ -455,18 +455,11 @@ pub unsafe extern "C" fn kernel_statement_execute(
     execute_with_deadline(stmt, None, out)
 }
 
-/// Wait-for-result execution with an execution-scoped client deadline.
+/// Wait-for-result execution with a client deadline in milliseconds.
 ///
-/// `timeout_ms == 0` disables the client deadline. A positive timeout covers
-/// C-ABI runtime admission, the initial ExecuteStatement request, retries and
-/// backoff, poll sleeps, status requests, and terminal-state mapping. Reader /
-/// schema materialisation and result fetching are outside it. The absolute
-/// deadline is captured on this native entry thread before work is queued onto
-/// the kernel runtime.
-///
-/// On expiry this returns [`KernelStatusCode::Timeout`], stores a non-retryable
-/// `HYT00` error (including the query id when already known), leaves `*out`
-/// null, and admits best-effort cancel/close work without waiting for it.
+/// Zero disables the deadline. It starts at native entry, ends after terminal
+/// mapping, and excludes result materialisation. Timeout returns
+/// [`KernelStatusCode::Timeout`] with `HYT00` and leaves `*out` null.
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `out` must be writable.
@@ -476,9 +469,7 @@ pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
     timeout_ms: u64,
     out: *mut *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
-    // Capture the monotonic origin at native entry, before validation, runtime
-    // initialisation, or queueing. Validation remains synchronous and RPC-free,
-    // but any time it consumes is still part of a positive caller budget.
+    // Include validation and runtime queueing in the deadline.
     let entered_at = std::time::Instant::now();
     crate::c_abi::error::clear_error();
     if out.is_null() {
@@ -490,8 +481,6 @@ pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
             "kernel_statement_execute_with_timeout_ms: stmt must not be null",
         );
     };
-    // Validate against the same finite range as the Rust surface, then derive
-    // from the instant captured above. No runtime work or RPC precedes this.
     let deadline = match crate::statement::timeout::deadline_from_timeout_at(
         std::time::Duration::from_millis(timeout_ms),
         entered_at,
@@ -503,10 +492,9 @@ pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
     execute_with_deadline(stmt, deadline, out)
 }
 
-/// Shared sync-execute bridge after pointer/range validation and optional
-/// deadline capture. The timeout entry point initializes `out` to null before
-/// calling this helper; the legacy entry point deliberately preserves its
-/// existing failure-path out-parameter behavior.
+/// Run synchronous execution after entry-point validation.
+///
+/// The timeout entry point clears `out`; the legacy entry point does not.
 unsafe fn execute_with_deadline(
     stmt: &mut Statement,
     deadline: Option<std::time::Instant>,

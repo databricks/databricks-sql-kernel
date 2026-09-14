@@ -436,10 +436,8 @@ impl ExecutedAsyncStatement {
     }
 
     /// Block until the server reaches a terminal state, then return
-    /// the result stream. Internally polls with backoff using the
-    /// session's [`crate::client::TransportConfig`] cadence. This async-handle
-    /// ceiling is separate from the optional per-call client deadline on
-    /// synchronous `Statement::execute_with_timeout()`.
+    /// the result stream. Internally polls using the session's
+    /// [`crate::client::TransportConfig`] cadence and ceiling.
     ///
     /// **Drop-cancellation.** Dropping the returned future before
     /// it resolves to a terminal state (e.g. a winning branch in
@@ -459,8 +457,6 @@ impl ExecutedAsyncStatement {
         let result = async {
             self.valid.check()?;
 
-            // Poll cadence + ceiling come from the transport's config. The sync
-            // execute path instead takes an optional execution-scoped deadline.
             let cfg = self.session.transport().poll_config();
             let start = std::time::Instant::now();
 

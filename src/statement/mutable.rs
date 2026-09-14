@@ -306,8 +306,8 @@ impl Statement {
     /// `CloseStatement`) and adds ~150–260ms to the response —
     /// observed against Dogfood; see PR description for the bench
     /// numbers. The kernel polls internally if the query needs
-    /// longer than 10s. This entry point has no client query deadline;
-    /// use [`Statement::execute_with_timeout`] to apply one.
+    /// longer than 10s. Use [`Statement::execute_with_timeout`] to add a client
+    /// deadline.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// the kernel spawns a fire-and-forget `CloseStatement` against it
@@ -320,20 +320,16 @@ impl Statement {
         self.execute_with_deadline(None).await
     }
 
-    /// Wait-for-result execution bounded by one client-side deadline.
+    /// Execute with a client deadline through terminal-state mapping.
     ///
-    /// The timeout starts at method entry and covers the initial execute RPC,
-    /// retry/backoff, polling sleeps and status RPCs through terminal-state
-    /// mapping. Result/schema materialisation and fetching happen after that
-    /// boundary and are not timed. `Duration::ZERO` and `Duration::MAX` disable
-    /// the client deadline; network and server-side timeouts remain independent.
+    /// Result materialisation is excluded. `Duration::ZERO` and `Duration::MAX`
+    /// disable the deadline.
     pub async fn execute_with_timeout(&mut self, timeout: Duration) -> Result<ExecutedStatement> {
         let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
         self.execute_with_deadline(deadline).await
     }
 
-    /// Absolute-deadline form used by the C ABI, which captures the deadline
-    /// before enqueueing work on its runtime.
+    /// Absolute-deadline form used by the C ABI.
     pub(crate) async fn execute_with_deadline(
         &mut self,
         client_deadline: Option<Instant>,
@@ -385,11 +381,7 @@ impl Statement {
             {
                 Ok(result) => result,
                 Err(error) if crate::statement::timeout::is_client_query_timeout(&error) => {
-                    // The transport future has been abandoned at its deadline.
-                    // It cannot safely keep borrowing this reusable Statement;
-                    // hand only its immutable, attempt-local id to bounded
-                    // background cleanup and prevent the generic drop guard from
-                    // dispatching a duplicate cancel.
+                    // Cleanup owns only the attempt id; defuse the duplicate guard.
                     guard.defuse();
                     self.session
                         .dispatch_timeout_cleanup(error.query_id.clone());

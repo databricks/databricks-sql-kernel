@@ -708,32 +708,21 @@ KernelStatusCode kernel_statement_set_query_tags(kernel_statement_t* stmt,
                                                  const char* query_tags);
 
 /*
- * Wait-for-result execution. On success, `*out` holds an executed handle
- * released with `kernel_executed_statement_close`. This entry point has no
- * client query deadline; use kernel_statement_execute_with_timeout_ms to apply
- * one.
+ * Wait-for-result execution without a client query deadline. On success,
+ * release `*out` with `kernel_executed_statement_close`.
  */
 KernelStatusCode kernel_statement_execute(kernel_statement_t* stmt,
                                           kernel_executed_statement_t** out);
 
 /*
- * Wait-for-result execution with a client-side query deadline. `timeout_ms` is
- * an unsigned millisecond duration; 0 disables the deadline. Positive values
- * must be <= DATABRICKS_KERNEL_MAX_CLIENT_QUERY_TIMEOUT_MS or InvalidArgument is
- * returned before any RPC. The value is snapshotted per call and never sent as
- * SEA wait_timeout or a server-side statement timeout.
+ * Wait-for-result execution with a client-side deadline in milliseconds.
+ * Zero disables it; values above DATABRICKS_KERNEL_MAX_CLIENT_QUERY_TIMEOUT_MS
+ * return InvalidArgument. The deadline starts on entry, covers execution
+ * through terminal-state mapping, and excludes result materialisation and
+ * fetching. It is never sent to the server.
  *
- * The deadline is captured on function entry and covers C-ABI runtime queueing,
- * the initial ExecuteStatement request, execution/status retries and backoff,
- * poll sleeps, GetStatementStatus requests, and terminal-state mapping. It ends
- * before DML-count, reader/schema/result materialisation, result fetching,
- * CloudFetch downloads, or post-terminal close work.
- *
- * On expiry this returns KernelStatusCode_Timeout and the last error carries
- * SQLSTATE HYT00, retryable=false, and the query id when one was observed.
- * `*out` is initialized to NULL and remains NULL on every failure. Server cancel
- * and close are bounded best-effort background work and never delay this call.
- * The statement remains reusable.
+ * Timeout returns KernelStatusCode_Timeout with SQLSTATE HYT00 and leaves
+ * `*out` NULL. Cleanup is best effort and asynchronous; `stmt` remains reusable.
  *
  * This function has the same handle invalidation and panic contract as
  * kernel_statement_execute.

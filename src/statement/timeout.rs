@@ -20,12 +20,7 @@ use crate::klog::warn;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Largest finite client query timeout accepted by the kernel, in milliseconds.
-///
-/// This is the largest whole-millisecond duration representable by a signed
-/// 64-bit nanosecond budget. Keeping the public C-ABI range within this bound
-/// gives every binding one portable limit and leaves deadline construction free
-/// of integer wraparound.
+/// Largest finite timeout, constrained to signed 64-bit nanoseconds.
 pub const MAX_CLIENT_QUERY_TIMEOUT_MS: u64 = 9_223_372_036_854;
 
 /// Rust form of [`MAX_CLIENT_QUERY_TIMEOUT_MS`].
@@ -33,32 +28,20 @@ pub const MAX_CLIENT_QUERY_TIMEOUT: Duration = Duration::from_millis(MAX_CLIENT_
 
 pub(crate) const CLIENT_QUERY_TIMEOUT_SQL_STATE: &str = "HYT00";
 
-/// Bound background work created by client query timeouts per session.
-///
-/// Timeout cleanup is best effort. Admission must never queue behind other
-/// cleanup because doing so would put that wait back on the foreground timeout
-/// path. Sixty-four concurrent attempts is deliberately generous for a single
-/// session while still placing a hard ceiling on abandoned work.
+/// Maximum detached cleanup tasks per session.
 const MAX_CONCURRENT_TIMEOUT_CLEANUPS: usize = 64;
 
-/// Fresh budget for the detached cancel-then-close sequence.
-///
-/// This is independent of the expired query deadline. It bounds resources held
-/// by a failed or stalled cleanup without delaying the caller-visible timeout.
+/// Independent budget for detached cancel and close.
 const TIMEOUT_CLEANUP_BUDGET: Duration = Duration::from_secs(30);
 
 /// Convert a public relative timeout into one absolute monotonic deadline.
 ///
-/// `Duration::ZERO` and `Duration::MAX` are explicit unlimited sentinels on the
-/// Rust surface. Other values above [`MAX_CLIENT_QUERY_TIMEOUT`] are rejected so
-/// Rust and C callers share the same finite range.
+/// Zero and [`Duration::MAX`] mean unlimited.
 pub(crate) fn deadline_from_timeout(timeout: Duration) -> Result<Option<Instant>> {
     deadline_from_timeout_at(timeout, Instant::now())
 }
 
-/// Convert a relative timeout using a caller-supplied monotonic entry instant.
-/// The C ABI uses this form so runtime initialization and queueing consume the
-/// same budget captured at its native boundary.
+/// Convert a timeout using a caller-supplied entry instant.
 pub(crate) fn deadline_from_timeout_at(
     timeout: Duration,
     entered_at: Instant,
@@ -77,7 +60,6 @@ pub(crate) fn deadline_from_timeout_at(
         .ok_or_else(|| Error::invalid_argument().message("client query timeout is out of range"))
 }
 
-/// Build the caller-visible error for an expired client execution deadline.
 pub(crate) fn client_query_timeout_error(query_id: Option<&str>) -> Error {
     let mut error = Error::timeout()
         .message("Client query timeout expired")
@@ -89,14 +71,13 @@ pub(crate) fn client_query_timeout_error(query_id: Option<&str>) -> Error {
     error
 }
 
-/// Distinguish the local execution deadline from network/server timeout errors.
 pub(crate) fn is_client_query_timeout(error: &Error) -> bool {
     error.code == ErrorCode::Timeout
         && error.sql_state.as_deref() == Some(CLIENT_QUERY_TIMEOUT_SQL_STATE)
         && !error.retryable
 }
 
-/// Per-session, non-blocking admission control for timeout cleanup tasks.
+/// Per-session admission control for detached cleanup.
 pub(crate) struct TimeoutCleanupManager {
     permits: Arc<tokio::sync::Semaphore>,
 }
@@ -114,8 +95,7 @@ impl TimeoutCleanupManager {
         }
     }
 
-    /// Admit and spawn best-effort cancel/close work without ever waiting for
-    /// queue capacity. Saturation intentionally drops the cleanup request.
+    /// Spawn best-effort cleanup without waiting for capacity.
     pub(crate) fn dispatch(
         &self,
         runtime: &tokio::runtime::Handle,
