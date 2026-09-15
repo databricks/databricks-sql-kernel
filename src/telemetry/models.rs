@@ -300,6 +300,7 @@ pub(crate) enum DriverMode {
     TypeUnspecified,
     Thrift,
     Sea,
+    Kernel,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -463,7 +464,7 @@ mod tests {
             }),
             driver_connection_params: Some(DriverConnectionParameters {
                 http_path: Some("/sql/1.0/warehouses/abc".to_string()),
-                mode: Some(DriverMode::Sea),
+                mode: Some(DriverMode::Kernel),
                 host_info: Some(HostDetails {
                     host_url: Some("https://example.databricks.com".to_string()),
                     port: Some(443),
@@ -526,7 +527,7 @@ mod tests {
         ] {
             assert!(json.get(field).is_some(), "missing field {field}");
         }
-        assert_eq!(json["driver_connection_params"]["mode"], "SEA");
+        assert_eq!(json["driver_connection_params"]["mode"], "KERNEL");
         assert_eq!(json["driver_connection_params"]["auth_mech"], "PAT");
         assert_eq!(json["sql_operation"]["execution_result"], "EXTERNAL_LINKS");
     }

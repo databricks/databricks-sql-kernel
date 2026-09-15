@@ -404,7 +404,7 @@ fn build_connection_params(
 ) -> DriverConnectionParameters {
     DriverConnectionParameters {
         http_path: Some(format!("/sql/1.0/warehouses/{}", connection.warehouse_id)),
-        mode: Some(DriverMode::Sea),
+        mode: Some(DriverMode::Kernel),
         host_info: Some(HostDetails {
             host_url: Some(connection.host.clone()),
             port: None,
@@ -469,6 +469,20 @@ fn duration_millis(duration: Duration) -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn connection_params_identify_kernel_mode() {
+        let connection = ConnectionConfig::new("example.databricks.com", "warehouse-id");
+        let auth = AuthConfig::Pat {
+            token: "dapi-token".to_string(),
+            identity_federation_client_id: None,
+        };
+
+        assert_eq!(
+            build_connection_params(&connection, &auth).mode,
+            Some(DriverMode::Kernel)
+        );
+    }
 
     #[test]
     fn pat_auth_has_no_driver_auth_flow() {
