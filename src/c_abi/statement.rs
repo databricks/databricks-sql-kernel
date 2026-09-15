@@ -38,6 +38,7 @@
 use super::error::{store_and_code, store_invalid_arg};
 use super::result::{into_raw_executed_stream, kernel_result_stream_t};
 use super::{block_on_ffi, catch_ffi, KernelStatusCode};
+use crate::client::ExecutionTimeout;
 use crate::kernel_error::Error;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::mutable::Statement;
@@ -452,13 +453,13 @@ pub unsafe extern "C" fn kernel_statement_execute(
         return store_invalid_arg("kernel_statement_execute: out must not be null");
     }
 
-    execute_with_deadline(stmt, None, out)
+    execute_with_timeout_mode(stmt, ExecutionTimeout::Default, out)
 }
 
 /// Wait-for-result execution with a client deadline in milliseconds.
 ///
-/// Zero disables the deadline. It starts at native entry, ends after terminal
-/// mapping, and excludes result materialisation. Timeout returns
+/// Zero selects unlimited execution. A finite deadline starts at native entry,
+/// ends after terminal mapping, and excludes result materialisation. Timeout returns
 /// [`KernelStatusCode::Timeout`] with `HYT00` and leaves `*out` null.
 ///
 /// # Safety
@@ -481,23 +482,23 @@ pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
             "kernel_statement_execute_with_timeout_ms: stmt must not be null",
         );
     };
-    let deadline = match crate::statement::timeout::deadline_from_timeout_at(
+    let timeout = match crate::statement::timeout::deadline_from_timeout_at(
         std::time::Duration::from_millis(timeout_ms),
         entered_at,
     ) {
-        Ok(deadline) => deadline,
+        Ok(deadline) => ExecutionTimeout::from_explicit_deadline(deadline),
         Err(error) => return store_and_code(error),
     };
 
-    execute_with_deadline(stmt, deadline, out)
+    execute_with_timeout_mode(stmt, timeout, out)
 }
 
 /// Run synchronous execution after entry-point validation.
 ///
-/// The timeout entry point clears `out`; the legacy entry point does not.
-unsafe fn execute_with_deadline(
+/// The timeout entry point clears `out`; the existing entry point does not.
+unsafe fn execute_with_timeout_mode(
     stmt: &mut Statement,
-    deadline: Option<std::time::Instant>,
+    timeout: ExecutionTimeout,
     out: *mut *mut kernel_executed_statement_t,
 ) -> KernelStatusCode {
     // `Statement::execute` borrows `&mut self`; we need that borrow to
@@ -508,7 +509,7 @@ unsafe fn execute_with_deadline(
     let stmt_ptr: *mut Statement = stmt;
     let executed = block_on_ffi(move || {
         let stmt: &mut Statement = unsafe { &mut *stmt_ptr };
-        Box::pin(async move { stmt.execute_with_deadline(deadline).await })
+        Box::pin(async move { stmt.execute_with_timeout_mode(timeout).await })
     });
     match executed {
         Ok(exec) => {

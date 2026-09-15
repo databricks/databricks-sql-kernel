@@ -54,7 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
-use crate::client::DirectOutcome;
+use crate::client::{DirectOutcome, ExecutionTimeout};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::result_stream::ResultStream;
@@ -68,7 +68,7 @@ use crate::telemetry::{OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use tracing::Instrument;
 
 /// Outcome of [`Statement::execute_direct`] — the Thrift/JDBC directResults
@@ -306,8 +306,8 @@ impl Statement {
     /// `CloseStatement`) and adds ~150–260ms to the response —
     /// observed against Dogfood; see PR description for the bench
     /// numbers. The kernel polls internally if the query needs
-    /// longer than 10s. Use [`Statement::execute_with_timeout`] to add a client
-    /// deadline.
+    /// longer than 10s. This entry point retains the transport's 600s polling
+    /// ceiling; use [`Statement::execute_with_timeout`] to choose another limit.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// the kernel spawns a fire-and-forget `CloseStatement` against it
@@ -317,22 +317,24 @@ impl Statement {
     /// calls on it short-circuit to `InvalidStatementHandle` without
     /// hitting the wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        self.execute_with_deadline(None).await
+        self.execute_with_timeout_mode(ExecutionTimeout::Default)
+            .await
     }
 
     /// Execute with a client deadline through terminal-state mapping.
     ///
     /// Result materialisation is excluded. `Duration::ZERO` and `Duration::MAX`
-    /// disable the deadline.
+    /// explicitly select unlimited execution.
     pub async fn execute_with_timeout(&mut self, timeout: Duration) -> Result<ExecutedStatement> {
         let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
-        self.execute_with_deadline(deadline).await
+        self.execute_with_timeout_mode(ExecutionTimeout::from_explicit_deadline(deadline))
+            .await
     }
 
-    /// Absolute-deadline form used by the C ABI.
-    pub(crate) async fn execute_with_deadline(
+    /// Internal form used by the Rust and C ABI entry points.
+    pub(crate) async fn execute_with_timeout_mode(
         &mut self,
-        client_deadline: Option<Instant>,
+        timeout: ExecutionTimeout,
     ) -> Result<ExecutedStatement> {
         // `instrument` (rather than `.entered()`) so the resulting
         // future stays `Send` — napi-rs's `execute_tokio_future` and
@@ -371,12 +373,7 @@ impl Statement {
             let result = match self
                 .session
                 .transport()
-                .execute_statement(
-                    self.session.session_id(),
-                    &sql,
-                    &exec_params,
-                    client_deadline,
-                )
+                .execute_statement(self.session.session_id(), &sql, &exec_params, timeout)
                 .await
             {
                 Ok(result) => result,

@@ -20,8 +20,8 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteResultData, InlineChunkFetchResult, SessionAttribution, SessionInfo, Transport,
-    TransportConfig,
+    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
+    Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -674,6 +674,7 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
+        poll_timeout: Option<std::time::Duration>,
     ) -> std::result::Result<TerminalExecution, TerminalExecutionFailure> {
         let response = self
             .call_execute_api(session_id, sql, params, request_type)
@@ -692,8 +693,6 @@ impl SeaRestTransport {
             }
         }
 
-        let poll_timeout =
-            (request_type == RequestType::ExecuteMetadataQuery).then_some(self.config.poll_timeout);
         let (response, response_from_poll) = self
             .wait_for_terminal(response, poll_timeout)
             .await
@@ -763,7 +762,7 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
-        client_deadline: Option<std::time::Instant>,
+        timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
         // After call_execute_api succeeds, the SEA statement is open
         // on the server. Any subsequent failure before we hand back
@@ -784,9 +783,12 @@ impl SeaRestTransport {
         //     downloading chunk 0 to extract the result schema; a
         //     non-retriable 4xx / 5xx on that GET propagates up.
         //
-        let execution = self.execute_to_terminal(session_id, sql, params, request_type);
-        let execution_result = match client_deadline {
-            Some(deadline) => {
+        let poll_timeout =
+            matches!(timeout, ExecutionTimeout::Default).then_some(self.config.poll_timeout);
+        let execution =
+            self.execute_to_terminal(session_id, sql, params, request_type, poll_timeout);
+        let execution_result = match timeout {
+            ExecutionTimeout::Deadline(deadline) => {
                 match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), execution)
                     .await
                 {
@@ -802,7 +804,7 @@ impl SeaRestTransport {
                     }
                 }
             }
-            None => execution.await,
+            ExecutionTimeout::Default | ExecutionTimeout::Unlimited => execution.await,
         };
         let terminal = match execution_result {
             Ok(terminal) => terminal,
@@ -1067,14 +1069,14 @@ impl Transport for SeaRestTransport {
         session_id: &str,
         sql: &str,
         params: &ExecuteParams,
-        client_deadline: Option<std::time::Instant>,
+        timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
         self.execute_and_read(
             session_id,
             sql,
             params,
             RequestType::ExecuteStatement,
-            client_deadline,
+            timeout,
         )
         .await
     }
@@ -1444,7 +1446,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1465,7 +1467,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1490,7 +1492,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1514,7 +1516,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1534,7 +1536,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1553,7 +1555,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1578,7 +1580,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1597,7 +1599,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1634,7 +1636,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
-            None,
+            ExecutionTimeout::Default,
         )
         .await
     }
@@ -1800,7 +1802,7 @@ mod tests {
                 "UPDATE t SET x = x + 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
-                None,
+                ExecutionTimeout::Default,
             )
             .await
             .expect("polled DML execution must succeed");
@@ -1863,6 +1865,7 @@ mod tests {
                 "SELEKT 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                None,
             )
             .await
             .expect("terminal server failure is a mapped execution outcome");
@@ -1882,13 +1885,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn synchronous_execute_has_no_hidden_poll_timeout() {
+    async fn default_execute_retains_poll_timeout() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         let running = json!({
-            "statement_id": "stmt-timeout",
+            "statement_id": "stmt-default-timeout",
             "status": { "state": "RUNNING" },
         });
         Mock::given(method("POST"))
@@ -1898,10 +1901,69 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/2.0/sql/statements/stmt-timeout"))
+            .and(path("/api/2.0/sql/statements/stmt-default-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-default-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_ready_test_client_against(
+            &server.uri(),
+            TransportConfig {
+                poll_timeout: std::time::Duration::ZERO,
+                poll_interval: std::time::Duration::ZERO,
+                ..TransportConfig::default()
+            },
+        );
+        let error = match transport
+            .execute_and_read(
+                "sess-test",
+                "SELECT 1",
+                &ExecuteParams::default(),
+                RequestType::ExecuteStatement,
+                ExecutionTimeout::Default,
+            )
+            .await
+        {
+            Ok(_) => panic!("default execution must retain the transport poll timeout"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::Timeout);
+        assert_eq!(error.message, "Statement execution timed out");
+        assert!(error.retryable);
+        assert_eq!(error.sql_state, None);
+        assert_eq!(error.query_id, None);
+        server.verify().await;
+    }
+
+    #[tokio::test]
+    async fn explicit_unlimited_execute_bypasses_poll_timeout() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let running = json!({
+            "statement_id": "stmt-explicit-unlimited",
+            "status": { "state": "RUNNING" },
+        });
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(running))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-explicit-unlimited"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_string(succeeded_inline_dml_body("stmt-timeout", 1)),
+                    .set_body_string(succeeded_inline_dml_body("stmt-explicit-unlimited", 1)),
             )
             .expect(1)
             .mount(&server)
@@ -1915,20 +1977,17 @@ mod tests {
                 ..TransportConfig::default()
             },
         );
-        let terminal = transport
-            .execute_to_terminal(
+        transport
+            .execute_and_read(
                 "sess-test",
                 "SELECT 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                ExecutionTimeout::Unlimited,
             )
             .await
-            .expect("sync execution must not inherit the async handle's poll timeout");
+            .expect("an explicit unlimited timeout must bypass the default ceiling");
 
-        assert!(matches!(
-            terminal.outcome,
-            TerminalExecutionOutcome::Succeeded(_)
-        ));
         server.verify().await;
     }
 
@@ -1975,7 +2034,7 @@ mod tests {
                 "SHOW CATALOGS",
                 &ExecuteParams::default(),
                 RequestType::ExecuteMetadataQuery,
-                None,
+                ExecutionTimeout::Default,
             )
             .await
         {

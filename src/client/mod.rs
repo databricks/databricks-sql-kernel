@@ -46,5 +46,6 @@ pub use retry::{
 pub(crate) use sea::SeaRestTransport;
 pub(crate) use transport::{
     ChunkLinkFetchResult, DirectOutcome, ExecuteResponse, ExecuteResult, ExecuteResultData,
-    InlineChunkFetchResult, SessionAttribution, SessionInfo, Transport, TransportConfig,
+    ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo, Transport,
+    TransportConfig,
 };

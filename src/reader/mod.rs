@@ -1449,7 +1449,8 @@ mod tests {
 
     use crate::client::{
         ChunkLinkFetchResult, DatabricksHttpClient, ExecuteResponse, ExecuteResult,
-        ExecuteResultData, HttpClientConfig, InlineChunkFetchResult, SessionInfo, TransportConfig,
+        ExecuteResultData, ExecutionTimeout, HttpClientConfig, InlineChunkFetchResult, SessionInfo,
+        TransportConfig,
     };
     use crate::kernel_error::ErrorCode;
     use crate::reader::post_processor::PostProcessOptions;
@@ -1480,7 +1481,7 @@ mod tests {
             _: &str,
             _: &str,
             _: &ExecuteParams,
-            _: Option<std::time::Instant>,
+            _: ExecutionTimeout,
         ) -> Result<ExecuteResult> {
             unreachable!()
         }

@@ -708,16 +708,18 @@ KernelStatusCode kernel_statement_set_query_tags(kernel_statement_t* stmt,
                                                  const char* query_tags);
 
 /*
- * Wait-for-result execution without a client query deadline. On success,
- * release `*out` with `kernel_executed_statement_close`.
+ * Wait-for-result execution with the existing 600-second polling ceiling and
+ * no caller-supplied deadline. On success, release `*out` with
+ * `kernel_executed_statement_close`.
  */
 KernelStatusCode kernel_statement_execute(kernel_statement_t* stmt,
                                           kernel_executed_statement_t** out);
 
 /*
  * Wait-for-result execution with a client-side deadline in milliseconds.
- * Zero disables it; values above DATABRICKS_KERNEL_MAX_CLIENT_QUERY_TIMEOUT_MS
- * return InvalidArgument. The deadline starts on entry, covers execution
+ * Zero selects unlimited execution; values above
+ * DATABRICKS_KERNEL_MAX_CLIENT_QUERY_TIMEOUT_MS return InvalidArgument. A finite
+ * deadline starts on entry and covers execution
  * through terminal-state mapping, and excludes result materialisation and
  * fetching. It is never sent to the server.
  *

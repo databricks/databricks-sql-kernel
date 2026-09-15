@@ -644,11 +644,12 @@ impl Statement {
     /// Read-only access (for logging or assertion).
     pub fn spec_ref(&self) -> &StatementSpec;
 
-    /// Wait-for-result execution without a client deadline.
+    /// Wait-for-result execution with the existing 600s polling ceiling.
     pub async fn execute(&mut self) -> Result<ExecutedStatement>;
 
     /// Execute with a client deadline through terminal-state mapping.
-    /// Zero and Duration::MAX disable it; result materialisation is excluded.
+    /// Zero and Duration::MAX select unlimited execution; result materialisation
+    /// is excluded.
     pub async fn execute_with_timeout(
         &mut self,
         timeout: std::time::Duration,

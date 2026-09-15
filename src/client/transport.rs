@@ -35,6 +35,23 @@ use std::time::{Duration, Instant};
 
 // ─── Transport-shared config ────────────────────────────────────────
 
+/// Timeout policy for synchronous execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExecutionTimeout {
+    /// Preserve the transport's pre-existing polling ceiling.
+    Default,
+    /// The caller explicitly disabled the client timeout.
+    Unlimited,
+    /// Apply one absolute client deadline.
+    Deadline(Instant),
+}
+
+impl ExecutionTimeout {
+    pub(crate) fn from_explicit_deadline(deadline: Option<Instant>) -> Self {
+        deadline.map_or(Self::Unlimited, Self::Deadline)
+    }
+}
+
 /// Backend-agnostic configuration for [`Transport`] implementations.
 ///
 /// Contains polling settings shared across SEA REST, SEA gRPC, and
@@ -43,7 +60,7 @@ use std::time::{Duration, Instant};
 /// never reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConfig {
-    /// Maximum wait for async-handle and metadata completion (default: 600s).
+    /// Default polling ceiling for sync, async, and metadata execution (600s).
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,
@@ -295,7 +312,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         session_id: &str,
         sql: &str,
         params: &ExecuteParams,
-        client_deadline: Option<Instant>,
+        timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult>;
 
     /// Execute a SQL statement relying on the server's default inline wait

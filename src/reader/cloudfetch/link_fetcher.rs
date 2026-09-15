@@ -1095,7 +1095,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::client::{ExecuteResult, SessionInfo};
+    use crate::client::{ExecuteResult, ExecutionTimeout, SessionInfo};
     use crate::reader::EmptyReader;
     use crate::types::sea::{ExecuteParams, StatementState, StatementStatus};
     use arrow_schema::Schema;
@@ -1136,7 +1136,7 @@ mod tests {
             _session_id: &str,
             _sql: &str,
             _params: &ExecuteParams,
-            _client_deadline: Option<std::time::Instant>,
+            _timeout: ExecutionTimeout,
         ) -> Result<ExecuteResult> {
             Ok(ExecuteResult {
                 statement_id: "mock-statement".to_string(),
@@ -1239,7 +1239,7 @@ mod tests {
         }
 
         async fn list_catalogs(&self, _session_id: &str) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1249,7 +1249,7 @@ mod tests {
             _catalog: Option<&str>,
             _schema_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1261,7 +1261,7 @@ mod tests {
             _table_pattern: Option<&str>,
             _table_types: Option<&[&str]>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1273,7 +1273,7 @@ mod tests {
             _table_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1284,7 +1284,7 @@ mod tests {
             _schema_pattern: Option<&str>,
             _procedure_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1295,7 +1295,7 @@ mod tests {
             _schema_pattern: Option<&str>,
             _function_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1307,7 +1307,7 @@ mod tests {
             _procedure_pattern: Option<&str>,
             _column_pattern: Option<&str>,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1318,7 +1318,7 @@ mod tests {
             _schema: &str,
             _table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 
@@ -1332,7 +1332,7 @@ mod tests {
             _foreign_schema: &str,
             _foreign_table: &str,
         ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), None)
+            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
                 .await
         }
 

@@ -152,11 +152,18 @@ impl TimeoutCleanupManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::ExecutionTimeout;
 
     #[test]
     fn zero_and_duration_max_are_unlimited() {
-        assert_eq!(deadline_from_timeout(Duration::ZERO).unwrap(), None);
-        assert_eq!(deadline_from_timeout(Duration::MAX).unwrap(), None);
+        for timeout in [Duration::ZERO, Duration::MAX] {
+            let deadline = deadline_from_timeout(timeout).unwrap();
+            assert_eq!(deadline, None);
+            assert_eq!(
+                ExecutionTimeout::from_explicit_deadline(deadline),
+                ExecutionTimeout::Unlimited
+            );
+        }
     }
 
     #[test]
