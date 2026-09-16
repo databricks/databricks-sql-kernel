@@ -649,7 +649,8 @@ impl Statement {
 
     /// Execute with a client deadline through terminal-state mapping.
     /// Zero and Duration::MAX select unlimited execution; result materialisation
-    /// is excluded.
+    /// is excluded. An in-flight status request gets a fixed five-second grace
+    /// period, but no new status request starts after the deadline.
     pub async fn execute_with_timeout(
         &mut self,
         timeout: std::time::Duration,

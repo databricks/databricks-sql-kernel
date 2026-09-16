@@ -459,8 +459,10 @@ pub unsafe extern "C" fn kernel_statement_execute(
 /// Wait-for-result execution with a client deadline in milliseconds.
 ///
 /// Zero selects unlimited execution. A finite deadline starts at native entry,
-/// ends after terminal mapping, and excludes result materialisation. Timeout returns
-/// [`KernelStatusCode::Timeout`] with `HYT00` and leaves `*out` null.
+/// ends after terminal mapping, and excludes result materialisation. A status request
+/// already in flight at the deadline may finish within a fixed five-second grace
+/// period. Timeout returns [`KernelStatusCode::Timeout`] with `HYT00` and leaves
+/// `*out` null.
 ///
 /// # Safety
 /// `stmt` must be a live statement handle; `out` must be writable.

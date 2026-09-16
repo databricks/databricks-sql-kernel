@@ -37,7 +37,7 @@ use crate::types::sea::{
 use async_trait::async_trait;
 use reqwest::Method;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 
@@ -479,7 +479,8 @@ impl SeaRestTransport {
     async fn wait_for_terminal(
         &self,
         response: ExecuteResponse,
-        poll_timeout: Option<std::time::Duration>,
+        timeout: ExecutionTimeout,
+        status_request_in_flight: &AtomicBool,
     ) -> Result<(ExecuteResponse, bool)> {
         let started = std::time::Instant::now();
         let mut current_response = response;
@@ -488,21 +489,46 @@ impl SeaRestTransport {
         loop {
             match current_response.status.state {
                 StatementState::Pending | StatementState::Running => {
-                    if poll_timeout.is_some_and(|timeout| started.elapsed() > timeout) {
+                    if matches!(timeout, ExecutionTimeout::Default)
+                        && started.elapsed() > self.config.poll_timeout
+                    {
                         return Err(Error::timeout().message("Statement execution timed out"));
                     }
+                    if matches!(
+                        timeout,
+                        ExecutionTimeout::Deadline(deadline)
+                            if std::time::Instant::now() >= deadline
+                    ) {
+                        return Err(crate::statement::timeout::client_query_timeout_error(Some(
+                            &current_response.statement_id,
+                        )));
+                    }
                     tokio::time::sleep(self.config.poll_interval).await;
+                    // When the execution future is resumed during status grace,
+                    // do not turn a completed poll sleep into a new status call.
+                    if matches!(
+                        timeout,
+                        ExecutionTimeout::Deadline(deadline)
+                            if std::time::Instant::now() >= deadline
+                    ) {
+                        return Err(crate::statement::timeout::client_query_timeout_error(Some(
+                            &current_response.statement_id,
+                        )));
+                    }
                     debug!(
                         statement_id = %current_response.statement_id,
                         state = ?current_response.status.state,
                         "Polling statement status"
                     );
-                    current_response = self
+                    status_request_in_flight.store(true, Ordering::Release);
+                    let status_result = self
                         .get_statement_status_raw(
                             &current_response.statement_id,
                             SessionAttribution::Current,
                         )
-                        .await?;
+                        .await;
+                    status_request_in_flight.store(false, Ordering::Release);
+                    current_response = status_result?;
                     response_from_poll = true;
                 }
                 StatementState::Succeeded
@@ -674,7 +700,8 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
-        poll_timeout: Option<std::time::Duration>,
+        timeout: ExecutionTimeout,
+        status_request_in_flight: &AtomicBool,
     ) -> std::result::Result<TerminalExecution, TerminalExecutionFailure> {
         let response = self
             .call_execute_api(session_id, sql, params, request_type)
@@ -694,12 +721,12 @@ impl SeaRestTransport {
         }
 
         let (response, response_from_poll) = self
-            .wait_for_terminal(response, poll_timeout)
+            .wait_for_terminal(response, timeout, status_request_in_flight)
             .await
             .map_err(|error| TerminalExecutionFailure {
-            statement_id: Some(statement_id.clone()),
-            error,
-        })?;
+                statement_id: Some(statement_id.clone()),
+                error,
+            })?;
 
         let outcome = match Self::terminal_outcome(response) {
             StatementOutcome::Done(response) => TerminalExecutionOutcome::Succeeded(response),
@@ -783,16 +810,43 @@ impl SeaRestTransport {
         //     downloading chunk 0 to extract the result schema; a
         //     non-retriable 4xx / 5xx on that GET propagates up.
         //
-        let poll_timeout =
-            matches!(timeout, ExecutionTimeout::Default).then_some(self.config.poll_timeout);
-        let execution =
-            self.execute_to_terminal(session_id, sql, params, request_type, poll_timeout);
+        let status_request_in_flight = AtomicBool::new(false);
+        let execution = self.execute_to_terminal(
+            session_id,
+            sql,
+            params,
+            request_type,
+            timeout,
+            &status_request_in_flight,
+        );
+        tokio::pin!(execution);
         let execution_result = match timeout {
             ExecutionTimeout::Deadline(deadline) => {
-                match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), execution)
-                    .await
-                {
+                let deadline = tokio::time::Instant::from_std(deadline);
+                match tokio::time::timeout_at(deadline, &mut execution).await {
                     Ok(result) => result,
+                    Err(_) if status_request_in_flight.load(Ordering::Acquire) => {
+                        let grace_deadline = deadline
+                            .checked_add(
+                                crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE,
+                            )
+                            .unwrap_or(deadline);
+                        match tokio::time::timeout_at(grace_deadline, &mut execution).await {
+                            // Terminal server errors are mapped into a successful
+                            // TerminalExecution, so only that shape may beat the
+                            // client timeout during grace.
+                            Ok(Ok(terminal)) => Ok(terminal),
+                            Ok(Err(_)) | Err(_) => {
+                                let query_id =
+                                    params.inflight_id_observer.as_ref().and_then(|slot| {
+                                        slot.try_lock().ok().and_then(|id| id.clone())
+                                    });
+                                return Err(crate::statement::timeout::client_query_timeout_error(
+                                    query_id.as_deref(),
+                                ));
+                            }
+                        }
+                    }
                     Err(_) => {
                         let query_id = params
                             .inflight_id_observer
@@ -1865,7 +1919,8 @@ mod tests {
                 "SELEKT 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
-                None,
+                ExecutionTimeout::Unlimited,
+                &AtomicBool::new(false),
             )
             .await
             .expect("terminal server failure is a mapped execution outcome");

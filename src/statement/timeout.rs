@@ -28,6 +28,10 @@ pub const MAX_CLIENT_QUERY_TIMEOUT: Duration = Duration::from_millis(MAX_CLIENT_
 
 pub(crate) const CLIENT_QUERY_TIMEOUT_SQL_STATE: &str = "HYT00";
 
+/// Maximum time an already-running status request may finish after the client
+/// query deadline. No new status request starts once the deadline has passed.
+pub(crate) const CLIENT_QUERY_TIMEOUT_STATUS_GRACE: Duration = Duration::from_secs(5);
+
 /// Maximum detached cleanup tasks per session.
 const MAX_CONCURRENT_TIMEOUT_CLEANUPS: usize = 64;
 

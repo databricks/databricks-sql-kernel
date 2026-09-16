@@ -1532,7 +1532,7 @@ async fn client_timeout_covers_poll_sleep_and_cleanup_does_not_delay_return() {
 }
 
 #[tokio::test]
-async fn client_timeout_covers_delayed_terminal_status_and_mapping() {
+async fn client_timeout_allows_inflight_terminal_status_to_win_during_grace() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -1553,12 +1553,6 @@ async fn client_timeout_covers_delayed_terminal_status_and_mapping() {
         .expect(1)
         .mount(&server)
         .await;
-    Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/statements/stmt-delayed-terminal/cancel"))
-        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
-        .mount(&server)
-        .await;
-
     let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT broken");
@@ -1566,12 +1560,108 @@ async fn client_timeout_covers_delayed_terminal_status_and_mapping() {
         .execute_with_timeout(Duration::from_millis(700))
         .await
         .err()
-        .expect("deadline must expire while the terminal status RPC is in flight");
-    assert_client_query_timeout(&error, Some("stmt-delayed-terminal"));
+        .expect("the terminal server failure must win during status grace");
+    assert_eq!(error.code, ErrorCode::SqlError);
+    assert_eq!(error.message, "server failure. SQLSTATE: 42000");
+    assert_eq!(error.sql_state.as_deref(), Some("42000"));
+    assert_eq!(error.query_id.as_deref(), Some("stmt-delayed-terminal"));
 
     let closes =
         wait_for_close_delete(&server, "stmt-delayed-terminal", 1, Duration::from_secs(1)).await;
     assert_eq!(closes, 1);
+}
+
+#[tokio::test]
+async fn client_timeout_does_not_repoll_after_nonterminal_status_during_grace() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-running-during-grace")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-running-during-grace"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(running_body("stmt-running-during-grace"))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/2.0/sql/statements/stmt-running-during-grace/cancel",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT still_running");
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(700))
+        .await
+        .err()
+        .expect("a non-terminal response during grace must preserve the timeout");
+    assert_client_query_timeout(&error, Some("stmt-running-during-grace"));
+
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-running-during-grace",
+        1,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(closes, 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn client_timeout_caps_inflight_status_grace() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-stalled-status")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-stalled-status"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(failed_body("stmt-stalled-status", "too late", "42000"))
+                .set_delay(Duration::from_secs(10)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-stalled-status/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT stalled_status");
+    let started = Instant::now();
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(700))
+        .await
+        .err()
+        .expect("a status request must not outlive the fixed grace window");
+    let elapsed = started.elapsed();
+    assert_client_query_timeout(&error, Some("stmt-stalled-status"));
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
+        "timeout returned after {elapsed:?}, expected the five-second status grace"
+    );
+
+    let closes =
+        wait_for_close_delete(&server, "stmt-stalled-status", 1, Duration::from_secs(1)).await;
+    assert_eq!(closes, 1);
+    server.verify().await;
 }
 
 #[tokio::test]

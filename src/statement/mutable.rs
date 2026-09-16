@@ -324,7 +324,9 @@ impl Statement {
     /// Execute with a client deadline through terminal-state mapping.
     ///
     /// Result materialisation is excluded. `Duration::ZERO` and `Duration::MAX`
-    /// explicitly select unlimited execution.
+    /// explicitly select unlimited execution. A status request already in flight
+    /// at the deadline may finish within a fixed five-second grace period; no new
+    /// poll starts after the deadline.
     pub async fn execute_with_timeout(&mut self, timeout: Duration) -> Result<ExecutedStatement> {
         let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
         self.execute_with_timeout_mode(ExecutionTimeout::from_explicit_deadline(deadline))

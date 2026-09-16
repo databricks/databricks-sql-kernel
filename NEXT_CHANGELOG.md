@@ -22,6 +22,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Client query deadlines now allow an already-running statement-status request
+  up to five seconds to return a terminal result; no new poll starts after the
+  configured deadline.
+
 ### Updated
 
 ### Fixed
