@@ -25,6 +25,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Reject non-HTTPS endpoints before connecting when an mTLS client
+  certificate and private key are configured.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

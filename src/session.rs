@@ -263,6 +263,13 @@ impl Session {
             ))
         })?;
 
+        // A client certificate has no meaning on a plaintext transport.
+        // Reject the contradictory configuration before constructing an
+        // auth provider or issuing the CreateSession request; otherwise
+        // reqwest silently ignores the identity for `http://` and sends the
+        // bearer credential in cleartext.
+        validate_mtls_endpoint_scheme(&config)?;
+
         // Install the tracing subscriber from the caller's LoggingConfig —
         // but ONLY when they explicitly configured a filter or a
         // destination. This is the direct-Rust counterpart to the C ABI's
@@ -955,6 +962,33 @@ impl SessionBuilder {
 
 // ─── Internal config translation ─────────────────────────────────────
 
+/// Reject a fully configured mTLS identity on anything except HTTPS.
+///
+/// Incomplete identities are intentionally left to the HTTP-client
+/// validator, which reports which half is missing. Ordinary explicit HTTP
+/// endpoints remain supported for non-mTLS test servers.
+fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
+    if config.tls.client_cert_pem.is_none() || config.tls.client_key_pem.is_none() {
+        return Ok(());
+    }
+
+    let scheme = config
+        .connection
+        .host
+        .split_once("://")
+        .map(|(scheme, _)| scheme);
+    if scheme.is_some_and(|scheme| scheme.eq_ignore_ascii_case("https")) {
+        return Ok(());
+    }
+
+    let scheme = scheme
+        .filter(|scheme| !scheme.is_empty())
+        .unwrap_or("<missing>");
+    Err(Error::invalid_argument().message(format!(
+        "mTLS client identity requires an HTTPS endpoint; got scheme '{scheme}'"
+    )))
+}
+
 /// Translate the public [`HttpConfig`] (+ proxy / TLS / org_id) into
 /// the internal [`HttpClientConfig`] the HTTP client expects.
 ///
@@ -1434,6 +1468,84 @@ async fn build_base_auth_provider(
             .message("AuthConfig::OAuthFederation is reserved for v0.1; not yet wired")),
         AuthConfig::External(_) => Err(Error::invalid_argument()
             .message("AuthConfig::External is reserved; v0 wires PAT + OAuthM2M + OAuthU2M only")),
+    }
+}
+
+#[cfg(test)]
+mod mtls_endpoint_tests {
+    use super::*;
+
+    fn config(host: &str, cert: bool, key: bool) -> SessionConfig {
+        let tls = TlsConfig {
+            client_cert_pem: cert.then(|| b"test-cert".to_vec()),
+            client_key_pem: key.then(|| b"test-key".to_vec()),
+            ..TlsConfig::default()
+        };
+
+        SessionConfig {
+            connection: ConnectionConfig::new(host, "test_wh"),
+            defaults: None,
+            auth: AuthConfig::Pat {
+                token: "dapi-test".to_string(),
+                identity_federation_client_id: None,
+            },
+            driver_system_configuration: None,
+            session_conf: Default::default(),
+            http: HttpConfig::default(),
+            proxy: None,
+            tls,
+            result: ResultConfig::default(),
+            logging: LoggingConfig::default(),
+            telemetry: TelemetryConfig::default(),
+            transport: None,
+        }
+    }
+
+    #[test]
+    fn complete_mtls_identity_accepts_only_https() {
+        for host in [
+            "https://workspace.databricks.com",
+            "HTTPS://workspace.databricks.com",
+            "workspace.databricks.com",
+        ] {
+            validate_mtls_endpoint_scheme(&config(host, true, true))
+                .unwrap_or_else(|error| panic!("{host} should be accepted: {error}"));
+        }
+
+        for host in [
+            "http://127.0.0.1:8080",
+            "HTTP://127.0.0.1:8080",
+            "ftp://workspace.databricks.com",
+        ] {
+            let error = validate_mtls_endpoint_scheme(&config(host, true, true))
+                .expect_err("non-HTTPS mTLS endpoint must be rejected");
+            assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+            assert!(error.message.contains("HTTPS"), "{}", error.message);
+        }
+    }
+
+    #[test]
+    fn explicit_http_remains_available_without_a_complete_mtls_identity() {
+        for (cert, key) in [(false, false), (true, false), (false, true)] {
+            validate_mtls_endpoint_scheme(&config("http://127.0.0.1:8080", cert, key))
+                .expect("scheme validation must not replace ordinary HTTP or missing-half checks");
+        }
+    }
+
+    #[tokio::test]
+    async fn session_open_rejects_http_mtls_before_client_construction() {
+        for host in ["http://127.0.0.1:1", "HTTP://127.0.0.1:1"] {
+            let error = Session::open(config(host, true, true))
+                .await
+                .expect_err("HTTP mTLS session must fail before dialing");
+            assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+            assert!(error.message.contains("HTTPS"), "{}", error.message);
+            assert!(
+                !error.message.contains("Failed to construct HTTP client"),
+                "scheme validation must run before HTTP client construction: {}",
+                error.message
+            );
+        }
     }
 }
 

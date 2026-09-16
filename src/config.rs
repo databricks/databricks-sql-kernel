@@ -87,9 +87,10 @@ impl ConnectionConfig {
     /// bare warehouse id (no `/sql/1.0/...` prefix).
     ///
     /// `host` is normalised: `https://` is prepended if no scheme is
-    /// present, and any trailing `/` is stripped. So `"my-workspace.databricks.com"`,
-    /// `"my-workspace.databricks.com/"`, and
-    /// `"https://my-workspace.databricks.com"` all produce the same
+    /// present, an explicitly supplied HTTP(S) scheme is canonicalised
+    /// case-insensitively, and any trailing `/` is stripped. So
+    /// `"my-workspace.databricks.com"`, `"my-workspace.databricks.com/"`,
+    /// and `"HTTPS://my-workspace.databricks.com"` all produce the same
     /// canonical `host`.
     pub fn new(host: impl Into<String>, warehouse_id: impl Into<String>) -> Self {
         Self {
@@ -131,14 +132,20 @@ impl ConnectionConfig {
 }
 
 /// Normalise a workspace host: prepend `https://` if no scheme is
-/// present, and strip any trailing `/`. Done eagerly at config
-/// construction so the rest of the kernel never has to second-guess
-/// the input shape.
+/// present, canonicalise an explicit HTTP(S) scheme case-insensitively,
+/// and strip any trailing `/`. Other explicit schemes are preserved so
+/// later configuration validation can reject them rather than disguising
+/// them as part of an HTTPS host.
 fn normalise_host(host: String) -> String {
-    let with_scheme = if host.starts_with("http://") || host.starts_with("https://") {
-        host
-    } else {
-        format!("https://{host}")
+    let with_scheme = match host.split_once("://") {
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("http") => {
+            format!("http://{rest}")
+        }
+        Some((scheme, rest)) if scheme.eq_ignore_ascii_case("https") => {
+            format!("https://{rest}")
+        }
+        Some(_) => host,
+        None => format!("https://{host}"),
     };
     with_scheme.trim_end_matches('/').to_string()
 }
@@ -1004,6 +1011,9 @@ pub struct TlsConfig {
     /// together; setting only one is rejected at
     /// [`Session::open`](crate::Session::open) with
     /// `ErrorCode::InvalidArgument`.
+    /// When both are set, the connection endpoint must use HTTPS;
+    /// an explicitly non-HTTPS scheme is rejected before any request
+    /// is sent.
     ///
     /// **Validation timing differs by backend.** Under `tls-native`,
     /// `from_pkcs8_pem` validates the cert/key pair at `Session::open`,
@@ -2036,6 +2046,21 @@ mod tests {
         // https:// when the caller has explicitly opted into http.
         let c = ConnectionConfig::new("http://127.0.0.1:8080", "abc");
         assert_eq!(c.host, "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn new_normalises_explicit_http_scheme_case() {
+        let http = ConnectionConfig::new("HTTP://127.0.0.1:8080", "abc");
+        assert_eq!(http.host, "http://127.0.0.1:8080");
+
+        let https = ConnectionConfig::new("HTTPS://workspace.databricks.com", "abc");
+        assert_eq!(https.host, "https://workspace.databricks.com");
+    }
+
+    #[test]
+    fn new_preserves_other_explicit_schemes_for_later_validation() {
+        let c = ConnectionConfig::new("ftp://workspace.databricks.com", "abc");
+        assert_eq!(c.host, "ftp://workspace.databricks.com");
     }
 
     #[test]
