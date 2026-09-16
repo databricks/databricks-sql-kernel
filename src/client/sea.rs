@@ -866,6 +866,13 @@ impl SeaRestTransport {
                 statement_id,
                 error,
             }) => {
+                // The deadline can become ready in the same scheduler tick as
+                // the poll sleep. If the inner check wins, preserve the normal
+                // timeout contract: the statement layer dispatches bounded
+                // cancel/close cleanup without delaying this return.
+                if crate::statement::timeout::is_client_query_timeout(&error) {
+                    return Err(error);
+                }
                 if let Some(statement_id) = statement_id {
                     self.close_orphaned_statement(&statement_id, "wait_for_terminal")
                         .await;
