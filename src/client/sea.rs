@@ -837,10 +837,10 @@ impl SeaRestTransport {
                             // client timeout during grace.
                             Ok(Ok(terminal)) => Ok(terminal),
                             Ok(Err(_)) | Err(_) => {
-                                let query_id =
-                                    params.inflight_id_observer.as_ref().and_then(|slot| {
-                                        slot.try_lock().ok().and_then(|id| id.clone())
-                                    });
+                                let query_id = params
+                                    .inflight_id_observer
+                                    .as_ref()
+                                    .and_then(|slot| slot.lock().ok().and_then(|id| id.clone()));
                                 return Err(crate::statement::timeout::client_query_timeout_error(
                                     query_id.as_deref(),
                                 ));
@@ -851,7 +851,7 @@ impl SeaRestTransport {
                         let query_id = params
                             .inflight_id_observer
                             .as_ref()
-                            .and_then(|slot| slot.try_lock().ok().and_then(|id| id.clone()));
+                            .and_then(|slot| slot.lock().ok().and_then(|id| id.clone()));
                         return Err(crate::statement::timeout::client_query_timeout_error(
                             query_id.as_deref(),
                         ));
