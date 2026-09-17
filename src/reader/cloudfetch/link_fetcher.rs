@@ -1147,6 +1147,7 @@ mod tests {
                     state: StatementState::Succeeded,
                     error: None,
                     sql_state: None,
+                    session_version: None,
                     num_modified_rows: None,
                     display_message: None,
                     diagnostic_info: None,
@@ -1175,6 +1176,7 @@ mod tests {
         async fn fetch_completed_result(
             &self,
             _statement_id: &str,
+            _session_attribution: crate::client::SessionAttribution,
         ) -> Result<Option<ExecuteResult>> {
             unimplemented!("fetch_completed_result not used by the link-fetcher mock")
         }
@@ -1182,6 +1184,7 @@ mod tests {
         async fn statement_status(
             &self,
             _statement_id: &str,
+            _session_attribution: crate::client::SessionAttribution,
         ) -> Result<crate::client::ExecuteResponse> {
             unimplemented!("statement_status not used by the link-fetcher mock")
         }

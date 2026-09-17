@@ -44,7 +44,7 @@
 //! class) can route through whichever handle their language idiom
 //! prefers; field availability is identical.
 
-use crate::client::ExecuteResponse;
+use crate::client::{ExecuteResponse, SessionAttribution};
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -225,6 +225,14 @@ pub struct ExecutedAsyncStatement {
 }
 
 impl ExecutedAsyncStatement {
+    fn session_attribution(&self) -> SessionAttribution {
+        if self.owning {
+            SessionAttribution::Current
+        } else {
+            SessionAttribution::Detached
+        }
+    }
+
     /// Crate-internal constructor. Built by [`Statement::submit`].
     ///
     /// `closed` is shared with the parent [`Statement`] so flipping it
@@ -395,7 +403,7 @@ impl ExecutedAsyncStatement {
             let response = self
                 .session
                 .transport()
-                .statement_status(&self.statement_id)
+                .statement_status(&self.statement_id, self.session_attribution())
                 .await?;
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
@@ -485,7 +493,7 @@ impl ExecutedAsyncStatement {
                 let response = self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id)
+                    .statement_status(&self.statement_id, self.session_attribution())
                     .await?;
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
@@ -579,7 +587,7 @@ impl ExecutedAsyncStatement {
         match self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id)
+            .fetch_completed_result(&self.statement_id, self.session_attribution())
             .await?
         {
             Some(result) => {
@@ -627,7 +635,7 @@ impl ExecutedAsyncStatement {
                 let observed = match self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id)
+                    .statement_status(&self.statement_id, self.session_attribution())
                     .await
                 {
                     Ok(r) => match r.status.state {

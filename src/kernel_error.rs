@@ -900,6 +900,7 @@ mod tests {
                 sql_state: Some("42P01".to_string()),
             }),
             sql_state: None,
+            session_version: None,
             num_modified_rows: None,
             display_message: None,
             diagnostic_info: None,

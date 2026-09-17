@@ -20,7 +20,8 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteResultData, InlineChunkFetchResult, SessionInfo, Transport, TransportConfig,
+    ExecuteResultData, InlineChunkFetchResult, SessionAttribution, SessionInfo, Transport,
+    TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -30,11 +31,13 @@ use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
     CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteParams,
-    ExecuteStatementRequest, GetChunksResponse, StatementExecutionResponse, StatementState,
+    ExecuteStatementRequest, GetChunksResponse, SessionExecutionMode, SessionVersion,
+    StatementExecutionResponse, StatementState,
 };
 use async_trait::async_trait;
 use reqwest::Method;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, OnceLock};
 use tokio::runtime::Handle as RuntimeHandle;
 
@@ -46,6 +49,8 @@ use tokio::runtime::Handle as RuntimeHandle;
 /// advisory — a server that does not recognise it ignores it — so there is
 /// nothing for a caller to configure.
 const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
+/// DBSQL omits session versions, while server-issued FAST versions start at 1.
+const NO_SESSION_VERSION: i64 = 0;
 
 /// Internal terminal-outcome for a single SEA statement response.
 ///
@@ -75,6 +80,7 @@ pub(crate) struct SeaRestTransport {
     host: String,
     warehouse_id: String,
     config: TransportConfig,
+    session_version: AtomicI64,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
@@ -85,6 +91,7 @@ impl std::fmt::Debug for SeaRestTransport {
             .field("host", &self.host)
             .field("warehouse_id", &self.warehouse_id)
             .field("config", &self.config)
+            .field("session_version", &self.current_session_version())
             .field(
                 "reader_factory",
                 &if self.reader_factory.get().is_some() {
@@ -114,6 +121,7 @@ impl SeaRestTransport {
             host: host.into(),
             warehouse_id: warehouse_id.into(),
             config,
+            session_version: AtomicI64::new(NO_SESSION_VERSION),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
         }
@@ -138,6 +146,18 @@ impl SeaRestTransport {
     /// Build the base URL for API requests.
     fn base_url(&self) -> String {
         format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
+    }
+
+    fn current_session_version(&self) -> Option<SessionVersion> {
+        let version_id = self.session_version.load(Ordering::SeqCst);
+        (version_id != NO_SESSION_VERSION).then_some(SessionVersion { version_id })
+    }
+
+    fn observe_session_version(&self, version: Option<SessionVersion>) {
+        if let Some(version) = version {
+            self.session_version
+                .fetch_max(version.version_id, Ordering::SeqCst);
+        }
     }
 
     /// Build the `/result/chunks/{idx}` URL, optionally with the
@@ -229,7 +249,11 @@ impl SeaRestTransport {
     }
 
     /// Poll for statement status (private — used by wait_for_completion).
-    async fn get_statement_status(&self, statement_id: &str) -> Result<ExecuteResponse> {
+    async fn get_statement_status(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements/{}", self.base_url(), statement_id);
 
         debug!("Getting statement status at {}", url);
@@ -258,6 +282,10 @@ impl SeaRestTransport {
                     "Failed to parse status response: {e} - body: {body}"
                 ))
             })?;
+
+        if session_attribution == SessionAttribution::Current {
+            self.observe_session_version(sea_response.status.session_version);
+        }
 
         debug!(
             "Status response: statement_id={}, status={:?}",
@@ -417,7 +445,9 @@ impl SeaRestTransport {
                         state = ?r.status.state,
                         "Polling statement status"
                     );
-                    current_response = self.get_statement_status(&r.statement_id).await?;
+                    current_response = self
+                        .get_statement_status(&r.statement_id, SessionAttribution::Current)
+                        .await?;
                 }
             }
         }
@@ -461,6 +491,7 @@ impl SeaRestTransport {
             warehouse_id: self.warehouse_id.clone(),
             statement: sql.to_string(),
             session_id: Some(session_id.to_string()),
+            session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
             disposition: disposition.to_string(),
@@ -518,6 +549,8 @@ impl SeaRestTransport {
                     "Failed to parse execute response: {e} - body: {body}"
                 ))
             })?;
+
+        self.observe_session_version(sea_response.status.session_version);
 
         debug!(
             "Execute response: statement_id={}, status={:?}",
@@ -790,6 +823,7 @@ impl Transport for SeaRestTransport {
             catalog: catalog.map(|s| s.to_string()),
             schema: schema.map(|s| s.to_string()),
             session_confs: session_config,
+            execution_mode: SessionExecutionMode::Fast,
         };
 
         debug!("Creating session at {}", url);
@@ -819,6 +853,8 @@ impl Transport for SeaRestTransport {
                 "Failed to parse session response: {e} - body: {body}"
             ))
         })?;
+
+        self.observe_session_version(session_response.session_version);
 
         debug!("Created session: {}", session_response.session_id);
 
@@ -976,8 +1012,14 @@ impl Transport for SeaRestTransport {
         }
     }
 
-    async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>> {
-        let response = self.get_statement_status(statement_id).await?;
+    async fn fetch_completed_result(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<Option<ExecuteResult>> {
+        let response = self
+            .get_statement_status(statement_id, session_attribution)
+            .await?;
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
@@ -998,8 +1040,13 @@ impl Transport for SeaRestTransport {
         }
     }
 
-    async fn statement_status(&self, statement_id: &str) -> Result<ExecuteResponse> {
-        self.get_statement_status(statement_id).await
+    async fn statement_status(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<ExecuteResponse> {
+        self.get_statement_status(statement_id, session_attribution)
+            .await
     }
 
     async fn get_result_chunks(
@@ -1490,6 +1537,7 @@ mod tests {
                     sql_state: None,
                 }),
                 sql_state: None,
+                session_version: None,
                 num_modified_rows: None,
                 display_message: None,
                 diagnostic_info: None,
@@ -1576,6 +1624,7 @@ mod tests {
                 state: StatementState::Succeeded,
                 error: None,
                 sql_state: None,
+                session_version: None,
                 num_modified_rows: None,
                 display_message: None,
                 diagnostic_info: None,
@@ -1842,6 +1891,208 @@ mod tests {
             "warehouse-123",
             TransportConfig::default(),
         )
+    }
+
+    #[tokio::test]
+    async fn exchanges_session_versions_on_create_and_execute() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .and(body_json(json!({
+                "warehouse_id": "warehouse-123",
+                "execution_mode": "FAST",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "session_id": "session-1",
+                "session_version": { "version_id": 7 },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_json(json!({
+                "warehouse_id": "warehouse-123",
+                "statement": "SELECT 1",
+                "session_id": "session-1",
+                "session_version": { "version_id": 7 },
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-1",
+                "status": {
+                    "state": "PENDING",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/statement-1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-1",
+                "status": {
+                    "state": "SUCCEEDED",
+                    "session_version": { "version_id": 9 },
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_json(json!({
+                "warehouse_id": "warehouse-123",
+                "statement": "SELECT 2",
+                "session_id": "session-1",
+                "session_version": { "version_id": 9 },
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-2",
+                "status": {
+                    "state": "PENDING",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against(&server.uri());
+        let session = transport
+            .create_session(None, None, HashMap::new())
+            .await
+            .expect("FAST session creation must succeed");
+
+        transport
+            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .await
+            .expect("FAST execution must send the initial session version");
+        transport
+            .get_statement_status("statement-1", SessionAttribution::Current)
+            .await
+            .expect("session-owned polling must observe the terminal version");
+        assert_eq!(
+            transport.current_session_version(),
+            Some(SessionVersion { version_id: 9 })
+        );
+
+        transport
+            .submit_statement(&session.session_id, "SELECT 2", &ExecuteParams::default())
+            .await
+            .expect("FAST execution must send the maximum observed session version");
+        transport.observe_session_version(Some(SessionVersion { version_id: 8 }));
+        assert_eq!(
+            transport.current_session_version(),
+            Some(SessionVersion { version_id: 9 })
+        );
+    }
+
+    #[tokio::test]
+    async fn keeps_session_version_absent_when_server_omits_it() {
+        use serde_json::json;
+        use wiremock::matchers::{body_json, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(r#"{"session_id":"session-1"}"#),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_json(json!({
+                "warehouse_id": "warehouse-123",
+                "statement": "SELECT 1",
+                "session_id": "session-1",
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "statement-1",
+                "status": {
+                    "state": "PENDING",
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let transport = create_test_client_against(&server.uri());
+        let session = transport
+            .create_session(None, None, HashMap::new())
+            .await
+            .expect("FAST session creation must accept a missing session version");
+        assert_eq!(transport.current_session_version(), None);
+
+        transport
+            .submit_statement(&session.session_id, "SELECT 1", &ExecuteParams::default())
+            .await
+            .expect("execution without a session version must succeed");
+        assert_eq!(transport.current_session_version(), None);
+    }
+
+    #[tokio::test]
+    async fn advances_session_version_only_from_session_owned_polls() {
+        use serde_json::json;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        for (statement_id, version_id) in [("owned", 9), ("detached", 11)] {
+            Mock::given(method("GET"))
+                .and(path(format!("/api/2.0/sql/statements/{statement_id}")))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "statement_id": statement_id,
+                    "status": {
+                        "state": "SUCCEEDED",
+                        "session_version": { "version_id": version_id },
+                    },
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+
+        let transport = create_test_client_against(&server.uri());
+        transport.observe_session_version(Some(SessionVersion { version_id: 7 }));
+
+        transport
+            .get_statement_status("owned", SessionAttribution::Current)
+            .await
+            .expect("session-owned polling must succeed");
+        assert_eq!(
+            transport.current_session_version(),
+            Some(SessionVersion { version_id: 9 })
+        );
+
+        transport
+            .statement_status("detached", SessionAttribution::Detached)
+            .await
+            .expect("detached polling must succeed");
+        assert_eq!(
+            transport.current_session_version(),
+            Some(SessionVersion { version_id: 9 })
+        );
     }
 
     #[tokio::test]

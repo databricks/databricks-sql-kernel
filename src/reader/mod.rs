@@ -1499,10 +1499,18 @@ mod tests {
         ) -> Result<crate::client::DirectOutcome> {
             unreachable!()
         }
-        async fn fetch_completed_result(&self, _: &str) -> Result<Option<ExecuteResult>> {
+        async fn fetch_completed_result(
+            &self,
+            _: &str,
+            _: crate::client::SessionAttribution,
+        ) -> Result<Option<ExecuteResult>> {
             unreachable!()
         }
-        async fn statement_status(&self, _: &str) -> Result<ExecuteResponse> {
+        async fn statement_status(
+            &self,
+            _: &str,
+            _: crate::client::SessionAttribution,
+        ) -> Result<ExecuteResponse> {
             unreachable!()
         }
         async fn get_result_chunks(&self, _: &str, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
@@ -1632,6 +1640,7 @@ mod tests {
             state: StatementState::Succeeded,
             error: None::<ServiceError>,
             sql_state: None,
+            session_version: None,
             num_modified_rows: None,
             display_message: None,
             diagnostic_info: None,

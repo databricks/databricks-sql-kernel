@@ -82,6 +82,15 @@ impl Default for TransportConfig {
 
 // ─── Trait input/output value types ─────────────────────────────────
 
+/// Whether a statement is known to belong to this transport's session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SessionAttribution {
+    /// The statement was submitted through this session, so its response may advance the session.
+    Current,
+    /// Only the statement ID is known; its response must not affect this session.
+    Detached,
+}
+
 /// Session information returned from [`Transport::create_session`].
 #[derive(Debug, Clone)]
 pub(crate) struct SessionInfo {
@@ -341,13 +350,21 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     ///
     /// Used by `ExecutedAsyncStatement::fetch_result` and inside the
     /// `await_result` poll loop.
-    async fn fetch_completed_result(&self, statement_id: &str) -> Result<Option<ExecuteResult>>;
+    async fn fetch_completed_result(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<Option<ExecuteResult>>;
 
     /// One-shot status check for an in-flight statement. Returns the
     /// full `ExecuteResponse` (status + manifest + initial result, if
     /// any). Used by `ExecutedAsyncStatement::status` and the
     /// `await_result` poll loop.
-    async fn statement_status(&self, statement_id: &str) -> Result<ExecuteResponse>;
+    async fn statement_status(
+        &self,
+        statement_id: &str,
+        session_attribution: SessionAttribution,
+    ) -> Result<ExecuteResponse>;
 
     // --- Result Fetching (CloudFetch) ---
 
