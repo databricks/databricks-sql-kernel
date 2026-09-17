@@ -216,6 +216,14 @@ author, follow-up, and review runs.
 - **Context:** PR #333 added a required cross-platform CI workflow (`release-debuginfo.yml`) and deliberately left it ungated; the author's rationale was that a top-level `paths:` filter on a required check can leave the check stuck **pending** in the merge queue when the path filter skips it, breaking required-check gating.
   **Rule:** Do not add a top-level `paths:`/`paths-ignore:` filter to a GitHub Actions workflow whose jobs are required merge checks — a skipped required check stays permanently pending; instead use an always-present change-detector job plus a no-op path when you need to bound CI cost.
 
+### 2026-09-17: learnings since 2026-09-16T07:30:40Z
+- **Context:** PR #342 rejected non-HTTPS endpoints before connecting when an mTLS client cert+key are configured, adding `validate_mtls_endpoint_scheme` in `Session::open` before auth-provider/client construction.
+  **Rule:** reqwest silently ignores a configured client-certificate identity on `http://` and still sends the bearer credential in cleartext — validate that a fully-configured mTLS identity has an HTTPS endpoint before building the HTTP client or issuing any request, and normalise host schemes so unknown/explicit non-HTTPS schemes are preserved for validation rather than disguised as part of an HTTPS host.
+- **Context:** PR #331 added `SessionAttribution::{Current,Detached}` to the SEA transport so statement-status polls only advance the shared `session_version` when the statement was submitted through this session.
+  **Rule:** when a transport carries mutable shared session state (e.g. a negotiated session version), only responses from session-owned operations may mutate it — thread an explicit ownership marker through status/poll APIs so detached calls that know only a statement ID cannot corrupt the session's state.
+- **Context:** PR #331 began unconditionally sending `execution_mode=FAST` on every SEA `create_session` and negotiating `session_version`, with coverage entirely in wiremock; the reviewer flagged the live-server behavior change.
+  **Rule:** adding a new field to a wire request or changing session-handshake behavior is a live-server change — confirm older/mixed-fleet servers ignore the unknown field (or gate it behind capability negotiation as sibling drivers do), and add an `#[ignore]` `tests/v0_*_e2e.rs` case, since wiremock/unit tests pin the wire shape but cannot catch a real server rejecting or diverging on the new field.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
