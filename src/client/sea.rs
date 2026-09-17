@@ -102,6 +102,19 @@ struct TerminalExecutionFailure {
     error: Error,
 }
 
+/// Read the statement id used to attribute and clean up a client timeout.
+/// Recovering a poisoned observer preserves best-effort cleanup after a panic.
+fn timeout_query_id(params: &ExecuteParams) -> Option<String> {
+    params.inflight_id_observer.as_ref().and_then(|slot| {
+        slot.lock()
+            .unwrap_or_else(|poisoned| {
+                warn!("in-flight statement id lock poisoned; recovering for timeout cleanup");
+                poisoned.into_inner()
+            })
+            .clone()
+    })
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -837,10 +850,7 @@ impl SeaRestTransport {
                             // client timeout during grace.
                             Ok(Ok(terminal)) => Ok(terminal),
                             Ok(Err(_)) | Err(_) => {
-                                let query_id = params
-                                    .inflight_id_observer
-                                    .as_ref()
-                                    .and_then(|slot| slot.lock().ok().and_then(|id| id.clone()));
+                                let query_id = timeout_query_id(params);
                                 return Err(crate::statement::timeout::client_query_timeout_error(
                                     query_id.as_deref(),
                                 ));
@@ -848,10 +858,7 @@ impl SeaRestTransport {
                         }
                     }
                     Err(_) => {
-                        let query_id = params
-                            .inflight_id_observer
-                            .as_ref()
-                            .and_then(|slot| slot.lock().ok().and_then(|id| id.clone()));
+                        let query_id = timeout_query_id(params);
                         return Err(crate::statement::timeout::client_query_timeout_error(
                             query_id.as_deref(),
                         ));
