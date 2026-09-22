@@ -344,42 +344,27 @@ impl SqlCommandBuilder {
         sql
     }
 
-    /// Build a SELECT query against `information_schema.routines` for
-    /// `getFunctions`.
-    ///
-    /// Mirrors [`SqlCommandBuilder::build_get_procedures`] but filters
-    /// `routine_type = 'FUNCTION'`. Catalog resolution and pattern
-    /// escaping match the procedures builder, so `escape_sql_string`
-    /// and `resolve_catalog_prefix` are the single source of truth
-    /// for both.
-    pub fn build_get_functions(
-        catalog: Option<&str>,
+    /// Build the JDBC-compatible `SHOW FUNCTIONS IN CATALOG` query.
+    pub fn build_show_functions(
+        catalog: &str,
         schema_pattern: Option<&str>,
         function_pattern: Option<&str>,
     ) -> String {
-        let prefix = Self::resolve_catalog_prefix(catalog);
         let mut sql = format!(
-            "SELECT routine_catalog, routine_schema, routine_name, comment, specific_name \
-             FROM {}.information_schema.routines \
-             WHERE routine_type = 'FUNCTION'",
-            prefix
+            "SHOW FUNCTIONS IN CATALOG {}",
+            Self::escape_identifier(catalog)
         );
 
         if let Some(pattern) = schema_pattern {
             sql.push_str(&format!(
-                " AND routine_schema LIKE '{}'",
-                Self::escape_sql_string(pattern)
+                " SCHEMA LIKE '{}'",
+                Self::jdbc_pattern_to_hive(pattern)
             ));
         }
 
-        if let Some(pattern) = function_pattern {
-            sql.push_str(&format!(
-                " AND routine_name LIKE '{}'",
-                Self::escape_sql_string(pattern)
-            ));
-        }
+        let pattern = function_pattern.unwrap_or("%");
+        sql.push_str(&format!(" LIKE '{}'", Self::jdbc_pattern_to_hive(pattern)));
 
-        sql.push_str(" ORDER BY routine_catalog, routine_schema, routine_name");
         sql
     }
 
@@ -940,45 +925,42 @@ mod tests {
     // --- getFunctions SQL builder tests ---
 
     #[test]
-    fn test_get_functions_null_catalog() {
-        let sql = SqlCommandBuilder::build_get_functions(None, None, None);
-        assert!(sql.starts_with("SELECT routine_catalog"));
-        assert!(sql.contains("FROM system.information_schema.routines"));
-        assert!(sql.contains("WHERE routine_type = 'FUNCTION'"));
-        assert!(sql.ends_with("ORDER BY routine_catalog, routine_schema, routine_name"));
-    }
-
-    #[test]
     fn test_get_functions_specific_catalog() {
-        let sql = SqlCommandBuilder::build_get_functions(Some("main"), None, None);
-        assert!(sql.contains("FROM `main`.information_schema.routines"));
+        let sql = SqlCommandBuilder::build_show_functions("main", None, None);
+        assert_eq!(sql, "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'");
     }
 
     #[test]
     fn test_get_functions_with_schema_pattern() {
-        let sql = SqlCommandBuilder::build_get_functions(None, Some("default%"), None);
-        assert!(sql.contains("AND routine_schema LIKE 'default%'"));
+        let sql = SqlCommandBuilder::build_show_functions("main", Some("default%"), None);
+        assert_eq!(
+            sql,
+            "SHOW FUNCTIONS IN CATALOG `main` SCHEMA LIKE 'default*' LIKE '*'"
+        );
     }
 
     #[test]
     fn test_get_functions_with_function_pattern() {
-        let sql = SqlCommandBuilder::build_get_functions(None, None, Some("avg%"));
-        assert!(sql.contains("AND routine_name LIKE 'avg%'"));
+        let sql = SqlCommandBuilder::build_show_functions("main", None, Some("avg%"));
+        assert_eq!(sql, "SHOW FUNCTIONS IN CATALOG `main` LIKE 'avg*'");
     }
 
     #[test]
     fn test_get_functions_with_all_filters() {
-        let sql =
-            SqlCommandBuilder::build_get_functions(Some("prod"), Some("public"), Some("fn_%"));
-        assert!(sql.contains("FROM `prod`.information_schema.routines"));
-        assert!(sql.contains("AND routine_schema LIKE 'public'"));
-        assert!(sql.contains("AND routine_name LIKE 'fn_%'"));
+        let sql = SqlCommandBuilder::build_show_functions("prod", Some("public"), Some("fn_%"));
+        assert_eq!(
+            sql,
+            "SHOW FUNCTIONS IN CATALOG `prod` SCHEMA LIKE 'public' LIKE 'fn.*'"
+        );
     }
 
     #[test]
     fn test_get_functions_sql_injection_escaped() {
-        let sql = SqlCommandBuilder::build_get_functions(None, Some("it's"), None);
-        assert!(sql.contains("AND routine_schema LIKE 'it''s'"));
+        let sql = SqlCommandBuilder::build_show_functions("my`catalog", Some("it's"), None);
+        assert_eq!(
+            sql,
+            "SHOW FUNCTIONS IN CATALOG `my``catalog` SCHEMA LIKE 'it''s' LIKE '*'"
+        );
     }
 
     // --- foreign keys with special characters ---

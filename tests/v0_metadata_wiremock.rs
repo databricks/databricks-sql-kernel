@@ -33,7 +33,7 @@
 //! `primary_keys`, etc.) are also covered here.
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, Int32Array, RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -217,6 +217,30 @@ fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
+fn native_functions_batch(function_catalog: Option<&str>) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("FUNCTION_CAT", DataType::Utf8, true),
+            Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
+            Field::new("FUNCTION_NAME", DataType::Utf8, false),
+            Field::new("REMARKS", DataType::Utf8, true),
+            // The native backend reports FUNCTION_TYPE as Int32; the public
+            // JDBC schema requires SMALLINT / Int16.
+            Field::new("FUNCTION_TYPE", DataType::Int32, true),
+            Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![function_catalog])),
+            Arc::new(StringArray::from(vec![Some("default")])),
+            Arc::new(StringArray::from(vec![Some("test_function")])),
+            Arc::new(StringArray::from(vec![None::<&str>])),
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(StringArray::from(vec![Some("test_function")])),
+        ],
+    )
+    .unwrap()
+}
+
 /// Mixed-type RecordBatch builder for `list_columns` fixtures, which
 /// need `ordinalPosition: Int32` alongside the string columns.
 fn columns_batch(
@@ -325,6 +349,67 @@ async fn native_catalogs_header_and_result_bypass_show_reshape() {
     assert_eq!(col_names(&stream.schema()), vec!["TABLE_CAT"]);
     let batches = drain_stream(&mut stream).await;
     assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "main");
+}
+
+#[tokio::test]
+async fn native_functions_no_filters_match_jdbc_and_preserve_null_request_catalog() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let current_catalog = string_batch(vec![("current_catalog()", vec![Some("main")])]);
+    mount_execute_expecting_sql(
+        &server,
+        "SELECT CURRENT_CATALOG()",
+        closed_inline_response_body(&current_catalog),
+    )
+    .await;
+
+    let native = native_functions_batch(Some(""));
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains(
+            "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
+        ))
+        .and(header(
+            "x-databricks-metadata-operation-type",
+            "GetFunctions",
+        ))
+        .and(header(
+            "x-databricks-require-thrift-native-metadata",
+            "true",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+        )
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .functions(None, None, None)
+        .await
+        .expect("native functions");
+
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "FUNCTION_CAT",
+            "FUNCTION_SCHEM",
+            "FUNCTION_NAME",
+            "REMARKS",
+            "FUNCTION_TYPE",
+            "SPECIFIC_NAME",
+        ]
+    );
+    assert!(batches[0].column(0).is_null(0));
+    assert_eq!(
+        batches[0].column(2).as_string::<i32>().value(0),
+        "test_function"
+    );
+    assert_eq!(batches[0].column(4).data_type(), &DataType::Int16);
 }
 
 #[tokio::test]
