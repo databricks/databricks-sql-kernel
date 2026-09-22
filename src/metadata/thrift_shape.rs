@@ -243,7 +243,9 @@ pub(crate) static GET_FUNCTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("FUNCTION_CAT", DataType::Utf8, true),
         Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
-        Field::new("FUNCTION_NAME", DataType::Utf8, false),
+        // Classic SHOW FUNCTIONS can omit the modern `functionName` field.
+        // Keep this nullable so one malformed row does not discard the result.
+        Field::new("FUNCTION_NAME", DataType::Utf8, true),
         Field::new("REMARKS", DataType::Utf8, true),
         Field::new("FUNCTION_TYPE", DataType::Int16, true),
         Field::new("SPECIFIC_NAME", DataType::Utf8, true),
@@ -837,26 +839,22 @@ pub(crate) fn reshape_procedures(batch: &RecordBatch) -> Result<RecordBatch> {
     .map_err(|e| Error::data_loss().message(format!("reshape procedures: {e}")))
 }
 
-/// Reshape the `build_get_functions` result (same server columns as
-/// `build_get_procedures`) into the JDBC `getFunctions` shape.
-///
-/// `FUNCTION_TYPE` is constant `functionNoTable` (1) — Databricks functions
-/// are scalar / return a value, not a table. (JDBC: `functionResultUnknown`=0,
-/// `functionNoTable`=1, `functionReturnsTable`=2.)
-pub(crate) fn reshape_functions(batch: &RecordBatch) -> Result<RecordBatch> {
-    let n = batch.num_rows();
-    let function_cat = utf8_column(batch, "routine_catalog")?;
-    let function_schem = utf8_column(batch, "routine_schema")?;
-    let function_name = utf8_column(batch, "routine_name")?;
-    let remarks = utf8_column(batch, "comment")?;
-    let specific_name = utf8_column(batch, "specific_name")?;
-    // FUNCTION_TYPE is reported functionNoTable(1) for every row. Databricks
-    // supports table-valued functions, which JDBC would report as
-    // functionReturnsTable(2), but build_get_functions does not select a column
-    // that distinguishes scalar from table functions, so the reshape cannot tell
-    // them apart. Known parity gap; distinguishing TVFs would require selecting
-    // additional information_schema.routines columns in the builder.
-    let function_type = Arc::new(Int16Array::from(vec![Some(1_i16); n])) as ArrayRef;
+/// Reshape the raw `SHOW FUNCTIONS` result into the JDBC `getFunctions` shape.
+pub(crate) fn reshape_functions(
+    batch: &RecordBatch,
+    resolved_catalog: &str,
+) -> Result<RecordBatch> {
+    let function_cat = constant_utf8(batch.num_rows(), Some(resolved_catalog));
+    let function_schem = utf8_column(batch, "namespace")?;
+    let function_name = if column_index(batch.schema_ref(), "functionName").is_some() {
+        utf8_column(batch, "functionName")?
+    } else {
+        // Classic SHOW FUNCTIONS exposes a single column named `function`.
+        utf8_column(batch, "function")?
+    };
+    let remarks = utf8_column(batch, "remarks")?;
+    let function_type = int16_column(batch, "functionType")?;
+    let specific_name = utf8_column(batch, "specificName")?;
     RecordBatch::try_new(
         GET_FUNCTIONS_SCHEMA.clone(),
         vec![
@@ -1991,7 +1989,7 @@ mod tests {
 
     // ─── procedures / functions / procedure-columns reshape ───────────
 
-    /// One-row `build_get_procedures` / `build_get_functions` server shape.
+    /// One-row `build_get_procedures` server shape.
     fn server_routine_row(comment: Option<&str>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("routine_catalog", DataType::Utf8, true),
@@ -2008,6 +2006,29 @@ mod tests {
                 Arc::new(StringArray::from(vec![Some("sp_report")])),
                 Arc::new(StringArray::from(vec![comment])),
                 Arc::new(StringArray::from(vec![Some("sp_report")])),
+            ],
+        )
+        .unwrap()
+    }
+
+    fn server_function_row() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("functionName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, true),
+            Field::new("catalogName", DataType::Utf8, true),
+            Field::new("remarks", DataType::Utf8, true),
+            Field::new("functionType", DataType::Int32, true),
+            Field::new("specificName", DataType::Utf8, true),
+        ]));
+        RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(StringArray::from(vec![Some("sales_total")])),
+                Arc::new(StringArray::from(vec![Some("sales")])),
+                Arc::new(StringArray::from(vec![Some("main")])),
+                Arc::new(StringArray::from(vec![None::<&str>])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("sales_total")])),
             ],
         )
         .unwrap()
@@ -2049,7 +2070,7 @@ mod tests {
 
     #[test]
     fn reshape_functions_produces_jdbc_get_functions_shape() {
-        let out = reshape_functions(&server_routine_row(None)).unwrap();
+        let out = reshape_functions(&server_function_row(), "main").unwrap();
         assert_eq!(
             col_names(&out),
             vec![
@@ -2061,9 +2082,44 @@ mod tests {
                 "SPECIFIC_NAME",
             ]
         );
-        // FUNCTION_TYPE = functionNoTable (1).
+        assert_eq!(
+            out.column(2)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0),
+            "sales_total"
+        );
+        // The wider server integer is narrowed to JDBC SMALLINT.
         let ftype = out.column(4).as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(ftype.value(0), 1);
+    }
+
+    #[test]
+    fn reshape_functions_supports_classic_single_column_shape() {
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "function",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("system.builtin.abs"),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        let out = reshape_functions(&source, "main").unwrap();
+        let names = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "system.builtin.abs");
+        assert!(names.is_null(1));
+        assert!(out.column(1).is_null(0));
+        assert!(out.column(3).is_null(0));
     }
 
     /// `build_get_procedure_columns` raw server shape (information_schema

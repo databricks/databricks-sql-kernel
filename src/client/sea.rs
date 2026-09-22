@@ -20,8 +20,8 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
-    Transport, TransportConfig,
+    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, ListFunctionsResult,
+    SessionAttribution, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -34,6 +34,7 @@ use crate::types::sea::{
     ExecuteStatementRequest, GetChunksResponse, SessionExecutionMode, SessionVersion,
     StatementExecutionResponse, StatementState,
 };
+use arrow_array::{Array, StringArray};
 use async_trait::async_trait;
 use reqwest::Method;
 use std::collections::HashMap;
@@ -88,10 +89,7 @@ impl MetadataOperation {
     }
 
     fn supports_thrift_native(self) -> bool {
-        !matches!(
-            self,
-            Self::Functions | Self::Procedures | Self::ProcedureColumns
-        )
+        !matches!(self, Self::Procedures | Self::ProcedureColumns)
     }
 }
 
@@ -175,6 +173,7 @@ pub(crate) struct SeaRestTransport {
     warehouse_id: String,
     config: TransportConfig,
     session_version: AtomicI64,
+    session_catalog: OnceLock<Option<String>>,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
@@ -216,6 +215,7 @@ impl SeaRestTransport {
             warehouse_id: warehouse_id.into(),
             config,
             session_version: AtomicI64::new(NO_SESSION_VERSION),
+            session_catalog: OnceLock::new(),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
         }
@@ -252,6 +252,13 @@ impl SeaRestTransport {
             self.session_version
                 .fetch_max(version.version_id, Ordering::SeqCst);
         }
+    }
+
+    fn session_catalog_or_hive_metastore(&self) -> &str {
+        self.session_catalog
+            .get()
+            .and_then(Option::as_deref)
+            .unwrap_or("hive_metastore")
     }
 
     /// Build the `/result/chunks/{idx}` URL, optionally with the
@@ -1023,6 +1030,61 @@ impl SeaRestTransport {
             );
         }
     }
+
+    /// Resolve the session catalog the same way JDBC's `getFunctions` path
+    /// does before issuing `SHOW FUNCTIONS IN CATALOG`.
+    async fn query_current_catalog(&self, session_id: &str) -> Result<Option<String>> {
+        let mut raw = self
+            .execute_and_read(
+                session_id,
+                "SELECT CURRENT_CATALOG()",
+                &ExecuteParams::default(),
+                RequestType::ExecuteMetadataQuery,
+                None,
+                ExecutionTimeout::Default,
+            )
+            .await?;
+        let statement_id = raw.statement_id.clone();
+        let needs_close = raw.status.state != StatementState::Closed;
+
+        let catalog = loop {
+            match raw.reader.next_batch().await {
+                Err(e) => break Err(e),
+                Ok(None) => break Ok(None),
+                Ok(Some(batch)) if batch.num_rows() == 0 => continue,
+                Ok(Some(batch)) => {
+                    let Some(column) = batch.columns().first() else {
+                        break Err(Error::data_loss()
+                            .message("CURRENT_CATALOG() returned a row without a column"));
+                    };
+                    let values = arrow_cast::cast(column.as_ref(), &arrow_schema::DataType::Utf8)
+                        .map_err(|e| {
+                            Error::data_loss().message(format!(
+                                "CURRENT_CATALOG() returned a non-string value: {e}"
+                            ))
+                        });
+                    break values.and_then(|values| {
+                        let values =
+                            values
+                                .as_any()
+                                .downcast_ref::<StringArray>()
+                                .ok_or_else(|| {
+                                    Error::data_loss().message(
+                                        "CURRENT_CATALOG() string cast did not yield StringArray",
+                                    )
+                                })?;
+                        Ok((!values.is_null(0)).then(|| values.value(0).to_owned()))
+                    });
+                }
+            }
+        };
+
+        if needs_close {
+            self.close_orphaned_statement(&statement_id, "query_current_catalog")
+                .await;
+        }
+        catalog
+    }
 }
 
 /// Convert a parsed `GetChunksResponse` into the kernel-facing
@@ -1103,6 +1165,7 @@ impl Transport for SeaRestTransport {
         session_config: HashMap<String, String>,
     ) -> Result<SessionInfo> {
         let url = format!("{}/sessions", self.base_url());
+        let _ = self.session_catalog.set(catalog.map(str::to_owned));
 
         let request_body = CreateSessionRequest {
             warehouse_id: self.warehouse_id.clone(),
@@ -1693,18 +1756,41 @@ impl Transport for SeaRestTransport {
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
         function_pattern: Option<&str>,
-    ) -> Result<ExecuteResult> {
-        let sql = SqlCommandBuilder::build_get_functions(catalog, schema_pattern, function_pattern);
+    ) -> Result<ListFunctionsResult> {
+        let resolved_catalog = match catalog {
+            Some(catalog) => catalog.to_owned(),
+            None => match self.query_current_catalog(session_id).await {
+                Ok(Some(catalog)) if !catalog.is_empty() => catalog,
+                Ok(_) => self.session_catalog_or_hive_metastore().to_owned(),
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "failed to query current catalog for list_functions; using session catalog fallback"
+                    );
+                    self.session_catalog_or_hive_metastore().to_owned()
+                }
+            },
+        };
+        let sql = SqlCommandBuilder::build_show_functions(
+            &resolved_catalog,
+            schema_pattern,
+            function_pattern,
+        );
         debug!("list_functions: {}", sql);
-        self.execute_and_read(
-            session_id,
-            &sql,
-            &ExecuteParams::default(),
-            RequestType::ExecuteMetadataQuery,
-            Some(MetadataOperation::Functions),
-            ExecutionTimeout::Default,
-        )
-        .await
+        let execute_result = self
+            .execute_and_read(
+                session_id,
+                &sql,
+                &ExecuteParams::default(),
+                RequestType::ExecuteMetadataQuery,
+                Some(MetadataOperation::Functions),
+                ExecutionTimeout::Default,
+            )
+            .await?;
+        Ok(ListFunctionsResult {
+            execute_result,
+            resolved_catalog,
+        })
     }
 
     async fn list_procedure_columns(

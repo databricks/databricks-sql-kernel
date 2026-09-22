@@ -1582,7 +1582,7 @@ mod tests {
             _: Option<&str>,
             _: Option<&str>,
             _: Option<&str>,
-        ) -> Result<ExecuteResult> {
+        ) -> Result<crate::client::ListFunctionsResult> {
             unreachable!()
         }
         async fn list_procedure_columns(

@@ -145,6 +145,12 @@ pub(crate) struct ExecuteResult {
     pub status: StatementStatus,
 }
 
+/// Result of listing functions, including the catalog used by the SHOW query.
+pub(crate) struct ListFunctionsResult {
+    pub execute_result: ExecuteResult,
+    pub resolved_catalog: String,
+}
+
 impl std::fmt::Debug for ExecuteResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExecuteResult")
@@ -495,15 +501,15 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
 
     /// List functions, optionally filtered by catalog, schema pattern, and function name pattern.
     ///
-    /// Uses `information_schema.routines` filtered by `routine_type = 'FUNCTION'`.
-    /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
+    /// Uses `SHOW FUNCTIONS IN CATALOG`, resolving the session's current
+    /// catalog (with a `hive_metastore` fallback) when catalog is None.
     async fn list_functions(
         &self,
         session_id: &str,
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
         function_pattern: Option<&str>,
-    ) -> Result<ExecuteResult>;
+    ) -> Result<ListFunctionsResult>;
 
     /// List procedure parameter / return columns, optionally filtered by
     /// catalog, schema pattern, procedure name pattern, and column name

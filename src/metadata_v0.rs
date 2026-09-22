@@ -95,7 +95,7 @@ use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef, StringArray};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 use tracing::{debug, Instrument};
@@ -135,6 +135,63 @@ fn normalize_native_metadata_batch(
 ) -> Result<arrow_array::RecordBatch> {
     arrow_array::RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| {
         Error::data_loss().message(format!("invalid Thrift-native metadata result: {e}"))
+    })
+}
+
+fn normalize_native_functions_batch(
+    batch: &arrow_array::RecordBatch,
+    resolved_catalog: &str,
+) -> Result<arrow_array::RecordBatch> {
+    if batch.num_columns() != GET_FUNCTIONS_SCHEMA.fields().len() {
+        return Err(Error::data_loss().message(format!(
+            "invalid Thrift-native functions result: expected {} columns, found {}",
+            GET_FUNCTIONS_SCHEMA.fields().len(),
+            batch.num_columns()
+        )));
+    }
+    let mut columns = batch
+        .columns()
+        .iter()
+        .zip(GET_FUNCTIONS_SCHEMA.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                arrow_cast::cast(column.as_ref(), field.data_type()).map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "invalid Thrift-native functions column {:?}: cannot cast {} to {}: {e}",
+                        field.name(),
+                        column.data_type(),
+                        field.data_type()
+                    ))
+                })
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let remarks = columns
+        .get(3)
+        .expect("function column count checked")
+        .as_any()
+        .downcast_ref::<StringArray>()
+        .ok_or_else(|| Error::data_loss().message("REMARKS is not Utf8"))?;
+    let normalized_remarks = Arc::new(StringArray::from(
+        (0..remarks.len())
+            .map(|i| {
+                if remarks.is_null(i) {
+                    ""
+                } else {
+                    remarks.value(i)
+                }
+            })
+            .collect::<Vec<_>>(),
+    )) as ArrayRef;
+    columns[0] = Arc::new(StringArray::from(vec![
+        Some(resolved_catalog);
+        batch.num_rows()
+    ])) as ArrayRef;
+    columns[3] = normalized_remarks;
+    arrow_array::RecordBatch::try_new(GET_FUNCTIONS_SCHEMA.clone(), columns).map_err(|e| {
+        Error::data_loss().message(format!("invalid Thrift-native functions result: {e}"))
     })
 }
 
@@ -1184,10 +1241,9 @@ impl Metadata {
     /// Functions visible to the session. Catalog is exact; schema /
     /// name are patterns.
     ///
-    /// Server shape (`SELECT ... FROM information_schema.routines`):
-    /// `routine_catalog, routine_schema, routine_name, comment,
-    /// specific_name`. Reshaped kernel-side into the JDBC `getFunctions`
-    /// column set by [`thrift_shape::reshape_functions`].
+    /// Uses `SHOW FUNCTIONS IN CATALOG`, resolving a null catalog from the
+    /// session like JDBC. Non-native responses are reshaped kernel-side into
+    /// the JDBC `getFunctions` column set.
     pub async fn functions(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -1198,7 +1254,7 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
         let telemetry_for_body = telemetry.clone();
         let result = async {
-            let raw = match self
+            let functions_result = match self
                 .session
                 .transport()
                 .list_functions(
@@ -1215,12 +1271,26 @@ impl Metadata {
                         .await
                 }
             };
+            let resolved_catalog = functions_result.resolved_catalog;
+            let raw = functions_result.execute_result;
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            native_or_reshaped_stream(
-                raw,
-                &self.session,
+            let stmt_id = close_id(&raw);
+            let native = is_native_metadata_result(&raw);
+            let reshaped = ThriftReshapingReader::new(
+                raw.reader,
                 GET_FUNCTIONS_SCHEMA.clone(),
-                Box::new(thrift_shape::reshape_functions),
+                Box::new(move |batch| {
+                    if native {
+                        normalize_native_functions_batch(batch, &resolved_catalog)
+                    } else {
+                        thrift_shape::reshape_functions(batch, &resolved_catalog)
+                    }
+                }),
+            );
+            ResultStream::from_reader_with_close(
+                Box::new(reshaped),
+                Arc::clone(&self.session),
+                stmt_id,
             )
             .await
         }
