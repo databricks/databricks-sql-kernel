@@ -19,6 +19,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - Route function metadata through the Thrift-native metadata path when supported by the server.
 
+- Sessions configured with an outer-driver identity now resolve authenticated
+  connector-service feature flags while opening and retain an
+  immutable per-session snapshot.
+
 ### Updated
 
 ### Fixed

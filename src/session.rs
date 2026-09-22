@@ -62,6 +62,7 @@ use crate::config::{
     AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
     ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
 };
+use crate::feature_flags::{ClientIdentity, FeatureFlagResolver, FeatureFlagValues};
 use crate::kernel_error::{Error, Result};
 use crate::klog::debug;
 use crate::metadata_v0::Metadata;
@@ -113,6 +114,10 @@ pub(crate) struct SessionInner {
     /// telemetry is disabled or initialization fails, so callsites can
     /// emit lifecycle events without branching on config.
     telemetry: Arc<TelemetryRuntime>,
+
+    /// Immutable connector-service feature flags resolved for the outer
+    /// driver before this session was created.
+    feature_flags: FeatureFlagValues,
 
     /// Flips to `true` only after [`Session::close`] has
     /// **successfully** awaited the `delete_session` call. Tells
@@ -352,6 +357,19 @@ impl Session {
             build_auth_provider(&config.auth, &host, http_client.clone()).await?;
         http_client.set_auth_provider(auth_provider);
 
+        // Connector-service feature flags require workspace authentication.
+        // Resolve once at the first authenticated point and retain the
+        // immutable snapshot for this session. Individual features decide
+        // whether and how to interpret a value.
+        let feature_flags = match config.client_identity.as_ref() {
+            Some(identity) => {
+                FeatureFlagResolver::new(&host, Arc::clone(&http_client))
+                    .resolve(identity)
+                    .await
+            }
+            None => FeatureFlagValues::default(),
+        };
+
         // 3. Transport. Two-phase: SeaRestTransport needs an
         //    Arc<dyn Transport> to build the result-reader factory,
         //    which in turn needs to be set on the transport via
@@ -435,6 +453,7 @@ impl Session {
                 timeout_cleanup: TimeoutCleanupManager::default(),
                 log_span,
                 telemetry,
+                feature_flags,
                 closed: std::sync::atomic::AtomicBool::new(false),
                 // Autocommit defaults to on (every statement commits); a
                 // caller opts into explicit transactions via set_autocommit.
@@ -455,6 +474,14 @@ impl Session {
     /// Metadata operations — flat, per-method (ODBC-shaped).
     pub fn metadata(&self) -> Metadata {
         Metadata::new(Arc::clone(&self.inner))
+    }
+
+    /// Connector-service feature flags captured when this session opened.
+    ///
+    /// Values are an immutable snapshot and remain opaque until a feature
+    /// explicitly interprets one.
+    pub fn feature_flags(&self) -> &FeatureFlagValues {
+        &self.inner.feature_flags
     }
 
     // ─── Transaction control ────────────────────────────────────────────
@@ -786,6 +813,7 @@ pub struct SessionBuilder {
     result: Option<ResultConfig>,
     logging: Option<LoggingConfig>,
     telemetry: Option<TelemetryConfig>,
+    client_identity: Option<ClientIdentity>,
     driver_system_configuration: Option<DriverSystemConfiguration>,
     session_conf: HashMap<String, String>,
     transport: Option<TransportMode>,
@@ -916,6 +944,15 @@ impl SessionBuilder {
         self
     }
 
+    /// Driver family and version used for connector-service feature flags.
+    ///
+    /// Bindings should pass the identity of the outer driver, not the kernel's
+    /// own crate version. Omitting identity keeps feature-flag resolution off.
+    pub fn client_identity(mut self, identity: ClientIdentity) -> Self {
+        self.client_identity = Some(identity);
+        self
+    }
+
     /// Driver/runtime identity stamped onto telemetry logs.
     ///
     /// Binding layers should use this to pass their own driver name,
@@ -968,6 +1005,7 @@ impl SessionBuilder {
             defaults: self.defaults,
             auth,
             driver_system_configuration: self.driver_system_configuration,
+            client_identity: self.client_identity,
             session_conf: self.session_conf,
             http: self.http.unwrap_or_default(),
             proxy: self.proxy,
@@ -1511,6 +1549,7 @@ mod mtls_endpoint_tests {
                 identity_federation_client_id: None,
             },
             driver_system_configuration: None,
+            client_identity: None,
             session_conf: Default::default(),
             http: HttpConfig::default(),
             proxy: None,
@@ -1639,6 +1678,7 @@ mod retry_config_tests {
                 identity_federation_client_id: None,
             },
             driver_system_configuration: None,
+            client_identity: None,
             session_conf: Default::default(),
             http,
             proxy: None,
@@ -2034,6 +2074,7 @@ mod retry_config_tests {
 #[cfg(test)]
 mod is_open_tests {
     use super::*;
+    use crate::feature_flags::ClientType;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
     use crate::ResultBatch;
@@ -2045,7 +2086,7 @@ mod is_open_tests {
     use serde_json::Value;
     use std::future::Future;
     use std::pin::Pin;
-    use wiremock::matchers::{body_json, body_string_contains, method, path, path_regex};
+    use wiremock::matchers::{body_json, body_string_contains, header, method, path, path_regex};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
@@ -2355,6 +2396,93 @@ mod is_open_tests {
             exporter.requests().is_empty(),
             "disabled telemetry must not export requests"
         );
+    }
+
+    #[tokio::test]
+    async fn feature_flags_are_resolved_before_create_session_and_retained() {
+        // Keep this cache identity unique among session/binding tests. Mock
+        // servers use ephemeral ports that the OS may reuse while the
+        // process-wide feature-flag cache is still alive.
+        const DRIVER_VERSION: &str = "session-feature-flag-ordering";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/2.0/connector-service/feature-flags/GOLANG/{DRIVER_VERSION}"
+            )))
+            .and(header("authorization", "Bearer dapi_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "flags": [{
+                    "name": "example.session-flag",
+                    "value": "opaque-value"
+                }],
+                "ttl_seconds": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_session_create_delete(&server, "sess-feature-flags").await;
+
+        for _ in 0..2 {
+            let session = Session::builder()
+                .connection(
+                    ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                        .expect("valid http_path"),
+                )
+                .auth(AuthConfig::Pat {
+                    token: "dapi_test_token".into(),
+                    identity_federation_client_id: None,
+                })
+                .client_identity(ClientIdentity::new(ClientType::Go, DRIVER_VERSION))
+                .open()
+                .await
+                .expect("session must open");
+
+            assert_eq!(
+                session.feature_flags().get("example.session-flag"),
+                Some("opaque-value")
+            );
+            session.close().await.expect("close succeeds");
+        }
+
+        let requests = server.received_requests().await.unwrap_or_default();
+        let feature_flags = requests
+            .iter()
+            .position(|request| request.method.as_str() == "GET")
+            .expect("feature-flag request");
+        let create_session = requests
+            .iter()
+            .position(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/sessions"
+            })
+            .expect("CreateSession request");
+        assert!(feature_flags < create_session);
+    }
+
+    #[tokio::test]
+    async fn session_without_client_identity_skips_feature_flag_resolution() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        mount_session_create_delete(&server, "sess-no-feature-flags").await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .expect("session must open");
+
+        assert!(session.feature_flags().is_empty());
+        session.close().await.expect("close succeeds");
     }
 
     #[tokio::test]

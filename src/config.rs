@@ -54,6 +54,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
+use crate::feature_flags::ClientIdentity;
 use crate::telemetry::DriverSystemConfiguration;
 
 // ─── Connection identity ────────────────────────────────────────────────────
@@ -1504,6 +1505,10 @@ pub struct SessionConfig {
     /// `DriverSystemConfiguration`, filling any missing fields with
     /// kernel defaults at session-open time.
     pub driver_system_configuration: Option<DriverSystemConfiguration>,
+
+    /// Outer-driver family and version used to resolve connector-service
+    /// feature flags. `None` performs no feature-flag request.
+    pub client_identity: Option<ClientIdentity>,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate
