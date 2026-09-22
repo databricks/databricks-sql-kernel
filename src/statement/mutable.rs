@@ -54,7 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
-use crate::client::DirectOutcome;
+use crate::client::{DirectOutcome, ExecutionTimeout};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::result_stream::ResultStream;
@@ -68,6 +68,7 @@ use crate::telemetry::{OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tracing::Instrument;
 
 /// Outcome of [`Statement::execute_direct`] — the Thrift/JDBC directResults
@@ -305,7 +306,8 @@ impl Statement {
     /// `CloseStatement`) and adds ~150–260ms to the response —
     /// observed against Dogfood; see PR description for the bench
     /// numbers. The kernel polls internally if the query needs
-    /// longer than 10s.
+    /// longer than 10s. This entry point retains the transport's 600s polling
+    /// ceiling; use [`Statement::execute_with_timeout`] to choose another limit.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// the kernel spawns a fire-and-forget `CloseStatement` against it
@@ -315,6 +317,27 @@ impl Statement {
     /// calls on it short-circuit to `InvalidStatementHandle` without
     /// hitting the wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
+        self.execute_with_timeout_mode(ExecutionTimeout::Default)
+            .await
+    }
+
+    /// Execute with a client deadline through terminal-state mapping.
+    ///
+    /// Result materialisation is excluded. `Duration::ZERO` and `Duration::MAX`
+    /// explicitly select unlimited execution. A status request already in flight
+    /// at the deadline may finish within a fixed five-second grace period; no new
+    /// poll starts after the deadline.
+    pub async fn execute_with_timeout(&mut self, timeout: Duration) -> Result<ExecutedStatement> {
+        let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
+        self.execute_with_timeout_mode(ExecutionTimeout::from_explicit_deadline(deadline))
+            .await
+    }
+
+    /// Internal form used by the Rust and C ABI entry points.
+    pub(crate) async fn execute_with_timeout_mode(
+        &mut self,
+        timeout: ExecutionTimeout,
+    ) -> Result<ExecutedStatement> {
         // `instrument` (rather than `.entered()`) so the resulting
         // future stays `Send` — napi-rs's `execute_tokio_future` and
         // `tokio::spawn` both require `Send`, and `EnteredSpan` is
@@ -349,11 +372,22 @@ impl Statement {
             // SeaRestTransport::execute_statement polls to completion
             // (10s server-side wait_timeout, then GetStatementStatus
             // loop until terminal).
-            let result = self
+            let result = match self
                 .session
                 .transport()
-                .execute_statement(self.session.session_id(), &sql, &exec_params)
-                .await?;
+                .execute_statement(self.session.session_id(), &sql, &exec_params, timeout)
+                .await
+            {
+                Ok(result) => result,
+                Err(error) if crate::statement::timeout::is_client_query_timeout(&error) => {
+                    // Cleanup owns only the attempt id; defuse the duplicate guard.
+                    guard.defuse();
+                    self.session
+                        .dispatch_timeout_cleanup(error.query_id.clone());
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
             telemetry_for_body.on_statement_submitted(&result.statement_id);
             telemetry_for_body.on_result_metadata(
                 result.telemetry_result_format,
@@ -413,8 +447,8 @@ impl Statement {
     /// Returns immediately once the server hands back a
     /// `statement_id` — the caller drives polling via
     /// [`ExecutedAsyncStatement::status`] / `await_result` /
-    /// `fetch_result`. Long-running queries that would blow past
-    /// `execute()`'s sync polling budget belong on this path.
+    /// `fetch_result`. Use this path when the caller needs an explicit
+    /// poll/cancel handle instead of waiting synchronously for terminal state.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
         let span = self.session.log_span().clone();
         // Clear the shared in-flight-id slot before the first `.await`

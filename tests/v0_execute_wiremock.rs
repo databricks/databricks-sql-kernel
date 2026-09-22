@@ -26,13 +26,15 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, ResultBatch, ResultConfig,
-    Session, TypedValue,
+    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, HttpConfig, ResultBatch,
+    ResultConfig, Session, TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
 use serde_json::json;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use wiremock::matchers::{method, path};
-use wiremock::{Mock, MockServer, ResponseTemplate};
+use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
@@ -64,6 +66,22 @@ async fn open_session_with_result(server: &MockServer, result: ResultConfig) -> 
             identity_federation_client_id: None,
         })
         .result(result)
+        .open()
+        .await
+        .expect("Session::open should succeed")
+}
+
+async fn open_session_with_http(server: &MockServer, http: HttpConfig) -> Session {
+    Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .http(http)
         .open()
         .await
         .expect("Session::open should succeed")
@@ -195,6 +213,26 @@ fn running_body(statement_id: &str) -> String {
     .to_string()
 }
 
+/// Delay only the first execute response.
+struct DelayedFirstExecute {
+    first: String,
+    later: String,
+    first_delay: Duration,
+    calls: AtomicUsize,
+}
+
+impl Respond for DelayedFirstExecute {
+    fn respond(&self, _request: &Request) -> ResponseTemplate {
+        if self.calls.fetch_add(1, Ordering::SeqCst) == 0 {
+            ResponseTemplate::new(200)
+                .set_body_string(self.first.clone())
+                .set_delay(self.first_delay)
+        } else {
+            ResponseTemplate::new(200).set_body_string(self.later.clone())
+        }
+    }
+}
+
 /// Poll `server.received_requests()` until `expected` `DELETE`s to the
 /// given statement endpoint are observed, or `timeout` elapses; returns
 /// the final observed count. Mirrors the metadata suite's helper: for a
@@ -323,6 +361,14 @@ async fn drain(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<RecordBa
         out.push(rb.clone());
     }
     out
+}
+
+fn assert_client_query_timeout(error: &databricks_sql_kernel::Error, query_id: Option<&str>) {
+    assert_eq!(error.code, ErrorCode::Timeout);
+    assert_eq!(error.message, "Client query timeout expired");
+    assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+    assert!(!error.retryable);
+    assert_eq!(error.query_id.as_deref(), query_id);
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -1338,4 +1384,424 @@ async fn execute_succeeded_inline_still_closes_statement() {
         "SUCCEEDED response must trigger exactly one CloseStatement"
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
+}
+
+// ─── Client query timeout ───────────────────────────────────────────
+
+#[tokio::test]
+async fn client_timeout_covers_initial_post_and_statement_is_immediately_reusable() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(DelayedFirstExecute {
+            first: running_body("stmt-delayed-post"),
+            later: closed_inline_body("stmt-reused", &batch),
+            first_delay: Duration::from_millis(500),
+            calls: AtomicUsize::new(0),
+        })
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+
+    let started = Instant::now();
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(75))
+        .await
+        .err()
+        .expect("the delayed initial POST must consume the client deadline");
+    assert_client_query_timeout(&error, None);
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "the 500ms POST must be abandoned near the 75ms deadline"
+    );
+
+    for timeout in [Duration::ZERO, Duration::MAX, MAX_CLIENT_QUERY_TIMEOUT] {
+        let exec = stmt
+            .execute_with_timeout(timeout)
+            .await
+            .expect("statement must be reusable after an initial-POST timeout");
+        exec.close().await.expect("close reused execution");
+    }
+
+    let oversized = MAX_CLIENT_QUERY_TIMEOUT
+        .checked_add(Duration::from_millis(1))
+        .unwrap();
+    let error = stmt
+        .execute_with_timeout(oversized)
+        .await
+        .err()
+        .expect("a finite timeout above the public maximum must be rejected");
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
+
+    let execute_posts = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path() == "/api/2.0/sql/statements"
+        })
+        .count();
+    assert_eq!(
+        execute_posts, 4,
+        "range validation must reject before issuing a fifth execute RPC"
+    );
+}
+
+#[tokio::test]
+async fn client_timeout_covers_poll_sleep_and_cleanup_does_not_delay_return() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let running = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-poll-sleep")))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let no_status_poll = Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-poll-sleep"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-poll-sleep")))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-poll-sleep/cancel"))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_string("already gone")
+                .set_delay(Duration::from_millis(750)),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-poll-sleep"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+
+    let started = Instant::now();
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(75))
+        .await
+        .err()
+        .expect("the first 500ms poll sleep must be bounded");
+    assert_client_query_timeout(&error, Some("stmt-poll-sleep"));
+    assert!(
+        started.elapsed() < Duration::from_millis(400),
+        "slow cancel/close cleanup must run in the background"
+    );
+    drop(no_status_poll);
+    drop(running);
+
+    let batch = int64_batch("n", vec![2]);
+    mount_execute(&server, closed_inline_body("stmt-after-timeout", &batch)).await;
+    let exec = stmt
+        .execute_with_timeout(Duration::ZERO)
+        .await
+        .expect("statement must be reusable before background cleanup finishes");
+    exec.close().await.expect("close reused execution");
+
+    let closes = wait_for_close_delete(&server, "stmt-poll-sleep", 1, Duration::from_secs(2)).await;
+    assert_eq!(closes, 1, "timeout cleanup must eventually close the query");
+    let cancel_count = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path() == "/api/2.0/sql/statements/stmt-poll-sleep/cancel"
+        })
+        .count();
+    assert_eq!(cancel_count, 1, "timeout cleanup must not dispatch twice");
+}
+
+#[tokio::test]
+async fn client_timeout_allows_inflight_terminal_status_to_win_during_grace() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-delayed-terminal")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-delayed-terminal"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(failed_body(
+                    "stmt-delayed-terminal",
+                    "server failure",
+                    "42000",
+                ))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT broken");
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(700))
+        .await
+        .err()
+        .expect("the terminal server failure must win during status grace");
+    assert_eq!(error.code, ErrorCode::SqlError);
+    assert_eq!(error.message, "server failure. SQLSTATE: 42000");
+    assert_eq!(error.sql_state.as_deref(), Some("42000"));
+    assert_eq!(error.query_id.as_deref(), Some("stmt-delayed-terminal"));
+
+    let closes =
+        wait_for_close_delete(&server, "stmt-delayed-terminal", 1, Duration::from_secs(1)).await;
+    assert_eq!(closes, 1);
+}
+
+#[tokio::test]
+async fn client_timeout_does_not_repoll_after_nonterminal_status_during_grace() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-running-during-grace")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-running-during-grace"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(running_body("stmt-running-during-grace"))
+                .set_delay(Duration::from_millis(600)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(
+            "/api/2.0/sql/statements/stmt-running-during-grace/cancel",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT still_running");
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(700))
+        .await
+        .err()
+        .expect("a non-terminal response during grace must preserve the timeout");
+    assert_client_query_timeout(&error, Some("stmt-running-during-grace"));
+
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-running-during-grace",
+        1,
+        Duration::from_secs(1),
+    )
+    .await;
+    assert_eq!(closes, 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn client_timeout_caps_inflight_status_grace() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_execute(&server, running_body("stmt-stalled-status")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-stalled-status"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(failed_body("stmt-stalled-status", "too late", "42000"))
+                .set_delay(Duration::from_secs(10)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-stalled-status/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT stalled_status");
+    let started = Instant::now();
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(700))
+        .await
+        .err()
+        .expect("a status request must not outlive the fixed grace window");
+    let elapsed = started.elapsed();
+    assert_client_query_timeout(&error, Some("stmt-stalled-status"));
+    assert!(
+        elapsed >= Duration::from_secs(5) && elapsed < Duration::from_secs(9),
+        "timeout returned after {elapsed:?}, expected the five-second status grace"
+    );
+
+    let closes =
+        wait_for_close_delete(&server, "stmt-stalled-status", 1, Duration::from_secs(1)).await;
+    assert_eq!(closes, 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn client_timeout_is_cumulative_across_retry_backoff() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(429).append_header("Retry-After", "0"))
+        .mount(&server)
+        .await;
+
+    let mut http = HttpConfig::default();
+    http.retry_min_wait = Duration::from_millis(250);
+    http.retry_max_wait = Duration::from_millis(250);
+    http.retry_max_retries = 1;
+    let session = open_session_with_http(&server, http).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+
+    let error = stmt
+        .execute_with_timeout(Duration::from_millis(75))
+        .await
+        .err()
+        .expect("client deadline must interrupt retry backoff");
+    assert_client_query_timeout(&error, None);
+    let execute_posts = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|request| {
+            request.method == wiremock::http::Method::POST
+                && request.url.path() == "/api/2.0/sql/statements"
+        })
+        .count();
+    assert_eq!(execute_posts, 1, "no retry may start after the deadline");
+}
+
+#[tokio::test]
+async fn terminal_error_mapping_is_inside_the_client_timeout_phase() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_execute(
+        &server,
+        failed_body("stmt-terminal-error", "bad SQL", "42000"),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT broken");
+    let error = stmt
+        .execute_with_timeout(Duration::from_secs(1))
+        .await
+        .err()
+        .expect("terminal FAILED must be mapped before materialisation");
+    assert_eq!(error.code, ErrorCode::SqlError);
+    assert_eq!(error.sql_state.as_deref(), Some("42000"));
+    assert_eq!(error.query_id.as_deref(), Some("stmt-terminal-error"));
+}
+
+#[tokio::test]
+async fn client_timeout_excludes_cloudfetch_materialisation() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let statement_id = "stmt-slow-materialisation";
+    let chunk_path = format!("/cloud-fetch/{statement_id}/chunk-0.arrow");
+    let chunk_url = format!("{}{}", server.uri(), chunk_path);
+    let batch = int64_batch("n", vec![42]);
+    let ipc = arrow_ipc_bytes(&batch);
+    let execute_body = json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 1,
+                "columns": [{
+                    "name": "n",
+                    "type_name": "BIGINT",
+                    "type_text": "BIGINT",
+                    "position": 0,
+                }],
+            },
+            "total_chunk_count": 1,
+            "total_row_count": 1,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "external_links": [{
+                "external_link": chunk_url,
+                "expiration": "2099-01-01T00:00:00.000Z",
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": 1,
+                "byte_count": ipc.len() as i64,
+            }],
+        },
+    })
+    .to_string();
+    mount_execute(&server, execute_body).await;
+    Mock::given(method("GET"))
+        .and(path(chunk_path.as_str()))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_bytes(ipc)
+                .set_delay(Duration::from_millis(700)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 42 AS n");
+    let started = Instant::now();
+    let mut exec = stmt
+        .execute_with_timeout(Duration::from_millis(300))
+        .await
+        .expect("CloudFetch reader materialisation must be outside the deadline");
+    assert!(
+        started.elapsed() >= Duration::from_millis(650),
+        "execute should wait for delayed reader materialisation after execution is terminal"
+    );
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        42
+    );
+    exec.close().await.expect("close");
 }

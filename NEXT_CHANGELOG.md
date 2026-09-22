@@ -11,6 +11,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Add execution-scoped client query deadlines to the Rust and C APIs.
 - Add an opt-in `release-with-debuginfo` Cargo profile and cross-platform
   symbol smoke checks for statically linked native consumers.
 - Create SQL Exec API sessions in FAST mode and exchange the maximum observed session version.
@@ -21,6 +22,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `query_tags` surface.
 
 ### Changed
+
+- Client query deadlines now allow an already-running statement-status request
+  up to five seconds to return a terminal result; no new poll starts after the
+  configured deadline.
 
 ### Updated
 

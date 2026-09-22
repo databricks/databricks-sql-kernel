@@ -38,12 +38,15 @@
 use super::error::{store_and_code, store_invalid_arg};
 use super::result::{into_raw_executed_stream, kernel_result_stream_t};
 use super::{block_on_ffi, catch_ffi, KernelStatusCode};
+use crate::client::ExecutionTimeout;
 use crate::kernel_error::Error;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
 use std::ffi::{c_char, CStr, CString};
+
+pub use crate::statement::timeout::MAX_CLIENT_QUERY_TIMEOUT_MS;
 
 /// Upper bound on a positional parameter ordinal accepted over the C ABI.
 ///
@@ -450,6 +453,56 @@ pub unsafe extern "C" fn kernel_statement_execute(
         return store_invalid_arg("kernel_statement_execute: out must not be null");
     }
 
+    execute_with_timeout_mode(stmt, ExecutionTimeout::Default, out)
+}
+
+/// Wait-for-result execution with a client deadline in milliseconds.
+///
+/// Zero selects unlimited execution. A finite deadline starts at native entry,
+/// ends after terminal mapping, and excludes result materialisation. A status request
+/// already in flight at the deadline may finish within a fixed five-second grace
+/// period. Timeout returns [`KernelStatusCode::Timeout`] with `HYT00` and leaves
+/// `*out` null.
+///
+/// # Safety
+/// `stmt` must be a live statement handle; `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_execute_with_timeout_ms(
+    stmt: *mut kernel_statement_t,
+    timeout_ms: u64,
+    out: *mut *mut kernel_executed_statement_t,
+) -> KernelStatusCode {
+    // Include validation and runtime queueing in the deadline.
+    let entered_at = std::time::Instant::now();
+    crate::c_abi::error::clear_error();
+    if out.is_null() {
+        return store_invalid_arg("kernel_statement_execute_with_timeout_ms: out must not be null");
+    }
+    std::ptr::write(out, std::ptr::null_mut());
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_invalid_arg(
+            "kernel_statement_execute_with_timeout_ms: stmt must not be null",
+        );
+    };
+    let timeout = match crate::statement::timeout::deadline_from_timeout_at(
+        std::time::Duration::from_millis(timeout_ms),
+        entered_at,
+    ) {
+        Ok(deadline) => ExecutionTimeout::from_explicit_deadline(deadline),
+        Err(error) => return store_and_code(error),
+    };
+
+    execute_with_timeout_mode(stmt, timeout, out)
+}
+
+/// Run synchronous execution after entry-point validation.
+///
+/// The timeout entry point clears `out`; the existing entry point does not.
+unsafe fn execute_with_timeout_mode(
+    stmt: &mut Statement,
+    timeout: ExecutionTimeout,
+    out: *mut *mut kernel_executed_statement_t,
+) -> KernelStatusCode {
     // `Statement::execute` borrows `&mut self`; we need that borrow to
     // live across the `block_on`. Raw-pointer the statement so the
     // closure can re-borrow it inside the runtime without entangling
@@ -458,7 +511,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
     let stmt_ptr: *mut Statement = stmt;
     let executed = block_on_ffi(move || {
         let stmt: &mut Statement = unsafe { &mut *stmt_ptr };
-        Box::pin(async move { stmt.execute().await })
+        Box::pin(async move { stmt.execute_with_timeout_mode(timeout).await })
     });
     match executed {
         Ok(exec) => {

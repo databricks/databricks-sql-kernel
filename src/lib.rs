@@ -147,6 +147,7 @@ pub use statement::handle::ExecutedStatementHandle;
 pub use statement::mutable::{DirectStatement, Statement, StatementCanceller};
 pub use statement::params_codec::parse_typed_value;
 pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};
+pub use statement::{MAX_CLIENT_QUERY_TIMEOUT, MAX_CLIENT_QUERY_TIMEOUT_MS};
 pub use telemetry::DriverSystemConfiguration;
 
 // === Compile-time guarantees on auto-traits ===

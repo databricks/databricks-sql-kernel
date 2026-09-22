@@ -77,6 +77,11 @@ static void test_null_guards(void) {
 
   rc = kernel_statement_set_query_tags(NULL, "team:eng");
   CHECK(rc == KernelStatusCode_InvalidArgument, "statement_set_query_tags(NULL) → InvalidArgument");
+  kernel_executed_statement_t* exec = (kernel_executed_statement_t*)0x1;
+  rc = kernel_statement_execute_with_timeout_ms(NULL, 1, &exec);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "statement_execute_with_timeout_ms(NULL) → InvalidArgument");
+  CHECK(exec == NULL, "statement_execute_with_timeout_ms failure clears out");
 
   rc = kernel_result_stream_close(NULL);
   CHECK(rc == KernelStatusCode_InvalidArgument, "result_stream_close(NULL) → InvalidArgument");
