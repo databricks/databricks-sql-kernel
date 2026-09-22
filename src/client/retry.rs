@@ -204,8 +204,12 @@ pub struct RetryStrategy {
 impl RetryStrategy {
     /// Create a strategy for the given request type and config.
     pub fn for_request(request_type: RequestType, config: &RetryConfig) -> Self {
+        Self::for_idempotency(request_type.idempotency(), config)
+    }
+
+    pub(crate) fn for_idempotency(idempotency: RequestIdempotency, config: &RetryConfig) -> Self {
         Self {
-            idempotency: request_type.idempotency(),
+            idempotency,
             override_codes: config.override_retryable_codes.clone(),
         }
     }

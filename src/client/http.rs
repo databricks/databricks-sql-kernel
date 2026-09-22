@@ -24,7 +24,7 @@
 
 use crate::auth::AuthProvider;
 use crate::client::retry::{
-    calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
+    calculate_backoff, RequestCategory, RequestIdempotency, RequestType, RetryConfig, RetryStrategy,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -382,6 +382,42 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
+    feature_flags_retry: RetryConfig,
+}
+
+#[derive(Clone, Copy)]
+enum RequestKind {
+    Public(RequestType),
+    FeatureFlags,
+}
+
+impl std::fmt::Debug for RequestKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Public(request_type) => request_type.fmt(f),
+            Self::FeatureFlags => f.write_str("FeatureFlags"),
+        }
+    }
+}
+
+impl RequestKind {
+    fn idempotency(self) -> RequestIdempotency {
+        match self {
+            Self::Public(request_type) => request_type.idempotency(),
+            Self::FeatureFlags => RequestIdempotency::Idempotent,
+        }
+    }
+
+    fn transport_error(self, source: &reqwest::Error) -> Error {
+        // Preserve timeout provenance for the feature-flag resolver so it can
+        // distinguish a slow endpoint from other caller-local transport
+        // failures. Keep the established public-request mapping unchanged.
+        if matches!(self, Self::FeatureFlags) && source.is_timeout() {
+            Error::timeout()
+        } else {
+            Error::network_error()
+        }
+    }
 }
 
 impl DatabricksHttpClient {
@@ -394,6 +430,15 @@ impl DatabricksHttpClient {
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
     ) -> Result<Self> {
+        // Keep this endpoint's policy private and single-attempt so adding
+        // connector-service traffic does not add a variant to the stable
+        // public RequestType/RequestCategory enums.
+        let feature_flags_retry = RetryConfig {
+            overall_timeout: Duration::from_secs(5),
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
         // re-applied per-request.
@@ -498,6 +543,7 @@ impl DatabricksHttpClient {
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
+            feature_flags_retry,
         })
     }
 
@@ -763,7 +809,15 @@ impl DatabricksHttpClient {
     ///
     /// The `RequestType` determines which `RetryConfig` and `RetryStrategy` to use.
     pub async fn execute(&self, request: Request, request_type: RequestType) -> Result<Response> {
-        self.execute_impl(request, true, request_type).await
+        self.execute_impl(request, true, RequestKind::Public(request_type))
+            .await
+    }
+
+    /// Execute the connector-service feature-flag request with authentication
+    /// and the kernel's fixed single-attempt policy.
+    pub(crate) async fn execute_feature_flags(&self, request: Request) -> Result<Response> {
+        self.execute_impl(request, true, RequestKind::FeatureFlags)
+            .await
     }
 
     /// Execute a request without authentication (for CloudFetch, OAuth endpoints).
@@ -774,7 +828,8 @@ impl DatabricksHttpClient {
         request: Request,
         request_type: RequestType,
     ) -> Result<Response> {
-        self.execute_impl(request, false, request_type).await
+        self.execute_impl(request, false, RequestKind::Public(request_type))
+            .await
     }
 
     /// Issue a single unauthenticated GET to `url` WITHOUT following redirects
@@ -817,10 +872,13 @@ impl DatabricksHttpClient {
         &self,
         request: Request,
         with_auth: bool,
-        request_type: RequestType,
+        request_kind: RequestKind,
     ) -> Result<Response> {
-        let config = self.retry_config(request_type.category());
-        let strategy = RetryStrategy::for_request(request_type, config);
+        let config = match request_kind {
+            RequestKind::Public(request_type) => self.retry_config(request_type.category()),
+            RequestKind::FeatureFlags => &self.feature_flags_retry,
+        };
+        let strategy = RetryStrategy::for_idempotency(request_kind.idempotency(), config);
         let max_attempts = config.max_retries + 1;
         let start_time = Instant::now();
 
@@ -916,7 +974,7 @@ impl DatabricksHttpClient {
 
             debug!(
                 "{:?}: {} {} (attempt {}/{})",
-                request_type, method, url, attempts, max_attempts
+                request_kind, method, url, attempts, max_attempts
             );
 
             match self.client.execute(request).await {
@@ -927,7 +985,7 @@ impl DatabricksHttpClient {
                         if attempts > 1 {
                             debug!(
                                 "{:?}: completed after {} attempts in {:.1}s — success",
-                                request_type,
+                                request_kind,
                                 attempts,
                                 start_time.elapsed().as_secs_f64()
                             );
@@ -955,7 +1013,7 @@ impl DatabricksHttpClient {
                             let error_body = response.text().await.unwrap_or_default();
                             debug!(
                                 "{:?}: failed after {} attempts in {:.1}s — retry timeout exceeded",
-                                request_type,
+                                request_kind,
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
@@ -974,7 +1032,7 @@ impl DatabricksHttpClient {
                         last_error = Some(format!("HTTP {}", status.as_u16()));
                         warn!(
                             "{:?}: HTTP {} (attempt {}/{}), waiting {:.1}s before retry",
-                            request_type,
+                            request_kind,
                             status.as_u16(),
                             attempts,
                             max_attempts,
@@ -988,7 +1046,7 @@ impl DatabricksHttpClient {
                     let error_body = response.text().await.unwrap_or_default();
                     debug!(
                         "{:?}: failed after {} attempts in {:.1}s — HTTP {}",
-                        request_type,
+                        request_kind,
                         attempts,
                         start_time.elapsed().as_secs_f64(),
                         status.as_u16()
@@ -1007,7 +1065,7 @@ impl DatabricksHttpClient {
                         if elapsed + wait > config.overall_timeout {
                             debug!(
                                 "{:?}: failed after {} attempts in {:.1}s — retry timeout exceeded",
-                                request_type,
+                                request_kind,
                                 attempts,
                                 elapsed.as_secs_f64()
                             );
@@ -1022,7 +1080,7 @@ impl DatabricksHttpClient {
                         last_error = Some(e.to_string());
                         warn!(
                             "{:?}: error (attempt {}/{}): {}, waiting {:.1}s before retry",
-                            request_type,
+                            request_kind,
                             attempts,
                             max_attempts,
                             e,
@@ -1034,12 +1092,12 @@ impl DatabricksHttpClient {
 
                     debug!(
                         "{:?}: failed after {} attempts in {:.1}s — {}",
-                        request_type,
+                        request_kind,
                         attempts,
                         start_time.elapsed().as_secs_f64(),
                         e
                     );
-                    return Err(Error::network_error().message(format!(
+                    return Err(request_kind.transport_error(&e).message(format!(
                         "HTTP request failed after {} attempts: {}",
                         attempts,
                         last_error.unwrap_or_else(|| e.to_string())
@@ -1077,6 +1135,22 @@ mod tests {
         let config = HttpClientConfig::default();
         let client = DatabricksHttpClient::new(config, default_retry_configs());
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn feature_flags_use_a_private_single_attempt_policy() {
+        let mut configs = default_retry_configs();
+        for config in configs.values_mut() {
+            config.max_retries = 42;
+            config.overall_timeout = Duration::from_secs(900);
+        }
+        let client = DatabricksHttpClient::new(HttpClientConfig::default(), configs).unwrap();
+
+        assert_eq!(client.feature_flags_retry.max_retries, 0);
+        assert_eq!(
+            client.feature_flags_retry.overall_timeout,
+            Duration::from_secs(5)
+        );
     }
 
     #[tokio::test]

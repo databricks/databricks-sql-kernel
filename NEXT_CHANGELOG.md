@@ -12,6 +12,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Added
 
 - Added Thrift-native metadata routing with compatible public-schema casts and one-based `getColumns` ordinals.
+- Add connector-service feature-flag resolution with authenticated requests,
+  JSON-serialized per-driver values, and bounded process-wide caching.
 
 ### Changed
 
