@@ -838,8 +838,11 @@ pub(crate) fn reshape_procedures(batch: &RecordBatch) -> Result<RecordBatch> {
 }
 
 /// Reshape the raw `SHOW FUNCTIONS` result into the JDBC `getFunctions` shape.
-pub(crate) fn reshape_functions(batch: &RecordBatch) -> Result<RecordBatch> {
-    let function_cat = utf8_column(batch, "catalogName")?;
+pub(crate) fn reshape_functions(
+    batch: &RecordBatch,
+    resolved_catalog: &str,
+) -> Result<RecordBatch> {
+    let function_cat = constant_utf8(batch.num_rows(), Some(resolved_catalog));
     let function_schem = utf8_column(batch, "namespace")?;
     let function_name = utf8_column(batch, "functionName")?;
     let remarks = utf8_column(batch, "remarks")?;
@@ -2060,7 +2063,7 @@ mod tests {
 
     #[test]
     fn reshape_functions_produces_jdbc_get_functions_shape() {
-        let out = reshape_functions(&server_function_row()).unwrap();
+        let out = reshape_functions(&server_function_row(), "main").unwrap();
         assert_eq!(
             col_names(&out),
             vec![

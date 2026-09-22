@@ -39,17 +39,17 @@ impl SqlCommandBuilder {
     }
 
     pub fn with_schema_pattern(mut self, pattern: Option<&str>) -> Self {
-        self.schema_pattern = pattern.map(Self::jdbc_pattern_to_hive);
+        self.schema_pattern = pattern.map(str::to_owned);
         self
     }
 
     pub fn with_table_pattern(mut self, pattern: Option<&str>) -> Self {
-        self.table_pattern = pattern.map(Self::jdbc_pattern_to_hive);
+        self.table_pattern = pattern.map(str::to_owned);
         self
     }
 
     pub fn with_column_pattern(mut self, pattern: Option<&str>) -> Self {
-        self.column_pattern = pattern.map(Self::jdbc_pattern_to_hive);
+        self.column_pattern = pattern.map(str::to_owned);
         self
     }
 
@@ -63,9 +63,10 @@ impl SqlCommandBuilder {
     /// - `_` → `.` (single-char wildcard)
     /// - `\%` → `%` (escaped literal percent)
     /// - `\_` → `_` (escaped literal underscore)
-    /// - `\\` → `\\` (escaped backslash)
+    /// - `\\` → `\` (escaped backslash)
     ///
-    /// Also escapes single quotes for safe SQL embedding.
+    /// This only converts wildcards; callers must separately escape the
+    /// converted value before embedding it in a SQL string literal.
     /// Matches JDBC driver's `WildcardUtil.jdbcPatternToHive`.
     fn jdbc_pattern_to_hive(pattern: &str) -> String {
         let mut result = String::with_capacity(pattern.len());
@@ -77,22 +78,24 @@ impl SqlCommandBuilder {
             }
             if escape_next {
                 // Escaped character: emit literally
-                if ch == '\\' {
-                    result.push_str("\\\\");
-                } else {
-                    result.push(ch);
-                }
+                result.push(ch);
                 escape_next = false;
             } else {
                 match ch {
                     '%' => result.push('*'),
                     '_' => result.push('.'),
-                    '\'' => result.push_str("''"),
                     _ => result.push(ch),
                 }
             }
         }
+        if escape_next {
+            result.push('\\');
+        }
         result
+    }
+
+    fn escape_show_pattern(pattern: &str) -> String {
+        Self::escape_sql_string(&Self::jdbc_pattern_to_hive(pattern))
     }
 
     /// Whether an ODBC/JDBC-style pattern contains an *active* wildcard
@@ -213,7 +216,7 @@ impl SqlCommandBuilder {
         };
 
         if let Some(ref pattern) = self.schema_pattern {
-            sql.push_str(&format!(" LIKE '{}'", pattern));
+            sql.push_str(&format!(" LIKE '{}'", Self::escape_show_pattern(pattern)));
         }
 
         sql
@@ -235,11 +238,14 @@ impl SqlCommandBuilder {
         };
 
         if let Some(ref pattern) = self.schema_pattern {
-            sql.push_str(&format!(" SCHEMA LIKE '{}'", pattern));
+            sql.push_str(&format!(
+                " SCHEMA LIKE '{}'",
+                Self::escape_show_pattern(pattern)
+            ));
         }
 
         if let Some(ref pattern) = self.table_pattern {
-            sql.push_str(&format!(" LIKE '{}'", pattern));
+            sql.push_str(&format!(" LIKE '{}'", Self::escape_show_pattern(pattern)));
         }
 
         sql
@@ -260,15 +266,21 @@ impl SqlCommandBuilder {
         };
 
         if let Some(ref pattern) = self.schema_pattern {
-            sql.push_str(&format!(" SCHEMA LIKE '{}'", pattern));
+            sql.push_str(&format!(
+                " SCHEMA LIKE '{}'",
+                Self::escape_show_pattern(pattern)
+            ));
         }
 
         if let Some(ref pattern) = self.table_pattern {
-            sql.push_str(&format!(" TABLE LIKE '{}'", pattern));
+            sql.push_str(&format!(
+                " TABLE LIKE '{}'",
+                Self::escape_show_pattern(pattern)
+            ));
         }
 
         if let Some(ref pattern) = self.column_pattern {
-            sql.push_str(&format!(" LIKE '{}'", pattern));
+            sql.push_str(&format!(" LIKE '{}'", Self::escape_show_pattern(pattern)));
         }
 
         sql
@@ -278,7 +290,7 @@ impl SqlCommandBuilder {
     ///
     /// Use for `LIKE` pattern values in `information_schema` queries.
     /// For identifiers (catalog/schema/table names), use [`escape_identifier`] instead.
-    /// For `SHOW` command patterns, use [`jdbc_pattern_to_hive`] instead.
+    /// For `SHOW` command patterns, use [`escape_show_pattern`] instead.
     ///
     /// Databricks SQL treats backslash as an escape character in string literals
     /// by default, so both single quotes and backslashes must be escaped.
@@ -358,12 +370,12 @@ impl SqlCommandBuilder {
         if let Some(pattern) = schema_pattern {
             sql.push_str(&format!(
                 " SCHEMA LIKE '{}'",
-                Self::jdbc_pattern_to_hive(pattern)
+                Self::escape_show_pattern(pattern)
             ));
         }
 
         let pattern = function_pattern.unwrap_or("%");
-        sql.push_str(&format!(" LIKE '{}'", Self::jdbc_pattern_to_hive(pattern)));
+        sql.push_str(&format!(" LIKE '{}'", Self::escape_show_pattern(pattern)));
 
         sql
     }
@@ -963,6 +975,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_get_functions_escaped_quotes_are_sql_escaped_once() {
+        let sql =
+            SqlCommandBuilder::build_show_functions("main", Some(r"sch\'ema"), Some(r"fn\'name"));
+        assert_eq!(
+            sql,
+            "SHOW FUNCTIONS IN CATALOG `main` SCHEMA LIKE 'sch''ema' LIKE 'fn''name'"
+        );
+    }
+
     // --- foreign keys with special characters ---
 
     #[test]
@@ -1001,7 +1023,7 @@ mod tests {
 
     #[test]
     fn test_pattern_escaped_backslash() {
-        assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive(r"abc\\"), r"abc\\");
+        assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive(r"abc\\"), r"abc\");
     }
 
     #[test]
@@ -1010,8 +1032,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pattern_single_quote_escaped() {
-        assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive("it's"), "it''s");
+    fn test_pattern_single_quote_unchanged() {
+        assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive("it's"), "it's");
+    }
+
+    #[test]
+    fn test_pattern_trailing_backslash_preserved() {
+        assert_eq!(SqlCommandBuilder::jdbc_pattern_to_hive(r"abc\"), r"abc\");
     }
 
     // --- catalog wildcard helpers (list_tables client-side path) ---

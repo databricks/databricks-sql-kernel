@@ -95,7 +95,7 @@ use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
-use arrow_array::{Array, ArrayRef, StringArray};
+use arrow_array::{Array, ArrayRef, Int32Array, StringArray};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 use tracing::{debug, Instrument};
@@ -127,8 +127,9 @@ fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
 
 /// Native metadata already has the canonical Thrift column order.
 /// Reattach the kernel's public schema so empty and non-empty responses expose
-/// the same stable Arrow contract, casting compatible server types when their
-/// physical representation differs from the JDBC schema.
+/// the same stable Arrow contract, casting server integer widths when they
+/// differ from the JDBC schema and applying the value normalization JDBC uses
+/// for copied native rows.
 fn normalize_native_metadata_batch(
     batch: &arrow_array::RecordBatch,
     schema: SchemaRef,
@@ -145,8 +146,8 @@ fn normalize_native_metadata_batch(
         .iter()
         .zip(schema.fields())
         .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
+            let column = if column.data_type() == field.data_type() {
+                Arc::clone(column)
             } else {
                 arrow_cast::cast(column.as_ref(), field.data_type()).map_err(|e| {
                     Error::data_loss().message(format!(
@@ -155,7 +156,63 @@ fn normalize_native_metadata_batch(
                         column.data_type(),
                         field.data_type()
                     ))
-                })
+                })?
+            };
+
+            match field.name().as_str() {
+                "REMARKS" => {
+                    let values = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| Error::data_loss().message("REMARKS is not Utf8"))?;
+                    Ok(Arc::new(StringArray::from(
+                        (0..values.len())
+                            .map(|i| {
+                                if values.is_null(i) {
+                                    ""
+                                } else {
+                                    values.value(i)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef)
+                }
+                "TABLE_TYPE" => {
+                    let values = column
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .ok_or_else(|| Error::data_loss().message("TABLE_TYPE is not Utf8"))?;
+                    Ok(Arc::new(StringArray::from(
+                        (0..values.len())
+                            .map(|i| {
+                                if values.is_null(i) || values.value(i).is_empty() {
+                                    "TABLE"
+                                } else {
+                                    values.value(i)
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    )) as ArrayRef)
+                }
+                "ORDINAL_POSITION" => {
+                    let values = column
+                        .as_any()
+                        .downcast_ref::<Int32Array>()
+                        .ok_or_else(|| {
+                            Error::data_loss().message("ORDINAL_POSITION is not Int32")
+                        })?;
+                    let values = values
+                        .iter()
+                        .map(|value| match value {
+                            Some(value) => value.checked_add(1).map(Some).ok_or_else(|| {
+                                Error::data_loss().message("ORDINAL_POSITION overflow")
+                            }),
+                            None => Ok(None),
+                        })
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+                }
+                _ => Ok(column),
             }
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1239,7 +1296,7 @@ impl Metadata {
         let telemetry_for_body = telemetry.clone();
         let result = async {
             let requested_catalog = catalog.as_ref().map(|i| i.as_str().to_owned());
-            let raw = match self
+            let functions_result = match self
                 .session
                 .transport()
                 .list_functions(
@@ -1256,6 +1313,8 @@ impl Metadata {
                         .await
                 }
             };
+            let resolved_catalog = functions_result.resolved_catalog;
+            let raw = functions_result.execute_result;
             Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
             let native = is_native_metadata_result(&raw);
@@ -1266,7 +1325,7 @@ impl Metadata {
                     if native {
                         normalize_native_functions_batch(batch, requested_catalog.as_deref())
                     } else {
-                        thrift_shape::reshape_functions(batch)
+                        thrift_shape::reshape_functions(batch, &resolved_catalog)
                     }
                 }),
             );
@@ -1439,6 +1498,58 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
+    use arrow_array::RecordBatch;
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn native_metadata_applies_jdbc_value_normalization() {
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("REMARKS", DataType::Utf8, true),
+                Field::new("TABLE_TYPE", DataType::Utf8, true),
+                Field::new("ORDINAL_POSITION", DataType::Int32, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![None, Some(""), Some("note")])),
+                Arc::new(StringArray::from(vec![None, Some(""), Some("VIEW")])),
+                Arc::new(Int32Array::from(vec![Some(0), Some(1), None])),
+            ],
+        )
+        .unwrap();
+        let target = Arc::new(Schema::new(vec![
+            Field::new("REMARKS", DataType::Utf8, true),
+            Field::new("TABLE_TYPE", DataType::Utf8, false),
+            Field::new("ORDINAL_POSITION", DataType::Int32, true),
+        ]));
+
+        let normalized = normalize_native_metadata_batch(&source, target).unwrap();
+        let remarks = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(remarks.value(0), "");
+        assert_eq!(remarks.value(1), "");
+        assert_eq!(remarks.value(2), "note");
+
+        let table_types = normalized
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(table_types.value(0), "TABLE");
+        assert_eq!(table_types.value(1), "TABLE");
+        assert_eq!(table_types.value(2), "VIEW");
+
+        let ordinals = normalized
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        assert_eq!(ordinals.value(0), 1);
+        assert_eq!(ordinals.value(1), 2);
+        assert!(ordinals.is_null(2));
+    }
 
     #[test]
     fn identifier_accepts_normal_name() {

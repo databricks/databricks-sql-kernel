@@ -20,8 +20,8 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
-    Transport, TransportConfig,
+    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, ListFunctionsResult,
+    SessionAttribution, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -173,6 +173,7 @@ pub(crate) struct SeaRestTransport {
     warehouse_id: String,
     config: TransportConfig,
     session_version: AtomicI64,
+    session_catalog: OnceLock<Option<String>>,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
@@ -214,6 +215,7 @@ impl SeaRestTransport {
             warehouse_id: warehouse_id.into(),
             config,
             session_version: AtomicI64::new(NO_SESSION_VERSION),
+            session_catalog: OnceLock::new(),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
         }
@@ -250,6 +252,13 @@ impl SeaRestTransport {
             self.session_version
                 .fetch_max(version.version_id, Ordering::SeqCst);
         }
+    }
+
+    fn session_catalog_or_hive_metastore(&self) -> &str {
+        self.session_catalog
+            .get()
+            .and_then(Option::as_deref)
+            .unwrap_or("hive_metastore")
     }
 
     /// Build the `/result/chunks/{idx}` URL, optionally with the
@@ -1156,6 +1165,7 @@ impl Transport for SeaRestTransport {
         session_config: HashMap<String, String>,
     ) -> Result<SessionInfo> {
         let url = format!("{}/sessions", self.base_url());
+        let _ = self.session_catalog.set(catalog.map(str::to_owned));
 
         let request_body = CreateSessionRequest {
             warehouse_id: self.warehouse_id.clone(),
@@ -1746,18 +1756,18 @@ impl Transport for SeaRestTransport {
         catalog: Option<&str>,
         schema_pattern: Option<&str>,
         function_pattern: Option<&str>,
-    ) -> Result<ExecuteResult> {
+    ) -> Result<ListFunctionsResult> {
         let resolved_catalog = match catalog {
             Some(catalog) => catalog.to_owned(),
             None => match self.query_current_catalog(session_id).await {
                 Ok(Some(catalog)) if !catalog.is_empty() => catalog,
-                Ok(_) => "hive_metastore".to_owned(),
+                Ok(_) => self.session_catalog_or_hive_metastore().to_owned(),
                 Err(e) => {
                     warn!(
                         error = %e,
-                        "failed to query current catalog for list_functions; using hive_metastore"
+                        "failed to query current catalog for list_functions; using session catalog fallback"
                     );
-                    "hive_metastore".to_owned()
+                    self.session_catalog_or_hive_metastore().to_owned()
                 }
             },
         };
@@ -1767,15 +1777,20 @@ impl Transport for SeaRestTransport {
             function_pattern,
         );
         debug!("list_functions: {}", sql);
-        self.execute_and_read(
-            session_id,
-            &sql,
-            &ExecuteParams::default(),
-            RequestType::ExecuteMetadataQuery,
-            Some(MetadataOperation::Functions),
-            ExecutionTimeout::Default,
-        )
-        .await
+        let execute_result = self
+            .execute_and_read(
+                session_id,
+                &sql,
+                &ExecuteParams::default(),
+                RequestType::ExecuteMetadataQuery,
+                Some(MetadataOperation::Functions),
+                ExecutionTimeout::Default,
+            )
+            .await?;
+        Ok(ListFunctionsResult {
+            execute_result,
+            resolved_catalog,
+        })
     }
 
     async fn list_procedure_columns(

@@ -1291,12 +1291,17 @@ mod tests {
         async fn list_functions(
             &self,
             _session_id: &str,
-            _catalog: Option<&str>,
+            catalog: Option<&str>,
             _schema_pattern: Option<&str>,
             _function_pattern: Option<&str>,
-        ) -> Result<ExecuteResult> {
-            self.execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
-                .await
+        ) -> Result<crate::client::ListFunctionsResult> {
+            let execute_result = self
+                .execute_statement("", "", &ExecuteParams::default(), ExecutionTimeout::Default)
+                .await?;
+            Ok(crate::client::ListFunctionsResult {
+                execute_result,
+                resolved_catalog: catalog.unwrap_or("hive_metastore").to_owned(),
+            })
         }
 
         async fn list_procedure_columns(
