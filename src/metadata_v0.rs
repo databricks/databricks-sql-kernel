@@ -195,6 +195,9 @@ fn normalize_native_metadata_batch(
                     )) as ArrayRef)
                 }
                 "ORDINAL_POSITION" => {
+                    // JDBC treats native GetColumns rows as zero-based and
+                    // increments them when copying native metadata. The SHOW
+                    // fallback already reports ordinalPosition as one-based.
                     let values = column
                         .as_any()
                         .downcast_ref::<Int32Array>()
@@ -227,6 +230,9 @@ fn normalize_native_functions_batch(
 ) -> Result<arrow_array::RecordBatch> {
     let normalized = normalize_native_metadata_batch(batch, GET_FUNCTIONS_SCHEMA.clone())?;
     let mut columns = normalized.columns().to_vec();
+    // Match JDBC's native-only override: preserve the caller's original
+    // catalog argument, including null. The SHOW fallback uses the resolved
+    // catalog because it is a different result path.
     columns[0] = Arc::new(StringArray::from(vec![
         requested_catalog;
         normalized.num_rows()

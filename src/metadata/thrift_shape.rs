@@ -243,7 +243,9 @@ pub(crate) static GET_FUNCTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("FUNCTION_CAT", DataType::Utf8, true),
         Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
-        Field::new("FUNCTION_NAME", DataType::Utf8, false),
+        // Classic SHOW FUNCTIONS can omit the modern `functionName` field.
+        // Keep this nullable so one malformed row does not discard the result.
+        Field::new("FUNCTION_NAME", DataType::Utf8, true),
         Field::new("REMARKS", DataType::Utf8, true),
         Field::new("FUNCTION_TYPE", DataType::Int16, true),
         Field::new("SPECIFIC_NAME", DataType::Utf8, true),
@@ -844,7 +846,12 @@ pub(crate) fn reshape_functions(
 ) -> Result<RecordBatch> {
     let function_cat = constant_utf8(batch.num_rows(), Some(resolved_catalog));
     let function_schem = utf8_column(batch, "namespace")?;
-    let function_name = utf8_column(batch, "functionName")?;
+    let function_name = if column_index(batch.schema_ref(), "functionName").is_some() {
+        utf8_column(batch, "functionName")?
+    } else {
+        // Classic SHOW FUNCTIONS exposes a single column named `function`.
+        utf8_column(batch, "function")?
+    };
     let remarks = utf8_column(batch, "remarks")?;
     let function_type = int16_column(batch, "functionType")?;
     let specific_name = utf8_column(batch, "specificName")?;
@@ -2086,6 +2093,33 @@ mod tests {
         // The wider server integer is narrowed to JDBC SMALLINT.
         let ftype = out.column(4).as_any().downcast_ref::<Int16Array>().unwrap();
         assert_eq!(ftype.value(0), 1);
+    }
+
+    #[test]
+    fn reshape_functions_supports_classic_single_column_shape() {
+        let source = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "function",
+                DataType::Utf8,
+                true,
+            )])),
+            vec![Arc::new(StringArray::from(vec![
+                Some("system.builtin.abs"),
+                None,
+            ]))],
+        )
+        .unwrap();
+
+        let out = reshape_functions(&source, "main").unwrap();
+        let names = out
+            .column(2)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(names.value(0), "system.builtin.abs");
+        assert!(names.is_null(1));
+        assert!(out.column(1).is_null(0));
+        assert!(out.column(3).is_null(0));
     }
 
     /// `build_get_procedure_columns` raw server shape (information_schema
