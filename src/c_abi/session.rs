@@ -30,6 +30,7 @@ use crate::config::{
     AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TelemetryConfig,
     TlsConfig, TokenCacheConfig,
 };
+use crate::feature_flags::{ClientIdentity, ClientType};
 use crate::kernel_error::Error;
 use crate::logging::{LoggingOutcome, LoggingSink};
 use crate::session::Session;
@@ -42,6 +43,34 @@ use std::time::Duration;
 #[repr(C)]
 pub struct kernel_session_t {
     _private: [u8; 0],
+}
+
+/// Driver family sent to the connector-service feature-flag endpoint.
+///
+/// This is a transparent integer wrapper rather than a Rust enum because C can
+/// pass any 32-bit value. Every bit pattern is valid at the ABI boundary; the
+/// setter validates the known values before constructing a [`ClientType`].
+#[repr(transparent)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KernelClientType(u32);
+
+impl KernelClientType {
+    pub const GO: Self = Self(1);
+    pub const NODE_JS: Self = Self(2);
+    pub const PYTHON: Self = Self(5);
+}
+
+impl TryFrom<KernelClientType> for ClientType {
+    type Error = u32;
+
+    fn try_from(value: KernelClientType) -> Result<Self, Self::Error> {
+        match value.0 {
+            1 => Ok(Self::Go),
+            2 => Ok(Self::NodeJs),
+            5 => Ok(Self::Python),
+            unknown => Err(unknown),
+        }
+    }
 }
 
 /// How the caller chose to identify the warehouse.
@@ -182,6 +211,9 @@ pub struct KernelSessionConfig {
     /// Telemetry collection/export knobs. Defaults to disabled; populated by
     /// `kernel_session_config_set_telemetry_config`.
     telemetry: TelemetryConfig,
+    /// Outer driver identity used for connector-service feature flags. `None`
+    /// preserves the legacy path and performs no feature-flag request.
+    client_identity: Option<ClientIdentity>,
     /// Driver/runtime/system identity supplied by the binding layer. `None`
     /// lets the kernel use only its own defaults; `Some` lets the kernel fill
     /// any omitted fields it knows how to derive.
@@ -278,6 +310,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         // Kernel result defaults (CloudFetch enabled, Arrow-native types).
         result: ResultConfig::default(),
         telemetry: TelemetryConfig::default(),
+        client_identity: None,
         driver_system_configuration: None,
     });
     std::ptr::write(out, Box::into_raw(config));
@@ -296,6 +329,39 @@ pub unsafe extern "C" fn kernel_session_config_free(config: *mut KernelSessionCo
     if !config.is_null() {
         drop(Box::from_raw(config));
     }
+}
+
+/// Set the outer driver's family and version for connector-service feature
+/// flags. The kernel reuses its authenticated HTTP client and process-wide
+/// cache; the native driver must not make a second request on the kernel path.
+///
+/// This setter is optional. Omitting it preserves legacy behavior and makes no
+/// feature-flag request. `version` must be UTF-8 containing at least one
+/// non-whitespace character.
+///
+/// # Safety
+/// `config` must be a live config handle; `version` must point to a
+/// NUL-terminated C string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_client_identity(
+    config: *mut KernelSessionConfig,
+    client_type: KernelClientType,
+    version: *const c_char,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        let client_type = ClientType::try_from(client_type).map_err(|unknown| {
+            Error::invalid_argument().message(format!(
+                "unknown client type {unknown}; expected Go (1), NodeJs (2), or Python (5)"
+            ))
+        })?;
+        let version = required_str(version, "driver version")?;
+        if version.trim().is_empty() {
+            return Err(Error::invalid_argument()
+                .message("driver version must contain a non-whitespace character"));
+        }
+        c.client_identity = Some(ClientIdentity::new(client_type, version));
+        Ok(())
+    })
 }
 
 /// Set the workspace host and bare warehouse id. Mutually exclusive with
@@ -1564,6 +1630,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         token_cache,
         result,
         telemetry,
+        client_identity,
         driver_system_configuration,
     } = config;
 
@@ -1611,6 +1678,9 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 });
             if let Some(system_configuration) = driver_system_configuration {
                 builder = builder.driver_system_configuration(system_configuration);
+            }
+            if let Some(identity) = client_identity {
+                builder = builder.client_identity(identity);
             }
 
             // Skip `.http()` when no HTTP override was set, so the kernel's
@@ -1917,6 +1987,128 @@ pub unsafe extern "C" fn kernel_session_rollback(
 mod tests {
     use super::*;
     use std::ffi::CString;
+
+    #[test]
+    fn client_type_header_constants_match_rust_mapping() {
+        let header = include_str!("../../include/databricks_kernel.h");
+        let mappings = [
+            ("Go", KernelClientType::GO, ClientType::Go),
+            ("NodeJs", KernelClientType::NODE_JS, ClientType::NodeJs),
+            ("Python", KernelClientType::PYTHON, ClientType::Python),
+        ];
+        assert_eq!(
+            header
+                .lines()
+                .filter(|line| line.trim_start().starts_with("KernelClientType_"))
+                .count(),
+            mappings.len(),
+            "every C header client type must have a Rust mapping"
+        );
+
+        for (header_name, ffi_type, client_type) in mappings {
+            assert_eq!(ClientType::try_from(ffi_type), Ok(client_type));
+            let declaration = format!("KernelClientType_{header_name} = {},", ffi_type.0);
+            assert!(
+                header.lines().any(|line| line.trim() == declaration),
+                "C header is missing the Rust mapping {declaration}"
+            );
+        }
+    }
+
+    #[test]
+    fn client_identity_setter_stores_type_and_version() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().client_identity.is_none());
+
+            let version = CString::new("1.2.3").unwrap();
+            assert_eq!(
+                kernel_session_config_set_client_identity(
+                    config,
+                    KernelClientType::GO,
+                    version.as_ptr(),
+                ),
+                KernelStatusCode::Success
+            );
+
+            let identity = config
+                .as_ref()
+                .unwrap()
+                .client_identity
+                .as_ref()
+                .expect("identity should be configured");
+            assert_eq!(identity.client_type(), ClientType::Go);
+            assert_eq!(identity.version(), "1.2.3");
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn client_identity_setter_rejects_unknown_type() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let version = CString::new("1.2.3").unwrap();
+
+            assert_eq!(
+                kernel_session_config_set_client_identity(
+                    config,
+                    KernelClientType(99),
+                    version.as_ptr(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            assert!(config.as_ref().unwrap().client_identity.is_none());
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn client_identity_setter_rejects_null_empty_or_blank_version() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_client_identity(
+                    config,
+                    KernelClientType::GO,
+                    std::ptr::null(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            let blank = CString::new(" \t").unwrap();
+            assert_eq!(
+                kernel_session_config_set_client_identity(
+                    config,
+                    KernelClientType::GO,
+                    blank.as_ptr(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            let empty = CString::new("").unwrap();
+            assert_eq!(
+                kernel_session_config_set_client_identity(
+                    config,
+                    KernelClientType::GO,
+                    empty.as_ptr(),
+                ),
+                KernelStatusCode::InvalidArgument
+            );
+            assert!(config.as_ref().unwrap().client_identity.is_none());
+            kernel_session_config_free(config);
+        }
+    }
 
     #[test]
     fn tls_client_certificate_setter_stores_both_values() {

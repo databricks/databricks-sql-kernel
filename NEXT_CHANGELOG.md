@@ -14,6 +14,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Added Thrift-native metadata routing with compatible public-schema casts and one-based `getColumns` ordinals.
 - Add connector-service feature-flag resolution with authenticated requests,
   JSON-serialized per-driver values, and bounded process-wide caching.
+- Add a C ABI client-identity setter so native drivers can use kernel-owned
+  connector-service feature flags without duplicate calls.
 
 ### Changed
 

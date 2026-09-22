@@ -324,8 +324,9 @@ export interface ConnectionOptions {
    */
   driverName?: string
   /**
-   * Driver version reported in telemetry system configuration. Omitted ⇒
-   * kernel default.
+   * Driver version reported in telemetry system configuration and used for
+   * connector-service feature-flag evaluation. Omitted ⇒ kernel default and
+   * no feature-flag request.
    */
   driverVersion?: string
   /**

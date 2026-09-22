@@ -34,8 +34,9 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError, HttpConfig,
-    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig, TokenCacheConfig,
+    AuthConfig, ClientIdentity, ClientType, DefaultOpts, DriverSystemConfiguration,
+    Error as KernelError, HttpConfig, ProxyConfig, ResultConfig, Session, TelemetryConfig,
+    TlsConfig, TokenCacheConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -234,8 +235,9 @@ pub struct ConnectionOptions {
     /// Driver name reported in telemetry system configuration. Omitted ⇒
     /// kernel default.
     pub driver_name: Option<String>,
-    /// Driver version reported in telemetry system configuration. Omitted ⇒
-    /// kernel default.
+    /// Driver version reported in telemetry system configuration and used for
+    /// connector-service feature-flag evaluation. Omitted ⇒ kernel default and
+    /// no feature-flag request.
     pub driver_version: Option<String>,
     /// Runtime name reported in telemetry system configuration. Omitted ⇒
     /// kernel default.
@@ -763,6 +765,12 @@ fn build_driver_system_configuration(
     })
 }
 
+fn build_client_identity(driver_version: Option<&str>) -> Option<ClientIdentity> {
+    driver_version
+        .filter(|version| !version.trim().is_empty())
+        .map(|version| ClientIdentity::new(ClientType::NodeJs, version))
+}
+
 /// Open a Databricks SQL session and return an opaque `Connection`
 /// wrapping the kernel `Session`. Authentication is selected by
 /// `options.auth_mode` (PAT / OAuth M2M / OAuth U2M) — see
@@ -798,6 +806,7 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         // `options` to avoid cloning the header strings.
         let http_config = build_http_config(&mut options);
         let telemetry_config = build_telemetry_config(&options)?;
+        let client_identity = build_client_identity(options.driver_version.as_deref());
         let driver_system_configuration = build_driver_system_configuration(&options);
 
         // SessionConfig is `#[non_exhaustive]` — go through the
@@ -846,6 +855,9 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         }
         if let Some(system_configuration) = driver_system_configuration {
             builder = builder.driver_system_configuration(system_configuration);
+        }
+        if let Some(identity) = client_identity {
+            builder = builder.client_identity(identity);
         }
         // Programmatic HTTP/HTTPS proxy. Only wire a `ProxyConfig` when a
         // proxy is supplied; otherwise leave it unset so the kernel keeps
@@ -1698,5 +1710,16 @@ mod tests {
             Some("UTF-8")
         );
         assert_eq!(system_configuration.process_name.as_deref(), Some("node"));
+    }
+
+    #[test]
+    fn driver_version_builds_node_client_identity() {
+        assert!(build_client_identity(None).is_none());
+        assert!(build_client_identity(Some("")).is_none());
+        assert!(build_client_identity(Some(" \t")).is_none());
+
+        let identity = build_client_identity(Some("1.2.3")).unwrap();
+        assert_eq!(identity.client_type(), ClientType::NodeJs);
+        assert_eq!(identity.version(), "1.2.3");
     }
 }

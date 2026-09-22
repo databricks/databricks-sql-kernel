@@ -60,6 +60,12 @@ static void test_config_lifecycle(void) {
   rc = kernel_session_config_set_session_conf(config, "ANSI_MODE", "true");
   CHECK(rc == KernelStatusCode_Success, "set_session_conf succeeds");
 
+  rc = kernel_session_config_set_client_identity(config, (KernelClientType)99, "1.2.3");
+  CHECK(rc == KernelStatusCode_InvalidArgument, "unknown client identity is rejected");
+
+  rc = kernel_session_config_set_client_identity(config, KernelClientType_Go, "1.2.3");
+  CHECK(rc == KernelStatusCode_Success, "set_client_identity succeeds");
+
   kernel_session_config_free(config);
   CHECK(1, "config_free does not crash");
 }

@@ -227,6 +227,16 @@ typedef struct kernel_statement_canceller_t kernel_statement_canceller_t;
  * stream is permanently aborted (every later next_batch returns Cancelled). */
 typedef struct kernel_result_stream_canceller_t kernel_result_stream_canceller_t;
 
+/* Outer driver family used by connector-service feature-flag evaluation.
+ * This is an integer rather than a C enum so every value crosses the FFI
+ * boundary safely; the setter returns InvalidArgument for unknown values. */
+typedef uint32_t KernelClientType;
+enum {
+  KernelClientType_Go = 1,
+  KernelClientType_NodeJs = 2,
+  KernelClientType_Python = 5,
+};
+
 /* ─── Session config ──────────────────────────────────────────────────
  *
  * Build a config, set exactly one connection form and exactly one auth
@@ -236,6 +246,15 @@ typedef struct kernel_result_stream_canceller_t kernel_result_stream_canceller_t
  */
 KernelStatusCode kernel_session_config_new(KernelSessionConfig** out);
 void kernel_session_config_free(KernelSessionConfig* config);
+
+/* Optional outer-driver identity for connector-service feature flags. Omitting
+ * this setter preserves legacy behavior and performs no feature-flag request.
+ * `version` must be non-NULL UTF-8 containing at least one non-whitespace
+ * character. The kernel owns fetching and caching; callers must not issue a
+ * duplicate request on the kernel path. */
+KernelStatusCode kernel_session_config_set_client_identity(KernelSessionConfig* config,
+                                                           KernelClientType client_type,
+                                                           const char* version);
 
 /* Connection identity — call exactly one; the last one wins. */
 KernelStatusCode kernel_session_config_set_warehouse(KernelSessionConfig* config,

@@ -15,6 +15,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Changed
 
+- Use a non-empty `driver_version` as the Python client identity for
+  connector-service feature flags.
+
 ### Updated
 
 ### Fixed

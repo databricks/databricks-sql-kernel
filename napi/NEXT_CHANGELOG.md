@@ -16,6 +16,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Changed
 
+- Use a non-empty `driverVersion` as the Node.js client identity for
+  connector-service feature flags.
+
 ### Updated
 
 ### Fixed

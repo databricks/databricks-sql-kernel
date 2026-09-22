@@ -24,7 +24,7 @@ use crate::auth::{build_auth_config, OAuthParams};
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::metadata::Metadata;
 use crate::statement::Statement;
-use databricks_sql_kernel::Session as KSession;
+use databricks_sql_kernel::{ClientIdentity, ClientType, Session as KSession};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -258,6 +258,12 @@ fn build_driver_system_configuration(
     })
 }
 
+fn build_client_identity(driver_version: Option<&str>) -> Option<ClientIdentity> {
+    driver_version
+        .filter(|version| !version.trim().is_empty())
+        .map(|version| ClientIdentity::new(ClientType::Python, version))
+}
+
 #[pymethods]
 impl Session {
     /// Open a new session against the given workspace.
@@ -325,6 +331,9 @@ impl Session {
     /// presets, etc. The kernel does not validate keys; the server
     /// rejects unknown ones with a `KernelError(code='SqlError')`
     /// when it picks them up.
+    ///
+    /// A non-empty `driver_version` also identifies the Python driver for
+    /// connector-service feature flags. Omitting it performs no flag request.
     #[new]
     #[pyo3(signature = (
         host,
@@ -545,6 +554,7 @@ impl Session {
             http_headers,
         )?;
 
+        let client_identity = build_client_identity(driver_version.as_deref());
         let driver_system_configuration = build_driver_system_configuration(
             driver_name,
             driver_version,
@@ -615,6 +625,9 @@ impl Session {
             }
             if let Some(system_configuration) = driver_system_configuration {
                 builder = builder.driver_system_configuration(system_configuration);
+            }
+            if let Some(identity) = client_identity {
+                builder = builder.client_identity(identity);
             }
             if catalog.is_some() || schema.is_some() {
                 let mut defaults = databricks_sql_kernel::DefaultOpts::default();
@@ -772,6 +785,17 @@ mod send_sync_tests {
     }
 
     #[test]
+    fn driver_version_builds_python_client_identity() {
+        assert!(build_client_identity(None).is_none());
+        assert!(build_client_identity(Some("")).is_none());
+        assert!(build_client_identity(Some(" \t")).is_none());
+
+        let identity = build_client_identity(Some("1.2.3")).unwrap();
+        assert_eq!(identity.client_type(), ClientType::Python);
+        assert_eq!(identity.version(), "1.2.3");
+    }
+
+    #[test]
     fn telemetry_kwargs_reject_zero_required_fields() {
         assert!(build_telemetry_config(TelemetryKwargs {
             batch_size: Some(0),
@@ -819,9 +843,11 @@ mod send_sync_tests {
         assert!(build_http_config(None, None, None, None, None, None, None)
             .unwrap()
             .is_none());
-        assert!(build_http_config(Some(0.0), None, None, None, None, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            build_http_config(Some(0.0), None, None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
 
         let http = build_http_config(Some(0.5), None, None, None, None, None, None)
             .unwrap()
@@ -832,8 +858,7 @@ mod send_sync_tests {
 
         let one_ns = std::time::Duration::from_nanos(1).as_secs_f64();
         assert!(
-            build_http_config(Some(one_ns / 1_000.0), None, None, None, None, None, None)
-                .is_err()
+            build_http_config(Some(one_ns / 1_000.0), None, None, None, None, None, None).is_err()
         );
         let http = build_http_config(Some(one_ns), None, None, None, None, None, None)
             .unwrap()
