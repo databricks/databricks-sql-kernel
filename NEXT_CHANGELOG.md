@@ -11,28 +11,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- Add execution-scoped client query deadlines to the Rust and C APIs.
-- Add an opt-in `release-with-debuginfo` Cargo profile and cross-platform
-  symbol smoke checks for statically linked native consumers.
-- Create SQL Exec API sessions in FAST mode and exchange the maximum observed session version.
-- Add a C ABI setter for the maximum idle HTTP connections retained per host.
-- C ABI: `kernel_statement_set_query_tags()` attaches per-statement query tags
-  (serialized `key:value` wire form) to a statement's execution, letting C ABI
-  consumers (ODBC, Go's kernel backend) reach parity with the Rust/PyO3/napi
-  `query_tags` surface.
-
 ### Changed
-
-- Client query deadlines now allow an already-running statement-status request
-  up to five seconds to return a terminal result; no new poll starts after the
-  configured deadline.
 
 ### Updated
 
 ### Fixed
-
-- Reject non-HTTPS endpoints before connecting when an mTLS client
-  certificate and private key are configured.
 
 ---
 *Note: When making changes, please add your change under the appropriate
