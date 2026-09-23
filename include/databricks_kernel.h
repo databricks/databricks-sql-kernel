@@ -876,7 +876,8 @@ KernelStatusCode kernel_executed_async_statement_status(
  * handle. This is NON-BLOCKING: the caller must first poll
  * kernel_executed_async_statement_status until it reports Succeeded (or Closed)
  * before calling this. Invoking it before the statement reaches a terminal
- * state returns InvalidState rather than blocking. This is single-consumption:
+ * state returns KernelStatusCode_InvalidArgument rather than blocking (v0
+ * collapses invalid-state into that code). This is single-consumption:
  * a second successful take is rejected. Close the stream with
  * kernel_result_stream_close. */
 KernelStatusCode kernel_executed_async_statement_get_result_stream(
