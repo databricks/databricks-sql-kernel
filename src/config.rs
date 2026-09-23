@@ -792,10 +792,10 @@ pub struct HttpConfig {
     /// HTTP stack.
     ///
     /// **Kernel-managed headers are reserved:** caller entries for
-    /// `Authorization`, `x-databricks-org-id`, or the SQL session-routing
-    /// headers are **silently dropped (with a `warn!`)**. The kernel owns
-    /// their values, so authentication and routing cannot be changed by a
-    /// caller header. This mirrors the Thrift connector, where
+    /// `Authorization`, `x-databricks-org-id`, or the real-time direct-routing
+    /// and DBSQL session-ID headers are **silently dropped (with a `warn!`)**.
+    /// The kernel owns their values, so authentication and routing cannot be
+    /// changed by a caller header. This mirrors the Thrift connector, where
     /// `auth_provider.add_headers` runs after the custom-header dict and
     /// overwrites managed names.
     ///

@@ -11,8 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- Negotiate Fast Path routing and session-ID headers during session creation and propagate them
-  on session-owned follow-up requests.
+- Negotiate real-time direct routing and DBSQL session-ID headers during session creation and
+  propagate them on session-owned follow-up requests.
 ### Changed
 
 ### Updated
