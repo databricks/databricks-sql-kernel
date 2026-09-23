@@ -23,11 +23,9 @@
 //! - Configurable timeouts
 
 use crate::auth::AuthProvider;
+use crate::client::headers::is_kernel_managed_header;
 use crate::client::retry::{
     calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
-};
-use crate::client::{
-    DBSQL_SESSION_ID_HEADER, REALTIME_DIRECT_ROUTING_HEADER, REALTIME_SESSION_HEADER,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -869,13 +867,7 @@ impl DatabricksHttpClient {
             // `setCustomHeaders` applies to every request on the
             // transport, IdP calls included.
             for (name, value) in &self.config.custom_headers {
-                let lname = name.to_ascii_lowercase();
-                if lname == "authorization"
-                    || lname == "x-databricks-org-id"
-                    || lname == REALTIME_DIRECT_ROUTING_HEADER
-                    || lname == REALTIME_SESSION_HEADER
-                    || lname == DBSQL_SESSION_ID_HEADER
-                {
+                if is_kernel_managed_header(name) {
                     warn!(
                         header = %name,
                         "ignoring caller-supplied custom header; this name is \
@@ -1060,6 +1052,9 @@ impl DatabricksHttpClient {
 mod tests {
     use super::*;
     use crate::auth::PersonalAccessToken;
+    use crate::client::headers::{
+        DBSQL_SESSION_ID_HEADER, REALTIME_DIRECT_ROUTING_HEADER, REALTIME_SESSION_HEADER,
+    };
     use crate::client::retry::build_retry_configs;
 
     fn default_retry_configs() -> HashMap<RequestCategory, RetryConfig> {

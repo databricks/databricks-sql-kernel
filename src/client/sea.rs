@@ -17,12 +17,14 @@
 //! This module implements the `Transport` trait using the Databricks
 //! SQL Statement Execution API (REST-based).
 
+use crate::client::headers::{
+    DBSQL_SESSION_ID_HEADER, REALTIME_DIRECT_ROUTING_HEADER, REALTIME_SESSION_HEADER,
+};
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
     ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
-    Transport, TransportConfig, DBSQL_SESSION_ID_HEADER, REALTIME_DIRECT_ROUTING_HEADER,
-    REALTIME_SESSION_HEADER,
+    Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
