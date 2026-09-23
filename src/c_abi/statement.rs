@@ -14,16 +14,8 @@
 
 //! Statement FFI — set sql, bind params, execute, and fetch results.
 //!
-//! ## Scope in v0
-//!
-//! The C ABI wires the **synchronous** execute path
-//! (`kernel_statement_execute` → `kernel_executed_statement_t` →
-//! `kernel_result_stream_t`), which is what the ODBC consumer needs. The
-//! **async** submit path (`kernel_statement_submit` +
-//! `kernel_executed_async_statement_*`) keeps its skeleton declarations
-//! and `unimplemented!()` bodies until a consumer needs caller-driven
-//! polling over the C ABI; Rust-crate consumers use `Statement::submit`
-//! directly.
+//! The C ABI exposes both blocking execution and caller-driven asynchronous
+//! execution. Both paths use the same result-stream ABI.
 //!
 //! ## Error reporting convention
 //!
@@ -36,11 +28,15 @@
 #![allow(non_camel_case_types)]
 
 use super::error::{store_and_code, store_invalid_arg};
-use super::result::{into_raw_executed_stream, kernel_result_stream_t};
+use super::result::{into_raw_executed_stream, into_raw_result_stream, kernel_result_stream_t};
 use super::{block_on_ffi, catch_ffi, KernelStatusCode};
 use crate::client::ExecutionTimeout;
 use crate::kernel_error::Error;
 use crate::statement::executed::ExecutedStatement;
+use crate::statement::executed_async::{
+    AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus,
+};
+use crate::statement::handle::ExecutedStatementHandle;
 use crate::statement::mutable::Statement;
 use crate::statement::spec::TypedValue;
 use crate::statement::validity::ValidityFlag;
@@ -91,6 +87,16 @@ pub(crate) struct ExecutedHandle {
     pub(crate) statement_id_c: CString,
 }
 
+struct ExecutedAsyncHandle {
+    exec: ExecutedAsyncStatement,
+    stream_taken: bool,
+    statement_id_c: CString,
+}
+
+struct AsyncCancellerHandle {
+    canceller: AsyncStatementCanceller,
+}
+
 // ─── Opaque handles ──────────────────────────────────────────────────────────
 
 /// Lifecycle owner. Returned by `kernel_session_new_statement`. Boxed
@@ -107,10 +113,15 @@ pub struct kernel_executed_statement_t {
     _private: [u8; 0],
 }
 
-/// Async-consumption executed handle. Returned by
-/// `kernel_statement_submit` (deferred in v0 — see module docs).
+/// Async-consumption executed handle. Returned by `kernel_statement_submit`.
 #[repr(C)]
 pub struct kernel_executed_async_statement_t {
+    _private: [u8; 0],
+}
+
+/// Detached, execution-scoped canceller for an async statement.
+#[repr(C)]
+pub struct kernel_executed_async_statement_canceller_t {
     _private: [u8; 0],
 }
 
@@ -867,11 +878,225 @@ pub unsafe extern "C" fn kernel_statement_submit(
     stmt: *mut kernel_statement_t,
     out: *mut *mut kernel_executed_async_statement_t,
 ) -> KernelStatusCode {
-    let _ = (stmt, out);
     crate::c_abi::error::clear_error();
-    store_invalid_arg(
-        "async submit is not exposed over the v0 C ABI; use the synchronous execute path",
-    )
+    if out.is_null() {
+        return store_invalid_arg("kernel_statement_submit: out must not be null");
+    }
+    std::ptr::write(out, std::ptr::null_mut());
+    let Some(stmt) = statement_mut(stmt) else {
+        return store_invalid_arg("kernel_statement_submit: stmt must not be null");
+    };
+    let stmt_ptr: *mut Statement = stmt;
+    match block_on_ffi(move || {
+        let stmt = unsafe { &mut *stmt_ptr };
+        Box::pin(async move { stmt.submit().await })
+    }) {
+        Ok(exec) => {
+            let statement_id_c = crate::c_abi::error::to_cstring_lossy(exec.statement_id());
+            let handle = ExecutedAsyncHandle {
+                exec,
+                stream_taken: false,
+                statement_id_c,
+            };
+            std::ptr::write(out, Box::into_raw(Box::new(handle)) as *mut _);
+            KernelStatusCode::Success
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_status(
+    exec: *mut kernel_executed_async_statement_t,
+    out: *mut KernelStatementStatusKind,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *mut ExecutedAsyncHandle).as_ref() else {
+        return store_invalid_arg("kernel_executed_async_statement_status: exec must not be null");
+    };
+    if out.is_null() {
+        return store_invalid_arg("kernel_executed_async_statement_status: out must not be null");
+    }
+    let exec_ptr: *const ExecutedAsyncStatement = &handle.exec;
+    match block_on_ffi(move || {
+        let exec = unsafe { &*exec_ptr };
+        Box::pin(async move { exec.status().await })
+    }) {
+        Ok(status) => {
+            let (kind, code) = match status {
+                StatementStatus::Pending => (
+                    KernelStatementStatusKind::Pending,
+                    KernelStatusCode::Success,
+                ),
+                StatementStatus::Running => (
+                    KernelStatementStatusKind::Running,
+                    KernelStatusCode::Success,
+                ),
+                StatementStatus::Succeeded => (
+                    KernelStatementStatusKind::Succeeded,
+                    KernelStatusCode::Success,
+                ),
+                StatementStatus::Closed => {
+                    (KernelStatementStatusKind::Closed, KernelStatusCode::Success)
+                }
+                StatementStatus::Failed(error) => {
+                    let code = store_and_code(error);
+                    (KernelStatementStatusKind::Failed, code)
+                }
+                StatementStatus::Cancelled => {
+                    let error = Error::cancelled()
+                        .message(format!(
+                            "Statement {} was cancelled",
+                            handle.exec.statement_id()
+                        ))
+                        .with_query_id(handle.exec.statement_id());
+                    let code = store_and_code(error);
+                    (KernelStatementStatusKind::Cancelled, code)
+                }
+            };
+            std::ptr::write(out, kind);
+            code
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_get_result_stream(
+    exec: *mut kernel_executed_async_statement_t,
+    out: *mut *mut kernel_result_stream_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *mut ExecutedAsyncHandle).as_mut() else {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_get_result_stream: exec must not be null",
+        );
+    };
+    if out.is_null() {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_get_result_stream: out must not be null",
+        );
+    }
+    std::ptr::write(out, std::ptr::null_mut());
+    if handle.stream_taken {
+        return store_invalid_arg(
+            "a result stream has already been taken from this async statement",
+        );
+    }
+    let exec_ptr: *const ExecutedAsyncStatement = &handle.exec;
+    match block_on_ffi(move || {
+        let exec = unsafe { &*exec_ptr };
+        Box::pin(async move { exec.fetch_result().await })
+    }) {
+        Ok(stream) => {
+            let schema = stream.schema();
+            handle.stream_taken = true;
+            std::ptr::write(out, into_raw_result_stream(schema, stream));
+            KernelStatusCode::Success
+        }
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_num_modified_rows(
+    exec: *const kernel_executed_async_statement_t,
+) -> i64 {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedAsyncHandle).as_ref() else {
+        store_invalid_arg(
+            "kernel_executed_async_statement_num_modified_rows: exec must not be null",
+        );
+        return -1;
+    };
+    handle.exec.num_modified_rows().unwrap_or(-1)
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_query_id(
+    exec: *const kernel_executed_async_statement_t,
+) -> *const c_char {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedAsyncHandle).as_ref() else {
+        store_invalid_arg("kernel_executed_async_statement_query_id: exec must not be null");
+        return std::ptr::null();
+    };
+    handle.statement_id_c.as_ptr()
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_canceller_new(
+    exec: *const kernel_executed_async_statement_t,
+    out: *mut *mut kernel_executed_async_statement_canceller_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (exec as *const ExecutedAsyncHandle).as_ref() else {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_canceller_new: exec must not be null",
+        );
+    };
+    if out.is_null() {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_canceller_new: out must not be null",
+        );
+    }
+    let handle = AsyncCancellerHandle {
+        canceller: handle.exec.canceller(),
+    };
+    std::ptr::write(out, Box::into_raw(Box::new(handle)) as *mut _);
+    KernelStatusCode::Success
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_canceller_cancel(
+    canceller: *mut kernel_executed_async_statement_canceller_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    let Some(handle) = (canceller as *mut AsyncCancellerHandle).as_ref() else {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_canceller_cancel: handle must not be null",
+        );
+    };
+    let detached = handle.canceller.clone();
+    match block_on_ffi(move || Box::pin(async move { detached.cancel().await })) {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_canceller_free(
+    canceller: *mut kernel_executed_async_statement_canceller_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    if canceller.is_null() {
+        return store_invalid_arg(
+            "kernel_executed_async_statement_canceller_free: handle must not be null",
+        );
+    }
+    drop(Box::from_raw(canceller as *mut AsyncCancellerHandle));
+    KernelStatusCode::Success
+}
+
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_async_statement_close(
+    exec: *mut kernel_executed_async_statement_t,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    if exec.is_null() {
+        return store_invalid_arg("kernel_executed_async_statement_close: exec must not be null");
+    }
+    let mut handle = Box::from_raw(exec as *mut ExecutedAsyncHandle);
+    let exec_ptr: *mut ExecutedAsyncStatement = &mut handle.exec;
+    let result = block_on_ffi(move || {
+        let exec = unsafe { &mut *exec_ptr };
+        Box::pin(async move { exec.close().await })
+    });
+    drop(handle);
+    match result {
+        Ok(()) => KernelStatusCode::Success,
+        Err(code) => code,
+    }
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
@@ -938,5 +1163,47 @@ mod tests {
 
         let rc = unsafe { kernel_statement_canceller_free(std::ptr::null_mut()) };
         assert_eq!(rc, KernelStatusCode::InvalidArgument);
+    }
+
+    #[test]
+    fn async_entry_points_reject_null_handles() {
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kernel_statement_submit(std::ptr::null_mut(), &mut exec) },
+            KernelStatusCode::InvalidArgument
+        );
+        assert!(exec.is_null());
+
+        let mut status = KernelStatementStatusKind::Pending;
+        assert_eq!(
+            unsafe { kernel_executed_async_statement_status(std::ptr::null_mut(), &mut status) },
+            KernelStatusCode::InvalidArgument
+        );
+        let mut stream = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                kernel_executed_async_statement_get_result_stream(std::ptr::null_mut(), &mut stream)
+            },
+            KernelStatusCode::InvalidArgument
+        );
+        let mut canceller = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                kernel_executed_async_statement_canceller_new(std::ptr::null(), &mut canceller)
+            },
+            KernelStatusCode::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { kernel_executed_async_statement_canceller_cancel(std::ptr::null_mut()) },
+            KernelStatusCode::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { kernel_executed_async_statement_canceller_free(std::ptr::null_mut()) },
+            KernelStatusCode::InvalidArgument
+        );
+        assert_eq!(
+            unsafe { kernel_executed_async_statement_close(std::ptr::null_mut()) },
+            KernelStatusCode::InvalidArgument
+        );
     }
 }

@@ -45,23 +45,121 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
+use databricks_sql_kernel::c_abi::result::{kernel_result_stream_close, kernel_result_stream_t};
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
     kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
     kernel_session_t, KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::statement::{
+    kernel_executed_async_statement_canceller_cancel,
+    kernel_executed_async_statement_canceller_free, kernel_executed_async_statement_canceller_new,
+    kernel_executed_async_statement_canceller_t, kernel_executed_async_statement_close,
+    kernel_executed_async_statement_get_result_stream, kernel_executed_async_statement_query_id,
+    kernel_executed_async_statement_status, kernel_executed_async_statement_t,
     kernel_executed_statement_close, kernel_executed_statement_query_id,
     kernel_executed_statement_t, kernel_statement_bind_parameter,
     kernel_statement_canceller_cancel, kernel_statement_canceller_free,
     kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
     kernel_statement_execute, kernel_statement_execute_with_timeout_ms, kernel_statement_set_sql,
-    kernel_statement_t, MAX_CLIENT_QUERY_TIMEOUT_MS,
+    kernel_statement_submit, kernel_statement_t, KernelStatementStatusKind,
+    MAX_CLIENT_QUERY_TIMEOUT_MS,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+#[test]
+fn async_c_abi_submit_poll_and_materialise() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-async")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-async"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-async")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-async/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(kernel_executed_async_statement_query_id(exec))
+                .to_str()
+                .unwrap(),
+            "stmt-async"
+        );
+        let mut status = KernelStatementStatusKind::Pending;
+        assert_eq!(
+            kernel_executed_async_statement_status(exec, &mut status),
+            KernelStatusCode::Success
+        );
+        assert_eq!(status, KernelStatementStatusKind::Succeeded);
+
+        let mut canceller: *mut kernel_executed_async_statement_canceller_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_async_statement_canceller_new(exec, &mut canceller),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_async_statement_canceller_cancel(canceller),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_async_statement_canceller_free(canceller),
+            KernelStatusCode::Success
+        );
+
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_async_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+        assert_eq!(
+            kernel_result_stream_close(stream),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
 
 // ─── Mock helpers (mirrors tests/v0_execute_wiremock.rs) ─────────────
 
