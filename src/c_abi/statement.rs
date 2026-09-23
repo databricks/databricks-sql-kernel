@@ -863,13 +863,13 @@ pub unsafe extern "C" fn kernel_executed_statement_close(
     KernelStatusCode::Success
 }
 
-// ─── ExecutedAsyncStatement (async) — deferred in v0 ─────────────────────────
+// ─── ExecutedAsyncStatement (async) ──────────────────────────────────────────
 //
-// The async submit path keeps its skeleton until a consumer needs
-// caller-driven polling over the C ABI. Rust-crate consumers use
-// `Statement::submit` + `ExecutedAsyncStatement` directly.
+// The async submit path exposes caller-driven polling over the C ABI,
+// mirroring `Statement::submit` + `ExecutedAsyncStatement` for Rust-crate
+// consumers.
 
-/// Submit-and-return. **Deferred in v0** — see module docs.
+/// Submit-and-return. On success, `*out` owns an async executed handle.
 ///
 /// # Safety
 /// `stmt` / `out` must be valid pointers.
