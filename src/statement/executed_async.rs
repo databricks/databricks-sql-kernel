@@ -391,6 +391,30 @@ impl ExecutedAsyncStatement {
         crate::kernel_error::carry_extended_status(error, status)
     }
 
+    /// Synthesize the terminal cancel `Error` from this handle's most
+    /// recently observed [`crate::types::sea::StatementStatus`] (the
+    /// cache that `status()` / `await_result()` refresh after every
+    /// poll). This is the same structured error the internal
+    /// `cancelled_error` / `await_result` telemetry path builds, so
+    /// out-of-crate drivers (the C ABI) that only see the unit
+    /// `StatementStatus::Cancelled` variant can recover it without
+    /// re-implementing the extended-status carry-over inline.
+    ///
+    /// Callers should invoke this immediately after a `status()` /
+    /// `await_result()` poll returned `Cancelled`, so the cached
+    /// status reflects that poll. If the cache lock is poisoned the
+    /// extended fields are simply omitted (best-effort), matching the
+    /// swallow-on-poison policy of the accessors.
+    pub(crate) fn cancelled_error_from_cache(&self) -> Error {
+        let error = Error::cancelled()
+            .message(format!("Statement {} was cancelled", self.statement_id))
+            .with_query_id(&self.statement_id);
+        match self.latest_status.lock() {
+            Ok(guard) => crate::kernel_error::carry_extended_status(error, &guard),
+            Err(_) => error,
+        }
+    }
+
     /// One-shot status check. Non-blocking. Issues a single
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`

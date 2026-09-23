@@ -967,27 +967,16 @@ pub unsafe extern "C" fn kernel_executed_async_statement_status(
                     }
                     StatementStatus::Cancelled => {
                         // `status()` refreshed the handle's cached status
-                        // before returning, so the extended-status
-                        // accessors reflect this poll. Carry them onto the
-                        // synthesized cancel error so the last-error channel
-                        // keeps the server-supplied cancel detail (parity
-                        // with the Rust `cancelled_error` /
-                        // `carry_extended_status` path).
-                        let mut error = Error::cancelled()
-                            .message(format!(
-                                "Statement {} was cancelled",
-                                handle.exec.statement_id()
-                            ))
-                            .with_query_id(handle.exec.statement_id());
-                        if let Some(msg) = handle.exec.display_message() {
-                            error = error.with_display_message(msg);
-                        }
-                        if let Some(info) = handle.exec.diagnostic_info() {
-                            error = error.with_diagnostic_info(info);
-                        }
-                        if let Some(json) = handle.exec.error_details_json() {
-                            error = error.with_error_details_json(json);
-                        }
+                        // before returning, so route through the shared
+                        // `cancelled_error_from_cache` helper rather than
+                        // re-listing the extended-status fields inline.
+                        // That keeps `carry_extended_status`
+                        // (src/kernel_error.rs) the single source of truth
+                        // for which SEA fields ride onto a cancel error, so
+                        // this terminal arm can't drift from the sibling
+                        // `Failed` arm or the Rust `cancelled_error` /
+                        // `await_result` path when a field is added there.
+                        let error = handle.exec.cancelled_error_from_cache();
                         let code = store_and_code(error);
                         (KernelStatementStatusKind::Cancelled, code)
                     }
