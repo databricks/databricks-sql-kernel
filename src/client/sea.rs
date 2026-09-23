@@ -38,7 +38,7 @@ use crate::types::sea::{
     StatementExecutionResponse, StatementState,
 };
 use async_trait::async_trait;
-use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::header::HeaderValue;
 use reqwest::Method;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -76,27 +76,7 @@ enum StatementOutcome {
 #[derive(Debug)]
 struct SessionRoutingHeaders {
     direct_routing_enabled: bool,
-    dbsql_session_id: Option<HeaderValue>,
-}
-
-impl SessionRoutingHeaders {
-    fn from_response(headers: &HeaderMap) -> Self {
-        // The response marks the session for real-time routing with REALTIME_SESSION_HEADER;
-        // follow-up requests select that route with REALTIME_DIRECT_ROUTING_HEADER.
-        let direct_routing_enabled = headers
-            .get(REALTIME_SESSION_HEADER)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
-        let dbsql_session_id = headers
-            .get(DBSQL_SESSION_ID_HEADER)
-            .filter(|value| value.to_str().is_ok_and(|value| !value.trim().is_empty()))
-            .cloned();
-
-        Self {
-            direct_routing_enabled,
-            dbsql_session_id,
-        }
-    }
+    dbsql_session_id: HeaderValue,
 }
 
 /// Mapped terminal outcome from the synchronous execution phase.
@@ -241,9 +221,7 @@ impl SeaRestTransport {
             if headers.direct_routing_enabled {
                 builder = builder.header(REALTIME_DIRECT_ROUTING_HEADER, "true");
             }
-            if let Some(dbsql_session_id) = &headers.dbsql_session_id {
-                builder = builder.header(DBSQL_SESSION_ID_HEADER, dbsql_session_id.clone());
-            }
+            builder = builder.header(DBSQL_SESSION_ID_HEADER, headers.dbsql_session_id.clone());
         }
         builder
     }
@@ -1124,7 +1102,13 @@ impl Transport for SeaRestTransport {
             .http_client
             .execute(request, RequestType::CreateSession)
             .await?;
-        let session_routing_headers = SessionRoutingHeaders::from_response(response.headers());
+        // The response marks the session for real-time routing with REALTIME_SESSION_HEADER;
+        // follow-up requests select that route with REALTIME_DIRECT_ROUTING_HEADER.
+        let direct_routing_enabled = response
+            .headers()
+            .get(REALTIME_SESSION_HEADER)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
         let body = response
             .text()
             .await
@@ -1135,9 +1119,18 @@ impl Transport for SeaRestTransport {
                 "Failed to parse session response: {e} - body: {body}"
             ))
         })?;
+        let dbsql_session_id = HeaderValue::try_from(session_response.session_id.as_str())
+            .map_err(|e| {
+                Error::data_loss().message(format!(
+                    "CreateSession returned a session_id that cannot be used as an HTTP header: {e}"
+                ))
+            })?;
 
         self.session_routing_headers
-            .set(session_routing_headers)
+            .set(SessionRoutingHeaders {
+                direct_routing_enabled,
+                dbsql_session_id,
+            })
             .map_err(|_| {
                 Error::invalid_state().message("SEA transport already created a session")
             })?;
@@ -2580,7 +2573,6 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
-                    .insert_header(DBSQL_SESSION_ID_HEADER, "routing-session-1")
                     .set_body_json(json!({
                         "session_id": "session-1",
                         "session_version": { "version_id": 7 },
@@ -2593,7 +2585,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/statements"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "statement_id": "statement-1",
                 "status": { "state": "PENDING" },
@@ -2604,7 +2596,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/statement-1"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "statement_id": "statement-1",
                 "status": { "state": "RUNNING" },
@@ -2615,7 +2607,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/statement-1/result/chunks/0"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "external_links": [],
                 "next_chunk_index": null,
@@ -2629,7 +2621,7 @@ mod tests {
             ))
             .and(query_param("row_offset", "3"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "chunk_index": 1,
                 "row_offset": 3,
@@ -2643,7 +2635,7 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/statements/statement-1/cancel"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -2651,7 +2643,7 @@ mod tests {
         Mock::given(method("DELETE"))
             .and(path("/api/2.0/sql/statements/statement-1"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -2660,7 +2652,7 @@ mod tests {
             .and(path("/api/2.0/sql/sessions/session-1"))
             .and(query_param("warehouse_id", "warehouse-123"))
             .and(header(REALTIME_DIRECT_ROUTING_HEADER, "true"))
-            .and(header(DBSQL_SESSION_ID_HEADER, "routing-session-1"))
+            .and(header(DBSQL_SESSION_ID_HEADER, "session-1"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -2710,27 +2702,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_response_headers_are_applied_independently() {
+    async fn create_session_response_header_only_controls_direct_routing() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        let cases = [
-            (Some("TRUE"), None, true, false),
-            (None, Some("routing-session-1"), false, true),
-            (Some("false"), Some("routing-session-1"), false, true),
-            (None, None, false, false),
-        ];
+        let cases = [(Some("TRUE"), true), (Some("false"), false), (None, false)];
 
-        for (routing_enabled, routing_session_id, expect_routing, expect_session_id) in cases {
+        for (routing_enabled, expect_routing) in cases {
             let server = MockServer::start().await;
             let mut create_response = ResponseTemplate::new(200).set_body_json(json!({
                 "session_id": "session-1",
             }));
             if let Some(value) = routing_enabled {
                 create_response = create_response.insert_header(REALTIME_SESSION_HEADER, value);
-            }
-            if let Some(value) = routing_session_id {
-                create_response = create_response.insert_header(DBSQL_SESSION_ID_HEADER, value);
             }
 
             Mock::given(method("POST"))
@@ -2773,8 +2757,11 @@ mod tests {
                 expect_routing
             );
             assert_eq!(
-                execute.headers.get(DBSQL_SESSION_ID_HEADER).is_some(),
-                expect_session_id
+                execute
+                    .headers
+                    .get(DBSQL_SESSION_ID_HEADER)
+                    .and_then(|value| value.to_str().ok()),
+                Some("session-1")
             );
         }
     }
@@ -2791,7 +2778,6 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
-                    .insert_header(DBSQL_SESSION_ID_HEADER, "routing-session-1")
                     .set_body_json(json!({ "session_id": "session-1" })),
             )
             .expect(1)
