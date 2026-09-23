@@ -14,6 +14,10 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.1.0] - 2026-09-23
+
+No Node.js-binding-specific changes.
+
 ## [v1.0.0] - 2026-08-31
 
 ### Fixed

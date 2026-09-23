@@ -1,6 +1,6 @@
 {
   "name": "@databricks/databricks-sql-kernel",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Databricks SQL Kernel — Node.js native binding.",
   "main": "index.js",
   "types": "index.d.ts",

@@ -13,8 +13,6 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
-- Add `Session(..., max_connections=...)` to configure idle HTTP connections per host.
-
 ### Changed
 
 ### Updated

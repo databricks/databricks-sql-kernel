@@ -14,6 +14,12 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.1.0] - 2026-09-23
+
+### Added
+- `Session(..., max_connections=...)` configures idle HTTP connections per
+  host.
+
 ## [v1.0.0] - 2026-08-31
 
 ### Fixed

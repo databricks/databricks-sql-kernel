@@ -14,6 +14,29 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.1.0] - 2026-09-23
+
+### Added
+- Execution-scoped client query deadlines for Rust and C APIs.
+- FAST-mode session version exchange.
+- C ABI query tags, HTTP connection limits, connection-test deadlines, and
+  result-stream cancellation.
+- Release-with-debuginfo build profile and native symbol checks.
+
+### Changed
+- Client deadlines permit an in-flight status request five seconds to finish.
+- Direct traffic identifies itself as Databricks SQL Kernel.
+- rustls now includes OS trust roots.
+- Updated rustls to remediate OSV findings.
+
+### Fixed
+- CloudFetch downloads have end-to-end deadlines and terminal link-fetch
+  errors.
+- C ABI workers preserve a two-MiB stack floor without shrinking larger
+  configured stacks.
+- mTLS rejects non-HTTPS endpoints.
+- PAT telemetry omits OAuth auth-flow metadata.
+
 ## [v1.0.0] - 2026-08-31
 
 ### Fixed
