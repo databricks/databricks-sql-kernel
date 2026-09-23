@@ -905,6 +905,10 @@ pub unsafe extern "C" fn kernel_statement_submit(
     }
 }
 
+/// One-shot status poll. Writes the current status kind to `*out`.
+///
+/// # Safety
+/// `exec` / `out` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_status(
     exec: *mut kernel_executed_async_statement_t,
@@ -944,12 +948,28 @@ pub unsafe extern "C" fn kernel_executed_async_statement_status(
                     (KernelStatementStatusKind::Failed, code)
                 }
                 StatementStatus::Cancelled => {
-                    let error = Error::cancelled()
+                    // `status()` refreshed the handle's cached status
+                    // before returning, so the extended-status
+                    // accessors reflect this poll. Carry them onto the
+                    // synthesized cancel error so the last-error channel
+                    // keeps the server-supplied cancel detail (parity
+                    // with the Rust `cancelled_error` /
+                    // `carry_extended_status` path).
+                    let mut error = Error::cancelled()
                         .message(format!(
                             "Statement {} was cancelled",
                             handle.exec.statement_id()
                         ))
                         .with_query_id(handle.exec.statement_id());
+                    if let Some(msg) = handle.exec.display_message() {
+                        error = error.with_display_message(msg);
+                    }
+                    if let Some(info) = handle.exec.diagnostic_info() {
+                        error = error.with_diagnostic_info(info);
+                    }
+                    if let Some(json) = handle.exec.error_details_json() {
+                        error = error.with_error_details_json(json);
+                    }
                     let code = store_and_code(error);
                     (KernelStatementStatusKind::Cancelled, code)
                 }
@@ -961,6 +981,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_status(
     }
 }
 
+/// Fetch the result stream. On success, `*out` owns a result stream.
+/// May be taken only once per async statement.
+///
+/// # Safety
+/// `exec` / `out` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_get_result_stream(
     exec: *mut kernel_executed_async_statement_t,
@@ -998,6 +1023,10 @@ pub unsafe extern "C" fn kernel_executed_async_statement_get_result_stream(
     }
 }
 
+/// Rows modified by the statement, or `-1` if unavailable / on error.
+///
+/// # Safety
+/// `exec` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_num_modified_rows(
     exec: *const kernel_executed_async_statement_t,
@@ -1012,6 +1041,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_num_modified_rows(
     handle.exec.num_modified_rows().unwrap_or(-1)
 }
 
+/// Borrowed NUL-terminated statement id, or null on error. Owned by
+/// the handle; valid until the handle is closed.
+///
+/// # Safety
+/// `exec` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_query_id(
     exec: *const kernel_executed_async_statement_t,
@@ -1024,6 +1058,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_query_id(
     handle.statement_id_c.as_ptr()
 }
 
+/// Build a detached canceller. On success, `*out` owns the canceller,
+/// which may outlive and be used concurrently with the statement.
+///
+/// # Safety
+/// `exec` / `out` must be valid pointers.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_canceller_new(
     exec: *const kernel_executed_async_statement_t,
@@ -1047,6 +1086,10 @@ pub unsafe extern "C" fn kernel_executed_async_statement_canceller_new(
     KernelStatusCode::Success
 }
 
+/// Request cancellation via a detached canceller.
+///
+/// # Safety
+/// `canceller` must be a valid pointer.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_canceller_cancel(
     canceller: *mut kernel_executed_async_statement_canceller_t,
@@ -1064,6 +1107,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_canceller_cancel(
     }
 }
 
+/// Free a detached canceller. Consumes the pointer.
+///
+/// # Safety
+/// `canceller` must be a valid pointer previously returned by
+/// `kernel_executed_async_statement_canceller_new`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_canceller_free(
     canceller: *mut kernel_executed_async_statement_canceller_t,
@@ -1078,6 +1126,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_canceller_free(
     KernelStatusCode::Success
 }
 
+/// Close the async statement and free its handle. Consumes the pointer.
+///
+/// # Safety
+/// `exec` must be a valid pointer previously returned by
+/// `kernel_statement_submit`.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_executed_async_statement_close(
     exec: *mut kernel_executed_async_statement_t,
