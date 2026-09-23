@@ -161,6 +161,278 @@ fn async_c_abi_submit_poll_and_materialise() {
     }
 }
 
+/// A submitted statement that the server reports as `FAILED` on the first
+/// status poll must surface `KernelStatementStatusKind::Failed` with a
+/// `SqlError` status code, and the last-error channel must carry the mapped
+/// code / sqlstate / query id from the server error envelope. Locks the
+/// `Failed` arm's `store_and_code(error)` forwarding.
+#[test]
+fn async_c_abi_status_maps_terminal_failure() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-fail")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-fail"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(failed_body("stmt-fail")))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELEKT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        let mut status = KernelStatementStatusKind::Pending;
+        assert_eq!(
+            kernel_executed_async_statement_status(exec, &mut status),
+            KernelStatusCode::SqlError
+        );
+        assert_eq!(status, KernelStatementStatusKind::Failed);
+
+        let mut raw_error = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(kernel_get_last_error(raw_error.as_mut_ptr()));
+        let raw_error = raw_error.assume_init();
+        assert_eq!(raw_error.code, KernelStatusCode::SqlError as i32);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.sql_state)
+                .to_str()
+                .unwrap(),
+            "42601"
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.query_id)
+                .to_str()
+                .unwrap(),
+            "stmt-fail"
+        );
+
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+/// A statement the server reports as `CANCELED` must surface
+/// `KernelStatementStatusKind::Cancelled` with a `Cancelled` status code, and
+/// the last-error channel must carry the synthesized cancel error's code and
+/// query id. Locks the hand-rolled `Cancelled` arm's carry-over.
+#[test]
+fn async_c_abi_status_maps_terminal_cancel() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-cancel")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(canceled_body("stmt-cancel")))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        let mut status = KernelStatementStatusKind::Pending;
+        assert_eq!(
+            kernel_executed_async_statement_status(exec, &mut status),
+            KernelStatusCode::Cancelled
+        );
+        assert_eq!(status, KernelStatementStatusKind::Cancelled);
+
+        let mut raw_error = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(kernel_get_last_error(raw_error.as_mut_ptr()));
+        let raw_error = raw_error.assume_init();
+        assert_eq!(raw_error.code, KernelStatusCode::Cancelled as i32);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.query_id)
+                .to_str()
+                .unwrap(),
+            "stmt-cancel"
+        );
+        assert!(!raw_error.message.is_null());
+
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+/// `kernel_executed_async_statement_get_result_stream` before the statement
+/// reaches a terminal state must reject with `InvalidArgument` (v0 collapses
+/// InvalidState into that code) and write a null out-pointer. Also asserts the
+/// single-consumption guard rejects a second take after a successful first one.
+#[test]
+fn async_c_abi_get_result_stream_state_guards() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    // First server: statement never leaves RUNNING, so a pre-terminal take
+    // must be rejected.
+    let running_server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-run")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-run"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-run")))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&running_server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        let mut stream: *mut kernel_result_stream_t = std::ptr::dangling_mut();
+        assert_eq!(
+            kernel_executed_async_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::InvalidArgument
+        );
+        assert!(stream.is_null(), "out must be null when not terminal");
+
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    // Second server: statement succeeds; the first take succeeds, the second
+    // take must be rejected by the `stream_taken` guard.
+    let ok_server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-ok")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-ok"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-ok")),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&ok_server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_async_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+
+        // Second take must be rejected without handing out another stream.
+        let mut stream2: *mut kernel_result_stream_t = std::ptr::dangling_mut();
+        assert_eq!(
+            kernel_executed_async_statement_get_result_stream(exec, &mut stream2),
+            KernelStatusCode::InvalidArgument
+        );
+        assert!(stream2.is_null(), "a second take must not yield a stream");
+
+        assert_eq!(
+            kernel_result_stream_close(stream),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
 // ─── Mock helpers (mirrors tests/v0_execute_wiremock.rs) ─────────────
 
 async fn mount_create_session(server: &MockServer) {
@@ -195,6 +467,24 @@ fn canceled_body(statement_id: &str) -> String {
     json!({
         "statement_id": statement_id,
         "status": { "state": "CANCELED" },
+    })
+    .to_string()
+}
+
+/// A terminal FAILED body carrying a server error envelope (`error_code`,
+/// `message`) and `sql_state`, so a status poll maps to `SqlError` with the
+/// sqlstate / query id surfaced on the last-error channel.
+fn failed_body(statement_id: &str) -> String {
+    json!({
+        "statement_id": statement_id,
+        "status": {
+            "state": "FAILED",
+            "sql_state": "42601",
+            "error": {
+                "error_code": "PARSE_SYNTAX_ERROR",
+                "message": "syntax error. SQLSTATE: 42601",
+            },
+        },
     })
     .to_string()
 }
