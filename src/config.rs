@@ -791,14 +791,13 @@ pub struct HttpConfig {
     /// which also carries the composed `User-Agent`) onto the kernel's
     /// HTTP stack.
     ///
-    /// **`Authorization` / `x-databricks-org-id` are reserved:** a
-    /// caller entry for either name is **silently dropped (with a
-    /// `warn!`)** — it never reaches the wire. The kernel always adds
-    /// its own `Authorization` (from the auth provider) and, when set,
-    /// `x-databricks-org-id`, so auth and multi-tenant routing can't be
-    /// hijacked by a caller header. (This mirrors the Thrift connector,
-    /// where `auth_provider.add_headers` runs after the custom-header
-    /// dict and overwrites those names.)
+    /// **Kernel-managed headers are reserved:** caller entries for
+    /// `Authorization`, `x-databricks-org-id`, or the SQL session-routing
+    /// headers are **silently dropped (with a `warn!`)**. The kernel owns
+    /// their values, so authentication and routing cannot be changed by a
+    /// caller header. This mirrors the Thrift connector, where
+    /// `auth_provider.add_headers` runs after the custom-header dict and
+    /// overwrites managed names.
     ///
     /// **`User-Agent` is special-cased:** a caller `User-Agent` here
     /// **replaces** the kernel's base UA entirely — it is folded into the

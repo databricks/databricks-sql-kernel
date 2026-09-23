@@ -36,6 +36,10 @@ pub mod retry;
 pub mod sea;
 pub(crate) mod transport;
 
+pub(crate) const DBSQL_SESSION_ID_HEADER: &str = "x-databricks-dbsql-session-id";
+pub(crate) const REALTIME_DIRECT_ROUTING_HEADER: &str = "x-databricks-realtime-direct-routing";
+pub(crate) const REALTIME_SESSION_HEADER: &str = "x-databricks-realtime-session";
+
 // Public surface — kept stable for advanced wrappers that tune HTTP.
 pub use http::{DatabricksHttpClient, HttpClientConfig, ProxyConfig};
 pub use retry::{

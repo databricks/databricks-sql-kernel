@@ -26,6 +26,9 @@ use crate::auth::AuthProvider;
 use crate::client::retry::{
     calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
 };
+use crate::client::{
+    DBSQL_SESSION_ID_HEADER, REALTIME_DIRECT_ROUTING_HEADER, REALTIME_SESSION_HEADER,
+};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::types::sea::ServiceError;
@@ -852,11 +855,9 @@ impl DatabricksHttpClient {
             // kernel's own auth / routing headers (set last, below) take
             // precedence — matching the Thrift connector, where
             // `auth_provider.add_headers` runs after the custom-header
-            // dict. We SKIP any custom header named `Authorization` or
-            // `x-databricks-org-id` (case-insensitive) so a stray caller
-            // header can't sit alongside the kernel's (reqwest appends
-            // same-named headers rather than replacing, which for those
-            // two would send a duplicate and could confuse the server).
+            // dict. Kernel-managed authentication and session-routing
+            // headers are skipped so caller values cannot coexist with
+            // the values selected by the kernel.
             // `User-Agent` is NOT in this map — it was folded into the
             // client's effective UA in `new()` (a caller UA replaces the
             // base, which then becomes reqwest's default UA header).
@@ -869,7 +870,12 @@ impl DatabricksHttpClient {
             // transport, IdP calls included.
             for (name, value) in &self.config.custom_headers {
                 let lname = name.to_ascii_lowercase();
-                if lname == "authorization" || lname == "x-databricks-org-id" {
+                if lname == "authorization"
+                    || lname == "x-databricks-org-id"
+                    || lname == REALTIME_DIRECT_ROUTING_HEADER
+                    || lname == REALTIME_SESSION_HEADER
+                    || lname == DBSQL_SESSION_ID_HEADER
+                {
                     warn!(
                         header = %name,
                         "ignoring caller-supplied custom header; this name is \
@@ -1114,7 +1120,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_custom_headers_applied_with_auth_winning() {
+    async fn test_custom_headers_applied_with_kernel_headers_winning() {
         use wiremock::matchers::{header, method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1151,6 +1157,15 @@ mod tests {
                     "Authorization".to_string(),
                     "Bearer caller-bogus".to_string(),
                 ),
+                (
+                    REALTIME_DIRECT_ROUTING_HEADER.to_string(),
+                    "false".to_string(),
+                ),
+                (REALTIME_SESSION_HEADER.to_string(), "true".to_string()),
+                (
+                    DBSQL_SESSION_ID_HEADER.to_string(),
+                    "caller-session".to_string(),
+                ),
             ],
             ..HttpClientConfig::default()
         };
@@ -1167,6 +1182,13 @@ mod tests {
             .await
             .expect("request should succeed against the mock");
         assert_eq!(resp.status().as_u16(), 200);
+        let requests = server.received_requests().await.unwrap();
+        assert!(requests[0]
+            .headers
+            .get(REALTIME_DIRECT_ROUTING_HEADER)
+            .is_none());
+        assert!(requests[0].headers.get(REALTIME_SESSION_HEADER).is_none());
+        assert!(requests[0].headers.get(DBSQL_SESSION_ID_HEADER).is_none());
         // If the matchers above didn't all match, wiremock returns the
         // default 404 and the status assert fails — so a 200 confirms
         // custom header + caller UA present AND auth = real-token.
