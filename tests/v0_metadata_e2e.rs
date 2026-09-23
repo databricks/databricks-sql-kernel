@@ -136,56 +136,34 @@ async fn list_tables_catalog_wildcard_filters_client_side() {
 
     let session = live_session().await;
 
-    // Prefer `samples` — a Databricks-managed catalog present on every
-    // UC workspace with a well-populated `information_schema.tables`, so
-    // the wildcard result is non-empty and the assertion has teeth. Fall
-    // back to any ascii catalog if `samples` is somehow absent.
-    let (catalogs, _) = collect(
-        session
-            .metadata()
-            .list_catalogs()
-            .await
-            .expect("list_catalogs"),
-    )
-    .await;
-    let catalog_names = string_column_values(&catalogs, "TABLE_CAT");
-    let base = catalog_names
-        .iter()
-        .find(|c| *c == "samples")
-        .or_else(|| catalog_names.iter().find(|c| c.len() >= 3 && c.is_ascii()))
-        .cloned()
-        .expect("expected `samples` or some ascii catalog name of length >= 3");
+    // Resolve a real table first so a zero-row wildcard result cannot be
+    // mistaken for an empty schema in the test workspace.
+    let (base, schema, table) = find_known_table(&session)
+        .await
+        .expect("expected a seeded samples table");
     // Replace the 2nd char with `_` (single-char wildcard). For
     // `samples` this yields `s_mples`, which must still match `samples`.
     let mut chars: Vec<char> = base.chars().collect();
     chars[1] = '_';
     let pattern: String = chars.into_iter().collect();
-    let expect_rows = base == "samples";
 
     let stream = session
         .metadata()
         .list_tables(
             Some(LikePattern::new(&pattern).unwrap()),
-            // Narrow to information_schema to keep the result small and
-            // fast; the catalog wildcard is what we're exercising.
-            Some(LikePattern::new("information_schema").unwrap()),
-            Some(LikePattern::new("tables").unwrap()),
+            Some(LikePattern::new(&schema).unwrap()),
+            Some(LikePattern::new(&table).unwrap()),
             None,
         )
         .await
         .expect("list_tables with wildcard catalog");
     let (batches, rows) = collect(stream).await;
 
-    // With `samples` as the base we KNOW information_schema.tables is
-    // populated, so the wildcard must return rows (proving the filter is
-    // inclusive, not silently dropping everything).
-    if expect_rows {
-        assert!(
-            rows > 0,
-            "wildcard catalog {pattern:?} against samples.information_schema.tables \
-             returned no rows — client-side catalog filter dropped valid rows"
-        );
-    }
+    assert!(
+        rows > 0,
+        "wildcard catalog {pattern:?} against {base}.{schema}.{table} returned no rows — \
+         client-side catalog filter dropped valid rows"
+    );
 
     // Every returned row's TABLE_CAT must match the `_` pattern — proves
     // the client-side catalog filter ran (vs. returning all catalogs).
@@ -197,17 +175,10 @@ async fn list_tables_catalog_wildcard_filters_client_side() {
              returned catalogs: {returned_cats:?}"
         );
     }
-    // The base catalog itself must be represented (it matches its own
-    // `_`-pattern), so the wildcard is inclusive, not just restrictive.
-    // Soft-warn rather than hard-fail if the base catalog happens to
-    // lack an information_schema.tables surface on this workspace.
-    if !returned_cats.iter().any(|c| c.eq_ignore_ascii_case(&base)) {
-        eprintln!(
-            "warning: base catalog {base:?} not present in wildcard result \
-             (pattern {pattern:?}); it may lack information_schema.tables. \
-             returned: {returned_cats:?}"
-        );
-    }
+    assert!(
+        returned_cats.iter().any(|c| c.eq_ignore_ascii_case(&base)),
+        "base catalog {base:?} not present in wildcard result {returned_cats:?}"
+    );
 
     session.close().await.expect("close");
 }

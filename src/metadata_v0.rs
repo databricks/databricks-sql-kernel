@@ -119,6 +119,48 @@ fn close_id(raw: &ExecuteResult) -> String {
     }
 }
 
+fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
+    raw.manifest
+        .as_ref()
+        .is_some_and(|manifest| manifest.is_native_metadata_result == Some(true))
+}
+
+/// Native metadata already has the canonical Thrift column order and values.
+/// Reattach the kernel's public schema so empty and non-empty responses expose
+/// the same stable Arrow contract, while deliberately skipping the SQL-result
+/// reshape.
+fn normalize_native_metadata_batch(
+    batch: &arrow_array::RecordBatch,
+    schema: SchemaRef,
+) -> Result<arrow_array::RecordBatch> {
+    arrow_array::RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| {
+        Error::data_loss().message(format!("invalid Thrift-native metadata result: {e}"))
+    })
+}
+
+async fn native_or_reshaped_stream(
+    raw: ExecuteResult,
+    session: &Arc<SessionInner>,
+    schema: SchemaRef,
+    reshape: Box<thrift_shape::ReshapeFn>,
+) -> Result<ResultStream> {
+    let stmt_id = close_id(&raw);
+    let native = is_native_metadata_result(&raw);
+    let native_schema = schema.clone();
+    let reader = ThriftReshapingReader::new(
+        raw.reader,
+        schema,
+        Box::new(move |batch| {
+            if native {
+                normalize_native_metadata_batch(batch, native_schema.clone())
+            } else {
+                reshape(batch)
+            }
+        }),
+    );
+    ResultStream::from_reader_with_close(Box::new(reader), Arc::clone(session), stmt_id).await
+}
+
 /// JDBC's `DatabaseMetaData` contract: metadata methods return an
 /// empty result set for non-existent catalogs / schemas / tables
 /// rather than raising. Translate `is_object_not_found` errors into
@@ -391,14 +433,13 @@ impl Metadata {
             .list_catalogs(self.session.session_id())
             .await?;
         Self::observe_raw_result(telemetry, &raw);
-        let stmt_id = close_id(&raw);
-        let reshaped = ThriftReshapingReader::new(
-            raw.reader,
+        native_or_reshaped_stream(
+            raw,
+            &self.session,
             GET_CATALOGS_SCHEMA.clone(),
             Box::new(thrift_shape::reshape_catalogs),
-        );
-        ResultStream::from_reader_with_close(Box::new(reshaped), Arc::clone(&self.session), stmt_id)
-            .await
+        )
+        .await
     }
 
     /// Schemas filtered by catalog (exact) and schema name pattern.
@@ -445,16 +486,11 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            let stmt_id = close_id(&raw);
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
+            native_or_reshaped_stream(
+                raw,
+                &self.session,
                 GET_SCHEMAS_SCHEMA.clone(),
                 Box::new(move |b| thrift_shape::reshape_schemas(b, catalog_str.as_deref())),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
             )
             .await
         }
@@ -772,15 +808,26 @@ impl Metadata {
         // streaming metadata paths and the regular-query path in
         // `statement/mutable.rs`.
         let stmt_id = close_id(&raw);
+        let native = is_native_metadata_result(&raw);
         let mut reader = raw.reader;
         let read: Result<Vec<arrow_array::RecordBatch>> = async {
             let mut out = Vec::new();
             while let Some(batch) = reader.next_batch().await? {
-                out.push(thrift_shape::reshape_tables(
-                    &batch,
-                    Some(catalog.as_str()),
-                    types_ref.as_deref(),
-                )?);
+                out.push(if native {
+                    let native_batch =
+                        normalize_native_metadata_batch(&batch, GET_TABLES_SCHEMA.clone())?;
+                    thrift_shape::process_native_tables(
+                        &native_batch,
+                        Some(catalog.as_str()),
+                        types_ref.as_deref(),
+                    )?
+                } else {
+                    thrift_shape::reshape_tables(
+                        &batch,
+                        Some(catalog.as_str()),
+                        types_ref.as_deref(),
+                    )?
+                });
             }
             Ok(out)
         }
@@ -828,6 +875,8 @@ impl Metadata {
         };
         Self::observe_raw_result(telemetry, &raw);
         let stmt_id = close_id(&raw);
+        let native = is_native_metadata_result(&raw);
+        let native_schema = GET_TABLES_SCHEMA.clone();
         let reshaped = ThriftReshapingReader::new(
             raw.reader,
             GET_TABLES_SCHEMA.clone(),
@@ -835,7 +884,20 @@ impl Metadata {
                 let types_ref: Option<Vec<&str>> = types_owned
                     .as_ref()
                     .map(|v| v.iter().map(|s| s.as_str()).collect());
-                thrift_shape::reshape_tables(b, requested_catalog.as_deref(), types_ref.as_deref())
+                if native {
+                    let native_batch = normalize_native_metadata_batch(b, native_schema.clone())?;
+                    thrift_shape::process_native_tables(
+                        &native_batch,
+                        requested_catalog.as_deref(),
+                        types_ref.as_deref(),
+                    )
+                } else {
+                    thrift_shape::reshape_tables(
+                        b,
+                        requested_catalog.as_deref(),
+                        types_ref.as_deref(),
+                    )
+                }
             }),
         );
         ResultStream::from_reader_with_close(Box::new(reshaped), Arc::clone(&self.session), stmt_id)
@@ -913,16 +975,11 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            let stmt_id = close_id(&raw);
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
+            native_or_reshaped_stream(
+                raw,
+                &self.session,
                 GET_COLUMNS_SCHEMA.clone(),
                 Box::new(move |b| thrift_shape::reshape_columns(b, catalog_str.as_deref())),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
             )
             .await
         }
@@ -987,16 +1044,11 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            let stmt_id = close_id(&raw);
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
+            native_or_reshaped_stream(
+                raw,
+                &self.session,
                 GET_PRIMARY_KEYS_SCHEMA.clone(),
                 Box::new(thrift_shape::reshape_primary_keys),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
             )
             .await
         }
@@ -1068,14 +1120,17 @@ impl Metadata {
             let foreign_schema = foreign_schema.ok_or_else(|| {
                 Error::invalid_argument().message("foreign_keys requires foreign_schema")
             })?;
+            let parent_catalog = parent_catalog.as_ref().map(|i| i.as_str().to_owned());
+            let parent_schema = parent_schema.as_ref().map(|i| i.as_str().to_owned());
+            let parent_table = parent_table.as_ref().map(|i| i.as_str().to_owned());
             let raw = match self
                 .session
                 .transport()
                 .list_foreign_keys(
                     self.session.session_id(),
-                    parent_catalog.as_ref().map(|i| i.as_str()),
-                    parent_schema.as_ref().map(|i| i.as_str()),
-                    parent_table.as_ref().map(|i| i.as_str()),
+                    parent_catalog.as_deref(),
+                    parent_schema.as_deref(),
+                    parent_table.as_deref(),
                     foreign_catalog.as_str(),
                     foreign_schema.as_str(),
                     foreign_table.as_str(),
@@ -1095,10 +1150,24 @@ impl Metadata {
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
             let stmt_id = close_id(&raw);
+            let native = is_native_metadata_result(&raw);
+            let native_schema = GET_CROSS_REFERENCE_SCHEMA.clone();
             let reshaped = ThriftReshapingReader::new(
                 raw.reader,
                 GET_CROSS_REFERENCE_SCHEMA.clone(),
-                Box::new(thrift_shape::reshape_foreign_keys),
+                Box::new(move |batch| {
+                    let canonical = if native {
+                        normalize_native_metadata_batch(batch, native_schema.clone())?
+                    } else {
+                        thrift_shape::reshape_foreign_keys(batch)?
+                    };
+                    thrift_shape::filter_cross_reference_by_parent(
+                        &canonical,
+                        parent_catalog.as_deref(),
+                        parent_schema.as_deref(),
+                        parent_table.as_deref(),
+                    )
+                }),
             );
             ResultStream::from_reader_with_close(
                 Box::new(reshaped),
@@ -1147,16 +1216,11 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            let stmt_id = close_id(&raw);
-            let reshaped = ThriftReshapingReader::new(
-                raw.reader,
+            native_or_reshaped_stream(
+                raw,
+                &self.session,
                 GET_FUNCTIONS_SCHEMA.clone(),
                 Box::new(thrift_shape::reshape_functions),
-            );
-            ResultStream::from_reader_with_close(
-                Box::new(reshaped),
-                Arc::clone(&self.session),
-                stmt_id,
             )
             .await
         }

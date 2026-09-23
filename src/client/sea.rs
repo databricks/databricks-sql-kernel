@@ -52,6 +52,54 @@ const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
 /// DBSQL omits session versions, while server-issued FAST versions start at 1.
 const NO_SESSION_VERSION: i64 = 0;
 
+/// Identifies the Thrift metadata operation represented by a SEA SQL
+/// statement. The server uses this together with
+/// [`REQUIRE_THRIFT_NATIVE_METADATA_HEADER`] to return the canonical Thrift
+/// result schema instead of the raw SQL result schema.
+const METADATA_OPERATION_HEADER: &str = "x-databricks-metadata-operation-type";
+const REQUIRE_THRIFT_NATIVE_METADATA_HEADER: &str = "x-databricks-require-thrift-native-metadata";
+
+#[derive(Debug, Clone, Copy)]
+enum MetadataOperation {
+    Catalogs,
+    Schemas,
+    Tables,
+    Columns,
+    Functions,
+    PrimaryKeys,
+    CrossReference,
+    Procedures,
+    ProcedureColumns,
+}
+
+impl MetadataOperation {
+    fn header_value(self) -> &'static str {
+        match self {
+            Self::Catalogs => "GetCatalogs",
+            Self::Schemas => "GetSchemas",
+            Self::Tables => "GetTables",
+            Self::Columns => "GetColumns",
+            Self::Functions => "GetFunctions",
+            Self::PrimaryKeys => "GetPrimaryKeys",
+            Self::CrossReference => "GetCrossReference",
+            Self::Procedures => "GetProcedures",
+            Self::ProcedureColumns => "GetProcedureColumns",
+        }
+    }
+
+    fn supports_thrift_native(self) -> bool {
+        !matches!(
+            self,
+            Self::Functions | Self::Procedures | Self::ProcedureColumns
+        )
+    }
+}
+
+struct ExecutionRequest {
+    request_type: RequestType,
+    metadata_operation: Option<MetadataOperation>,
+}
+
 /// Internal terminal-outcome for a single SEA statement response.
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
@@ -561,6 +609,7 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
+        metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements", self.base_url());
 
@@ -632,6 +681,13 @@ impl SeaRestTransport {
         if request_type == RequestType::ExecuteMetadataQuery {
             debug!("Adding {SEA_SYNC_METADATA_HEADER} for synchronous metadata query");
             builder = builder.header(SEA_SYNC_METADATA_HEADER, "true");
+        }
+
+        if let Some(operation) = metadata_operation {
+            builder = builder.header(METADATA_OPERATION_HEADER, operation.header_value());
+            if operation.supports_thrift_native() {
+                builder = builder.header(REQUIRE_THRIFT_NATIVE_METADATA_HEADER, "true");
+            }
         }
 
         let request = builder.json(&request_body).build().map_err(|e| {
@@ -712,12 +768,18 @@ impl SeaRestTransport {
         session_id: &str,
         sql: &str,
         params: &ExecuteParams,
-        request_type: RequestType,
+        request: ExecutionRequest,
         timeout: ExecutionTimeout,
         status_request_in_flight: &AtomicBool,
     ) -> std::result::Result<TerminalExecution, TerminalExecutionFailure> {
         let response = self
-            .call_execute_api(session_id, sql, params, request_type)
+            .call_execute_api(
+                session_id,
+                sql,
+                params,
+                request.request_type,
+                request.metadata_operation,
+            )
             .await
             .map_err(|error| TerminalExecutionFailure {
                 statement_id: None,
@@ -802,6 +864,7 @@ impl SeaRestTransport {
         sql: &str,
         params: &ExecuteParams,
         request_type: RequestType,
+        metadata_operation: Option<MetadataOperation>,
         timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
         // After call_execute_api succeeds, the SEA statement is open
@@ -828,7 +891,10 @@ impl SeaRestTransport {
             session_id,
             sql,
             params,
-            request_type,
+            ExecutionRequest {
+                request_type,
+                metadata_operation,
+            },
             timeout,
             &status_request_in_flight,
         );
@@ -1144,6 +1210,7 @@ impl Transport for SeaRestTransport {
             sql,
             params,
             RequestType::ExecuteStatement,
+            None,
             timeout,
         )
         .await
@@ -1167,8 +1234,14 @@ impl Transport for SeaRestTransport {
         let mut params = params.clone();
         params.wait_timeout = Some("0s".to_string());
         params.on_wait_timeout = Some("CONTINUE".to_string());
-        self.call_execute_api(session_id, sql, &params, RequestType::ExecuteStatement)
-            .await
+        self.call_execute_api(
+            session_id,
+            sql,
+            &params,
+            RequestType::ExecuteStatement,
+            None,
+        )
+        .await
     }
 
     async fn execute_statement_direct(
@@ -1189,7 +1262,7 @@ impl Transport for SeaRestTransport {
         // internal poll loop: a query that outlasts the inline wait
         // comes back `Running` for the caller to poll/cancel.
         let response = self
-            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement)
+            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement, None)
             .await?;
         let statement_id = response.statement_id.clone();
 
@@ -1514,6 +1587,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Catalogs),
             ExecutionTimeout::Default,
         )
         .await
@@ -1535,6 +1609,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Schemas),
             ExecutionTimeout::Default,
         )
         .await
@@ -1560,6 +1635,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Tables),
             ExecutionTimeout::Default,
         )
         .await
@@ -1584,6 +1660,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Columns),
             ExecutionTimeout::Default,
         )
         .await
@@ -1604,6 +1681,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Procedures),
             ExecutionTimeout::Default,
         )
         .await
@@ -1623,6 +1701,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::Functions),
             ExecutionTimeout::Default,
         )
         .await
@@ -1648,6 +1727,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::ProcedureColumns),
             ExecutionTimeout::Default,
         )
         .await
@@ -1667,6 +1747,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::PrimaryKeys),
             ExecutionTimeout::Default,
         )
         .await
@@ -1704,6 +1785,7 @@ impl Transport for SeaRestTransport {
             &sql,
             &ExecuteParams::default(),
             RequestType::ExecuteMetadataQuery,
+            Some(MetadataOperation::CrossReference),
             ExecutionTimeout::Default,
         )
         .await
@@ -1870,6 +1952,7 @@ mod tests {
                 "UPDATE t SET x = x + 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                None,
                 ExecutionTimeout::Default,
             )
             .await
@@ -1932,7 +2015,10 @@ mod tests {
                 "sess-test",
                 "SELEKT 1",
                 &ExecuteParams::default(),
-                RequestType::ExecuteStatement,
+                ExecutionRequest {
+                    request_type: RequestType::ExecuteStatement,
+                    metadata_operation: None,
+                },
                 ExecutionTimeout::Unlimited,
                 &AtomicBool::new(false),
             )
@@ -1996,6 +2082,7 @@ mod tests {
                 "SELECT 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                None,
                 ExecutionTimeout::Default,
             )
             .await
@@ -2052,6 +2139,7 @@ mod tests {
                 "SELECT 1",
                 &ExecuteParams::default(),
                 RequestType::ExecuteStatement,
+                None,
                 ExecutionTimeout::Unlimited,
             )
             .await
@@ -2103,6 +2191,7 @@ mod tests {
                 "SHOW CATALOGS",
                 &ExecuteParams::default(),
                 RequestType::ExecuteMetadataQuery,
+                Some(MetadataOperation::Catalogs),
                 ExecutionTimeout::Default,
             )
             .await
@@ -2120,6 +2209,14 @@ mod tests {
     fn test_base_url() {
         let client = create_test_client();
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
+    }
+
+    #[test]
+    fn native_metadata_support_matches_server_contract() {
+        assert!(MetadataOperation::Columns.supports_thrift_native());
+        assert!(MetadataOperation::CrossReference.supports_thrift_native());
+        assert!(!MetadataOperation::Procedures.supports_thrift_native());
+        assert!(!MetadataOperation::ProcedureColumns.supports_thrift_native());
     }
 
     #[test]
@@ -2253,6 +2350,7 @@ mod tests {
                 truncated: false,
                 chunks: None,
                 result_compression: Some("LZ4_FRAME".to_string()),
+                is_native_metadata_result: None,
             }),
             result: None,
         };

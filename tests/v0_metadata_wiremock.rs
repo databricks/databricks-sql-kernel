@@ -43,7 +43,7 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{body_string_contains, method, path};
+use wiremock::matchers::{body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -133,6 +133,13 @@ fn succeeded_inline_response_body(batch: &RecordBatch) -> String {
         },
     })
     .to_string()
+}
+
+fn native_inline_response_body(batch: &RecordBatch) -> String {
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_response_body(batch)).unwrap();
+    body["manifest"]["is_native_metadata_result"] = json!(true);
+    body.to_string()
 }
 
 /// SEA response body for a FAILED statement with the given SQLSTATE +
@@ -282,6 +289,43 @@ async fn wait_for_close_delete(
 }
 
 // ─── Thrift-shape reshape tests ─────────────────────────────────────
+
+#[tokio::test]
+async fn native_catalogs_header_and_result_bypass_show_reshape() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    // A native result already uses the Thrift/JDBC column name. Attempting
+    // the SHOW CATALOGS reshape would look for `catalog` and fail.
+    let native = string_batch(vec![("TABLE_CAT", vec![Some("main")])]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(header(
+            "x-databricks-metadata-operation-type",
+            "GetCatalogs",
+        ))
+        .and(header(
+            "x-databricks-require-thrift-native-metadata",
+            "true",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+        )
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .list_catalogs()
+        .await
+        .expect("native list_catalogs");
+
+    assert_eq!(col_names(&stream.schema()), vec!["TABLE_CAT"]);
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "main");
+}
 
 #[tokio::test]
 async fn list_catalogs_returns_table_cat_column() {

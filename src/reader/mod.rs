@@ -1169,6 +1169,7 @@ mod tests {
             truncated: false,
             chunks: None,
             result_compression: None,
+            is_native_metadata_result: None,
         }
     }
 
@@ -1663,6 +1664,7 @@ mod tests {
             truncated: false,
             chunks: None,
             result_compression: None,
+            is_native_metadata_result: None,
         }
     }
 
