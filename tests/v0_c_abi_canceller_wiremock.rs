@@ -44,6 +44,11 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use arrow_array::{Int64Array, RecordBatch};
+use arrow_ipc::writer::StreamWriter;
+use arrow_schema::{DataType, Field, Schema};
+use base64::{engine::general_purpose::STANDARD, Engine};
+
 use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
 use databricks_sql_kernel::c_abi::result::{kernel_result_stream_close, kernel_result_stream_t};
 use databricks_sql_kernel::c_abi::session::{
@@ -55,7 +60,8 @@ use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_async_statement_canceller_cancel,
     kernel_executed_async_statement_canceller_free, kernel_executed_async_statement_canceller_new,
     kernel_executed_async_statement_canceller_t, kernel_executed_async_statement_close,
-    kernel_executed_async_statement_get_result_stream, kernel_executed_async_statement_query_id,
+    kernel_executed_async_statement_get_result_stream,
+    kernel_executed_async_statement_num_modified_rows, kernel_executed_async_statement_query_id,
     kernel_executed_async_statement_status, kernel_executed_async_statement_t,
     kernel_executed_statement_close, kernel_executed_statement_query_id,
     kernel_executed_statement_t, kernel_statement_bind_parameter,
@@ -307,6 +313,100 @@ fn async_c_abi_status_maps_terminal_cancel() {
     }
 }
 
+/// A DML statement submitted over the C ABI must surface the affected-row
+/// count through `kernel_executed_async_statement_num_modified_rows`. The SEA
+/// status envelope carries no count for DML (unlike Thrift): it rides in the
+/// result set as a single `num_*_rows` summary row. The kernel derives it from
+/// that inline result — on the status poll (`enrich_num_modified_rows`) and,
+/// as a fallback, on result materialisation — so this drives BOTH the status
+/// poll and the stream fetch and asserts the C-ABI accessor returns the count
+/// each time. This locks the accessor's *value* path (the four existing async
+/// wiremock tests all run SELECT-shaped statements and never assert a returned
+/// count), guarding against a regression that dropped the count over the C ABI.
+#[test]
+fn async_c_abi_num_modified_rows_after_materialise() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-dml")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-dml"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(succeeded_dml_count_body("stmt-dml", 42)),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("UPDATE t SET x = 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        // The SEA status envelope carries no count for DML; the kernel derives
+        // it from the inline DML-count result on the status poll itself
+        // (`enrich_num_modified_rows`), so the accessor already reports it here.
+        let mut status = KernelStatementStatusKind::Pending;
+        assert_eq!(
+            kernel_executed_async_statement_status(exec, &mut status),
+            KernelStatusCode::Success
+        );
+        assert_eq!(status, KernelStatementStatusKind::Succeeded);
+        assert_eq!(
+            kernel_executed_async_statement_num_modified_rows(exec),
+            42,
+            "affected-row count must be surfaced over the C ABI after the status poll"
+        );
+
+        // Materialising the result set must not drop the count: the accessor
+        // still returns it (the DML summary row also flows to the caller).
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_async_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+        assert_eq!(
+            kernel_executed_async_statement_num_modified_rows(exec),
+            42,
+            "affected-row count must remain available over the C ABI after materialise"
+        );
+
+        assert_eq!(
+            kernel_result_stream_close(stream),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
 /// `kernel_executed_async_statement_get_result_stream` before the statement
 /// reaches a terminal state must reject with `InvalidArgument` (v0 collapses
 /// InvalidState into that code) and write a null out-pointer. Also asserts the
@@ -506,6 +606,67 @@ fn succeeded_empty_body(statement_id: &str) -> String {
             "total_row_count": 0,
             "total_byte_count": 0,
             "truncated": false,
+        },
+    })
+    .to_string()
+}
+
+/// Serialize a `RecordBatch` to an Arrow IPC stream byte buffer (mirrors the
+/// helper in tests/v0_execute_wiremock.rs). Used to build the inline
+/// attachment for a DML count result set.
+fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
+    let mut buf: Vec<u8> = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut buf, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+    }
+    buf
+}
+
+/// A terminal SUCCEEDED body whose result set is a single-row SEA DML count
+/// (`num_affected_rows`, …). The SEA status envelope carries NO row count for
+/// DML — the count rides in the result set and is derived on materialisation —
+/// so this deliberately omits `num_modified_rows` from `status`. Locks the
+/// C-ABI `num_modified_rows` *value* path end to end.
+fn succeeded_dml_count_body(statement_id: &str, affected: i64) -> String {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("num_affected_rows", DataType::Int64, false),
+        Field::new("num_inserted_rows", DataType::Int64, false),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(Int64Array::from(vec![affected])),
+            Arc::new(Int64Array::from(vec![affected])),
+        ],
+    )
+    .unwrap();
+    let ipc = arrow_ipc_bytes(&batch);
+    let attachment = STANDARD.encode(&ipc);
+    json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    { "name": "num_affected_rows", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0 },
+                    { "name": "num_inserted_rows", "type_name": "BIGINT", "type_text": "BIGINT", "position": 1 }
+                ],
+            },
+            "total_chunk_count": 1,
+            "total_row_count": 1,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": 1,
+            "byte_count": ipc.len() as i64,
+            "attachment": attachment,
         },
     })
     .to_string()
