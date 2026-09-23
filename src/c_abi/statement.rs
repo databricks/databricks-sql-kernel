@@ -934,6 +934,11 @@ pub unsafe extern "C" fn kernel_executed_async_statement_status(
                 "kernel_executed_async_statement_status: out must not be null",
             );
         }
+        // Pre-write a defined sentinel so `*out` is never left holding the
+        // caller's uninitialized input on a non-`Success` return (e.g. a
+        // transport error from the poll below). Mirrors the up-front
+        // `ptr::write(out, null_mut())` in the sibling out-param entry points.
+        std::ptr::write(out, KernelStatementStatusKind::Pending);
         let exec_ptr: *const ExecutedAsyncStatement = &handle.exec;
         match block_on_ffi(move || {
             let exec = unsafe { &*exec_ptr };
