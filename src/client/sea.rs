@@ -81,6 +81,8 @@ struct SessionRoutingHeaders {
 
 impl SessionRoutingHeaders {
     fn from_response(headers: &HeaderMap) -> Self {
+        // The response marks the session for real-time routing with REALTIME_SESSION_HEADER;
+        // follow-up requests select that route with REALTIME_DIRECT_ROUTING_HEADER.
         let direct_routing_enabled = headers
             .get(REALTIME_SESSION_HEADER)
             .and_then(|value| value.to_str().ok())
