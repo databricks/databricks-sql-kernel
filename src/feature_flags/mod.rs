@@ -96,8 +96,10 @@ impl ClientIdentity {
 /// Immutable name/value snapshot returned by feature-flag resolution.
 ///
 /// Connector-service is responsible for returning only flags that are safe for
-/// the identified driver. The kernel deliberately does not interpret values at
-/// this layer; each feature owns its flag name, parsing, and fallback policy.
+/// the identified driver. Each value is the JSON-serialized SAFE value (for
+/// example, `true`, `42`, `"value"`, or `["a","b"]`). The kernel deliberately
+/// preserves that JSON text without interpreting it; each feature owns its flag
+/// name, expected type, parsing, and fallback policy.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct FeatureFlagValues {
     values: Arc<HashMap<String, String>>,
@@ -110,7 +112,7 @@ impl FeatureFlagValues {
         }
     }
 
-    /// Return the opaque value associated with `name` in this snapshot.
+    /// Return the JSON-serialized SAFE value associated with `name`.
     pub fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
     }
@@ -487,7 +489,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fetches_once_then_serves_the_process_cache() {
+    async fn fetches_all_safe_value_types_once_then_serves_the_process_cache() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path(
@@ -497,11 +499,23 @@ mod tests {
             .and(header("x-databricks-org-id", "42"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "flags": [{
-                    "name": "example.boolean-looking",
-                    "value": " TRUE "
+                    "name": "example.boolean",
+                    "value": "true"
                 }, {
-                    "name": "example.json-looking",
-                    "value": "{\"enabled\":1}"
+                    "name": "example.int32",
+                    "value": "-2147483648"
+                }, {
+                    "name": "example.int64",
+                    "value": "9223372036854775807"
+                }, {
+                    "name": "example.double",
+                    "value": "3.141592653589793"
+                }, {
+                    "name": "example.string",
+                    "value": "\"hello\""
+                }, {
+                    "name": "example.string-list",
+                    "value": "[\"a\",\"b\"]"
                 }, {
                     "name": "",
                     "value": "ignored"
@@ -535,9 +549,13 @@ mod tests {
 
         for _ in 0..2 {
             let values = resolver.resolve(&identity).await;
-            assert_eq!(values.len(), 2);
-            assert_eq!(values.get("example.boolean-looking"), Some(" TRUE "));
-            assert_eq!(values.get("example.json-looking"), Some("{\"enabled\":1}"));
+            assert_eq!(values.len(), 6);
+            assert_eq!(values.get("example.boolean"), Some("true"));
+            assert_eq!(values.get("example.int32"), Some("-2147483648"));
+            assert_eq!(values.get("example.int64"), Some("9223372036854775807"));
+            assert_eq!(values.get("example.double"), Some("3.141592653589793"));
+            assert_eq!(values.get("example.string"), Some("\"hello\""));
+            assert_eq!(values.get("example.string-list"), Some("[\"a\",\"b\"]"));
         }
     }
 
