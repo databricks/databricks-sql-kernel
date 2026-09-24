@@ -750,11 +750,89 @@ impl Session {
 #[cfg(test)]
 mod send_sync_tests {
     use super::*;
+    use databricks_sql_kernel::{AuthConfig, ConnectionConfig};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
     fn assert_send_sync<T: Send + Sync>() {}
     #[test]
     fn runtime_arc_is_send_sync() {
         assert_send_sync::<Arc<Runtime>>();
         assert_send_sync::<SessionInner>();
+    }
+
+    #[test]
+    fn feature_flag_reads_snapshot_and_rejects_closed_session() {
+        Python::initialize();
+        let runtime = Arc::new(
+            Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime"),
+        );
+        let (server, kernel_session) = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/api/2.0/connector-service/feature-flags/PYTHON/pyo3-test",
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"flags":[{"name":"example.flag","value":"[\"a\",\"b\"]"}],"ttl_seconds":300}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-pyo3-flags","warehouse_id":"test_wh"}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/2.0/sql/sessions/sess-pyo3-flags"))
+                .respond_with(ResponseTemplate::new(200))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let session = KSession::builder()
+                .connection(
+                    ConnectionConfig::from_http_path(
+                        server.uri(),
+                        "/sql/1.0/warehouses/test_wh",
+                    )
+                    .expect("valid HTTP path"),
+                )
+                .auth(AuthConfig::Pat {
+                    token: "dapi_test_token".into(),
+                    identity_federation_client_id: None,
+                })
+                .client_identity(ClientIdentity::new(ClientType::Python, "pyo3-test"))
+                .open()
+                .await
+                .expect("session opens against mock server");
+            (server, session)
+        });
+        let mut session = Session {
+            inner: Some(SessionInner {
+                session: kernel_session,
+                runtime: Arc::clone(&runtime),
+            }),
+        };
+
+        assert_eq!(
+            session.feature_flag("example.flag").unwrap().as_deref(),
+            Some(r#"["a","b"]"#)
+        );
+        assert_eq!(session.feature_flag("missing.flag").unwrap(), None);
+
+        let inner = session.inner.take().expect("open session");
+        runtime.block_on(inner.session.close()).unwrap();
+        let error = session.feature_flag("example.flag").unwrap_err();
+        assert!(error.to_string().contains("Session is closed"));
+        runtime.block_on(server.verify());
     }
 
     #[test]

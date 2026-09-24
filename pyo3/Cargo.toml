@@ -97,3 +97,6 @@ chrono = "0.4"
 pyo3-log = "0.13"
 log = "0.4"
 tracing = "0.1"
+
+[dev-dependencies]
+wiremock = "0.6"

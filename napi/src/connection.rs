@@ -661,7 +661,9 @@ impl Drop for Connection {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode};
+    use databricks_sql_kernel::{
+        AuthConfig, ClientIdentity, ClientType, ConnectionConfig, ErrorCode,
+    };
     use serde_json::json;
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -710,6 +712,79 @@ mod tests {
             session_id: "session-survives-close".to_owned(),
         };
         assert_eq!(conn.session_id(), "session-survives-close");
+    }
+
+    #[tokio::test]
+    async fn feature_flag_reads_snapshot_and_rejects_closed_connection() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/connector-service/feature-flags/NODEJS/napi-test",
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                r#"{"flags":[{"name":"example.flag","value":"[\"a\",\"b\"]"}],"ttl_seconds":300}"#,
+            ))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/sessions"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-napi-flags","warehouse_id":"test_wh"}"#,
+                ),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/sessions/sess-napi-flags"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid HTTP path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .client_identity(ClientIdentity::new(ClientType::NodeJs, "napi-test"))
+            .open()
+            .await
+            .expect("session opens against mock server");
+        let connection = Connection {
+            session_id: session.session_id().to_owned(),
+            inner: Arc::new(Mutex::new(Some(session))),
+        };
+
+        assert_eq!(
+            connection
+                .feature_flag("example.flag".to_owned())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(r#"["a","b"]"#)
+        );
+        assert_eq!(
+            connection
+                .feature_flag("missing.flag".to_owned())
+                .await
+                .unwrap(),
+            None
+        );
+
+        connection.close().await.unwrap();
+        let error = connection
+            .feature_flag("example.flag".to_owned())
+            .await
+            .unwrap_err();
+        assert_invalid_statement_handle_envelope(&error);
+        server.verify().await;
     }
 
     #[tokio::test]
