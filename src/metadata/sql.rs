@@ -55,7 +55,7 @@ impl SqlCommandBuilder {
 
     /// Convert JDBC/ADBC-style pattern to Hive-style pattern for `SHOW` commands.
     ///
-    /// Use this for `SHOW TABLES/SCHEMAS/COLUMNS` patterns, which use Hive-style wildcards.
+    /// Use this for `SHOW TABLES/SCHEMAS/COLUMNS/FUNCTIONS` patterns.
     /// For `information_schema` SQL `LIKE` patterns, use [`escape_sql_string`] instead.
     ///
     /// Databricks SHOW commands use Hive-style wildcards, not SQL LIKE wildcards:
@@ -65,39 +65,8 @@ impl SqlCommandBuilder {
     /// - `\_` → `_` (escaped literal underscore)
     /// - `\\` → `\\` (escaped backslash)
     ///
-    /// Also escapes single quotes for safe SQL embedding.
-    /// Matches JDBC driver's `WildcardUtil.jdbcPatternToHive`.
+    /// SQL-escape quotes and backslashes once, after wildcard conversion.
     fn jdbc_pattern_to_hive(pattern: &str) -> String {
-        let mut result = String::with_capacity(pattern.len());
-        let mut escape_next = false;
-        for ch in pattern.chars() {
-            if ch == '\\' && !escape_next {
-                escape_next = true;
-                continue;
-            }
-            if escape_next {
-                // Escaped character: emit literally
-                if ch == '\\' {
-                    result.push_str("\\\\");
-                } else {
-                    result.push(ch);
-                }
-                escape_next = false;
-            } else {
-                match ch {
-                    '%' => result.push('*'),
-                    '_' => result.push('.'),
-                    '\'' => result.push_str("''"),
-                    _ => result.push(ch),
-                }
-            }
-        }
-        result
-    }
-
-    /// Convert a getFunctions pattern to SHOW wildcards, then escape the
-    /// resulting SQL literal exactly once.
-    fn escape_show_function_pattern(pattern: &str) -> String {
         let mut converted = String::with_capacity(pattern.len());
         let mut escaped = false;
         for ch in pattern.chars() {
@@ -385,15 +354,12 @@ impl SqlCommandBuilder {
         if let Some(pattern) = schema_pattern {
             sql.push_str(&format!(
                 " SCHEMA LIKE '{}'",
-                Self::escape_show_function_pattern(pattern)
+                Self::jdbc_pattern_to_hive(pattern)
             ));
         }
 
         let pattern = function_pattern.unwrap_or("%");
-        sql.push_str(&format!(
-            " LIKE '{}'",
-            Self::escape_show_function_pattern(pattern)
-        ));
+        sql.push_str(&format!(" LIKE '{}'", Self::jdbc_pattern_to_hive(pattern)));
 
         sql
     }
@@ -720,11 +686,39 @@ mod tests {
     }
 
     #[test]
-    fn test_escape_pattern_with_single_quote() {
-        let sql = SqlCommandBuilder::new()
-            .with_schema_pattern(Some("it's"))
-            .build_show_schemas();
-        assert_eq!(sql, "SHOW SCHEMAS IN ALL CATALOGS LIKE 'it''s'");
+    fn test_show_patterns_are_sql_escaped_once() {
+        for (pattern, escaped) in [
+            ("it's", "it''s"),
+            (r"it\'s", "it''s"),
+            (r"tail\", r"tail\\"),
+            (r"slash\\'quote", r"slash\\''quote"),
+        ] {
+            let builder = SqlCommandBuilder::new()
+                .with_catalog(Some("main"))
+                .with_schema_pattern(Some(pattern))
+                .with_table_pattern(Some(pattern))
+                .with_column_pattern(Some(pattern));
+            assert_eq!(
+                builder.build_show_schemas(),
+                format!("SHOW SCHEMAS IN `main` LIKE '{escaped}'")
+            );
+            assert_eq!(
+                builder.build_show_tables(),
+                format!("SHOW TABLES IN CATALOG `main` SCHEMA LIKE '{escaped}' LIKE '{escaped}'")
+            );
+            assert_eq!(
+                builder.build_show_columns(Some("main")),
+                format!(
+                    "SHOW COLUMNS IN CATALOG `main` SCHEMA LIKE '{escaped}' TABLE LIKE '{escaped}' LIKE '{escaped}'"
+                )
+            );
+            assert_eq!(
+                SqlCommandBuilder::build_show_functions("main", Some(pattern), Some(pattern)),
+                format!(
+                    "SHOW FUNCTIONS IN CATALOG `main` SCHEMA LIKE '{escaped}' LIKE '{escaped}'"
+                )
+            );
+        }
     }
 
     #[test]
