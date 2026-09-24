@@ -449,6 +449,7 @@ async fn native_functions_preserve_null_requested_catalog() {
         ]
     );
     assert!(batches[0].column(0).is_null(0));
+    assert!(!stream.schema().field(2).is_nullable());
     assert_eq!(
         batches[0].column(2).as_string::<i32>().value(0),
         "test_function"

@@ -243,9 +243,7 @@ pub(crate) static GET_FUNCTIONS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
     Arc::new(Schema::new(vec![
         Field::new("FUNCTION_CAT", DataType::Utf8, true),
         Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
-        // Classic SHOW FUNCTIONS can omit the modern `functionName` field.
-        // Keep this nullable so one malformed row does not discard the result.
-        Field::new("FUNCTION_NAME", DataType::Utf8, true),
+        Field::new("FUNCTION_NAME", DataType::Utf8, false),
         Field::new("REMARKS", DataType::Utf8, true),
         Field::new("FUNCTION_TYPE", DataType::Int16, true),
         Field::new("SPECIFIC_NAME", DataType::Utf8, true),
@@ -2103,10 +2101,9 @@ mod tests {
                 DataType::Utf8,
                 true,
             )])),
-            vec![Arc::new(StringArray::from(vec![
-                Some("system.builtin.abs"),
-                None,
-            ]))],
+            vec![Arc::new(StringArray::from(vec![Some(
+                "system.builtin.abs",
+            )]))],
         )
         .unwrap();
 
@@ -2117,7 +2114,6 @@ mod tests {
             .downcast_ref::<StringArray>()
             .unwrap();
         assert_eq!(names.value(0), "system.builtin.abs");
-        assert!(names.is_null(1));
         assert!(out.column(1).is_null(0));
         assert!(out.column(3).is_null(0));
     }
