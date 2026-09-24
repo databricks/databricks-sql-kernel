@@ -226,15 +226,12 @@ fn normalize_native_metadata_batch(
 
 fn normalize_native_functions_batch(
     batch: &arrow_array::RecordBatch,
-    requested_catalog: Option<&str>,
+    resolved_catalog: &str,
 ) -> Result<arrow_array::RecordBatch> {
     let normalized = normalize_native_metadata_batch(batch, GET_FUNCTIONS_SCHEMA.clone())?;
     let mut columns = normalized.columns().to_vec();
-    // Match JDBC's native-only override: preserve the caller's original
-    // catalog argument, including null. The SHOW fallback uses the resolved
-    // catalog because it is a different result path.
     columns[0] = Arc::new(StringArray::from(vec![
-        requested_catalog;
+        Some(resolved_catalog);
         normalized.num_rows()
     ])) as ArrayRef;
     arrow_array::RecordBatch::try_new(GET_FUNCTIONS_SCHEMA.clone(), columns).map_err(|e| {
@@ -1301,7 +1298,6 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
         let telemetry_for_body = telemetry.clone();
         let result = async {
-            let requested_catalog = catalog.as_ref().map(|i| i.as_str().to_owned());
             let functions_result = match self
                 .session
                 .transport()
@@ -1329,7 +1325,7 @@ impl Metadata {
                 GET_FUNCTIONS_SCHEMA.clone(),
                 Box::new(move |batch| {
                     if native {
-                        normalize_native_functions_batch(batch, requested_catalog.as_deref())
+                        normalize_native_functions_batch(batch, &resolved_catalog)
                     } else {
                         thrift_shape::reshape_functions(batch, &resolved_catalog)
                     }

@@ -708,7 +708,7 @@ async fn native_foreign_keys_header_and_result_bypass_show_reshape() {
 }
 
 #[tokio::test]
-async fn native_functions_no_filters_match_jdbc_and_preserve_null_request_catalog() {
+async fn native_functions_no_filters_use_resolved_catalog() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -760,7 +760,7 @@ async fn native_functions_no_filters_match_jdbc_and_preserve_null_request_catalo
             "SPECIFIC_NAME",
         ]
     );
-    assert!(batches[0].column(0).is_null(0));
+    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "main");
     assert_eq!(
         batches[0].column(2).as_string::<i32>().value(0),
         "test_function"
