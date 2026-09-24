@@ -198,8 +198,8 @@ impl FeatureFlagCache {
     /// Complete a caller-local failure without publishing a process-wide
     /// negative result. Cold entries are removed and waiters retry so a bad
     /// token, proxy, or cancelled leader cannot suppress a healthy session.
-    /// A stale entry keeps its last good values and becomes immediately
-    /// refreshable by the next caller.
+    /// A stale entry keeps its last good values and briefly backs off so a
+    /// persistent caller-local failure cannot start a refresh on every read.
     fn complete_uncached_failure(&self, key: CacheKey) -> FeatureFlagValues {
         let mut entries = self.lock_entries();
         let Some(mut entry) = entries.remove(&key) else {
@@ -210,6 +210,7 @@ impl FeatureFlagCache {
 
         if entry.values.is_some() {
             entry.refreshing = false;
+            entry.refresh_after = Instant::now() + TRANSIENT_NEGATIVE_TTL;
             entry.last_access = self.next_access();
             entries.insert(key.clone(), entry);
             self.trim_entries(&mut entries, self.idle_capacity, Some(&key));
@@ -451,6 +452,29 @@ mod tests {
         assert!(cache.refresh_guard(key.clone()).retry().is_empty());
         assert!(waiter.await.unwrap().is_none());
         assert!(matches!(cache.lookup(&key), CacheLookup::Load));
+    }
+
+    #[test]
+    fn caller_local_stale_failure_retains_values_and_briefly_backs_off() {
+        let cache = Arc::new(FeatureFlagCache::default());
+        let key = key("local-stale-failure");
+        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
+        cache
+            .refresh_guard(key.clone())
+            .success(values(), Duration::ZERO);
+        assert!(matches!(
+            cache.lookup(&key),
+            CacheLookup::Stale {
+                start_refresh: true,
+                ..
+            }
+        ));
+
+        assert_eq!(
+            cache.refresh_guard(key.clone()).retry().get("test.flag"),
+            Some("test-value")
+        );
+        assert!(matches!(cache.lookup(&key), CacheLookup::Fresh(_)));
     }
 
     #[test]

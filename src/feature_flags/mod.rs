@@ -312,8 +312,9 @@ impl FeatureFlagResolver {
 /// transport failures (DNS, TLS, proxy, connection refusal, or a shorter
 /// caller timeout) receive a brief interval: this bounds request storms while
 /// limiting how long one session's transport problem can affect another.
-/// Auth, malformed-response, configuration, and cancellation failures remain
-/// uncached because they are caller-local.
+/// Auth, malformed-response, configuration, and cancellation failures do not
+/// publish a cold negative result because they are caller-local. If a prior
+/// value exists, the cache retains it with a brief stale-refresh cooldown.
 fn failure_backoff(error: &Error, request_timeout: Duration) -> Option<Duration> {
     match error.http_status {
         Some(401 | 403) => None,
