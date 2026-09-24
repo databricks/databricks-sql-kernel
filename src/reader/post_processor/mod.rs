@@ -33,6 +33,7 @@
 //!
 //! See `docs/designs/complex-types-json-stringify.md` for the design.
 
+mod geospatial;
 mod json;
 
 use crate::kernel_error::{Error, Result};
@@ -109,34 +110,59 @@ impl ResultPostProcessor {
             Some(m) => ResultReaderAdapter::augment_schema_with_manifest(&inner_schema, m),
             None => inner_schema.clone(),
         };
+        let logical_schema = match manifest {
+            Some(manifest) => Some(
+                super::ResultReaderFactory::extract_logical_schema_from_manifest(Some(manifest))?,
+            ),
+            None => None,
+        };
 
-        // 2. Compute the set of column indices that need stringification.
-        //    JSON-rewrite covers complex types; interval-rewrite covers
-        //    `Interval(*)` and `Duration(*)`. Each is gated by its own
-        //    option; both produce a `Utf8` output column. The two sets
-        //    are disjoint by construction (`is_complex_type` returns
-        //    false for interval/duration), so a column is rewritten by
-        //    at most one transform.
+        // 2. Compute the normalized schema and the set of per-column
+        //    rewrites. Geo metadata reconciliation runs first because a geo
+        //    leaf may be nested inside a complex column that is subsequently
+        //    rendered as JSON.
         let mut json_columns: Vec<usize> = Vec::new();
         let mut interval_columns: Vec<usize> = Vec::new();
         let mut null_columns: Vec<usize> = Vec::new();
-        let mut new_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
+        let mut geospatial_columns: Vec<usize> = Vec::new();
+        let mut normalized_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
+        let mut output_fields: Vec<Field> = Vec::with_capacity(augmented_schema.fields().len());
         let mut schema_changed = false;
         for (i, field) in augmented_schema.fields().iter().enumerate() {
-            let dt = field.data_type();
-            if options.complex_types_as_json && json::is_complex_type(dt) {
+            let logical_field = logical_schema
+                .as_ref()
+                .and_then(|schema| schema.fields().get(i))
+                .map(|field| field.as_ref());
+            let geo_plan = geospatial::plan(field, logical_field)?;
+            let (normalized_field, is_top_level_geo) = match geo_plan {
+                Some(plan) => {
+                    if plan.needs_rewrite {
+                        schema_changed = true;
+                        geospatial_columns.push(i);
+                    }
+                    (
+                        field.as_ref().clone().with_data_type(plan.output_type),
+                        plan.is_top_level_geo,
+                    )
+                }
+                None => (field.as_ref().clone(), false),
+            };
+
+            let normalized_type = normalized_field.data_type();
+            let output_field = if options.complex_types_as_json
+                && !is_top_level_geo
+                && json::is_complex_type(normalized_type)
+            {
                 json_columns.push(i);
-                let metadata = field.metadata().clone();
-                new_fields
-                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
                 schema_changed = true;
-            } else if options.intervals_as_string && is_interval_or_duration_type(dt) {
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
+            } else if options.intervals_as_string && is_interval_or_duration_type(normalized_type) {
                 interval_columns.push(i);
-                let metadata = field.metadata().clone();
-                new_fields
-                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
                 schema_changed = true;
-            } else if matches!(dt, DataType::Null) {
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
+            } else if matches!(normalized_type, DataType::Null) {
                 // Untyped NULL (`SELECT NULL` / VOID) arrives as an Arrow
                 // `Null`-typed column, but the server reports it as STRING
                 // (the manifest carries `type_name=NULL`/`type_text=VOID`,
@@ -148,17 +174,26 @@ impl ResultPostProcessor {
                 // carries values, so this is lossless. See issue #203
                 // (DATATYPE-041).
                 null_columns.push(i);
-                let metadata = field.metadata().clone();
-                new_fields
-                    .push(Field::new(field.name(), DataType::Utf8, true).with_metadata(metadata));
                 schema_changed = true;
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
             } else {
-                new_fields.push(field.as_ref().clone());
-            }
+                normalized_field.clone()
+            };
+            normalized_fields.push(normalized_field);
+            output_fields.push(output_field);
         }
+        let normalized_schema: SchemaRef = if geospatial_columns.is_empty() {
+            augmented_schema.clone()
+        } else {
+            Arc::new(Schema::new_with_metadata(
+                normalized_fields,
+                augmented_schema.metadata().clone(),
+            ))
+        };
         let output_schema: SchemaRef = if schema_changed {
             Arc::new(Schema::new_with_metadata(
-                new_fields,
+                output_fields,
                 augmented_schema.metadata().clone(),
             ))
         } else {
@@ -179,8 +214,10 @@ impl ResultPostProcessor {
         //    primitives and emits new Utf8 arrays for the rewritten
         //    columns.
         let needs_rebuild = !schemas_field_equal(&inner_schema, &output_schema);
-        let has_rewrites =
-            !json_columns.is_empty() || !interval_columns.is_empty() || !null_columns.is_empty();
+        let has_rewrites = !geospatial_columns.is_empty()
+            || !json_columns.is_empty()
+            || !interval_columns.is_empty()
+            || !null_columns.is_empty();
         let transform: Option<BatchTransform> = if !needs_rebuild && !has_rewrites {
             None
         } else if !has_rewrites {
@@ -201,15 +238,17 @@ impl ResultPostProcessor {
             // (interval path). Captures only what each closure
             // invocation actually needs.
             let target_schema = output_schema.clone();
-            let augmented = augmented_schema.clone();
+            let normalized = normalized_schema.clone();
             let json_cols: Vec<usize> = json_columns;
             let interval_cols: Vec<usize> = interval_columns;
             let null_cols: Vec<usize> = null_columns;
+            let geo_cols: Vec<usize> = geospatial_columns;
             Some(Box::new(move |batch: &RecordBatch| {
                 build_rewritten_batch(
                     batch,
-                    &augmented,
+                    &normalized,
                     &target_schema,
+                    &geo_cols,
                     &json_cols,
                     &interval_cols,
                     &null_cols,
@@ -264,23 +303,21 @@ fn schemas_field_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
         && a.metadata() == b.metadata()
 }
 
-/// Build a `RecordBatch` whose primitive columns are reprojected
-/// from `batch`, complex columns (indexed by `json_cols`) are replaced
-/// with `Utf8` arrays of compact JSON text, interval / duration
-/// columns (indexed by `interval_cols`) are replaced with `Utf8`
-/// arrays of canonical Databricks interval text, and untyped-NULL
-/// columns (indexed by `null_cols`) are replaced with all-null `Utf8`
-/// arrays (the server-reported STRING type — see issue #203).
+/// Build a `RecordBatch` whose tagged geo values are first recursively
+/// normalized, complex columns (indexed by `json_cols`) are replaced with
+/// `Utf8` arrays of compact JSON text, interval / duration columns (indexed by
+/// `interval_cols`) are replaced with canonical Databricks text, and untyped
+/// NULL columns (indexed by `null_cols`) become all-null `Utf8` arrays.
 ///
-/// `json_cols`, `interval_cols`, and `null_cols` are assumed to be
-/// sorted in ascending order (the constructor walks the schema
-/// linearly) and pairwise disjoint (`is_complex_type` returns false
-/// for intervals; a `Null`-typed column is neither complex nor
-/// interval).
+/// All index sets are sorted. `geo_cols` may overlap `json_cols` when a
+/// complex column contains a geo leaf; geo normalization intentionally runs
+/// first so JSON sees the normalized nested schema and values. The other
+/// rewrite sets are pairwise disjoint.
 fn build_rewritten_batch(
     batch: &RecordBatch,
-    augmented: &SchemaRef,
+    normalized: &SchemaRef,
     output: &SchemaRef,
+    geo_cols: &[usize],
     json_cols: &[usize],
     interval_cols: &[usize],
     null_cols: &[usize],
@@ -288,10 +325,22 @@ fn build_rewritten_batch(
     let num_rows = batch.num_rows();
     let mut columns: Vec<ArrayRef> = Vec::with_capacity(batch.num_columns());
 
+    let mut next_geo_idx = 0;
     let mut next_json_idx = 0;
     let mut next_interval_idx = 0;
     let mut next_null_idx = 0;
     for (col_idx, column) in batch.columns().iter().enumerate() {
+        let normalized_field = normalized.fields().get(col_idx).ok_or_else(|| {
+            Error::internal().message(format!(
+                "ResultPostProcessor: upstream batch has {} columns but normalized schema only has {}",
+                batch.num_columns(),
+                normalized.fields().len()
+            ))
+        })?;
+        let is_geo = geo_cols
+            .get(next_geo_idx)
+            .copied()
+            .is_some_and(|target| target == col_idx);
         let is_json = json_cols
             .get(next_json_idx)
             .copied()
@@ -304,21 +353,20 @@ fn build_rewritten_batch(
             .get(next_null_idx)
             .copied()
             .is_some_and(|target| target == col_idx);
+
+        let column = if is_geo {
+            next_geo_idx += 1;
+            geospatial::rewrite(
+                column,
+                normalized_field.data_type(),
+                normalized_field.name(),
+            )?
+        } else {
+            column.clone()
+        };
+
         if is_json {
             next_json_idx += 1;
-            // Use the augmented field (carries databricks.* metadata)
-            // so the per-row encoder can see VARIANT / GEOMETRY /
-            // GEOGRAPHY hints if they ever apply to a complex column.
-            // Guard against an upstream batch that has more columns
-            // than the schema it advertised — `Schema::field` would
-            // panic; we want a typed `Error::internal` instead.
-            let field = augmented.fields().get(col_idx).ok_or_else(|| {
-                Error::internal().message(format!(
-                    "ResultPostProcessor: upstream batch has {} columns but advertised schema only has {}",
-                    batch.num_columns(),
-                    augmented.fields().len()
-                ))
-            })?;
             let mut builder = StringBuilder::with_capacity(num_rows, num_rows * 16);
             let mut scratch = String::new();
             for row in 0..num_rows {
@@ -327,7 +375,12 @@ fn build_rewritten_batch(
                     continue;
                 }
                 scratch.clear();
-                json::append_json(&mut scratch, column.as_ref(), row, field.as_ref())?;
+                json::append_json(
+                    &mut scratch,
+                    column.as_ref(),
+                    row,
+                    normalized_field.as_ref(),
+                )?;
                 builder.append_value(&scratch);
             }
             columns.push(Arc::new(builder.finish()));
@@ -359,7 +412,7 @@ fn build_rewritten_batch(
             // the server-reported STRING type for untyped NULL / VOID.
             columns.push(arrow_array::new_null_array(&DataType::Utf8, num_rows));
         } else {
-            columns.push(column.clone());
+            columns.push(column);
         }
     }
 
@@ -383,8 +436,11 @@ mod tests {
     use crate::reader::test_utils::MockReader;
     use crate::reader::ResultReader;
     use crate::types::sea::{ColumnInfo, ResultSchema};
-    use arrow_array::builder::{ListBuilder, MapBuilder, StringBuilder};
+    use arrow_array::builder::{
+        BinaryBuilder, Int32Builder, ListBuilder, MapBuilder, StringBuilder,
+    };
     use arrow_array::{Array, Int32Array, StringArray, StructArray};
+    use arrow_buffer::NullBuffer;
     use arrow_schema::Fields;
 
     fn make_manifest(columns: Vec<ColumnInfo>) -> ResultManifest {
@@ -394,6 +450,7 @@ mod tests {
                 column_count: columns.len() as i32,
                 columns,
             },
+            arrow_schema: None,
             total_chunk_count: None,
             total_row_count: None,
             total_byte_count: None,
@@ -414,6 +471,41 @@ mod tests {
             type_scale: None,
             type_interval_type: None,
         }
+    }
+
+    const POINT_1_2_WKB: &[u8] = &[
+        1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+    ];
+
+    fn untagged_geo_values(row_srids: &[Option<i32>]) -> ArrayRef {
+        let fields = Fields::from(vec![
+            Field::new("srid", DataType::Int32, false),
+            Field::new("wkb", DataType::Binary, false),
+        ]);
+        let mut srids = Int32Builder::new();
+        let mut wkbs = BinaryBuilder::new();
+        let mut validity = Vec::with_capacity(row_srids.len());
+        for row_srid in row_srids {
+            match row_srid {
+                Some(srid) => {
+                    srids.append_value(*srid);
+                    wkbs.append_value(POINT_1_2_WKB);
+                    validity.push(true);
+                }
+                None => {
+                    // Non-null children carry placeholders masked by the null
+                    // outer struct, matching Reyden's encoding.
+                    srids.append_value(0);
+                    wkbs.append_value([]);
+                    validity.push(false);
+                }
+            }
+        }
+        Arc::new(StructArray::new(
+            fields,
+            vec![Arc::new(srids.finish()), Arc::new(wkbs.finish())],
+            Some(NullBuffer::from(validity)),
+        ))
     }
 
     #[tokio::test]
@@ -772,5 +864,48 @@ mod tests {
         assert_eq!(pp.schema().await.unwrap().field(0).data_type(), &list_dt);
         let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(out.schema().field(0).data_type(), &list_dt);
+    }
+
+    #[tokio::test]
+    async fn geospatial_results_attach_tags_and_reuse_child_arrays() {
+        let geometry = untagged_geo_values(&[Some(4326)]);
+        let original = geometry
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap()
+            .columns()
+            .to_vec();
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_0",
+            geometry.data_type().clone(),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![geometry]).unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![column_info("geom", "GEOMETRY", "GEOMETRY(ANY)", 0)]);
+        let mut pp =
+            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
+                .await
+                .unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
+        let values = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(Arc::ptr_eq(values.column(0), &original[0]));
+        assert!(Arc::ptr_eq(values.column(1), &original[1]));
+        let schema = out.schema();
+        let DataType::Struct(fields) = schema.field(0).data_type() else {
+            panic!("binary geometry must remain a struct")
+        };
+        assert_eq!(
+            fields[1].metadata().get("geometry").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            fields[1].metadata().get("srid").map(String::as_str),
+            Some("-1")
+        );
     }
 }

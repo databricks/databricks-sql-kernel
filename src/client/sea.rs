@@ -2342,6 +2342,7 @@ mod tests {
                     column_count: 0,
                     columns: vec![],
                 },
+                arrow_schema: None,
                 total_chunk_count: None,
                 total_row_count: None,
                 total_byte_count: None,
