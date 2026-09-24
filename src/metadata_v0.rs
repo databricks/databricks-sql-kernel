@@ -125,11 +125,9 @@ fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
         .is_some_and(|manifest| manifest.is_native_metadata_result == Some(true))
 }
 
-/// Native metadata already has the canonical Thrift column order.
-/// Reattach the kernel's public schema so empty and non-empty responses expose
-/// the same stable Arrow contract, casting compatible physical types when the
-/// server's Arrow schema differs from the public JDBC schema and applying the
-/// value normalization JDBC uses for copied native rows.
+/// Native metadata already has the canonical Thrift column order. Reattach the
+/// public schema, casting differing physical types. Native `GetColumns`
+/// ordinals are converted from zero-based to JDBC one-based.
 fn normalize_native_metadata_batch(
     batch: &arrow_array::RecordBatch,
     schema: SchemaRef,
@@ -1445,7 +1443,8 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
-    use arrow_array::{Int16Array, Int32Array, RecordBatch};
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Int16Array, Int32Array, LargeStringArray, RecordBatch, StringViewArray};
     use arrow_schema::{DataType, Field, Schema};
 
     #[test]
@@ -1500,6 +1499,56 @@ mod tests {
         assert_eq!(ordinals.value(0), 1);
         assert_eq!(ordinals.value(1), 2);
         assert!(ordinals.is_null(2));
+    }
+
+    #[test]
+    fn native_metadata_rejects_ordinal_overflow() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ORDINAL_POSITION",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![i32::MAX]))],
+        )
+        .unwrap();
+
+        let err = normalize_native_metadata_batch(&batch, schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("ORDINAL_POSITION overflow"));
+    }
+
+    #[test]
+    fn native_metadata_casts_string_representations_to_utf8() {
+        let sources: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(vec![Some("main"), None])),
+            Arc::new(StringViewArray::from(vec![Some("main"), None])),
+        ];
+
+        for source in sources {
+            let source_type = source.data_type().clone();
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "TABLE_CAT",
+                    source_type,
+                    true,
+                )])),
+                vec![source],
+            )
+            .unwrap();
+            let public_schema = Arc::new(Schema::new(vec![Field::new(
+                "TABLE_CAT",
+                DataType::Utf8,
+                true,
+            )]));
+
+            let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+            let values = normalized.column(0).as_string::<i32>();
+            assert_eq!(values.value(0), "main");
+            assert!(values.is_null(1));
+        }
     }
 
     #[test]

@@ -11,13 +11,13 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Added Thrift-native metadata routing with compatible public-schema casts and one-based `getColumns` ordinals.
+
 ### Changed
 
 ### Updated
 
 ### Fixed
-
-- Cast compatible Thrift-native metadata arrays to the public JDBC schema and normalize column ordinals to one-based positions.
 
 ---
 *Note: When making changes, please add your change under the appropriate
