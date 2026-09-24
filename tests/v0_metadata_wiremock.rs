@@ -396,7 +396,7 @@ async fn native_catalogs_header_and_result_bypass_show_reshape() {
 }
 
 #[tokio::test]
-async fn native_functions_no_filters_use_resolved_catalog() {
+async fn native_functions_preserve_null_requested_catalog() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -409,7 +409,7 @@ async fn native_functions_no_filters_use_resolved_catalog() {
     )
     .await;
 
-    let native = native_functions_batch(Some(""));
+    let native = native_functions_batch(Some("main"));
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/statements"))
         .and(body_string_contains(
@@ -448,7 +448,7 @@ async fn native_functions_no_filters_use_resolved_catalog() {
             "SPECIFIC_NAME",
         ]
     );
-    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "main");
+    assert!(batches[0].column(0).is_null(0));
     assert_eq!(
         batches[0].column(2).as_string::<i32>().value(0),
         "test_function"

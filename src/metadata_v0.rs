@@ -140,7 +140,7 @@ fn normalize_native_metadata_batch(
 
 fn normalize_native_functions_batch(
     batch: &arrow_array::RecordBatch,
-    resolved_catalog: &str,
+    requested_catalog: Option<&str>,
 ) -> Result<arrow_array::RecordBatch> {
     if batch.num_columns() != GET_FUNCTIONS_SCHEMA.fields().len() {
         return Err(Error::data_loss().message(format!(
@@ -185,10 +185,7 @@ fn normalize_native_functions_batch(
             })
             .collect::<Vec<_>>(),
     )) as ArrayRef;
-    columns[0] = Arc::new(StringArray::from(vec![
-        Some(resolved_catalog);
-        batch.num_rows()
-    ])) as ArrayRef;
+    columns[0] = Arc::new(StringArray::from(vec![requested_catalog; batch.num_rows()])) as ArrayRef;
     columns[3] = normalized_remarks;
     arrow_array::RecordBatch::try_new(GET_FUNCTIONS_SCHEMA.clone(), columns).map_err(|e| {
         Error::data_loss().message(format!("invalid Thrift-native functions result: {e}"))
@@ -1254,6 +1251,8 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
         let telemetry_for_body = telemetry.clone();
         let result = async {
+            // JDBC preserves the original argument, including null, for native rows.
+            let requested_catalog = catalog.as_ref().map(|catalog| catalog.as_str().to_owned());
             let functions_result = match self
                 .session
                 .transport()
@@ -1281,7 +1280,7 @@ impl Metadata {
                 GET_FUNCTIONS_SCHEMA.clone(),
                 Box::new(move |batch| {
                     if native {
-                        normalize_native_functions_batch(batch, &resolved_catalog)
+                        normalize_native_functions_batch(batch, requested_catalog.as_deref())
                     } else {
                         thrift_shape::reshape_functions(batch, &resolved_catalog)
                     }
