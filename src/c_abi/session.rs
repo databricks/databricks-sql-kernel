@@ -1802,6 +1802,50 @@ pub unsafe extern "C" fn kernel_session_is_open(
     KernelStatusCode::Success
 }
 
+/// Read one opaque JSON value from the immutable feature-flag snapshot.
+///
+/// On a hit, `*out_value` borrows UTF-8 bytes owned by the session and
+/// `*out_value_len` receives their length. The bytes are not NUL-terminated
+/// and remain valid until [`kernel_session_close`]. A missing flag is a
+/// successful lookup with a null pointer and zero length. This performs no I/O.
+///
+/// # Safety
+/// `session` must be a live session handle, `name` must point to a
+/// NUL-terminated C string, and both output pointers must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_get_feature_flag(
+    session: *const kernel_session_t,
+    name: *const c_char,
+    out_value: *mut *const u8,
+    out_value_len: *mut usize,
+) -> KernelStatusCode {
+    crate::c_abi::error::clear_error();
+    if out_value.is_null() || out_value_len.is_null() {
+        return crate::c_abi::error::store_and_code(
+            Error::invalid_argument()
+                .message("kernel_session_get_feature_flag: output pointers must not be null"),
+        );
+    }
+    std::ptr::write(out_value, std::ptr::null());
+    std::ptr::write(out_value_len, 0);
+
+    let Some(session) = (session as *const Session).as_ref() else {
+        return crate::c_abi::error::store_and_code(
+            Error::invalid_argument()
+                .message("kernel_session_get_feature_flag: session must not be null"),
+        );
+    };
+    let name = match required_str(name, "feature flag name") {
+        Ok(name) => name,
+        Err(error) => return crate::c_abi::error::store_and_code(error),
+    };
+    if let Some(value) = session.feature_flags().get(&name) {
+        std::ptr::write(out_value, value.as_ptr());
+        std::ptr::write(out_value_len, value.len());
+    }
+    KernelStatusCode::Success
+}
+
 /// Actively validate the session against the server by round-tripping a
 /// lightweight `SELECT 1` test query (result discarded). This is the
 /// I/O-performing complement of [`kernel_session_is_open`]: where that is
@@ -2108,6 +2152,95 @@ mod tests {
             assert!(config.as_ref().unwrap().client_identity.is_none());
             kernel_session_config_free(config);
         }
+    }
+
+    #[test]
+    fn feature_flag_lookup_returns_borrowed_snapshot_value() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let runtime = tokio::runtime::Runtime::new().expect("runtime");
+        let (server, session) = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path(
+                    "/api/2.0/connector-service/feature-flags/GOLANG/c-abi-test",
+                ))
+                .and(header("authorization", "Bearer dapi_test_token"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"flags":[{"name":"example.flag","value":"[\"a\",\"b\"]"}],"ttl_seconds":300}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/sessions"))
+                .respond_with(ResponseTemplate::new(200).set_body_string(
+                    r#"{"session_id":"sess-cabi-flags","warehouse_id":"test_wh"}"#,
+                ))
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/api/2.0/sql/sessions/sess-cabi-flags"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let session = Session::builder()
+                .connection(
+                    ConnectionConfig::from_http_path(
+                        server.uri(),
+                        "/sql/1.0/warehouses/test_wh",
+                    )
+                    .expect("valid http_path"),
+                )
+                .auth(AuthConfig::Pat {
+                    token: "dapi_test_token".into(),
+                    identity_federation_client_id: None,
+                })
+                .client_identity(ClientIdentity::new(ClientType::Go, "c-abi-test"))
+                .open()
+                .await
+                .expect("session opens");
+            (server, session)
+        });
+
+        let session = Box::into_raw(Box::new(session)) as *mut kernel_session_t;
+        let name = CString::new("example.flag").unwrap();
+        let mut value = std::ptr::null();
+        let mut value_len = 0;
+        assert_eq!(
+            unsafe {
+                kernel_session_get_feature_flag(session, name.as_ptr(), &mut value, &mut value_len)
+            },
+            KernelStatusCode::Success
+        );
+        let value = unsafe { std::slice::from_raw_parts(value, value_len) };
+        assert_eq!(std::str::from_utf8(value).unwrap(), r#"["a","b"]"#);
+
+        let missing = CString::new("missing.flag").unwrap();
+        let mut value = 1usize as *const u8;
+        let mut value_len = usize::MAX;
+        assert_eq!(
+            unsafe {
+                kernel_session_get_feature_flag(
+                    session,
+                    missing.as_ptr(),
+                    &mut value,
+                    &mut value_len,
+                )
+            },
+            KernelStatusCode::Success
+        );
+        assert!(value.is_null());
+        assert_eq!(value_len, 0);
+
+        assert_eq!(
+            unsafe { kernel_session_close(session) },
+            KernelStatusCode::Success
+        );
+        drop(server);
     }
 
     #[test]

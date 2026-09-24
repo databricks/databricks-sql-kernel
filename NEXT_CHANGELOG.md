@@ -16,6 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
   JSON-serialized per-driver values, and bounded process-wide caching.
 - Add a C ABI client-identity setter so native drivers can use kernel-owned
   connector-service feature flags without duplicate calls.
+- Add a C ABI lookup for values in a session's feature-flag snapshot.
 
 ### Changed
 

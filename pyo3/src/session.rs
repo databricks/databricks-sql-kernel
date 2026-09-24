@@ -661,6 +661,14 @@ impl Session {
         Ok(inner.session.session_id().to_owned())
     }
 
+    /// Return one opaque JSON value from the immutable feature-flag snapshot
+    /// captured when this session opened. A missing flag returns `None`.
+    /// This reads local state and performs no connector-service request.
+    fn feature_flag(&self, name: &str) -> PyResult<Option<String>> {
+        let inner = alive!(self, "Session");
+        Ok(inner.session.feature_flags().get(name).map(str::to_owned))
+    }
+
     /// Build a new `Statement` bound to this session.
     fn statement(&self) -> PyResult<Statement> {
         let inner = alive!(self, "Session");

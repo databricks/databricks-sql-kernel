@@ -13,6 +13,8 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- Add `Session.feature_flag()` to read the kernel-owned session snapshot.
+
 ### Changed
 
 - Use a non-empty `driver_version` as the Python client identity for

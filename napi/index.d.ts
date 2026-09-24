@@ -973,8 +973,14 @@ export declare class Connection {
    * Server-issued session id. Cached at construction; readable
    * even after `close()` so JS-side log lines can correlate
    * against kernel / server logs which key on the same id.
-   */
+  */
   get sessionId(): string
+  /**
+   * Return one opaque JSON value from the immutable feature-flag snapshot
+   * captured when this connection opened. A missing flag returns `null`.
+   * This reads local state and performs no connector-service request.
+   */
+  featureFlag(name: string): Promise<string | null>
   /**
    * Execute a SQL statement and return a Statement handle that
    * streams batches via `fetchNextBatch()`.

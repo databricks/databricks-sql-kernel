@@ -273,6 +273,16 @@ impl Connection {
         &self.session_id
     }
 
+    /// Return one opaque JSON value from the immutable feature-flag snapshot
+    /// captured when this connection opened. A missing flag returns `null`.
+    /// This reads local state and performs no connector-service request.
+    #[napi]
+    pub async fn feature_flag(&self, name: String) -> napi::Result<Option<String>> {
+        let guard = self.inner.lock().await;
+        let session = guard.as_ref().ok_or_else(connection_closed_err)?;
+        Ok(session.feature_flags().get(&name).map(str::to_owned))
+    }
+
     /// Execute a SQL statement and return a Statement handle that
     /// streams batches via `fetchNextBatch()`.
     ///

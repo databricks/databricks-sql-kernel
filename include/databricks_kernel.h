@@ -613,6 +613,16 @@ KernelStatusCode kernel_session_close(kernel_session_t* session);
  * "not known-dead", not a positive liveness guarantee. No ownership. */
 KernelStatusCode kernel_session_is_open(const kernel_session_t* session, bool* out);
 
+/* Read one value from the immutable feature-flag snapshot captured when the
+ * session opened. `name` is the connector-service flag name. On a hit,
+ * `*out_value` points to borrowed UTF-8 JSON text and `*out_value_len` is its
+ * byte length; the bytes are NOT NUL-terminated and remain valid until
+ * kernel_session_close. On a miss, returns Success with NULL/0. No I/O. */
+KernelStatusCode kernel_session_get_feature_flag(const kernel_session_t* session,
+                                                 const char* name,
+                                                 const uint8_t** out_value,
+                                                 size_t* out_value_len);
+
 /* Actively validate the session against the server by round-tripping a
  * lightweight `SELECT 1` test query (result discarded). This is the
  * I/O-performing complement of kernel_session_is_open: it reaches the

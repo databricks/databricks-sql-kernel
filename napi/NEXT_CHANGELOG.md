@@ -14,6 +14,8 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- Add `Connection.featureFlag()` to read the kernel-owned session snapshot.
+
 ### Changed
 
 - Use a non-empty `driverVersion` as the Node.js client identity for

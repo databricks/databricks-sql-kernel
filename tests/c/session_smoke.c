@@ -78,6 +78,14 @@ static void test_null_guards(void) {
   rc = kernel_session_close(NULL);
   CHECK(rc == KernelStatusCode_InvalidArgument, "session_close(NULL) → InvalidArgument");
 
+  const uint8_t* flag_value = (const uint8_t*)0x1;
+  size_t flag_value_len = 1;
+  rc = kernel_session_get_feature_flag(NULL, "example.flag", &flag_value, &flag_value_len);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "session_get_feature_flag(NULL) → InvalidArgument");
+  CHECK(flag_value == NULL && flag_value_len == 0,
+        "session_get_feature_flag failure clears outputs");
+
   rc = kernel_statement_close(NULL);
   CHECK(rc == KernelStatusCode_InvalidArgument, "statement_close(NULL) → InvalidArgument");
 
