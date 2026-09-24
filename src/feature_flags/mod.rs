@@ -229,7 +229,6 @@ impl FeatureFlagResolver {
                     "feature-flag fetch failed; using defaults or stale values"
                 );
                 match failure_backoff(&error, self.request_timeout()) {
-                    Some(ttl) if ttl == NEGATIVE_TTL => guard.backoff(),
                     Some(ttl) => guard.backoff_for(ttl),
                     None => guard.retry(),
                 }
@@ -252,9 +251,6 @@ impl FeatureFlagResolver {
                         "background feature-flag refresh failed; retaining stale values"
                     );
                     match failure_backoff(&error, resolver.request_timeout()) {
-                        Some(ttl) if ttl == NEGATIVE_TTL => {
-                            guard.backoff();
-                        }
                         Some(ttl) => {
                             guard.backoff_for(ttl);
                         }
