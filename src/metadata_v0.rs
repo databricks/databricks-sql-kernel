@@ -95,7 +95,7 @@ use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 use tracing::{debug, Instrument};
@@ -125,15 +125,72 @@ fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
         .is_some_and(|manifest| manifest.is_native_metadata_result == Some(true))
 }
 
-/// Native metadata already has the canonical Thrift column order and values.
-/// Reattach the kernel's public schema so empty and non-empty responses expose
-/// the same stable Arrow contract, while deliberately skipping the SQL-result
-/// reshape.
+/// Native metadata already has the canonical Thrift column order. Reattach the
+/// public schema, casting differing physical types. Native `GetColumns`
+/// ordinals are converted from zero-based to JDBC one-based.
 fn normalize_native_metadata_batch(
     batch: &arrow_array::RecordBatch,
     schema: SchemaRef,
 ) -> Result<arrow_array::RecordBatch> {
-    arrow_array::RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(Error::data_loss().message(format!(
+            "invalid Thrift-native metadata result: expected {} columns, found {}",
+            schema.fields().len(),
+            batch.num_columns()
+        )));
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            let column = if column.data_type() == field.data_type() {
+                Arc::clone(column)
+            } else {
+                arrow_cast::cast_with_options(
+                    column.as_ref(),
+                    field.data_type(),
+                    &arrow_cast::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "invalid Thrift-native metadata column {:?}: cannot cast {} to {}: {e}",
+                        field.name(),
+                        column.data_type(),
+                        field.data_type()
+                    ))
+                })?
+            };
+
+            if field.name() != "ORDINAL_POSITION" {
+                return Ok(column);
+            }
+
+            // Native GetColumns ordinals are zero-based. JDBC increments them
+            // when copying native metadata; the SHOW fallback is already one-based.
+            let ordinals = column
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .ok_or_else(|| Error::data_loss().message("ORDINAL_POSITION is not Int32"))?;
+            let ordinals = ordinals
+                .iter()
+                .map(|ordinal| match ordinal {
+                    Some(ordinal) => ordinal
+                        .checked_add(1)
+                        .map(Some)
+                        .ok_or_else(|| Error::data_loss().message("ORDINAL_POSITION overflow")),
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(arrow_array::Int32Array::from(ordinals)) as ArrayRef)
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    arrow_array::RecordBatch::try_new(schema, columns).map_err(|e| {
         Error::data_loss().message(format!("invalid Thrift-native metadata result: {e}"))
     })
 }
@@ -1386,6 +1443,158 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
+    use arrow_array::cast::AsArray;
+    use arrow_array::{Int16Array, Int32Array, LargeStringArray, RecordBatch, StringViewArray};
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn native_metadata_casts_server_integer_width_to_public_schema() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(3), None]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "UPDATE_RULE",
+            DataType::Int16,
+            true,
+        )]));
+
+        let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+        let values = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Int16);
+        assert_eq!(values.value(0), 3);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn native_metadata_makes_column_ordinals_one_based() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ORDINAL_POSITION",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(0), Some(1), None]))],
+        )
+        .unwrap();
+
+        let normalized = normalize_native_metadata_batch(&batch, schema).unwrap();
+        let ordinals = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(ordinals.value(0), 1);
+        assert_eq!(ordinals.value(1), 2);
+        assert!(ordinals.is_null(2));
+    }
+
+    #[test]
+    fn native_metadata_rejects_ordinal_overflow() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ORDINAL_POSITION",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![i32::MAX]))],
+        )
+        .unwrap();
+
+        let err = normalize_native_metadata_batch(&batch, schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("ORDINAL_POSITION overflow"));
+    }
+
+    #[test]
+    fn native_metadata_casts_string_representations_to_utf8() {
+        let sources: Vec<ArrayRef> = vec![
+            Arc::new(LargeStringArray::from(vec![Some("main"), None])),
+            Arc::new(StringViewArray::from(vec![Some("main"), None])),
+        ];
+
+        for source in sources {
+            let source_type = source.data_type().clone();
+            let batch = RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new(
+                    "TABLE_CAT",
+                    source_type,
+                    true,
+                )])),
+                vec![source],
+            )
+            .unwrap();
+            let public_schema = Arc::new(Schema::new(vec![Field::new(
+                "TABLE_CAT",
+                DataType::Utf8,
+                true,
+            )]));
+
+            let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+            let values = normalized.column(0).as_string::<i32>();
+            assert_eq!(values.value(0), "main");
+            assert!(values.is_null(1));
+        }
+    }
+
+    #[test]
+    fn native_metadata_rejects_unexpected_column_count() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(3)]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![
+            Field::new("UPDATE_RULE", DataType::Int16, true),
+            Field::new("DELETE_RULE", DataType::Int16, true),
+        ]));
+
+        let err = normalize_native_metadata_batch(&batch, public_schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("expected 2 columns, found 1"));
+    }
+
+    #[test]
+    fn native_metadata_rejects_out_of_range_narrowing_cast() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(i32::MAX)]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "UPDATE_RULE",
+            DataType::Int16,
+            true,
+        )]));
+
+        let err = normalize_native_metadata_batch(&batch, public_schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("cannot cast Int32 to Int16"));
+    }
 
     #[test]
     fn identifier_accepts_normal_name() {

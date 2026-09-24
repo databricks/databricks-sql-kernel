@@ -11,6 +11,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- Added Thrift-native metadata routing with compatible public-schema casts and one-based `getColumns` ordinals.
+
 ### Changed
 
 ### Updated
