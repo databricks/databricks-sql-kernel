@@ -127,13 +127,49 @@ fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
 
 /// Native metadata already has the canonical Thrift column order and values.
 /// Reattach the kernel's public schema so empty and non-empty responses expose
-/// the same stable Arrow contract, while deliberately skipping the SQL-result
-/// reshape.
+/// the same stable Arrow contract, casting compatible physical types when the
+/// server's Arrow schema differs from the public JDBC schema.
 fn normalize_native_metadata_batch(
     batch: &arrow_array::RecordBatch,
     schema: SchemaRef,
 ) -> Result<arrow_array::RecordBatch> {
-    arrow_array::RecordBatch::try_new(schema, batch.columns().to_vec()).map_err(|e| {
+    if batch.num_columns() != schema.fields().len() {
+        return Err(Error::data_loss().message(format!(
+            "invalid Thrift-native metadata result: expected {} columns, found {}",
+            schema.fields().len(),
+            batch.num_columns()
+        )));
+    }
+
+    let columns = batch
+        .columns()
+        .iter()
+        .zip(schema.fields())
+        .map(|(column, field)| {
+            if column.data_type() == field.data_type() {
+                Ok(Arc::clone(column))
+            } else {
+                arrow_cast::cast_with_options(
+                    column.as_ref(),
+                    field.data_type(),
+                    &arrow_cast::CastOptions {
+                        safe: false,
+                        ..Default::default()
+                    },
+                )
+                .map_err(|e| {
+                    Error::data_loss().message(format!(
+                        "invalid Thrift-native metadata column {:?}: cannot cast {} to {}: {e}",
+                        field.name(),
+                        column.data_type(),
+                        field.data_type()
+                    ))
+                })
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    arrow_array::RecordBatch::try_new(schema, columns).map_err(|e| {
         Error::data_loss().message(format!("invalid Thrift-native metadata result: {e}"))
     })
 }
@@ -1386,6 +1422,82 @@ impl Metadata {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
+    use arrow_array::{Int16Array, Int32Array, RecordBatch};
+    use arrow_schema::{DataType, Field, Schema};
+
+    #[test]
+    fn native_metadata_casts_server_integer_width_to_public_schema() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(3), None]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "UPDATE_RULE",
+            DataType::Int16,
+            true,
+        )]));
+
+        let normalized = normalize_native_metadata_batch(&batch, public_schema).unwrap();
+        let values = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int16Array>()
+            .unwrap();
+
+        assert_eq!(normalized.schema().field(0).data_type(), &DataType::Int16);
+        assert_eq!(values.value(0), 3);
+        assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn native_metadata_rejects_unexpected_column_count() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(3)]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![
+            Field::new("UPDATE_RULE", DataType::Int16, true),
+            Field::new("DELETE_RULE", DataType::Int16, true),
+        ]));
+
+        let err = normalize_native_metadata_batch(&batch, public_schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("expected 2 columns, found 1"));
+    }
+
+    #[test]
+    fn native_metadata_rejects_out_of_range_narrowing_cast() {
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "UPDATE_RULE",
+                DataType::Int32,
+                true,
+            )])),
+            vec![Arc::new(Int32Array::from(vec![Some(i32::MAX)]))],
+        )
+        .unwrap();
+        let public_schema = Arc::new(Schema::new(vec![Field::new(
+            "UPDATE_RULE",
+            DataType::Int16,
+            true,
+        )]));
+
+        let err = normalize_native_metadata_batch(&batch, public_schema).unwrap_err();
+
+        assert_eq!(err.code, ErrorCode::DataLoss);
+        assert!(err.message.contains("cannot cast Int32 to Int16"));
+    }
 
     #[test]
     fn identifier_accepts_normal_name() {

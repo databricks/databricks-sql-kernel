@@ -17,6 +17,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Cast compatible Thrift-native metadata arrays to the kernel's public JDBC schema.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here
