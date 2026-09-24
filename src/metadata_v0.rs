@@ -95,7 +95,7 @@ use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
-use arrow_array::Array;
+use arrow_array::{Array, ArrayRef};
 use arrow_schema::SchemaRef;
 use std::sync::Arc;
 use tracing::{debug, Instrument};
@@ -125,10 +125,11 @@ fn is_native_metadata_result(raw: &ExecuteResult) -> bool {
         .is_some_and(|manifest| manifest.is_native_metadata_result == Some(true))
 }
 
-/// Native metadata already has the canonical Thrift column order and values.
+/// Native metadata already has the canonical Thrift column order.
 /// Reattach the kernel's public schema so empty and non-empty responses expose
 /// the same stable Arrow contract, casting compatible physical types when the
-/// server's Arrow schema differs from the public JDBC schema.
+/// server's Arrow schema differs from the public JDBC schema and applying the
+/// value normalization JDBC uses for copied native rows.
 fn normalize_native_metadata_batch(
     batch: &arrow_array::RecordBatch,
     schema: SchemaRef,
@@ -146,8 +147,8 @@ fn normalize_native_metadata_batch(
         .iter()
         .zip(schema.fields())
         .map(|(column, field)| {
-            if column.data_type() == field.data_type() {
-                Ok(Arc::clone(column))
+            let column = if column.data_type() == field.data_type() {
+                Arc::clone(column)
             } else {
                 arrow_cast::cast_with_options(
                     column.as_ref(),
@@ -164,8 +165,30 @@ fn normalize_native_metadata_batch(
                         column.data_type(),
                         field.data_type()
                     ))
-                })
+                })?
+            };
+
+            if field.name() != "ORDINAL_POSITION" {
+                return Ok(column);
             }
+
+            // Native GetColumns ordinals are zero-based. JDBC increments them
+            // when copying native metadata; the SHOW fallback is already one-based.
+            let ordinals = column
+                .as_any()
+                .downcast_ref::<arrow_array::Int32Array>()
+                .ok_or_else(|| Error::data_loss().message("ORDINAL_POSITION is not Int32"))?;
+            let ordinals = ordinals
+                .iter()
+                .map(|ordinal| match ordinal {
+                    Some(ordinal) => ordinal
+                        .checked_add(1)
+                        .map(Some)
+                        .ok_or_else(|| Error::data_loss().message("ORDINAL_POSITION overflow")),
+                    None => Ok(None),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(Arc::new(arrow_array::Int32Array::from(ordinals)) as ArrayRef)
         })
         .collect::<Result<Vec<_>>>()?;
 
@@ -1452,6 +1475,31 @@ mod tests {
         assert_eq!(normalized.schema().field(0).data_type(), &DataType::Int16);
         assert_eq!(values.value(0), 3);
         assert!(values.is_null(1));
+    }
+
+    #[test]
+    fn native_metadata_makes_column_ordinals_one_based() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ORDINAL_POSITION",
+            DataType::Int32,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![Some(0), Some(1), None]))],
+        )
+        .unwrap();
+
+        let normalized = normalize_native_metadata_batch(&batch, schema).unwrap();
+        let ordinals = normalized
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(ordinals.value(0), 1);
+        assert_eq!(ordinals.value(1), 2);
+        assert!(ordinals.is_null(2));
     }
 
     #[test]
