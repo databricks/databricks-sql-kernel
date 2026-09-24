@@ -268,10 +268,6 @@ impl RefreshGuard {
         )
     }
 
-    pub(crate) fn backoff(self) -> FeatureFlagValues {
-        self.backoff_for(NEGATIVE_TTL)
-    }
-
     pub(crate) fn backoff_for(mut self, ttl: Duration) -> FeatureFlagValues {
         self.cache.complete_cached(
             self.key.take().expect("refresh guard is armed"),
@@ -405,7 +401,7 @@ mod tests {
             }
         ));
 
-        cache.refresh_guard(key).backoff();
+        cache.refresh_guard(key).backoff_for(NEGATIVE_TTL);
     }
 
     #[test]
@@ -425,7 +421,10 @@ mod tests {
         ));
 
         assert_eq!(
-            cache.refresh_guard(key.clone()).backoff().get("test.flag"),
+            cache
+                .refresh_guard(key.clone())
+                .backoff_for(NEGATIVE_TTL)
+                .get("test.flag"),
             Some("test-value")
         );
         assert!(matches!(cache.lookup(&key), CacheLookup::Fresh(_)));
@@ -436,7 +435,10 @@ mod tests {
         let cache = Arc::new(FeatureFlagCache::default());
         let key = key("failure");
         assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        assert!(cache.refresh_guard(key.clone()).backoff().is_empty());
+        assert!(cache
+            .refresh_guard(key.clone())
+            .backoff_for(NEGATIVE_TTL)
+            .is_empty());
         assert!(matches!(cache.lookup(&key), CacheLookup::Fresh(_)));
     }
 
