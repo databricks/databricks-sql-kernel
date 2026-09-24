@@ -357,19 +357,6 @@ impl Session {
             build_auth_provider(&config.auth, &host, http_client.clone()).await?;
         http_client.set_auth_provider(auth_provider);
 
-        // Connector-service feature flags require workspace authentication.
-        // Resolve once at the first authenticated point and retain the
-        // immutable snapshot for this session. Individual features decide
-        // whether and how to interpret a value.
-        let feature_flags = match config.client_identity.as_ref() {
-            Some(identity) => {
-                FeatureFlagResolver::new(&host, Arc::clone(&http_client))
-                    .resolve(identity)
-                    .await
-            }
-            None => FeatureFlagValues::default(),
-        };
-
         // 3. Transport. Two-phase: SeaRestTransport needs an
         //    Arc<dyn Transport> to build the result-reader factory,
         //    which in turn needs to be set on the transport via
@@ -412,15 +399,34 @@ impl Session {
         // `disposition` (threaded onto `TransportConfig` above), not via a
         // session conf. The kernel synthesises no session_conf entries;
         // caller-supplied server-bound entries pass through unchanged.
-        let create_started = Instant::now();
-        let session_info = transport
-            .create_session(
-                defaults.catalog.as_deref(),
-                defaults.schema.as_deref(),
-                config.session_conf.clone(),
-            )
-            .await?;
-        let create_elapsed = create_started.elapsed();
+        // Feature flags require workspace authentication but no reviewed flag
+        // affects CreateSession. Resolve them alongside CreateSession so the
+        // connector-service request does not serially delay the backend
+        // connection, while still retaining one immutable snapshot before
+        // open() returns. try_join cancels resolution promptly if
+        // CreateSession fails.
+        let client_identity = config.client_identity.clone();
+        let feature_flag_resolver = FeatureFlagResolver::new(&host, Arc::clone(&http_client));
+        let create_session = async {
+            let create_started = Instant::now();
+            let session_info = transport
+                .create_session(
+                    defaults.catalog.as_deref(),
+                    defaults.schema.as_deref(),
+                    config.session_conf.clone(),
+                )
+                .await?;
+            Ok::<_, Error>((session_info, create_started.elapsed()))
+        };
+        let resolve_feature_flags = async {
+            let values = match client_identity.as_ref() {
+                Some(identity) => feature_flag_resolver.resolve(identity).await,
+                None => FeatureFlagValues::default(),
+            };
+            Ok::<_, Error>(values)
+        };
+        let ((session_info, create_elapsed), feature_flags) =
+            tokio::try_join!(create_session, resolve_feature_flags,)?;
 
         let telemetry = Arc::new(TelemetryRuntime::from_config(
             &config.telemetry,
@@ -2399,7 +2405,7 @@ mod is_open_tests {
     }
 
     #[tokio::test]
-    async fn feature_flags_are_resolved_before_create_session_and_retained() {
+    async fn feature_flags_are_resolved_during_open_and_retained() {
         // Keep this cache identity unique among session/binding tests. Mock
         // servers use ephemeral ports that the OS may reuse while the
         // process-wide feature-flag cache is still alive.
@@ -2445,17 +2451,18 @@ mod is_open_tests {
         }
 
         let requests = server.received_requests().await.unwrap_or_default();
-        let feature_flags = requests
+        let feature_flag_requests = requests
             .iter()
-            .position(|request| request.method.as_str() == "GET")
-            .expect("feature-flag request");
-        let create_session = requests
+            .filter(|request| request.method.as_str() == "GET")
+            .count();
+        let create_session_requests = requests
             .iter()
-            .position(|request| {
+            .filter(|request| {
                 request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/sessions"
             })
-            .expect("CreateSession request");
-        assert!(feature_flags < create_session);
+            .count();
+        assert_eq!(feature_flag_requests, 1, "sessions share the flag cache");
+        assert_eq!(create_session_requests, 2, "each open creates a session");
     }
 
     #[tokio::test]
