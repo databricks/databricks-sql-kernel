@@ -168,25 +168,7 @@ fn normalize_native_functions_batch(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let remarks = columns
-        .get(3)
-        .expect("function column count checked")
-        .as_any()
-        .downcast_ref::<StringArray>()
-        .ok_or_else(|| Error::data_loss().message("REMARKS is not Utf8"))?;
-    let normalized_remarks = Arc::new(StringArray::from(
-        (0..remarks.len())
-            .map(|i| {
-                if remarks.is_null(i) {
-                    ""
-                } else {
-                    remarks.value(i)
-                }
-            })
-            .collect::<Vec<_>>(),
-    )) as ArrayRef;
     columns[0] = Arc::new(StringArray::from(vec![requested_catalog; batch.num_rows()])) as ArrayRef;
-    columns[3] = normalized_remarks;
     arrow_array::RecordBatch::try_new(GET_FUNCTIONS_SCHEMA.clone(), columns).map_err(|e| {
         Error::data_loss().message(format!("invalid Thrift-native functions result: {e}"))
     })

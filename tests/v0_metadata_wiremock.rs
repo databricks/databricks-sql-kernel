@@ -396,7 +396,7 @@ async fn native_catalogs_header_and_result_bypass_show_reshape() {
 }
 
 #[tokio::test]
-async fn native_functions_preserve_null_requested_catalog() {
+async fn native_functions_preserve_null_catalog_and_remarks() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -454,7 +454,7 @@ async fn native_functions_preserve_null_requested_catalog() {
         batches[0].column(2).as_string::<i32>().value(0),
         "test_function"
     );
-    assert_eq!(batches[0].column(3).as_string::<i32>().value(0), "");
+    assert!(batches[0].column(3).is_null(0));
     assert_eq!(batches[0].column(4).data_type(), &DataType::Int16);
 }
 
