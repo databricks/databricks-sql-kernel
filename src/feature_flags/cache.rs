@@ -32,9 +32,8 @@ use tokio::sync::oneshot;
 use super::{ClientIdentity, FeatureFlagValues};
 
 const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
-const MIN_TTL: Duration = Duration::from_secs(60);
-const MAX_TTL: Duration = Duration::from_secs(60 * 60);
-const NEGATIVE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const NEGATIVE_TTL: Duration = Duration::from_secs(60);
+pub(crate) const TRANSIENT_NEGATIVE_TTL: Duration = Duration::from_secs(5);
 const MAX_IDLE_CACHE_ENTRIES: usize = 256;
 const MIN_JITTER_FACTOR: f64 = 0.9;
 const MAX_JITTER_FACTOR: f64 = 1.0;
@@ -66,6 +65,11 @@ struct CacheEntry {
     refreshing: bool,
     waiters: Vec<oneshot::Sender<Option<FeatureFlagValues>>>,
     last_access: u64,
+}
+
+enum CacheCompletion {
+    Success(FeatureFlagValues, Duration),
+    Backoff(Duration),
 }
 
 pub(crate) enum CacheLookup {
@@ -151,11 +155,7 @@ impl FeatureFlagCache {
         }
     }
 
-    fn complete_cached(
-        &self,
-        key: CacheKey,
-        result: Option<(FeatureFlagValues, Duration)>,
-    ) -> FeatureFlagValues {
+    fn complete_cached(&self, key: CacheKey, result: CacheCompletion) -> FeatureFlagValues {
         let now = Instant::now();
         let last_access = self.next_access();
         let protected_key = key.clone();
@@ -170,17 +170,17 @@ impl FeatureFlagCache {
         entry.last_access = last_access;
 
         let values = match result {
-            Some((values, ttl)) => {
+            CacheCompletion::Success(values, ttl) => {
                 entry.values = Some(values.clone());
                 entry.refresh_after = now + ttl;
                 values
             }
-            None => {
+            CacheCompletion::Backoff(ttl) => {
                 let values = entry.values.clone().unwrap_or_default();
                 entry.values = Some(values.clone());
                 // Cache cold failures and back off stale refresh failures so a
                 // connector-service outage cannot create a connection storm.
-                entry.refresh_after = now + NEGATIVE_TTL;
+                entry.refresh_after = now + ttl;
                 values
             }
         };
@@ -263,13 +263,19 @@ impl RefreshGuard {
     pub(crate) fn success(mut self, values: FeatureFlagValues, ttl: Duration) -> FeatureFlagValues {
         self.cache.complete_cached(
             self.key.take().expect("refresh guard is armed"),
-            Some((values, ttl)),
+            CacheCompletion::Success(values, ttl),
         )
     }
 
-    pub(crate) fn backoff(mut self) -> FeatureFlagValues {
-        self.cache
-            .complete_cached(self.key.take().expect("refresh guard is armed"), None)
+    pub(crate) fn backoff(self) -> FeatureFlagValues {
+        self.backoff_for(NEGATIVE_TTL)
+    }
+
+    pub(crate) fn backoff_for(mut self, ttl: Duration) -> FeatureFlagValues {
+        self.cache.complete_cached(
+            self.key.take().expect("refresh guard is armed"),
+            CacheCompletion::Backoff(ttl),
+        )
     }
 
     pub(crate) fn retry(mut self) -> FeatureFlagValues {
@@ -299,14 +305,12 @@ pub(crate) fn response_ttl(ttl_seconds: Option<i64>) -> Duration {
     let seconds = ttl_seconds
         .filter(|seconds| *seconds > 0)
         .map(|seconds| seconds as f64)
-        .unwrap_or(DEFAULT_TTL.as_secs_f64())
-        .clamp(MIN_TTL.as_secs_f64(), MAX_TTL.as_secs_f64());
-    // Within the supported TTL band, refresh no later than the server's
-    // advertised TTL. Downward-only jitter spreads callers without extending
-    // a rollout or kill-switch lifetime; the clamps still protect the endpoint
-    // from pathological sub-minute or multi-hour values.
+        .unwrap_or(DEFAULT_TTL.as_secs_f64());
+    // Refresh no later than the server's advertised TTL. Downward-only jitter
+    // spreads callers without extending a rollout or kill-switch lifetime.
+    // Missing and non-positive TTLs use the reference-driver default.
     let jitter = rand::rng().random_range(MIN_JITTER_FACTOR..=MAX_JITTER_FACTOR);
-    Duration::from_secs_f64((seconds * jitter).clamp(MIN_TTL.as_secs_f64(), MAX_TTL.as_secs_f64()))
+    Duration::from_secs_f64(seconds * jitter)
 }
 
 #[cfg(test)]
@@ -495,17 +499,17 @@ mod tests {
     }
 
     #[test]
-    fn response_ttl_defaults_clamps_and_jitters() {
-        for (supplied, upper_bound) in [
+    fn response_ttl_honors_server_values_with_downward_jitter() {
+        for (supplied, advertised) in [
             (None, DEFAULT_TTL),
             (Some(-1), DEFAULT_TTL),
-            (Some(1), MIN_TTL),
+            (Some(1), Duration::from_secs(1)),
             (Some(900), Duration::from_secs(900)),
-            (Some(86_400), MAX_TTL),
+            (Some(86_400), Duration::from_secs(86_400)),
         ] {
             let ttl = response_ttl(supplied);
-            assert!(ttl >= MIN_TTL);
-            assert!(ttl <= upper_bound);
+            assert!(ttl >= advertised.mul_f64(MIN_JITTER_FACTOR));
+            assert!(ttl <= advertised);
         }
     }
 }

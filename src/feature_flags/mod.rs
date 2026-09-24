@@ -34,7 +34,10 @@ use crate::client::DatabricksHttpClient;
 use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::warn;
 
-use cache::{global_cache, response_ttl, CacheKey, CacheLookup, FeatureFlagCache};
+use cache::{
+    global_cache, response_ttl, CacheKey, CacheLookup, FeatureFlagCache, NEGATIVE_TTL,
+    TRANSIENT_NEGATIVE_TTL,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -78,9 +81,10 @@ pub struct ClientIdentity {
 
 impl ClientIdentity {
     pub fn new(client_type: ClientType, version: impl Into<String>) -> Self {
+        let version = version.into();
         Self {
             client_type,
-            version: version.into(),
+            version: version.trim().to_owned(),
         }
     }
 
@@ -224,10 +228,10 @@ impl FeatureFlagResolver {
                     error = %error,
                     "feature-flag fetch failed; using defaults or stale values"
                 );
-                if should_backoff(&error, self.request_timeout()) {
-                    guard.backoff()
-                } else {
-                    guard.retry()
+                match failure_backoff(&error, self.request_timeout()) {
+                    Some(ttl) if ttl == NEGATIVE_TTL => guard.backoff(),
+                    Some(ttl) => guard.backoff_for(ttl),
+                    None => guard.retry(),
                 }
             }
         }
@@ -247,10 +251,16 @@ impl FeatureFlagResolver {
                         error = %error,
                         "background feature-flag refresh failed; retaining stale values"
                     );
-                    if should_backoff(&error, resolver.request_timeout()) {
-                        guard.backoff();
-                    } else {
-                        guard.retry();
+                    match failure_backoff(&error, resolver.request_timeout()) {
+                        Some(ttl) if ttl == NEGATIVE_TTL => {
+                            guard.backoff();
+                        }
+                        Some(ttl) => {
+                            guard.backoff_for(ttl);
+                        }
+                        None => {
+                            guard.retry();
+                        }
                     }
                 }
             }
@@ -298,19 +308,21 @@ impl FeatureFlagResolver {
     }
 }
 
-/// Only endpoint-wide failures receive process-wide negative backoff. Auth,
-/// network/proxy, configuration, and cancellation errors can differ between
-/// sessions sharing the same host and must not poison healthy callers. A
-/// timeout is shared only when the resolver reached its full endpoint cap;
-/// shorter caller-configured deadlines remain local to that session.
-fn should_backoff(error: &Error, request_timeout: Duration) -> bool {
+/// Endpoint failures receive the full negative-cache interval. Ambiguous
+/// transport failures (DNS, TLS, proxy, connection refusal, or a shorter
+/// caller timeout) receive a brief interval: this bounds request storms while
+/// limiting how long one session's transport problem can affect another.
+/// Auth, malformed-response, configuration, and cancellation failures remain
+/// uncached because they are caller-local.
+fn failure_backoff(error: &Error, request_timeout: Duration) -> Option<Duration> {
     match error.http_status {
-        Some(401 | 403) => false,
-        Some(_) => true,
+        Some(401 | 403) => None,
+        Some(_) => Some(NEGATIVE_TTL),
         None => match error.code {
-            ErrorCode::Timeout => request_timeout >= REQUEST_TIMEOUT,
-            ErrorCode::ResourceExhausted | ErrorCode::Unavailable => true,
-            _ => false,
+            ErrorCode::Timeout if request_timeout >= REQUEST_TIMEOUT => Some(NEGATIVE_TTL),
+            ErrorCode::Timeout | ErrorCode::NetworkError => Some(TRANSIENT_NEGATIVE_TTL),
+            ErrorCode::ResourceExhausted | ErrorCode::Unavailable => Some(NEGATIVE_TTL),
+            _ => None,
         },
     }
 }
@@ -402,7 +414,8 @@ mod tests {
 
     #[test]
     fn endpoint_uses_api_prefix_and_encodes_version_as_one_segment() {
-        let identity = ClientIdentity::new(ClientType::Go, "1.2.3/beta");
+        let identity = ClientIdentity::new(ClientType::Go, " 1.2.3/beta\t");
+        assert_eq!(identity.version(), "1.2.3/beta");
         let url = build_endpoint("https://workspace.example.com", &identity).unwrap();
 
         assert_eq!(
@@ -441,13 +454,22 @@ mod tests {
     }
 
     #[test]
-    fn shared_backoff_is_limited_to_endpoint_wide_failures() {
+    fn failure_backoff_distinguishes_endpoint_and_transport_failures() {
         let timeout = Error::timeout();
 
-        assert!(should_backoff(&timeout, REQUEST_TIMEOUT));
-        assert!(!should_backoff(&timeout, Duration::from_millis(250)));
-        assert!(!should_backoff(&Error::network_error(), REQUEST_TIMEOUT));
-        assert!(!should_backoff(&Error::data_loss(), REQUEST_TIMEOUT));
+        assert_eq!(
+            failure_backoff(&timeout, REQUEST_TIMEOUT),
+            Some(NEGATIVE_TTL)
+        );
+        assert_eq!(
+            failure_backoff(&timeout, Duration::from_millis(250)),
+            Some(TRANSIENT_NEGATIVE_TTL)
+        );
+        assert_eq!(
+            failure_backoff(&Error::network_error(), REQUEST_TIMEOUT),
+            Some(TRANSIENT_NEGATIVE_TTL)
+        );
+        assert_eq!(failure_backoff(&Error::data_loss(), REQUEST_TIMEOUT), None);
     }
 
     #[tokio::test]
@@ -485,7 +507,10 @@ mod tests {
             .err()
             .expect("delayed response should exceed the request timeout");
         assert_eq!(error.code, ErrorCode::Timeout);
-        assert!(!should_backoff(&error, resolver.request_timeout()));
+        assert_eq!(
+            failure_backoff(&error, resolver.request_timeout()),
+            Some(TRANSIENT_NEGATIVE_TTL)
+        );
     }
 
     #[tokio::test]
