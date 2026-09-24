@@ -17,6 +17,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   The kernel treats Reyder's structured logical manifest as authoritative and
   reconciles attachments that omit the canonical tags without copying child
   buffers.
+- Added typed client-side `GEOMETRY` / `GEOGRAPHY` result representation
+  selection. String mode renders the native WKB as EWKT locally; binary mode
+  retains the tagged Arrow struct. No representation setting is sent to SEA.
 
 ### Changed
 

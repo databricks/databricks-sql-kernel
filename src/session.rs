@@ -59,8 +59,9 @@ use crate::client::{
     SessionAttribution, Transport,
 };
 use crate::config::{
-    AuthConfig, ConnectionConfig, DefaultOpts, HttpConfig, LoggingConfig, ProxyConfig,
-    ResultConfig, SessionConfig, TelemetryConfig, TlsConfig, TransportMode,
+    AuthConfig, ConnectionConfig, DefaultOpts, GeospatialResultRepresentation, HttpConfig,
+    LoggingConfig, ProxyConfig, ResultConfig, SessionConfig, TelemetryConfig, TlsConfig,
+    TransportMode,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::debug;
@@ -332,6 +333,12 @@ impl Session {
         // is sent on the wire.
         apply_client_result_overrides(&mut config);
 
+        // Resolve the typed client-side representation once. It is applied
+        // locally by the reader factory and is never synthesized into
+        // `session_conf` or sent to SEA.
+        let geospatial_result_representation =
+            config.geospatial_result_representation.unwrap_or_default();
+
         let host = config.connection.host.clone();
         let warehouse_id = config.connection.warehouse_id.clone();
         let org_id = config.connection.org_id.clone();
@@ -378,6 +385,7 @@ impl Session {
             http_client.clone(),
             result_to_cloudfetch_config(&config.result),
             result_to_post_process_options(&config.result),
+            geospatial_result_representation,
             runtime_handle.clone(),
         );
         sea.set_reader_factory(reader_factory, runtime_handle.clone());
@@ -392,8 +400,8 @@ impl Session {
 
         // CloudFetch-disable is expressed per-statement via the SEA
         // `disposition` (threaded onto `TransportConfig` above), not via a
-        // session conf. The kernel synthesises no session_conf entries;
-        // caller-supplied server-bound entries pass through unchanged.
+        // session conf. The kernel synthesises no geospatial session-conf
+        // entry; caller-supplied server-bound entries pass through unchanged.
         let create_started = Instant::now();
         let session_info = transport
             .create_session(
@@ -788,6 +796,7 @@ pub struct SessionBuilder {
     telemetry: Option<TelemetryConfig>,
     driver_system_configuration: Option<DriverSystemConfiguration>,
     session_conf: HashMap<String, String>,
+    geospatial_result_representation: Option<GeospatialResultRepresentation>,
     transport: Option<TransportMode>,
     /// Sentinel for [`SessionBuilder::http_path`] parse failures.
     /// Defers the error to `open()` so the builder API stays
@@ -935,6 +944,21 @@ impl SessionBuilder {
         self
     }
 
+    /// Request the physical representation used for `GEOMETRY` and
+    /// `GEOGRAPHY` values inside Arrow result batches.
+    ///
+    /// Both choices keep the outer result format as Arrow. String mode emits
+    /// `Utf8` EWKT values; binary mode emits
+    /// `struct<srid: int32, wkb: binary>` values. The kernel normalizes the
+    /// server result locally; this setting is not forwarded to SEA.
+    pub fn geospatial_result_representation(
+        mut self,
+        representation: GeospatialResultRepresentation,
+    ) -> Self {
+        self.geospatial_result_representation = Some(representation);
+        self
+    }
+
     /// Transport override. Default = `SeaRest`. Wrappers translate
     /// user-facing flags (`UseThriftClient=0/1`, `transport=...`)
     /// into this field.
@@ -969,6 +993,7 @@ impl SessionBuilder {
             auth,
             driver_system_configuration: self.driver_system_configuration,
             session_conf: self.session_conf,
+            geospatial_result_representation: self.geospatial_result_representation,
             http: self.http.unwrap_or_default(),
             proxy: self.proxy,
             tls: self.tls.unwrap_or_default(),
@@ -1251,6 +1276,7 @@ fn result_to_post_process_options(
     crate::reader::post_processor::PostProcessOptions {
         complex_types_as_json: result.complex_types_as_json,
         intervals_as_string: result.intervals_as_string,
+        ..Default::default()
     }
 }
 
@@ -1512,6 +1538,7 @@ mod mtls_endpoint_tests {
             },
             driver_system_configuration: None,
             session_conf: Default::default(),
+            geospatial_result_representation: None,
             http: HttpConfig::default(),
             proxy: None,
             tls,
@@ -1640,6 +1667,7 @@ mod retry_config_tests {
             },
             driver_system_configuration: None,
             session_conf: Default::default(),
+            geospatial_result_representation: None,
             http,
             proxy: None,
             tls: Default::default(),

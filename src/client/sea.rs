@@ -1804,6 +1804,7 @@ mod tests {
     use crate::auth::PersonalAccessToken;
     use crate::client::retry::{build_retry_configs, RetryConfig};
     use crate::client::HttpClientConfig;
+    use crate::config::GeospatialResultRepresentation;
     use crate::reader::post_processor::PostProcessOptions;
     use crate::result_stream::{ResultBatch, ResultStream};
     use crate::types::cloudfetch::CloudFetchConfig;
@@ -1851,6 +1852,7 @@ mod tests {
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),
+            GeospatialResultRepresentation::String,
             runtime_handle.clone(),
         );
         transport.set_reader_factory(reader_factory, runtime_handle);
