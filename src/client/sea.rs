@@ -52,12 +52,8 @@ const SEA_SYNC_METADATA_HEADER: &str = "x-databricks-sea-can-run-fully-sync";
 /// DBSQL omits session versions, while server-issued FAST versions start at 1.
 const NO_SESSION_VERSION: i64 = 0;
 
-/// Identifies the Thrift metadata operation represented by a SEA SQL
-/// statement. The server uses this together with
-/// [`REQUIRE_THRIFT_NATIVE_METADATA_HEADER`] to return the canonical Thrift
-/// result schema instead of the raw SQL result schema.
+/// Identifies the metadata operation represented by a SEA SQL statement.
 const METADATA_OPERATION_HEADER: &str = "x-databricks-metadata-operation-type";
-const REQUIRE_THRIFT_NATIVE_METADATA_HEADER: &str = "x-databricks-require-thrift-native-metadata";
 
 #[derive(Debug, Clone, Copy)]
 enum MetadataOperation {
@@ -85,13 +81,6 @@ impl MetadataOperation {
             Self::Procedures => "GetProcedures",
             Self::ProcedureColumns => "GetProcedureColumns",
         }
-    }
-
-    fn supports_thrift_native(self) -> bool {
-        !matches!(
-            self,
-            Self::Functions | Self::Procedures | Self::ProcedureColumns
-        )
     }
 }
 
@@ -685,9 +674,7 @@ impl SeaRestTransport {
 
         if let Some(operation) = metadata_operation {
             builder = builder.header(METADATA_OPERATION_HEADER, operation.header_value());
-            if operation.supports_thrift_native() {
-                builder = builder.header(REQUIRE_THRIFT_NATIVE_METADATA_HEADER, "true");
-            }
+            // Native Thrift metadata requests are temporarily disabled.
         }
 
         let request = builder.json(&request_body).build().map_err(|e| {
@@ -2209,14 +2196,6 @@ mod tests {
     fn test_base_url() {
         let client = create_test_client();
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
-    }
-
-    #[test]
-    fn native_metadata_support_matches_server_contract() {
-        assert!(MetadataOperation::Columns.supports_thrift_native());
-        assert!(MetadataOperation::CrossReference.supports_thrift_native());
-        assert!(!MetadataOperation::Procedures.supports_thrift_native());
-        assert!(!MetadataOperation::ProcedureColumns.supports_thrift_native());
     }
 
     #[test]

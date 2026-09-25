@@ -33,7 +33,7 @@
 //! `primary_keys`, etc.) are also covered here.
 
 use arrow_array::cast::AsArray;
-use arrow_array::{Array, ArrayRef, Int16Array, Int32Array, Int8Array, RecordBatch, StringArray};
+use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -43,7 +43,7 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_string_contains, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -133,13 +133,6 @@ fn succeeded_inline_response_body(batch: &RecordBatch) -> String {
         },
     })
     .to_string()
-}
-
-fn native_inline_response_body(batch: &RecordBatch) -> String {
-    let mut body: serde_json::Value =
-        serde_json::from_str(&succeeded_inline_response_body(batch)).unwrap();
-    body["manifest"]["is_native_metadata_result"] = json!(true);
-    body.to_string()
 }
 
 /// SEA response body for a FAILED statement with the given SQLSTATE +
@@ -239,60 +232,6 @@ fn columns_batch(
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
 }
 
-fn native_columns_batch(ordinal_position: i32) -> RecordBatch {
-    let fields = vec![
-        Field::new("TABLE_CAT", DataType::Utf8, true),
-        Field::new("TABLE_SCHEM", DataType::Utf8, true),
-        Field::new("TABLE_NAME", DataType::Utf8, false),
-        Field::new("COLUMN_NAME", DataType::Utf8, false),
-        Field::new("DATA_TYPE", DataType::Int32, false),
-        Field::new("TYPE_NAME", DataType::Utf8, false),
-        Field::new("COLUMN_SIZE", DataType::Int32, true),
-        Field::new("BUFFER_LENGTH", DataType::Int8, true),
-        Field::new("DECIMAL_DIGITS", DataType::Int32, true),
-        Field::new("NUM_PREC_RADIX", DataType::Int32, true),
-        Field::new("NULLABLE", DataType::Int32, false),
-        Field::new("REMARKS", DataType::Utf8, true),
-        Field::new("COLUMN_DEF", DataType::Utf8, true),
-        Field::new("SQL_DATA_TYPE", DataType::Int32, true),
-        Field::new("SQL_DATETIME_SUB", DataType::Int32, true),
-        Field::new("CHAR_OCTET_LENGTH", DataType::Int32, true),
-        Field::new("ORDINAL_POSITION", DataType::Int32, true),
-        Field::new("IS_NULLABLE", DataType::Utf8, false),
-        Field::new("SCOPE_CATALOG", DataType::Utf8, true),
-        Field::new("SCOPE_SCHEMA", DataType::Utf8, true),
-        Field::new("SCOPE_TABLE", DataType::Utf8, true),
-        Field::new("SOURCE_DATA_TYPE", DataType::Int16, true),
-        Field::new("IS_AUTO_INCREMENT", DataType::Utf8, false),
-    ];
-    let columns: Vec<ArrayRef> = vec![
-        Arc::new(StringArray::from(vec![Some("main")])),
-        Arc::new(StringArray::from(vec![Some("default")])),
-        Arc::new(StringArray::from(vec![Some("t")])),
-        Arc::new(StringArray::from(vec![Some("id")])),
-        Arc::new(Int32Array::from(vec![4])),
-        Arc::new(StringArray::from(vec![Some("INT")])),
-        Arc::new(Int32Array::from(vec![Some(10)])),
-        Arc::new(Int8Array::from(vec![None])),
-        Arc::new(Int32Array::from(vec![Some(0)])),
-        Arc::new(Int32Array::from(vec![Some(10)])),
-        Arc::new(Int32Array::from(vec![1])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(Int32Array::from(vec![None])),
-        Arc::new(Int32Array::from(vec![None])),
-        Arc::new(Int32Array::from(vec![None])),
-        Arc::new(Int32Array::from(vec![ordinal_position])),
-        Arc::new(StringArray::from(vec![Some("YES")])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(StringArray::from(vec![None::<&str>])),
-        Arc::new(Int16Array::from(vec![None])),
-        Arc::new(StringArray::from(vec![Some("NO")])),
-    ];
-    RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
-}
-
 async fn drain_stream(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("next_batch") {
@@ -343,78 +282,6 @@ async fn wait_for_close_delete(
 }
 
 // ─── Thrift-shape reshape tests ─────────────────────────────────────
-
-#[tokio::test]
-async fn native_catalogs_header_and_result_bypass_show_reshape() {
-    let server = MockServer::start().await;
-    mount_create_session(&server).await;
-    mount_delete_session(&server).await;
-
-    // A native result already uses the Thrift/JDBC column name. Attempting
-    // the SHOW CATALOGS reshape would look for `catalog` and fail.
-    let native = string_batch(vec![("TABLE_CAT", vec![Some("main")])]);
-    Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/statements"))
-        .and(header(
-            "x-databricks-metadata-operation-type",
-            "GetCatalogs",
-        ))
-        .and(header(
-            "x-databricks-require-thrift-native-metadata",
-            "true",
-        ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
-        )
-        .mount(&server)
-        .await;
-
-    let session = open_session(&server).await;
-    let mut stream = session
-        .metadata()
-        .list_catalogs()
-        .await
-        .expect("native list_catalogs");
-
-    assert_eq!(col_names(&stream.schema()), vec!["TABLE_CAT"]);
-    let batches = drain_stream(&mut stream).await;
-    assert_eq!(batches[0].column(0).as_string::<i32>().value(0), "main");
-}
-
-#[tokio::test]
-async fn native_columns_zero_based_ordinal_is_one_based() {
-    let server = MockServer::start().await;
-    mount_create_session(&server).await;
-    mount_delete_session(&server).await;
-
-    let native = native_columns_batch(0);
-    Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/statements"))
-        .and(header("x-databricks-metadata-operation-type", "GetColumns"))
-        .and(header(
-            "x-databricks-require-thrift-native-metadata",
-            "true",
-        ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
-        )
-        .mount(&server)
-        .await;
-
-    let session = open_session(&server).await;
-    let mut stream = session
-        .metadata()
-        .list_columns(Some(Identifier::new("main").unwrap()), None, None, None)
-        .await
-        .expect("native list_columns");
-    let batches = drain_stream(&mut stream).await;
-    let ordinal = batches[0]
-        .column_by_name("ORDINAL_POSITION")
-        .unwrap()
-        .as_primitive::<arrow_array::types::Int32Type>();
-
-    assert_eq!(ordinal.value(0), 1);
-}
 
 #[tokio::test]
 async fn list_catalogs_returns_table_cat_column() {
