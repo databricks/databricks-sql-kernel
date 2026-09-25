@@ -1127,11 +1127,12 @@ export declare class Connection {
    */
   getPrimaryKeys(catalog: string, schema: string, table: string): Promise<Statement>
   /**
-   * Foreign-key relationships. The foreign side must be fully
-   * specified (catalog + schema + table); the parent side is
-   * optional. All identifiers are exact — no LIKE patterns.
+   * Foreign-key relationships. The parent side is optional. When the
+   * foreign table is omitted, returns an empty result without issuing a
+   * server statement. When it is provided, its catalog and schema are
+   * required. All identifiers are exact — no LIKE patterns.
    */
-  getCrossReference(parentCatalog: string | undefined | null, parentSchema: string | undefined | null, parentTable: string | undefined | null, foreignCatalog: string, foreignSchema: string, foreignTable: string): Promise<Statement>
+  getCrossReference(parentCatalog: string | undefined | null, parentSchema: string | undefined | null, parentTable: string | undefined | null, foreignCatalog: string | undefined | null, foreignSchema: string | undefined | null, foreignTable: string | undefined | null): Promise<Statement>
 }
 /**
  * Opaque executed-statement handle.
