@@ -417,6 +417,73 @@ async fn native_columns_zero_based_ordinal_is_one_based() {
 }
 
 #[tokio::test]
+async fn native_functions_header_and_result_use_public_schema() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let native = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("FUNCTION_CAT", DataType::Utf8, true),
+            Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
+            Field::new("FUNCTION_NAME", DataType::Utf8, false),
+            Field::new("REMARKS", DataType::Utf8, true),
+            Field::new("FUNCTION_TYPE", DataType::Int32, true),
+            Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![Some("main")])),
+            Arc::new(StringArray::from(vec![Some("default")])),
+            Arc::new(StringArray::from(vec![Some("answer")])),
+            Arc::new(StringArray::from(vec![Some("Returns 42")])),
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(StringArray::from(vec![Some("answer")])),
+        ],
+    )
+    .unwrap();
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(header(
+            "x-databricks-metadata-operation-type",
+            "GetFunctions",
+        ))
+        .and(header(
+            "x-databricks-require-thrift-native-metadata",
+            "true",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+        )
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .functions(None, None, None)
+        .await
+        .expect("native list_functions");
+    assert_eq!(
+        col_names(&stream.schema()),
+        vec![
+            "FUNCTION_CAT",
+            "FUNCTION_SCHEM",
+            "FUNCTION_NAME",
+            "REMARKS",
+            "FUNCTION_TYPE",
+            "SPECIFIC_NAME",
+        ]
+    );
+
+    let batches = drain_stream(&mut stream).await;
+    let function_type = batches[0]
+        .column_by_name("FUNCTION_TYPE")
+        .unwrap()
+        .as_primitive::<arrow_array::types::Int16Type>();
+    assert_eq!(function_type.value(0), 1);
+}
+
+#[tokio::test]
 async fn list_catalogs_returns_table_cat_column() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

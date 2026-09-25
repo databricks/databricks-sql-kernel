@@ -88,10 +88,7 @@ impl MetadataOperation {
     }
 
     fn supports_thrift_native(self) -> bool {
-        !matches!(
-            self,
-            Self::Functions | Self::Procedures | Self::ProcedureColumns
-        )
+        !matches!(self, Self::Procedures | Self::ProcedureColumns)
     }
 }
 
@@ -2215,6 +2212,7 @@ mod tests {
     fn native_metadata_support_matches_server_contract() {
         assert!(MetadataOperation::Columns.supports_thrift_native());
         assert!(MetadataOperation::CrossReference.supports_thrift_native());
+        assert!(MetadataOperation::Functions.supports_thrift_native());
         assert!(!MetadataOperation::Procedures.supports_thrift_native());
         assert!(!MetadataOperation::ProcedureColumns.supports_thrift_native());
     }
