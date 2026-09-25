@@ -1241,9 +1241,9 @@ impl Metadata {
     /// Functions visible to the session. Catalog is exact; schema /
     /// name are patterns.
     ///
-    /// SQL fallback shape (`SELECT ... FROM information_schema.routines`):
-    /// `routine_catalog, routine_schema, routine_name, comment,
-    /// specific_name`. Reshaped kernel-side into the JDBC `getFunctions`
+    /// SQL fallback shape (`SHOW FUNCTIONS IN CATALOG ...`):
+    /// `functionName, namespace, catalogName, remarks, functionType,
+    /// specificName`. Reshaped kernel-side into the JDBC `getFunctions`
     /// column set by [`thrift_shape::reshape_functions`]. Thrift-native
     /// results are normalized directly to that public schema.
     pub async fn functions(

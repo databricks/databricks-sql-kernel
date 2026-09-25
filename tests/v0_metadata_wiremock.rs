@@ -451,6 +451,9 @@ async fn native_functions_header_and_result_use_public_schema() {
             "x-databricks-require-thrift-native-metadata",
             "true",
         ))
+        .and(body_string_contains(
+            "SHOW FUNCTIONS IN CATALOG `hive_metastore` LIKE '*'",
+        ))
         .respond_with(
             ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
         )
