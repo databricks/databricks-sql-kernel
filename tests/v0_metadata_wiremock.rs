@@ -417,73 +417,93 @@ async fn native_columns_zero_based_ordinal_is_one_based() {
 }
 
 #[tokio::test]
-async fn native_functions_header_and_result_use_public_schema() {
-    let server = MockServer::start().await;
-    mount_create_session(&server).await;
-    mount_delete_session(&server).await;
-
-    let native = RecordBatch::try_new(
-        Arc::new(Schema::new(vec![
-            Field::new("FUNCTION_CAT", DataType::Utf8, true),
-            Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
-            Field::new("FUNCTION_NAME", DataType::Utf8, false),
-            Field::new("REMARKS", DataType::Utf8, true),
-            Field::new("FUNCTION_TYPE", DataType::Int32, true),
-            Field::new("SPECIFIC_NAME", DataType::Utf8, true),
-        ])),
-        vec![
-            Arc::new(StringArray::from(vec![Some("main")])),
-            Arc::new(StringArray::from(vec![Some("default")])),
-            Arc::new(StringArray::from(vec![Some("answer")])),
-            Arc::new(StringArray::from(vec![Some("Returns 42")])),
-            Arc::new(Int32Array::from(vec![Some(1)])),
-            Arc::new(StringArray::from(vec![Some("answer")])),
-        ],
-    )
-    .unwrap();
-    Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/statements"))
-        .and(header(
-            "x-databricks-metadata-operation-type",
-            "GetFunctions",
-        ))
-        .and(header(
-            "x-databricks-require-thrift-native-metadata",
-            "true",
-        ))
-        .and(body_string_contains(
+async fn native_functions_header_and_result_match_jdbc() {
+    for (catalog, expected_sql, expected_catalog) in [
+        (
+            None,
             "SHOW FUNCTIONS IN CATALOG `hive_metastore` LIKE '*'",
-        ))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+            None,
+        ),
+        (
+            Some("main"),
+            "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
+            Some("main"),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+
+        let native = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("FUNCTION_CAT", DataType::Utf8, true),
+                Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
+                Field::new("FUNCTION_NAME", DataType::Utf8, false),
+                Field::new("REMARKS", DataType::Utf8, true),
+                Field::new("FUNCTION_TYPE", DataType::Int32, true),
+                Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("")])),
+                Arc::new(StringArray::from(vec![Some("default")])),
+                Arc::new(StringArray::from(vec![Some("answer")])),
+                Arc::new(StringArray::from(vec![Some("Returns 42")])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("answer")])),
+            ],
         )
-        .mount(&server)
-        .await;
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(header(
+                "x-databricks-metadata-operation-type",
+                "GetFunctions",
+            ))
+            .and(header(
+                "x-databricks-require-thrift-native-metadata",
+                "true",
+            ))
+            .and(body_string_contains(expected_sql))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+            )
+            .mount(&server)
+            .await;
 
-    let session = open_session(&server).await;
-    let mut stream = session
-        .metadata()
-        .functions(None, None, None)
-        .await
-        .expect("native list_functions");
-    assert_eq!(
-        col_names(&stream.schema()),
-        vec![
-            "FUNCTION_CAT",
-            "FUNCTION_SCHEM",
-            "FUNCTION_NAME",
-            "REMARKS",
-            "FUNCTION_TYPE",
-            "SPECIFIC_NAME",
-        ]
-    );
+        let session = open_session(&server).await;
+        let catalog = catalog.map(|catalog| Identifier::new(catalog).unwrap());
+        let mut stream = session
+            .metadata()
+            .functions(catalog, None, None)
+            .await
+            .expect("native list_functions");
+        assert_eq!(
+            col_names(&stream.schema()),
+            vec![
+                "FUNCTION_CAT",
+                "FUNCTION_SCHEM",
+                "FUNCTION_NAME",
+                "REMARKS",
+                "FUNCTION_TYPE",
+                "SPECIFIC_NAME",
+            ]
+        );
 
-    let batches = drain_stream(&mut stream).await;
-    let function_type = batches[0]
-        .column_by_name("FUNCTION_TYPE")
-        .unwrap()
-        .as_primitive::<arrow_array::types::Int16Type>();
-    assert_eq!(function_type.value(0), 1);
+        let batches = drain_stream(&mut stream).await;
+        let function_catalog = batches[0]
+            .column_by_name("FUNCTION_CAT")
+            .unwrap()
+            .as_string::<i32>();
+        assert_eq!(
+            (!function_catalog.is_null(0)).then(|| function_catalog.value(0)),
+            expected_catalog
+        );
+        let function_type = batches[0]
+            .column_by_name("FUNCTION_TYPE")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int16Type>();
+        assert_eq!(function_type.value(0), 1);
+    }
 }
 
 #[tokio::test]

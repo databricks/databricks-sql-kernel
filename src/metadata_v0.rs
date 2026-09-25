@@ -195,6 +195,26 @@ fn normalize_native_metadata_batch(
     })
 }
 
+fn normalize_native_functions_batch(
+    batch: &arrow_array::RecordBatch,
+    schema: SchemaRef,
+    requested_catalog: Option<&str>,
+) -> Result<arrow_array::RecordBatch> {
+    let normalized = normalize_native_metadata_batch(batch, schema.clone())?;
+    let mut columns = normalized.columns().to_vec();
+
+    // Native GetFunctions searches the session catalog and leaves FUNCTION_CAT
+    // empty. Match JDBC by reporting the caller's original catalog, including null.
+    columns[0] = Arc::new(arrow_array::StringArray::from(vec![
+        requested_catalog;
+        normalized.num_rows()
+    ]));
+
+    arrow_array::RecordBatch::try_new(schema, columns).map_err(|e| {
+        Error::data_loss().message(format!("invalid Thrift-native GetFunctions result: {e}"))
+    })
+}
+
 async fn native_or_reshaped_stream(
     raw: ExecuteResult,
     session: &Arc<SessionInner>,
@@ -212,6 +232,32 @@ async fn native_or_reshaped_stream(
                 normalize_native_metadata_batch(batch, native_schema.clone())
             } else {
                 reshape(batch)
+            }
+        }),
+    );
+    ResultStream::from_reader_with_close(Box::new(reader), Arc::clone(session), stmt_id).await
+}
+
+async fn native_or_reshaped_functions_stream(
+    raw: ExecuteResult,
+    session: &Arc<SessionInner>,
+    requested_catalog: Option<String>,
+) -> Result<ResultStream> {
+    let stmt_id = close_id(&raw);
+    let native = is_native_metadata_result(&raw);
+    let native_schema = GET_FUNCTIONS_SCHEMA.clone();
+    let reader = ThriftReshapingReader::new(
+        raw.reader,
+        GET_FUNCTIONS_SCHEMA.clone(),
+        Box::new(move |batch| {
+            if native {
+                normalize_native_functions_batch(
+                    batch,
+                    native_schema.clone(),
+                    requested_catalog.as_deref(),
+                )
+            } else {
+                thrift_shape::reshape_functions(batch)
             }
         }),
     );
@@ -1256,6 +1302,7 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
         let telemetry_for_body = telemetry.clone();
         let result = async {
+            let requested_catalog = catalog.as_ref().map(|catalog| catalog.as_str().to_owned());
             let raw = match self
                 .session
                 .transport()
@@ -1274,13 +1321,7 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            native_or_reshaped_stream(
-                raw,
-                &self.session,
-                GET_FUNCTIONS_SCHEMA.clone(),
-                Box::new(thrift_shape::reshape_functions),
-            )
-            .await
+            native_or_reshaped_functions_stream(raw, &self.session, requested_catalog).await
         }
         .instrument(span)
         .await;

@@ -495,8 +495,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
 
     /// List functions, optionally filtered by catalog, schema pattern, and function name pattern.
     ///
-    /// Uses `information_schema.routines` filtered by `routine_type = 'FUNCTION'`.
-    /// When catalog is None, queries `system.information_schema.routines` (cross-catalog).
+    /// Uses `SHOW FUNCTIONS IN CATALOG`, which SEA can route to native `GetFunctions`.
     async fn list_functions(
         &self,
         session_id: &str,
