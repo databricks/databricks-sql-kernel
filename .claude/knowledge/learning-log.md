@@ -242,6 +242,12 @@ author, follow-up, and review runs.
 - **Context:** PR #353 wired the native-result bypass into `list_tables`/`list_columns`/`foreign_keys`/etc., but the only added wire-level (wiremock) test drove the catalogs path; the new filter helpers were only unit-tested in isolation, so a routing regression (wrong helper, dropped parent filter) in the other native paths would pass CI.
   **Rule:** Unit-testing metadata reshape/filter helpers in isolation does not cover the routing that invokes them — add a wiremock test that drives an `is_native_metadata_result: true` manifest through each native metadata path so mis-wired routing is caught.
 
+### 2026-09-25: learnings since 2026-09-24T07:31:40Z
+- **Context:** PR #364 normalized Thrift-native metadata to the public Arrow schema, casting physical types and converting `GetColumns` `ORDINAL_POSITION` from zero-based (native Thrift) to JDBC one-based (`+1`), while the SHOW fallback path is already one-based.
+  **Rule:** Native Thrift `GetColumns` ordinals are zero-based and must be `+1`'d to match JDBC one-based `ORDINAL_POSITION`, but the SHOW/reshape fallback is already one-based — when adding a native path for any metadata op, verify which ordinal convention the source uses rather than assuming.
+- **Context:** In PR #364 reviewers flagged that the shared `normalize_native_metadata_batch` helper dispatches its zero→one-based ordinal fix off the bare public field name (`field.name() == "ORDINAL_POSITION"`) and zips native columns to public fields strictly positionally, relying on the documented canonical-column-order invariant.
+  **Rule:** In shared metadata normalizers, don't key value transforms on a bare column name (multiple JDBC schemas reuse names like `ORDINAL_POSITION` with different semantics — e.g. GetColumns vs procedure-columns) and don't rely on positional column zips alone; gate transforms on the specific operation/schema and assert native field names match positions so contract drift fails loudly as DataLoss instead of silently corrupting values.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
