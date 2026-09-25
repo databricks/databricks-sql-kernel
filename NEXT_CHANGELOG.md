@@ -19,6 +19,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Made `Metadata::list_tables` table-type filtering case-sensitive to match databricks-jdbc.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here

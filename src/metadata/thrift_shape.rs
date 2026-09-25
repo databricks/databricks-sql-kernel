@@ -1022,12 +1022,7 @@ fn filter_tables_by_type(batch: &RecordBatch, types: &[&str]) -> Result<RecordBa
                 false
             } else {
                 let t = types_arr.value(i);
-                // Case-insensitive match: callers may pass `"view"` /
-                // `"Table"` (JDBC `getTables` allows any case) while the
-                // warehouse reports canonical uppercase (`TABLE` / `VIEW`
-                // / `SYSTEM_TABLE` / `METRIC_VIEW`). An exact match would
-                // silently drop all rows for a mixed-case request.
-                types.iter().any(|req| req.eq_ignore_ascii_case(t))
+                types.contains(&t)
             }
         })
         .collect();
@@ -1441,10 +1436,10 @@ mod tests {
     }
 
     #[test]
-    fn native_tables_apply_case_insensitive_catalog_and_type_filters() {
+    fn native_tables_apply_case_insensitive_catalog_and_exact_type_filters() {
         let native = reshape_tables(&server_tables_full(), Some("main"), None).unwrap();
 
-        let views = process_native_tables(&native, Some("MAIN"), Some(&["view"])).unwrap();
+        let views = process_native_tables(&native, Some("MAIN"), Some(&["VIEW"])).unwrap();
         assert_eq!(views.num_rows(), 1);
         assert_eq!(
             views
@@ -1454,6 +1449,12 @@ mod tests {
                 .unwrap()
                 .value(0),
             "v1"
+        );
+        assert_eq!(
+            process_native_tables(&native, Some("MAIN"), Some(&["view"]))
+                .unwrap()
+                .num_rows(),
+            0
         );
         assert_eq!(
             process_native_tables(&native, Some("other"), None)
@@ -1974,12 +1975,13 @@ mod tests {
     }
 
     #[test]
-    fn filter_tables_by_type_is_case_insensitive() {
-        // Warehouse reports canonical uppercase; a lowercase / mixed-case
-        // request must still match (JDBC getTables allows any case).
+    fn filter_tables_by_type_is_case_sensitive() {
         let batch = tables_with_types(&["TABLE", "VIEW", "SYSTEM_TABLE"]);
-        let out = filter_tables_by_type(&batch, &["view", "Table"]).unwrap();
-        assert_eq!(kept_types(&out), vec!["TABLE", "VIEW"]);
+        let exact = filter_tables_by_type(&batch, &["VIEW", "TABLE"]).unwrap();
+        assert_eq!(kept_types(&exact), vec!["TABLE", "VIEW"]);
+
+        let different_case = filter_tables_by_type(&batch, &["view", "Table"]).unwrap();
+        assert!(kept_types(&different_case).is_empty());
     }
 
     #[test]
