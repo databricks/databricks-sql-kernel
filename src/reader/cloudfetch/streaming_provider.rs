@@ -494,9 +494,7 @@ impl StreamingCloudFetchProvider {
         }
 
         // Drain batch buffer first
-        if let Some(batch) = self.current_batch_buffer.lock().unwrap().pop_front() {
-            // Capture schema from first batch
-            let _ = self.schema.get_or_init(|| batch.schema());
+        if let Some(batch) = self.take_buffered_batch() {
             return Ok(Some(batch));
         }
 
@@ -504,7 +502,7 @@ impl StreamingCloudFetchProvider {
         let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
 
         // Check if we've reached end of stream
-        if self.end_of_stream.load(Ordering::Acquire) && !self.chunks.contains_key(&chunk_index) {
+        if self.is_at_end(chunk_index) {
             debug!("End of stream reached at chunk {}", chunk_index);
             return Ok(None);
         }
@@ -513,32 +511,12 @@ impl StreamingCloudFetchProvider {
         self.wait_for_chunk(chunk_index).await?;
 
         // Get the chunk and move batches to buffer
-        if let Some((_, mut entry)) = self.chunks.remove(&chunk_index) {
-            if let Some(batches) = entry.batches.take() {
-                let mut buffer = self.current_batch_buffer.lock().unwrap();
-                for batch in batches {
-                    buffer.push_back(batch);
-                }
-            }
-
-            // Mark chunk as released and decrement counter
-            let new_count = self.chunks_in_memory.fetch_sub(1, Ordering::Release) - 1;
-
-            // Move to next chunk
-            let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
-            self.metrics.record_chunk_iterated();
-
-            debug!(
-                "Released chunk {}: chunks_in_memory={}/{}, consumer advancing to {}",
-                chunk_index, new_count, self.max_chunks_in_memory, next_chunk
-            );
-
+        if self.release_downloaded_chunk(chunk_index) {
             // Schedule more downloads
             self.schedule_downloads().await;
 
             // Return first batch from buffer
-            if let Some(batch) = self.current_batch_buffer.lock().unwrap().pop_front() {
-                let _ = self.schema.get_or_init(|| batch.schema());
+            if let Some(batch) = self.take_buffered_batch() {
                 return Ok(Some(batch));
             }
         }
@@ -558,6 +536,67 @@ impl StreamingCloudFetchProvider {
         Err(Error::invalid_state().message(format!("Chunk {} not found after wait", chunk_index)))
     }
 
+    /// Return the next batch if it is already downloaded, without waiting for
+    /// chunk state to change. Download and link-fetch tasks continue on the
+    /// provider runtime while this returns `Pending` to the caller.
+    pub fn try_next_batch(self: &Arc<Self>) -> Result<crate::reader::TryNextBatch> {
+        use crate::reader::TryNextBatch;
+
+        loop {
+            if self.cancel_token.is_cancelled() {
+                return Err(Error::invalid_state().message("Operation cancelled"));
+            }
+
+            if let Some(batch) = self.take_buffered_batch() {
+                return Ok(TryNextBatch::Ready(batch));
+            }
+
+            let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
+            if self.is_at_end(chunk_index) {
+                return Ok(TryNextBatch::End);
+            }
+
+            let ready = if let Some(entry) = self.chunks.get(&chunk_index) {
+                match &entry.state {
+                    ChunkState::Downloaded => true,
+                    ChunkState::DownloadFailed(error) => return Err(error.clone()),
+                    ChunkState::ProcessingFailed(error) => {
+                        return Err(Error::io().message(error.clone()))
+                    }
+                    ChunkState::Cancelled => {
+                        return Err(Error::invalid_state().message("Operation cancelled"))
+                    }
+                    _ => false,
+                }
+            } else {
+                false
+            };
+
+            if !ready {
+                if let Some(error) = self.terminal_error() {
+                    return Err(error);
+                }
+                return Ok(TryNextBatch::Pending);
+            }
+
+            // Only the single result consumer removes chunks. Once a chunk is
+            // Downloaded its entry is terminal, so the remove cannot race a
+            // downloader changing it back to an earlier state.
+            if !self.release_downloaded_chunk(chunk_index) {
+                return Ok(TryNextBatch::Pending);
+            }
+
+            // Refill the rolling window independently. The current batch is
+            // already available, so scheduling must not make this call block.
+            let provider = Arc::clone(self);
+            self.runtime_handle.spawn(async move {
+                provider.schedule_downloads().await;
+            });
+            // Loop once to return the first batch, or advance across an empty
+            // downloaded chunk to Pending/End/the following ready chunk.
+        }
+    }
+
     /// Cancel all pending operations.
     pub fn cancel(&self) {
         debug!("Cancelling CloudFetch provider");
@@ -566,6 +605,36 @@ impl StreamingCloudFetchProvider {
     }
 
     // --- Internal methods ---
+
+    fn take_buffered_batch(&self) -> Option<RecordBatch> {
+        let batch = self.current_batch_buffer.lock().unwrap().pop_front()?;
+        let _ = self.schema.get_or_init(|| batch.schema());
+        Some(batch)
+    }
+
+    fn is_at_end(&self, chunk_index: i64) -> bool {
+        self.end_of_stream.load(Ordering::Acquire) && !self.chunks.contains_key(&chunk_index)
+    }
+
+    /// Move one downloaded chunk into the consumer buffer and advance the
+    /// shared cursor. Scheduling the replacement download remains caller-owned
+    /// because the blocking path awaits it while the non-blocking path spawns it.
+    fn release_downloaded_chunk(&self, chunk_index: i64) -> bool {
+        let Some((_, mut entry)) = self.chunks.remove(&chunk_index) else {
+            return false;
+        };
+        if let Some(batches) = entry.batches.take() {
+            self.current_batch_buffer.lock().unwrap().extend(batches);
+        }
+        let new_count = self.chunks_in_memory.fetch_sub(1, Ordering::Release) - 1;
+        let next_chunk = self.current_chunk_index.fetch_add(1, Ordering::Release) + 1;
+        self.metrics.record_chunk_iterated();
+        debug!(
+            "Released chunk {}: chunks_in_memory={}/{}, consumer advancing to {}",
+            chunk_index, new_count, self.max_chunks_in_memory, next_chunk
+        );
+        true
+    }
 
     /// Record the first terminal link-fetch failure and wake every waiter.
     ///

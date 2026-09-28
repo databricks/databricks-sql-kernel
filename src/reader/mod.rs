@@ -593,12 +593,46 @@ pub trait ResultReader: Send + Sync {
     /// Get the next record batch, or None if end of results.
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
 
+    /// Return the next batch if it is already available without waiting.
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        Err(Error::invalid_state().message("reader does not support non-blocking batch reads"))
+    }
+
     /// Optional reader-level metrics accumulated below `ResultStream`.
     ///
     /// CloudFetch overrides this to surface chunk download metrics into
     /// statement telemetry. Inline/in-memory readers keep the default.
     fn metrics(&self) -> Option<ResultReaderMetrics> {
         None
+    }
+}
+
+/// Result of a non-blocking batch read.
+pub enum TryNextBatch {
+    Ready(RecordBatch),
+    Pending,
+    End,
+}
+
+impl TryNextBatch {
+    /// Convert the blocking reader representation into the non-blocking one.
+    pub(crate) fn from_option(batch: Option<RecordBatch>) -> Self {
+        match batch {
+            Some(batch) => Self::Ready(batch),
+            None => Self::End,
+        }
+    }
+
+    /// Transform a ready batch while preserving pending and end states.
+    pub(crate) fn map_ready(
+        self,
+        transform: impl FnOnce(RecordBatch) -> Result<RecordBatch>,
+    ) -> Result<Self> {
+        Ok(match self {
+            Self::Ready(batch) => Self::Ready(transform(batch)?),
+            Self::Pending => Self::Pending,
+            Self::End => Self::End,
+        })
     }
 }
 
@@ -633,6 +667,10 @@ impl ResultReader for CloudFetchResultReader {
         self.provider.next_batch().await
     }
 
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        self.provider.try_next_batch()
+    }
+
     fn metrics(&self) -> Option<ResultReaderMetrics> {
         self.provider.metrics()
     }
@@ -665,6 +703,10 @@ impl ResultReader for InlineArrowReader {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch()
     }
+
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        Ok(TryNextBatch::from_option(self.provider.next_batch()?))
+    }
 }
 
 /// Reader for multi-chunk inline-Arrow streaming.
@@ -696,6 +738,10 @@ impl ResultReader for InlineStreamingReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         self.provider.next_batch().await
+    }
+
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        self.provider.try_next_batch()
     }
 }
 
@@ -732,6 +778,10 @@ impl ResultReader for InMemoryReader {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(self.batches.next())
     }
+
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        Ok(TryNextBatch::from_option(self.batches.next()))
+    }
 }
 
 /// Empty reader for queries with no results.
@@ -757,6 +807,10 @@ impl ResultReader for EmptyReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(None)
+    }
+
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        Ok(TryNextBatch::End)
     }
 }
 

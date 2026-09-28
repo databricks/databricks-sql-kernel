@@ -163,6 +163,40 @@ struct ConsumerState {
     sticky_error: Option<Error>,
 }
 
+impl ConsumerState {
+    fn take_buffered_batch(&mut self) -> Option<RecordBatch> {
+        let current = self.current.as_ref()?;
+        if self.cursor < current.batches.len() {
+            let batch = current.batches[self.cursor].clone();
+            self.cursor += 1;
+            return Some(batch);
+        }
+        debug!(
+            "Drained inline chunk {} ({} batches)",
+            current.chunk_index,
+            current.batches.len(),
+        );
+        self.current = None;
+        self.cursor = 0;
+        None
+    }
+
+    /// Install one channel item. Returns false for clean end-of-stream.
+    fn accept_chunk(&mut self, item: Option<Result<InlineChunkEntry>>) -> Result<bool> {
+        match item {
+            Some(Ok(entry)) => {
+                self.current = Some(entry);
+                Ok(true)
+            }
+            Some(Err(error)) => {
+                self.sticky_error = Some(error.clone());
+                Err(error)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 impl InlineStreamingProvider {
     /// Build a streaming provider seeded by the first chunk's payload
     /// (which the kernel already received in the initial execute
@@ -302,20 +336,8 @@ impl InlineStreamingProvider {
             // error surfaces. Only when no more buffered data is
             // available do we consult the sticky-error slot or the
             // channel.
-            if let Some(ref current) = state.current {
-                if state.cursor < current.batches.len() {
-                    let batch = current.batches[state.cursor].clone();
-                    state.cursor += 1;
-                    return Ok(Some(batch));
-                }
-                // Current chunk fully drained; advance.
-                debug!(
-                    "Drained inline chunk {} ({} batches)",
-                    current.chunk_index,
-                    current.batches.len(),
-                );
-                state.current = None;
-                state.cursor = 0;
+            if let Some(batch) = state.take_buffered_batch() {
+                return Ok(Some(batch));
             }
 
             // Buffered chunk is drained. Sticky-error short-
@@ -327,20 +349,37 @@ impl InlineStreamingProvider {
             }
 
             // Need to recv the next chunk from the prefetch task.
-            match state.rx.recv().await {
-                Some(Ok(entry)) => {
-                    state.current = Some(entry);
-                    // Loop back to drain.
+            let item = state.rx.recv().await;
+            if !state.accept_chunk(item)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Return a buffered batch without waiting for the prefetch task.
+    pub(crate) fn try_next_batch(&self) -> Result<crate::reader::TryNextBatch> {
+        use crate::reader::TryNextBatch;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let Ok(mut state) = self.consumer.try_lock() else {
+            return Ok(TryNextBatch::Pending);
+        };
+        loop {
+            if let Some(batch) = state.take_buffered_batch() {
+                return Ok(TryNextBatch::Ready(batch));
+            }
+
+            if let Some(ref error) = state.sticky_error {
+                return Err(error.clone());
+            }
+
+            let item = state.rx.try_recv();
+            match item {
+                Ok(item) => {
+                    state.accept_chunk(Some(item))?;
                 }
-                Some(Err(e)) => {
-                    // Store sticky and surface on this call.
-                    state.sticky_error = Some(e.clone());
-                    return Err(e);
-                }
-                None => {
-                    // Channel closed: clean EOS.
-                    return Ok(None);
-                }
+                Err(TryRecvError::Empty) => return Ok(TryNextBatch::Pending),
+                Err(TryRecvError::Disconnected) => return Ok(TryNextBatch::End),
             }
         }
     }

@@ -1226,6 +1226,10 @@ impl ThriftReshapingReader {
             reshape,
         }
     }
+
+    fn reshape_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        (self.reshape)(&batch)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1236,9 +1240,15 @@ impl ResultReader for ThriftReshapingReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.upstream.next_batch().await? {
-            Some(b) => Ok(Some((self.reshape)(&b)?)),
+            Some(batch) => Ok(Some(self.reshape_batch(batch)?)),
             None => Ok(None),
         }
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        self.upstream
+            .try_next_batch()?
+            .map_ready(|batch| self.reshape_batch(batch))
     }
 }
 
