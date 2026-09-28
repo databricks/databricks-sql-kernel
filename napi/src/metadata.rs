@@ -319,9 +319,10 @@ impl Connection {
         .await
     }
 
-    /// Foreign-key relationships. The foreign side must be fully
-    /// specified (catalog + schema + table); the parent side is
-    /// optional. All identifiers are exact — no LIKE patterns.
+    /// Foreign-key relationships. The parent side is optional. When the
+    /// foreign table is omitted, returns an empty result without issuing a
+    /// server statement. When it is provided, its catalog and schema are
+    /// required. All identifiers are exact — no LIKE patterns.
     #[napi]
     #[allow(clippy::too_many_arguments)]
     pub async fn get_cross_reference(
@@ -329,9 +330,9 @@ impl Connection {
         parent_catalog: Option<String>,
         parent_schema: Option<String>,
         parent_table: Option<String>,
-        foreign_catalog: String,
-        foreign_schema: String,
-        foreign_table: String,
+        foreign_catalog: Option<String>,
+        foreign_schema: Option<String>,
+        foreign_table: Option<String>,
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
@@ -339,9 +340,9 @@ impl Connection {
                 let pc = Identifier::from_opt(&parent_catalog)?;
                 let ps = Identifier::from_opt(&parent_schema)?;
                 let pt = Identifier::from_opt(&parent_table)?;
-                let fc = Some(Identifier::new(&foreign_catalog)?);
-                let fs = Some(Identifier::new(&foreign_schema)?);
-                let ft = Some(Identifier::new(&foreign_table)?);
+                let fc = Identifier::from_opt(&foreign_catalog)?;
+                let fs = Identifier::from_opt(&foreign_schema)?;
+                let ft = Identifier::from_opt(&foreign_table)?;
                 meta.foreign_keys(pc, ps, pt, fc, fs, ft).await
             })
             .await?;
@@ -393,7 +394,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn empty_catalog_metadata_calls_return_empty_without_statement_request() {
+    async fn metadata_short_circuits_return_empty_without_statement_request() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/sessions"))
@@ -435,6 +436,17 @@ mod tests {
                 .list_columns(Some(String::new()), None, None, None)
                 .await
                 .expect("empty catalog returns empty columns"),
+            connection
+                .get_cross_reference(
+                    Some("main".to_owned()),
+                    Some("default".to_owned()),
+                    Some("parent".to_owned()),
+                    None,
+                    None,
+                    None,
+                )
+                .await
+                .expect("missing foreign table returns empty cross references"),
         ];
         for statement in statements {
             assert!(statement
@@ -455,7 +467,7 @@ mod tests {
                 })
                 .count(),
             0,
-            "empty catalog must short-circuit before statement execution"
+            "metadata short-circuits must not execute a statement"
         );
 
         connection.close().await.expect("connection closes");
