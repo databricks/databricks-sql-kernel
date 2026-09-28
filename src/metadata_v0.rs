@@ -93,6 +93,7 @@ use crate::metadata::thrift_shape::{
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
+use crate::statement::Statement;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
 use arrow_array::{Array, ArrayRef};
@@ -509,6 +510,65 @@ impl Metadata {
             Err(error) => {
                 telemetry.finalize(Some(&error));
                 Err(error)
+            }
+        }
+    }
+
+    async fn current_catalog(&self) -> Result<String> {
+        let mut statement = Statement::new(Arc::clone(&self.session));
+        statement.spec().sql("SELECT CURRENT_CATALOG()");
+        let mut executed = statement.execute().await?;
+
+        let catalog = match executed.next_batch().await {
+            Ok(Some(ResultBatch::Arrow(batch))) => {
+                if batch.num_columns() == 0 || batch.num_rows() == 0 {
+                    Err(Error::data_loss().message("CURRENT_CATALOG() returned no rows or columns"))
+                } else {
+                    let catalogs = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .ok_or_else(|| {
+                            Error::data_loss()
+                                .message("CURRENT_CATALOG() result is not a UTF-8 string")
+                        });
+                    catalogs.and_then(|catalogs| {
+                        if catalogs.is_null(0) {
+                            Err(Error::data_loss().message("CURRENT_CATALOG() returned null"))
+                        } else {
+                            Ok(catalogs.value(0).to_owned())
+                        }
+                    })
+                }
+            }
+            Ok(None) => Err(Error::data_loss().message("CURRENT_CATALOG() returned no result")),
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = executed.close().await {
+            debug!(
+                error = %error,
+                "failed to close CURRENT_CATALOG() statement"
+            );
+        }
+        catalog
+    }
+
+    async fn resolve_functions_catalog(&self) -> String {
+        match self.current_catalog().await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let fallback = self
+                    .session
+                    .default_catalog()
+                    .unwrap_or("hive_metastore")
+                    .to_owned();
+                debug!(
+                    error = %error,
+                    catalog = %fallback,
+                    "failed to resolve current catalog for list_functions; using fallback"
+                );
+                fallback
             }
         }
     }
@@ -1303,12 +1363,16 @@ impl Metadata {
         let telemetry_for_body = telemetry.clone();
         let result = async {
             let requested_catalog = catalog.as_ref().map(|catalog| catalog.as_str().to_owned());
+            let resolved_catalog = match catalog.as_ref() {
+                Some(catalog) => catalog.as_str().to_owned(),
+                None => self.resolve_functions_catalog().await,
+            };
             let raw = match self
                 .session
                 .transport()
                 .list_functions(
                     self.session.session_id(),
-                    catalog.as_ref().map(|i| i.as_str()),
+                    Some(resolved_catalog.as_str()),
                     schema_pattern.as_ref().map(|p| p.as_str()),
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
