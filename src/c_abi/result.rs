@@ -441,6 +441,14 @@ pub unsafe extern "C" fn kernel_result_stream_next_batch(
 }
 
 /// Attempt to fetch one batch without waiting for provider progress.
+///
+/// # Safety
+/// `stream` must be a live result-stream handle from a `kernel_*` call that
+/// produces one, and not previously closed; `ready`, `out_array`, and
+/// `out_schema` must be valid, writable pointers. On `Success` with
+/// `*ready == true` the Arrow outputs are transferred to the caller (an
+/// end-of-stream yields a released array); with `*ready == false` they are left
+/// untouched.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_result_stream_try_next_batch(
     stream: *mut kernel_result_stream_t,
@@ -480,8 +488,18 @@ pub unsafe extern "C" fn kernel_result_stream_try_next_batch(
                 std::ptr::write(out_schema, FFI_ArrowSchema::empty());
                 KernelStatusCode::Success
             }
-            Ok(crate::result_stream::TryNextBatch::Ready(ResultBatch::Arrow(batch))) => {
-                let struct_array: arrow_array::StructArray = batch.clone().into();
+            Ok(crate::result_stream::TryNextBatch::Ready(batch)) => {
+                #[allow(
+                    unreachable_patterns,
+                    reason = "forward-compat fallback for future #[non_exhaustive] ResultBatch variants"
+                )]
+                let arrow = match batch {
+                    ResultBatch::Arrow(batch) => batch,
+                    _ => return store_and_code(Error::not_implemented().message(
+                        "try_next_batch yielded a non-Arrow batch; the C ABI exports Arrow only",
+                    )),
+                };
+                let struct_array: arrow_array::StructArray = arrow.clone().into();
                 match arrow_array::ffi::to_ffi(&struct_array.into_data()) {
                     Ok((array, schema)) => {
                         std::ptr::write(ready, true);
@@ -766,6 +784,60 @@ mod tests {
             KernelStatusCode::Success
         );
         assert!(!ready);
+        unsafe { kernel_result_stream_close(stream) };
+    }
+
+    /// A reader that errors on fetch must surface the TYPED error on the
+    /// caller thread: `try_next_batch` returns the mapped status code AND
+    /// `kernel_get_last_error` reports the structured fields (code / message /
+    /// retryable). This pins the `Err(error) => store_and_code(error)` branch —
+    /// a regression that dropped the error (falling through with no
+    /// `kernel_get_last_error` detail) or lost the typed fields would pass CI
+    /// otherwise.
+    #[test]
+    fn try_next_batch_surfaces_typed_error_on_caller_thread() {
+        use crate::reader::test_utils::ErrorReader;
+        use crate::result_stream::ResultStream;
+
+        let schema: SchemaRef =
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let result_stream = rt.block_on(async {
+            ResultStream::from_reader(Box::new(ErrorReader {
+                schema: schema.clone(),
+            }))
+            .await
+            .unwrap()
+        });
+        let stream = into_raw_result_stream(schema, result_stream);
+
+        let mut ready = true;
+        let mut arr = FFI_ArrowArray::empty();
+        let mut sch = FFI_ArrowSchema::empty();
+        // `Error::io()` maps to `ErrorCode::Internal` -> `KernelStatusCode::Internal`.
+        let rc =
+            unsafe { kernel_result_stream_try_next_batch(stream, &mut ready, &mut arr, &mut sch) };
+        assert_eq!(rc, KernelStatusCode::Internal);
+        assert!(!ready, "a failing fetch must not report a ready batch");
+        assert!(arr.is_released(), "no array should be handed out on error");
+
+        // The typed error must be retrievable on THIS (caller) thread.
+        let mut err = std::mem::MaybeUninit::<crate::c_abi::error::KernelError>::uninit();
+        let present = unsafe { crate::c_abi::error::kernel_get_last_error(err.as_mut_ptr()) };
+        assert!(
+            present,
+            "a typed error must be recorded after a failed fetch"
+        );
+        let err = unsafe { err.assume_init() };
+        assert_eq!(err.code, KernelStatusCode::Internal as i32);
+        let msg = unsafe { std::ffi::CStr::from_ptr(err.message) }
+            .to_str()
+            .unwrap();
+        assert!(
+            msg.contains("simulated read error"),
+            "message should round-trip the reader's error, got: {msg}"
+        );
+
         unsafe { kernel_result_stream_close(stream) };
     }
 

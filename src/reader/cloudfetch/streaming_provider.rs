@@ -2451,6 +2451,214 @@ mod tests {
         }
     }
 
+    /// Build a downloader that is never exercised by the non-blocking
+    /// consumer-path tests below (they seed chunk state directly and set
+    /// `end_of_stream`, so the spawned `schedule_downloads` refill exits
+    /// without issuing an RPC). Points at an unroutable URL and disables
+    /// retries so any accidental download fails fast rather than hanging.
+    fn unused_downloader() -> Arc<ChunkDownloader> {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        Arc::new(ChunkDownloader::new(
+            http_client,
+            CompressionCodec::None,
+            0.1,
+        ))
+    }
+
+    /// `try_next_batch` must return `Pending` (without blocking) while the
+    /// head chunk is not yet `Downloaded`, then `Ready` once it flips, and
+    /// finally `End` after the last chunk is consumed. This exercises the
+    /// non-blocking chunk-state machine that diverges from `next_batch`.
+    #[tokio::test]
+    async fn try_next_batch_pending_then_ready_then_end() {
+        use crate::reader::TryNextBatch;
+
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        // Chunk 0 present but still downloading — not ready to yield.
+        chunks.insert(
+            0,
+            entry_with_state(create_test_link(0), ChunkState::Downloading),
+        );
+        let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
+        let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+            fetcher,
+            unused_downloader(),
+            Arc::clone(&chunks),
+            /* end_of_stream = */ true,
+        );
+        // One chunk resident: `release_downloaded_chunk` decrements this.
+        provider.chunks_in_memory.store(1, Ordering::Release);
+
+        // Not downloaded yet → Pending, and it must NOT block.
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::Pending),
+            "a not-yet-Downloaded head chunk must report Pending"
+        );
+
+        // Flip the chunk to Downloaded with real batches, as a download
+        // task would.
+        {
+            let mut entry = chunks.get_mut(&0).unwrap();
+            entry.state = ChunkState::Downloaded;
+            entry.batches = Some(vec![make_batch(&[1, 2, 3])]);
+        }
+
+        match provider.try_next_batch().unwrap() {
+            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 3),
+            _ => panic!("expected Ready after chunk flipped to Downloaded"),
+        }
+
+        // Head chunk consumed; end_of_stream + no more chunks → End.
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::End),
+            "after the only chunk is drained the stream must report End"
+        );
+    }
+
+    /// A `Downloaded` chunk that decoded to zero batches must be skipped
+    /// (the cursor advancing past it) so the caller sees the *next*
+    /// chunk's data — not a spurious `Pending`/`End`. Guards the
+    /// empty-downloaded-chunk skip in the non-blocking loop.
+    #[tokio::test]
+    async fn try_next_batch_skips_empty_downloaded_chunk() {
+        use crate::reader::TryNextBatch;
+
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        // Chunk 0: Downloaded but empty (legal on paginated results).
+        chunks.insert(
+            0,
+            ChunkEntry {
+                link: Some(create_test_link(0)),
+                state: ChunkState::Downloaded,
+                batches: Some(vec![]),
+                last_failure_reason: None,
+            },
+        );
+        // Chunk 1: Downloaded with real data.
+        chunks.insert(
+            1,
+            ChunkEntry {
+                link: Some(create_test_link(1)),
+                state: ChunkState::Downloaded,
+                batches: Some(vec![make_batch(&[7, 8])]),
+                last_failure_reason: None,
+            },
+        );
+        let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(2));
+        let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+            fetcher,
+            unused_downloader(),
+            Arc::clone(&chunks),
+            /* end_of_stream = */ true,
+        );
+        provider.chunks_in_memory.store(2, Ordering::Release);
+
+        // The empty chunk 0 must not stall the stream: the loop advances
+        // past it and yields chunk 1's batch in a single call.
+        match provider.try_next_batch().unwrap() {
+            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 2),
+            _ => panic!("empty chunk must be skipped to reach chunk 1"),
+        }
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::End),
+            "both chunks consumed → End"
+        );
+    }
+
+    /// A terminal per-chunk failure at the head must surface as `Err`
+    /// (not `Pending`/`End`) so the non-blocking caller sees the real
+    /// cause deterministically. `DownloadFailed` carries a typed error
+    /// that must be returned verbatim; `ProcessingFailed` carries a
+    /// message that is re-wrapped as `Error::io()`.
+    #[tokio::test]
+    async fn try_next_batch_surfaces_terminal_chunk_errors() {
+        use crate::kernel_error::ErrorCode;
+
+        // DownloadFailed → the carried typed error is returned as-is,
+        // preserving its classification and retryable flag.
+        {
+            let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+            let download_err = Error::network_error().message("chunk 0 download blew up");
+            assert_eq!(download_err.code, ErrorCode::NetworkError);
+            chunks.insert(
+                0,
+                entry_with_state(
+                    create_test_link(0),
+                    ChunkState::DownloadFailed(download_err),
+                ),
+            );
+            let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                fetcher,
+                unused_downloader(),
+                Arc::clone(&chunks),
+                /* end_of_stream = */ true,
+            );
+
+            let err = match provider.try_next_batch() {
+                Err(err) => err,
+                Ok(_) => panic!("a DownloadFailed head chunk must surface an error"),
+            };
+            assert_eq!(
+                err.code,
+                ErrorCode::NetworkError,
+                "DownloadFailed must return its carried error verbatim, got: {err}"
+            );
+            assert!(
+                err.message.contains("chunk 0 download blew up"),
+                "the original download error message must be preserved: {err}"
+            );
+        }
+
+        // ProcessingFailed → the carried message is re-wrapped as an
+        // I/O error (ErrorCode::Internal).
+        {
+            let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+            chunks.insert(
+                0,
+                entry_with_state(
+                    create_test_link(0),
+                    ChunkState::ProcessingFailed("arrow decode failed".to_string()),
+                ),
+            );
+            let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                fetcher,
+                unused_downloader(),
+                Arc::clone(&chunks),
+                /* end_of_stream = */ true,
+            );
+
+            let err = match provider.try_next_batch() {
+                Err(err) => err,
+                Ok(_) => panic!("a ProcessingFailed head chunk must surface an error"),
+            };
+            assert_eq!(
+                err.code,
+                ErrorCode::Internal,
+                "ProcessingFailed must be re-wrapped as an I/O error, got: {err}"
+            );
+            assert!(
+                err.message.contains("arrow decode failed"),
+                "the original processing error message must be preserved: {err}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn refresh_batch_updates_link_for_urlfetched_chunks() {
         // Chunks 0-2 all expired, all in UrlFetched state. One
