@@ -81,6 +81,7 @@ pub enum ResultBatch {
 }
 
 /// Outcome of a non-blocking result-stream read.
+#[non_exhaustive]
 pub enum TryNextBatch<'a> {
     Ready(&'a ResultBatch),
     Pending,
