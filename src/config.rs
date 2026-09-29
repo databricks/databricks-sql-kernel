@@ -1134,10 +1134,12 @@ pub struct ResultConfig {
     pub inline_max_chunks_in_memory: usize,
 
     /// When `true`, every column of complex type (`List` /
-    /// `LargeList` / `FixedSizeList` / `Map` / `Struct`, plus the
-    /// precise types `VARIANT` / `GEOMETRY` / `GEOGRAPHY` carried in
-    /// field metadata) is replaced with a `Utf8` column holding
-    /// compact JSON text per row.
+    /// `LargeList` / `FixedSizeList` / `Map` / `Struct`, plus the precise type
+    /// `VARIANT` carried in field metadata) is replaced with a `Utf8` column
+    /// holding compact JSON text per row. Top-level `GEOMETRY` / `GEOGRAPHY`
+    /// columns instead follow [`SessionConfig::geospatial_result_representation`];
+    /// geo leaves nested inside a complex column are normalized before that
+    /// outer column is rendered as JSON.
     ///
     /// The JSON format matches what the Databricks server emits on
     /// the Thrift wire when `complexTypesAsArrow=false` (compact —
@@ -1484,6 +1486,38 @@ pub enum TransportMode {
     SeaRest,
 }
 
+// ─── Client-side result representation ─────────────────────────────────────
+
+/// Client-facing representation for geospatial values inside Arrow result
+/// batches.
+///
+/// The outer result format remains Arrow in both modes:
+///
+/// - [`String`](Self::String) returns Arrow `Utf8` values containing EWKT.
+/// - [`Binary`](Self::Binary) returns
+///   `struct<srid: int32 not null, wkb: binary not null>` values.
+///
+/// This is a client-side result setting and is never sent to SEA. Reyden
+/// returns `struct<srid,wkb>` values, and Reyder's structured manifest carries
+/// their logical `GEOMETRY(...)` / `GEOGRAPHY(...)` types. The manifest is the
+/// source of truth when an attachment omits the canonical tags. The kernel
+/// reconciles the two, then exposes tagged binary values or recursively renders
+/// EWKT strings. Legacy SEA paths that already return `Utf8` EWKT satisfy
+/// string mode directly; requesting binary mode on such a path returns an
+/// error because the original WKB cannot be recovered losslessly. Empty and
+/// non-empty results use the same client-facing schema.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum GeospatialResultRepresentation {
+    /// Arrow `Utf8` containing EWKT. This is the kernel default.
+    #[default]
+    String,
+    /// Arrow `struct<srid: int32, wkb: binary>` containing little-endian OGC
+    /// WKB. The SRID is carried by the sibling `srid` value, not by EWKB.
+    /// Requires the native Reyden Arrow result path.
+    Binary,
+}
+
 // ─── Assembled SessionConfig ────────────────────────────────────────────────
 
 /// The fully-assembled session configuration consumed by `Session::open`
@@ -1530,6 +1564,13 @@ pub struct SessionConfig {
     /// pre-validate — its posture is "trust the user's session_conf" —
     /// so non-canonical values flow to the server as-is.
     pub session_conf: HashMap<String, String>,
+
+    /// Optional typed override for the physical representation of
+    /// `GEOMETRY` / `GEOGRAPHY` values in Arrow results.
+    ///
+    /// `None` uses [`GeospatialResultRepresentation::String`]. The
+    /// choice is applied locally and is not forwarded to SEA.
+    pub geospatial_result_representation: Option<GeospatialResultRepresentation>,
 
     pub http: HttpConfig,
     pub proxy: Option<ProxyConfig>,

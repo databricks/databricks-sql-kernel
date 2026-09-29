@@ -28,7 +28,8 @@
 //! production backoff ladder before their final error is observable.
 
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, HttpConfig, ResultConfig, Session,
+    AuthConfig, ConnectionConfig, ErrorCode, GeospatialResultRepresentation, HttpConfig,
+    ResultConfig, Session,
 };
 use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -469,6 +470,141 @@ async fn create_session_forwards_user_supplied_session_conf_unchanged() {
     assert_eq!(
         obj.get("unknown.MixedCase").and_then(|v| v.as_str()),
         Some("value")
+    );
+}
+
+async fn open_session_with_geospatial_config(
+    server: &MockServer,
+    representation: Option<GeospatialResultRepresentation>,
+    session_conf: std::collections::HashMap<String, String>,
+) -> Session {
+    let mut builder = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                .expect("valid http_path"),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .session_conf(session_conf);
+    if let Some(representation) = representation {
+        builder = builder.geospatial_result_representation(representation);
+    }
+    builder.open().await.expect("session must open")
+}
+
+async fn mount_geospatial_session(server: &MockServer, session_id: &str) {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/sessions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "session_id": session_id,
+            "warehouse_id": "test_wh",
+        })))
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
+#[tokio::test]
+async fn create_session_keeps_geospatial_string_mode_client_side() {
+    let server = MockServer::start().await;
+    mount_geospatial_session(&server, "sess-geo-string").await;
+
+    let session = open_session_with_geospatial_config(
+        &server,
+        Some(GeospatialResultRepresentation::String),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(session.session_id(), "sess-geo-string");
+
+    let body = create_session_body(&server).await;
+    assert!(body
+        .pointer("/session_confs/geospatial_as_string")
+        .is_none());
+}
+
+#[tokio::test]
+async fn create_session_keeps_geospatial_binary_mode_client_side() {
+    let server = MockServer::start().await;
+    mount_geospatial_session(&server, "sess-geo-binary").await;
+
+    let session = open_session_with_geospatial_config(
+        &server,
+        Some(GeospatialResultRepresentation::Binary),
+        Default::default(),
+    )
+    .await;
+    assert_eq!(session.session_id(), "sess-geo-binary");
+
+    let body = create_session_body(&server).await;
+    assert!(body
+        .pointer("/session_confs/geospatial_as_string")
+        .is_none());
+}
+
+#[tokio::test]
+async fn create_session_omits_geospatial_conf_when_unset() {
+    let server = MockServer::start().await;
+    mount_geospatial_session(&server, "sess-geo-default").await;
+
+    let session = open_session_with_geospatial_config(&server, None, Default::default()).await;
+    assert_eq!(session.session_id(), "sess-geo-default");
+
+    let body = create_session_body(&server).await;
+    let has_geospatial_conf = body
+        .get("session_confs")
+        .and_then(|value| value.as_object())
+        .is_some_and(|confs| {
+            confs
+                .keys()
+                .any(|key| key.eq_ignore_ascii_case("geospatial_as_string"))
+        });
+    assert!(
+        !has_geospatial_conf,
+        "unset mode must not synthesize a geospatial server conf"
+    );
+}
+
+#[tokio::test]
+async fn typed_geospatial_config_does_not_reinterpret_raw_session_conf() {
+    let server = MockServer::start().await;
+    mount_geospatial_session(&server, "sess-geo-pass-through").await;
+
+    let session_conf = std::collections::HashMap::from([
+        ("GEOSPATIAL_AS_STRING".to_string(), "true".to_string()),
+        ("Geospatial_As_String".to_string(), "false".to_string()),
+        ("ansi_mode".to_string(), "true".to_string()),
+    ]);
+    let session = open_session_with_geospatial_config(
+        &server,
+        Some(GeospatialResultRepresentation::Binary),
+        session_conf,
+    )
+    .await;
+    assert_eq!(session.session_id(), "sess-geo-pass-through");
+
+    let body = create_session_body(&server).await;
+    let confs = body
+        .get("session_confs")
+        .and_then(|value| value.as_object())
+        .expect("session_confs object");
+    assert_eq!(
+        confs
+            .get("GEOSPATIAL_AS_STRING")
+            .and_then(|value| value.as_str()),
+        Some("true")
+    );
+    assert_eq!(
+        confs
+            .get("Geospatial_As_String")
+            .and_then(|value| value.as_str()),
+        Some("false")
+    );
+    assert_eq!(
+        confs.get("ansi_mode").and_then(|value| value.as_str()),
+        Some("true")
     );
 }
 

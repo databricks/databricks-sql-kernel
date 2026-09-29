@@ -15,6 +15,7 @@ by the struct it lives on. `ConnectionConfig` and `AuthConfig` are
 | [`ProxyConfig`](#proxyconfig--httphttps-proxy-optional) | HTTP/HTTPS proxy |
 | [`TlsConfig`](#tlsconfig--tls--ssl-optional) | cert validation, custom CA, mTLS |
 | [`ResultConfig`](#resultconfig--result-handling-optional) | CloudFetch tuning, type rendering |
+| [`geospatial_result_representation`](#geospatial_result_representation--geospatial-result-encoding-optional) | GEOMETRY / GEOGRAPHY result encoding |
 | [`LoggingConfig`](#loggingconfig--logging-optional) | log filter / file |
 | [`transport`](#transport--wire-protocol-optional) | wire protocol |
 | [`session_conf`](#session_conf--server-side-session-configuration-optional) | server-side SQL / Spark config |
@@ -173,8 +174,44 @@ Setting only one of `client_cert_pem` / `client_key_pem` is rejected at
 | `cloudfetch_link_prefetch_window` | Number of presigned URLs to prefetch ahead of the consumer. | `10` |
 | `cloudfetch_max_chunks_in_memory` | Max decompressed CloudFetch chunks held in memory at once (bounds download parallelism and peak RSS). | `16` |
 | `inline_max_chunks_in_memory` | Prefetch window for the inline-Arrow path (used when CloudFetch is disabled). `1` disables prefetching. | `4` |
-| `complex_types_as_json` | Render complex columns (`ARRAY` / `MAP` / `STRUCT` / `VARIANT` / `GEOMETRY` / `GEOGRAPHY`) as compact JSON strings instead of native Arrow nested types. | `false` |
+| `complex_types_as_json` | Render complex columns (`ARRAY` / `MAP` / `STRUCT` / `VARIANT`) as compact JSON strings instead of native Arrow nested types. Top-level geo columns use `geospatial_result_representation`; nested geo leaves are normalized before the enclosing value is rendered as JSON. | `false` |
 | `intervals_as_string` | Render `INTERVAL` / `DURATION` columns as canonical Databricks text (e.g. `"Y-M"`, `"D HH:MM:SS.nnnnnnnnn"`) instead of native Arrow interval types. | `false` |
+
+## `geospatial_result_representation` — geospatial result encoding (optional)
+
+Set with `SessionBuilder::geospatial_result_representation(...)`. Both modes
+keep the outer result format as Arrow; this setting only selects the physical
+Arrow representation of `GEOMETRY` and `GEOGRAPHY` values.
+
+| Value | Arrow representation |
+|-------|----------------------|
+| `GeospatialResultRepresentation::String` | Arrow `Utf8` containing EWKT (the default). |
+| `GeospatialResultRepresentation::Binary` | Arrow `struct<srid: int32 not null, wkb: binary not null>` containing the SRID and little-endian OGC WKB. The WKB itself is not EWKB. |
+
+Reyden returns every geo value as that native struct. The physical attachment
+can omit the canonical Arrow tags, while Reyder's structured manifest reports
+the logical `GEOMETRY(...)` or `GEOGRAPHY(...)` type and is the source of
+truth. The kernel reconciles the attachment with that logical schema: binary
+mode attaches `geometry=true` or `geography=true` and the type-level `srid`
+(`-1` for `ANY`) to the `wkb` field, and string mode recursively converts the
+WKB to EWKT. Every row's sibling `srid` carries the actual value. Nested values
+in arrays, maps, and structs and null outer structs are preserved.
+
+On legacy SEA paths that already return geospatial columns as Arrow `Utf8`,
+string mode preserves those values. Binary mode requires Reyden's native
+`struct<srid,wkb>` attachment and returns an error when only text is available;
+the kernel does not parse server-rendered text back into WKB.
+
+This is entirely client-side and is never forwarded to SEA. Set it through
+the typed kernel or binding API. A `geospatial_as_string` entry placed
+directly in `session_conf` is not interpreted by the kernel and is forwarded
+unchanged; SEA/Reyden does not define that server configuration.
+
+The structured manifest type text is authoritative for identifying geo leaves;
+the attachment supplies the physical values. The same post-processing step
+produces the requested client-facing schema for non-empty and empty results.
+Manifest field metadata preserves the logical type and SRID text under
+`databricks.type_name` and `databricks.type_text`.
 
 ## `LoggingConfig` — logging (optional)
 

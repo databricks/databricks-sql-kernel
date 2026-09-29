@@ -12,21 +12,30 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Reconciliation of Reyden GEOMETRY / GEOGRAPHY Arrow results.
+//! Local rendering of Reyden GEOMETRY / GEOGRAPHY Arrow results.
 //!
 //! Reyden encodes each value as
 //! `struct<srid:int32 not null,wkb:binary not null>`. Reyder's structured
 //! manifest retains the logical `GEOMETRY(...)` / `GEOGRAPHY(...)` type and is
 //! the source of truth for interpreting result attachments. An attachment can
-//! contain the same struct without the canonical Arrow tags, so this module
-//! reconstructs them from the logical schema without copying child buffers.
+//! contain the same struct without the canonical Arrow tags. This module uses
+//! the logical schema to reconstruct the tags in binary mode without copying
+//! child buffers, or to recursively render each declared geo value as EWKT in
+//! string mode.
 
+use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
+use arrow_array::builder::StringBuilder;
 use arrow_array::{
-    Array, ArrayRef, FixedSizeListArray, LargeListArray, LargeListViewArray, ListArray,
-    ListViewArray, MapArray, StructArray,
+    Array, ArrayRef, BinaryArray, FixedSizeListArray, Int32Array, LargeListArray,
+    LargeListViewArray, ListArray, ListViewArray, MapArray, StructArray,
 };
 use arrow_schema::{DataType, Field, FieldRef, Fields};
+use geo_traits::{
+    CoordTrait, Dimensions, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
+    MultiLineStringTrait, MultiPointTrait, MultiPolygonTrait, PointTrait, PolygonTrait,
+};
+use std::fmt::Write as _;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -47,9 +56,9 @@ impl GeoFamily {
 /// Schema decision for a top-level result column.
 #[derive(Debug)]
 pub(super) struct GeoPlan {
-    /// Type after attaching canonical geo metadata recursively.
+    /// Type after applying the requested geo representation recursively.
     pub(super) output_type: DataType,
-    /// Whether the values need local tag attachment.
+    /// Whether the values need either local tag attachment or EWKT rendering.
     pub(super) needs_rewrite: bool,
     /// Whether the column itself is a logical geo value. This distinguishes a
     /// native geo struct from an ordinary complex column for JSON rendering.
@@ -76,10 +85,15 @@ struct TypePlan {
 /// `struct<srid,wkb>` is geospatial. A plain user struct remains a struct unless
 /// the logical schema declares it geo. Canonical attachment tags are used as a
 /// fallback only when no logical field is available.
-pub(super) fn plan(field: &Field, logical_field: Option<&Field>) -> Result<Option<GeoPlan>> {
+pub(super) fn plan(
+    field: &Field,
+    logical_field: Option<&Field>,
+    target: GeospatialResultRepresentation,
+) -> Result<Option<GeoPlan>> {
     let type_plan = plan_data_type(
         field.data_type(),
         logical_field.map(Field::data_type),
+        target,
         field.name(),
     )?;
     if !type_plan.contains_geo {
@@ -94,8 +108,9 @@ pub(super) fn plan(field: &Field, logical_field: Option<&Field>) -> Result<Optio
 
 /// Recursively reconcile geo leaves in `array` with `output_type`.
 ///
-/// Only container array objects whose field metadata must be tagged are
-/// rebuilt; value buffers and child arrays remain shared.
+/// Binary mode rebuilds only container array objects whose field metadata must
+/// be tagged; value buffers and child arrays remain shared. String mode renders
+/// each declared geo leaf to a new UTF-8 array.
 pub(super) fn rewrite(
     array: &ArrayRef,
     output_type: &DataType,
@@ -104,26 +119,42 @@ pub(super) fn rewrite(
     rewrite_array(array, output_type, column_name)
 }
 
-fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -> Result<TypePlan> {
+fn plan_data_type(
+    physical: &DataType,
+    logical: Option<&DataType>,
+    target: GeospatialResultRepresentation,
+    path: &str,
+) -> Result<TypePlan> {
     let logical_tag = logical.map(native_geo_tag).transpose()?.flatten();
     let physical_tag = native_geo_tag(physical)?;
 
     if let Some(expected) = logical_tag {
-        // DBR/legacy SEA paths serialize geo values as text even though the
-        // structured manifest still declares GEOMETRY / GEOGRAPHY. Preserve
-        // that already-public representation. Native Reyden is identified by
-        // its `struct<srid,wkb>` attachment and is reconciled below.
+        // DBR/legacy SEA paths can already serialize geo values as EWKT even
+        // though the structured manifest declares GEOMETRY / GEOGRAPHY. That
+        // satisfies string mode without another conversion. Binary mode must
+        // fail explicitly: an EWKT attachment cannot be losslessly turned back
+        // into Reyden's canonical `struct<srid,wkb>` representation here.
         if matches!(physical, DataType::Utf8 | DataType::LargeUtf8) {
+            if target == GeospatialResultRepresentation::Binary {
+                return Err(Error::not_implemented().message(format!(
+                    "binary geospatial result representation is unavailable for '{path}': the server returned {physical:?}"
+                )));
+            }
             return Ok(TypePlan {
                 output_type: physical.clone(),
-                contains_geo: false,
-                is_root_geo: false,
+                contains_geo: true,
+                is_root_geo: true,
             });
         }
         validate_geo_source(physical, expected, path)?;
-        // The logical schema is canonical and contains the family and
-        // type-level SRID tags that can be missing from the payload.
-        let output_type = logical.expect("logical_tag implies a logical type").clone();
+        let output_type = match target {
+            GeospatialResultRepresentation::String => DataType::Utf8,
+            GeospatialResultRepresentation::Binary => {
+                // The logical schema is canonical and contains the family and
+                // type-level SRID tags that can be missing from the payload.
+                logical.expect("logical_tag implies a logical type").clone()
+            }
+        };
         return Ok(TypePlan {
             output_type,
             contains_geo: true,
@@ -139,8 +170,12 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 actual.srid,
             )));
         }
+        let output_type = match target {
+            GeospatialResultRepresentation::String => DataType::Utf8,
+            GeospatialResultRepresentation::Binary => physical.clone(),
+        };
         return Ok(TypePlan {
-            output_type: physical.clone(),
+            output_type,
             contains_geo: true,
             is_root_geo: true,
         });
@@ -169,6 +204,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 let child = plan_data_type(
                     field.data_type(),
                     logical_field.map(|field| field.data_type()),
+                    target,
                     &child_path,
                 )?;
                 contains_geo |= child.contains_geo;
@@ -190,6 +226,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 DataType::List(field) => Some(field.as_ref()),
                 _ => None,
             }),
+            target,
             path,
             DataType::List,
             logical,
@@ -200,6 +237,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 DataType::LargeList(field) => Some(field.as_ref()),
                 _ => None,
             }),
+            target,
             path,
             DataType::LargeList,
             logical,
@@ -210,6 +248,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 DataType::ListView(field) => Some(field.as_ref()),
                 _ => None,
             }),
+            target,
             path,
             DataType::ListView,
             logical,
@@ -220,6 +259,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
                 DataType::LargeListView(field) => Some(field.as_ref()),
                 _ => None,
             }),
+            target,
             path,
             DataType::LargeListView,
             logical,
@@ -234,6 +274,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
             plan_nested_field(
                 field,
                 logical_field,
+                target,
                 path,
                 |field| DataType::FixedSizeList(field, *size),
                 logical,
@@ -249,6 +290,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
             plan_nested_field(
                 field,
                 logical_field,
+                target,
                 path,
                 |field| DataType::Map(field, *ordered),
                 logical,
@@ -275,6 +317,7 @@ fn plan_data_type(physical: &DataType, logical: Option<&DataType>, path: &str) -
 fn plan_nested_field(
     physical_field: &FieldRef,
     logical_field: Option<&Field>,
+    target: GeospatialResultRepresentation,
     path: &str,
     constructor: impl FnOnce(FieldRef) -> DataType,
     logical_container: Option<&DataType>,
@@ -287,6 +330,7 @@ fn plan_nested_field(
     let child = plan_data_type(
         physical_field.data_type(),
         logical_field.map(Field::data_type),
+        target,
         path,
     )?;
     let output_field = if &child.output_type == physical_field.data_type() {
@@ -347,7 +391,7 @@ fn contains_tagged_geo(data_type: &DataType) -> Result<bool> {
 
 fn unsupported_container<T>(data_type: &DataType) -> Result<T> {
     Err(Error::not_implemented().message(format!(
-        "geospatial metadata reconciliation is not implemented for Arrow container {data_type:?}"
+        "geospatial EWKT conversion is not implemented for Arrow container {data_type:?}"
     )))
 }
 
@@ -430,6 +474,10 @@ fn native_geo_tag(data_type: &DataType) -> Result<Option<GeoTag>> {
     }))
 }
 
+fn native_geo_family(data_type: &DataType) -> Result<Option<GeoFamily>> {
+    Ok(native_geo_tag(data_type)?.map(|tag| tag.family))
+}
+
 fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result<ArrayRef> {
     if let Some(output_tag) = native_geo_tag(output_type)? {
         validate_geo_source(array.data_type(), output_tag, path)?;
@@ -447,6 +495,16 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         )
         .map_err(|error| rebuild_error(path, error))?;
         return Ok(Arc::new(output));
+    }
+
+    if output_type == &DataType::Utf8 && is_geo_struct_shape(array.data_type()) {
+        return native_to_ewkt(array, path);
+    }
+
+    if native_geo_family(array.data_type())?.is_some() {
+        return Err(Error::internal().message(format!(
+            "geospatial rewrite for '{path}' planned unexpected output type {output_type:?}"
+        )));
     }
 
     match (array.data_type(), output_type) {
@@ -567,6 +625,340 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
     }
 }
 
+fn native_to_ewkt(array: &ArrayRef, path: &str) -> Result<ArrayRef> {
+    let values = downcast::<StructArray>(array, path, "StructArray")?;
+    let srids = values
+        .column_by_name("srid")
+        .and_then(|array| array.as_any().downcast_ref::<Int32Array>())
+        .ok_or_else(|| malformed_native(path, "missing Int32 child 'srid'"))?;
+    let wkbs = values
+        .column_by_name("wkb")
+        .and_then(|array| array.as_any().downcast_ref::<BinaryArray>())
+        .ok_or_else(|| malformed_native(path, "missing Binary child 'wkb'"))?;
+
+    let mut output = StringBuilder::with_capacity(values.len(), values.len() * 32);
+    for row in 0..values.len() {
+        if values.is_null(row) {
+            output.append_null();
+            continue;
+        }
+        if srids.is_null(row) || wkbs.is_null(row) {
+            return Err(malformed_native(
+                path,
+                &format!("row {row} has a null child under a non-null struct"),
+            ));
+        }
+
+        let geometry = wkb::reader::read_wkb(wkbs.value(row)).map_err(|error| {
+            Error::data_loss().message(format!(
+                "geospatial value '{path}' row {row} contains invalid WKB: {error}"
+            ))
+        })?;
+        let mut ewkt = String::new();
+        let srid = srids.value(row);
+        if srid != 0 {
+            write!(&mut ewkt, "SRID={srid};").expect("writing to String is infallible");
+        }
+        write_ogc_wkt(&mut ewkt, &geometry).map_err(|error| {
+            Error::data_loss().message(format!(
+                "geospatial value '{path}' row {row} could not be rendered as WKT: {error}"
+            ))
+        })?;
+        output.append_value(ewkt);
+    }
+    Ok(Arc::new(output.finish()) as ArrayRef)
+}
+
+/// Error from rendering an already-validated WKB geometry as OGC WKT.
+///
+/// WKB only contains the seven Simple Features geometry families handled
+/// below. The additional `geo_traits` variants are rejected explicitly so a
+/// future parser change cannot silently emit a non-OGC representation.
+#[derive(Debug)]
+enum WktRenderError {
+    UnsupportedDimension(Dimensions),
+    CoordinateDimension {
+        geometry: Dimensions,
+        coordinate: Dimensions,
+    },
+    MissingCoordinate(usize),
+    UnsupportedGeometry(&'static str),
+}
+
+impl std::fmt::Display for WktRenderError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedDimension(dimension) => {
+                write!(formatter, "unsupported coordinate dimension {dimension:?}")
+            }
+            Self::CoordinateDimension {
+                geometry,
+                coordinate,
+            } => write!(
+                formatter,
+                "coordinate dimension {coordinate:?} does not match geometry dimension {geometry:?}"
+            ),
+            Self::MissingCoordinate(index) => {
+                write!(formatter, "coordinate is missing ordinate {index}")
+            }
+            Self::UnsupportedGeometry(kind) => {
+                write!(formatter, "unsupported non-WKB geometry kind {kind}")
+            }
+        }
+    }
+}
+
+type WktRenderResult = std::result::Result<(), WktRenderError>;
+
+/// Render the OGC/ISO WKB geometry as WKT without allocating an intermediate
+/// geometry tree.
+///
+/// The `wkt` crate's generic writer currently assumes that members of multi
+/// geometries are never empty. Databricks permits values such as
+/// `MULTIPOINT(EMPTY,(1 2))` and `MULTIPOLYGON(EMPTY,...)`, so walking the
+/// `geo_traits` view directly is both allocation-free and preserves those
+/// valid values instead of panicking.
+fn write_ogc_wkt(output: &mut String, geometry: &impl GeometryTrait<T = f64>) -> WktRenderResult {
+    match geometry.as_type() {
+        GeometryType::Point(point) => write_point(output, point),
+        GeometryType::LineString(line) => write_line_string(output, line),
+        GeometryType::Polygon(polygon) => write_polygon(output, polygon),
+        GeometryType::MultiPoint(points) => write_multi_point(output, points),
+        GeometryType::MultiLineString(lines) => write_multi_line_string(output, lines),
+        GeometryType::MultiPolygon(polygons) => write_multi_polygon(output, polygons),
+        GeometryType::GeometryCollection(collection) => {
+            write_geometry_collection(output, collection)
+        }
+        GeometryType::Rect(_) => Err(WktRenderError::UnsupportedGeometry("RECT")),
+        GeometryType::Triangle(_) => Err(WktRenderError::UnsupportedGeometry("TRIANGLE")),
+        GeometryType::Line(_) => Err(WktRenderError::UnsupportedGeometry("LINE")),
+    }
+}
+
+fn write_point(output: &mut String, point: &impl PointTrait<T = f64>) -> WktRenderResult {
+    let dimension = point.dim();
+    write_type_name(output, "POINT", dimension)?;
+    match point.coord() {
+        Some(coordinate) => {
+            write_body_start(output, dimension);
+            write_coordinate(output, &coordinate, dimension)?;
+            output.push(')');
+        }
+        None => output.push_str(" EMPTY"),
+    }
+    Ok(())
+}
+
+fn write_line_string(output: &mut String, line: &impl LineStringTrait<T = f64>) -> WktRenderResult {
+    let dimension = line.dim();
+    write_type_name(output, "LINESTRING", dimension)?;
+    if line.num_coords() == 0 {
+        output.push_str(" EMPTY");
+    } else {
+        write_body_start(output, dimension);
+        write_coordinates(output, line, dimension)?;
+        output.push(')');
+    }
+    Ok(())
+}
+
+fn write_polygon(output: &mut String, polygon: &impl PolygonTrait<T = f64>) -> WktRenderResult {
+    let dimension = polygon.dim();
+    write_type_name(output, "POLYGON", dimension)?;
+    match polygon.exterior() {
+        Some(exterior) if exterior.num_coords() != 0 => {
+            write_body_start(output, dimension);
+            write_polygon_body(output, &exterior, polygon.interiors(), dimension)?;
+            output.push(')');
+        }
+        _ => output.push_str(" EMPTY"),
+    }
+    Ok(())
+}
+
+fn write_multi_point(
+    output: &mut String,
+    points: &impl MultiPointTrait<T = f64>,
+) -> WktRenderResult {
+    let dimension = points.dim();
+    write_type_name(output, "MULTIPOINT", dimension)?;
+    if points.num_points() == 0 {
+        output.push_str(" EMPTY");
+        return Ok(());
+    }
+
+    write_body_start(output, dimension);
+    for (index, point) in points.points().enumerate() {
+        write_separator(output, index);
+        if let Some(coordinate) = point.coord() {
+            output.push('(');
+            write_coordinate(output, &coordinate, dimension)?;
+            output.push(')');
+        } else {
+            output.push_str("EMPTY");
+        }
+    }
+    output.push(')');
+    Ok(())
+}
+
+fn write_multi_line_string(
+    output: &mut String,
+    lines: &impl MultiLineStringTrait<T = f64>,
+) -> WktRenderResult {
+    let dimension = lines.dim();
+    write_type_name(output, "MULTILINESTRING", dimension)?;
+    if lines.num_line_strings() == 0 {
+        output.push_str(" EMPTY");
+        return Ok(());
+    }
+
+    write_body_start(output, dimension);
+    for (index, line) in lines.line_strings().enumerate() {
+        write_separator(output, index);
+        if line.num_coords() == 0 {
+            output.push_str("EMPTY");
+        } else {
+            output.push('(');
+            write_coordinates(output, &line, dimension)?;
+            output.push(')');
+        }
+    }
+    output.push(')');
+    Ok(())
+}
+
+fn write_multi_polygon(
+    output: &mut String,
+    polygons: &impl MultiPolygonTrait<T = f64>,
+) -> WktRenderResult {
+    let dimension = polygons.dim();
+    write_type_name(output, "MULTIPOLYGON", dimension)?;
+    if polygons.num_polygons() == 0 {
+        output.push_str(" EMPTY");
+        return Ok(());
+    }
+
+    write_body_start(output, dimension);
+    for (index, polygon) in polygons.polygons().enumerate() {
+        write_separator(output, index);
+        match polygon.exterior() {
+            Some(exterior) if exterior.num_coords() != 0 => {
+                output.push('(');
+                write_polygon_body(output, &exterior, polygon.interiors(), dimension)?;
+                output.push(')');
+            }
+            _ => output.push_str("EMPTY"),
+        }
+    }
+    output.push(')');
+    Ok(())
+}
+
+fn write_geometry_collection(
+    output: &mut String,
+    collection: &impl GeometryCollectionTrait<T = f64>,
+) -> WktRenderResult {
+    let dimension = collection.dim();
+    write_type_name(output, "GEOMETRYCOLLECTION", dimension)?;
+    if collection.num_geometries() == 0 {
+        output.push_str(" EMPTY");
+        return Ok(());
+    }
+
+    write_body_start(output, dimension);
+    for (index, geometry) in collection.geometries().enumerate() {
+        write_separator(output, index);
+        write_ogc_wkt(output, &geometry)?;
+    }
+    output.push(')');
+    Ok(())
+}
+
+fn write_polygon_body<R, I>(
+    output: &mut String,
+    exterior: &R,
+    interiors: I,
+    dimension: Dimensions,
+) -> WktRenderResult
+where
+    R: LineStringTrait<T = f64>,
+    I: Iterator<Item = R>,
+{
+    output.push('(');
+    write_coordinates(output, exterior, dimension)?;
+    output.push(')');
+    for interior in interiors {
+        output.push_str(",(");
+        write_coordinates(output, &interior, dimension)?;
+        output.push(')');
+    }
+    Ok(())
+}
+
+fn write_coordinates(
+    output: &mut String,
+    line: &impl LineStringTrait<T = f64>,
+    dimension: Dimensions,
+) -> WktRenderResult {
+    for (index, coordinate) in line.coords().enumerate() {
+        write_separator(output, index);
+        write_coordinate(output, &coordinate, dimension)?;
+    }
+    Ok(())
+}
+
+fn write_coordinate(
+    output: &mut String,
+    coordinate: &impl CoordTrait<T = f64>,
+    dimension: Dimensions,
+) -> WktRenderResult {
+    if coordinate.dim().size() != dimension.size() {
+        return Err(WktRenderError::CoordinateDimension {
+            geometry: dimension,
+            coordinate: coordinate.dim(),
+        });
+    }
+    for index in 0..dimension.size() {
+        if index != 0 {
+            output.push(' ');
+        }
+        let ordinate = coordinate
+            .nth(index)
+            .ok_or(WktRenderError::MissingCoordinate(index))?;
+        write!(output, "{ordinate}").expect("writing to String is infallible");
+    }
+    Ok(())
+}
+
+fn write_type_name(output: &mut String, type_name: &str, dimension: Dimensions) -> WktRenderResult {
+    output.push_str(type_name);
+    match dimension {
+        Dimensions::Xy | Dimensions::Unknown(2) => {}
+        Dimensions::Xyz | Dimensions::Unknown(3) => output.push_str(" Z"),
+        Dimensions::Xym => output.push_str(" M"),
+        Dimensions::Xyzm | Dimensions::Unknown(4) => output.push_str(" ZM"),
+        unsupported => return Err(WktRenderError::UnsupportedDimension(unsupported)),
+    }
+    Ok(())
+}
+
+fn write_body_start(output: &mut String, dimension: Dimensions) {
+    if matches!(dimension, Dimensions::Xy | Dimensions::Unknown(2)) {
+        output.push('(');
+    } else {
+        // Databricks' canonical higher-dimensional spelling includes a
+        // space between the Z/M qualifier and the coordinate body.
+        output.push_str(" (");
+    }
+}
+
+fn write_separator(output: &mut String, index: usize) {
+    if index != 0 {
+        output.push(',');
+    }
+}
+
 fn downcast<'a, T: 'static>(array: &'a ArrayRef, path: &str, expected: &str) -> Result<&'a T> {
     array.as_any().downcast_ref::<T>().ok_or_else(|| {
         Error::data_loss().message(format!(
@@ -576,9 +968,15 @@ fn downcast<'a, T: 'static>(array: &'a ArrayRef, path: &str, expected: &str) -> 
     })
 }
 
+fn malformed_native(path: &str, detail: &str) -> Error {
+    Error::data_loss().message(format!(
+        "geospatial value '{path}' has malformed native Arrow data: {detail}"
+    ))
+}
+
 fn rebuild_error(path: &str, error: arrow_schema::ArrowError) -> Error {
     Error::data_loss().message(format!(
-        "failed to rebuild Arrow container '{path}' after geospatial reconciliation: {error}"
+        "failed to rebuild Arrow container '{path}' after geospatial conversion: {error}"
     ))
 }
 
@@ -586,7 +984,7 @@ fn rebuild_error(path: &str, error: arrow_schema::ArrowError) -> Error {
 mod tests {
     use super::*;
     use arrow_array::builder::{BinaryBuilder, Int32Builder};
-    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
+    use arrow_buffer::NullBuffer;
     use std::collections::HashMap;
 
     const POINT_1_2_WKB: &[u8] = &[
@@ -638,23 +1036,27 @@ mod tests {
         ))
     }
 
+    fn wkt_from_hex(value: &str) -> String {
+        let bytes = hex::decode(value).unwrap();
+        let geometry = wkb::reader::read_wkb(&bytes).unwrap();
+        let mut output = String::new();
+        write_ogc_wkt(&mut output, &geometry).unwrap();
+        output
+    }
+
     #[test]
     fn recognizes_only_canonical_tagged_structs() {
         assert_eq!(
-            native_geo_tag(&geo_type(GeoFamily::Geometry, -1))
-                .unwrap()
-                .map(|tag| tag.family),
+            native_geo_family(&geo_type(GeoFamily::Geometry, -1)).unwrap(),
             Some(GeoFamily::Geometry)
         );
         assert_eq!(
-            native_geo_tag(&geo_type(GeoFamily::Geography, 4326))
-                .unwrap()
-                .map(|tag| tag.family),
+            native_geo_family(&geo_type(GeoFamily::Geography, 4326)).unwrap(),
             Some(GeoFamily::Geography)
         );
 
         let plain = plain_geo_type();
-        assert_eq!(native_geo_tag(&plain).unwrap(), None);
+        assert_eq!(native_geo_family(&plain).unwrap(), None);
     }
 
     #[test]
@@ -662,31 +1064,95 @@ mod tests {
         let physical = Field::new("g", plain_geo_type(), true);
         let logical = Field::new("g", geo_type(GeoFamily::Geometry, -1), true);
 
-        let binary = plan(&physical, Some(&logical)).unwrap().unwrap();
+        let binary = plan(
+            &physical,
+            Some(&logical),
+            GeospatialResultRepresentation::Binary,
+        )
+        .unwrap()
+        .unwrap();
         assert!(binary.needs_rewrite);
         assert_eq!(binary.output_type, logical.data_type().clone());
 
         let already_tagged = Field::new("g", geo_type(GeoFamily::Geometry, -1), true);
-        let binary = plan(&already_tagged, Some(&logical)).unwrap().unwrap();
+        let binary = plan(
+            &already_tagged,
+            Some(&logical),
+            GeospatialResultRepresentation::Binary,
+        )
+        .unwrap()
+        .unwrap();
         assert!(!binary.needs_rewrite);
         assert_eq!(binary.output_type, logical.data_type().clone());
 
-        let fallback = plan(&already_tagged, None).unwrap().unwrap();
+        let fallback = plan(
+            &already_tagged,
+            None,
+            GeospatialResultRepresentation::Binary,
+        )
+        .unwrap()
+        .unwrap();
         assert!(!fallback.needs_rewrite);
         assert_eq!(fallback.output_type, already_tagged.data_type().clone());
 
+        let string = plan(
+            &physical,
+            Some(&logical),
+            GeospatialResultRepresentation::String,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(string.output_type, DataType::Utf8);
+
         let wrong_family = Field::new("g", geo_type(GeoFamily::Geography, -1), true);
-        let error = plan(&wrong_family, Some(&logical)).unwrap_err();
+        let error = plan(
+            &wrong_family,
+            Some(&logical),
+            GeospatialResultRepresentation::Binary,
+        )
+        .unwrap_err();
         assert!(error.message.contains("tagged GEOGRAPHY"));
 
         let logical_plain = Field::new("g", plain_geo_type(), true);
-        let error = plan(&already_tagged, Some(&logical_plain)).unwrap_err();
+        let error = plan(
+            &already_tagged,
+            Some(&logical_plain),
+            GeospatialResultRepresentation::Binary,
+        )
+        .unwrap_err();
         assert!(error.message.contains("logical manifest type"));
 
-        let bad_shape = Field::new("g", DataType::Utf8, true);
-        assert!(plan(&bad_shape, Some(&logical)).unwrap().is_none());
+        for text_type in [DataType::Utf8, DataType::LargeUtf8] {
+            let text = Field::new("g", text_type.clone(), true);
+            let string = plan(
+                &text,
+                Some(&logical),
+                GeospatialResultRepresentation::String,
+            )
+            .unwrap()
+            .unwrap();
+            assert!(!string.needs_rewrite);
+            assert_eq!(string.output_type, text_type);
 
-        assert!(plan(&physical, None).unwrap().is_none());
+            let error = plan(
+                &text,
+                Some(&logical),
+                GeospatialResultRepresentation::Binary,
+            )
+            .unwrap_err();
+            assert!(
+                error
+                    .message
+                    .contains(&format!("server returned {text_type:?}")),
+                "{error:?}"
+            );
+        }
+
+        assert!(
+            plan(&physical, None, GeospatialResultRepresentation::String)
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -716,49 +1182,81 @@ mod tests {
     }
 
     #[test]
-    fn nested_geo_rewrite_attaches_tags_and_preserves_buffers_and_nulls() {
-        let tagged = geo_array(GeoFamily::Geometry, -1, 4326);
-        let tagged = tagged.as_any().downcast_ref::<StructArray>().unwrap();
-        let DataType::Struct(plain_fields) = plain_geo_type() else {
+    fn native_geometry_converts_to_ewkt_and_preserves_outer_null() {
+        let array = geo_array(GeoFamily::Geometry, -1, 4326);
+        let output = rewrite(&array, &DataType::Utf8, "g").unwrap();
+        let output = output
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(output.value(0), "SRID=4326;POINT(1 2)");
+        assert!(output.is_null(1));
+    }
+
+    #[test]
+    fn srid_zero_uses_plain_wkt() {
+        let array = geo_array(GeoFamily::Geometry, 0, 0);
+        let output = rewrite(&array, &DataType::Utf8, "g").unwrap();
+        let output = output
+            .as_any()
+            .downcast_ref::<arrow_array::StringArray>()
+            .unwrap();
+        assert_eq!(output.value(0), "POINT(1 2)");
+    }
+
+    #[test]
+    fn invalid_wkb_is_reported_as_data_loss() {
+        let DataType::Struct(fields) = geo_type(GeoFamily::Geometry, 0) else {
             unreachable!()
         };
-        let plain_values: ArrayRef = Arc::new(StructArray::new(
-            plain_fields,
-            tagged.columns().to_vec(),
-            tagged.nulls().cloned(),
-        ));
-        let list = ListArray::new(
-            Arc::new(Field::new("item", plain_geo_type(), true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
-            plain_values,
+        let array: ArrayRef = Arc::new(StructArray::new(
+            fields,
+            vec![
+                Arc::new(Int32Array::from(vec![0])),
+                Arc::new(BinaryArray::from(vec![&b"not-wkb"[..]])),
+            ],
             None,
-        );
-        let physical = Field::new("values", list.data_type().clone(), true);
-        let logical_type = DataType::List(Arc::new(Field::new(
-            "item",
-            geo_type(GeoFamily::Geometry, -1),
-            true,
-        )));
-        let logical = Field::new("values", logical_type, true);
+        ));
 
-        let plan = plan(&physical, Some(&logical)).unwrap().unwrap();
-        assert!(plan.needs_rewrite);
-        let output = rewrite(&(Arc::new(list) as ArrayRef), &plan.output_type, "values").unwrap();
-        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
-        let values = output
-            .values()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        let DataType::Struct(fields) = values.data_type() else {
-            panic!("nested geometry must remain a struct")
-        };
-        assert_eq!(
-            fields[1].metadata().get("geometry").map(String::as_str),
-            Some("true")
-        );
-        assert!(Arc::ptr_eq(values.column(0), tagged.column(0)));
-        assert!(Arc::ptr_eq(values.column(1), tagged.column(1)));
-        assert!(values.is_null(1));
+        let error = rewrite(&array, &DataType::Utf8, "g").unwrap_err();
+        assert!(error.message.contains("contains invalid WKB"));
+    }
+
+    #[test]
+    fn wkb_renderer_handles_dimensions_collections_and_empty_members() {
+        let cases = [
+            (
+                "0101000000000000000000f87f000000000000f87f",
+                "POINT EMPTY",
+            ),
+            (
+                "01b90b0000000000000000f03f000000000000004000000000000008400000000000001040",
+                "POINT ZM (1 2 3 4)",
+            ),
+            (
+                "010100000050fc1873d79a5ec0d0d556ec2fe34240",
+                "POINT(-122.4194 37.7749)",
+            ),
+            (
+                "0104000000040000000101000000000000000000f03f00000000000000400101000000000000000000f87f000000000000f87f0101000000000000000000f87f000000000000f87f010100000000000000000008400000000000001040",
+                "MULTIPOINT((1 2),EMPTY,EMPTY,(3 4))",
+            ),
+            (
+                "010500000003000000010200000000000000010200000002000000000000000000f03f000000000000004000000000000008400000000000001040010200000000000000",
+                "MULTILINESTRING(EMPTY,(1 2,3 4),EMPTY)",
+            ),
+            (
+                "010600000001000000010300000000000000",
+                "MULTIPOLYGON(EMPTY)",
+            ),
+            (
+                "0107000000020000000101000000000000000000f03f0000000000000040010200000000000000",
+                "GEOMETRYCOLLECTION(POINT(1 2),LINESTRING EMPTY)",
+            ),
+        ];
+
+        for (wkb, expected) in cases {
+            assert_eq!(wkt_from_hex(wkb), expected);
+        }
     }
 }

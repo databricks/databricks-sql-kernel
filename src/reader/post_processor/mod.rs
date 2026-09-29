@@ -36,6 +36,7 @@
 mod geospatial;
 mod json;
 
+use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
 use crate::reader::{ResultReader, ResultReaderAdapter, ResultReaderMetrics};
 use crate::types::sea::ResultManifest;
@@ -65,6 +66,11 @@ pub(crate) struct PostProcessOptions {
     /// Python; non-Python consumers can leave it `false` if they
     /// have a working interval decoder.
     pub intervals_as_string: bool,
+    /// Client-facing physical representation for logical GEOMETRY and
+    /// GEOGRAPHY columns. The structured logical manifest schema is reconciled
+    /// with the physical `struct<srid,wkb>` attachment, then exposed with
+    /// canonical tags or recursively rendered as EWKT.
+    pub geospatial_result_representation: GeospatialResultRepresentation,
 }
 
 /// Wrapper that runs all per-batch post-processing the kernel does
@@ -118,9 +124,10 @@ impl ResultPostProcessor {
         };
 
         // 2. Compute the normalized schema and the set of per-column
-        //    rewrites. Geo metadata reconciliation runs first because a geo
-        //    leaf may be nested inside a complex column that is subsequently
-        //    rendered as JSON.
+        //    rewrites. Geo normalization runs first because a geo leaf may be
+        //    nested inside a complex column that is subsequently rendered as
+        //    JSON. Binary geo mode may rebuild array containers to attach
+        //    metadata, but it reuses the existing child/value buffers.
         let mut json_columns: Vec<usize> = Vec::new();
         let mut interval_columns: Vec<usize> = Vec::new();
         let mut null_columns: Vec<usize> = Vec::new();
@@ -133,7 +140,11 @@ impl ResultPostProcessor {
                 .as_ref()
                 .and_then(|schema| schema.fields().get(i))
                 .map(|field| field.as_ref());
-            let geo_plan = geospatial::plan(field, logical_field)?;
+            let geo_plan = geospatial::plan(
+                field,
+                logical_field,
+                options.geospatial_result_representation,
+            )?;
             let (normalized_field, is_top_level_geo) = match geo_plan {
                 Some(plan) => {
                     if plan.needs_rewrite {
@@ -439,8 +450,8 @@ mod tests {
     use arrow_array::builder::{
         BinaryBuilder, Int32Builder, ListBuilder, MapBuilder, StringBuilder,
     };
-    use arrow_array::{Array, Int32Array, StringArray, StructArray};
-    use arrow_buffer::NullBuffer;
+    use arrow_array::{Array, Int32Array, ListArray, MapArray, StringArray, StructArray};
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::Fields;
 
     fn make_manifest(columns: Vec<ColumnInfo>) -> ResultManifest {
@@ -867,7 +878,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn geospatial_results_attach_tags_and_reuse_child_arrays() {
+    async fn geospatial_string_mode_converts_geometry_geography_any_and_nulls() {
+        let geometry = untagged_geo_values(&[Some(3857), None]);
+        let geography = untagged_geo_values(&[Some(4326), None]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", geometry.data_type().clone(), true),
+            Field::new("col_1", geography.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(schema, vec![geometry, geography]).unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![
+            column_info("geom", "GEOMETRY", "GEOMETRY(ANY)", 0),
+            column_info("geog", "GEOGRAPHY", "GEOGRAPHY(4326)", 1),
+        ]);
+
+        let mut pp =
+            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
+                .await
+                .unwrap();
+        assert_eq!(
+            pp.schema().await.unwrap().field(0).data_type(),
+            &DataType::Utf8
+        );
+        assert_eq!(
+            pp.schema().await.unwrap().field(1).data_type(),
+            &DataType::Utf8
+        );
+
+        let out = pp.next_batch().await.unwrap().unwrap();
+        let geometry = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let geography = out
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert_eq!(geometry.value(0), "SRID=3857;POINT(1 2)");
+        assert_eq!(geography.value(0), "SRID=4326;POINT(1 2)");
+        assert!(geometry.is_null(1));
+        assert!(geography.is_null(1));
+        assert_eq!(
+            out.schema()
+                .field(0)
+                .metadata()
+                .get(metadata_keys::TYPE_TEXT)
+                .map(String::as_str),
+            Some("GEOMETRY(ANY)")
+        );
+    }
+
+    #[tokio::test]
+    async fn geospatial_binary_mode_attaches_tags_and_reuses_child_arrays() {
         let geometry = untagged_geo_values(&[Some(4326)]);
         let original = geometry
             .as_any()
@@ -883,10 +947,14 @@ mod tests {
         let batch = RecordBatch::try_new(schema, vec![geometry]).unwrap();
         let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
         let manifest = make_manifest(vec![column_info("geom", "GEOMETRY", "GEOMETRY(ANY)", 0)]);
-        let mut pp =
-            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
-                .await
-                .unwrap();
+        let options = PostProcessOptions {
+            geospatial_result_representation: GeospatialResultRepresentation::Binary,
+            ..Default::default()
+        };
+
+        let mut pp = ResultPostProcessor::new(inner, Some(&manifest), options)
+            .await
+            .unwrap();
         let out = pp.next_batch().await.unwrap().unwrap();
         let values = out
             .column(0)
@@ -907,5 +975,79 @@ mod tests {
             fields[1].metadata().get("srid").map(String::as_str),
             Some("-1")
         );
+    }
+
+    #[tokio::test]
+    async fn nested_geo_is_converted_before_complex_json() {
+        let list_values = untagged_geo_values(&[Some(4326), None]);
+        let list_item = Arc::new(Field::new("item", list_values.data_type().clone(), true));
+        let list = ListArray::new(
+            list_item,
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2])),
+            list_values,
+            None,
+        );
+
+        let struct_values = untagged_geo_values(&[Some(0)]);
+        let struct_fields = Fields::from(vec![Field::new(
+            "g",
+            struct_values.data_type().clone(),
+            true,
+        )]);
+        let struct_array = StructArray::new(struct_fields, vec![struct_values], None);
+
+        let map_values = untagged_geo_values(&[Some(4326)]);
+        let entry_fields = Fields::from(vec![
+            Field::new("key", DataType::Utf8, false),
+            Field::new("value", map_values.data_type().clone(), true),
+        ]);
+        let entries = StructArray::new(
+            entry_fields.clone(),
+            vec![Arc::new(StringArray::from(vec!["k"])), map_values],
+            None,
+        );
+        let map = MapArray::new(
+            Arc::new(Field::new("entries", DataType::Struct(entry_fields), false)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1])),
+            entries,
+            None,
+            false,
+        );
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", list.data_type().clone(), true),
+            Field::new("col_1", struct_array.data_type().clone(), true),
+            Field::new("col_2", map.data_type().clone(), true),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![Arc::new(list), Arc::new(struct_array), Arc::new(map)],
+        )
+        .unwrap();
+        let inner: Box<dyn ResultReader + Send> = Box::new(MockReader::new(vec![batch]));
+        let manifest = make_manifest(vec![
+            column_info("arr", "ARRAY", "ARRAY<GEOMETRY(ANY)>", 0),
+            column_info("s", "STRUCT", "STRUCT<g:GEOMETRY(0)>", 1),
+            column_info("m", "MAP", "MAP<STRING,GEOGRAPHY(4326)>", 2),
+        ]);
+        let options = PostProcessOptions {
+            complex_types_as_json: true,
+            ..Default::default()
+        };
+
+        let mut pp = ResultPostProcessor::new(inner, Some(&manifest), options)
+            .await
+            .unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
+        let value = |index| {
+            out.column(index)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .value(0)
+        };
+        assert_eq!(value(0), "[\"SRID=4326;POINT(1 2)\",null]");
+        assert_eq!(value(1), "{\"g\":\"POINT(1 2)\"}");
+        assert_eq!(value(2), "{\"k\":\"SRID=4326;POINT(1 2)\"}");
     }
 }

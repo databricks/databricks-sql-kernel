@@ -67,6 +67,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 base64 = "0.22"
 hex = "0.4"          # Hex encoding (binary param literals, token cache key)
+wkb = "0.9.2"       # OGC WKB parser for geospatial result rendering
+geo-traits = "0.3"  # Generic geometry traversal for WKB-to-EWKT rendering
 
 # Date/time handling
 chrono = { version = "0.4", features = ["serde"] }

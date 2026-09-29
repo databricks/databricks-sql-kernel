@@ -23,6 +23,7 @@
 //!
 //! When adding a new type, update **both** mapping functions.
 
+use crate::config::GeospatialResultRepresentation;
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, TimeUnit};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -110,6 +111,11 @@ pub(crate) const JDBC_ARRAY: i16 = 2003;
 /// Unrecognised input falls back to `DataType::Utf8` rather than
 /// panicking; the kernel always returns *some* schema even when the
 /// type is unknown.
+///
+/// `GEOMETRY` / `GEOGRAPHY` also default to `DataType::Utf8`: this public
+/// mapping describes the string representation exposed by default, whose
+/// values are rendered locally as EWKT. The result reader uses the internal
+/// representation-aware mapper below when it needs the tagged binary schema.
 pub fn databricks_type_to_arrow(type_text: &str) -> DataType {
     databricks_type_to_arrow_with_interval(type_text, None)
 }
@@ -125,11 +131,34 @@ pub fn databricks_type_to_arrow(type_text: &str) -> DataType {
 /// the parser falls back to the `type_text` itself, which for
 /// real SEA columns is `"INTERVAL YEAR TO MONTH"` /
 /// `"INTERVAL DAY TO SECOND"`.
+///
+/// Like [`databricks_type_to_arrow`], this public helper maps geospatial
+/// leaves to their default EWKT `DataType::Utf8` representation.
 pub fn databricks_type_to_arrow_with_interval(
     type_text: &str,
     type_interval_type: Option<&str>,
 ) -> DataType {
-    parse_type(type_text, type_interval_type, 0).unwrap_or(DataType::Utf8)
+    databricks_type_to_arrow_with_options(
+        type_text,
+        type_interval_type,
+        GeospatialResultRepresentation::String,
+    )
+}
+
+/// Manifest-aware mapping with an explicit physical representation for
+/// `GEOMETRY` / `GEOGRAPHY` leaves.
+///
+/// SEA's structured manifest reports the logical geospatial type. This mapper
+/// reconstructs its tagged `struct<srid,wkb>` schema when binary output is
+/// requested, including for attachments whose IPC schema omits the tags. The
+/// choice is applied recursively through ARRAY / MAP / STRUCT type text.
+pub(crate) fn databricks_type_to_arrow_with_options(
+    type_text: &str,
+    type_interval_type: Option<&str>,
+    geospatial_representation: GeospatialResultRepresentation,
+) -> DataType {
+    parse_type(type_text, type_interval_type, geospatial_representation, 0)
+        .unwrap_or(DataType::Utf8)
 }
 
 /// Maximum depth of nested composite types we'll parse before
@@ -147,7 +176,12 @@ const MAX_PARSE_DEPTH: usize = 64;
 /// only consulted at the `INTERVAL` arm — it has no meaning for
 /// nested composites, so passing it down is harmless and lets the
 /// caller specify it once.
-fn parse_type(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
+fn parse_type(
+    s: &str,
+    type_interval_type: Option<&str>,
+    geospatial_representation: GeospatialResultRepresentation,
+    depth: usize,
+) -> Option<DataType> {
     if depth >= MAX_PARSE_DEPTH {
         return None;
     }
@@ -198,10 +232,28 @@ fn parse_type(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option
         }
         "TIMESTAMP_NTZ" => DataType::Timestamp(TimeUnit::Microsecond, None),
         "INTERVAL" => DataType::Interval(resolve_interval_unit(trimmed, type_interval_type)),
-        "ARRAY" => parse_array(trimmed, type_interval_type, depth)?,
-        "MAP" => parse_map(trimmed, type_interval_type, depth)?,
-        "STRUCT" => parse_struct(trimmed, type_interval_type, depth)?,
-        "GEOMETRY" | "GEOGRAPHY" => geospatial_binary_arrow_type(trimmed)?,
+        "ARRAY" => parse_array(
+            trimmed,
+            type_interval_type,
+            geospatial_representation,
+            depth,
+        )?,
+        "MAP" => parse_map(
+            trimmed,
+            type_interval_type,
+            geospatial_representation,
+            depth,
+        )?,
+        "STRUCT" => parse_struct(
+            trimmed,
+            type_interval_type,
+            geospatial_representation,
+            depth,
+        )?,
+        "GEOMETRY" | "GEOGRAPHY" => match geospatial_representation {
+            GeospatialResultRepresentation::String => DataType::Utf8,
+            GeospatialResultRepresentation::Binary => geospatial_binary_arrow_type(trimmed)?,
+        },
         // Untyped NULL (`SELECT NULL` / VOID) maps to `Utf8`, not
         // `DataType::Null`: the server reports it as STRING (and the
         // Thrift / JDBC reference exposes it as STRING), so an
@@ -282,9 +334,19 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
 /// `list_(t)` default also uses `"item"`. Using anything else would
 /// make the empty-result schema fail field-level equality against
 /// the non-empty Arrow IPC payload.
-fn parse_array(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
+fn parse_array(
+    s: &str,
+    type_interval_type: Option<&str>,
+    geospatial_representation: GeospatialResultRepresentation,
+    depth: usize,
+) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
-    let inner_dt = parse_type(inner, type_interval_type, depth + 1)?;
+    let inner_dt = parse_type(
+        inner,
+        type_interval_type,
+        geospatial_representation,
+        depth + 1,
+    )?;
     Some(DataType::List(Arc::new(Field::new_list_field(
         inner_dt, true,
     ))))
@@ -292,14 +354,29 @@ fn parse_array(s: &str, type_interval_type: Option<&str>, depth: usize) -> Optio
 
 /// Parse `MAP<K, V>` into Arrow's canonical `Map(entries: Struct{key, value})`.
 /// Field names `"entries"` / `"key"` / `"value"` match pyarrow.map_(k, v).
-fn parse_map(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
+fn parse_map(
+    s: &str,
+    type_interval_type: Option<&str>,
+    geospatial_representation: GeospatialResultRepresentation,
+    depth: usize,
+) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
     let parts = split_top_level_commas(inner);
     if parts.len() != 2 {
         return None;
     }
-    let key_dt = parse_type(parts[0], type_interval_type, depth + 1)?;
-    let val_dt = parse_type(parts[1], type_interval_type, depth + 1)?;
+    let key_dt = parse_type(
+        parts[0],
+        type_interval_type,
+        geospatial_representation,
+        depth + 1,
+    )?;
+    let val_dt = parse_type(
+        parts[1],
+        type_interval_type,
+        geospatial_representation,
+        depth + 1,
+    )?;
     let entries = Field::new(
         "entries",
         DataType::Struct(Fields::from(vec![
@@ -314,7 +391,12 @@ fn parse_map(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<
 /// Parse `STRUCT<name:type, name:type, ...>` into `Struct(Fields::from([Field; N]))`.
 /// Each child field is nullable (SEA's manifest doesn't carry per-field
 /// nullability) — same convention used elsewhere in the kernel.
-fn parse_struct(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option<DataType> {
+fn parse_struct(
+    s: &str,
+    type_interval_type: Option<&str>,
+    geospatial_representation: GeospatialResultRepresentation,
+    depth: usize,
+) -> Option<DataType> {
     let inner = inside_angle_brackets(s)?;
     if inner.is_empty() {
         return Some(DataType::Struct(Fields::empty()));
@@ -330,7 +412,12 @@ fn parse_struct(s: &str, type_interval_type: Option<&str>, depth: usize) -> Opti
         if name.is_empty() {
             return None;
         }
-        let dt = parse_type(type_text, type_interval_type, depth + 1)?;
+        let dt = parse_type(
+            type_text,
+            type_interval_type,
+            geospatial_representation,
+            depth + 1,
+        )?;
         fields.push(Field::new(name, dt, true));
     }
     Some(DataType::Struct(Fields::from(fields)))
@@ -624,10 +711,34 @@ mod tests {
     }
 
     #[test]
-    fn test_geospatial_types_use_srid_wkb_struct() {
+    fn test_geospatial_types_default_to_ewkt_string() {
+        for type_text in [
+            "GEOGRAPHY",
+            "GEOGRAPHY(4326)",
+            "GEOMETRY(ANY)",
+            "geometry(3857)",
+        ] {
+            assert_eq!(
+                databricks_type_to_arrow(type_text),
+                DataType::Utf8,
+                "{type_text}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_geospatial_binary_types_use_srid_wkb_struct() {
         for type_text in ["GEOGRAPHY(4326)", "GEOMETRY(ANY)", "geometry(3857)"] {
             let expected = geospatial_binary_arrow_type(type_text).unwrap();
-            assert_eq!(databricks_type_to_arrow(type_text), expected, "{type_text}");
+            assert_eq!(
+                databricks_type_to_arrow_with_options(
+                    type_text,
+                    None,
+                    GeospatialResultRepresentation::Binary,
+                ),
+                expected,
+                "{type_text}"
+            );
         }
 
         let expected = geospatial_binary_arrow_type("GEOMETRY(ANY)").unwrap();
@@ -684,9 +795,17 @@ mod tests {
     }
 
     #[test]
-    fn test_geospatial_types_are_reconstructed_inside_nested_type_text() {
-        let binary =
-            databricks_type_to_arrow("STRUCT<geom:GEOMETRY(ANY), geogs:ARRAY<GEOGRAPHY(4326)>>");
+    fn test_geospatial_representation_applies_to_nested_type_text() {
+        let binary = databricks_type_to_arrow_with_options(
+            "STRUCT<geom:GEOMETRY(ANY), geogs:ARRAY<GEOGRAPHY(4326)>>",
+            None,
+            GeospatialResultRepresentation::Binary,
+        );
+        let string = databricks_type_to_arrow_with_options(
+            "STRUCT<geom:GEOMETRY(ANY), geogs:ARRAY<GEOGRAPHY(4326)>>",
+            None,
+            GeospatialResultRepresentation::String,
+        );
 
         let DataType::Struct(binary_fields) = binary else {
             panic!("expected outer struct")
@@ -702,6 +821,15 @@ mod tests {
             binary_items.data_type(),
             &geospatial_binary_arrow_type("GEOGRAPHY(4326)").unwrap()
         );
+
+        let DataType::Struct(string_fields) = string else {
+            panic!("expected outer struct")
+        };
+        assert_eq!(string_fields[0].data_type(), &DataType::Utf8);
+        let DataType::List(string_items) = string_fields[1].data_type() else {
+            panic!("expected geography list")
+        };
+        assert_eq!(string_items.data_type(), &DataType::Utf8);
     }
 
     #[test]

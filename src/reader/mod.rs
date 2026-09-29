@@ -26,6 +26,7 @@ pub mod post_processor;
 pub(crate) mod test_utils;
 
 use crate::client::{DatabricksHttpClient, ExecuteResponse, Transport};
+use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::{SeaChunkLinkFetcher, SeaChunkLinkFetcherHandle};
@@ -64,9 +65,11 @@ impl ResultReaderFactory {
         client: Arc<dyn Transport>,
         http_client: Arc<DatabricksHttpClient>,
         config: CloudFetchConfig,
-        post_process_options: PostProcessOptions,
+        mut post_process_options: PostProcessOptions,
+        geospatial_result_representation: GeospatialResultRepresentation,
         runtime_handle: tokio::runtime::Handle,
     ) -> Self {
+        post_process_options.geospatial_result_representation = geospatial_result_representation;
         Self {
             client,
             http_client,
@@ -424,13 +427,15 @@ impl ResultReaderFactory {
                 // `IntervalUnit::YearMonth` vs `IntervalUnit::DayTime`
                 // without re-parsing the `type_text`.
                 // Reconstruct logical geo leaves as canonical tagged
-                // `struct<srid,wkb>` values. For empty results this is also the
-                // physical schema; for non-empty results it identifies untagged
-                // attachment structs during post-processing.
+                // `struct<srid,wkb>` values. The physical schema comes from
+                // the attachment (or `manifest.arrow_schema` for an empty
+                // result); `ResultPostProcessor` reconciles it and applies the
+                // local string-vs-binary choice uniformly.
                 let data_type =
-                    crate::metadata::type_mapping::databricks_type_to_arrow_with_interval(
+                    crate::metadata::type_mapping::databricks_type_to_arrow_with_options(
                         &col.type_text,
                         col.type_interval_type.as_deref(),
+                        GeospatialResultRepresentation::Binary,
                     );
                 Field::new(&col.name, data_type, true) // nullable by default
             })
@@ -1804,6 +1809,7 @@ mod tests {
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),
+            GeospatialResultRepresentation::String,
             runtime,
         )
     }

@@ -231,20 +231,17 @@ pub(crate) fn append_json(
     Ok(())
 }
 
-/// Decide if `field` says the column is one of the precise Databricks
-/// types whose `Utf8` payload is **already** correctly formatted
-/// (VARIANT carries JSON text, GEOMETRY/GEOGRAPHY carry WKT). In that
-/// case we pass through verbatim, including the surrounding quoting
-/// the server emitted; otherwise we treat it as a normal string and
-/// JSON-escape it.
+/// Encode an `Utf8` value using any logical Databricks type metadata on
+/// `field`. VARIANT contains an already-encoded JSON value and is inserted
+/// verbatim. GEOMETRY / GEOGRAPHY contain kernel-rendered EWKT and are JSON
+/// strings, like ordinary `Utf8` values.
 ///
 /// Known limitation: the manifest only attaches `databricks.type_name`
 /// to top-level Arrow fields, so inner fields of `ARRAY<VARIANT>` /
 /// `MAP<…, VARIANT>` / `STRUCT<v: VARIANT>` lack the metadata and the
 /// nested element is treated as a plain `Utf8` and JSON-escaped
-/// (`"\"{\\\"a\\\":1}\""` instead of `{"a":1}`). Same for nested
-/// `GEOMETRY` / `GEOGRAPHY`. Producing the JDBC-matching form for
-/// nested VARIANTs requires parsing the manifest's `type_text`
+/// (`"\"{\\\"a\\\":1}\""` instead of `{"a":1}`). Producing the
+/// JDBC-matching form for nested VARIANTs requires parsing the manifest's `type_text`
 /// (e.g. `ARRAY<VARIANT>`) and propagating into inner Arrow fields;
 /// tracked separately, see `tests::nested_variant_inside_list_is_escaped_known_limitation`.
 fn append_utf8_value(out: &mut String, value: &str, field: &Field) {
@@ -257,9 +254,9 @@ fn append_utf8_value(out: &mut String, value: &str, field: &Field) {
                 out.push_str(value);
                 return;
             }
-            // GEOMETRY / GEOGRAPHY render as quoted WKT text. The
-            // server delivers the raw WKT (without quotes); we add
-            // the JSON quoting here.
+            // GEOMETRY / GEOGRAPHY reach this path as kernel-rendered EWKT
+            // text after the tagged Arrow struct has been normalized. Add
+            // JSON quoting around that scalar value.
             "GEOMETRY" | "GEOGRAPHY" => {
                 append_quoted(out, value);
                 return;
