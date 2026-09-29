@@ -73,6 +73,7 @@ pub type SchemaRef = Arc<Schema>;
 /// non-Arrow variants (`ColumnarThrift`, `JsonRows`, …) are additive
 /// — wrappers writing `match` against `ResultBatch` get a forced
 /// `_ =>` arm that keeps compiling.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum ResultBatch {
     /// Arrow `RecordBatch`.
@@ -81,6 +82,7 @@ pub enum ResultBatch {
 }
 
 /// Outcome of a non-blocking result-stream read.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum TryNextBatch<'a> {
     Ready(&'a ResultBatch),

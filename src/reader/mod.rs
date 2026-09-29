@@ -615,6 +615,7 @@ pub trait ResultReader: Send + Sync {
 }
 
 /// Result of a non-blocking batch read.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum TryNextBatch {
     Ready(RecordBatch),
