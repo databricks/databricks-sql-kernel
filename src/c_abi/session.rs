@@ -2220,7 +2220,7 @@ mod tests {
         assert_eq!(std::str::from_utf8(value).unwrap(), r#"["a","b"]"#);
 
         let missing = CString::new("missing.flag").unwrap();
-        let mut value = 1usize as *const u8;
+        let mut value = std::ptr::dangling::<u8>();
         let mut value_len = usize::MAX;
         assert_eq!(
             unsafe {
