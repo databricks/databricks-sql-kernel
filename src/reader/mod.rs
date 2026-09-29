@@ -594,6 +594,13 @@ pub trait ResultReader: Send + Sync {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>>;
 
     /// Return the next batch if it is already available without waiting.
+    ///
+    /// Every reader intended to back a non-blocking [`ResultStream`] MUST
+    /// override this method. The default returns an `invalid_state` error at
+    /// runtime rather than failing to compile, so a newly added reader that
+    /// forgets to override it will only surface the omission when
+    /// `ResultStream::try_next_batch` is called. Leave the default in place
+    /// only as a deliberate opt-out for readers that genuinely cannot poll.
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         Err(Error::invalid_state().message("reader does not support non-blocking batch reads"))
     }
