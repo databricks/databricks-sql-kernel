@@ -542,29 +542,30 @@ impl StreamingCloudFetchProvider {
     pub fn try_next_batch(self: &Arc<Self>) -> Result<crate::reader::TryNextBatch> {
         use crate::reader::TryNextBatch;
 
-        loop {
+        let mut released = false;
+        let outcome = loop {
             if self.cancel_token.is_cancelled() {
-                return Err(Error::invalid_state().message("Operation cancelled"));
+                break Err(Error::invalid_state().message("Operation cancelled"));
             }
 
             if let Some(batch) = self.take_buffered_batch() {
-                return Ok(TryNextBatch::Ready(batch));
+                break Ok(TryNextBatch::Ready(batch));
             }
 
             let chunk_index = self.current_chunk_index.load(Ordering::Acquire);
             if self.is_at_end(chunk_index) {
-                return Ok(TryNextBatch::End);
+                break Ok(TryNextBatch::End);
             }
 
             let ready = if let Some(entry) = self.chunks.get(&chunk_index) {
                 match &entry.state {
                     ChunkState::Downloaded => true,
-                    ChunkState::DownloadFailed(error) => return Err(error.clone()),
+                    ChunkState::DownloadFailed(error) => break Err(error.clone()),
                     ChunkState::ProcessingFailed(error) => {
-                        return Err(Error::io().message(error.clone()))
+                        break Err(Error::io().message(error.clone()))
                     }
                     ChunkState::Cancelled => {
-                        return Err(Error::invalid_state().message("Operation cancelled"))
+                        break Err(Error::invalid_state().message("Operation cancelled"))
                     }
                     _ => false,
                 }
@@ -574,27 +575,34 @@ impl StreamingCloudFetchProvider {
 
             if !ready {
                 if let Some(error) = self.terminal_error() {
-                    return Err(error);
+                    break Err(error);
                 }
-                return Ok(TryNextBatch::Pending);
+                break Ok(TryNextBatch::Pending);
             }
 
             // Only the single result consumer removes chunks. Once a chunk is
             // Downloaded its entry is terminal, so the remove cannot race a
             // downloader changing it back to an earlier state.
             if !self.release_downloaded_chunk(chunk_index) {
-                return Ok(TryNextBatch::Pending);
+                break Ok(TryNextBatch::Pending);
             }
+            released = true;
+            // Loop once to return the first batch, or advance across an empty
+            // downloaded chunk to Pending/End/the following ready chunk.
+        };
 
-            // Refill the rolling window independently. The current batch is
-            // already available, so scheduling must not make this call block.
+        // Refill the rolling window once, after the loop settles, rather than
+        // once per skipped empty chunk. Any released chunk freed a window slot;
+        // schedule_downloads early-exits when the window is full and the current
+        // batch (if any) is already buffered, so this must not block.
+        if released {
             let provider = Arc::clone(self);
             self.runtime_handle.spawn(async move {
                 provider.schedule_downloads().await;
             });
-            // Loop once to return the first batch, or advance across an empty
-            // downloaded chunk to Pending/End/the following ready chunk.
         }
+
+        outcome
     }
 
     /// Cancel all pending operations.
