@@ -20,16 +20,21 @@
 //! Session::open → Statement::execute → ExecutedStatement →
 //! ResultStream::next_batch → Row accessors.
 
+use arrow_array::builder::{BinaryBuilder, Int32Builder};
 use arrow_array::cast::AsArray;
-use arrow_array::{Int64Array, RecordBatch, StringArray};
+use arrow_array::{
+    Array, BinaryArray, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
+};
+use arrow_buffer::NullBuffer;
 use arrow_ipc::writer::StreamWriter;
-use arrow_schema::{DataType, Field, Schema};
+use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
     AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle, HttpConfig, ResultBatch,
     ResultConfig, Session, TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
 use serde_json::json;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -141,6 +146,13 @@ fn arrow_ipc_bytes(batch: &RecordBatch) -> Vec<u8> {
         writer.write(batch).unwrap();
         writer.finish().unwrap();
     }
+    buf
+}
+
+fn arrow_schema_ipc_bytes(schema: &Schema) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut writer = StreamWriter::try_new(&mut buf, schema).unwrap();
+    writer.finish().unwrap();
     buf
 }
 
@@ -352,6 +364,205 @@ fn str_batch(name: &str, values: Vec<&str>) -> RecordBatch {
     RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
 }
 
+const POINT_1_2_WKB: &[u8] = &[
+    1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 240, 63, 0, 0, 0, 0, 0, 0, 0, 64,
+];
+
+fn geospatial_type(family: &str, type_srid: i32) -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("srid", DataType::Int32, false),
+        Field::new("wkb", DataType::Binary, false).with_metadata(HashMap::from([
+            (family.to_string(), "true".to_string()),
+            ("srid".to_string(), type_srid.to_string()),
+        ])),
+    ]))
+}
+
+fn untagged_geospatial_type() -> DataType {
+    DataType::Struct(Fields::from(vec![
+        Field::new("srid", DataType::Int32, true),
+        Field::new("wkb", DataType::Binary, true),
+    ]))
+}
+
+fn geospatial_array(row_srid: i32) -> Arc<StructArray> {
+    let DataType::Struct(fields) = untagged_geospatial_type() else {
+        unreachable!()
+    };
+    let mut srids = Int32Builder::new();
+    srids.append_value(row_srid);
+    srids.append_value(0);
+    let mut wkbs = BinaryBuilder::new();
+    wkbs.append_value(POINT_1_2_WKB);
+    wkbs.append_value([]);
+    Arc::new(StructArray::new(
+        fields,
+        vec![Arc::new(srids.finish()), Arc::new(wkbs.finish())],
+        Some(NullBuffer::from(vec![true, false])),
+    ))
+}
+
+fn geospatial_batch() -> RecordBatch {
+    // Reyden's result projection emits nullable physical children without
+    // logical geo tags. Reyder retains the canonical geo identity in the
+    // structured manifest schema below.
+    let geometry = geospatial_array(3857);
+    let geography = geospatial_array(4326);
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_0", geometry.data_type().clone(), true),
+        Field::new("col_1", geography.data_type().clone(), true),
+    ]));
+    RecordBatch::try_new(schema, vec![geometry, geography]).unwrap()
+}
+
+fn legacy_geospatial_batch() -> RecordBatch {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("col_0", DataType::Utf8, true),
+        Field::new("col_1", DataType::Utf8, true),
+    ]));
+    RecordBatch::try_new(
+        schema,
+        vec![
+            Arc::new(StringArray::from(vec![Some("SRID=3857;POINT (1 2)"), None])) as _,
+            Arc::new(StringArray::from(vec![Some("SRID=4326;POINT (1 2)"), None])) as _,
+        ],
+    )
+    .unwrap()
+}
+
+fn logical_geospatial_schema() -> Schema {
+    Schema::new(vec![
+        Field::new("geom", geospatial_type("geometry", -1), true),
+        Field::new("geog", geospatial_type("geography", 4326), true),
+    ])
+}
+
+fn succeeded_geospatial_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
+    let ipc = arrow_ipc_bytes(batch);
+    let logical_schema = arrow_schema_ipc_bytes(&logical_geospatial_schema());
+    json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    {
+                        "name": "geom",
+                        "type_name": "GEOMETRY",
+                        "type_text": "GEOMETRY(ANY)",
+                        "position": 0,
+                    },
+                    {
+                        "name": "geog",
+                        "type_name": "GEOGRAPHY",
+                        "type_text": "GEOGRAPHY(4326)",
+                        "position": 1,
+                    }
+                ],
+            },
+            "arrow_schema": STANDARD.encode(logical_schema),
+            "total_chunk_count": 1,
+            "total_row_count": batch.num_rows() as i64,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": batch.num_rows() as i64,
+            "byte_count": ipc.len() as i64,
+            "attachment": STANDARD.encode(&ipc),
+        },
+    })
+    .to_string()
+}
+
+fn succeeded_empty_geospatial_body(statement_id: &str) -> String {
+    let logical_schema = arrow_schema_ipc_bytes(&logical_geospatial_schema());
+    json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    {
+                        "name": "geom",
+                        "type_name": "GEOMETRY",
+                        "type_text": "GEOMETRY(ANY)",
+                        "position": 0,
+                    },
+                    {
+                        "name": "geog",
+                        "type_name": "GEOGRAPHY",
+                        "type_text": "GEOGRAPHY(4326)",
+                        "position": 1,
+                    }
+                ],
+            },
+            "arrow_schema": STANDARD.encode(logical_schema),
+            "total_chunk_count": 0,
+            "total_row_count": 0,
+            "total_byte_count": 0,
+            "truncated": false,
+        },
+    })
+    .to_string()
+}
+
+fn succeeded_legacy_geospatial_body(
+    statement_id: &str,
+    batch: &RecordBatch,
+    include_rows: bool,
+) -> String {
+    let ipc = arrow_ipc_bytes(batch);
+    let physical_schema = arrow_schema_ipc_bytes(batch.schema().as_ref());
+    let total_chunks = i32::from(include_rows);
+    let total_rows = if include_rows { batch.num_rows() } else { 0 };
+    let mut body = json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    {
+                        "name": "geom",
+                        "type_name": "GEOMETRY",
+                        "type_text": "GEOMETRY(ANY)",
+                        "position": 0,
+                    },
+                    {
+                        "name": "geog",
+                        "type_name": "GEOGRAPHY",
+                        "type_text": "GEOGRAPHY(4326)",
+                        "position": 1,
+                    }
+                ],
+            },
+            "arrow_schema": STANDARD.encode(physical_schema),
+            "total_chunk_count": total_chunks,
+            "total_row_count": total_rows,
+            "total_byte_count": if include_rows { ipc.len() } else { 0 },
+            "truncated": false,
+        },
+    });
+    if include_rows {
+        body["result"] = json!({
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": batch.num_rows(),
+            "byte_count": ipc.len(),
+            "attachment": STANDARD.encode(&ipc),
+        });
+    }
+    body.to_string()
+}
+
 async fn drain(stream: &mut databricks_sql_kernel::ResultStream) -> Vec<RecordBatch> {
     let mut out = Vec::new();
     while let Some(batch) = stream.next_batch().await.expect("next_batch") {
@@ -396,6 +607,272 @@ async fn execute_succeeded_inline_returns_one_row() {
             .value(0),
         1
     );
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_geospatial_applies_manifest_tags_to_arrow_ipc() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = geospatial_batch();
+    mount_execute(
+        &server,
+        succeeded_geospatial_inline_body("stmt-geo-binary", &batch),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT geom, geog FROM geo_values");
+    let mut exec = stmt.execute().await.expect("execute");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    let out = &batches[0];
+
+    let geometry = out
+        .column(0)
+        .as_any()
+        .downcast_ref::<StructArray>()
+        .unwrap();
+    assert_eq!(
+        geometry
+            .column_by_name("srid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap()
+            .value(0),
+        3857
+    );
+    assert_eq!(
+        geometry
+            .column_by_name("wkb")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap()
+            .value(0),
+        POINT_1_2_WKB
+    );
+    assert!(geometry.is_null(1));
+
+    let schema = out.schema();
+    let DataType::Struct(geometry_fields) = schema.field(0).data_type() else {
+        panic!("geometry must stay a tagged struct")
+    };
+    assert_eq!(
+        geometry_fields[1]
+            .metadata()
+            .get("geometry")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        geometry_fields[1]
+            .metadata()
+            .get("srid")
+            .map(String::as_str),
+        Some("-1")
+    );
+    let DataType::Struct(geography_fields) = schema.field(1).data_type() else {
+        panic!("geography must stay a tagged struct")
+    };
+    assert_eq!(
+        geography_fields[1]
+            .metadata()
+            .get("geography")
+            .map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        geography_fields[1]
+            .metadata()
+            .get("srid")
+            .map(String::as_str),
+        Some("4326")
+    );
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_legacy_geospatial_text_is_preserved() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = legacy_geospatial_batch();
+    mount_execute(
+        &server,
+        succeeded_legacy_geospatial_body("stmt-legacy-geo", &batch, true),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT geom, geog FROM legacy_geo_values");
+    let mut exec = stmt.execute().await.expect("execute");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    let output = &batches[0];
+    assert_eq!(output.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(output.schema().field(1).data_type(), &DataType::Utf8);
+    assert_eq!(
+        output.column(0).as_string::<i32>().value(0),
+        "SRID=3857;POINT (1 2)"
+    );
+    assert!(output.column(0).is_null(1));
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_cloudfetch_geospatial_reconciles_manifest_and_untagged_payload() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let statement_id = "stmt-cloud-geo-binary";
+    let chunk_path = format!("/cloud-fetch/{statement_id}/chunk-0.arrow");
+    let chunk_url = format!("{}{}", server.uri(), chunk_path);
+    let batch = geospatial_batch();
+    let ipc = arrow_ipc_bytes(&batch);
+    // CloudFetch preserves the physical (currently untagged) IPC schema in
+    // manifest.arrow_schema. The structured manifest schema remains the
+    // logical source of GEOMETRY / GEOGRAPHY identity.
+    let physical_schema = arrow_schema_ipc_bytes(batch.schema().as_ref());
+    let execute_body = json!({
+        "statement_id": statement_id,
+        "status": { "state": "SUCCEEDED" },
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 2,
+                "columns": [
+                    {
+                        "name": "geom",
+                        "type_name": "GEOMETRY",
+                        "type_text": "GEOMETRY(ANY)",
+                        "position": 0,
+                    },
+                    {
+                        "name": "geog",
+                        "type_name": "GEOGRAPHY",
+                        "type_text": "GEOGRAPHY(4326)",
+                        "position": 1,
+                    }
+                ],
+            },
+            "arrow_schema": STANDARD.encode(physical_schema),
+            "total_chunk_count": 1,
+            "total_row_count": batch.num_rows() as i64,
+            "total_byte_count": ipc.len() as i64,
+            "truncated": false,
+        },
+        "result": {
+            "external_links": [{
+                "external_link": chunk_url,
+                "expiration": "2099-01-01T00:00:00.000Z",
+                "chunk_index": 0,
+                "row_offset": 0,
+                "row_count": batch.num_rows() as i64,
+                "byte_count": ipc.len() as i64,
+            }],
+        },
+    })
+    .to_string();
+    mount_execute(&server, execute_body).await;
+    Mock::given(method("GET"))
+        .and(path(chunk_path.as_str()))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT geom, geog FROM geo_values");
+    let mut exec = stmt.execute().await.expect("execute");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    let schema = batches[0].schema();
+    let DataType::Struct(fields) = schema.field(0).data_type() else {
+        panic!("binary geometry must be a tagged struct")
+    };
+    assert_eq!(
+        fields[1].metadata().get("geometry").map(String::as_str),
+        Some("true")
+    );
+    assert_eq!(
+        fields[1].metadata().get("srid").map(String::as_str),
+        Some("-1")
+    );
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_empty_geospatial_result_has_the_requested_client_schema() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_execute(&server, succeeded_empty_geospatial_body("stmt-empty-geo")).await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT geom, geog FROM empty_geo_values");
+    let mut exec = stmt.execute().await.expect("execute");
+    let schema = exec.schema();
+    assert_eq!(schema.field(0).name(), "geom");
+    assert_eq!(schema.field(1).name(), "geog");
+    assert_eq!(
+        schema
+            .field(0)
+            .metadata()
+            .get("databricks.type_text")
+            .map(String::as_str),
+        Some("GEOMETRY(ANY)")
+    );
+
+    for (index, family, type_srid) in [(0, "geometry", "-1"), (1, "geography", "4326")] {
+        let DataType::Struct(fields) = schema.field(index).data_type() else {
+            panic!("binary geo field must use the tagged struct encoding")
+        };
+        assert_eq!(
+            fields[1].metadata().get(family).map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            fields[1].metadata().get("srid").map(String::as_str),
+            Some(type_srid)
+        );
+    }
+    assert!(drain(exec.result_stream_mut()).await.is_empty());
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_empty_legacy_geospatial_result_uses_physical_text_schema() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = legacy_geospatial_batch();
+    mount_execute(
+        &server,
+        succeeded_legacy_geospatial_body("stmt-empty-legacy-geo", &batch, false),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec()
+        .sql("SELECT geom, geog FROM empty_legacy_geo_values");
+    let mut exec = stmt.execute().await.expect("execute");
+    assert_eq!(exec.schema().field(0).data_type(), &DataType::Utf8);
+    assert_eq!(exec.schema().field(1).data_type(), &DataType::Utf8);
+    assert!(drain(exec.result_stream_mut()).await.is_empty());
     exec.close().await.expect("close");
 }
 

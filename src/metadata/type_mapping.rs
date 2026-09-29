@@ -24,6 +24,7 @@
 //! When adding a new type, update **both** mapping functions.
 
 use arrow_schema::{DataType, Field, Fields, IntervalUnit, TimeUnit};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 // ─── JDBC `Types` integer codes ─────────────────────────────────────
@@ -104,7 +105,7 @@ pub(crate) const JDBC_ARRAY: i16 = 2003;
 /// `"ARRAY<INT>"`, `"MAP<STRING,INT>"`, `"STRUCT<a:INT,b:STRING>"`).
 /// The latter is the form the kernel uses to synthesise an Arrow schema
 /// for empty-result responses where no Arrow IPC payload is available
-/// — see `reader::ResultReaderFactory::extract_schema_from_manifest`.
+/// — see `reader::ResultReaderFactory::extract_logical_schema_from_manifest`.
 ///
 /// Unrecognised input falls back to `DataType::Utf8` rather than
 /// panicking; the kernel always returns *some* schema even when the
@@ -200,6 +201,7 @@ fn parse_type(s: &str, type_interval_type: Option<&str>, depth: usize) -> Option
         "ARRAY" => parse_array(trimmed, type_interval_type, depth)?,
         "MAP" => parse_map(trimmed, type_interval_type, depth)?,
         "STRUCT" => parse_struct(trimmed, type_interval_type, depth)?,
+        "GEOMETRY" | "GEOGRAPHY" => geospatial_binary_arrow_type(trimmed)?,
         // Untyped NULL (`SELECT NULL` / VOID) maps to `Utf8`, not
         // `DataType::Null`: the server reports it as STRING (and the
         // Thrift / JDBC reference exposes it as STRING), so an
@@ -332,6 +334,42 @@ fn parse_struct(s: &str, type_interval_type: Option<&str>, depth: usize) -> Opti
         fields.push(Field::new(name, dt, true));
     }
     Some(DataType::Struct(Fields::from(fields)))
+}
+
+/// Native Arrow representation emitted by DBR and Reyden.
+///
+/// Besides the `struct<srid,wkb>` layout, the `wkb` child carries the exact
+/// family and type-level SRID tags that geo-aware Arrow consumers use to
+/// distinguish this encoding from an ordinary user struct. `ANY` is tagged
+/// with Reyden's `-1` sentinel; bare types use their SQL defaults.
+pub(crate) fn geospatial_binary_arrow_type(type_text: &str) -> Option<DataType> {
+    let upper = type_text.trim().to_ascii_uppercase();
+    let (family, default_srid, qualifier) = if let Some(rest) = upper.strip_prefix("GEOGRAPHY") {
+        ("geography", 4326, rest)
+    } else {
+        let rest = upper.strip_prefix("GEOMETRY")?;
+        ("geometry", 0, rest)
+    };
+    let qualifier = qualifier.trim();
+    let srid = if qualifier.is_empty() {
+        default_srid
+    } else {
+        let value = qualifier.strip_prefix('(')?.strip_suffix(')')?.trim();
+        if value == "ANY" {
+            -1
+        } else {
+            value.parse::<i32>().ok()?
+        }
+    };
+    let wkb_metadata = HashMap::from([
+        (family.to_string(), "true".to_string()),
+        ("srid".to_string(), srid.to_string()),
+    ]);
+
+    Some(DataType::Struct(Fields::from(vec![
+        Field::new("srid", DataType::Int32, false),
+        Field::new("wkb", DataType::Binary, false).with_metadata(wkb_metadata),
+    ])))
 }
 
 /// Find the first `:` at angle/paren depth 0 in a STRUCT field text.
@@ -583,6 +621,87 @@ mod tests {
         assert_eq!(databricks_type_to_arrow("ARRAY"), DataType::Utf8);
         assert_eq!(databricks_type_to_arrow("MAP"), DataType::Utf8);
         assert_eq!(databricks_type_to_arrow("STRUCT"), DataType::Utf8);
+    }
+
+    #[test]
+    fn test_geospatial_types_use_srid_wkb_struct() {
+        for type_text in ["GEOGRAPHY(4326)", "GEOMETRY(ANY)", "geometry(3857)"] {
+            let expected = geospatial_binary_arrow_type(type_text).unwrap();
+            assert_eq!(databricks_type_to_arrow(type_text), expected, "{type_text}");
+        }
+
+        let expected = geospatial_binary_arrow_type("GEOMETRY(ANY)").unwrap();
+        let DataType::Struct(fields) = expected else {
+            unreachable!("geo binary helper must return a struct")
+        };
+        assert_eq!(fields[0].name(), "srid");
+        assert_eq!(fields[0].data_type(), &DataType::Int32);
+        assert!(!fields[0].is_nullable());
+        assert_eq!(fields[1].name(), "wkb");
+        assert_eq!(fields[1].data_type(), &DataType::Binary);
+        assert!(!fields[1].is_nullable());
+        assert_eq!(
+            fields[1].metadata().get("geometry").map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            fields[1].metadata().get("srid").map(String::as_str),
+            Some("-1")
+        );
+
+        let DataType::Struct(geography_fields) =
+            geospatial_binary_arrow_type("GEOGRAPHY(4326)").unwrap()
+        else {
+            unreachable!("geo binary helper must return a struct")
+        };
+        assert_eq!(
+            geography_fields[1]
+                .metadata()
+                .get("geography")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert_eq!(
+            geography_fields[1]
+                .metadata()
+                .get("srid")
+                .map(String::as_str),
+            Some("4326")
+        );
+
+        for malformed in [
+            "GEOMETRY(garbage)",
+            "GEOGRAPHY()",
+            "GEOMETRY(4326) trailing",
+        ] {
+            assert_eq!(
+                geospatial_binary_arrow_type(malformed),
+                None,
+                "a malformed logical type must not be assigned canonical geo tags"
+            );
+            assert_eq!(databricks_type_to_arrow(malformed), DataType::Utf8);
+        }
+    }
+
+    #[test]
+    fn test_geospatial_types_are_reconstructed_inside_nested_type_text() {
+        let binary =
+            databricks_type_to_arrow("STRUCT<geom:GEOMETRY(ANY), geogs:ARRAY<GEOGRAPHY(4326)>>");
+
+        let DataType::Struct(binary_fields) = binary else {
+            panic!("expected outer struct")
+        };
+        assert_eq!(
+            binary_fields[0].data_type(),
+            &geospatial_binary_arrow_type("GEOMETRY(ANY)").unwrap()
+        );
+        let DataType::List(binary_items) = binary_fields[1].data_type() else {
+            panic!("expected geography list")
+        };
+        assert_eq!(
+            binary_items.data_type(),
+            &geospatial_binary_arrow_type("GEOGRAPHY(4326)").unwrap()
+        );
     }
 
     #[test]

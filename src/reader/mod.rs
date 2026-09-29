@@ -35,8 +35,10 @@ use crate::reader::post_processor::{PostProcessOptions, ResultPostProcessor};
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
 use arrow_array::RecordBatch;
+use arrow_ipc::reader::StreamReader;
 use arrow_schema::{ArrowError, Field, Schema, SchemaRef};
 use async_trait::async_trait;
+use std::io::Cursor;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -171,7 +173,7 @@ impl ResultReaderFactory {
                 statement_id,
                 "Manifest reports total_chunk_count=0; short-circuiting to empty reader",
             );
-            let schema = Self::extract_schema_from_manifest(response.manifest.as_ref())?;
+            let schema = Self::extract_physical_schema_from_manifest(response.manifest.as_ref())?;
             return Ok(Box::new(EmptyReader::new(schema)));
         }
 
@@ -303,7 +305,7 @@ impl ResultReaderFactory {
                         // return `None` and downstream wrappers
                         // would reject the stream.
                         let manifest_schema = response.manifest.as_ref().and_then(|m| {
-                            match Self::extract_schema_from_manifest(Some(m)) {
+                            match Self::extract_physical_schema_from_manifest(Some(m)) {
                                 Ok(s) => Some(s),
                                 Err(e) => {
                                     crate::klog::warn!(
@@ -367,7 +369,8 @@ impl ResultReaderFactory {
                     "Using empty reader: no result data present for {:?} statement",
                     response.status.state
                 );
-                let schema = Self::extract_schema_from_manifest(response.manifest.as_ref())?;
+                let schema =
+                    Self::extract_physical_schema_from_manifest(response.manifest.as_ref())?;
                 Ok(Box::new(EmptyReader::new(schema)))
             }
             StatementState::Pending | StatementState::Running => Err(Error::invalid_state()
@@ -385,10 +388,16 @@ impl ResultReaderFactory {
         }
     }
 
-    /// Extract Arrow schema from the result manifest.
+    /// Reconstruct the logical Arrow schema from SEA's structured manifest.
     ///
-    /// Falls back to an empty schema if no manifest is available.
-    fn extract_schema_from_manifest(manifest: Option<&ResultManifest>) -> Result<SchemaRef> {
+    /// The post-processor uses this to interpret physical attachments. Empty
+    /// readers start from `manifest.arrow_schema` via
+    /// [`Self::extract_physical_schema_from_manifest`] and pass through the
+    /// same reconciliation. Falls back to an empty schema if no manifest is
+    /// available.
+    fn extract_logical_schema_from_manifest(
+        manifest: Option<&ResultManifest>,
+    ) -> Result<SchemaRef> {
         let Some(manifest) = manifest else {
             crate::klog::warn!("No manifest available for empty result set, using empty schema");
             return Ok(Arc::new(Schema::empty()));
@@ -403,18 +412,21 @@ impl ResultReaderFactory {
                 // `"INTERVAL YEAR TO MONTH"`) rather than `type_name`
                 // (e.g. `"DECIMAL"` or `"INTERVAL"`) so the shared mapper
                 // can recover precision/scale / interval qualifier. The
-                // non-empty result path uses the Arrow schema embedded in
-                // the wire payload (which already encodes these); only
-                // this empty-result path has to reconstruct the Arrow type
-                // from the manifest, and reconstructing without those
-                // produces wrong defaults that diverge from the Thrift
-                // backend's wire schema for the same query.
+                // non-empty result path uses the Arrow schema embedded in the
+                // wire payload for its values, while this reconstructed schema
+                // supplies the logical type contract. Reconstructing without
+                // the qualifiers produces wrong defaults that diverge from the
+                // Thrift backend's wire schema for the same query.
                 //
                 // `type_interval_type` (`"YEAR_MONTH"` / `"DAY_TIME"`) is
                 // the canonical hint for INTERVAL columns; passing it
                 // through lets the mapper choose
                 // `IntervalUnit::YearMonth` vs `IntervalUnit::DayTime`
                 // without re-parsing the `type_text`.
+                // Reconstruct logical geo leaves as canonical tagged
+                // `struct<srid,wkb>` values. For empty results this is also the
+                // physical schema; for non-empty results it identifies untagged
+                // attachment structs during post-processing.
                 let data_type =
                     crate::metadata::type_mapping::databricks_type_to_arrow_with_interval(
                         &col.type_text,
@@ -425,6 +437,44 @@ impl ResultReaderFactory {
             .collect();
 
         Ok(Arc::new(Schema::new(fields)))
+    }
+
+    /// Decode the physical schema that SEA says its Arrow attachments use.
+    ///
+    /// Reyder intentionally keeps `manifest.arrow_schema` physical while the
+    /// structured manifest above remains logical. That distinction matters for
+    /// legacy warehouses (geo arrives as `Utf8`) and for native Reyden results
+    /// (geo arrives as an untagged `struct<srid,wkb>`). Empty results and an
+    /// empty leading streaming chunk must start from this physical schema so
+    /// the shared post-processor can apply the same reconciliation as it does
+    /// to a non-empty attachment.
+    fn extract_physical_schema_from_manifest(
+        manifest: Option<&ResultManifest>,
+    ) -> Result<SchemaRef> {
+        let logical = Self::extract_logical_schema_from_manifest(manifest)?;
+        let Some(manifest) = manifest else {
+            return Ok(logical);
+        };
+        let Some(bytes) = manifest
+            .arrow_schema
+            .as_deref()
+            .filter(|bytes| !bytes.is_empty())
+        else {
+            return Ok(logical);
+        };
+
+        let reader = StreamReader::try_new(Cursor::new(bytes), None).map_err(|error| {
+            Error::data_loss().message(format!("failed to decode manifest.arrow_schema: {error}"))
+        })?;
+        let physical = reader.schema();
+        if physical.fields().len() != manifest.schema.columns.len() {
+            return Err(Error::data_loss().message(format!(
+                "manifest.arrow_schema has {} columns but structured manifest has {}",
+                physical.fields().len(),
+                manifest.schema.columns.len()
+            )));
+        }
+        Ok(physical)
     }
 
     fn create_cloudfetch_reader(
@@ -908,11 +958,20 @@ mod tests {
     use crate::reader::test_utils::{ErrorReader, MockReader, SchemaErrorReader};
     use crate::types::sea::{ColumnInfo, ResultManifest, ResultSchema};
     use arrow_array::StringArray;
-    use arrow_schema::DataType;
+    use arrow_ipc::writer::StreamWriter;
+    use arrow_schema::{DataType, Fields};
 
     fn make_test_batch(values: Vec<&str>) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, false)]));
         RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(values))]).unwrap()
+    }
+
+    fn schema_ipc(schema: &Schema) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, schema).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        bytes
     }
 
     // --- ResultReaderAdapter tests ---
@@ -997,7 +1056,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_primitives() {
+    fn test_extract_logical_schema_from_manifest_primitives() {
         // The simple-primitive cases the previous private mapper covered.
         // Verifies the shared `databricks_type_to_arrow` still produces
         // the same Arrow types for these so behaviour didn't regress when
@@ -1009,7 +1068,8 @@ mod tests {
             make_column_info("d", "STRING", "STRING", 3, None, None, None),
             make_column_info("e", "DOUBLE", "DOUBLE", 4, None, None, None),
         ]);
-        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
         assert_eq!(schema.field(0).data_type(), &DataType::Boolean);
         assert_eq!(schema.field(1).data_type(), &DataType::Int32);
         assert_eq!(schema.field(2).data_type(), &DataType::Int64);
@@ -1018,7 +1078,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_decimal_carries_precision_scale() {
+    fn test_extract_logical_schema_from_manifest_decimal_carries_precision_scale() {
         // Regression test for the comparator bucket-C cause #1:
         // empty-result schema for a DECIMAL column was previously
         // `Utf8` (because the local mapper fell through to the catch-all
@@ -1033,12 +1093,13 @@ mod tests {
             Some(2),
             None,
         )]);
-        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
         assert_eq!(schema.field(0).data_type(), &DataType::Decimal128(10, 2));
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_interval_void() {
+    fn test_extract_logical_schema_from_manifest_interval_void() {
         // INTERVAL and VOID were both falling through to Utf8 in the
         // previous private mapper — bucket-C cause #1 sub-cases.
         //
@@ -1069,7 +1130,8 @@ mod tests {
             ),
             make_column_info("v", "VOID", "VOID", 2, None, None, None),
         ]);
-        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
         assert_eq!(
             schema.field(0).data_type(),
             &DataType::Interval(arrow_schema::IntervalUnit::YearMonth),
@@ -1087,7 +1149,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_interval_keyword_fallback() {
+    fn test_extract_logical_schema_from_manifest_interval_keyword_fallback() {
         // When `type_interval_type` is absent, the mapper falls back to
         // keyword-matching the `type_text`. Bare `"INTERVAL"` (no
         // qualifier) historically meant DAY_TIME; preserve that.
@@ -1112,7 +1174,8 @@ mod tests {
             ),
             make_column_info("bare", "INTERVAL", "INTERVAL", 2, None, None, None),
         ]);
-        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
         assert_eq!(
             schema.field(0).data_type(),
             &DataType::Interval(arrow_schema::IntervalUnit::YearMonth)
@@ -1128,7 +1191,7 @@ mod tests {
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_complex_types_parse_into_nested_arrow() {
+    fn test_extract_logical_schema_from_manifest_complex_types_parse_into_nested_arrow() {
         // ARRAY / MAP / STRUCT carry their structure in the manifest's
         // `type_text` field; the empty-result schema now reconstructs the
         // matching nested Arrow type so the empty-result path agrees
@@ -1140,17 +1203,84 @@ mod tests {
             make_column_info("m", "MAP", "MAP<STRING,INT>", 1, None, None, None),
             make_column_info("s", "STRUCT", "STRUCT<x:INT>", 2, None, None, None),
         ]);
-        let schema = ResultReaderFactory::extract_schema_from_manifest(Some(&manifest)).unwrap();
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
         assert!(matches!(schema.field(0).data_type(), DataType::List(_)));
         assert!(matches!(schema.field(1).data_type(), DataType::Map(_, _)));
         assert!(matches!(schema.field(2).data_type(), DataType::Struct(_)));
     }
 
     #[test]
-    fn test_extract_schema_from_manifest_no_manifest_returns_empty() {
+    fn test_extract_empty_geospatial_schema_uses_canonical_tagged_structs() {
+        let manifest = make_manifest(vec![
+            make_column_info("geom", "GEOMETRY", "GEOMETRY(ANY)", 0, None, None, None),
+            make_column_info("geog", "GEOGRAPHY", "GEOGRAPHY(4326)", 1, None, None, None),
+        ]);
+
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
+        for field in schema.fields() {
+            assert!(field.is_nullable(), "geo column itself remains nullable");
+            let DataType::Struct(children) = field.data_type() else {
+                panic!("binary geo must be struct, got {:?}", field.data_type());
+            };
+            assert_eq!(children[0].name(), "srid");
+            assert_eq!(children[0].data_type(), &DataType::Int32);
+            assert!(!children[0].is_nullable());
+            assert_eq!(children[1].name(), "wkb");
+            assert_eq!(children[1].data_type(), &DataType::Binary);
+            assert!(!children[1].is_nullable());
+        }
+    }
+
+    #[test]
+    fn test_extract_physical_schema_uses_manifest_arrow_schema() {
+        let mut manifest = make_manifest(vec![make_column_info(
+            "geom",
+            "GEOMETRY",
+            "GEOMETRY(ANY)",
+            0,
+            None,
+            None,
+            None,
+        )]);
+        manifest.arrow_schema = Some(schema_ipc(&Schema::new(vec![Field::new(
+            "col_0",
+            DataType::Utf8,
+            true,
+        )])));
+
+        let logical =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
+        assert!(matches!(logical.field(0).data_type(), DataType::Struct(_)));
+
+        let physical =
+            ResultReaderFactory::extract_physical_schema_from_manifest(Some(&manifest)).unwrap();
+        assert_eq!(physical.field(0).data_type(), &DataType::Utf8);
+        assert_eq!(physical.field(0).name(), "col_0");
+    }
+
+    #[test]
+    fn test_extract_physical_schema_rejects_invalid_or_mismatched_ipc() {
+        let mut manifest = make_manifest(vec![make_column_info(
+            "value", "STRING", "STRING", 0, None, None, None,
+        )]);
+        manifest.arrow_schema = Some(b"not arrow IPC".to_vec());
+        let error = ResultReaderFactory::extract_physical_schema_from_manifest(Some(&manifest))
+            .unwrap_err();
+        assert!(error.message.contains("manifest.arrow_schema"));
+
+        manifest.arrow_schema = Some(schema_ipc(&Schema::empty()));
+        let error = ResultReaderFactory::extract_physical_schema_from_manifest(Some(&manifest))
+            .unwrap_err();
+        assert!(error.message.contains("0 columns"));
+    }
+
+    #[test]
+    fn test_extract_logical_schema_from_manifest_no_manifest_returns_empty() {
         // Pre-existing fallback path: no manifest at all → empty schema,
         // no warning, no panic. Lock in.
-        let schema = ResultReaderFactory::extract_schema_from_manifest(None).unwrap();
+        let schema = ResultReaderFactory::extract_logical_schema_from_manifest(None).unwrap();
         assert_eq!(schema.fields().len(), 0);
     }
 
@@ -1163,6 +1293,7 @@ mod tests {
                 column_count: columns.len() as i32,
                 columns,
             },
+            arrow_schema: None,
             total_chunk_count: None,
             total_row_count: None,
             total_byte_count: None,
@@ -1322,6 +1453,45 @@ mod tests {
         assert_eq!(
             field.metadata().get(metadata_keys::TYPE_SCALE),
             Some(&"2".to_string())
+        );
+    }
+
+    #[test]
+    fn test_augment_schema_preserves_geospatial_identity_and_srid() {
+        let binary_geo = DataType::Struct(Fields::from(vec![
+            Field::new("srid", DataType::Int32, false),
+            Field::new("wkb", DataType::Binary, false),
+        ]));
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", binary_geo.clone(), true),
+            Field::new("col_1", binary_geo.clone(), true),
+        ]));
+        let manifest = make_manifest(vec![
+            make_column_info("geom", "GEOMETRY", "GEOMETRY(ANY)", 0, None, None, None),
+            make_column_info("geog", "GEOGRAPHY", "GEOGRAPHY(4326)", 1, None, None, None),
+        ]);
+
+        let augmented = ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+
+        assert_eq!(augmented.field(0).data_type(), &binary_geo);
+        assert_eq!(augmented.field(1).data_type(), &binary_geo);
+        assert_eq!(augmented.field(0).name(), "geom");
+        assert_eq!(augmented.field(1).name(), "geog");
+        assert_eq!(
+            augmented.field(0).metadata().get(metadata_keys::TYPE_NAME),
+            Some(&"GEOMETRY".to_string())
+        );
+        assert_eq!(
+            augmented.field(0).metadata().get(metadata_keys::TYPE_TEXT),
+            Some(&"GEOMETRY(ANY)".to_string())
+        );
+        assert_eq!(
+            augmented.field(1).metadata().get(metadata_keys::TYPE_NAME),
+            Some(&"GEOGRAPHY".to_string())
+        );
+        assert_eq!(
+            augmented.field(1).metadata().get(metadata_keys::TYPE_TEXT),
+            Some(&"GEOGRAPHY(4326)".to_string())
         );
     }
 
@@ -1658,6 +1828,7 @@ mod tests {
                 column_count: 0,
                 columns: vec![],
             },
+            arrow_schema: None,
             total_chunk_count,
             total_row_count: None,
             total_byte_count: None,

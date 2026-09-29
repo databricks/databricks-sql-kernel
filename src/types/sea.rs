@@ -170,6 +170,14 @@ pub struct ServiceError {
 pub struct ResultManifest {
     pub format: String,
     pub schema: ResultSchema,
+    /// Physical Arrow schema carried by SEA as a schema-only IPC stream.
+    ///
+    /// Reyder deliberately keeps this schema aligned with result attachments.
+    /// It can therefore differ from the logical [`ResultSchema`]: native
+    /// geospatial attachments use an untagged `struct<srid,wkb>`, while the
+    /// structured schema still declares `GEOMETRY` / `GEOGRAPHY`.
+    #[serde(default, deserialize_with = "deserialize_base64_attachment")]
+    pub arrow_schema: Option<Vec<u8>>,
     #[serde(default)]
     pub total_chunk_count: Option<i64>,
     #[serde(default)]
