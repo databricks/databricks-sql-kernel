@@ -596,6 +596,17 @@ impl StreamingCloudFetchProvider {
         // schedule_downloads early-exits when the window is full and the current
         // batch (if any) is already buffered, so this must not block.
         if released {
+            // Detached spawn (vs. the blocking path's inline await) means two
+            // rapid try_next_batch calls can overlap this refill, and a mixed
+            // try_next_batch + next_batch caller can run it alongside next_batch's
+            // inline refill. That is safe because schedule_downloads is
+            // reentrant against itself: the load of next_download_index is only
+            // a hint. The actual claim is the UrlFetched -> Downloading
+            // transition performed under the DashMap get_mut write guard, so at
+            // most one runner ever claims a given chunk. A runner that loses the
+            // race sees a non-UrlFetched state, fails the claim, and breaks
+            // without advancing next_download_index (only the winner fetch_adds
+            // it), so no index is double-scheduled or skipped.
             let provider = Arc::clone(self);
             self.runtime_handle.spawn(async move {
                 provider.schedule_downloads().await;
