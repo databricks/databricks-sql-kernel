@@ -15,6 +15,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Route function metadata through the Thrift-native metadata path when supported by the server.
+
 ### Updated
 
 ### Fixed

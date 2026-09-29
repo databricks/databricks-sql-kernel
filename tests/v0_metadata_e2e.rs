@@ -497,9 +497,8 @@ async fn foreign_keys_returns_jdbc_columns() {
 #[ignore]
 async fn functions_returns_jdbc_columns() {
     let session = live_session().await;
-    // Reshaped kernel-side into the JDBC getFunctions column set
-    // (the raw information_schema.routines columns are renamed by
-    // reshape_functions).
+    // Reshaped kernel-side into the JDBC getFunctions column set when
+    // the server executes the SHOW fallback; native results already use it.
     let stream = session
         .metadata()
         .functions(None, None, None)

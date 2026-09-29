@@ -39,7 +39,7 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, Identifier, LikePattern, ResultBatch, Session,
+    AuthConfig, ConnectionConfig, DefaultOpts, Identifier, LikePattern, ResultBatch, Session,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -49,7 +49,11 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 // ─── Helpers ────────────────────────────────────────────────────────
 
 async fn open_session(server: &MockServer) -> Session {
-    Session::builder()
+    open_session_with_default_catalog(server, None).await
+}
+
+async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<&str>) -> Session {
+    let builder = Session::builder()
         .connection(
             ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
                 .expect("valid http_path"),
@@ -57,10 +61,16 @@ async fn open_session(server: &MockServer) -> Session {
         .auth(AuthConfig::Pat {
             token: "dapi_test_token".into(),
             identity_federation_client_id: None,
-        })
-        .open()
-        .await
-        .expect("Session::open should succeed")
+        });
+    let builder = match catalog {
+        Some(catalog) => {
+            let mut defaults = DefaultOpts::default();
+            defaults.catalog = Some(catalog.to_owned());
+            builder.defaults(defaults)
+        }
+        None => builder,
+    };
+    builder.open().await.expect("Session::open should succeed")
 }
 
 async fn mount_create_session(server: &MockServer) {
@@ -191,6 +201,25 @@ fn closed_inline_response_body(batch: &RecordBatch) -> String {
     succeeded_inline_response_body(batch).replace(r#""state":"SUCCEEDED""#, r#""state":"CLOSED""#)
 }
 
+async fn mount_current_catalog(server: &MockServer, catalog: Option<&str>) {
+    let current_catalog = string_batch(vec![(
+        "current_catalog()",
+        catalog
+            .map(|catalog| vec![Some(catalog)])
+            .unwrap_or_default(),
+    )]);
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(body_string_contains("SELECT CURRENT_CATALOG()"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(closed_inline_response_body(&current_catalog)),
+        )
+        .expect(1)
+        .mount(server)
+        .await;
+}
+
 /// Like [`succeeded_inline_response_body`] but with a caller-chosen
 /// `statement_id` and `status.state`. Used by the wildcard fan-out
 /// CLOSED-skip test, which stubs several statements in one call and must
@@ -215,6 +244,28 @@ fn string_batch(cols: Vec<(&str, Vec<Option<&str>>)>) -> RecordBatch {
         .map(|(_, v)| Arc::new(StringArray::from(v.clone())) as ArrayRef)
         .collect();
     RecordBatch::try_new(Arc::new(Schema::new(fields)), arrays).unwrap()
+}
+
+fn functions_batch(catalog: &str) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("functionName", DataType::Utf8, false),
+            Field::new("namespace", DataType::Utf8, false),
+            Field::new("catalogName", DataType::Utf8, true),
+            Field::new("remarks", DataType::Utf8, true),
+            Field::new("functionType", DataType::Int32, true),
+            Field::new("specificName", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(StringArray::from(vec![Some("answer")])),
+            Arc::new(StringArray::from(vec![Some("default")])),
+            Arc::new(StringArray::from(vec![Some(catalog)])),
+            Arc::new(StringArray::from(vec![Some("Returns 42")])),
+            Arc::new(Int32Array::from(vec![Some(1)])),
+            Arc::new(StringArray::from(vec![Some("answer")])),
+        ],
+    )
+    .unwrap()
 }
 
 /// Mixed-type RecordBatch builder for `list_columns` fixtures, which
@@ -414,6 +465,178 @@ async fn native_columns_zero_based_ordinal_is_one_based() {
         .as_primitive::<arrow_array::types::Int32Type>();
 
     assert_eq!(ordinal.value(0), 1);
+}
+
+#[tokio::test]
+async fn native_functions_header_and_result_match_jdbc() {
+    for (catalog, expected_sql, expected_catalog) in [
+        (None, "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'", None),
+        (
+            Some("main"),
+            "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
+            Some("main"),
+        ),
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+
+        if catalog.is_none() {
+            mount_current_catalog(&server, Some("main")).await;
+        }
+
+        let native = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![
+                Field::new("FUNCTION_CAT", DataType::Utf8, true),
+                Field::new("FUNCTION_SCHEM", DataType::Utf8, true),
+                Field::new("FUNCTION_NAME", DataType::Utf8, false),
+                Field::new("REMARKS", DataType::Utf8, true),
+                Field::new("FUNCTION_TYPE", DataType::Int32, true),
+                Field::new("SPECIFIC_NAME", DataType::Utf8, true),
+            ])),
+            vec![
+                Arc::new(StringArray::from(vec![Some("")])),
+                Arc::new(StringArray::from(vec![Some("default")])),
+                Arc::new(StringArray::from(vec![Some("answer")])),
+                Arc::new(StringArray::from(vec![Some("Returns 42")])),
+                Arc::new(Int32Array::from(vec![Some(1)])),
+                Arc::new(StringArray::from(vec![Some("answer")])),
+            ],
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(header(
+                "x-databricks-metadata-operation-type",
+                "GetFunctions",
+            ))
+            .and(header(
+                "x-databricks-require-thrift-native-metadata",
+                "true",
+            ))
+            .and(body_string_contains(expected_sql))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(native_inline_response_body(&native)),
+            )
+            .mount(&server)
+            .await;
+
+        let session = open_session(&server).await;
+        let catalog = catalog.map(|catalog| Identifier::new(catalog).unwrap());
+        let mut stream = session
+            .metadata()
+            .functions(catalog, None, None)
+            .await
+            .expect("native list_functions");
+        assert_eq!(
+            col_names(&stream.schema()),
+            vec![
+                "FUNCTION_CAT",
+                "FUNCTION_SCHEM",
+                "FUNCTION_NAME",
+                "REMARKS",
+                "FUNCTION_TYPE",
+                "SPECIFIC_NAME",
+            ]
+        );
+
+        let batches = drain_stream(&mut stream).await;
+        let function_catalog = batches[0]
+            .column_by_name("FUNCTION_CAT")
+            .unwrap()
+            .as_string::<i32>();
+        assert_eq!(
+            (!function_catalog.is_null(0)).then(|| function_catalog.value(0)),
+            expected_catalog
+        );
+        let function_type = batches[0]
+            .column_by_name("FUNCTION_TYPE")
+            .unwrap()
+            .as_primitive::<arrow_array::types::Int16Type>();
+        assert_eq!(function_type.value(0), 1);
+    }
+}
+
+#[tokio::test]
+async fn functions_sql_fallback_uses_current_catalog() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    mount_current_catalog(&server, Some("main")).await;
+
+    let functions = functions_batch("main");
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .and(header(
+            "x-databricks-metadata-operation-type",
+            "GetFunctions",
+        ))
+        .and(body_string_contains(
+            "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(succeeded_inline_response_body(&functions)),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stream = session
+        .metadata()
+        .functions(None, None, None)
+        .await
+        .expect("list_functions SQL fallback");
+    let batches = drain_stream(&mut stream).await;
+    assert_eq!(
+        batches[0]
+            .column_by_name("FUNCTION_CAT")
+            .unwrap()
+            .as_string::<i32>()
+            .value(0),
+        "main"
+    );
+}
+
+#[tokio::test]
+async fn functions_falls_back_when_current_catalog_is_unavailable() {
+    for (configured_catalog, expected_catalog) in
+        [(Some("configured"), "configured"), (None, "hive_metastore")]
+    {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+
+        mount_current_catalog(&server, None).await;
+
+        let functions = functions_batch(expected_catalog);
+        mount_execute_expecting_sql(
+            &server,
+            &format!("SHOW FUNCTIONS IN CATALOG `{expected_catalog}` LIKE '*'"),
+            succeeded_inline_response_body(&functions),
+        )
+        .await;
+
+        let session = match configured_catalog {
+            Some(catalog) => open_session_with_default_catalog(&server, Some(catalog)).await,
+            None => open_session(&server).await,
+        };
+        let mut stream = session
+            .metadata()
+            .functions(None, None, None)
+            .await
+            .expect("list_functions catalog fallback");
+        let batches = drain_stream(&mut stream).await;
+        assert_eq!(
+            batches[0]
+                .column_by_name("FUNCTION_CAT")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            expected_catalog
+        );
+    }
 }
 
 #[tokio::test]

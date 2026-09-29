@@ -93,6 +93,7 @@ use crate::metadata::thrift_shape::{
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::session::SessionInner;
+use crate::statement::Statement;
 use crate::telemetry::{ExecutionResultFormat, OperationType, StatementTelemetry, StatementType};
 use crate::types::sea::StatementState;
 use arrow_array::{Array, ArrayRef};
@@ -195,6 +196,26 @@ fn normalize_native_metadata_batch(
     })
 }
 
+fn normalize_native_functions_batch(
+    batch: &arrow_array::RecordBatch,
+    schema: SchemaRef,
+    requested_catalog: Option<&str>,
+) -> Result<arrow_array::RecordBatch> {
+    let normalized = normalize_native_metadata_batch(batch, schema.clone())?;
+    let mut columns = normalized.columns().to_vec();
+
+    // Native GetFunctions searches the session catalog and leaves FUNCTION_CAT
+    // empty. Match JDBC by reporting the caller's original catalog, including null.
+    columns[0] = Arc::new(arrow_array::StringArray::from(vec![
+        requested_catalog;
+        normalized.num_rows()
+    ]));
+
+    arrow_array::RecordBatch::try_new(schema, columns).map_err(|e| {
+        Error::data_loss().message(format!("invalid Thrift-native GetFunctions result: {e}"))
+    })
+}
+
 async fn native_or_reshaped_stream(
     raw: ExecuteResult,
     session: &Arc<SessionInner>,
@@ -212,6 +233,32 @@ async fn native_or_reshaped_stream(
                 normalize_native_metadata_batch(batch, native_schema.clone())
             } else {
                 reshape(batch)
+            }
+        }),
+    );
+    ResultStream::from_reader_with_close(Box::new(reader), Arc::clone(session), stmt_id).await
+}
+
+async fn native_or_reshaped_functions_stream(
+    raw: ExecuteResult,
+    session: &Arc<SessionInner>,
+    requested_catalog: Option<String>,
+) -> Result<ResultStream> {
+    let stmt_id = close_id(&raw);
+    let native = is_native_metadata_result(&raw);
+    let native_schema = GET_FUNCTIONS_SCHEMA.clone();
+    let reader = ThriftReshapingReader::new(
+        raw.reader,
+        GET_FUNCTIONS_SCHEMA.clone(),
+        Box::new(move |batch| {
+            if native {
+                normalize_native_functions_batch(
+                    batch,
+                    native_schema.clone(),
+                    requested_catalog.as_deref(),
+                )
+            } else {
+                thrift_shape::reshape_functions(batch)
             }
         }),
     );
@@ -463,6 +510,65 @@ impl Metadata {
             Err(error) => {
                 telemetry.finalize(Some(&error));
                 Err(error)
+            }
+        }
+    }
+
+    async fn current_catalog(&self) -> Result<String> {
+        let mut statement = Statement::new(Arc::clone(&self.session));
+        statement.spec().sql("SELECT CURRENT_CATALOG()");
+        let mut executed = statement.execute().await?;
+
+        let catalog = match executed.next_batch().await {
+            Ok(Some(ResultBatch::Arrow(batch))) => {
+                if batch.num_columns() == 0 || batch.num_rows() == 0 {
+                    Err(Error::data_loss().message("CURRENT_CATALOG() returned no rows or columns"))
+                } else {
+                    let catalogs = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .ok_or_else(|| {
+                            Error::data_loss()
+                                .message("CURRENT_CATALOG() result is not a UTF-8 string")
+                        });
+                    catalogs.and_then(|catalogs| {
+                        if catalogs.is_null(0) {
+                            Err(Error::data_loss().message("CURRENT_CATALOG() returned null"))
+                        } else {
+                            Ok(catalogs.value(0).to_owned())
+                        }
+                    })
+                }
+            }
+            Ok(None) => Err(Error::data_loss().message("CURRENT_CATALOG() returned no result")),
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = executed.close().await {
+            debug!(
+                error = %error,
+                "failed to close CURRENT_CATALOG() statement"
+            );
+        }
+        catalog
+    }
+
+    async fn resolve_functions_catalog(&self) -> String {
+        match self.current_catalog().await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                let fallback = self
+                    .session
+                    .default_catalog()
+                    .unwrap_or("hive_metastore")
+                    .to_owned();
+                debug!(
+                    error = %error,
+                    catalog = %fallback,
+                    "failed to resolve current catalog for list_functions; using fallback"
+                );
+                fallback
             }
         }
     }
@@ -1241,10 +1347,11 @@ impl Metadata {
     /// Functions visible to the session. Catalog is exact; schema /
     /// name are patterns.
     ///
-    /// Server shape (`SELECT ... FROM information_schema.routines`):
-    /// `routine_catalog, routine_schema, routine_name, comment,
-    /// specific_name`. Reshaped kernel-side into the JDBC `getFunctions`
-    /// column set by [`thrift_shape::reshape_functions`].
+    /// SQL fallback shape (`SHOW FUNCTIONS IN CATALOG ...`):
+    /// `functionName, namespace, catalogName, remarks, functionType,
+    /// specificName`. Reshaped kernel-side into the JDBC `getFunctions`
+    /// column set by [`thrift_shape::reshape_functions`]. Thrift-native
+    /// results are normalized directly to that public schema.
     pub async fn functions(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -1255,12 +1362,17 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListFunctions);
         let telemetry_for_body = telemetry.clone();
         let result = async {
+            let requested_catalog = catalog.as_ref().map(|catalog| catalog.as_str().to_owned());
+            let resolved_catalog = match catalog.as_ref() {
+                Some(catalog) => catalog.as_str().to_owned(),
+                None => self.resolve_functions_catalog().await,
+            };
             let raw = match self
                 .session
                 .transport()
                 .list_functions(
                     self.session.session_id(),
-                    catalog.as_ref().map(|i| i.as_str()),
+                    Some(resolved_catalog.as_str()),
                     schema_pattern.as_ref().map(|p| p.as_str()),
                     name_pattern.as_ref().map(|p| p.as_str()),
                 )
@@ -1273,13 +1385,7 @@ impl Metadata {
                 }
             };
             Self::observe_raw_result(&telemetry_for_body, &raw);
-            native_or_reshaped_stream(
-                raw,
-                &self.session,
-                GET_FUNCTIONS_SCHEMA.clone(),
-                Box::new(thrift_shape::reshape_functions),
-            )
-            .await
+            native_or_reshaped_functions_stream(raw, &self.session, requested_catalog).await
         }
         .instrument(span)
         .await;

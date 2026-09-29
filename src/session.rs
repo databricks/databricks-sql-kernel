@@ -156,6 +156,14 @@ impl SessionInner {
         &self.session_id
     }
 
+    /// Catalog configured as the session default, if any.
+    pub(crate) fn default_catalog(&self) -> Option<&str> {
+        self.config
+            .defaults
+            .as_ref()
+            .and_then(|defaults| defaults.catalog.as_deref())
+    }
+
     /// Crate-internal accessor for the per-session tracing span.
     /// Callers clone the span and `.entered()` it at the top of each
     /// public method body.
