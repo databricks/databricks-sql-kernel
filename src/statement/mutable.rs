@@ -450,6 +450,28 @@ impl Statement {
     /// `fetch_result`. Use this path when the caller needs an explicit
     /// poll/cancel handle instead of waiting synchronously for terminal state.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
+        self.submit_with_timeout_mode(ExecutionTimeout::Default)
+            .await
+    }
+
+    /// Submit-and-return with one client-side execution deadline retained by
+    /// the returned handle across caller-driven status polls.
+    ///
+    /// `Duration::ZERO` and `Duration::MAX` explicitly select unlimited
+    /// execution. Result materialisation and fetching are outside the deadline.
+    pub async fn submit_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExecutedAsyncStatement> {
+        let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
+        self.submit_with_timeout_mode(ExecutionTimeout::from_explicit_deadline(deadline))
+            .await
+    }
+
+    async fn submit_with_timeout_mode(
+        &mut self,
+        timeout: ExecutionTimeout,
+    ) -> Result<ExecutedAsyncStatement> {
         let span = self.session.log_span().clone();
         // Clear the shared in-flight-id slot before the first `.await`
         // (see `reset_inflight_slot`).
@@ -466,11 +488,26 @@ impl Statement {
             );
             let guard = cancel_state.guard();
 
-            let response = self
-                .session
-                .transport()
-                .submit_statement(self.session.session_id(), &sql, &exec_params)
-                .await?;
+            let submit = self.session.transport().submit_statement(
+                self.session.session_id(),
+                &sql,
+                &exec_params,
+            );
+            let response = match timeout {
+                ExecutionTimeout::Deadline(deadline) => {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), submit)
+                        .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            return Err(crate::statement::timeout::client_query_timeout_error(
+                                None,
+                            ));
+                        }
+                    }
+                }
+                ExecutionTimeout::Default | ExecutionTimeout::Unlimited => submit.await?,
+            };
             telemetry_for_body.on_statement_submitted(&response.statement_id);
 
             cancel_state.observe(&response.statement_id);
@@ -498,6 +535,10 @@ impl Statement {
                 // the first poll.
                 response.status,
                 telemetry_for_body,
+                match timeout {
+                    ExecutionTimeout::Deadline(deadline) => Some(deadline),
+                    ExecutionTimeout::Default | ExecutionTimeout::Unlimited => None,
+                },
             ))
         }
         .instrument(span)
@@ -623,6 +664,7 @@ impl Statement {
                         closed,
                         resp.status,
                         telemetry_for_body,
+                        None,
                     )))
                 }
             }

@@ -222,9 +222,25 @@ pub struct ExecutedAsyncStatement {
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
     result_stream_owns_success_telemetry: AtomicBool,
+    /// Absolute execution deadline retained across caller-driven polls.
+    client_deadline: Option<std::time::Instant>,
+    client_timeout_expired: AtomicBool,
 }
 
 impl ExecutedAsyncStatement {
+    /// Produce the stable client query-timeout error and schedule bounded,
+    /// best-effort server cleanup when a deadline retained across
+    /// caller-driven status polls expires.
+    pub(crate) fn expire_client_query_timeout(&self) -> Error {
+        if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
+            self.session
+                .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
+        }
+        let error = crate::statement::timeout::client_query_timeout_error(Some(&self.statement_id));
+        self.statement_telemetry.finalize(Some(&error));
+        error
+    }
+
     fn session_attribution(&self) -> SessionAttribution {
         if self.owning {
             SessionAttribution::Current
@@ -255,6 +271,7 @@ impl ExecutedAsyncStatement {
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
         statement_telemetry: StatementTelemetry,
+        client_deadline: Option<std::time::Instant>,
     ) -> Self {
         Self {
             session,
@@ -266,6 +283,8 @@ impl ExecutedAsyncStatement {
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            client_deadline,
+            client_timeout_expired: AtomicBool::new(false),
         }
     }
 
@@ -300,6 +319,8 @@ impl ExecutedAsyncStatement {
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            client_deadline: None,
+            client_timeout_expired: AtomicBool::new(false),
         }
     }
 
@@ -423,12 +444,35 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.valid.check()?;
+            if self.client_timeout_expired.load(Ordering::Acquire)
+                || self
+                    .client_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(self.expire_client_query_timeout());
+            }
             let status_started = std::time::Instant::now();
-            let response = self
+            let poll = self
                 .session
                 .transport()
-                .statement_status(&self.statement_id, self.session_attribution())
-                .await?;
+                .statement_status(&self.statement_id, self.session_attribution());
+            let response = match self.client_deadline {
+                Some(deadline) => {
+                    let poll_deadline = deadline
+                        .checked_add(crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE)
+                        .unwrap_or(deadline);
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(poll_deadline),
+                        poll,
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => return Err(self.expire_client_query_timeout()),
+                    }
+                }
+                None => poll.await?,
+            };
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
             // Cache the wire status so the extended-field accessors
@@ -436,6 +480,13 @@ impl ExecutedAsyncStatement {
             // stale initial-submit snapshot).
             self.record_latest_status(response.status.clone());
             let status = StatementStatus::from_sea_response(&response);
+            if matches!(status, StatementStatus::Pending | StatementStatus::Running)
+                && self
+                    .client_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(self.expire_client_query_timeout());
+            }
             match &status {
                 StatementStatus::Failed(error) => {
                     self.statement_telemetry.finalize(Some(error));
@@ -507,12 +558,45 @@ impl ExecutedAsyncStatement {
 
             loop {
                 self.valid.check()?;
+                if self.client_timeout_expired.load(Ordering::Acquire)
+                    || self
+                        .client_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                {
+                    if let Some(g) = cancel_guard.take() {
+                        g.defuse();
+                    }
+                    return Err(self.expire_client_query_timeout());
+                }
                 let status_started = std::time::Instant::now();
-                let response = self
+                let poll = self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution())
-                    .await?;
+                    .statement_status(&self.statement_id, self.session_attribution());
+                let response = match self.client_deadline {
+                    Some(deadline) => {
+                        let poll_deadline = deadline
+                            .checked_add(
+                                crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE,
+                            )
+                            .unwrap_or(deadline);
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(poll_deadline),
+                            poll,
+                        )
+                        .await
+                        {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                if let Some(g) = cancel_guard.take() {
+                                    g.defuse();
+                                }
+                                return Err(self.expire_client_query_timeout());
+                            }
+                        }
+                    }
+                    None => poll.await?,
+                };
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
                 // Cache the wire status so the extended-field
@@ -550,6 +634,15 @@ impl ExecutedAsyncStatement {
                         return Err(error);
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
+                        if self
+                            .client_deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        {
+                            if let Some(g) = cancel_guard.take() {
+                                g.defuse();
+                            }
+                            return Err(self.expire_client_query_timeout());
+                        }
                         if start.elapsed() > cfg.poll_timeout {
                             // Internal poll-timeout: we asked to wait,
                             // we gave up. Leave the cancel guard armed
