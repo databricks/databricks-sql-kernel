@@ -266,6 +266,12 @@ author, follow-up, and review runs.
 - **Context:** PR #360 moved WKT/EWKT coordinate formatting into the kernel (emitting `f64` ordinates via Rust's default `Display`), but every WKT test used integer coordinates like `POINT(1 2)`, so fractional/extreme-magnitude formatting parity with the reference JDBC rendering was unverified despite the PR claiming a corpus check.
   **Rule:** When the kernel takes ownership of rendering numeric values to text (e.g. WKT coordinates), test fractional and very-large/very-small magnitudes for digit-for-digit parity with the reference driver — integer-only cases do not lock the formatting contract (trailing zeros, precision, scientific-notation avoidance).
 
+### 2026-10-01: learnings since 2026-09-30T07:38:45Z
+- **Context:** PR #373 fixed `list_functions` so an empty `catalog` is forwarded to native `GetFunctions` (via `Identifier::new_allow_empty`), whereas schema/column metadata calls still turn an empty catalog into an empty match-nothing pattern.
+  **Rule:** Empty-catalog semantics are per-metadata-call, not uniform — native `GetFunctions` accepts `catalog=""` as a meaningful value, so don't blanket-apply the match-nothing empty-catalog rule across all metadata entrypoints; use `Identifier::new_allow_empty` only where the protocol defines empty-catalog behavior.
+- **Context:** In PR #373 the empty-catalog fix was applied only to the napi binding; a reviewer flagged that the pyo3 `functions()` binding still used `Identifier::from_opt`, so a Python caller passing `catalog=""` errors while Node returns native results — the napi module doc even claims it "follows the pyo3 binding pattern."
+  **Rule:** Parameter-validation/mapping changes to one language binding (napi) must be mirrored in the sibling binding (pyo3) or they silently diverge on contract; when landing a binding-only fix, explicitly track the parity follow-up rather than leaving the bindings inconsistent.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
