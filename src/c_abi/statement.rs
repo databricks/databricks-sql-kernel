@@ -956,7 +956,7 @@ pub unsafe extern "C" fn kernel_executed_async_statement_status(
     // that run on the caller thread outside block_on_ffi's future guard
     // (a panic there would be UB); it also clears the thread-local error.
     catch_ffi(|| {
-        let Some(handle) = (exec as *mut ExecutedAsyncHandle).as_mut() else {
+        let Some(handle) = (exec as *mut ExecutedAsyncHandle).as_ref() else {
             return store_invalid_arg(
                 "kernel_executed_async_statement_status: exec must not be null",
             );
