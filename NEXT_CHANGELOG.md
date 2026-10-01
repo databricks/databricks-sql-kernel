@@ -20,10 +20,16 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Added typed client-side `GEOMETRY` / `GEOGRAPHY` result representation
   selection. String mode renders the native WKB as EWKT locally; binary mode
   retains the tagged Arrow struct. No representation setting is sent to SEA.
+- Add authenticated connector-service feature flags with a bounded,
+  process-wide workspace cache and kernel-internal typed readers for all six
+  SAFE types.
 
 ### Changed
 
 - Route function metadata through the Thrift-native metadata path when supported by the server.
+
+- Feature flags are fetched after kernel authentication and before session
+  creation; sessions read process-cache values instead of retaining snapshots.
 
 ### Updated
 
