@@ -930,6 +930,80 @@ async fn await_result_client_query_timeout_fires_on_hung_status_poll() {
     );
 }
 
+/// Companion to `await_result_client_query_timeout_fires_on_hung_status_poll`,
+/// pinning the OTHER `tokio::time::timeout_at` exit on the submit path: the
+/// mid-*submit* deadline-expiry branch, where the `POST /statements` RPC itself
+/// hangs past the deadline. This branch has distinct observable behavior from
+/// the status-poll exit: because `cancel_state.observe` runs only after `submit`
+/// resolves, a timeout before that leaves the statement id unknown, so the
+/// surfaced `Timeout`/`HYT00` error carries a `None` query id and NO server-side
+/// cancel/close is scheduled (there is no id to target). The same `set_delay`
+/// technique as the status-poll test covers it — delay the `POST /statements`
+/// past the deadline so `timeout_at` wins.
+#[tokio::test]
+async fn submit_with_timeout_client_query_timeout_fires_on_hung_submit() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // The submit POST hangs for 8s — far longer than the 300ms deadline —
+    // so the only way out is the mid-submit `timeout_at` RPC-expiry branch.
+    // The response body never matters because the deadline fires first.
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(pending_body("stmt-hung-submit"))
+                .set_delay(std::time::Duration::from_secs(8)),
+        )
+        .mount(&server)
+        .await;
+    // Mount a cancel endpoint so that, if the kernel erroneously tried to
+    // cancel, the request would be recorded (and the negative assertion
+    // below would catch it).
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-hung-submit/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let err = match stmt
+        .submit_with_timeout(std::time::Duration::from_millis(300))
+        .await
+    {
+        Ok(_) => panic!("submit_with_timeout must time out when the submit POST hangs"),
+        Err(e) => e,
+    };
+    assert_eq!(err.code, ErrorCode::Timeout);
+    assert_eq!(err.sql_state.as_deref(), Some("HYT00"));
+    // No statement id was observed before the deadline fired, so the error
+    // carries no query id — distinct from the status-poll exit.
+    assert_eq!(
+        err.query_id, None,
+        "mid-submit timeout cannot know the server statement id, so query_id must be None"
+    );
+
+    // Because the id is unknown, no best-effort cancel/close can be scheduled.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let cancel_calls = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|req| {
+            req.method == wiremock::http::Method::POST && req.url.path().ends_with("/cancel")
+        })
+        .count();
+    assert_eq!(
+        cancel_calls, 0,
+        "mid-submit timeout has no id to target, so no cancel_statement should fire; got {cancel_calls}"
+    );
+}
+
 // ─── Extended SEA status fields on the async handle (PR #23) ────────
 //
 // The accessors `num_modified_rows()` / `display_message()` /
