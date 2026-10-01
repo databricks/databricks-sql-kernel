@@ -151,6 +151,22 @@ pub enum StatementState {
     Closed,
 }
 
+impl StatementState {
+    /// Whether this is a terminal state — the server has reached a
+    /// final outcome and will not transition further. Used to latch
+    /// the "terminal observed" flag so a retained client deadline
+    /// stops governing a handle once its statement has finished.
+    pub(crate) fn is_terminal(self) -> bool {
+        matches!(
+            self,
+            StatementState::Succeeded
+                | StatementState::Failed
+                | StatementState::Canceled
+                | StatementState::Closed
+        )
+    }
+}
+
 /// Error information from the service.
 #[derive(Debug, Clone, Deserialize)]
 pub struct ServiceError {
