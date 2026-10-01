@@ -631,10 +631,20 @@ impl ExecutedAsyncStatement {
 
             loop {
                 self.valid.check()?;
-                if self.client_timeout_expired.load(Ordering::Acquire)
-                    || self
-                        .client_deadline
-                        .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                // The client deadline governs only the pre-terminal
+                // window. Once this handle has observed a terminal state
+                // (here or via a prior `status()` / initial-submit
+                // snapshot), stop enforcing the deadline so we proceed to
+                // materialise the finished result instead of masking it
+                // with a `Timeout`/`HYT00` and firing a wasted
+                // cancel+close against an already-finished statement —
+                // mirrors the `enforce_deadline` gating in `status()`.
+                let enforce_deadline = !self.terminal_observed.load(Ordering::Acquire);
+                if enforce_deadline
+                    && (self.client_timeout_expired.load(Ordering::Acquire)
+                        || self
+                            .client_deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline))
                 {
                     if let Some(g) = cancel_guard.take() {
                         g.defuse();
@@ -647,7 +657,7 @@ impl ExecutedAsyncStatement {
                     .transport()
                     .statement_status(&self.statement_id, self.session_attribution());
                 let response = match self.client_deadline {
-                    Some(deadline) => {
+                    Some(deadline) if enforce_deadline => {
                         let poll_deadline = deadline
                             .checked_add(
                                 crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE,
@@ -668,7 +678,7 @@ impl ExecutedAsyncStatement {
                             }
                         }
                     }
-                    None => poll.await?,
+                    _ => poll.await?,
                 };
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
@@ -713,9 +723,10 @@ impl ExecutedAsyncStatement {
                         return Err(error);
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
-                        if self
-                            .client_deadline
-                            .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        if enforce_deadline
+                            && self
+                                .client_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
                         {
                             if let Some(g) = cancel_guard.take() {
                                 g.defuse();
