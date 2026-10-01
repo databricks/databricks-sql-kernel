@@ -23,9 +23,10 @@
 //! involved (metadata calls don't use the mutable `Statement` path).
 //!
 //! Parameter mapping from JS strings to kernel newtypes follows the
-//! pyo3 binding pattern. Empty exact catalog filters become empty
-//! patterns (match nothing); other validation remains kernel-owned and
-//! surfaces as `InvalidArgument` through the standard error envelope.
+//! pyo3 binding pattern. Empty catalog filters for schemas and columns
+//! become empty patterns (match nothing); functions pass an empty catalog
+//! through to native `GetFunctions`. Other validation remains kernel-owned
+//! and surfaces as `InvalidArgument` through the standard error envelope.
 //!
 //! ## `!Send` future workaround
 //!
@@ -226,8 +227,8 @@ impl Connection {
         .await
     }
 
-    /// Functions visible to the session. `catalog` is exact;
-    /// `schemaPattern` and `functionPattern` are SQL LIKE.
+    /// Functions visible to the session. An empty `catalog` is forwarded to
+    /// SEA for native `GetFunctions`; `schemaPattern` and `functionPattern` are SQL LIKE.
     #[napi]
     pub async fn list_functions(
         &self,
@@ -238,7 +239,10 @@ impl Connection {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = Identifier::from_opt(&catalog)?;
+                let cat = catalog
+                    .as_deref()
+                    .map(Identifier::new_allow_empty)
+                    .transpose()?;
                 let sch = LikePattern::from_opt(&schema_pattern)?;
                 let nam = LikePattern::from_opt(&function_pattern)?;
                 meta.functions(cat, sch, nam).await

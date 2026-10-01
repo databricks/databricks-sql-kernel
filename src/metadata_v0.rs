@@ -347,6 +347,17 @@ impl<'a> Identifier<'a> {
         Ok(Self(s))
     }
 
+    /// Allow `""` for metadata calls with protocol-specific empty catalog
+    /// semantics, such as Thrift `GetFunctions`. Nonempty names use the
+    /// standard identifier validation.
+    pub fn new_allow_empty(s: &'a str) -> Result<Self> {
+        if s.is_empty() {
+            Ok(Self(s))
+        } else {
+            Self::new(s)
+        }
+    }
+
     /// Construct from an optional borrowed string.
     ///
     /// Maps `None` to `Ok(None)` ("not supplied" — e.g. ODBC-style
@@ -1344,8 +1355,8 @@ impl Metadata {
         Self::finish_metadata_call(telemetry, result)
     }
 
-    /// Functions visible to the session. Catalog is exact; schema /
-    /// name are patterns.
+    /// Functions visible to the session. Catalog is exact, except that
+    /// native `GetFunctions` accepts an empty catalog; schema / name are patterns.
     ///
     /// SQL fallback shape (`SHOW FUNCTIONS IN CATALOG ...`):
     /// `functionName, namespace, catalogName, remarks, functionType,
@@ -1836,6 +1847,14 @@ mod tests {
         let input = Some("  ".to_owned());
         let err = Identifier::from_opt(&input).unwrap_err();
         assert_eq!(err.code, ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn identifier_empty_opt_out_preserves_default_validation() {
+        let input = Some(String::new());
+        assert_eq!(Identifier::new_allow_empty("").unwrap().as_str(), "");
+        assert!(Identifier::from_opt(&input).is_err());
+        assert!(Identifier::new_allow_empty("  ").is_err());
     }
 
     #[test]

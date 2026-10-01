@@ -469,12 +469,24 @@ async fn native_columns_zero_based_ordinal_is_one_based() {
 
 #[tokio::test]
 async fn native_functions_header_and_result_match_jdbc() {
-    for (catalog, expected_sql, expected_catalog) in [
-        (None, "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'", None),
+    for (catalog, name_pattern, expected_sql, expected_catalog) in [
+        (
+            None,
+            None,
+            "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
+            None,
+        ),
         (
             Some("main"),
+            None,
             "SHOW FUNCTIONS IN CATALOG `main` LIKE '*'",
             Some("main"),
+        ),
+        (
+            Some(""),
+            Some("answer"),
+            "SHOW FUNCTIONS IN CATALOG `` LIKE 'answer'",
+            Some(""),
         ),
     ] {
         let server = MockServer::start().await;
@@ -522,10 +534,11 @@ async fn native_functions_header_and_result_match_jdbc() {
             .await;
 
         let session = open_session(&server).await;
-        let catalog = catalog.map(|catalog| Identifier::new(catalog).unwrap());
+        let catalog = catalog.map(|catalog| Identifier::new_allow_empty(catalog).unwrap());
+        let name_pattern = name_pattern.map(|pattern| LikePattern::new(pattern).unwrap());
         let mut stream = session
             .metadata()
-            .functions(catalog, None, None)
+            .functions(catalog, None, name_pattern)
             .await
             .expect("native list_functions");
         assert_eq!(
@@ -541,6 +554,15 @@ async fn native_functions_header_and_result_match_jdbc() {
         );
 
         let batches = drain_stream(&mut stream).await;
+        assert_eq!(batches[0].num_rows(), 1);
+        assert_eq!(
+            batches[0]
+                .column_by_name("FUNCTION_NAME")
+                .unwrap()
+                .as_string::<i32>()
+                .value(0),
+            "answer"
+        );
         let function_catalog = batches[0]
             .column_by_name("FUNCTION_CAT")
             .unwrap()
