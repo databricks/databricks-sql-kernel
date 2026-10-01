@@ -550,10 +550,7 @@ impl Statement {
                 // the first poll.
                 response.status,
                 telemetry_for_body,
-                match timeout {
-                    ExecutionTimeout::Deadline(deadline) => Some(deadline),
-                    ExecutionTimeout::Default | ExecutionTimeout::Unlimited => None,
-                },
+                timeout,
             ))
         }
         .instrument(span)
@@ -679,7 +676,7 @@ impl Statement {
                         closed,
                         resp.status,
                         telemetry_for_body,
-                        None,
+                        ExecutionTimeout::Default,
                     )))
                 }
             }

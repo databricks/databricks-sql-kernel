@@ -44,7 +44,7 @@
 //! class) can route through whichever handle their language idiom
 //! prefers; field availability is identical.
 
-use crate::client::{ExecuteResponse, SessionAttribution};
+use crate::client::{ExecuteResponse, ExecutionTimeout, SessionAttribution};
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -224,7 +224,33 @@ pub struct ExecutedAsyncStatement {
     result_stream_owns_success_telemetry: AtomicBool,
     /// Absolute execution deadline retained across caller-driven polls.
     client_deadline: Option<std::time::Instant>,
+    /// When `true`, the caller explicitly disabled the client timeout
+    /// (`ExecutionTimeout::Unlimited`), so the poll loop must NOT fall
+    /// back to the transport's default `poll_timeout` ceiling. Mirrors
+    /// the sync `wait_for_terminal` gating, which only applies that
+    /// ceiling under `ExecutionTimeout::Default`. Without this, an
+    /// "unlimited" submit still dies at the 600s default poll_timeout.
+    poll_timeout_disabled: bool,
     client_timeout_expired: AtomicBool,
+}
+
+/// Map an [`ExecutionTimeout`] onto the async handle's two deadline
+/// knobs: `(client_deadline, poll_timeout_disabled)`.
+///
+/// Mirrors the sync `wait_for_terminal` gating so the two consumption
+/// modes agree on what "unlimited" means:
+/// - `Deadline` → retain an absolute client deadline; the transport's
+///   `poll_timeout` ceiling is irrelevant (the deadline fires first).
+/// - `Unlimited` → no client deadline AND bypass the `poll_timeout`
+///   ceiling, so an explicitly-unlimited submit does not silently die
+///   at the 600s default.
+/// - `Default` → no client deadline, keep the `poll_timeout` ceiling.
+fn deadline_policy(timeout: ExecutionTimeout) -> (Option<std::time::Instant>, bool) {
+    match timeout {
+        ExecutionTimeout::Deadline(deadline) => (Some(deadline), false),
+        ExecutionTimeout::Unlimited => (None, true),
+        ExecutionTimeout::Default => (None, false),
+    }
 }
 
 impl ExecutedAsyncStatement {
@@ -264,6 +290,13 @@ impl ExecutedAsyncStatement {
     /// return useful values even before the caller drives a single
     /// `status()` / `await_result()` poll (e.g. when the server
     /// already finished by the time `submit` returned).
+    ///
+    /// `timeout` selects the handle's deadline policy, mirroring the
+    /// sync `wait_for_terminal` gating: `Deadline` retains an absolute
+    /// client deadline across polls; `Unlimited` disables BOTH that
+    /// deadline and the transport's default `poll_timeout` ceiling;
+    /// `Default` keeps the `poll_timeout` ceiling with no client
+    /// deadline.
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
@@ -271,8 +304,9 @@ impl ExecutedAsyncStatement {
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
         statement_telemetry: StatementTelemetry,
-        client_deadline: Option<std::time::Instant>,
+        timeout: ExecutionTimeout,
     ) -> Self {
+        let (client_deadline, poll_timeout_disabled) = deadline_policy(timeout);
         Self {
             session,
             statement_id,
@@ -284,6 +318,7 @@ impl ExecutedAsyncStatement {
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
+            poll_timeout_disabled,
             client_timeout_expired: AtomicBool::new(false),
         }
     }
@@ -320,6 +355,7 @@ impl ExecutedAsyncStatement {
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,
+            poll_timeout_disabled: false,
             client_timeout_expired: AtomicBool::new(false),
         }
     }
@@ -643,7 +679,7 @@ impl ExecutedAsyncStatement {
                             }
                             return Err(self.expire_client_query_timeout());
                         }
-                        if start.elapsed() > cfg.poll_timeout {
+                        if !self.poll_timeout_disabled && start.elapsed() > cfg.poll_timeout {
                             // Internal poll-timeout: we asked to wait,
                             // we gave up. Leave the cancel guard armed
                             // so the server stops charging DBUs on the
@@ -1043,5 +1079,31 @@ mod tests {
         assert_eq!(StatementStatus::Closed.as_str(), "Closed");
         let failed = StatementStatus::Failed(Error::sql_error().message("boom"));
         assert_eq!(failed.as_str(), "Failed");
+    }
+
+    #[test]
+    fn deadline_policy_mirrors_sync_timeout_gating() {
+        // Default: no client deadline, poll_timeout ceiling stays on.
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Default),
+            (None, false),
+            "Default must keep the transport poll_timeout ceiling"
+        );
+        // Unlimited: no client deadline AND the poll_timeout ceiling is
+        // bypassed — regression guard for an explicitly-unlimited submit
+        // silently dying at the 600s default poll_timeout.
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Unlimited),
+            (None, true),
+            "Unlimited must disable the poll_timeout ceiling"
+        );
+        // Deadline: retains the absolute client deadline; the ceiling is
+        // left on but is moot because the deadline fires first.
+        let deadline = std::time::Instant::now();
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Deadline(deadline)),
+            (Some(deadline), false),
+            "Deadline must retain the client deadline"
+        );
     }
 }
