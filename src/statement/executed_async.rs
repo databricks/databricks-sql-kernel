@@ -239,15 +239,22 @@ pub struct ExecutedAsyncStatement {
 ///
 /// Mirrors the sync `wait_for_terminal` gating so the two consumption
 /// modes agree on what "unlimited" means:
-/// - `Deadline` → retain an absolute client deadline; the transport's
-///   `poll_timeout` ceiling is irrelevant (the deadline fires first).
+/// - `Deadline` → retain an absolute client deadline AND bypass the
+///   `poll_timeout` ceiling: the client deadline *is* the ceiling. The
+///   sync path only applies `poll_timeout` under `Default`, so a
+///   `Deadline` runs to the full client deadline even when it exceeds
+///   the 600s default `poll_timeout` (`MAX_CLIENT_QUERY_TIMEOUT_MS`
+///   permits deadlines far beyond 600s). Leaving the ceiling armed here
+///   would abort such a query at 600s with the generic internal
+///   poll-timeout error instead of the caller's deadline firing with
+///   the `Timeout`/`HYT00` client-query-timeout error.
 /// - `Unlimited` → no client deadline AND bypass the `poll_timeout`
 ///   ceiling, so an explicitly-unlimited submit does not silently die
 ///   at the 600s default.
 /// - `Default` → no client deadline, keep the `poll_timeout` ceiling.
 fn deadline_policy(timeout: ExecutionTimeout) -> (Option<std::time::Instant>, bool) {
     match timeout {
-        ExecutionTimeout::Deadline(deadline) => (Some(deadline), false),
+        ExecutionTimeout::Deadline(deadline) => (Some(deadline), true),
         ExecutionTimeout::Unlimited => (None, true),
         ExecutionTimeout::Default => (None, false),
     }
@@ -1097,13 +1104,18 @@ mod tests {
             (None, true),
             "Unlimited must disable the poll_timeout ceiling"
         );
-        // Deadline: retains the absolute client deadline; the ceiling is
-        // left on but is moot because the deadline fires first.
+        // Deadline: retains the absolute client deadline AND bypasses the
+        // poll_timeout ceiling — the client deadline *is* the ceiling.
+        // Regression guard: MAX_CLIENT_QUERY_TIMEOUT_MS permits deadlines
+        // far beyond the 600s default poll_timeout, so leaving the ceiling
+        // armed would abort such a query at 600s with the generic internal
+        // poll-timeout error instead of the caller's deadline firing. The
+        // sync wait_for_terminal only applies poll_timeout under Default.
         let deadline = std::time::Instant::now();
         assert_eq!(
             deadline_policy(ExecutionTimeout::Deadline(deadline)),
-            (Some(deadline), false),
-            "Deadline must retain the client deadline"
+            (Some(deadline), true),
+            "Deadline must retain the client deadline AND disable the poll_timeout ceiling"
         );
     }
 }
