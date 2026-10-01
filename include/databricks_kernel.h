@@ -746,7 +746,11 @@ KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
  * deadline starts on entry and is retained by the returned async handle across
  * status polls. If it expires before a terminal status is observed, status
  * returns Timeout with SQLSTATE HYT00 and the kernel schedules best-effort
- * cancel/close cleanup. Result fetching is outside this deadline. */
+ * cancel/close cleanup. One exception: if the deadline fires DURING the initial
+ * submit round-trip (before the server returns a statement id), no id is known
+ * yet, so no cancel/close can be scheduled; a statement the server may have
+ * created is left for session-close to reclaim. This window is small because
+ * submit uses wait_timeout=0s. Result fetching is outside this deadline. */
 KernelStatusCode kernel_statement_submit_with_timeout_ms(
     kernel_statement_t* stmt, uint64_t timeout_ms,
     kernel_executed_async_statement_t** out);

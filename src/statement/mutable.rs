@@ -500,6 +500,21 @@ impl Statement {
                     {
                         Ok(result) => result?,
                         Err(_) => {
+                            // Mid-submit deadline expiry. The server statement
+                            // id is unknown here: `cancel_state.observe` runs
+                            // only once `submit` resolves, so a timeout before
+                            // that leaves `observed_id` as `None`. Dropping the
+                            // `submit` future therefore cannot schedule any
+                            // server-side cancel/close — if the POST already
+                            // reached the server and created a statement, that
+                            // statement is leaked until session close reclaims
+                            // it. This is inherent (no id to target) and the
+                            // window is small because submit uses
+                            // `wait_timeout=0s`; the "best-effort cancel/close
+                            // cleanup on expiry" contract in the header is only
+                            // fully honored on the status path, where an id has
+                            // already been observed. We pass `None` as the
+                            // query id for the same reason.
                             return Err(crate::statement::timeout::client_query_timeout_error(
                                 None,
                             ));
