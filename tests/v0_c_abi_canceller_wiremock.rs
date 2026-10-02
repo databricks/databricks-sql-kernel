@@ -68,8 +68,8 @@ use databricks_sql_kernel::c_abi::statement::{
     kernel_statement_canceller_cancel, kernel_statement_canceller_free,
     kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
     kernel_statement_execute, kernel_statement_execute_with_timeout_ms, kernel_statement_set_sql,
-    kernel_statement_submit, kernel_statement_t, KernelStatementStatusKind,
-    MAX_CLIENT_QUERY_TIMEOUT_MS,
+    kernel_statement_submit, kernel_statement_submit_with_timeout_ms, kernel_statement_t,
+    KernelStatementStatusKind, MAX_CLIENT_QUERY_TIMEOUT_MS,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -165,6 +165,179 @@ fn async_c_abi_submit_poll_and_materialise() {
         assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
         assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
     }
+}
+
+#[test]
+fn async_c_abi_query_timeout_expires_across_status_polls() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-timeout")))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-timeout"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-timeout")))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-timeout/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_submit_with_timeout_ms(stmt, 25, &mut exec),
+            KernelStatusCode::Success
+        );
+        std::thread::sleep(Duration::from_millis(40));
+
+        let mut status = KernelStatementStatusKind::Running;
+        assert_eq!(
+            kernel_executed_async_statement_status(exec, &mut status),
+            KernelStatusCode::Timeout
+        );
+        assert_eq!(status, KernelStatementStatusKind::Pending);
+
+        let mut raw_error = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(kernel_get_last_error(raw_error.as_mut_ptr()));
+        let raw_error = raw_error.assume_init();
+        assert_eq!(raw_error.code, KernelStatusCode::Timeout as i32);
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.sql_state)
+                .to_str()
+                .unwrap(),
+            "HYT00"
+        );
+        assert_eq!(
+            std::ffi::CStr::from_ptr(raw_error.query_id)
+                .to_str()
+                .unwrap(),
+            "stmt-timeout"
+        );
+
+        assert_eq!(
+            kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+/// Boundary contract for `kernel_statement_submit_with_timeout_ms`, mirroring
+/// the sibling `kernel_statement_execute_with_timeout_ms` boundary test: a
+/// timeout above `MAX_CLIENT_QUERY_TIMEOUT_MS` is rejected with
+/// `InvalidArgument` without a submit RPC, while `MAX_CLIENT_QUERY_TIMEOUT_MS`
+/// and `0` are accepted. Locks the documented contract on the submit surface.
+#[test]
+fn async_c_abi_submit_timeout_rejects_oversized_and_accepts_boundaries() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-submit-bnd")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-submit-bnd"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-submit-bnd")),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-submit-bnd/cancel"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec = std::ptr::dangling_mut::<kernel_executed_async_statement_t>();
+        assert_eq!(
+            kernel_statement_submit_with_timeout_ms(
+                stmt,
+                MAX_CLIENT_QUERY_TIMEOUT_MS + 1,
+                &mut exec
+            ),
+            KernelStatusCode::InvalidArgument
+        );
+        assert!(
+            exec.is_null(),
+            "the C output must be null on InvalidArgument"
+        );
+
+        for timeout_ms in [MAX_CLIENT_QUERY_TIMEOUT_MS, 0] {
+            let mut exec: *mut kernel_executed_async_statement_t = std::ptr::null_mut();
+            assert_eq!(
+                kernel_statement_submit_with_timeout_ms(stmt, timeout_ms, &mut exec),
+                KernelStatusCode::Success
+            );
+            assert!(!exec.is_null());
+            assert_eq!(
+                kernel_executed_async_statement_close(exec),
+                KernelStatusCode::Success
+            );
+        }
+
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+
+    let submit_posts = rt.block_on(async {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|request| {
+                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/statements"
+            })
+            .count()
+    });
+    assert_eq!(
+        submit_posts, 2,
+        "the oversized timeout must be rejected without a submit RPC"
+    );
 }
 
 /// A submitted statement that the server reports as `FAILED` on the first

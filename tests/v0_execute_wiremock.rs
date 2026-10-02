@@ -2372,6 +2372,76 @@ async fn client_timeout_is_cumulative_across_retry_backoff() {
 }
 
 #[tokio::test]
+async fn status_after_observed_terminal_ignores_client_deadline() {
+    // Regression: once `status()` has observed a terminal state, the
+    // retained client deadline must stop governing the handle. A later
+    // `status()` past the deadline must return the terminal state
+    // (not Timeout/HYT00) and must NOT fire a cancel/close against the
+    // already-finished statement. The deadline covers only "initial
+    // submit through observed terminal status".
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    // Submit returns RUNNING (wait_timeout=0s), so the handle starts
+    // pre-terminal with the client deadline armed.
+    mount_execute(&server, running_body("stmt-latch-terminal")).await;
+    // Every status poll reports SUCCEEDED.
+    mount_status(
+        &server,
+        "stmt-latch-terminal",
+        json!({
+            "statement_id": "stmt-latch-terminal",
+            "status": { "state": "SUCCEEDED" },
+        })
+        .to_string(),
+    )
+    .await;
+    // A cancel must never fire; mount it so an erroneous POST would be
+    // observable (and would otherwise 404).
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-latch-terminal/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let async_exec = stmt
+        .submit_with_timeout(Duration::from_millis(100))
+        .await
+        .expect("submit returns a handle");
+
+    // First poll observes the terminal SUCCEEDED (within the deadline).
+    let first = async_exec.status().await.expect("first status");
+    assert_eq!(first.as_str(), "Succeeded");
+
+    // Let the client deadline elapse, then poll again. The latch must
+    // make this return SUCCEEDED rather than the client-query-timeout.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let second = async_exec
+        .status()
+        .await
+        .expect("terminal status must survive the elapsed deadline");
+    assert_eq!(second.as_str(), "Succeeded");
+
+    // No cancel RPC may have been dispatched against the finished query.
+    let cancels = server
+        .received_requests()
+        .await
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| {
+            r.method == wiremock::http::Method::POST
+                && r.url.path() == "/api/2.0/sql/statements/stmt-latch-terminal/cancel"
+        })
+        .count();
+    assert_eq!(cancels, 0, "a finished statement must not be cancelled");
+}
+
+#[tokio::test]
 async fn terminal_error_mapping_is_inside_the_client_timeout_phase() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

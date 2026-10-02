@@ -740,6 +740,21 @@ KernelStatusCode kernel_statement_execute_with_timeout_ms(
 KernelStatusCode kernel_statement_submit(kernel_statement_t* stmt,
                                          kernel_executed_async_statement_t** out);
 
+/* Submit-and-return with a client-side execution deadline in milliseconds.
+ * Zero selects unlimited execution; values above
+ * DATABRICKS_KERNEL_MAX_CLIENT_QUERY_TIMEOUT_MS return InvalidArgument. The
+ * deadline starts on entry and is retained by the returned async handle across
+ * status polls. If it expires before a terminal status is observed, status
+ * returns Timeout with SQLSTATE HYT00 and the kernel schedules best-effort
+ * cancel/close cleanup. One exception: if the deadline fires DURING the initial
+ * submit round-trip (before the server returns a statement id), no id is known
+ * yet, so no cancel/close can be scheduled; a statement the server may have
+ * created is left for session-close to reclaim. This window is small because
+ * submit uses wait_timeout=0s. Result fetching is outside this deadline. */
+KernelStatusCode kernel_statement_submit_with_timeout_ms(
+    kernel_statement_t* stmt, uint64_t timeout_ms,
+    kernel_executed_async_statement_t** out);
+
 /*
  * Free the statement lifecycle owner. Does NOT free executed-handle
  * boxes — each executed handle is a separate allocation that you must
