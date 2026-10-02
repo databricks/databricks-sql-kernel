@@ -132,7 +132,6 @@ pub use config::{
     LoggingConfig, ProxyConfig, ResultConfig, SessionConfig, TelemetryConfig, TlsConfig,
     TokenCacheConfig, TransportMode,
 };
-pub use feature_flags::{ClientIdentity, ClientType};
 pub use kernel_error::{Error, ErrorCode, Result};
 /// The `tracing` target string stamped on every kernel log event.
 /// Binding crates (pyo3, napi) reference this constant directly so the

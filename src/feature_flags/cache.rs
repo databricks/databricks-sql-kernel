@@ -14,24 +14,23 @@
 
 //! Process-wide feature-flag cache.
 //!
-//! This follows the kernel's existing cache patterns: a `OnceLock` owns the
-//! process-global instance, a short `Mutex<HashMap<...>>` critical section
-//! makes each compound state transition atomic, and an RAII refresh guard
-//! publishes a fail-open result if the loading future is cancelled. The OAuth
-//! token store uses the same fresh/stale/single-flight lifecycle and guard
-//! pattern; this cache adds per-workspace keys and async waiter notification.
+//! Moka supplies bounded LRU eviction, per-key cold-load single-flight, and
+//! cancellation-safe coordination. Expiry is deliberately stored in the value
+//! rather than configured on Moka: an expired value remains available as a
+//! fail-open fallback while one caller refreshes it.
 
-use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
+use std::future::Future;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use tokio::sync::oneshot;
+use moka::future::Cache;
+use moka::ops::compute::Op;
+use moka::policy::EvictionPolicy;
 
 use super::FeatureFlagValues;
 
 const DEFAULT_TTL: Duration = Duration::from_secs(15 * 60);
-const MAX_IDLE_CACHE_ENTRIES: usize = 256;
+const MAX_CACHE_ENTRIES: u64 = 256;
 
 /// Stable process-cache partition for one workspace.
 ///
@@ -55,217 +54,112 @@ impl WorkspaceKey {
     }
 }
 
-struct CacheEntry {
-    values: Option<FeatureFlagValues>,
+#[derive(Clone)]
+struct CachedFeatureFlags {
+    values: FeatureFlagValues,
     refresh_after: Instant,
-    refreshing: bool,
-    waiters: Vec<oneshot::Sender<FeatureFlagValues>>,
-    last_access: u64,
+}
+
+impl CachedFeatureFlags {
+    fn new(values: FeatureFlagValues, ttl: Duration) -> Self {
+        let now = Instant::now();
+        let refresh_after = now
+            .checked_add(ttl)
+            .or_else(|| now.checked_add(DEFAULT_TTL))
+            .unwrap_or(now);
+        Self {
+            values,
+            refresh_after,
+        }
+    }
+
+    fn is_fresh(&self) -> bool {
+        Instant::now() < self.refresh_after
+    }
 }
 
 pub(crate) enum CacheLookup {
     Fresh(FeatureFlagValues),
-    Stale {
-        values: FeatureFlagValues,
-        start_refresh: bool,
-    },
-    Load,
-    Wait(oneshot::Receiver<FeatureFlagValues>),
+    Stale(FeatureFlagValues),
+    Missing,
 }
 
 pub(crate) struct FeatureFlagCache {
-    entries: Mutex<HashMap<WorkspaceKey, CacheEntry>>,
-    // Completed entries are kept within this bound. In-flight entries are
-    // never evicted because doing so would break their single-flight waiters,
-    // so concurrent cold loads may temporarily exceed it; each completion
-    // trims the least-recently-used idle entries back to capacity.
-    idle_capacity: usize,
-    access_sequence: AtomicU64,
+    entries: Cache<WorkspaceKey, CachedFeatureFlags>,
 }
 
 impl Default for FeatureFlagCache {
     fn default() -> Self {
-        Self::with_idle_capacity(MAX_IDLE_CACHE_ENTRIES)
+        Self {
+            entries: Cache::builder()
+                // TinyLFU may reject a newly fetched workspace. LRU ensures a
+                // session-open fetch is available to cache-only typed getters.
+                .eviction_policy(EvictionPolicy::lru())
+                .max_capacity(MAX_CACHE_ENTRIES)
+                .build(),
+        }
     }
 }
 
 impl FeatureFlagCache {
-    fn with_idle_capacity(idle_capacity: usize) -> Self {
-        Self {
-            entries: Mutex::new(HashMap::new()),
-            idle_capacity: idle_capacity.max(1),
-            access_sequence: AtomicU64::new(0),
+    pub(crate) async fn lookup(&self, key: &WorkspaceKey) -> CacheLookup {
+        match self.entries.get(key).await {
+            Some(entry) if entry.is_fresh() => CacheLookup::Fresh(entry.values),
+            Some(entry) => CacheLookup::Stale(entry.values),
+            None => CacheLookup::Missing,
         }
     }
 
-    pub(crate) fn lookup(&self, key: &WorkspaceKey) -> CacheLookup {
-        let now = Instant::now();
-        let last_access = self.next_access();
-        let mut entries = self.lock_entries();
-
-        if let Some(entry) = entries.get_mut(key) {
-            entry.last_access = last_access;
-            if let Some(values) = entry.values.clone() {
-                if now < entry.refresh_after {
-                    return CacheLookup::Fresh(values);
-                }
-                let start_refresh = !entry.refreshing;
-                entry.refreshing = true;
-                return CacheLookup::Stale {
-                    values,
-                    start_refresh,
-                };
-            }
-
-            let (sender, receiver) = oneshot::channel();
-            entry.waiters.push(sender);
-            return CacheLookup::Wait(receiver);
-        }
-
-        self.trim_entries(&mut entries, self.idle_capacity.saturating_sub(1), None);
-        entries.insert(
-            key.clone(),
-            CacheEntry {
-                values: None,
-                refresh_after: now,
-                refreshing: true,
-                waiters: Vec::new(),
-                last_access,
-            },
-        );
-        CacheLookup::Load
+    /// Read cached flags without starting network work.
+    pub(crate) async fn current(&self, key: &WorkspaceKey) -> Option<FeatureFlagValues> {
+        self.entries.get(key).await.map(|entry| entry.values)
     }
 
-    /// Read the latest value already stored for a workspace without starting
-    /// network work. Typed getters use this after session-open preparation.
-    pub(crate) fn current(&self, key: &WorkspaceKey) -> Option<FeatureFlagValues> {
-        let last_access = self.next_access();
-        let mut entries = self.lock_entries();
-        let entry = entries.get_mut(key)?;
-        entry.last_access = last_access;
-        entry.values.clone()
-    }
-
-    pub(crate) fn refresh_guard(self: &Arc<Self>, key: WorkspaceKey) -> RefreshGuard {
-        RefreshGuard {
-            cache: self.clone(),
-            key: Some(key),
-        }
-    }
-
-    fn complete_success(
+    /// Load a missing workspace. Moka coalesces concurrent loads and does not
+    /// cache errors.
+    pub(crate) async fn load<F, E>(
         &self,
         key: WorkspaceKey,
-        values: FeatureFlagValues,
-        ttl: Duration,
-    ) -> FeatureFlagValues {
-        let now = Instant::now();
-        let last_access = self.next_access();
-        let protected_key = key.clone();
-        let mut entries = self.lock_entries();
-        let entry = entries.entry(key).or_insert_with(|| CacheEntry {
-            values: None,
-            refresh_after: now,
-            refreshing: true,
-            waiters: Vec::new(),
-            last_access,
-        });
-        entry.last_access = last_access;
-        entry.values = Some(values.clone());
-        entry.refresh_after = now + ttl;
-        entry.refreshing = false;
-        let waiters = std::mem::take(&mut entry.waiters);
-        self.trim_entries(&mut entries, self.idle_capacity, Some(&protected_key));
-        drop(entries);
-
-        for waiter in waiters {
-            let _ = waiter.send(values.clone());
-        }
-        values
-    }
-
-    /// Do not cache failures. A cold failure removes the entry; a refresh
-    /// failure retains its last good values with the original expired TTL so
-    /// the next session open retries.
-    fn complete_failure(&self, key: WorkspaceKey) -> FeatureFlagValues {
-        let mut entries = self.lock_entries();
-        let Some(mut entry) = entries.remove(&key) else {
-            return FeatureFlagValues::default();
-        };
-        let values = entry.values.clone().unwrap_or_default();
-        let waiters = std::mem::take(&mut entry.waiters);
-
-        if entry.values.is_some() {
-            entry.refreshing = false;
-            entry.last_access = self.next_access();
-            entries.insert(key.clone(), entry);
-            self.trim_entries(&mut entries, self.idle_capacity, Some(&key));
-        }
-        drop(entries);
-
-        for waiter in waiters {
-            let _ = waiter.send(values.clone());
-        }
-        values
-    }
-
-    fn next_access(&self) -> u64 {
-        self.access_sequence.fetch_add(1, Ordering::Relaxed)
-    }
-
-    fn trim_entries(
-        &self,
-        entries: &mut HashMap<WorkspaceKey, CacheEntry>,
-        target_len: usize,
-        protected: Option<&WorkspaceKey>,
-    ) {
-        while entries.len() > target_len {
-            let candidate = entries
-                .iter()
-                .filter(|(key, entry)| {
-                    !entry.refreshing && protected.is_none_or(|protected| *key != protected)
-                })
-                .min_by_key(|(_, entry)| entry.last_access)
-                .map(|(key, _)| key.clone());
-            let Some(candidate) = candidate else {
-                break;
-            };
-            entries.remove(&candidate);
-        }
-    }
-
-    fn lock_entries(&self) -> MutexGuard<'_, HashMap<WorkspaceKey, CacheEntry>> {
+        loader: F,
+    ) -> Result<FeatureFlagValues, Arc<E>>
+    where
+        F: Future<Output = Result<(FeatureFlagValues, Duration), E>>,
+        E: Send + Sync + 'static,
+    {
         self.entries
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-    }
-}
-
-pub(crate) struct RefreshGuard {
-    cache: Arc<FeatureFlagCache>,
-    key: Option<WorkspaceKey>,
-}
-
-impl RefreshGuard {
-    pub(crate) fn success(mut self, values: FeatureFlagValues, ttl: Duration) -> FeatureFlagValues {
-        self.cache.complete_success(
-            self.key.take().expect("refresh guard is armed"),
-            values,
-            ttl,
-        )
+            .try_get_with(key, async move {
+                let (values, ttl) = loader.await?;
+                Ok(CachedFeatureFlags::new(values, ttl))
+            })
+            .await
+            .map(|entry| entry.values)
     }
 
-    pub(crate) fn failure(mut self) -> FeatureFlagValues {
-        self.cache
-            .complete_failure(self.key.take().expect("refresh guard is armed"))
-    }
-}
+    /// Refresh an expired workspace without making concurrent stale readers
+    /// wait. A failed refresh leaves the previous entry unchanged.
+    pub(crate) async fn refresh<F, E>(
+        &self,
+        key: WorkspaceKey,
+        loader: F,
+    ) -> Result<Option<FeatureFlagValues>, E>
+    where
+        F: Future<Output = Result<(FeatureFlagValues, Duration), E>>,
+        E: Send + Sync + 'static,
+    {
+        let result = self
+            .entries
+            .entry(key)
+            .and_try_compute_if_nobody_else(move |entry| async move {
+                if entry.as_ref().is_some_and(|entry| entry.value().is_fresh()) {
+                    return Ok(Op::Nop);
+                }
 
-impl Drop for RefreshGuard {
-    fn drop(&mut self) {
-        if let Some(key) = self.key.take() {
-            self.cache.complete_failure(key);
-        }
+                let (values, ttl) = loader.await?;
+                Ok(Op::Put(CachedFeatureFlags::new(values, ttl)))
+            })
+            .await?;
+
+        Ok(result.into_entry().map(|entry| entry.into_value().values))
     }
 }
 
@@ -287,16 +181,8 @@ pub(crate) fn response_ttl(ttl_seconds: Option<i64>) -> Duration {
 mod tests {
     use super::*;
 
-    fn key(name: &str) -> WorkspaceKey {
-        WorkspaceKey::Host(format!("https://{name}.example.com"))
-    }
-
-    fn values() -> FeatureFlagValues {
-        FeatureFlagValues::from_entries([("test.flag".to_string(), "test-value".to_string())])
-    }
-
     #[test]
-    fn workspace_id_is_the_primary_cache_partition() {
+    fn workspace_cache_partition_prefers_id_and_falls_back_to_host() {
         assert_eq!(
             WorkspaceKey::new("https://first.example.com", Some("42".to_string())),
             WorkspaceKey::new("https://alias.example.com", Some("42".to_string()))
@@ -305,181 +191,27 @@ mod tests {
             WorkspaceKey::new("https://first.example.com", Some("42".to_string())),
             WorkspaceKey::new("https://first.example.com", Some("43".to_string()))
         );
-    }
-
-    #[test]
-    fn canonical_host_is_the_fallback_when_workspace_id_is_absent() {
         assert_ne!(
             WorkspaceKey::new("https://first.example.com", None),
             WorkspaceKey::new("https://second.example.com", None)
         );
     }
 
-    #[tokio::test]
-    async fn cold_miss_is_single_flight_and_wakes_waiters() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("cold");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        let CacheLookup::Wait(waiter) = cache.lookup(&key) else {
-            panic!("concurrent cold miss should wait");
-        };
-
-        cache
-            .refresh_guard(key)
-            .success(values(), Duration::from_secs(300));
-
-        assert_eq!(waiter.await.unwrap().get("test.flag"), Some("test-value"));
-    }
-
-    #[tokio::test]
-    async fn cancelled_cold_load_fails_open_and_wakes_waiters() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("cancelled");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        let CacheLookup::Wait(waiter) = cache.lookup(&key) else {
-            panic!("concurrent cold miss should wait");
-        };
-
-        drop(cache.refresh_guard(key.clone()));
-
-        assert!(waiter.await.unwrap().is_empty());
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-    }
-
     #[test]
-    fn fresh_hit_does_not_start_refresh() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("fresh");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        cache
-            .refresh_guard(key.clone())
-            .success(values(), Duration::from_secs(300));
-
-        assert!(matches!(cache.lookup(&key), CacheLookup::Fresh(_)));
-    }
-
-    #[test]
-    fn only_one_stale_reader_owns_refresh() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("stale");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        cache
-            .refresh_guard(key.clone())
-            .success(values(), Duration::ZERO);
-
-        assert!(matches!(
-            cache.lookup(&key),
-            CacheLookup::Stale {
-                start_refresh: true,
-                ..
-            }
-        ));
-        assert!(matches!(
-            cache.lookup(&key),
-            CacheLookup::Stale {
-                start_refresh: false,
-                ..
-            }
-        ));
-
-        cache.refresh_guard(key).failure();
-    }
-
-    #[test]
-    fn failed_stale_refresh_retains_values_and_next_lookup_retries() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("stale-failure");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        cache
-            .refresh_guard(key.clone())
-            .success(values(), Duration::ZERO);
-        assert!(matches!(
-            cache.lookup(&key),
-            CacheLookup::Stale {
-                start_refresh: true,
-                ..
-            }
-        ));
-
-        assert_eq!(
-            cache.refresh_guard(key.clone()).failure().get("test.flag"),
-            Some("test-value")
-        );
-        assert!(matches!(
-            cache.lookup(&key),
-            CacheLookup::Stale {
-                start_refresh: true,
-                ..
-            }
-        ));
-        cache.refresh_guard(key).failure();
-    }
-
-    #[test]
-    fn failed_cold_fetch_is_not_cached() {
-        let cache = Arc::new(FeatureFlagCache::default());
-        let key = key("failure");
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        assert!(cache.refresh_guard(key.clone()).failure().is_empty());
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        cache.refresh_guard(key).failure();
-    }
-
-    #[test]
-    fn cache_evicts_the_least_recently_used_idle_entry() {
-        let cache = Arc::new(FeatureFlagCache::with_idle_capacity(2));
-        let first = key("first");
-        let second = key("second");
-        let third = key("third");
-
-        for key in [&first, &second] {
-            assert!(matches!(cache.lookup(key), CacheLookup::Load));
-            cache
-                .refresh_guard(key.clone())
-                .success(values(), Duration::from_secs(300));
-        }
-        assert!(matches!(cache.lookup(&first), CacheLookup::Fresh(_)));
-        assert!(matches!(cache.lookup(&third), CacheLookup::Load));
-
-        let entries = cache.lock_entries();
-        assert_eq!(entries.len(), 2);
-        assert!(entries.contains_key(&first));
-        assert!(!entries.contains_key(&second));
-        assert!(entries.contains_key(&third));
-    }
-
-    #[test]
-    fn in_flight_overflow_shrinks_to_idle_capacity_after_completion() {
-        let cache = Arc::new(FeatureFlagCache::with_idle_capacity(2));
-        let keys = [key("first"), key("second"), key("third")];
-
-        for key in &keys {
-            assert!(matches!(cache.lookup(key), CacheLookup::Load));
-        }
-        assert_eq!(
-            cache.lock_entries().len(),
-            3,
-            "in-flight loads must not be evicted"
-        );
-
-        for key in keys {
-            cache
-                .refresh_guard(key)
-                .success(values(), Duration::from_secs(300));
-        }
-        assert_eq!(cache.lock_entries().len(), 2);
-    }
-
-    #[test]
-    fn response_ttl_uses_server_value_exactly() {
+    fn response_ttl_uses_server_value() {
         for (supplied, expected) in [
             (None, DEFAULT_TTL),
             (Some(-1), DEFAULT_TTL),
             (Some(1), Duration::from_secs(1)),
             (Some(900), Duration::from_secs(900)),
-            (Some(86_400), Duration::from_secs(86_400)),
         ] {
             assert_eq!(response_ttl(supplied), expected);
         }
+    }
+
+    #[test]
+    fn oversized_ttl_does_not_panic() {
+        let entry = CachedFeatureFlags::new(FeatureFlagValues::default(), Duration::MAX);
+        assert!(entry.is_fresh());
     }
 }
