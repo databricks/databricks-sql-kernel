@@ -163,6 +163,40 @@ struct ConsumerState {
     sticky_error: Option<Error>,
 }
 
+impl ConsumerState {
+    fn take_buffered_batch(&mut self) -> Option<RecordBatch> {
+        let current = self.current.as_ref()?;
+        if self.cursor < current.batches.len() {
+            let batch = current.batches[self.cursor].clone();
+            self.cursor += 1;
+            return Some(batch);
+        }
+        debug!(
+            "Drained inline chunk {} ({} batches)",
+            current.chunk_index,
+            current.batches.len(),
+        );
+        self.current = None;
+        self.cursor = 0;
+        None
+    }
+
+    /// Install one channel item. Returns false for clean end-of-stream.
+    fn accept_chunk(&mut self, item: Option<Result<InlineChunkEntry>>) -> Result<bool> {
+        match item {
+            Some(Ok(entry)) => {
+                self.current = Some(entry);
+                Ok(true)
+            }
+            Some(Err(error)) => {
+                self.sticky_error = Some(error.clone());
+                Err(error)
+            }
+            None => Ok(false),
+        }
+    }
+}
+
 impl InlineStreamingProvider {
     /// Build a streaming provider seeded by the first chunk's payload
     /// (which the kernel already received in the initial execute
@@ -302,20 +336,8 @@ impl InlineStreamingProvider {
             // error surfaces. Only when no more buffered data is
             // available do we consult the sticky-error slot or the
             // channel.
-            if let Some(ref current) = state.current {
-                if state.cursor < current.batches.len() {
-                    let batch = current.batches[state.cursor].clone();
-                    state.cursor += 1;
-                    return Ok(Some(batch));
-                }
-                // Current chunk fully drained; advance.
-                debug!(
-                    "Drained inline chunk {} ({} batches)",
-                    current.chunk_index,
-                    current.batches.len(),
-                );
-                state.current = None;
-                state.cursor = 0;
+            if let Some(batch) = state.take_buffered_batch() {
+                return Ok(Some(batch));
             }
 
             // Buffered chunk is drained. Sticky-error short-
@@ -327,20 +349,37 @@ impl InlineStreamingProvider {
             }
 
             // Need to recv the next chunk from the prefetch task.
-            match state.rx.recv().await {
-                Some(Ok(entry)) => {
-                    state.current = Some(entry);
-                    // Loop back to drain.
+            let item = state.rx.recv().await;
+            if !state.accept_chunk(item)? {
+                return Ok(None);
+            }
+        }
+    }
+
+    /// Return a buffered batch without waiting for the prefetch task.
+    pub(crate) fn try_next_batch(&self) -> Result<crate::reader::TryNextBatch> {
+        use crate::reader::TryNextBatch;
+        use tokio::sync::mpsc::error::TryRecvError;
+
+        let Ok(mut state) = self.consumer.try_lock() else {
+            return Ok(TryNextBatch::Pending);
+        };
+        loop {
+            if let Some(batch) = state.take_buffered_batch() {
+                return Ok(TryNextBatch::Ready(batch));
+            }
+
+            if let Some(ref error) = state.sticky_error {
+                return Err(error.clone());
+            }
+
+            let item = state.rx.try_recv();
+            match item {
+                Ok(item) => {
+                    state.accept_chunk(Some(item))?;
                 }
-                Some(Err(e)) => {
-                    // Store sticky and surface on this call.
-                    state.sticky_error = Some(e.clone());
-                    return Err(e);
-                }
-                None => {
-                    // Channel closed: clean EOS.
-                    return Ok(None);
-                }
+                Err(TryRecvError::Empty) => return Ok(TryNextBatch::Pending),
+                Err(TryRecvError::Disconnected) => return Ok(TryNextBatch::End),
             }
         }
     }
@@ -1091,5 +1130,142 @@ mod tests {
         }
         assert_eq!(total_batches, 5, "all 5 chunks must arrive after resume");
         assert_eq!(mock.call_count(), 4, "exactly 4 RPCs total (chunks 1-4)");
+    }
+
+    /// Non-blocking `try_next_batch`: a buffered batch is returned as
+    /// `Ready` without awaiting the prefetch task, and once the single
+    /// chunk is drained the closed channel surfaces as `End`
+    /// (`TryRecvError::Disconnected`).
+    #[tokio::test]
+    async fn try_next_batch_ready_then_end_on_disconnect() {
+        use crate::reader::TryNextBatch;
+
+        // Single-chunk result (next_chunk_index = None): the provider
+        // drops the sender, so after the initial chunk drains the
+        // receiver observes Disconnected.
+        let mock = MockSource::new(vec![]);
+        let source: Arc<dyn InlineChunkSource> = mock.clone();
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            build_ipc_bytes(&[10, 20]),
+            0, // initial_chunk_index
+            0, // initial_row_offset
+            2, // initial_row_count
+            None,
+            CompressionCodec::None,
+            4,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        match provider.try_next_batch().unwrap() {
+            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 2),
+            _ => panic!("buffered initial chunk must be Ready without awaiting prefetch"),
+        }
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::End),
+            "drained single-chunk stream → closed channel → End"
+        );
+        assert_eq!(mock.call_count(), 0, "no prefetch RPC for a single chunk");
+    }
+
+    /// When another task holds the consumer lock, `try_next_batch` must
+    /// report `Pending` immediately (via `try_lock` failing) rather than
+    /// blocking on the lock.
+    #[tokio::test]
+    async fn try_next_batch_pending_on_lock_contention() {
+        use crate::reader::TryNextBatch;
+
+        let mock = MockSource::new(vec![]);
+        let source: Arc<dyn InlineChunkSource> = mock.clone();
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            build_ipc_bytes(&[1]),
+            0,
+            0,
+            1,
+            None,
+            CompressionCodec::None,
+            4,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Hold the consumer lock so try_next_batch's try_lock fails.
+        let guard = provider.consumer.lock().await;
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::Pending),
+            "contended consumer lock must yield Pending, not block"
+        );
+        drop(guard);
+
+        // Once released the buffered batch becomes available.
+        match provider.try_next_batch().unwrap() {
+            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 1),
+            _ => panic!("after lock released the buffered batch must be Ready"),
+        }
+    }
+
+    /// Non-blocking `try_next_batch`: when the channel is open but
+    /// empty (the prefetch task is parked mid-RPC and hasn't delivered
+    /// the next chunk yet), `try_recv` yields `TryRecvError::Empty`,
+    /// which must map to `Pending` — never `End` — and must not block.
+    /// This is the branch the blocking `next_batch` cannot exercise,
+    /// so it needs its own guard.
+    #[tokio::test]
+    async fn try_next_batch_pending_on_empty_open_channel() {
+        use crate::reader::TryNextBatch;
+
+        // A source whose RPC never completes: once the initial chunk
+        // drains, the prefetch task is parked inside `get_inline_chunk`,
+        // so the sender stays alive (channel open) but nothing is ever
+        // delivered (channel empty) — deterministically the `Empty`
+        // case regardless of task scheduling.
+        #[derive(Debug)]
+        struct StalledSource;
+        #[async_trait]
+        impl InlineChunkSource for StalledSource {
+            async fn get_inline_chunk(
+                &self,
+                _statement_id: &str,
+                _chunk_index: i64,
+                _row_offset: i64,
+            ) -> Result<InlineChunkFetchResult> {
+                std::future::pending().await
+            }
+        }
+
+        let source: Arc<dyn InlineChunkSource> = Arc::new(StalledSource);
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            build_ipc_bytes(&[7, 8]),
+            0,       // initial_chunk_index
+            0,       // initial_row_offset
+            2,       // initial_row_count
+            Some(1), // more chunks → prefetch task spawned, sender stays alive
+            CompressionCodec::None,
+            4,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+
+        // Drain the buffered initial chunk.
+        match provider.try_next_batch().unwrap() {
+            TryNextBatch::Ready(batch) => assert_eq!(batch.num_rows(), 2),
+            _ => panic!("buffered initial chunk must be Ready"),
+        }
+
+        // Channel is open (prefetch task parked in the RPC) but empty:
+        // must be Pending, and must not block.
+        assert!(
+            matches!(provider.try_next_batch().unwrap(), TryNextBatch::Pending),
+            "open-but-empty channel → TryRecvError::Empty → Pending"
+        );
     }
 }

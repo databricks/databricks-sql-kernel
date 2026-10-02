@@ -918,6 +918,12 @@ KernelStatusCode kernel_result_stream_get_schema(kernel_result_stream_t* stream,
 KernelStatusCode kernel_result_stream_next_batch(kernel_result_stream_t* stream,
                                                  struct ArrowArray* out_array,
                                                  struct ArrowSchema* out_schema);
+/* Fetch one batch without waiting. Success with ready=false means provider
+ * work is still pending and leaves the Arrow outputs untouched. Success with
+ * ready=true transfers a batch, or an empty array at end-of-stream. */
+KernelStatusCode kernel_result_stream_try_next_batch(
+    kernel_result_stream_t* stream, bool* ready, struct ArrowArray* out_array,
+    struct ArrowSchema* out_schema);
 KernelStatusCode kernel_result_stream_close(kernel_result_stream_t* stream);
 
 /* ─── Result-stream cancellation (detached canceller) ─────────────────
