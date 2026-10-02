@@ -50,7 +50,7 @@ async fn open_session_against(server: &MockServer) -> databricks_sql_kernel::Res
 /// Mount a single-response mock for the create-session endpoint.
 async fn mock_create_session_returns(server: &MockServer, status: u16, body: &'static str) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(status).set_body_string(body))
         .mount(server)
         .await;
@@ -96,7 +96,7 @@ async fn create_session_404_maps_to_not_found() {
 async fn create_session_429_maps_to_resource_exhausted_retryable() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(429).set_body_string("rate limited"))
         .mount(&server)
         .await;
@@ -112,7 +112,7 @@ async fn create_session_429_maps_to_resource_exhausted_retryable() {
 async fn create_session_503_maps_to_unavailable_retryable() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(503).set_body_string("warehouse cold"))
         .mount(&server)
         .await;
@@ -128,7 +128,7 @@ async fn create_session_503_maps_to_unavailable_retryable() {
 async fn create_session_504_maps_to_timeout_retryable() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(504).set_body_string("upstream timeout"))
         .mount(&server)
         .await;
@@ -160,7 +160,7 @@ async fn create_session_500_maps_to_internal() {
     // Internal per the plan's mapping table.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(500).set_body_string("server bug"))
         .mount(&server)
         .await;
@@ -357,7 +357,8 @@ async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
     let create = recorded
         .iter()
         .find(|r| {
-            r.url.path() == "/api/2.0/warehouses/test_wh/sessions" && r.method.as_str() == "POST"
+            r.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
+                && r.method.as_str() == "POST"
         })
         .expect("a POST /sessions request was made");
     let body: serde_json::Value =
@@ -383,7 +384,8 @@ async fn create_session_body(server: &MockServer) -> serde_json::Value {
     let create = recorded
         .iter()
         .find(|r| {
-            r.url.path() == "/api/2.0/warehouses/test_wh/sessions" && r.method.as_str() == "POST"
+            r.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
+                && r.method.as_str() == "POST"
         })
         .expect("a POST /sessions request was made");
     serde_json::from_slice(&create.body).expect("create-session body must be valid JSON")
@@ -401,7 +403,7 @@ async fn create_session_with_cloudfetch_disabled_omits_can_cloud_download() {
     // opens and the poisoned conf never reaches the wire.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-cf-off","warehouse_id":"test_wh"}"#),
@@ -427,7 +429,7 @@ async fn create_session_forwards_user_supplied_session_conf_unchanged() {
     // through unchanged; validation belongs to the server.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-dropped","warehouse_id":"test_wh"}"#),
@@ -492,7 +494,7 @@ async fn open_session_with_geospatial_config(
 
 async fn mount_geospatial_session(server: &MockServer, session_id: &str) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "session_id": session_id,
             "warehouse_id": "test_wh",
@@ -611,7 +613,7 @@ async fn create_session_with_cloudfetch_enabled_omits_can_cloud_download() {
     // here on either branch now.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-cf-on","warehouse_id":"test_wh"}"#),

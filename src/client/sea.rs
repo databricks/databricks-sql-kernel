@@ -249,7 +249,7 @@ impl SeaRestTransport {
 
     fn warehouse_sessions_url(&self) -> String {
         format!(
-            "{}/api/2.0/warehouses/{}/sessions",
+            "{}/api/2.0/sql/warehouses/{}/sessions",
             self.host.trim_end_matches('/'),
             self.warehouse_id
         )
@@ -2699,7 +2699,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
@@ -2714,7 +2714,7 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path(
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1/statements",
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "statement_id": "statement-1",
@@ -2725,7 +2725,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1/statements/statement-1",
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/statement-1",
             ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "statement_id": "statement-1",
@@ -2735,7 +2735,7 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions/session-1/statements/statement-1/result/chunks/0"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/statement-1/result/chunks/0"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "external_links": [],
                 "next_chunk_index": null,
@@ -2745,7 +2745,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path(
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1/statements/inline-statement/result/chunks/1",
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/inline-statement/result/chunks/1",
             ))
             .and(query_param("row_offset", "3"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2759,21 +2759,23 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions/session-1/statements/statement-1/cancel"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/statement-1/cancel"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
             .and(path(
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1/statements/statement-1",
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/statement-1",
             ))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("DELETE"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions/session-1"))
+            .and(path(
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1",
+            ))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
@@ -2819,7 +2821,8 @@ mod tests {
             .iter()
             .find(|request| {
                 request.method == Method::DELETE
-                    && request.url.path() == "/api/2.0/warehouses/warehouse-123/sessions/session-1"
+                    && request.url.path()
+                        == "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1"
             })
             .expect("session close request must be recorded");
         assert!(close.url.query().is_none());
@@ -2845,13 +2848,13 @@ mod tests {
             }
 
             Mock::given(method("POST"))
-                .and(path("/api/2.0/warehouses/warehouse-123/sessions"))
+                .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
                 .respond_with(create_response)
                 .expect(1)
                 .mount(&server)
                 .await;
             let statement_path = if realtime {
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1/statements"
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements"
             } else {
                 "/api/2.0/sql/statements"
             };
@@ -2865,7 +2868,7 @@ mod tests {
                 .mount(&server)
                 .await;
             let close_path = if realtime {
-                "/api/2.0/warehouses/warehouse-123/sessions/session-1"
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1"
             } else {
                 "/api/2.0/sql/sessions/session-1"
             };
@@ -2911,7 +2914,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
@@ -2956,7 +2959,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
             .and(body_json(json!({
                 "warehouse_id": "warehouse-123",
                 "execution_mode": "FAST",
@@ -3063,7 +3066,7 @@ mod tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/warehouses/warehouse-123/sessions"))
+            .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_string(r#"{"session_id":"session-1"}"#),
             )

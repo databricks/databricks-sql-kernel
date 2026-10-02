@@ -48,7 +48,7 @@ fn session_close_initiates_delete_with_statement_still_open() {
         rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/api/2.0/warehouses/test_wh/sessions"))
+                .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"session_id":"sess-c-abi-close","warehouse_id":"test_wh"}"#,
                 ))

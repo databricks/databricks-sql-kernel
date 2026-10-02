@@ -712,7 +712,7 @@ fn async_c_abi_get_result_stream_state_guards() {
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/warehouses/test_wh/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
