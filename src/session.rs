@@ -2119,10 +2119,10 @@ mod is_open_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn sessions_enable_version_exchange_on_standard_path() {
+    async fn sessions_enable_version_exchange() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .and(body_json(json!({
                 "warehouse_id": "test_wh",
                 "execution_mode": "FAST",
@@ -2149,7 +2149,7 @@ mod is_open_tests {
             })
             .open()
             .await
-            .expect("FAST session must open on the standard path");
+            .expect("FAST session must open");
 
         session.close().await.expect("FAST session must close");
     }
@@ -2166,7 +2166,7 @@ mod is_open_tests {
     async fn is_open_flips_true_to_false_on_delete() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-is-open","warehouse_id":"test_wh"}"#),
@@ -2217,7 +2217,7 @@ mod is_open_tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-test-conn","warehouse_id":"test_wh"}"#),
@@ -2309,7 +2309,7 @@ mod is_open_tests {
     async fn test_connection_fails_when_server_unreachable() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-dead","warehouse_id":"test_wh"}"#),
@@ -2360,7 +2360,7 @@ mod is_open_tests {
     async fn transaction_controls_are_noop_when_ignored() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-txn","warehouse_id":"test_wh"}"#),
@@ -3555,7 +3555,7 @@ mod is_open_tests {
 
     async fn mount_session_create_delete(server: &MockServer, session_id: &str) {
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
                 r#"{{"session_id":"{session_id}","warehouse_id":"test_wh"}}"#
             )))

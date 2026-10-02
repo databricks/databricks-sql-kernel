@@ -85,7 +85,7 @@ fn exported_canceller_aborts_the_stream() {
     let server = rt.block_on(async {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-rs-cancel","warehouse_id":"test_wh"}"#),

@@ -13,6 +13,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- SQL sessions open through the warehouse sessions URL and use warehouse statement URLs when the create response enables real-time routing.
+
 ### Updated
 
 ### Fixed

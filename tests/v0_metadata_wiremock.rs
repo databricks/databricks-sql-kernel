@@ -74,7 +74,7 @@ async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),

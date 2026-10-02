@@ -159,7 +159,7 @@ async fn empty_logging_config_open_does_not_install_subscriber() {
 
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-gate-213","warehouse_id":"test_wh"}"#),

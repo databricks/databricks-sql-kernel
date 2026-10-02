@@ -2770,7 +2770,7 @@ mod tests {
             let server = MockServer::start().await;
             let counter = attempts.clone();
             Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/sessions"))
+                .and(path("/api/2.0/warehouses/test_wh/sessions"))
                 .respond_with(move |_req: &wiremock::Request| {
                     // First attempt 503 (retryable); a retrying policy would
                     // then see the 200 below.
@@ -3140,7 +3140,7 @@ mod tests {
         let (server, session, exporter) = rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/sessions"))
+                .and(path("/api/2.0/warehouses/test_wh/sessions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"session_id":"sess-cabi-telemetry-close","warehouse_id":"test_wh"}"#,
                 ))

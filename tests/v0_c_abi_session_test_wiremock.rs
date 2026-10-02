@@ -118,7 +118,7 @@ fn session_test_returns_success_when_server_reachable() {
         rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/sessions"))
+                .and(path("/api/2.0/warehouses/test_wh/sessions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"session_id":"sess-c-abi-test","warehouse_id":"test_wh"}"#,
                 ))
@@ -179,7 +179,7 @@ fn session_test_returns_error_when_server_unreachable() {
         rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/sessions"))
+                .and(path("/api/2.0/warehouses/test_wh/sessions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"session_id":"sess-c-abi-dead","warehouse_id":"test_wh"}"#,
                 ))
@@ -216,7 +216,7 @@ fn session_test_honours_per_call_timeout() {
         rt.block_on(async {
             let server = MockServer::start().await;
             Mock::given(method("POST"))
-                .and(path("/api/2.0/sql/sessions"))
+                .and(path("/api/2.0/warehouses/test_wh/sessions"))
                 .respond_with(ResponseTemplate::new(200).set_body_string(
                     r#"{"session_id":"sess-c-abi-slow","warehouse_id":"test_wh"}"#,
                 ))

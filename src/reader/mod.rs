@@ -25,13 +25,15 @@ pub mod post_processor;
 #[cfg(test)]
 pub(crate) mod test_utils;
 
-use crate::client::{DatabricksHttpClient, ExecuteResponse, Transport};
+use crate::client::{
+    DatabricksHttpClient, ExecuteResponse, InlineChunkFetchResult, SessionAttribution, Transport,
+};
 use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::{SeaChunkLinkFetcher, SeaChunkLinkFetcherHandle};
 use crate::reader::cloudfetch::streaming_provider::StreamingCloudFetchProvider;
-use crate::reader::inline::{InlineArrowProvider, InlineStreamingProvider};
+use crate::reader::inline::{InlineArrowProvider, InlineChunkSource, InlineStreamingProvider};
 use crate::reader::post_processor::{PostProcessOptions, ResultPostProcessor};
 use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
 use crate::types::sea::{CompressionCodec, ResultManifest, StatementState};
@@ -44,6 +46,31 @@ use std::sync::Arc;
 use std::time::Duration;
 
 pub use cloudfetch::StreamingCloudFetchProvider as CloudFetchReader;
+
+#[derive(Debug)]
+struct AttributedInlineChunkSource {
+    client: Arc<dyn Transport>,
+    session_attribution: SessionAttribution,
+}
+
+#[async_trait]
+impl InlineChunkSource for AttributedInlineChunkSource {
+    async fn get_inline_chunk(
+        &self,
+        statement_id: &str,
+        chunk_index: i64,
+        row_offset: i64,
+    ) -> Result<InlineChunkFetchResult> {
+        self.client
+            .get_inline_chunk(
+                statement_id,
+                chunk_index,
+                row_offset,
+                self.session_attribution,
+            )
+            .await
+    }
+}
 
 /// Factory that creates the appropriate reader based on the response type.
 ///
@@ -105,8 +132,9 @@ impl ResultReaderFactory {
         &self,
         statement_id: &str,
         response: &ExecuteResponse,
+        session_attribution: SessionAttribution,
     ) -> Result<Box<dyn ResultReader + Send>> {
-        let inner = self.create_inner_reader(statement_id, response)?;
+        let inner = self.create_inner_reader(statement_id, response, session_attribution)?;
         Ok(Box::new(
             ResultPostProcessor::new(
                 inner,
@@ -125,6 +153,7 @@ impl ResultReaderFactory {
         &self,
         statement_id: &str,
         response: &ExecuteResponse,
+        session_attribution: SessionAttribution,
     ) -> Result<Box<dyn ResultReader + Send>> {
         // Log manifest info for debugging
         if let Some(ref manifest) = response.manifest {
@@ -216,6 +245,7 @@ impl ResultReaderFactory {
                         external_links,
                         total_chunk_count,
                         compression,
+                        session_attribution,
                     );
                 }
             }
@@ -330,6 +360,7 @@ impl ResultReaderFactory {
                             Some(next_idx),
                             compression,
                             manifest_schema,
+                            session_attribution,
                         );
                     }
 
@@ -517,6 +548,7 @@ impl ResultReaderFactory {
         external_links: &[CloudFetchLink],
         total_chunk_count: Option<i64>,
         compression: CompressionCodec,
+        session_attribution: SessionAttribution,
     ) -> Result<Box<dyn ResultReader + Send>> {
         crate::klog::debug!(
             statement_id,
@@ -533,13 +565,14 @@ impl ResultReaderFactory {
         // transition-period guard for servers that haven't rolled
         // out the per-link field yet — see
         // `SeaChunkLinkFetcher::decode_continuation`.
-        let fetcher = SeaChunkLinkFetcher::new(
+        let fetcher = SeaChunkLinkFetcher::new_with_attribution(
             self.client.clone(),
             statement_id.to_string(),
             external_links,
             total_chunk_count,
             self.config.link_prefetch_window as i64,
             self.runtime_handle.clone(),
+            session_attribution,
         );
         let link_fetcher: Arc<dyn crate::reader::cloudfetch::ChunkLinkFetcher> =
             Arc::new(SeaChunkLinkFetcherHandle::new(fetcher));
@@ -602,6 +635,7 @@ impl ResultReaderFactory {
         next_chunk_index: Option<i64>,
         compression: CompressionCodec,
         manifest_schema: Option<SchemaRef>,
+        session_attribution: SessionAttribution,
     ) -> Result<Box<dyn ResultReader + Send>> {
         crate::klog::debug!(
             "Creating inline-Arrow streaming reader: stmt={}, initial_chunk={}, \
@@ -612,19 +646,10 @@ impl ResultReaderFactory {
             self.config.inline_max_chunks_in_memory,
         );
 
-        // Note: `Arc::new(self.client.clone())` produces
-        // `Arc<Arc<dyn Transport>>` because the blanket impl of
-        // `InlineChunkSource` is on `Arc<dyn Transport>` (not on
-        // `dyn Transport`), and trait-objects of different traits
-        // don't share a vtable so direct coercion
-        // `Arc<dyn Transport>` → `Arc<dyn InlineChunkSource>`
-        // isn't legal. The outer `Arc::new` is the price of using a
-        // narrow trait so test mocks don't have to stub the full
-        // 20-method `Transport` surface; net cost is one extra
-        // pointer + one extra deref per RPC, negligible vs the SEA
-        // round-trip.
-        let source: Arc<dyn crate::reader::inline::InlineChunkSource> =
-            Arc::new(self.client.clone());
+        let source: Arc<dyn InlineChunkSource> = Arc::new(AttributedInlineChunkSource {
+            client: self.client.clone(),
+            session_attribution,
+        });
         let provider = InlineStreamingProvider::new(
             source,
             statement_id.to_string(),
@@ -1899,12 +1924,12 @@ mod tests {
     use crate::reader::post_processor::PostProcessOptions;
     use crate::types::sea::{ExecuteParams, ServiceError, StatementStatus};
     use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
 
-    /// Transport stub that panics on every method. Adequate for
-    /// tests that exercise the *factory's* synchronous control
-    /// flow before any RPC fires (e.g. the rollout-skew guard).
-    #[derive(Debug)]
-    struct PanickingTransport;
+    #[derive(Debug, Default)]
+    struct PanickingTransport {
+        inline_chunk_attributions: StdMutex<Vec<SessionAttribution>>,
+    }
 
     #[async_trait]
     impl Transport for PanickingTransport {
@@ -1958,7 +1983,13 @@ mod tests {
         ) -> Result<ExecuteResponse> {
             unreachable!()
         }
-        async fn get_result_chunks(&self, _: &str, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+        async fn get_result_chunks(
+            &self,
+            _: &str,
+            _: i64,
+            _: i64,
+            _: SessionAttribution,
+        ) -> Result<ChunkLinkFetchResult> {
             unreachable!()
         }
         async fn get_inline_chunk(
@@ -1966,8 +1997,13 @@ mod tests {
             _: &str,
             _: i64,
             _: i64,
+            session_attribution: SessionAttribution,
         ) -> Result<InlineChunkFetchResult> {
-            unreachable!()
+            self.inline_chunk_attributions
+                .lock()
+                .unwrap()
+                .push(session_attribution);
+            Err(Error::invalid_state().message("recorded inline chunk attribution"))
         }
         fn poll_config(&self) -> TransportConfig {
             TransportConfig::default()
@@ -2072,13 +2108,28 @@ mod tests {
         );
         let runtime = tokio::runtime::Handle::current();
         ResultReaderFactory::new(
-            Arc::new(PanickingTransport),
+            Arc::new(PanickingTransport::default()),
             http_client,
             CloudFetchConfig::default(),
             PostProcessOptions::default(),
             GeospatialResultRepresentation::String,
             runtime,
         )
+    }
+
+    #[tokio::test]
+    async fn inline_chunk_source_preserves_detached_attribution() {
+        let transport = Arc::new(PanickingTransport::default());
+        let source = AttributedInlineChunkSource {
+            client: transport.clone(),
+            session_attribution: SessionAttribution::Detached,
+        };
+
+        assert!(source.get_inline_chunk("statement", 1, 3).await.is_err());
+        assert_eq!(
+            *transport.inline_chunk_attributions.lock().unwrap(),
+            vec![SessionAttribution::Detached]
+        );
     }
 
     fn ok_status() -> StatementStatus {
@@ -2137,10 +2188,11 @@ mod tests {
             }),
         };
 
-        let err = match factory.create_inner_reader("stmt-1", &response) {
-            Ok(_) => panic!("rollout-skew must surface as Err"),
-            Err(e) => e,
-        };
+        let err =
+            match factory.create_inner_reader("stmt-1", &response, SessionAttribution::Current) {
+                Ok(_) => panic!("rollout-skew must surface as Err"),
+                Err(e) => e,
+            };
         assert_eq!(err.code, ErrorCode::DataLoss);
         assert!(
             err.message.contains("total_chunk_count"),
@@ -2178,7 +2230,7 @@ mod tests {
             }),
         };
 
-        match factory.create_inner_reader("stmt-1", &response) {
+        match factory.create_inner_reader("stmt-1", &response, SessionAttribution::Current) {
             // OK or any non-rollout-guard error is acceptable —
             // we're proving the guard is *not* the failure mode.
             Ok(_) => {}
@@ -2214,10 +2266,11 @@ mod tests {
             }),
         };
 
-        let err = match factory.create_inner_reader("stmt-1", &response) {
-            Ok(_) => panic!("missing row_count on streaming response must surface as Err"),
-            Err(e) => e,
-        };
+        let err =
+            match factory.create_inner_reader("stmt-1", &response, SessionAttribution::Current) {
+                Ok(_) => panic!("missing row_count on streaming response must surface as Err"),
+                Err(e) => e,
+            };
         assert_eq!(err.code, ErrorCode::DataLoss);
         assert!(
             err.message.to_lowercase().contains("row_count"),
@@ -2244,10 +2297,11 @@ mod tests {
             }),
         };
 
-        let err = match factory.create_inner_reader("stmt-1", &response) {
-            Ok(_) => panic!("missing chunk_index on streaming response must surface as Err"),
-            Err(e) => e,
-        };
+        let err =
+            match factory.create_inner_reader("stmt-1", &response, SessionAttribution::Current) {
+                Ok(_) => panic!("missing chunk_index on streaming response must surface as Err"),
+                Err(e) => e,
+            };
         assert_eq!(err.code, ErrorCode::DataLoss);
         assert!(
             err.message.to_lowercase().contains("chunk_index"),
@@ -2291,7 +2345,7 @@ mod tests {
         };
 
         let mut reader = factory
-            .create_inner_reader("stmt-1", &response)
+            .create_inner_reader("stmt-1", &response, SessionAttribution::Current)
             .expect("zero-chunk manifest must succeed without parsing inline bytes");
         assert!(
             reader.next_batch().await.unwrap().is_none(),
@@ -2316,7 +2370,7 @@ mod tests {
         };
 
         let mut reader = factory
-            .create_inner_reader("stmt-1", &response)
+            .create_inner_reader("stmt-1", &response, SessionAttribution::Current)
             .expect("absent total_chunk_count + Succeeded state must yield empty reader");
         assert!(reader.next_batch().await.unwrap().is_none());
     }
@@ -2351,7 +2405,7 @@ mod tests {
         // a parse error. If the short-circuit had fired, this would
         // return `Ok` and we'd never reach the IPC parser.
         let err = factory
-            .create_inner_reader("stmt-1", &response)
+            .create_inner_reader("stmt-1", &response, SessionAttribution::Current)
             .err()
             .expect("non-zero total_chunk_count + garbage inline must surface parse error");
         assert!(

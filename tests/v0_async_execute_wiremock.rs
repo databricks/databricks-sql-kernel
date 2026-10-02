@@ -55,7 +55,7 @@ async fn open_session(server: &MockServer) -> Session {
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
@@ -375,7 +375,7 @@ async fn submit_returns_pending_handle_without_polling() {
 async fn owning_async_status_advances_session_version_for_next_execute() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/warehouses/test_wh/sessions"))
         .and(body_json(json!({
             "warehouse_id": "test_wh",
             "execution_mode": "FAST",
