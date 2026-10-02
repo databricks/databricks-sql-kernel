@@ -14,6 +14,12 @@
 
 //! Databricks SQL Kernel
 //!
+// `async_trait` marks its generated boxed futures as `must_use`. Rust 1.99's
+// `double_must_use` lint also sees the `Future` trait's own annotation, so all
+// async trait methods otherwise fail Clippy despite having the intended
+// must-use behavior.
+#![allow(clippy::double_must_use)]
+//!
 //! Rust client core for Databricks SQL — the shared engine that powers
 //! the Databricks ODBC, Python, Go, and Node.js drivers.
 //!
