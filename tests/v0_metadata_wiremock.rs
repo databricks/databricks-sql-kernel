@@ -29,8 +29,7 @@
 //! `type_info` verifies the Thrift-compatible result the kernel constructs
 //! locally; `table_types` verifies its JDBC shape.
 //!
-//! Validation errors (empty identifier, `None` catalog on
-//! `primary_keys`, etc.) are also covered here.
+//! Identifier validation and session namespace resolution are also covered here.
 
 use arrow_array::cast::AsArray;
 use arrow_array::{Array, ArrayRef, Int16Array, Int32Array, Int8Array, RecordBatch, StringArray};
@@ -43,7 +42,7 @@ use databricks_sql_kernel::{
 };
 use serde_json::json;
 use std::sync::Arc;
-use wiremock::matchers::{body_string_contains, header, method, path};
+use wiremock::matchers::{body_partial_json, body_string_contains, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1746,25 +1745,213 @@ async fn foreign_keys_both_tables_null_returns_empty_without_wire_call() {
 }
 
 #[tokio::test]
-async fn primary_keys_without_schema_errors() {
+async fn primary_keys_resolves_missing_names_and_preserves_explicit_names() {
+    for catalog in [None, Some("explicit_catalog"), Some("")] {
+        for schema in [None, Some("explicit_schema"), Some("")] {
+            let server = MockServer::start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            let needs_lookup = catalog.is_none() || schema.is_none();
+            let current = string_batch(vec![
+                ("current_catalog()", vec![Some("current_catalog")]),
+                ("current_schema()", vec![Some("current_schema")]),
+            ]);
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(body_partial_json(json!({
+                    "statement": "SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()",
+                    "session_id": "sess-test",
+                })))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(closed_inline_response_body(&current)),
+                )
+                .expect(u64::from(needs_lookup))
+                .mount(&server)
+                .await;
+
+            let expected_catalog = catalog.unwrap_or("current_catalog");
+            let expected_schema = schema.unwrap_or("current_schema");
+            let sql = format!(
+                "SHOW KEYS IN CATALOG `{expected_catalog}` IN SCHEMA `{expected_schema}` IN TABLE `t`"
+            );
+            let raw = string_batch(vec![
+                ("catalogName", vec![Some(expected_catalog)]),
+                ("namespace", vec![Some(expected_schema)]),
+                ("tableName", vec![Some("t")]),
+                ("col_name", vec![Some("id")]),
+                ("keySeq", vec![Some("1")]),
+                ("constraintName", vec![Some("pk_t")]),
+                ("constraintType", vec![Some("PRIMARY")]),
+            ]);
+            let has_empty_name = catalog == Some("") || schema == Some("");
+            let body = if has_empty_name {
+                failed_response_body("42704", "SCHEMA_NOT_FOUND")
+            } else {
+                closed_inline_response_body(&raw)
+            };
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements"))
+                .and(body_partial_json(json!({
+                    "statement": sql,
+                    "session_id": "sess-test",
+                })))
+                .respond_with(ResponseTemplate::new(200).set_body_string(body))
+                .expect(1)
+                .mount(&server)
+                .await;
+
+            let session = open_session(&server).await;
+            let mut stream = session
+                .metadata()
+                .primary_keys(
+                    catalog.map(|value| Identifier::new_allow_empty(value).unwrap()),
+                    schema.map(|value| Identifier::new_allow_empty(value).unwrap()),
+                    Identifier::new("t").unwrap(),
+                )
+                .await
+                .expect("primary_keys resolves missing namespace components");
+            assert_eq!(col_names(&stream.schema())[0], "TABLE_CAT");
+            let batches = drain_stream(&mut stream).await;
+            assert_eq!(
+                batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+                usize::from(!has_empty_name)
+            );
+            if !has_empty_name {
+                assert_eq!(
+                    batches[0].column(0).as_string::<i32>().value(0),
+                    expected_catalog
+                );
+                assert_eq!(
+                    batches[0].column(1).as_string::<i32>().value(0),
+                    expected_schema
+                );
+            }
+            session.close().await.unwrap();
+            server.verify().await;
+        }
+    }
+}
+
+#[tokio::test]
+async fn primary_keys_rejects_invalid_current_namespace_and_closes_lookup() {
+    use databricks_sql_kernel::ErrorCode;
+
+    let invalid_batches = [
+        (
+            ErrorCode::DataLoss,
+            string_batch(vec![
+                ("catalog", vec![None]),
+                ("schema", vec![Some("default")]),
+            ]),
+        ),
+        (
+            ErrorCode::DataLoss,
+            string_batch(vec![
+                ("catalog", vec![Some("main")]),
+                ("schema", vec![None]),
+            ]),
+        ),
+        (
+            ErrorCode::InvalidArgument,
+            string_batch(vec![("catalog", vec![]), ("schema", vec![])]),
+        ),
+        (
+            ErrorCode::DataLoss,
+            string_batch(vec![("catalog", vec![Some("main")])]),
+        ),
+        (
+            ErrorCode::InvalidArgument,
+            string_batch(vec![
+                ("catalog", vec![Some("")]),
+                ("schema", vec![Some("default")]),
+            ]),
+        ),
+        (
+            ErrorCode::InvalidArgument,
+            string_batch(vec![
+                ("catalog", vec![Some("main")]),
+                ("schema", vec![Some("")]),
+            ]),
+        ),
+    ];
+    for (index, (expected_code, batch)) in invalid_batches.iter().enumerate() {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_execute_expecting_sql(
+            &server,
+            "SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()",
+            succeeded_inline_response_body(batch),
+        )
+        .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-test"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = open_session(&server).await;
+        let result = session
+            .metadata()
+            .primary_keys(None, None, Identifier::new("t").unwrap())
+            .await;
+        let error = match result {
+            Ok(_) => panic!("invalid namespace must fail"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            &error.code, expected_code,
+            "namespace case {index}: {error}"
+        );
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.method.as_str() == "POST"
+                    && request.url.path() == "/api/2.0/sql/statements")
+                .count(),
+            1,
+            "invalid namespace must not issue SHOW KEYS"
+        );
+        session.close().await.unwrap();
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
+async fn primary_keys_propagates_current_namespace_lookup_errors() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
+    mount_execute_expecting_sql(
+        &server,
+        "SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()",
+        failed_response_body("42501", "PERMISSION_DENIED"),
+    )
+    .await;
 
     let session = open_session(&server).await;
-    let res = session
+    let error = match session
         .metadata()
-        .primary_keys(
-            Some(Identifier::new("main").unwrap()),
-            None,
-            Identifier::new("t").unwrap(),
-        )
-        .await;
-    use databricks_sql_kernel::ErrorCode;
-    match res {
-        Ok(_) => panic!("None schema must error"),
-        Err(err) => assert_eq!(err.code, ErrorCode::InvalidArgument),
-    }
+        .primary_keys(None, None, Identifier::new("t").unwrap())
+        .await
+    {
+        Ok(_) => panic!("lookup failure must propagate"),
+        Err(error) => error,
+    };
+    assert!(error.message.contains("PERMISSION_DENIED"));
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| request.method.as_str() == "POST"
+                && request.url.path() == "/api/2.0/sql/statements")
+            .count(),
+        1
+    );
+    session.close().await.unwrap();
 }
 
 // ─── Static-method tests (synthesised) ─────────────────────────────

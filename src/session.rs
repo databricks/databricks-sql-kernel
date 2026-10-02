@@ -3227,8 +3227,12 @@ mod is_open_tests {
             telemetry_test_session(&server, "sess-telemetry-metadata-error", telemetry).await;
 
         let table = crate::metadata_v0::Identifier::new("tbl").expect("valid table id");
-        let error = match session.metadata().primary_keys(None, None, table).await {
-            Ok(_) => panic!("missing catalog/schema should fail"),
+        let error = match session
+            .metadata()
+            .foreign_keys(None, None, None, None, None, Some(table))
+            .await
+        {
+            Ok(_) => panic!("missing foreign catalog/schema should fail"),
             Err(error) => error,
         };
         assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
@@ -3236,7 +3240,7 @@ mod is_open_tests {
 
         let metadata_log = exported_logs(&exporter)
             .into_iter()
-            .find(|log| operation_type(log) == Some("LIST_PRIMARY_KEYS"))
+            .find(|log| operation_type(log) == Some("LIST_CROSS_REFERENCES"))
             .expect("metadata error event exported");
         let sql_log = &metadata_log["entry"]["sql_driver_log"];
         assert_eq!(sql_log["sql_operation"]["statement_type"], "METADATA");
@@ -3252,7 +3256,7 @@ mod is_open_tests {
         assert!(
             !serde_json::to_string(&metadata_log)
                 .expect("metadata log json")
-                .contains("primary_keys requires a catalog identifier"),
+                .contains("foreign_keys requires foreign_catalog"),
             "metadata telemetry should not include raw error messages"
         );
     }
