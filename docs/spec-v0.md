@@ -761,11 +761,7 @@ distinction with two newtypes:
 pub struct Identifier<'a>(&'a str);     // exact name, backtick-escaped
 pub struct LikePattern<'a>(&'a str);   // LIKE pattern, wildcards preserved
 
-impl<'a> Identifier<'a> {
-    pub fn new(s: &'a str) -> Result<Self>;
-    pub fn new_allow_empty(s: &'a str) -> Result<Self>;
-    pub fn as_str(&self) -> &'a str;
-}
+impl<'a> Identifier<'a>  { pub fn new(s: &'a str) -> Result<Self>; pub fn as_str(&self) -> &'a str; }
 impl<'a> LikePattern<'a> { pub fn new(s: &'a str) -> Result<Self>; pub fn as_str(&self) -> &'a str; pub fn all() -> Self; }
 ```
 
@@ -790,11 +786,6 @@ Each `Metadata` method below is annotated for which params take which:
 
 ODBC reference: `SQLPrimaryKeys` and `SQLForeignKeys` do not accept
 patterns; everything else does for the schema/name fields.
-
-For `primary_keys`, an omitted catalog or schema resolves independently
-from the current session. Explicit empty catalog/schema names use
-`Identifier::new_allow_empty` and pass through to the server; table names
-still use strict `Identifier::new` validation.
 
 ## A3. ResultStream split: async batch + sync row cursor
 
