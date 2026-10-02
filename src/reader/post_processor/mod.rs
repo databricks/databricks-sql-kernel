@@ -38,7 +38,7 @@ mod json;
 
 use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
-use crate::reader::{ResultReader, ResultReaderAdapter, ResultReaderMetrics};
+use crate::reader::{ResultReader, ResultReaderAdapter, ResultReaderMetrics, TryNextBatch};
 use crate::types::sea::ResultManifest;
 use arrow_array::builder::StringBuilder;
 use arrow_array::{ArrayRef, RecordBatch};
@@ -97,6 +97,13 @@ pub(crate) struct ResultPostProcessor {
 type BatchTransform = Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>;
 
 impl ResultPostProcessor {
+    fn process_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        match &self.transform {
+            Some(transform) => transform(&batch),
+            None => Ok(batch),
+        }
+    }
+
     /// Build a post-processor around `inner`.
     ///
     /// `manifest` is the SEA `ResultManifest` carrying server-reported
@@ -285,10 +292,12 @@ impl ResultReader for ResultPostProcessor {
         let Some(batch) = self.inner.next_batch().await? else {
             return Ok(None);
         };
-        match &self.transform {
-            Some(t) => Ok(Some(t(&batch)?)),
-            None => Ok(Some(batch)),
-        }
+        Ok(Some(self.process_batch(batch)?))
+    }
+
+    fn try_next_batch(&mut self) -> Result<TryNextBatch> {
+        let next = self.inner.try_next_batch()?;
+        next.map_ready(|batch| self.process_batch(batch))
     }
 
     fn metrics(&self) -> Option<ResultReaderMetrics> {

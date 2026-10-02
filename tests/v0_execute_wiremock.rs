@@ -32,8 +32,8 @@ use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
     AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle,
-    GeospatialResultRepresentation, HttpConfig, ResultBatch, ResultConfig, Session, TypedValue,
-    MAX_CLIENT_QUERY_TIMEOUT,
+    GeospatialResultRepresentation, HttpConfig, ResultBatch, ResultConfig, Session, TryNextBatch,
+    TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
 use serde_json::json;
 use std::collections::HashMap;
@@ -2051,6 +2051,75 @@ async fn execute_succeeded_inline_still_closes_statement() {
     assert_eq!(
         closes, 1,
         "SUCCEEDED response must trigger exactly one CloseStatement"
+    );
+    // `_close` also verifies expect(1) when it drops at end of scope.
+}
+
+/// The non-blocking `ExecutedStatement::try_next_batch` must preserve the same
+/// drain-driven auto-close as the blocking `next_batch`: the first time it
+/// observes `TryNextBatch::End` it fires exactly one fire-and-forget
+/// `CloseStatement` (DELETE) on a `SUCCEEDED` (server-owned) statement. This
+/// pins the `State::End => { self.spawn_close_if_open(); ... }` arm, which the
+/// doc comment claims "preserves the same drain-driven auto-close behavior" —
+/// a claim otherwise covered only on the blocking sibling.
+#[tokio::test]
+async fn try_next_batch_drain_auto_closes_statement() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    // SUCCEEDED (not CLOSED): the server still owns the statement, so draining
+    // to End must trigger exactly one CloseStatement.
+    mount_execute(&server, succeeded_inline_body("stmt-try-drain", &batch)).await;
+
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-try-drain"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute");
+
+        // Drain via the non-blocking API. The inline direct-result payload is
+        // already buffered, so try_next_batch never has to report Pending here;
+        // a defensive bound keeps a regression from spinning forever.
+        let mut saw_ready = false;
+        let mut saw_end = false;
+        for _ in 0..1000 {
+            match exec.try_next_batch().expect("try_next_batch") {
+                TryNextBatch::Ready(_) => saw_ready = true,
+                TryNextBatch::Pending => {
+                    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                }
+                TryNextBatch::End => {
+                    saw_end = true;
+                    break;
+                }
+                _ => unreachable!("TryNextBatch has only Ready/Pending/End today"),
+            }
+        }
+        assert!(saw_ready, "the one buffered batch must surface as Ready");
+        assert!(saw_end, "draining must reach End");
+        // No explicit close(): the End-arm auto-close is the only path that can
+        // fire the DELETE below. exec/stmt drop at end of scope.
+    }
+
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-try-drain",
+        1,
+        std::time::Duration::from_millis(2000),
+    )
+    .await;
+    assert_eq!(
+        closes, 1,
+        "try_next_batch draining to End must trigger exactly one CloseStatement"
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
 }

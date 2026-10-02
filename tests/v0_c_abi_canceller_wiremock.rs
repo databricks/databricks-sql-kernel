@@ -50,7 +50,9 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 use databricks_sql_kernel::c_abi::error::{kernel_get_last_error, KernelError};
-use databricks_sql_kernel::c_abi::result::{kernel_result_stream_close, kernel_result_stream_t};
+use databricks_sql_kernel::c_abi::result::{
+    kernel_result_stream_close, kernel_result_stream_t, kernel_result_stream_try_next_batch,
+};
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_new, kernel_session_config_set_auth_pat,
     kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
@@ -63,13 +65,13 @@ use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_async_statement_get_result_stream,
     kernel_executed_async_statement_num_modified_rows, kernel_executed_async_statement_query_id,
     kernel_executed_async_statement_status, kernel_executed_async_statement_t,
-    kernel_executed_statement_close, kernel_executed_statement_query_id,
-    kernel_executed_statement_t, kernel_statement_bind_parameter,
-    kernel_statement_canceller_cancel, kernel_statement_canceller_free,
-    kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
-    kernel_statement_execute, kernel_statement_execute_with_timeout_ms, kernel_statement_set_sql,
-    kernel_statement_submit, kernel_statement_submit_with_timeout_ms, kernel_statement_t,
-    KernelStatementStatusKind, MAX_CLIENT_QUERY_TIMEOUT_MS,
+    kernel_executed_statement_close, kernel_executed_statement_get_result_stream,
+    kernel_executed_statement_query_id, kernel_executed_statement_t,
+    kernel_statement_bind_parameter, kernel_statement_canceller_cancel,
+    kernel_statement_canceller_free, kernel_statement_canceller_new, kernel_statement_canceller_t,
+    kernel_statement_close, kernel_statement_execute, kernel_statement_execute_with_timeout_ms,
+    kernel_statement_set_sql, kernel_statement_submit, kernel_statement_submit_with_timeout_ms,
+    kernel_statement_t, KernelStatementStatusKind, MAX_CLIENT_QUERY_TIMEOUT_MS,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -1357,6 +1359,106 @@ fn query_id_is_null_after_reexecute_invalidates_the_handle() {
 
         assert_eq!(
             kernel_executed_statement_close(exec2),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn try_next_batch_on_stream_of_closed_executed_handle_returns_invalid_handle() {
+    // The C ABI `ResultStreamShape::Executed` arm routes `try_next_batch`
+    // through `executed_ref`, whose `alive` guard fires BEFORE the backing
+    // `ExecutedStatement` pointer is dereferenced. Closing the executed handle
+    // (`kernel_executed_statement_close`) invalidates that shared flag and frees
+    // the handle, so a subsequent `kernel_result_stream_try_next_batch` on a
+    // stream borrowed from it must yield `InvalidStatementHandle` — a defined
+    // error, never a use-after-free. This pins the Executed arm's stale-handle
+    // guard on the non-blocking path specifically (the blocking `next_batch`
+    // path shares the same guard, but nothing else exercises `try_next_batch`
+    // over an invalidated Executed stream).
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        // A terminal SUCCEEDED inline result: execute returns a live executed
+        // handle we can borrow a stream from.
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_string(succeeded_empty_body("stmt-stale")),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri);
+        let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 1").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+
+        // Borrow a result stream from the live executed handle.
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+
+        // Close (and free) the executed handle. This invalidates the shared
+        // `alive` flag the borrowed stream checks.
+        assert_eq!(
+            kernel_executed_statement_close(exec),
+            KernelStatusCode::Success
+        );
+
+        // The stream is now stale: try_next_batch must surface
+        // InvalidStatementHandle via the Executed arm's `executed_ref` guard,
+        // not dereference the freed handle.
+        let mut ready = true;
+        let mut arr = arrow_array::ffi::FFI_ArrowArray::empty();
+        let mut sch = arrow_array::ffi::FFI_ArrowSchema::empty();
+        let rc = kernel_result_stream_try_next_batch(stream, &mut ready, &mut arr, &mut sch);
+        assert_eq!(
+            rc,
+            KernelStatusCode::InvalidStatementHandle,
+            "try_next_batch on a stream of a closed executed handle must return \
+             InvalidStatementHandle"
+        );
+        assert!(!ready, "no batch may be reported ready on a stale handle");
+
+        // The typed error is retrievable on the caller thread.
+        let mut err = std::mem::MaybeUninit::<KernelError>::uninit();
+        assert!(
+            kernel_get_last_error(err.as_mut_ptr()),
+            "a typed error must accompany the stale-handle rejection"
+        );
+        assert_eq!(
+            err.assume_init().code,
+            KernelStatusCode::InvalidStatementHandle as i32,
+        );
+
+        // Orderly teardown: close the (stale) stream, then statement + session.
+        assert_eq!(
+            kernel_result_stream_close(stream),
             KernelStatusCode::Success
         );
         assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
