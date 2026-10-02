@@ -32,7 +32,8 @@ use serde::{de::DeserializeOwned, Deserialize};
 
 use crate::client::DatabricksHttpClient;
 use crate::kernel_error::{Error, Result};
-use crate::klog::warn;
+use crate::klog::{debug, warn};
+use crate::telemetry::DriverSystemConfiguration;
 
 use cache::{global_cache, response_ttl, CacheLookup, FeatureFlagCache, WorkspaceKey};
 
@@ -47,7 +48,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(5);
 /// `GetFeatureFlagsRequest.ClientType` in connector-service.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ClientType {
+enum ClientType {
     Go,
     NodeJs,
     Odbc,
@@ -55,6 +56,16 @@ pub enum ClientType {
 }
 
 impl ClientType {
+    fn from_driver_name(driver_name: &str) -> Option<Self> {
+        match driver_name.trim() {
+            "databricks-sql-go" => Some(Self::Go),
+            "nodejs-sql-driver" => Some(Self::NodeJs),
+            "Databricks ODBC Driver" => Some(Self::Odbc),
+            "Databricks SQL Python Connector" => Some(Self::Python),
+            _ => None,
+        }
+    }
+
     const fn as_endpoint_segment(self) -> &'static str {
         match self {
             Self::Go => "GOLANG",
@@ -77,13 +88,13 @@ impl fmt::Display for ClientType {
 /// properties of the outer driver and therefore do not participate in the
 /// workspace cache key.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ClientIdentity {
+pub(crate) struct ClientIdentity {
     client_type: ClientType,
     version: String,
 }
 
 impl ClientIdentity {
-    pub fn new(client_type: ClientType, version: impl Into<String>) -> Self {
+    fn new(client_type: ClientType, version: impl Into<String>) -> Self {
         let version = version.into();
         Self {
             client_type,
@@ -91,11 +102,19 @@ impl ClientIdentity {
         }
     }
 
-    pub fn client_type(&self) -> ClientType {
+    pub(crate) fn from_driver_system_configuration(
+        configuration: &DriverSystemConfiguration,
+    ) -> Option<Self> {
+        let client_type = ClientType::from_driver_name(configuration.driver_name.as_deref()?)?;
+        let version = configuration.driver_version.as_deref()?.trim();
+        (!version.is_empty()).then(|| Self::new(client_type, version))
+    }
+
+    fn client_type(&self) -> ClientType {
         self.client_type
     }
 
-    pub fn version(&self) -> &str {
+    fn version(&self) -> &str {
         &self.version
     }
 }
@@ -116,11 +135,6 @@ impl FeatureFlagValues {
 
     fn get(&self, name: &str) -> Option<&str> {
         self.values.get(name).map(String::as_str)
-    }
-
-    #[cfg(test)]
-    fn is_empty(&self) -> bool {
-        self.values.is_empty()
     }
 }
 
@@ -182,25 +196,38 @@ impl FeatureFlagResolver {
 
         let key = self.workspace_key.clone();
 
-        match self.cache.lookup(&key) {
+        match self.cache.lookup(&key).await {
             CacheLookup::Fresh(values) => values,
-            CacheLookup::Wait(receiver) => {
-                match tokio::time::timeout(self.request_timeout(), receiver).await {
+            CacheLookup::Missing => {
+                // Moka coalesces cold loads, but every waiter keeps its own
+                // session-open timeout instead of inheriting the leader's.
+                match tokio::time::timeout(
+                    self.request_timeout(),
+                    self.cache.load(key, self.fetch_values()),
+                )
+                .await
+                {
                     Ok(Ok(values)) => values,
-                    // A waiter must respect its own connection timeout rather
-                    // than inherit a slower leader's network settings.
-                    Ok(Err(_)) | Err(_) => FeatureFlagValues::default(),
+                    Ok(Err(error)) => {
+                        self.warn_fetch_failure(error);
+                        FeatureFlagValues::default()
+                    }
+                    Err(error) => {
+                        self.warn_fetch_failure(error);
+                        FeatureFlagValues::default()
+                    }
                 }
             }
-            CacheLookup::Load => self.fetch_and_complete(key.clone()).await,
-            CacheLookup::Stale {
-                values,
-                start_refresh,
-            } => {
-                if start_refresh {
-                    self.fetch_and_complete(key.clone()).await
-                } else {
-                    values
+            CacheLookup::Stale(stale) => {
+                match self.cache.refresh(key, self.fetch_values()).await {
+                    Ok(Some(values)) => values,
+                    // A size eviction can race this refresh. The values from
+                    // the initial lookup remain the safest fail-open result.
+                    Ok(None) => stale,
+                    Err(error) => {
+                        self.warn_fetch_failure(error);
+                        stale
+                    }
                 }
             }
         }
@@ -216,47 +243,47 @@ impl FeatureFlagResolver {
     /// failures all fail open as `None`.
     // The readers intentionally precede their first kernel-owned consumer.
     #[allow(dead_code)]
-    pub(crate) fn get_bool(&self, name: &str) -> Option<bool> {
-        self.get_typed(name, "boolean")
+    pub(crate) async fn get_bool(&self, name: &str) -> Option<bool> {
+        self.get_typed(name, "boolean").await
     }
 
     /// Read and validate a signed 32-bit integer SAFE flag.
     #[allow(dead_code)]
-    pub(crate) fn get_int32(&self, name: &str) -> Option<i32> {
-        self.get_typed(name, "int32")
+    pub(crate) async fn get_int32(&self, name: &str) -> Option<i32> {
+        self.get_typed(name, "int32").await
     }
 
     /// Read and validate a signed 64-bit integer SAFE flag.
     #[allow(dead_code)]
-    pub(crate) fn get_int64(&self, name: &str) -> Option<i64> {
-        self.get_typed(name, "int64")
+    pub(crate) async fn get_int64(&self, name: &str) -> Option<i64> {
+        self.get_typed(name, "int64").await
     }
 
     /// Read and validate a double-precision SAFE flag.
     #[allow(dead_code)]
-    pub(crate) fn get_double(&self, name: &str) -> Option<f64> {
-        self.get_typed(name, "double")
+    pub(crate) async fn get_double(&self, name: &str) -> Option<f64> {
+        self.get_typed(name, "double").await
     }
 
     /// Read and validate a string SAFE flag.
     #[allow(dead_code)]
-    pub(crate) fn get_string(&self, name: &str) -> Option<String> {
-        self.get_typed(name, "string")
+    pub(crate) async fn get_string(&self, name: &str) -> Option<String> {
+        self.get_typed(name, "string").await
     }
 
     /// Read and validate a string-list SAFE flag.
     #[allow(dead_code)]
-    pub(crate) fn get_string_list(&self, name: &str) -> Option<Vec<String>> {
-        self.get_typed(name, "string list")
+    pub(crate) async fn get_string_list(&self, name: &str) -> Option<Vec<String>> {
+        self.get_typed(name, "string list").await
     }
 
-    fn get_typed<T: DeserializeOwned>(&self, name: &str, expected: &str) -> Option<T> {
-        let values = self.cache.current(&self.workspace_key)?;
+    async fn get_typed<T: DeserializeOwned>(&self, name: &str, expected: &str) -> Option<T> {
+        let values = self.cache.current(&self.workspace_key).await?;
         let raw = values.get(name)?;
         match serde_json::from_str(raw) {
             Ok(value) => Some(value),
             Err(error) => {
-                warn!(
+                debug!(
                     flag_name = name,
                     expected_type = expected,
                     error = %error,
@@ -267,19 +294,17 @@ impl FeatureFlagResolver {
         }
     }
 
-    async fn fetch_and_complete(&self, key: WorkspaceKey) -> FeatureFlagValues {
-        let guard = self.cache.refresh_guard(key);
-        match self.fetch().await {
-            Ok(result) => guard.success(result.values, response_ttl(result.ttl_seconds)),
-            Err(error) => {
-                warn!(
-                    client_type = %self.identity.client_type(),
-                    error = %error,
-                    "feature-flag fetch failed; using defaults or stale values"
-                );
-                guard.failure()
-            }
-        }
+    async fn fetch_values(&self) -> Result<(FeatureFlagValues, Duration)> {
+        let result = self.fetch().await?;
+        Ok((result.values, response_ttl(result.ttl_seconds)))
+    }
+
+    fn warn_fetch_failure(&self, error: impl fmt::Display) {
+        warn!(
+            client_type = %self.identity.client_type(),
+            error = %error,
+            "feature-flag fetch failed; using defaults or stale values"
+        );
     }
 
     fn request_timeout(&self) -> Duration {
@@ -422,6 +447,47 @@ mod tests {
     }
 
     #[test]
+    fn client_identity_uses_existing_driver_system_configuration() {
+        let cases = [
+            ("databricks-sql-go", ClientType::Go),
+            ("nodejs-sql-driver", ClientType::NodeJs),
+            ("Databricks ODBC Driver", ClientType::Odbc),
+            ("Databricks SQL Python Connector", ClientType::Python),
+        ];
+
+        for (driver_name, expected_type) in cases {
+            let configuration = DriverSystemConfiguration {
+                driver_name: Some(driver_name.to_string()),
+                driver_version: Some(" 1.2.3 ".to_string()),
+                ..DriverSystemConfiguration::default()
+            };
+            let identity =
+                ClientIdentity::from_driver_system_configuration(&configuration).unwrap();
+            assert_eq!(identity.client_type(), expected_type);
+            assert_eq!(identity.version(), "1.2.3");
+        }
+    }
+
+    #[test]
+    fn client_identity_requires_known_name_and_nonempty_version() {
+        for configuration in [
+            DriverSystemConfiguration::default(),
+            DriverSystemConfiguration {
+                driver_name: Some("unknown-driver".to_string()),
+                driver_version: Some("1.2.3".to_string()),
+                ..DriverSystemConfiguration::default()
+            },
+            DriverSystemConfiguration {
+                driver_name: Some("databricks-sql-go".to_string()),
+                driver_version: Some(" \t".to_string()),
+                ..DriverSystemConfiguration::default()
+            },
+        ] {
+            assert!(ClientIdentity::from_driver_system_configuration(&configuration).is_none());
+        }
+    }
+
+    #[test]
     fn feature_flag_values_preserve_opaque_values() {
         let values = FeatureFlagValues::from_entries([
             ("boolean-looking".to_string(), " TRUE ".to_string()),
@@ -484,7 +550,7 @@ mod tests {
             .and(path(
                 "/api/2.0/connector-service/feature-flags/GOLANG/1.2.3",
             ))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(100)))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(500)))
             .expect(1)
             .mount(&server)
             .await;
@@ -492,7 +558,7 @@ mod tests {
         let http_client = Arc::new(
             DatabricksHttpClient::new(
                 HttpClientConfig {
-                    read_timeout: Duration::from_millis(20),
+                    read_timeout: Duration::from_millis(100),
                     ..HttpClientConfig::default()
                 },
                 HashMap::new(),
@@ -524,36 +590,40 @@ mod tests {
             ))
             .and(header("authorization", "Bearer test-token"))
             .and(header("x-databricks-org-id", "42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "flags": [{
-                    "name": "example.boolean",
-                    "value": "true"
-                }, {
-                    "name": "example.int32",
-                    "value": "-2147483648"
-                }, {
-                    "name": "example.int64",
-                    "value": "9223372036854775807"
-                }, {
-                    "name": "example.double",
-                    "value": "3.141592653589793"
-                }, {
-                    "name": "example.string",
-                    "value": "\"hello\""
-                }, {
-                    "name": "example.string-list",
-                    "value": "[\"a\",\"b\"]"
-                }, {
-                    "name": "example.opaque-json",
-                    "value": "{\"enabled\":true}"
-                }, {
-                    "name": "",
-                    "value": "ignored"
-                }, {
-                    "name": "example.missing-value"
-                }],
-                "ttl_seconds": 300
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(50))
+                    .set_body_json(json!({
+                        "flags": [{
+                            "name": "example.boolean",
+                            "value": "true"
+                        }, {
+                            "name": "example.int32",
+                            "value": "-2147483648"
+                        }, {
+                            "name": "example.int64",
+                            "value": "9223372036854775807"
+                        }, {
+                            "name": "example.double",
+                            "value": "3.141592653589793"
+                        }, {
+                            "name": "example.string",
+                            "value": "\"hello\""
+                        }, {
+                            "name": "example.string-list",
+                            "value": "[\"a\",\"b\"]"
+                        }, {
+                            "name": "example.opaque-json",
+                            "value": "{\"enabled\":true}"
+                        }, {
+                            "name": "",
+                            "value": "ignored"
+                        }, {
+                            "name": "example.missing-value"
+                        }],
+                        "ttl_seconds": 300
+                    })),
+            )
             .expect(1)
             .mount(&server)
             .await;
@@ -578,43 +648,49 @@ mod tests {
         );
 
         assert_eq!(
-            resolver.get_bool("example.boolean"),
+            resolver.get_bool("example.boolean").await,
             None,
             "typed getters must not trigger connector-service requests"
         );
-        resolver.prepare_for_session_open().await;
+        let preparations = (0..8).map(|_| {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.prepare_for_session_open().await })
+        });
+        for preparation in preparations {
+            preparation.await.expect("session preparation task");
+        }
         for _ in 0..2 {
-            assert_eq!(resolver.get_bool("example.boolean"), Some(true));
-            assert_eq!(resolver.get_int32("example.int32"), Some(i32::MIN));
-            assert_eq!(resolver.get_int64("example.int64"), Some(i64::MAX));
+            assert_eq!(resolver.get_bool("example.boolean").await, Some(true));
+            assert_eq!(resolver.get_int32("example.int32").await, Some(i32::MIN));
+            assert_eq!(resolver.get_int64("example.int64").await, Some(i64::MAX));
             assert_eq!(
-                resolver.get_double("example.double"),
+                resolver.get_double("example.double").await,
                 Some(std::f64::consts::PI)
             );
             assert_eq!(
-                resolver.get_string("example.string").as_deref(),
+                resolver.get_string("example.string").await.as_deref(),
                 Some("hello")
             );
             assert_eq!(
-                resolver.get_string_list("example.string-list"),
+                resolver.get_string_list("example.string-list").await,
                 Some(vec!["a".to_string(), "b".to_string()])
             );
             assert_eq!(
-                resolver.get_int32("example.int64"),
+                resolver.get_int32("example.int64").await,
                 None,
                 "int32 validates range even though JSON has no integer type tag"
             );
             assert_eq!(
-                resolver.get_bool("example.string"),
+                resolver.get_bool("example.string").await,
                 None,
                 "typed getters do not coerce JSON strings"
             );
-            assert_eq!(resolver.get_bool("example.opaque-json"), None);
-            assert_eq!(resolver.get_int32("example.opaque-json"), None);
-            assert_eq!(resolver.get_int64("example.opaque-json"), None);
-            assert_eq!(resolver.get_double("example.opaque-json"), None);
-            assert_eq!(resolver.get_string("example.opaque-json"), None);
-            assert_eq!(resolver.get_string_list("example.opaque-json"), None);
+            assert_eq!(resolver.get_bool("example.opaque-json").await, None);
+            assert_eq!(resolver.get_int32("example.opaque-json").await, None);
+            assert_eq!(resolver.get_int64("example.opaque-json").await, None);
+            assert_eq!(resolver.get_double("example.opaque-json").await, None);
+            assert_eq!(resolver.get_string("example.opaque-json").await, None);
+            assert_eq!(resolver.get_string_list("example.opaque-json").await, None);
         }
     }
 
@@ -623,7 +699,21 @@ mod tests {
         let cache = Arc::new(FeatureFlagCache::default());
         let host = "https://workspace.example.com";
         let key = WorkspaceKey::new(host, None);
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
+        let leader_started = Arc::new(tokio::sync::Notify::new());
+        let leader = {
+            let cache = Arc::clone(&cache);
+            let key = key.clone();
+            let leader_started = Arc::clone(&leader_started);
+            tokio::spawn(async move {
+                cache
+                    .load(key, async move {
+                        leader_started.notify_one();
+                        std::future::pending::<Result<(FeatureFlagValues, Duration)>>().await
+                    })
+                    .await
+            })
+        };
+        leader_started.notified().await;
 
         let http_client = Arc::new(
             DatabricksHttpClient::new(
@@ -645,10 +735,12 @@ mod tests {
         let started = std::time::Instant::now();
         resolver.prepare_for_session_open().await;
         assert!(started.elapsed() < Duration::from_millis(100));
-        assert_eq!(resolver.get_bool("example.flag"), None);
+        assert_eq!(resolver.get_bool("example.flag").await, None);
 
-        // Cancel the synthetic leader and clean up the in-flight entry.
-        drop(cache.refresh_guard(key));
+        // Cancel the synthetic leader and verify Moka releases the key.
+        leader.abort();
+        assert!(leader.await.unwrap_err().is_cancelled());
+        assert!(matches!(cache.lookup(&key).await, CacheLookup::Missing));
     }
 
     #[tokio::test]
@@ -660,7 +752,7 @@ mod tests {
             ))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_delay(Duration::from_millis(50))
+                    .set_delay(Duration::from_millis(200))
                     .set_body_json(json!({
                         "flags": [{"name": "example.flag", "value": "\"new\""}],
                         "ttl_seconds": 300
@@ -673,14 +765,18 @@ mod tests {
         let identity = ClientIdentity::new(ClientType::Go, "1.2.3");
         let cache = Arc::new(FeatureFlagCache::default());
         let key = WorkspaceKey::new(canonical_host(server.uri()), None);
-        assert!(matches!(cache.lookup(&key), CacheLookup::Load));
-        cache.refresh_guard(key).success(
-            FeatureFlagValues::from_entries([(
-                "example.flag".to_string(),
-                "\"stale\"".to_string(),
-            )]),
-            Duration::ZERO,
-        );
+        cache
+            .load(key, async {
+                Ok::<_, Error>((
+                    FeatureFlagValues::from_entries([(
+                        "example.flag".to_string(),
+                        "\"stale\"".to_string(),
+                    )]),
+                    Duration::ZERO,
+                ))
+            })
+            .await
+            .expect("prime stale cache entry");
 
         let http_client = Arc::new(
             DatabricksHttpClient::new(HttpClientConfig::default(), HashMap::new()).unwrap(),
@@ -692,22 +788,29 @@ mod tests {
             let resolver = resolver.clone();
             tokio::spawn(async move { resolver.prepare_for_session_open().await })
         };
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            resolver.prepare_for_session_open(),
+        )
+        .await
+        .expect("a concurrent session open must use stale flags without waiting");
 
         assert_eq!(
-            resolver.get_string("example.flag").as_deref(),
+            resolver.get_string("example.flag").await.as_deref(),
             Some("stale")
         );
 
         // Typed readers never start network work; while session-open refresh is
         // in flight they keep seeing the last process-cache value.
-        let second = resolver.get_string("example.flag");
-        let third = resolver.get_string("example.flag");
+        let second = resolver.get_string("example.flag").await;
+        let third = resolver.get_string("example.flag").await;
         assert_eq!(second.as_deref(), Some("stale"));
         assert_eq!(third.as_deref(), Some("stale"));
 
         refresh.await.expect("session-open refresh task");
-        let refreshed = resolver.get_string("example.flag");
+        let refreshed = resolver.get_string("example.flag").await;
         assert_eq!(refreshed.as_deref(), Some("new"));
         server.verify().await;
     }
@@ -729,7 +832,7 @@ mod tests {
                 Arc::new(FeatureFlagCache::default()),
             );
             resolver.prepare_for_session_open().await;
-            assert_eq!(resolver.get_bool("missing.flag"), None);
+            assert_eq!(resolver.get_bool("missing.flag").await, None);
         }
     }
 
@@ -758,7 +861,7 @@ mod tests {
 
         resolver.prepare_for_session_open().await;
         for _ in 0..2 {
-            assert_eq!(resolver.get_bool("missing.flag"), None);
+            assert_eq!(resolver.get_bool("missing.flag").await, None);
         }
         resolver.prepare_for_session_open().await;
     }
@@ -801,12 +904,12 @@ mod tests {
 
         let expired = resolver("expired-token");
         expired.prepare_for_session_open().await;
-        assert_eq!(expired.get_string("example.flag"), None);
+        assert_eq!(expired.get_string("example.flag").await, None);
 
         let healthy = resolver("healthy-token");
         healthy.prepare_for_session_open().await;
         assert_eq!(
-            healthy.get_string("example.flag").as_deref(),
+            healthy.get_string("example.flag").await.as_deref(),
             Some("opaque")
         );
     }
@@ -849,12 +952,12 @@ mod tests {
 
         let malformed = resolver("proxied-token");
         malformed.prepare_for_session_open().await;
-        assert_eq!(malformed.get_string("example.flag"), None);
+        assert_eq!(malformed.get_string("example.flag").await, None);
 
         let healthy = resolver("healthy-token");
         healthy.prepare_for_session_open().await;
         assert_eq!(
-            healthy.get_string("example.flag").as_deref(),
+            healthy.get_string("example.flag").await.as_deref(),
             Some("opaque")
         );
     }

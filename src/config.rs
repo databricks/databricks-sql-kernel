@@ -54,7 +54,6 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::feature_flags::ClientIdentity;
 use crate::telemetry::DriverSystemConfiguration;
 
 // ─── Connection identity ────────────────────────────────────────────────────
@@ -1535,14 +1534,10 @@ pub struct SessionConfig {
     /// Required: how to authenticate.
     pub auth: AuthConfig,
 
-    /// Client-provided driver/runtime identity. Telemetry uses this for
-    /// `DriverSystemConfiguration`, filling any missing fields with
-    /// kernel defaults at session-open time.
+    /// Client-provided driver/runtime identity. The kernel uses the canonical
+    /// driver name and version for connector-service feature flags and fills
+    /// any missing fields with kernel defaults when emitting telemetry.
     pub driver_system_configuration: Option<DriverSystemConfiguration>,
-
-    /// Outer-driver family and version used to resolve connector-service
-    /// feature flags. `None` performs no feature-flag request.
-    pub client_identity: Option<ClientIdentity>,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /
     /// Thrift `configuration`. Typed sub-structs above translate

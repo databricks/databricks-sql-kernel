@@ -420,8 +420,9 @@ impl Session {
         // before CreateSession. The resolver populates the process-wide
         // workspace cache; the session retains no private snapshot.
         let feature_flags = config
-            .client_identity
-            .clone()
+            .driver_system_configuration
+            .as_ref()
+            .and_then(ClientIdentity::from_driver_system_configuration)
             .map(|identity| FeatureFlagResolver::new(&host, Arc::clone(&http_client), identity));
         if let Some(feature_flags) = &feature_flags {
             feature_flags.prepare_for_session_open().await;
@@ -819,7 +820,6 @@ pub struct SessionBuilder {
     result: Option<ResultConfig>,
     logging: Option<LoggingConfig>,
     telemetry: Option<TelemetryConfig>,
-    client_identity: Option<ClientIdentity>,
     driver_system_configuration: Option<DriverSystemConfiguration>,
     session_conf: HashMap<String, String>,
     geospatial_result_representation: Option<GeospatialResultRepresentation>,
@@ -951,20 +951,12 @@ impl SessionBuilder {
         self
     }
 
-    /// Driver family and version used for connector-service feature flags.
+    /// Driver/runtime identity used for feature flags and telemetry logs.
     ///
-    /// Bindings should pass the identity of the outer driver, not the kernel's
-    /// own crate version. Omitting identity keeps feature-flag resolution off.
-    pub fn client_identity(mut self, identity: ClientIdentity) -> Self {
-        self.client_identity = Some(identity);
-        self
-    }
-
-    /// Driver/runtime identity stamped onto telemetry logs.
-    ///
-    /// Binding layers should use this to pass their own driver name,
-    /// version, runtime, and process details. Any fields left unset are
-    /// filled from kernel defaults when the session opens.
+    /// Binding layers should pass their own canonical driver name and version.
+    /// Recognized drivers use those fields for connector-service feature-flag
+    /// evaluation; telemetry also fills any omitted runtime or process fields
+    /// from kernel defaults when the session opens.
     pub fn driver_system_configuration(
         mut self,
         system_configuration: DriverSystemConfiguration,
@@ -1027,7 +1019,6 @@ impl SessionBuilder {
             defaults: self.defaults,
             auth,
             driver_system_configuration: self.driver_system_configuration,
-            client_identity: self.client_identity,
             session_conf: self.session_conf,
             geospatial_result_representation: self.geospatial_result_representation,
             http: self.http.unwrap_or_default(),
@@ -1573,7 +1564,6 @@ mod mtls_endpoint_tests {
                 identity_federation_client_id: None,
             },
             driver_system_configuration: None,
-            client_identity: None,
             session_conf: Default::default(),
             geospatial_result_representation: None,
             http: HttpConfig::default(),
@@ -1703,7 +1693,6 @@ mod retry_config_tests {
                 identity_federation_client_id: None,
             },
             driver_system_configuration: None,
-            client_identity: None,
             session_conf: Default::default(),
             geospatial_result_representation: None,
             http,
@@ -2100,7 +2089,6 @@ mod retry_config_tests {
 #[cfg(test)]
 mod is_open_tests {
     use super::*;
-    use crate::feature_flags::ClientType;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::{TelemetryExportResult, TelemetryExporter, TelemetryRequest};
     use crate::ResultBatch;
@@ -2426,9 +2414,9 @@ mod is_open_tests {
 
     #[tokio::test]
     async fn feature_flags_are_loaded_before_session_open_and_shared_across_sessions() {
-        // Keep this cache identity unique among session/binding tests. Mock
-        // servers use ephemeral ports that the OS may reuse while the
-        // process-wide feature-flag cache is still alive.
+        // Use a test-specific workspace id so ephemeral mock-server port reuse
+        // cannot collide with another process-wide cache entry.
+        const WORKSPACE_ID: &str = "3762429";
         const DRIVER_VERSION: &str = "session-feature-flag-ordering";
         let server = MockServer::start().await;
         Mock::given(method("GET"))
@@ -2451,14 +2439,21 @@ mod is_open_tests {
         for iteration in 0..2 {
             let session = Session::builder()
                 .connection(
-                    ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
-                        .expect("valid http_path"),
+                    ConnectionConfig::from_http_path(
+                        server.uri(),
+                        &format!("/sql/1.0/warehouses/test_wh?o={WORKSPACE_ID}"),
+                    )
+                    .expect("valid http_path"),
                 )
                 .auth(AuthConfig::Pat {
                     token: "dapi_test_token".into(),
                     identity_federation_client_id: None,
                 })
-                .client_identity(ClientIdentity::new(ClientType::Go, DRIVER_VERSION))
+                .driver_system_configuration(DriverSystemConfiguration {
+                    driver_name: Some("databricks-sql-go".to_string()),
+                    driver_version: Some(DRIVER_VERSION.to_string()),
+                    ..DriverSystemConfiguration::default()
+                })
                 .open()
                 .await
                 .expect("session must open");
@@ -2488,7 +2483,10 @@ mod is_open_tests {
                 .inner
                 .feature_flags()
                 .expect("configured client identity installs a resolver");
-            assert_eq!(internal_flags.get_bool("example.session-flag"), Some(true));
+            assert_eq!(
+                internal_flags.get_bool("example.session-flag").await,
+                Some(true)
+            );
             session.close().await.expect("close succeeds");
         }
 
@@ -2508,7 +2506,7 @@ mod is_open_tests {
     }
 
     #[tokio::test]
-    async fn session_without_client_identity_skips_feature_flag_resolution() {
+    async fn session_without_driver_identity_skips_feature_flag_resolution() {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(500))
