@@ -1585,8 +1585,8 @@ async fn foreign_keys_reshaped_to_jdbc_columns() {
     // Live `SHOW FOREIGN KEYS` shape — the FK-bearing side is in
     // `catalogName / namespace / tableName / col_name`, the referenced
     // primary side in the `parent*` columns. The kernel reshapes into
-    // the JDBC `getCrossReference` set; UPDATE_RULE / DELETE_RULE /
-    // PK_NAME have no server source and come back null.
+    // the JDBC `getCrossReference` set. This older response omits
+    // rule columns, so they remain null along with PK_NAME.
     let raw = string_batch(vec![
         ("catalogName", vec![Some("main")]),
         ("namespace", vec![Some("d")]),
@@ -1661,10 +1661,115 @@ async fn foreign_keys_reshaped_to_jdbc_columns() {
             .value(0),
         "fk_child"
     );
-    // UPDATE_RULE / DELETE_RULE / PK_NAME have no server source → null.
+    // Absent rule fields and PK_NAME remain null.
     assert!(b.column_by_name("UPDATE_RULE").unwrap().is_null(0));
     assert!(b.column_by_name("DELETE_RULE").unwrap().is_null(0));
     assert!(b.column_by_name("PK_NAME").unwrap().is_null(0));
+}
+
+#[tokio::test]
+async fn foreign_keys_preserves_rules_for_show_and_native_responses() {
+    for native in [false, true] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+
+        let names = if native {
+            [
+                "PKTABLE_CAT",
+                "PKTABLE_SCHEM",
+                "PKTABLE_NAME",
+                "PKCOLUMN_NAME",
+                "FKTABLE_CAT",
+                "FKTABLE_SCHEM",
+                "FKTABLE_NAME",
+                "FKCOLUMN_NAME",
+                "KEY_SEQ",
+                "UPDATE_RULE",
+                "DELETE_RULE",
+                "FK_NAME",
+                "DEFERRABILITY",
+            ]
+        } else {
+            [
+                "parentCatalogName",
+                "parentNamespace",
+                "parentTableName",
+                "parentColName",
+                "catalogName",
+                "namespace",
+                "tableName",
+                "col_name",
+                "keySeq",
+                "updateRule",
+                "deleteRule",
+                "constraintName",
+                "deferrability",
+            ]
+        };
+        let mut columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec!["main"; 3])),
+            Arc::new(StringArray::from(vec!["d"; 3])),
+            Arc::new(StringArray::from(vec!["parent"; 3])),
+            Arc::new(StringArray::from(vec!["id"; 3])),
+            Arc::new(StringArray::from(vec!["main"; 3])),
+            Arc::new(StringArray::from(vec!["d"; 3])),
+            Arc::new(StringArray::from(vec!["child"; 3])),
+            Arc::new(StringArray::from(vec!["pid"; 3])),
+            Arc::new(Int32Array::from(vec![1; 3])),
+            Arc::new(Int32Array::from(vec![Some(3), Some(0), None])),
+            Arc::new(Int32Array::from(vec![Some(3), Some(2), Some(4)])),
+            Arc::new(StringArray::from(vec!["fk_child"; 3])),
+            Arc::new(Int32Array::from(vec![7; 3])),
+        ];
+        let mut fields: Vec<_> = names
+            .into_iter()
+            .zip(&columns)
+            .map(|(name, column)| Field::new(name, column.data_type().clone(), true))
+            .collect();
+        if native {
+            fields.insert(12, Field::new("PK_NAME", DataType::Utf8, true));
+            columns.insert(12, Arc::new(StringArray::from(vec![None::<&str>; 3])));
+        }
+        let raw = RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap();
+        let body = if native {
+            native_inline_response_body(&raw)
+        } else {
+            succeeded_inline_response_body(&raw)
+        };
+        mount_execute_expecting_sql(&server, "SHOW FOREIGN KEYS", body).await;
+
+        let session = open_session(&server).await;
+        let mut stream = session
+            .metadata()
+            .foreign_keys(
+                Some(Identifier::new("main").unwrap()),
+                Some(Identifier::new("d").unwrap()),
+                Some(Identifier::new("parent").unwrap()),
+                Some(Identifier::new("main").unwrap()),
+                Some(Identifier::new("d").unwrap()),
+                Some(Identifier::new("child").unwrap()),
+            )
+            .await
+            .expect("foreign_keys");
+        let batches = drain_stream(&mut stream).await;
+        assert_eq!(batches.len(), 1);
+        let batch = &batches[0];
+        assert_eq!(batch.num_rows(), 3);
+        for (name, expected) in [
+            ("UPDATE_RULE", vec![Some(3), Some(0), None]),
+            ("DELETE_RULE", vec![Some(3), Some(2), Some(4)]),
+        ] {
+            let values = batch
+                .column_by_name(name)
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int16Array>()
+                .expect("rule column is Int16");
+            assert_eq!(values, &Int16Array::from(expected), "native={native}");
+        }
+        assert_eq!(batch.column_by_name("PK_NAME").unwrap().null_count(), 3);
+    }
 }
 
 #[tokio::test]
