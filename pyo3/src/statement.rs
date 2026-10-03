@@ -235,8 +235,8 @@ impl Statement {
     /// `ExecutedAsyncStatement` the caller drives via `status()` /
     /// `await_result()` / `fetch_result()`.
     ///
-    /// Long-running queries that would blow past `execute()`'s sync
-    /// polling budget belong on this path.
+    /// Use this path when the caller needs a poll/cancel handle instead of
+    /// waiting synchronously for a terminal state.
     fn submit(&mut self, py: Python<'_>) -> PyResult<ExecutedAsyncStatement> {
         let inner = alive_mut!(self, "Statement");
         let runtime = inner.runtime.clone();

@@ -464,7 +464,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
         return store_invalid_arg("kernel_statement_execute: out must not be null");
     }
 
-    execute_with_timeout_mode(stmt, ExecutionTimeout::Default, out)
+    execute_with_timeout_mode(stmt, ExecutionTimeout::Unlimited, out)
 }
 
 /// Wait-for-result execution with a client deadline in milliseconds.

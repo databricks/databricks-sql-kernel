@@ -303,11 +303,9 @@ impl Statement {
     /// statement on success and returns `state=CLOSED`. Setting
     /// `wait_timeout=10s` explicitly returns `state=SUCCEEDED`
     /// (statement still alive server-side, requires a separate
-    /// `CloseStatement`) and adds ~150–260ms to the response —
-    /// observed against Dogfood; see PR description for the bench
-    /// numbers. The kernel polls internally if the query needs
-    /// longer than 10s. This entry point retains the transport's 600s polling
-    /// ceiling; use [`Statement::execute_with_timeout`] to choose another limit.
+    /// `CloseStatement`). The kernel polls internally if the query needs
+    /// longer than 10s. This entry point has no overall client polling deadline;
+    /// use [`Statement::execute_with_timeout`] to set one.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// the kernel spawns a fire-and-forget `CloseStatement` against it
@@ -317,7 +315,7 @@ impl Statement {
     /// calls on it short-circuit to `InvalidStatementHandle` without
     /// hitting the wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        self.execute_with_timeout_mode(ExecutionTimeout::Default)
+        self.execute_with_timeout_mode(ExecutionTimeout::Unlimited)
             .await
     }
 
