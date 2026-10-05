@@ -461,7 +461,7 @@ impl<'a> LikePattern<'a> {
 /// pattern filter.
 ///
 /// Non-empty catalogs remain exact [`Identifier`]s. An empty catalog cannot
-/// be represented as an `Identifier`, but JDBC metadata semantics require it
+/// be represented by `Identifier::new`, but JDBC metadata semantics require it
 /// to match nothing rather than fail validation. Encode that case as an empty
 /// [`LikePattern`] on the accompanying pattern dimension; metadata methods
 /// short-circuit empty patterns to a typed empty result before any wire call.
@@ -563,6 +563,51 @@ impl Metadata {
             );
         }
         catalog
+    }
+
+    async fn current_catalog_and_schema(&self) -> Result<(String, String)> {
+        let mut statement = Statement::new(Arc::clone(&self.session));
+        statement
+            .spec()
+            .sql("SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()");
+        let mut executed = statement.execute().await?;
+
+        let namespace = match executed.next_batch().await {
+            Ok(Some(ResultBatch::Arrow(batch))) => (|| {
+                if batch.num_columns() != 2 || batch.num_rows() == 0 {
+                    return Err(Error::data_loss()
+                        .message("Current catalog/schema returned no rows or unexpected columns"));
+                }
+                let read_name = |index: usize, function: &str| -> Result<String> {
+                    let names = batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<arrow_array::StringArray>()
+                        .ok_or_else(|| {
+                            Error::data_loss()
+                                .message(format!("{function} result is not a UTF-8 string"))
+                        })?;
+                    if names.is_null(0) {
+                        Err(Error::data_loss().message(format!("{function} returned null")))
+                    } else {
+                        Ok(names.value(0).to_owned())
+                    }
+                };
+                Ok((
+                    read_name(0, "CURRENT_CATALOG()")?,
+                    read_name(1, "CURRENT_SCHEMA()")?,
+                ))
+            })(),
+            Ok(None) => {
+                Err(Error::data_loss().message("Current catalog/schema returned no result"))
+            }
+            Err(error) => Err(error),
+        };
+
+        if let Err(error) = executed.close().await {
+            debug!(error = %error, "failed to close current catalog/schema statement");
+        }
+        namespace
     }
 
     async fn resolve_functions_catalog(&self) -> String {
@@ -1175,10 +1220,9 @@ impl Metadata {
     /// [`thrift_shape::reshape_primary_keys`] so every binding sees the
     /// canonical names without re-mapping.
     ///
-    /// Catalog and schema are required at the kernel layer:
-    /// Databricks `SHOW KEYS` needs `IN CATALOG / IN SCHEMA / IN
-    /// TABLE` fully qualified. Wrappers that want to fall back to a
-    /// session default should resolve it before calling.
+    /// Missing catalog or schema names resolve independently from the
+    /// current session. Explicit empty names are preserved when constructed
+    /// with [`Identifier::new_allow_empty`].
     pub async fn primary_keys(
         &self,
         catalog: Option<Identifier<'_>>,
@@ -1189,12 +1233,19 @@ impl Metadata {
         let telemetry = self.metadata_telemetry(OperationType::ListPrimaryKeys);
         let telemetry_for_body = telemetry.clone();
         let result = async {
-            let catalog = catalog.ok_or_else(|| {
-                Error::invalid_argument().message("primary_keys requires a catalog identifier")
-            })?;
-            let schema = schema.ok_or_else(|| {
-                Error::invalid_argument().message("primary_keys requires a schema identifier")
-            })?;
+            let (current_catalog, current_schema) = if catalog.is_none() || schema.is_none() {
+                self.current_catalog_and_schema().await?
+            } else {
+                (String::new(), String::new())
+            };
+            let catalog = match catalog {
+                Some(catalog) => catalog,
+                None => Identifier::new(&current_catalog)?,
+            };
+            let schema = match schema {
+                Some(schema) => schema,
+                None => Identifier::new(&current_schema)?,
+            };
             let raw = match self
                 .session
                 .transport()

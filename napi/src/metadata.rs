@@ -305,15 +305,21 @@ impl Connection {
     #[napi]
     pub async fn get_primary_keys(
         &self,
-        catalog: String,
-        schema: String,
+        catalog: Option<String>,
+        schema: Option<String>,
         table: String,
     ) -> napi::Result<Statement> {
         let meta = take_metadata(&self.inner).await?;
         guarded(async move {
             let stream = run_on_blocking(move || async move {
-                let cat = Some(Identifier::new(&catalog)?);
-                let sch = Some(Identifier::new(&schema)?);
+                let cat = catalog
+                    .as_deref()
+                    .map(Identifier::new_allow_empty)
+                    .transpose()?;
+                let sch = schema
+                    .as_deref()
+                    .map(Identifier::new_allow_empty)
+                    .transpose()?;
                 let tbl = Identifier::new(&table)?;
                 meta.primary_keys(cat, sch, tbl).await
             })
@@ -362,7 +368,7 @@ mod tests {
     use databricks_sql_kernel::{AuthConfig, ConnectionConfig, ErrorCode, Session};
     use serde_json::json;
     use tokio::sync::Mutex;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_partial_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // The `Option<String>` → kernel-newtype conversion now lives on the
@@ -397,21 +403,19 @@ mod tests {
         assert!(LikePattern::from_opt(&input).unwrap().is_none());
     }
 
-    #[tokio::test]
-    async fn metadata_short_circuits_return_empty_without_statement_request() {
-        let server = MockServer::start().await;
+    async fn open_mock_connection(server: &MockServer) -> Connection {
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "session_id": "sess-napi-metadata" })),
             )
-            .mount(&server)
+            .mount(server)
             .await;
         Mock::given(method("DELETE"))
             .and(path("/api/2.0/sql/sessions/sess-napi-metadata"))
             .respond_with(ResponseTemplate::new(200))
-            .mount(&server)
+            .mount(server)
             .await;
 
         let session = Session::builder()
@@ -426,10 +430,16 @@ mod tests {
             .open()
             .await
             .expect("session opens against mock server");
-        let connection = Connection {
+        Connection {
             inner: Arc::new(Mutex::new(Some(session))),
             session_id: "sess-napi-metadata".to_owned(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_short_circuits_return_empty_without_statement_request() {
+        let server = MockServer::start().await;
+        let connection = open_mock_connection(&server).await;
 
         let statements = [
             connection
@@ -475,5 +485,93 @@ mod tests {
         );
 
         connection.close().await.expect("connection closes");
+    }
+
+    #[tokio::test]
+    async fn primary_keys_accepts_null_and_empty_namespace_and_keeps_table_validation() {
+        let server = MockServer::start().await;
+        let connection = open_mock_connection(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_partial_json(json!({
+                "statement": "SHOW KEYS IN CATALOG `` IN SCHEMA `` IN TABLE `t`",
+                "session_id": "sess-napi-metadata",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "stmt-empty-namespace",
+                "status": {
+                    "state": "FAILED",
+                    "sql_state": "42704",
+                    "error": {
+                        "error_code": "BAD_REQUEST",
+                        "message": "NO_SUCH_CATALOG_EXCEPTION",
+                    },
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let statement = connection
+            .get_primary_keys(Some(String::new()), Some(String::new()), "t".to_owned())
+            .await
+            .expect("empty names reach SHOW KEYS");
+        assert!(statement.fetch_next_batch().await.unwrap().is_none());
+        statement.close().await.unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .and(body_partial_json(json!({
+                "statement": "SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()",
+                "session_id": "sess-napi-metadata",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": "stmt-current-namespace",
+                "status": {
+                    "state": "FAILED",
+                    "sql_state": "42501",
+                    "error": {
+                        "error_code": "BAD_REQUEST",
+                        "message": "PERMISSION_DENIED",
+                    },
+                },
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let error = match connection
+            .get_primary_keys(None, None, "t".to_owned())
+            .await
+        {
+            Ok(_) => panic!("lookup error must propagate"),
+            Err(error) => error,
+        };
+        assert!(error.reason.contains("PERMISSION_DENIED"));
+
+        for table in ["", " "] {
+            let error = match connection
+                .get_primary_keys(None, None, table.to_owned())
+                .await
+            {
+                Ok(_) => panic!("invalid table name must fail"),
+                Err(error) => error,
+            };
+            assert!(error.reason.contains("InvalidArgument"));
+        }
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request.method.as_str() == "POST"
+                        && request.url.path() == "/api/2.0/sql/statements"
+                })
+                .count(),
+            2,
+            "invalid table names must not execute a statement"
+        );
+        connection.close().await.unwrap();
+        server.verify().await;
     }
 }
