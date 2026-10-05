@@ -644,7 +644,7 @@ impl Statement {
     /// Read-only access (for logging or assertion).
     pub fn spec_ref(&self) -> &StatementSpec;
 
-    /// Wait-for-result execution with the existing 600s polling ceiling.
+    /// Wait-for-result execution without an overall client polling deadline.
     pub async fn execute(&mut self) -> Result<ExecutedStatement>;
 
     /// Execute with a client deadline through terminal-state mapping.

@@ -1308,8 +1308,8 @@ impl Metadata {
     /// `getCrossReference` column set (`PKTABLE_*`, `FKTABLE_*`,
     /// `KEY_SEQ`, `UPDATE_RULE`, `DELETE_RULE`, `FK_NAME`, `PK_NAME`,
     /// `DEFERRABILITY`) by [`thrift_shape::reshape_foreign_keys`].
-    /// `UPDATE_RULE` / `DELETE_RULE` / `PK_NAME` have no source in the
-    /// server response and are emitted as typed nulls (not synthesized).
+    /// Rule values are preserved when present, otherwise emitted as
+    /// typed nulls. `PK_NAME` has no server source and remains null.
     pub async fn foreign_keys(
         &self,
         parent_catalog: Option<Identifier<'_>>,

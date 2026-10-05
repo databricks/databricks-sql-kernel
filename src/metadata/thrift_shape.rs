@@ -423,7 +423,8 @@ fn null_int16(len: usize) -> ArrayRef {
 /// array when the column is absent — symmetric with [`int32_column`].
 /// A cast failure is surfaced as `Error::data_loss` rather than
 /// silently producing nulls. Used for JDBC `SMALLINT` columns
-/// (`DEFERRABILITY`) whose server source ships as a wider integer.
+/// (`UPDATE_RULE`, `DELETE_RULE`, `DEFERRABILITY`) whose server source
+/// ships as a wider integer.
 fn int16_column(batch: &RecordBatch, name: &str) -> Result<ArrayRef> {
     match column_index(batch.schema_ref(), name) {
         Some(idx) => {
@@ -1141,10 +1142,8 @@ pub(crate) fn reshape_primary_keys(batch: &RecordBatch) -> Result<RecordBatch> {
 /// (FK-bearing) side is in `catalogName / namespace / tableName /
 /// col_name`, and the referenced primary side is in the `parent*`
 /// columns. This is a pure column rename + projection onto the 14
-/// JDBC columns. `UPDATE_RULE`, `DELETE_RULE`, and `PK_NAME` have no
-/// source in the server response — they are emitted as typed nulls
-/// rather than synthesizing a value (e.g. the kernel does not fabricate
-/// a JDBC `importedKeyNoAction` rule code).
+/// JDBC columns. Rule values are preserved when present, otherwise
+/// emitted as typed nulls. `PK_NAME` has no server source and remains null.
 pub(crate) fn reshape_foreign_keys(batch: &RecordBatch) -> Result<RecordBatch> {
     let n = batch.num_rows();
     let pktable_cat = utf8_column(batch, "parentCatalogName")?;
@@ -1156,6 +1155,8 @@ pub(crate) fn reshape_foreign_keys(batch: &RecordBatch) -> Result<RecordBatch> {
     let fktable_name = utf8_column(batch, "tableName")?;
     let fkcolumn_name = utf8_column(batch, "col_name")?;
     let key_seq = int32_column(batch, "keySeq")?;
+    let update_rule = int16_column(batch, "updateRule")?;
+    let delete_rule = int16_column(batch, "deleteRule")?;
     let fk_name = utf8_column(batch, "constraintName")?;
     let deferrability = int16_column(batch, "deferrability")?;
     RecordBatch::try_new(
@@ -1170,8 +1171,8 @@ pub(crate) fn reshape_foreign_keys(batch: &RecordBatch) -> Result<RecordBatch> {
             fktable_name,
             fkcolumn_name,
             key_seq,
-            null_int16(n), // UPDATE_RULE — no server source; not synthesized
-            null_int16(n), // DELETE_RULE — no server source; not synthesized
+            update_rule,
+            delete_rule,
             fk_name,
             null_utf8(n), // PK_NAME — no server source; not synthesized
             deferrability,
@@ -1214,6 +1215,10 @@ impl ThriftReshapingReader {
             reshape,
         }
     }
+
+    fn reshape_batch(&self, batch: RecordBatch) -> Result<RecordBatch> {
+        (self.reshape)(&batch)
+    }
 }
 
 #[async_trait::async_trait]
@@ -1224,9 +1229,15 @@ impl ResultReader for ThriftReshapingReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.upstream.next_batch().await? {
-            Some(b) => Ok(Some((self.reshape)(&b)?)),
+            Some(batch) => Ok(Some(self.reshape_batch(batch)?)),
             None => Ok(None),
         }
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        self.upstream
+            .try_next_batch()?
+            .map_ready(|batch| self.reshape_batch(batch))
     }
 }
 
@@ -1866,6 +1877,130 @@ mod tests {
             ],
         )
         .unwrap()
+    }
+
+    fn server_show_foreign_keys_with_rules(
+        update_rule: ArrayRef,
+        delete_rule: ArrayRef,
+    ) -> RecordBatch {
+        let batch = server_show_foreign_keys();
+        let mut fields = batch.schema().fields().to_vec();
+        fields.push(Arc::new(Field::new(
+            "updateRule",
+            update_rule.data_type().clone(),
+            true,
+        )));
+        fields.push(Arc::new(Field::new(
+            "deleteRule",
+            delete_rule.data_type().clone(),
+            true,
+        )));
+        let mut columns = batch.columns().to_vec();
+        columns.extend([update_rule, delete_rule]);
+        RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+    }
+
+    #[test]
+    fn foreign_keys_preserves_server_rule_values() {
+        for (update_rule, delete_rule) in [(3, 3), (0, 2)] {
+            let raw = server_show_foreign_keys_with_rules(
+                Arc::new(Int32Array::from(vec![update_rule])),
+                Arc::new(Int32Array::from(vec![delete_rule])),
+            );
+            let out = reshape_foreign_keys(&raw).unwrap();
+            for (name, expected) in [
+                ("UPDATE_RULE", update_rule as i16),
+                ("DELETE_RULE", delete_rule as i16),
+            ] {
+                let values = out
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .unwrap();
+                assert_eq!(values, &Int16Array::from(vec![expected]));
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_keys_preserves_null_rules() {
+        for (update_rule, delete_rule) in [(None, Some(3)), (Some(3), None), (None, None)] {
+            let raw = server_show_foreign_keys_with_rules(
+                Arc::new(Int32Array::from(vec![update_rule])),
+                Arc::new(Int32Array::from(vec![delete_rule])),
+            );
+            let out = reshape_foreign_keys(&raw).unwrap();
+            for (name, expected) in [
+                ("UPDATE_RULE", update_rule.map(|v| v as i16)),
+                ("DELETE_RULE", delete_rule.map(|v| v as i16)),
+            ] {
+                let values = out
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .unwrap();
+                assert_eq!(values, &Int16Array::from(vec![expected]));
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_keys_preserves_int16_rules() {
+        let raw = server_show_foreign_keys_with_rules(
+            Arc::new(Int16Array::from(vec![3])),
+            Arc::new(Int16Array::from(vec![2])),
+        );
+        let out = reshape_foreign_keys(&raw).unwrap();
+        for (source, target) in [("updateRule", "UPDATE_RULE"), ("deleteRule", "DELETE_RULE")] {
+            assert_eq!(
+                out.column_by_name(target).unwrap(),
+                raw.column_by_name(source).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_keys_handles_each_missing_rule_independently() {
+        let raw = server_show_foreign_keys_with_rules(
+            Arc::new(Int32Array::from(vec![3])),
+            Arc::new(Int32Array::from(vec![3])),
+        );
+        for (missing, update_rule, delete_rule) in
+            [("updateRule", None, Some(3)), ("deleteRule", Some(3), None)]
+        {
+            let indices: Vec<_> = raw
+                .schema()
+                .fields()
+                .iter()
+                .enumerate()
+                .filter_map(|(i, field)| (field.name() != missing).then_some(i))
+                .collect();
+            let out = reshape_foreign_keys(&raw.project(&indices).unwrap()).unwrap();
+            for (name, expected) in [("UPDATE_RULE", update_rule), ("DELETE_RULE", delete_rule)] {
+                let values = out
+                    .column_by_name(name)
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int16Array>()
+                    .unwrap();
+                assert_eq!(values, &Int16Array::from(vec![expected]));
+            }
+        }
+    }
+
+    #[test]
+    fn foreign_keys_empty_result_preserves_jdbc_schema() {
+        let raw = server_show_foreign_keys_with_rules(
+            Arc::new(Int32Array::from(vec![3])),
+            Arc::new(Int32Array::from(vec![3])),
+        );
+        for batch in [raw.slice(0, 0), server_show_foreign_keys().slice(0, 0)] {
+            let out = reshape_foreign_keys(&batch).unwrap();
+            assert_eq!(out.schema(), GET_CROSS_REFERENCE_SCHEMA.clone());
+            assert_eq!(out.num_rows(), 0);
+        }
     }
 
     #[test]

@@ -73,11 +73,21 @@ pub type SchemaRef = Arc<Schema>;
 /// non-Arrow variants (`ColumnarThrift`, `JsonRows`, …) are additive
 /// — wrappers writing `match` against `ResultBatch` get a forced
 /// `_ =>` arm that keeps compiling.
+#[derive(Debug)]
 #[non_exhaustive]
 pub enum ResultBatch {
     /// Arrow `RecordBatch`.
     Arrow(RecordBatch),
     // Future: ColumnarThrift(...), JsonRows(...)
+}
+
+/// Outcome of a non-blocking result-stream read.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum TryNextBatch<'a> {
+    Ready(&'a ResultBatch),
+    Pending,
+    End,
 }
 
 // `ResultBatch::into_arrow()` was deliberately removed: the
@@ -734,6 +744,46 @@ impl ResultStream {
             Err(e) => {
                 self.finalize_telemetry(Some(&e));
                 Err(e)
+            }
+        }
+    }
+
+    /// Return the next batch if it is already available without waiting for
+    /// network or background-prefetch progress.
+    pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {
+        if let Some(batch) = self.prefetched.take() {
+            self.set_current_batch(batch);
+            return Ok(TryNextBatch::Ready(
+                self.current.as_ref().expect("batch was just installed"),
+            ));
+        }
+        if self.exhausted {
+            self.finalize_telemetry(None);
+            return Ok(TryNextBatch::End);
+        }
+
+        let reader = self
+            .reader
+            .as_mut()
+            .expect("ResultStream reader is present until into_owned_batches consumes it");
+        match reader.try_next_batch() {
+            Ok(crate::reader::TryNextBatch::Ready(batch)) => {
+                self.set_current_batch(ResultBatch::Arrow(batch));
+                Ok(TryNextBatch::Ready(
+                    self.current.as_ref().expect("batch was just installed"),
+                ))
+            }
+            Ok(crate::reader::TryNextBatch::Pending) => Ok(TryNextBatch::Pending),
+            Ok(crate::reader::TryNextBatch::End) => {
+                self.current = None;
+                self.current_row_idx = 0;
+                self.exhausted = true;
+                self.finalize_telemetry(None);
+                Ok(TryNextBatch::End)
+            }
+            Err(error) => {
+                self.finalize_telemetry(Some(&error));
+                Err(error)
             }
         }
     }

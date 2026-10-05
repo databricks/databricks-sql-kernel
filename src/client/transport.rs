@@ -35,12 +35,12 @@ use std::time::{Duration, Instant};
 
 // ─── Transport-shared config ────────────────────────────────────────
 
-/// Timeout policy for synchronous execution.
+/// Timeout policy for statement execution.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecutionTimeout {
     /// Preserve the transport's pre-existing polling ceiling.
     Default,
-    /// The caller explicitly disabled the client timeout.
+    /// Skip the transport's polling ceiling.
     Unlimited,
     /// Apply one absolute client deadline.
     Deadline(Instant),
@@ -60,7 +60,7 @@ impl ExecutionTimeout {
 /// never reads it.
 #[derive(Debug, Clone)]
 pub(crate) struct TransportConfig {
-    /// Default polling ceiling for sync, async, and metadata execution (600s).
+    /// Default polling ceiling for async and metadata execution (600s).
     pub poll_timeout: Duration,
     /// Interval between status polls (default: 500ms).
     pub poll_interval: Duration,

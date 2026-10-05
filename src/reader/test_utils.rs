@@ -59,6 +59,16 @@ impl ResultReader for MockReader {
             Ok(Some(batch))
         }
     }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        Ok(if self.index >= self.batches.len() {
+            crate::reader::TryNextBatch::End
+        } else {
+            let batch = self.batches[self.index].clone();
+            self.index += 1;
+            crate::reader::TryNextBatch::Ready(batch)
+        })
+    }
 }
 
 /// A reader that returns an error on `next_batch()`.
@@ -73,6 +83,10 @@ impl ResultReader for ErrorReader {
     }
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        Err(Error::io().message("simulated read error"))
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
         Err(Error::io().message("simulated read error"))
     }
 }
@@ -96,6 +110,13 @@ impl ResultReader for BatchThenErrorReader {
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         match self.batch.take() {
             Some(b) => Ok(Some(b)),
+            None => Err(Error::io().message("simulated read error after first batch")),
+        }
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        match self.batch.take() {
+            Some(batch) => Ok(crate::reader::TryNextBatch::Ready(batch)),
             None => Err(Error::io().message("simulated read error after first batch")),
         }
     }
@@ -133,6 +154,10 @@ impl ResultReader for BlockingReader {
         self.release.notified().await;
         Ok(None)
     }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        Ok(crate::reader::TryNextBatch::Pending)
+    }
 }
 
 /// A reader that returns an error on `schema()`.
@@ -146,5 +171,9 @@ impl ResultReader for SchemaErrorReader {
 
     async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
         Ok(None)
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        Ok(crate::reader::TryNextBatch::End)
     }
 }

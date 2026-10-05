@@ -464,7 +464,7 @@ pub unsafe extern "C" fn kernel_statement_execute(
         return store_invalid_arg("kernel_statement_execute: out must not be null");
     }
 
-    execute_with_timeout_mode(stmt, ExecutionTimeout::Default, out)
+    execute_with_timeout_mode(stmt, ExecutionTimeout::Unlimited, out)
 }
 
 /// Wait-for-result execution with a client deadline in milliseconds.
@@ -878,6 +878,33 @@ pub unsafe extern "C" fn kernel_statement_submit(
     stmt: *mut kernel_statement_t,
     out: *mut *mut kernel_executed_async_statement_t,
 ) -> KernelStatusCode {
+    submit_with_timeout(stmt, None, out)
+}
+
+/// Submit-and-return with a client-side deadline retained across status polls.
+/// Zero means unlimited. Result materialisation/fetching is outside the
+/// deadline, matching synchronous execution.
+///
+/// # Safety
+/// `stmt` / `out` must be valid pointers.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_submit_with_timeout_ms(
+    stmt: *mut kernel_statement_t,
+    timeout_ms: u64,
+    out: *mut *mut kernel_executed_async_statement_t,
+) -> KernelStatusCode {
+    submit_with_timeout(
+        stmt,
+        Some(std::time::Duration::from_millis(timeout_ms)),
+        out,
+    )
+}
+
+unsafe fn submit_with_timeout(
+    stmt: *mut kernel_statement_t,
+    timeout: Option<std::time::Duration>,
+    out: *mut *mut kernel_executed_async_statement_t,
+) -> KernelStatusCode {
     // Wrap the whole body in catch_ffi: block_on_ffi only catches a panic
     // in the awaited future, so the surrounding sync prologue/epilogue
     // (to_cstring_lossy, Box allocation, ptr::write) must not be able to
@@ -885,16 +912,21 @@ pub unsafe extern "C" fn kernel_statement_submit(
     // thread-local error on entry.
     catch_ffi(|| {
         if out.is_null() {
-            return store_invalid_arg("kernel_statement_submit: out must not be null");
+            return store_invalid_arg("statement submit: out must not be null");
         }
         std::ptr::write(out, std::ptr::null_mut());
         let Some(stmt) = statement_mut(stmt) else {
-            return store_invalid_arg("kernel_statement_submit: stmt must not be null");
+            return store_invalid_arg("statement submit: stmt must not be null");
         };
         let stmt_ptr: *mut Statement = stmt;
         match block_on_ffi(move || {
             let stmt = unsafe { &mut *stmt_ptr };
-            Box::pin(async move { stmt.submit().await })
+            Box::pin(async move {
+                match timeout {
+                    Some(timeout) => stmt.submit_with_timeout(timeout).await,
+                    None => stmt.submit().await,
+                }
+            })
         }) {
             Ok(exec) => {
                 let statement_id_c = crate::c_abi::error::to_cstring_lossy(exec.statement_id());

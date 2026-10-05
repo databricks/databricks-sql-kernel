@@ -303,11 +303,9 @@ impl Statement {
     /// statement on success and returns `state=CLOSED`. Setting
     /// `wait_timeout=10s` explicitly returns `state=SUCCEEDED`
     /// (statement still alive server-side, requires a separate
-    /// `CloseStatement`) and adds ~150–260ms to the response —
-    /// observed against Dogfood; see PR description for the bench
-    /// numbers. The kernel polls internally if the query needs
-    /// longer than 10s. This entry point retains the transport's 600s polling
-    /// ceiling; use [`Statement::execute_with_timeout`] to choose another limit.
+    /// `CloseStatement`). The kernel polls internally if the query needs
+    /// longer than 10s. This entry point has no overall client polling deadline;
+    /// use [`Statement::execute_with_timeout`] to set one.
     ///
     /// If a prior executed handle is still tracked by this `Statement`,
     /// the kernel spawns a fire-and-forget `CloseStatement` against it
@@ -317,7 +315,7 @@ impl Statement {
     /// calls on it short-circuit to `InvalidStatementHandle` without
     /// hitting the wire.
     pub async fn execute(&mut self) -> Result<ExecutedStatement> {
-        self.execute_with_timeout_mode(ExecutionTimeout::Default)
+        self.execute_with_timeout_mode(ExecutionTimeout::Unlimited)
             .await
     }
 
@@ -450,6 +448,28 @@ impl Statement {
     /// `fetch_result`. Use this path when the caller needs an explicit
     /// poll/cancel handle instead of waiting synchronously for terminal state.
     pub async fn submit(&mut self) -> Result<ExecutedAsyncStatement> {
+        self.submit_with_timeout_mode(ExecutionTimeout::Default)
+            .await
+    }
+
+    /// Submit-and-return with one client-side execution deadline retained by
+    /// the returned handle across caller-driven status polls.
+    ///
+    /// `Duration::ZERO` and `Duration::MAX` explicitly select unlimited
+    /// execution. Result materialisation and fetching are outside the deadline.
+    pub async fn submit_with_timeout(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<ExecutedAsyncStatement> {
+        let deadline = crate::statement::timeout::deadline_from_timeout(timeout)?;
+        self.submit_with_timeout_mode(ExecutionTimeout::from_explicit_deadline(deadline))
+            .await
+    }
+
+    async fn submit_with_timeout_mode(
+        &mut self,
+        timeout: ExecutionTimeout,
+    ) -> Result<ExecutedAsyncStatement> {
         let span = self.session.log_span().clone();
         // Clear the shared in-flight-id slot before the first `.await`
         // (see `reset_inflight_slot`).
@@ -466,11 +486,41 @@ impl Statement {
             );
             let guard = cancel_state.guard();
 
-            let response = self
-                .session
-                .transport()
-                .submit_statement(self.session.session_id(), &sql, &exec_params)
-                .await?;
+            let submit = self.session.transport().submit_statement(
+                self.session.session_id(),
+                &sql,
+                &exec_params,
+            );
+            let response = match timeout {
+                ExecutionTimeout::Deadline(deadline) => {
+                    match tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), submit)
+                        .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => {
+                            // Mid-submit deadline expiry. The server statement
+                            // id is unknown here: `cancel_state.observe` runs
+                            // only once `submit` resolves, so a timeout before
+                            // that leaves `observed_id` as `None`. Dropping the
+                            // `submit` future therefore cannot schedule any
+                            // server-side cancel/close — if the POST already
+                            // reached the server and created a statement, that
+                            // statement is leaked until session close reclaims
+                            // it. This is inherent (no id to target) and the
+                            // window is small because submit uses
+                            // `wait_timeout=0s`; the "best-effort cancel/close
+                            // cleanup on expiry" contract in the header is only
+                            // fully honored on the status path, where an id has
+                            // already been observed. We pass `None` as the
+                            // query id for the same reason.
+                            return Err(crate::statement::timeout::client_query_timeout_error(
+                                None,
+                            ));
+                        }
+                    }
+                }
+                ExecutionTimeout::Default | ExecutionTimeout::Unlimited => submit.await?,
+            };
             telemetry_for_body.on_statement_submitted(&response.statement_id);
 
             cancel_state.observe(&response.statement_id);
@@ -498,6 +548,7 @@ impl Statement {
                 // the first poll.
                 response.status,
                 telemetry_for_body,
+                timeout,
             ))
         }
         .instrument(span)
@@ -623,6 +674,7 @@ impl Statement {
                         closed,
                         resp.status,
                         telemetry_for_body,
+                        ExecutionTimeout::Default,
                     )))
                 }
             }

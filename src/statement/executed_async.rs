@@ -44,7 +44,7 @@
 //! class) can route through whichever handle their language idiom
 //! prefers; field availability is identical.
 
-use crate::client::{ExecuteResponse, SessionAttribution};
+use crate::client::{ExecuteResponse, ExecutionTimeout, SessionAttribution};
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -222,9 +222,68 @@ pub struct ExecutedAsyncStatement {
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
     result_stream_owns_success_telemetry: AtomicBool,
+    /// Absolute execution deadline retained across caller-driven polls.
+    client_deadline: Option<std::time::Instant>,
+    /// When `true`, the caller explicitly disabled the client timeout
+    /// (`ExecutionTimeout::Unlimited`), so the poll loop must NOT fall
+    /// back to the transport's default `poll_timeout` ceiling. Mirrors
+    /// the sync `wait_for_terminal` gating, which only applies that
+    /// ceiling under `ExecutionTimeout::Default`. Without this, an
+    /// "unlimited" submit still dies at the 600s default poll_timeout.
+    poll_timeout_disabled: bool,
+    client_timeout_expired: AtomicBool,
+    /// Latched once this handle observes a terminal server state
+    /// (`Succeeded` / `Failed` / `Cancelled` / `Closed`), including
+    /// the initial-submit snapshot. The client deadline governs only
+    /// the pre-terminal window ("initial submit through observed
+    /// terminal status"): once a terminal state has been seen, a
+    /// subsequent `status()` must return that state regardless of the
+    /// deadline, instead of masking it with a `Timeout`/`HYT00` and
+    /// firing a wasted cancel+close against an already-finished
+    /// statement.
+    terminal_observed: AtomicBool,
+}
+
+/// Map an [`ExecutionTimeout`] onto the async handle's two deadline
+/// knobs: `(client_deadline, poll_timeout_disabled)`.
+///
+/// Mirrors the sync `wait_for_terminal` gating so the two consumption
+/// modes agree on what "unlimited" means:
+/// - `Deadline` → retain an absolute client deadline AND bypass the
+///   `poll_timeout` ceiling: the client deadline *is* the ceiling. The
+///   sync path only applies `poll_timeout` under `Default`, so a
+///   `Deadline` runs to the full client deadline even when it exceeds
+///   the 600s default `poll_timeout` (`MAX_CLIENT_QUERY_TIMEOUT_MS`
+///   permits deadlines far beyond 600s). Leaving the ceiling armed here
+///   would abort such a query at 600s with the generic internal
+///   poll-timeout error instead of the caller's deadline firing with
+///   the `Timeout`/`HYT00` client-query-timeout error.
+/// - `Unlimited` → no client deadline AND bypass the `poll_timeout`
+///   ceiling, so an explicitly-unlimited submit does not silently die
+///   at the 600s default.
+/// - `Default` → no client deadline, keep the `poll_timeout` ceiling.
+fn deadline_policy(timeout: ExecutionTimeout) -> (Option<std::time::Instant>, bool) {
+    match timeout {
+        ExecutionTimeout::Deadline(deadline) => (Some(deadline), true),
+        ExecutionTimeout::Unlimited => (None, true),
+        ExecutionTimeout::Default => (None, false),
+    }
 }
 
 impl ExecutedAsyncStatement {
+    /// Produce the stable client query-timeout error and schedule bounded,
+    /// best-effort server cleanup when a deadline retained across
+    /// caller-driven status polls expires.
+    pub(crate) fn expire_client_query_timeout(&self) -> Error {
+        if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
+            self.session
+                .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
+        }
+        let error = crate::statement::timeout::client_query_timeout_error(Some(&self.statement_id));
+        self.statement_telemetry.finalize(Some(&error));
+        error
+    }
+
     fn session_attribution(&self) -> SessionAttribution {
         if self.owning {
             SessionAttribution::Current
@@ -248,6 +307,13 @@ impl ExecutedAsyncStatement {
     /// return useful values even before the caller drives a single
     /// `status()` / `await_result()` poll (e.g. when the server
     /// already finished by the time `submit` returned).
+    ///
+    /// `timeout` selects the handle's deadline policy, mirroring the
+    /// sync `wait_for_terminal` gating: `Deadline` retains an absolute
+    /// client deadline across polls; `Unlimited` disables BOTH that
+    /// deadline and the transport's default `poll_timeout` ceiling;
+    /// `Default` keeps the `poll_timeout` ceiling with no client
+    /// deadline.
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
@@ -255,7 +321,10 @@ impl ExecutedAsyncStatement {
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
         statement_telemetry: StatementTelemetry,
+        timeout: ExecutionTimeout,
     ) -> Self {
+        let (client_deadline, poll_timeout_disabled) = deadline_policy(timeout);
+        let initial_terminal = initial_status.state.is_terminal();
         Self {
             session,
             statement_id,
@@ -266,6 +335,10 @@ impl ExecutedAsyncStatement {
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            client_deadline,
+            poll_timeout_disabled,
+            client_timeout_expired: AtomicBool::new(false),
+            terminal_observed: AtomicBool::new(initial_terminal),
         }
     }
 
@@ -291,6 +364,7 @@ impl ExecutedAsyncStatement {
         statement_id: String,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
+        let initial_terminal = initial_status.state.is_terminal();
         Self {
             session,
             statement_id,
@@ -300,6 +374,10 @@ impl ExecutedAsyncStatement {
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
+            client_deadline: None,
+            poll_timeout_disabled: false,
+            client_timeout_expired: AtomicBool::new(false),
+            terminal_observed: AtomicBool::new(initial_terminal),
         }
     }
 
@@ -423,19 +501,65 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.valid.check()?;
+            // The client deadline governs only the pre-terminal window
+            // ("initial submit through observed terminal status"). Once
+            // this handle has observed a terminal state, `status()`
+            // re-polls and returns it regardless of the deadline, rather
+            // than masking the terminal outcome with a `Timeout`/`HYT00`
+            // and firing a wasted cancel+close against an already-
+            // finished statement.
+            let enforce_deadline = !self.terminal_observed.load(Ordering::Acquire);
+            if enforce_deadline
+                && (self.client_timeout_expired.load(Ordering::Acquire)
+                    || self
+                        .client_deadline
+                        .is_some_and(|deadline| std::time::Instant::now() >= deadline))
+            {
+                return Err(self.expire_client_query_timeout());
+            }
             let status_started = std::time::Instant::now();
-            let response = self
+            let poll = self
                 .session
                 .transport()
-                .statement_status(&self.statement_id, self.session_attribution())
-                .await?;
+                .statement_status(&self.statement_id, self.session_attribution());
+            let response = match self.client_deadline {
+                Some(deadline) if enforce_deadline => {
+                    let poll_deadline = deadline
+                        .checked_add(crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE)
+                        .unwrap_or(deadline);
+                    match tokio::time::timeout_at(
+                        tokio::time::Instant::from_std(poll_deadline),
+                        poll,
+                    )
+                    .await
+                    {
+                        Ok(result) => result?,
+                        Err(_) => return Err(self.expire_client_query_timeout()),
+                    }
+                }
+                _ => poll.await?,
+            };
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
             // Cache the wire status so the extended-field accessors
             // reflect what THIS handle has observed (instead of the
             // stale initial-submit snapshot).
             self.record_latest_status(response.status.clone());
+            // Latch the terminal observation so subsequent `status()`
+            // calls stop enforcing the client deadline against this
+            // already-finished statement.
+            if response.status.state.is_terminal() {
+                self.terminal_observed.store(true, Ordering::Release);
+            }
             let status = StatementStatus::from_sea_response(&response);
+            if enforce_deadline
+                && matches!(status, StatementStatus::Pending | StatementStatus::Running)
+                && self
+                    .client_deadline
+                    .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+            {
+                return Err(self.expire_client_query_timeout());
+            }
             match &status {
                 StatementStatus::Failed(error) => {
                     self.statement_telemetry.finalize(Some(error));
@@ -507,18 +631,67 @@ impl ExecutedAsyncStatement {
 
             loop {
                 self.valid.check()?;
+                // The client deadline governs only the pre-terminal
+                // window. Once this handle has observed a terminal state
+                // (here or via a prior `status()` / initial-submit
+                // snapshot), stop enforcing the deadline so we proceed to
+                // materialise the finished result instead of masking it
+                // with a `Timeout`/`HYT00` and firing a wasted
+                // cancel+close against an already-finished statement —
+                // mirrors the `enforce_deadline` gating in `status()`.
+                let enforce_deadline = !self.terminal_observed.load(Ordering::Acquire);
+                if enforce_deadline
+                    && (self.client_timeout_expired.load(Ordering::Acquire)
+                        || self
+                            .client_deadline
+                            .is_some_and(|deadline| std::time::Instant::now() >= deadline))
+                {
+                    if let Some(g) = cancel_guard.take() {
+                        g.defuse();
+                    }
+                    return Err(self.expire_client_query_timeout());
+                }
                 let status_started = std::time::Instant::now();
-                let response = self
+                let poll = self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution())
-                    .await?;
+                    .statement_status(&self.statement_id, self.session_attribution());
+                let response = match self.client_deadline {
+                    Some(deadline) if enforce_deadline => {
+                        let poll_deadline = deadline
+                            .checked_add(
+                                crate::statement::timeout::CLIENT_QUERY_TIMEOUT_STATUS_GRACE,
+                            )
+                            .unwrap_or(deadline);
+                        match tokio::time::timeout_at(
+                            tokio::time::Instant::from_std(poll_deadline),
+                            poll,
+                        )
+                        .await
+                        {
+                            Ok(result) => result?,
+                            Err(_) => {
+                                if let Some(g) = cancel_guard.take() {
+                                    g.defuse();
+                                }
+                                return Err(self.expire_client_query_timeout());
+                            }
+                        }
+                    }
+                    _ => poll.await?,
+                };
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
                 // Cache the wire status so the extended-field
                 // accessors reflect THIS poll's observation — not the
                 // initial-submit snapshot that's now stale by minutes.
                 self.record_latest_status(response.status.clone());
+                // Latch the terminal observation so a later `status()`
+                // call stops enforcing the client deadline against this
+                // already-finished statement.
+                if response.status.state.is_terminal() {
+                    self.terminal_observed.store(true, Ordering::Release);
+                }
                 match StatementStatus::from_sea_response(&response) {
                     StatementStatus::Succeeded | StatementStatus::Closed => {
                         if let Some(g) = cancel_guard.take() {
@@ -550,7 +723,17 @@ impl ExecutedAsyncStatement {
                         return Err(error);
                     }
                     StatementStatus::Pending | StatementStatus::Running => {
-                        if start.elapsed() > cfg.poll_timeout {
+                        if enforce_deadline
+                            && self
+                                .client_deadline
+                                .is_some_and(|deadline| std::time::Instant::now() >= deadline)
+                        {
+                            if let Some(g) = cancel_guard.take() {
+                                g.defuse();
+                            }
+                            return Err(self.expire_client_query_timeout());
+                        }
+                        if !self.poll_timeout_disabled && start.elapsed() > cfg.poll_timeout {
                             // Internal poll-timeout: we asked to wait,
                             // we gave up. Leave the cancel guard armed
                             // so the server stops charging DBUs on the
@@ -950,5 +1133,36 @@ mod tests {
         assert_eq!(StatementStatus::Closed.as_str(), "Closed");
         let failed = StatementStatus::Failed(Error::sql_error().message("boom"));
         assert_eq!(failed.as_str(), "Failed");
+    }
+
+    #[test]
+    fn deadline_policy_mirrors_sync_timeout_gating() {
+        // Default: no client deadline, poll_timeout ceiling stays on.
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Default),
+            (None, false),
+            "Default must keep the transport poll_timeout ceiling"
+        );
+        // Unlimited: no client deadline AND the poll_timeout ceiling is
+        // bypassed — regression guard for an explicitly-unlimited submit
+        // silently dying at the 600s default poll_timeout.
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Unlimited),
+            (None, true),
+            "Unlimited must disable the poll_timeout ceiling"
+        );
+        // Deadline: retains the absolute client deadline AND bypasses the
+        // poll_timeout ceiling — the client deadline *is* the ceiling.
+        // Regression guard: MAX_CLIENT_QUERY_TIMEOUT_MS permits deadlines
+        // far beyond the 600s default poll_timeout, so leaving the ceiling
+        // armed would abort such a query at 600s with the generic internal
+        // poll-timeout error instead of the caller's deadline firing. The
+        // sync wait_for_terminal only applies poll_timeout under Default.
+        let deadline = std::time::Instant::now();
+        assert_eq!(
+            deadline_policy(ExecutionTimeout::Deadline(deadline)),
+            (Some(deadline), true),
+            "Deadline must retain the client deadline AND disable the poll_timeout ceiling"
+        );
     }
 }

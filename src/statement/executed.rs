@@ -151,6 +151,33 @@ impl ExecutedStatement {
         Ok(None)
     }
 
+    /// Non-blocking counterpart to [`Self::next_batch`]. It preserves the same
+    /// drain-driven auto-close behavior when end-of-stream is observed.
+    pub fn try_next_batch(&mut self) -> Result<crate::result_stream::TryNextBatch<'_>> {
+        enum State {
+            Ready,
+            Pending,
+            End,
+        }
+        let state = match self.result_stream.try_next_batch()? {
+            crate::result_stream::TryNextBatch::Ready(_) => State::Ready,
+            crate::result_stream::TryNextBatch::Pending => State::Pending,
+            crate::result_stream::TryNextBatch::End => State::End,
+        };
+        match state {
+            State::Ready => Ok(crate::result_stream::TryNextBatch::Ready(
+                self.result_stream
+                    .current()
+                    .expect("ready batch was just installed"),
+            )),
+            State::Pending => Ok(crate::result_stream::TryNextBatch::Pending),
+            State::End => {
+                self.spawn_close_if_open();
+                Ok(crate::result_stream::TryNextBatch::End)
+            }
+        }
+    }
+
     /// Explicit close for concrete sync statements.
     ///
     /// This finalizes result-stream telemetry before the server-side
