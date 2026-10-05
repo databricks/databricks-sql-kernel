@@ -292,6 +292,10 @@ author, follow-up, and review runs.
 - **Context:** PR #374's timeout bug (a `Deadline` > `poll_timeout` aborting early) escaped the existing wiremock test because it only exercised a 25ms timeout, which is far below the 600s `poll_timeout` ceiling, so the ceiling-vs-deadline interaction never fired.
   **Rule:** Timeout regression tests must exercise a client deadline that EXCEEDS the configured `poll_timeout` (or configure a small `poll_timeout`), not just a sub-second timeout — only a deadline past the ceiling exercises the gating divergence between the client deadline and the transport poll-timeout.
 
+### 2026-10-05: learnings since 2026-10-04T09:25:50Z
+- **Context:** PR #381 changed `reshape_foreign_keys` (src/metadata/thrift_shape.rs): `UPDATE_RULE`/`DELETE_RULE` had been hardcoded to typed nulls on the assumption they had "no server source," but newer `SHOW FOREIGN KEYS` and native responses actually ship `updateRule`/`deleteRule` columns.
+  **Rule:** When reshaping server metadata into JDBC columns, prefer preserve-when-present over hardcoding a column to null — server response shapes evolve and gain columns across versions/variants (SHOW vs native); gate the null only on the column being genuinely absent, and cover both response variants plus the empty-result schema in tests.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
