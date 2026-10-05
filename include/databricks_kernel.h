@@ -709,8 +709,8 @@ KernelStatusCode kernel_statement_set_query_tags(kernel_statement_t* stmt,
                                                  const char* query_tags);
 
 /*
- * Wait-for-result execution with the existing 600-second polling ceiling and
- * no caller-supplied deadline. On success, release `*out` with
+ * Wait-for-result execution without an overall client polling deadline.
+ * On success, release `*out` with
  * `kernel_executed_statement_close`.
  */
 KernelStatusCode kernel_statement_execute(kernel_statement_t* stmt,
