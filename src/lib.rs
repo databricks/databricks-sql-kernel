@@ -144,7 +144,7 @@ pub use kernel_error::{Error, ErrorCode, Result};
 /// kernel actually emits. See [`klog::KERNEL_LOG_TARGET`].
 pub use klog::KERNEL_LOG_TARGET;
 pub use metadata_v0::{Identifier, LikePattern, Metadata};
-pub use result_stream::{OwnedBatchIter, ResultBatch, ResultStream, Row, SchemaRef};
+pub use result_stream::{OwnedBatchIter, ResultBatch, ResultStream, Row, SchemaRef, TryNextBatch};
 pub use session::{Session, SessionBuilder};
 pub use statement::executed::ExecutedStatement;
 pub use statement::executed_async::{
