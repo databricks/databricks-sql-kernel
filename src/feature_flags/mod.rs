@@ -199,11 +199,20 @@ impl FeatureFlagResolver {
         match self.cache.lookup(&key).await {
             CacheLookup::Fresh(values) => values,
             CacheLookup::Missing => {
+                // Token acquisition can include an interactive login and must
+                // finish before the connector-service timeout starts.
+                let request = match self.authenticated_request() {
+                    Ok(request) => request,
+                    Err(error) => {
+                        self.warn_fetch_failure(error);
+                        return FeatureFlagValues::default();
+                    }
+                };
                 // Moka coalesces cold loads, but every waiter keeps its own
-                // session-open timeout instead of inheriting the leader's.
+                // fetch timeout instead of inheriting the leader's.
                 match tokio::time::timeout(
                     self.request_timeout(),
-                    self.cache.load(key, self.fetch_values()),
+                    self.cache.load(key, self.fetch_values(request)),
                 )
                 .await
                 {
@@ -219,7 +228,11 @@ impl FeatureFlagResolver {
                 }
             }
             CacheLookup::Stale(stale) => {
-                match self.cache.refresh(key, self.fetch_values()).await {
+                let loader = async {
+                    let request = self.authenticated_request()?;
+                    self.fetch_values(request).await
+                };
+                match self.cache.refresh(key, loader).await {
                     Ok(Some(values)) => values,
                     // A size eviction can race this refresh. The values from
                     // the initial lookup remain the safest fail-open result.
@@ -294,8 +307,11 @@ impl FeatureFlagResolver {
         }
     }
 
-    async fn fetch_values(&self) -> Result<(FeatureFlagValues, Duration)> {
-        let result = self.fetch().await?;
+    async fn fetch_values(
+        &self,
+        request: reqwest::RequestBuilder,
+    ) -> Result<(FeatureFlagValues, Duration)> {
+        let result = self.fetch(request).await?;
         Ok((result.values, response_ttl(result.ttl_seconds)))
     }
 
@@ -311,7 +327,7 @@ impl FeatureFlagResolver {
         REQUEST_TIMEOUT.min(self.http_client.config().read_timeout)
     }
 
-    async fn fetch(&self) -> Result<FetchResult> {
+    fn authenticated_request(&self) -> Result<reqwest::RequestBuilder> {
         let url = build_endpoint(&self.host, &self.identity)?;
         let mut request = self
             .http_client
@@ -334,7 +350,10 @@ impl FeatureFlagResolver {
         if let Some(org_id) = &self.http_client.config().org_id {
             request = request.header("x-databricks-org-id", org_id);
         }
+        Ok(request)
+    }
 
+    async fn fetch(&self, request: reqwest::RequestBuilder) -> Result<FetchResult> {
         let response = request.send().await.map_err(|error| {
             let kernel_error = if error.is_timeout() {
                 Error::timeout()
@@ -436,6 +455,7 @@ mod tests {
 
     use super::*;
     use crate::auth::pat::PersonalAccessToken;
+    use crate::auth::AuthProvider;
     use crate::client::{build_retry_configs, HttpClientConfig, RetryConfig};
 
     #[test]
@@ -543,6 +563,60 @@ mod tests {
         assert_eq!(resolver.request_timeout(), Duration::from_millis(250));
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn authentication_does_not_consume_connector_timeout() {
+        #[derive(Debug)]
+        struct SlowAuthProvider;
+
+        impl AuthProvider for SlowAuthProvider {
+            fn get_auth_header(&self) -> Result<String> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok("Bearer test-token".to_string())
+            }
+
+            fn extra_headers(&self) -> Result<Vec<(String, String)>> {
+                std::thread::sleep(Duration::from_millis(300));
+                Ok(vec![("x-test-auth".to_string(), "ready".to_string())])
+            }
+        }
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(
+                "/api/2.0/connector-service/feature-flags/GOLANG/1.2.3",
+            ))
+            .and(header("authorization", "Bearer test-token"))
+            .and(header("x-test-auth", "ready"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "flags": [{"name": "example.flag", "value": "true"}],
+                "ttl_seconds": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig {
+                    read_timeout: Duration::from_millis(250),
+                    ..HttpClientConfig::default()
+                },
+                HashMap::new(),
+            )
+            .unwrap(),
+        );
+        http_client.set_auth_provider(Arc::new(SlowAuthProvider));
+        let resolver = FeatureFlagResolver::with_cache(
+            server.uri(),
+            http_client,
+            ClientIdentity::new(ClientType::Go, "1.2.3"),
+            Arc::new(FeatureFlagCache::default()),
+        );
+
+        resolver.prepare_for_session_open().await;
+        assert_eq!(resolver.get_bool("example.flag").await, Some(true));
+    }
+
     #[tokio::test]
     async fn feature_flag_transport_timeout_preserves_timeout_code() {
         let server = MockServer::start().await;
@@ -574,7 +648,7 @@ mod tests {
         );
 
         let error = resolver
-            .fetch()
+            .fetch(resolver.authenticated_request().unwrap())
             .await
             .err()
             .expect("delayed response should exceed the request timeout");
@@ -725,6 +799,7 @@ mod tests {
             )
             .unwrap(),
         );
+        http_client.set_auth_provider(Arc::new(PersonalAccessToken::new("test-token")));
         let resolver = FeatureFlagResolver::with_cache(
             host,
             http_client,
