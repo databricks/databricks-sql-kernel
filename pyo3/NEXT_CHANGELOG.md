@@ -13,6 +13,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- Added `Session(..., sea_response_compression_enabled=...)` to opt back into
+  HTTP compression for bandwidth-constrained SEA connections.
+
 ### Changed
 
 ### Updated

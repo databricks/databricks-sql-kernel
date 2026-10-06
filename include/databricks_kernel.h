@@ -349,6 +349,11 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
                                                          const char* name, const char* value);
 
+/* Configure whether authenticated SEA responses may use HTTP compression.
+ * Disabled by default. */
+KernelStatusCode kernel_session_config_set_sea_response_compression_enabled(
+    KernelSessionConfig* config, bool enabled);
+
 /* Configure the total timeout for one HTTP request, from connection start
  * through response-body completion. A separate 30s connection timeout also
  * applies, so connection establishment is bounded by the shorter limit.

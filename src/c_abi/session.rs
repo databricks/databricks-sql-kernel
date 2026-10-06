@@ -131,6 +131,8 @@ pub struct KernelSessionConfig {
     /// Extra HTTP headers sent on every request (accumulated by
     /// `..._set_custom_header`, one `(name, value)` pair per call).
     custom_headers: Vec<(String, String)>,
+    /// Whether authenticated SEA responses may use HTTP compression.
+    sea_response_compression_enabled: bool,
     /// Total request timeout (populated by `..._set_request_timeout`). `None`
     /// keeps [`HttpConfig::default`]'s 120-second timeout.
     request_timeout: Option<Duration>,
@@ -265,6 +267,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
+        sea_response_compression_enabled: false,
         request_timeout: None,
         max_connections: None,
         retry: None,
@@ -583,6 +586,22 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
         let name = required_str(name, "header name")?;
         let value = required_str(value, "header value")?;
         c.custom_headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Configure whether authenticated SEA responses may use HTTP compression.
+/// The default is `false`.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_sea_response_compression_enabled(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.sea_response_compression_enabled = enabled;
         Ok(())
     })
 }
@@ -1417,12 +1436,14 @@ fn parse_scopes(s: &str) -> Option<Vec<String>> {
 /// kept unit-testable without a live session.
 fn merge_http_config(
     custom_headers: Vec<(String, String)>,
+    sea_response_compression_enabled: bool,
     request_timeout: Option<Duration>,
     max_connections: Option<usize>,
     retry: Option<RetrySpec>,
 ) -> HttpConfig {
     let mut http = HttpConfig {
         custom_headers,
+        sea_response_compression_enabled,
         ..HttpConfig::default()
     };
     if let Some(t) = request_timeout {
@@ -1554,6 +1575,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         proxy,
         tls,
         custom_headers,
+        sea_response_compression_enabled,
         request_timeout,
         max_connections,
         retry,
@@ -1616,12 +1638,14 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             // Skip `.http()` when no HTTP override was set, so the kernel's
             // full `HttpConfig::default()` applies untouched.
             if !custom_headers.is_empty()
+                || sea_response_compression_enabled
                 || request_timeout.is_some()
                 || max_connections.is_some()
                 || retry.is_some()
             {
                 builder = builder.http(merge_http_config(
                     custom_headers,
+                    sea_response_compression_enabled,
                     request_timeout,
                     max_connections,
                     retry,
@@ -2531,6 +2555,23 @@ mod tests {
         }
     }
 
+    #[test]
+    fn set_sea_response_compression_records_value() {
+        unsafe {
+            let mut config = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                kernel_session_config_set_sea_response_compression_enabled(config, true),
+                KernelStatusCode::Success
+            );
+            assert!(config.as_ref().unwrap().sea_response_compression_enabled);
+            kernel_session_config_free(config);
+        }
+    }
+
     /// The retry setter rejects a zero min_wait with `InvalidArgument` (a zero
     /// floor is genuinely invalid), but a `max_wait < min_wait` pair is a tuning
     /// typo that is CORRECTED (max raised to min) with a warning rather than
@@ -3086,6 +3127,7 @@ mod tests {
     fn merge_http_config_maps_every_retry_field() {
         let http = merge_http_config(
             Vec::new(),
+            false,
             None,
             None,
             Some(RetrySpec {
@@ -3109,6 +3151,7 @@ mod tests {
         let default_budget = HttpConfig::default().overall_timeout;
         let http = merge_http_config(
             Vec::new(),
+            false,
             None,
             None,
             Some(RetrySpec {
@@ -3134,6 +3177,7 @@ mod tests {
         // Retry-only: knobs applied, headers empty.
         let retry_only = merge_http_config(
             Vec::new(),
+            false,
             None,
             None,
             Some(RetrySpec {
@@ -3151,6 +3195,7 @@ mod tests {
         let default = HttpConfig::default();
         let headers_only = merge_http_config(
             vec![("X-Test".to_string(), "1".to_string())],
+            false,
             None,
             None,
             None,
@@ -3168,7 +3213,13 @@ mod tests {
     #[test]
     fn merge_http_config_maps_request_timeout_and_preserves_other_defaults() {
         let default = HttpConfig::default();
-        let http = merge_http_config(Vec::new(), Some(Duration::from_millis(4_500)), None, None);
+        let http = merge_http_config(
+            Vec::new(),
+            false,
+            Some(Duration::from_millis(4_500)),
+            None,
+            None,
+        );
         assert_eq!(http.request_timeout, Duration::from_millis(4_500));
         assert_eq!(http.retry_min_wait, default.retry_min_wait);
         assert_eq!(http.overall_timeout, default.overall_timeout);
@@ -3177,7 +3228,7 @@ mod tests {
     #[test]
     fn merge_http_config_maps_max_connections_and_preserves_other_defaults() {
         let default = HttpConfig::default();
-        let http = merge_http_config(Vec::new(), None, Some(23), None);
+        let http = merge_http_config(Vec::new(), false, None, Some(23), None);
         assert_eq!(http.pool_max_idle_per_host, 23);
         assert_eq!(http.request_timeout, default.request_timeout);
         assert_eq!(http.retry_max_retries, default.retry_max_retries);

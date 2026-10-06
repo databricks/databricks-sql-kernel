@@ -24,6 +24,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Changed
 
 - Route function metadata through the Thrift-native metadata path when supported by the server.
+- Authenticated SEA requests now use `Accept-Encoding: identity` by default to
+  avoid gzipping inline LZ4-compressed Arrow results. Response compression can
+  be re-enabled through `HttpConfig` or the C ABI.
 
 ### Updated
 
