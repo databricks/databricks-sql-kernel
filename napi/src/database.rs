@@ -613,9 +613,8 @@ fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
 /// strings.
 fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     let mut http = HttpConfig::default();
-    http.sea_response_compression_enabled = options
-        .sea_response_compression_enabled
-        .unwrap_or(false);
+    http.sea_response_compression_enabled =
+        options.sea_response_compression_enabled.unwrap_or(false);
     http.pool_max_idle_per_host = options
         .max_connections
         .map(|max| max as usize)

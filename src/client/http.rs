@@ -880,6 +880,17 @@ impl DatabricksHttpClient {
                     );
                     continue;
                 }
+                if lname == "accept-encoding"
+                    && with_auth
+                    && !self.config.sea_response_compression_enabled
+                {
+                    warn!(
+                        header = %name,
+                        "ignoring caller-supplied Accept-Encoding header because SEA response \
+                         compression is disabled"
+                    );
+                    continue;
+                }
                 req_builder = req_builder.header(name, value);
             }
 
@@ -1191,7 +1202,11 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap();
+        let config = HttpClientConfig {
+            custom_headers: vec![("Accept-Encoding".to_string(), "gzip".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::with_default_retry(config).unwrap();
         client.set_auth_provider(Arc::new(PersonalAccessToken::new("token".to_string())));
         let request = client
             .inner()
@@ -1203,6 +1218,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let requests = server.received_requests().await.unwrap();
+        let accept_encodings: Vec<_> = requests[0]
+            .headers
+            .get_all("accept-encoding")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(accept_encodings, vec!["identity"]);
     }
 
     #[tokio::test]
@@ -1219,6 +1243,7 @@ mod tests {
 
         let config = HttpClientConfig {
             sea_response_compression_enabled: true,
+            custom_headers: vec![("Accept-Encoding".to_string(), "gzip".to_string())],
             ..HttpClientConfig::default()
         };
         let client = DatabricksHttpClient::with_default_retry(config).unwrap();
@@ -1234,12 +1259,12 @@ mod tests {
             .unwrap();
 
         let requests = server.received_requests().await.unwrap();
-        assert_ne!(
+        assert_eq!(
             requests[0]
                 .headers
                 .get("accept-encoding")
                 .map(|value| value.to_str().unwrap()),
-            Some("identity")
+            Some("gzip")
         );
     }
 
