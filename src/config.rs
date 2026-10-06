@@ -748,6 +748,10 @@ impl std::fmt::Debug for AuthConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// Whether authenticated SEA requests may negotiate HTTP response compression.
+    /// Defaults to `false` because inline Arrow results are already LZ4-compressed.
+    pub sea_response_compression_enabled: bool,
+
     /// Total timeout for one HTTP request, from connection start through
     /// response-body completion. A separate 30-second connection timeout also
     /// applies, so connection establishment is bounded by the shorter limit.
@@ -830,6 +834,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            sea_response_compression_enabled: false,
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,

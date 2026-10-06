@@ -266,6 +266,8 @@ impl TlsConfig {
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
+    /// Whether authenticated SEA requests may negotiate HTTP response compression.
+    pub sea_response_compression_enabled: bool,
     /// Connection timeout duration.
     pub connect_timeout: Duration,
     /// Total request timeout. Despite the historical field name, this is
@@ -295,6 +297,7 @@ pub struct HttpClientConfig {
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
+            sea_response_compression_enabled: false,
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
             max_connections_per_host: 100,
@@ -877,6 +880,17 @@ impl DatabricksHttpClient {
                     );
                     continue;
                 }
+                if lname == "accept-encoding"
+                    && with_auth
+                    && !self.config.sea_response_compression_enabled
+                {
+                    warn!(
+                        header = %name,
+                        "ignoring caller-supplied Accept-Encoding header because SEA response \
+                         compression is disabled"
+                    );
+                    continue;
+                }
                 req_builder = req_builder.header(name, value);
             }
 
@@ -885,6 +899,9 @@ impl DatabricksHttpClient {
             }
 
             if with_auth {
+                if !self.config.sea_response_compression_enabled {
+                    req_builder = req_builder.header("Accept-Encoding", "identity");
+                }
                 let auth_header = self.auth_header()?;
                 req_builder = req_builder.header("Authorization", auth_header);
                 // Extra auth headers (Azure SP management-token pair). Empty for
@@ -1170,6 +1187,85 @@ mod tests {
         // If the matchers above didn't all match, wiremock returns the
         // default 404 and the status assert fails — so a 200 confirms
         // custom header + caller UA present AND auth = real-token.
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_use_identity_encoding_by_default() {
+        use wiremock::matchers::{header, method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .and(header("accept-encoding", "identity"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = HttpClientConfig {
+            custom_headers: vec![("Accept-Encoding".to_string(), "gzip".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::with_default_retry(config).unwrap();
+        client.set_auth_provider(Arc::new(PersonalAccessToken::new("token".to_string())));
+        let request = client
+            .inner()
+            .get(format!("{}/probe", server.uri()))
+            .build()
+            .unwrap();
+        let response = client
+            .execute(request, RequestType::GetStatementStatus)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+        let requests = server.received_requests().await.unwrap();
+        let accept_encodings: Vec<_> = requests[0]
+            .headers
+            .get_all("accept-encoding")
+            .iter()
+            .map(|value| value.to_str().unwrap())
+            .collect();
+        assert_eq!(accept_encodings, vec!["identity"]);
+    }
+
+    #[tokio::test]
+    async fn authenticated_requests_can_enable_response_compression() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/probe"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = HttpClientConfig {
+            sea_response_compression_enabled: true,
+            custom_headers: vec![("Accept-Encoding".to_string(), "gzip".to_string())],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::with_default_retry(config).unwrap();
+        client.set_auth_provider(Arc::new(PersonalAccessToken::new("token".to_string())));
+        let request = client
+            .inner()
+            .get(format!("{}/probe", server.uri()))
+            .build()
+            .unwrap();
+        client
+            .execute(request, RequestType::GetStatementStatus)
+            .await
+            .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(
+            requests[0]
+                .headers
+                .get("accept-encoding")
+                .map(|value| value.to_str().unwrap()),
+            Some("gzip")
+        );
     }
 
     #[test]

@@ -14,6 +14,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- Added `ConnectionOptions.seaResponseCompressionEnabled` to opt back into
+  HTTP compression for bandwidth-constrained SEA connections.
+
 ### Changed
 
 ### Updated

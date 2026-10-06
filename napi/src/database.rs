@@ -377,6 +377,9 @@ pub struct ConnectionOptions {
     ///   `User-Agent` entry here.
     pub custom_headers: Option<Vec<HeaderEntry>>,
 
+    /// Whether SEA API responses may use HTTP compression. Defaults to false.
+    pub sea_response_compression_enabled: Option<bool>,
+
     /// Retry/backoff tuning — all optional. An unset field keeps the kernel's
     /// built-in policy (1s/60s exponential backoff, 6 total attempts, 900s
     /// budget). Mirrors the pyo3 binding's `retry_*` kwargs so the Node.js
@@ -610,6 +613,8 @@ fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
 /// strings.
 fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     let mut http = HttpConfig::default();
+    http.sea_response_compression_enabled =
+        options.sea_response_compression_enabled.unwrap_or(false);
     http.pool_max_idle_per_host = options
         .max_connections
         .map(|max| max as usize)
@@ -922,6 +927,7 @@ mod tests {
             client_cert_pem: None,
             client_key_pem: None,
             custom_headers: None,
+            sea_response_compression_enabled: None,
             retry_min_wait_secs: None,
             retry_max_wait_secs: None,
             retry_max_attempts: None,
@@ -1523,6 +1529,16 @@ mod tests {
         assert_eq!(http.custom_headers.len(), 2);
         assert_eq!(http.custom_headers[0].1, "Caller/1.0");
         assert_eq!(http.custom_headers[1].1, "Connector/2.0");
+    }
+
+    #[test]
+    fn sea_response_compression_option_maps_to_http_config() {
+        let mut defaults = base();
+        assert!(!build_http_config(&mut defaults).sea_response_compression_enabled);
+
+        let mut enabled = base();
+        enabled.sea_response_compression_enabled = Some(true);
+        assert!(build_http_config(&mut enabled).sea_response_compression_enabled);
     }
 
     #[test]
