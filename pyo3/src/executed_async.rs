@@ -22,12 +22,12 @@
 
 use crate::errors::to_py_err;
 use crate::result_stream::ResultStream;
+use crate::runtime::KernelRuntime;
 use databricks_sql_kernel::{
     ExecutedAsyncStatement as KExecutedAsyncStatement, ExecutedStatementHandle, StatementStatus,
 };
 use pyo3::prelude::*;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 #[pyclass(name = "ExecutedAsyncStatement")]
 pub(crate) struct ExecutedAsyncStatement {
@@ -38,11 +38,11 @@ pub(crate) struct ExecutedAsyncStatement {
 
 struct ExecutedAsyncInner {
     exec: KExecutedAsyncStatement,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
 }
 
 impl ExecutedAsyncStatement {
-    pub(crate) fn new(exec: KExecutedAsyncStatement, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(exec: KExecutedAsyncStatement, runtime: Arc<KernelRuntime>) -> Self {
         let statement_id = exec.statement_id().to_owned();
         Self {
             statement_id,

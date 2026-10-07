@@ -42,11 +42,11 @@
 //! conversions stay explicit and grep-able.
 
 use crate::result_stream::ResultStream;
+use crate::runtime::KernelRuntime;
 use databricks_sql_kernel::metadata_v0::exact_catalog_and_pattern;
 use databricks_sql_kernel::{Identifier, LikePattern, Metadata as KMetadata};
 use pyo3::prelude::*;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 /// Python-facing metadata handle.
 ///
@@ -56,11 +56,11 @@ use tokio::runtime::Runtime;
 #[pyclass(name = "Metadata")]
 pub(crate) struct Metadata {
     inner: KMetadata,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
 }
 
 impl Metadata {
-    pub(crate) fn new(inner: KMetadata, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(inner: KMetadata, runtime: Arc<KernelRuntime>) -> Self {
         Self { inner, runtime }
     }
 }

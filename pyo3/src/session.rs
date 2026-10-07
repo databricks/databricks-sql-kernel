@@ -23,12 +23,13 @@
 use crate::auth::{build_auth_config, OAuthParams};
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::metadata::Metadata;
+use crate::runtime::KernelRuntime;
 use crate::statement::Statement;
 use databricks_sql_kernel::Session as KSession;
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::runtime::{Builder, Runtime};
+use tokio::runtime::Builder;
 
 /// Python-facing session handle.
 ///
@@ -48,7 +49,7 @@ pub(crate) struct Session {
 
 pub(crate) struct SessionInner {
     pub(crate) session: KSession,
-    pub(crate) runtime: Arc<Runtime>,
+    pub(crate) runtime: Arc<KernelRuntime>,
 }
 
 #[derive(Default)]
@@ -586,7 +587,7 @@ impl Session {
         // One tokio runtime per session. Multi-thread so CloudFetch
         // chunk downloads can overlap with the main poll loop. Worker
         // count left to tokio's default (logical CPU count).
-        let runtime = Arc::new(
+        let runtime = Arc::new(KernelRuntime::new(
             Builder::new_multi_thread()
                 .enable_all()
                 .thread_name("dbx-sql-kernel")
@@ -596,7 +597,7 @@ impl Session {
                         "failed to build tokio runtime: {e}"
                     ))
                 })?,
-        );
+        ));
 
         // `Session::open` is async and grabs the current tokio handle.
         // Drive it on the runtime; the macro detaches the GIL for the
@@ -738,7 +739,7 @@ mod send_sync_tests {
     fn assert_send_sync<T: Send + Sync>() {}
     #[test]
     fn runtime_arc_is_send_sync() {
-        assert_send_sync::<Arc<Runtime>>();
+        assert_send_sync::<Arc<KernelRuntime>>();
         assert_send_sync::<SessionInner>();
     }
 
