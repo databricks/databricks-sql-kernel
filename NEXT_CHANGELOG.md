@@ -39,6 +39,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Kernel telemetry enablement now follows the connector-service ADBC feature
   flag when the client leaves it unspecified; explicit client enable/disable
   settings take precedence.
+- Added a backward-compatible C telemetry-config v2 setter whose nullable
+  config and `has_enabled` field preserve unspecified client enablement.
 
 ### Updated
 
