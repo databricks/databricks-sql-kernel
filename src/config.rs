@@ -1386,11 +1386,39 @@ pub struct LoggingConfig {
 /// driver telemetry envelope. Telemetry failures are fail-open: export
 /// errors are logged at trace/debug level and never change user operation
 /// results.
+///
+/// To express an explicit on/off choice that takes precedence over the
+/// workspace feature flag, use [`set_enabled`] / [`with_enabled`]. Assigning
+/// the [`enabled`] field directly is **not** a full override: a direct
+/// `enabled = false` does not suppress the server flag (see that field's docs
+/// for the backward-compatibility rationale). Direct writers who previously
+/// relied on `enabled = false` as a hard off-switch should migrate to
+/// `set_enabled(false)`.
+///
+/// [`set_enabled`]: Self::set_enabled
+/// [`with_enabled`]: Self::with_enabled
+/// [`enabled`]: Self::enabled
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {
-    /// Whether telemetry collection is enabled when no explicit client
-    /// override or server feature flag is present.
+    /// Default telemetry state used only when no explicit client choice
+    /// and no server feature flag are present.
+    ///
+    /// This is **not** an explicit override. Assigning this field directly
+    /// (e.g. `config.telemetry.enabled = false`) does *not* suppress the
+    /// workspace feature flag: with no override recorded, [`enabled_override`]
+    /// falls through to the server flag, which may still enable telemetry.
+    /// Only assigning `true` is honoured directly (for backward compatibility
+    /// with callers that enabled telemetry via this field before the explicit
+    /// setter existed).
+    ///
+    /// To express an explicit choice that takes precedence over the server
+    /// feature flag — in particular, to *disable* telemetry unconditionally —
+    /// use [`set_enabled`] / [`with_enabled`] rather than assigning this field.
+    ///
+    /// [`enabled_override`]: Self::enabled_override
+    /// [`set_enabled`]: Self::set_enabled
+    /// [`with_enabled`]: Self::with_enabled
     pub enabled: bool,
 
     /// Explicit client choice. Private so the kernel can distinguish an

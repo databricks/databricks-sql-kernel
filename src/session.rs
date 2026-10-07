@@ -73,6 +73,9 @@ use crate::statement::mutable::Statement;
 use crate::statement::timeout::TimeoutCleanupManager;
 use crate::telemetry::{DriverSystemConfiguration, OperationType, TelemetryRuntime};
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tracing::{info_span, Instrument, Span};
 
 const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
     "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForAdbc";
@@ -80,9 +83,6 @@ const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
 fn telemetry_enabled(config: &TelemetryConfig, feature_flag: Option<bool>) -> bool {
     config.enabled_override().or(feature_flag).unwrap_or(false)
 }
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use tracing::{info_span, Instrument, Span};
 
 /// Crate-internal session state. Wrapped in `Arc` and shared with
 /// every child handle (`Statement`, `ExecutedStatement`, …) so the
