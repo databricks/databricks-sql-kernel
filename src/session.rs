@@ -73,6 +73,13 @@ use crate::statement::mutable::Statement;
 use crate::statement::timeout::TimeoutCleanupManager;
 use crate::telemetry::{DriverSystemConfiguration, OperationType, TelemetryRuntime};
 use std::collections::HashMap;
+
+const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
+    "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForAdbc";
+
+fn telemetry_enabled(config: &TelemetryConfig, feature_flag: Option<bool>) -> bool {
+    config.enabled_override().or(feature_flag).unwrap_or(false)
+}
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tracing::{info_span, Instrument, Span};
@@ -427,6 +434,12 @@ impl Session {
         if let Some(feature_flags) = &feature_flags {
             feature_flags.prepare_for_session_open().await;
         }
+        let mut telemetry_config = config.telemetry.clone();
+        let telemetry_feature_flag = match &feature_flags {
+            Some(flags) => flags.get_bool(TELEMETRY_ENABLED_FEATURE_FLAG).await,
+            None => None,
+        };
+        telemetry_config.enabled = telemetry_enabled(&telemetry_config, telemetry_feature_flag);
         let create_started = Instant::now();
         let session_info = transport
             .create_session(
@@ -438,7 +451,7 @@ impl Session {
         let create_elapsed = create_started.elapsed();
 
         let telemetry = Arc::new(TelemetryRuntime::from_config(
-            &config.telemetry,
+            &telemetry_config,
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
@@ -2410,6 +2423,74 @@ mod is_open_tests {
         assert!(
             exporter.requests().is_empty(),
             "disabled telemetry must not export requests"
+        );
+    }
+
+    #[test]
+    fn telemetry_client_setting_precedes_feature_flag() {
+        let default = TelemetryConfig::default();
+        assert!(telemetry_enabled(&default, Some(true)));
+        assert!(!telemetry_enabled(&default, Some(false)));
+        assert!(!telemetry_enabled(&default, None));
+
+        let explicitly_disabled = TelemetryConfig::default().with_enabled(false);
+        assert!(!telemetry_enabled(&explicitly_disabled, Some(true)));
+
+        let explicitly_enabled = TelemetryConfig::default().with_enabled(true);
+        assert!(telemetry_enabled(&explicitly_enabled, Some(false)));
+    }
+
+    #[tokio::test]
+    async fn telemetry_feature_flag_enables_export_when_client_setting_is_omitted() {
+        const WORKSPACE_ID: &str = "3762430";
+        const DRIVER_VERSION: &str = "telemetry-enablement";
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/2.0/connector-service/feature-flags/GOLANG/{DRIVER_VERSION}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "flags": [{
+                    "name": TELEMETRY_ENABLED_FEATURE_FLAG,
+                    "value": "true"
+                }],
+                "ttl_seconds": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_session_create_delete(&server, "sess-telemetry-feature-flag").await;
+        let exporter = CapturingTelemetryExporter::default();
+        let telemetry =
+            TelemetryConfig::default().with_exporter(std::sync::Arc::new(exporter.clone()));
+
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(
+                    server.uri(),
+                    &format!("/sql/1.0/warehouses/test_wh?o={WORKSPACE_ID}"),
+                )
+                .expect("valid http_path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .driver_system_configuration(DriverSystemConfiguration {
+                driver_name: Some("databricks-sql-go".to_string()),
+                driver_version: Some(DRIVER_VERSION.to_string()),
+                ..DriverSystemConfiguration::default()
+            })
+            .telemetry(telemetry)
+            .open()
+            .await
+            .expect("session must open");
+        session.close().await.expect("close succeeds");
+
+        assert_eq!(
+            exporter.requests().len(),
+            1,
+            "feature flag should enable and flush connection telemetry"
         );
     }
 

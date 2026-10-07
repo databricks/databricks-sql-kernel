@@ -704,7 +704,9 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
     }
 
     let mut telemetry = TelemetryConfig::default();
-    telemetry.enabled = options.telemetry_enabled.unwrap_or(false);
+    if let Some(enabled) = options.telemetry_enabled {
+        telemetry.set_enabled(enabled);
+    }
     if let Some(v) = options.telemetry_batch_size {
         telemetry.batch_size = v as usize;
     }

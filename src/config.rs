@@ -1389,8 +1389,13 @@ pub struct LoggingConfig {
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {
-    /// Whether telemetry collection is enabled.
+    /// Whether telemetry collection is enabled when no explicit client
+    /// override or server feature flag is present.
     pub enabled: bool,
+
+    /// Explicit client choice. Private so the kernel can distinguish an
+    /// explicit `false` from the default.
+    pub(crate) enabled_override: Option<bool>,
 
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
@@ -1450,6 +1455,7 @@ impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
             enabled: false,
+            enabled_override: None,
             batch_size: 100,
             flush_interval: Duration::from_secs(5),
             max_retries: 3,
@@ -1466,14 +1472,23 @@ impl Default for TelemetryConfig {
 
 impl TelemetryConfig {
     /// Explicitly enable or disable telemetry for this client.
+    ///
+    /// This setting takes precedence over workspace feature flags.
     pub fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+        self.enabled_override = Some(enabled);
     }
 
     /// Builder-style form of [`Self::set_enabled`].
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.set_enabled(enabled);
         self
+    }
+
+    pub(crate) fn enabled_override(&self) -> Option<bool> {
+        // Preserve compatibility for callers that assigned `enabled = true`
+        // before the explicit setter existed.
+        self.enabled_override.or(self.enabled.then_some(true))
     }
 
     #[cfg(test)]

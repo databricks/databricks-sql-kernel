@@ -36,6 +36,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - Feature flags are fetched after kernel authentication and before session
   creation; sessions read process-cache values instead of retaining snapshots.
+- Kernel telemetry enablement now follows the connector-service ADBC feature
+  flag when the client leaves it unspecified; explicit client enable/disable
+  settings take precedence.
 
 ### Updated
 

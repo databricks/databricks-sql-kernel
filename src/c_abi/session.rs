@@ -795,6 +795,7 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
             circuit_breaker_timeout: c.telemetry.circuit_breaker_timeout,
             ..Default::default()
         };
+        c.telemetry.set_enabled(enabled);
         Ok(())
     })
 }
