@@ -14,6 +14,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- Added the default-enabled `ConnectionOptions.enableGeoSpatialSupport` option.
+  Enabled returns native SRID+WKB Arrow results; disabled returns WKT / EWKT
+  strings.
 - Added `ConnectionOptions.seaResponseCompressionEnabled` to opt back into
   HTTP compression for bandwidth-constrained SEA connections.
 

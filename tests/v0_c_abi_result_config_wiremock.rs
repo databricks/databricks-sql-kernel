@@ -30,8 +30,8 @@ use std::ffi::CString;
 use databricks_sql_kernel::c_abi::session::{
     kernel_session_close, kernel_session_config_free, kernel_session_config_new,
     kernel_session_config_set_auth_pat, kernel_session_config_set_client_conf,
-    kernel_session_config_set_http_path, kernel_session_new_statement, kernel_session_open,
-    kernel_session_t, KernelSessionConfig,
+    kernel_session_config_set_enable_geospatial_support, kernel_session_config_set_http_path,
+    kernel_session_new_statement, kernel_session_open, kernel_session_t, KernelSessionConfig,
 };
 use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_statement_close, kernel_executed_statement_t, kernel_statement_execute,
@@ -95,7 +95,11 @@ async fn mount_execute(server: &MockServer) {
 ///
 /// # Safety
 /// Caller owns the returned handle and must `kernel_session_close` it.
-unsafe fn open_session_c_abi(uri: &str, cloudfetch_enabled: Option<bool>) -> *mut kernel_session_t {
+unsafe fn open_session_c_abi(
+    uri: &str,
+    cloudfetch_enabled: Option<bool>,
+    enable_geospatial_support: Option<bool>,
+) -> *mut kernel_session_t {
     let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
     assert_eq!(
         kernel_session_config_new(&mut config),
@@ -122,6 +126,12 @@ unsafe fn open_session_c_abi(uri: &str, cloudfetch_enabled: Option<bool>) -> *mu
             KernelStatusCode::Success
         );
     }
+    if let Some(enabled) = enable_geospatial_support {
+        assert_eq!(
+            kernel_session_config_set_enable_geospatial_support(config, enabled),
+            KernelStatusCode::Success
+        );
+    }
     let mut session: *mut kernel_session_t = std::ptr::null_mut();
     assert_eq!(
         kernel_session_open(config, &mut session),
@@ -145,7 +155,7 @@ fn recorded_execute_disposition(cloudfetch_enabled: Option<bool>) -> String {
     let uri = server.uri();
 
     unsafe {
-        let session = open_session_c_abi(&uri, cloudfetch_enabled);
+        let session = open_session_c_abi(&uri, cloudfetch_enabled, None);
         let mut stmt: *mut kernel_statement_t = std::ptr::null_mut();
         assert_eq!(
             kernel_session_new_statement(session, &mut stmt),
@@ -178,6 +188,35 @@ fn recorded_execute_disposition(cloudfetch_enabled: Option<bool>) -> String {
         .to_string()
 }
 
+fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        server
+    });
+    let uri = server.uri();
+
+    unsafe {
+        let session = open_session_c_abi(&uri, None, Some(enabled));
+        kernel_session_close(session);
+    }
+
+    let recorded = rt.block_on(async { server.received_requests().await.unwrap() });
+    let create = recorded
+        .iter()
+        .find(|request| {
+            request.url.path() == "/api/2.0/sql/sessions" && request.method.as_str() == "POST"
+        })
+        .expect("a POST /sessions request was made");
+    let body: serde_json::Value =
+        serde_json::from_slice(&create.body).expect("create-session body must be valid JSON");
+    body.pointer("/session_confs/EnableGeoSpatialSupport")
+        .and_then(|value| value.as_str())
+        .map(str::to_string)
+}
+
 #[test]
 fn c_abi_client_conf_cloudfetch_disabled_sends_inline_disposition() {
     // The headline: a C-ABI host that disables CloudFetch via
@@ -203,6 +242,12 @@ fn c_abi_default_result_config_sends_inline_or_external_links_disposition() {
         recorded_execute_disposition(None),
         "INLINE_OR_EXTERNAL_LINKS"
     );
+}
+
+#[test]
+fn c_abi_geospatial_mode_stays_client_side() {
+    assert_eq!(recorded_create_session_geospatial_conf(true), None);
+    assert_eq!(recorded_create_session_geospatial_conf(false), None);
 }
 
 #[test]

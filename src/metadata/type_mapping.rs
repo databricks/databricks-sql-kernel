@@ -112,10 +112,9 @@ pub(crate) const JDBC_ARRAY: i16 = 2003;
 /// panicking; the kernel always returns *some* schema even when the
 /// type is unknown.
 ///
-/// `GEOMETRY` / `GEOGRAPHY` also default to `DataType::Utf8`: this public
-/// mapping describes the string representation exposed by default, whose
-/// values are rendered locally as EWKT. The result reader uses the internal
-/// representation-aware mapper below when it needs the tagged binary schema.
+/// `GEOMETRY` / `GEOGRAPHY` map to `DataType::Utf8` in this legacy public
+/// helper. The result reader uses the internal representation-aware mapper
+/// below to apply the session's native/binary default or explicit string mode.
 pub fn databricks_type_to_arrow(type_text: &str) -> DataType {
     databricks_type_to_arrow_with_interval(type_text, None)
 }
@@ -132,8 +131,8 @@ pub fn databricks_type_to_arrow(type_text: &str) -> DataType {
 /// real SEA columns is `"INTERVAL YEAR TO MONTH"` /
 /// `"INTERVAL DAY TO SECOND"`.
 ///
-/// Like [`databricks_type_to_arrow`], this public helper maps geospatial
-/// leaves to their default EWKT `DataType::Utf8` representation.
+/// Like [`databricks_type_to_arrow`], this legacy public helper maps
+/// geospatial leaves to the EWKT `DataType::Utf8` representation.
 pub fn databricks_type_to_arrow_with_interval(
     type_text: &str,
     type_interval_type: Option<&str>,
@@ -711,7 +710,7 @@ mod tests {
     }
 
     #[test]
-    fn test_geospatial_types_default_to_ewkt_string() {
+    fn test_legacy_geospatial_type_mapping_uses_ewkt_string() {
         for type_text in [
             "GEOGRAPHY",
             "GEOGRAPHY(4326)",

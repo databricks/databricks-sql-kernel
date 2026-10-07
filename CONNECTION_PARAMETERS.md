@@ -185,8 +185,8 @@ Arrow representation of `GEOMETRY` and `GEOGRAPHY` values.
 
 | Value | Arrow representation |
 |-------|----------------------|
-| `GeospatialResultRepresentation::String` | Arrow `Utf8` containing EWKT (the default). |
-| `GeospatialResultRepresentation::Binary` | Arrow `struct<srid: int32 not null, wkb: binary not null>` containing the SRID and little-endian OGC WKB. The WKB itself is not EWKB. |
+| `GeospatialResultRepresentation::String` | Arrow `Utf8` containing WKT / EWKT. |
+| `GeospatialResultRepresentation::Binary` | Arrow `struct<srid: int32 not null, wkb: binary not null>` containing the SRID and little-endian OGC WKB. The WKB itself is not EWKB. This is the default. |
 
 Reyden returns every geo value as that native struct. The physical attachment
 can omit the canonical Arrow tags, while Reyder's structured manifest reports
@@ -203,9 +203,14 @@ string mode preserves those values. Binary mode requires Reyden's native
 the kernel does not parse server-rendered text back into WKB.
 
 This is entirely client-side and is never forwarded to SEA. Set it through
-the typed kernel or binding API. A `geospatial_as_string` entry placed
+the typed kernel or binding API. An `EnableGeoSpatialSupport` entry placed
 directly in `session_conf` is not interpreted by the kernel and is forwarded
 unchanged; SEA/Reyden does not define that server configuration.
+
+Bindings expose the same default-enabled boolean as Python
+`enable_geospatial_support`, Node.js `enableGeoSpatialSupport`, and C
+`kernel_session_config_set_enable_geospatial_support`. Enabled returns the
+native SRID+WKB Arrow representation; disabled returns WKT / EWKT strings.
 
 The structured manifest type text is authoritative for identifying geo leaves;
 the attachment supplies the physical values. The same post-processing step

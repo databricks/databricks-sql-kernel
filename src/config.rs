@@ -1514,12 +1514,13 @@ pub enum TransportMode {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GeospatialResultRepresentation {
-    /// Arrow `Utf8` containing EWKT. This is the kernel default.
-    #[default]
+    /// Arrow `Utf8` containing EWKT.
     String,
     /// Arrow `struct<srid: int32, wkb: binary>` containing little-endian OGC
     /// WKB. The SRID is carried by the sibling `srid` value, not by EWKB.
-    /// Requires the native Reyden Arrow result path.
+    /// This is the kernel default and requires the native Reyden Arrow result
+    /// path.
+    #[default]
     Binary,
 }
 
@@ -1573,7 +1574,7 @@ pub struct SessionConfig {
     /// Optional typed override for the physical representation of
     /// `GEOMETRY` / `GEOGRAPHY` values in Arrow results.
     ///
-    /// `None` uses [`GeospatialResultRepresentation::String`]. The
+    /// `None` uses [`GeospatialResultRepresentation::Binary`]. The
     /// choice is applied locally and is not forwarded to SEA.
     pub geospatial_result_representation: Option<GeospatialResultRepresentation>,
 
@@ -1591,6 +1592,14 @@ pub struct SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geospatial_result_representation_defaults_to_binary() {
+        assert_eq!(
+            GeospatialResultRepresentation::default(),
+            GeospatialResultRepresentation::Binary
+        );
+    }
 
     // ─── token cache policy ────────────────────────────────────────
 

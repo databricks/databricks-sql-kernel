@@ -20,8 +20,13 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Added typed client-side `GEOMETRY` / `GEOGRAPHY` result representation
   selection. String mode renders the native WKB as EWKT locally; binary mode
   retains the tagged Arrow struct. No representation setting is sent to SEA.
+- Added the default-enabled
+  `kernel_session_config_set_enable_geospatial_support` C ABI setting. Enabled
+  returns native SRID+WKB Arrow results; disabled returns WKT / EWKT strings.
 
 ### Changed
+
+- Native SRID+WKB is now the default geospatial result representation.
 
 - Route function metadata through the Thrift-native metadata path when supported by the server.
 - Authenticated SEA requests now use `Accept-Encoding: identity` by default to

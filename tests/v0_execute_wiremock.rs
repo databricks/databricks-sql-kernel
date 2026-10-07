@@ -702,7 +702,7 @@ async fn execute_geospatial_string_mode_uses_manifest_tags_for_untagged_arrow_ip
         .is_some_and(|confs| {
             confs
                 .keys()
-                .any(|key| key.eq_ignore_ascii_case("geospatial_as_string"))
+                .any(|key| key.eq_ignore_ascii_case("EnableGeoSpatialSupport"))
         });
     assert!(
         !forwarded_geo_setting,
@@ -711,7 +711,7 @@ async fn execute_geospatial_string_mode_uses_manifest_tags_for_untagged_arrow_ip
 }
 
 #[tokio::test]
-async fn execute_geospatial_binary_mode_applies_manifest_tags_to_arrow_ipc() {
+async fn execute_default_geospatial_mode_applies_manifest_tags_to_arrow_ipc() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -723,8 +723,7 @@ async fn execute_geospatial_binary_mode_applies_manifest_tags_to_arrow_ipc() {
     )
     .await;
 
-    let session =
-        open_session_with_geospatial(&server, GeospatialResultRepresentation::Binary).await;
+    let session = open_session(&server).await;
     let mut stmt = session.statement();
     stmt.spec().sql("SELECT geom, geog FROM geo_values");
     let mut exec = stmt.execute().await.expect("execute");
@@ -815,7 +814,8 @@ async fn execute_legacy_geospatial_text_is_preserved() {
         )
         .await;
 
-        let session = open_session(&server).await;
+        let session =
+            open_session_with_geospatial(&server, GeospatialResultRepresentation::String).await;
         let mut stmt = session.statement();
         stmt.spec().sql("SELECT geom, geog FROM legacy_geo_values");
         let mut exec = stmt.execute().await.expect("execute");
@@ -1056,7 +1056,8 @@ async fn execute_empty_legacy_geospatial_result_uses_physical_text_schema() {
         )
         .await;
 
-        let session = open_session(&server).await;
+        let session =
+            open_session_with_geospatial(&server, GeospatialResultRepresentation::String).await;
         let mut stmt = session.statement();
         stmt.spec()
             .sql("SELECT geom, geog FROM empty_legacy_geo_values");

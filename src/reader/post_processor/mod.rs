@@ -901,10 +901,13 @@ mod tests {
             column_info("geog", "GEOGRAPHY", "GEOGRAPHY(4326)", 1),
         ]);
 
-        let mut pp =
-            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
-                .await
-                .unwrap();
+        let options = PostProcessOptions {
+            geospatial_result_representation: GeospatialResultRepresentation::String,
+            ..Default::default()
+        };
+        let mut pp = ResultPostProcessor::new(inner, Some(&manifest), options)
+            .await
+            .unwrap();
         assert_eq!(
             pp.schema().await.unwrap().field(0).data_type(),
             &DataType::Utf8
@@ -1041,6 +1044,7 @@ mod tests {
         ]);
         let options = PostProcessOptions {
             complex_types_as_json: true,
+            geospatial_result_representation: GeospatialResultRepresentation::String,
             ..Default::default()
         };
 
