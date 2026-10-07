@@ -15,20 +15,30 @@
 //! `KernelRuntime` — the session-owned tokio runtime.
 
 use std::ops::Deref;
+use std::time::Duration;
 use tokio::runtime::Runtime;
 
-/// Tokio runtime that shuts down without waiting for its worker threads.
+/// Tokio runtime that never blocks on its workers while the GIL may be held.
 ///
-/// The last `Arc` is usually released with the GIL held — at the end of
-/// `Session.close()`, or when Python frees a handle. A plain `Runtime`
-/// drop blocks until every worker exits, but a worker forwarding a log
-/// record through `pyo3_log` is waiting for that same GIL, so the two
-/// deadlock. `shutdown_background` returns immediately instead.
+/// A plain `Runtime` drop blocks until every worker exits, but a worker
+/// forwarding a log record through `pyo3_log` waits for the GIL, so
+/// dropping it with the GIL held deadlocks. `Session.close()` instead calls
+/// [`shutdown_timeout`](Self::shutdown_timeout) with the GIL released.
+/// `Drop` — reached when Python frees a handle — uses `shutdown_background`,
+/// so workers may still run briefly after it returns.
 pub(crate) struct KernelRuntime(Option<Runtime>);
 
 impl KernelRuntime {
     pub(crate) fn new(runtime: Runtime) -> Self {
         Self(Some(runtime))
+    }
+
+    /// Shut down, waiting up to `timeout` for the workers to exit. Call
+    /// with the GIL released: workers may need it to finish.
+    pub(crate) fn shutdown_timeout(mut self, timeout: Duration) {
+        if let Some(runtime) = self.0.take() {
+            runtime.shutdown_timeout(timeout);
+        }
     }
 }
 
@@ -36,7 +46,7 @@ impl Deref for KernelRuntime {
     type Target = Runtime;
 
     fn deref(&self) -> &Runtime {
-        self.0.as_ref().expect("runtime is only taken in Drop")
+        self.0.as_ref().expect("runtime is only taken on shutdown")
     }
 }
 
