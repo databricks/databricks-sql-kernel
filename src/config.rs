@@ -1539,9 +1539,9 @@ pub struct SessionConfig {
     /// Required: how to authenticate.
     pub auth: AuthConfig,
 
-    /// Client-provided driver/runtime identity. Telemetry uses this for
-    /// `DriverSystemConfiguration`, filling any missing fields with
-    /// kernel defaults at session-open time.
+    /// Client-provided driver/runtime identity. The kernel uses the canonical
+    /// driver name and version for connector-service feature flags and fills
+    /// any missing fields with kernel defaults when emitting telemetry.
     pub driver_system_configuration: Option<DriverSystemConfiguration>,
 
     /// Server-bound session conf. Maps to SEA `session_confs` /

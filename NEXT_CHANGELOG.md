@@ -20,6 +20,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Added typed client-side `GEOMETRY` / `GEOGRAPHY` result representation
   selection. String mode renders the native WKB as EWKT locally; binary mode
   retains the tagged Arrow struct. No representation setting is sent to SEA.
+- Add authenticated connector-service feature flags with a bounded,
+  process-wide workspace cache and kernel-internal typed readers for all six
+  SAFE types.
 
 ### Changed
 
@@ -27,6 +30,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Authenticated SEA requests now use `Accept-Encoding: identity` by default to
   avoid gzipping inline LZ4-compressed Arrow results. Response compression can
   be re-enabled through `HttpConfig` or the C ABI.
+
+- Feature flags are fetched after kernel authentication and before session
+  creation; sessions read process-cache values instead of retaining snapshots.
 
 ### Updated
 
