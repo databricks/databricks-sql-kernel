@@ -23,10 +23,10 @@
 use arrow_array::builder::{BinaryBuilder, Int32Builder};
 use arrow_array::cast::AsArray;
 use arrow_array::{
-    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, RecordBatch,
+    Array, ArrayRef, BinaryArray, Int32Array, Int64Array, LargeStringArray, ListArray, RecordBatch,
     StringArray, StructArray,
 };
-use arrow_buffer::NullBuffer;
+use arrow_buffer::{NullBuffer, OffsetBuffer};
 use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -979,6 +979,98 @@ async fn execute_cloudfetch_geospatial_reconciles_manifest_and_untagged_payload(
         }
         exec.close().await.expect("close");
     }
+}
+
+#[tokio::test]
+async fn execute_array_child_names_match_for_empty_and_non_empty_results() {
+    let array = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("element", DataType::Int32, true)),
+            OffsetBuffer::new(vec![0, 2].into()),
+            Arc::new(Int32Array::from(vec![1, 2])),
+            None,
+        )
+        .unwrap(),
+    );
+    let nested = Arc::new(
+        ListArray::try_new(
+            Arc::new(Field::new("element", array.data_type().clone(), true)),
+            OffsetBuffer::new(vec![0, 1].into()),
+            array.clone(),
+            None,
+        )
+        .unwrap(),
+    );
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("a", array.data_type().clone(), true),
+            Field::new("nested", nested.data_type().clone(), true),
+        ])),
+        vec![array, nested],
+    )
+    .unwrap();
+    let mut schemas = Vec::new();
+
+    for empty in [false, true] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let mut body = json!({
+            "statement_id": "stmt-arrays",
+            "status": { "state": "SUCCEEDED" },
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": 2,
+                    "columns": [
+                        {
+                            "name": "a",
+                            "type_name": "ARRAY",
+                            "type_text": "ARRAY<INT>",
+                            "position": 0,
+                        },
+                        {
+                            "name": "nested",
+                            "type_name": "ARRAY",
+                            "type_text": "ARRAY<ARRAY<INT>>",
+                            "position": 1,
+                        },
+                    ],
+                },
+                "total_chunk_count": if empty { 0 } else { 1 },
+                "total_row_count": if empty { 0 } else { 1 },
+                "truncated": false,
+            },
+        });
+        if !empty {
+            body["result"] = json!({ "attachment": STANDARD.encode(arrow_ipc_bytes(&batch)) });
+        }
+        mount_execute(&server, body.to_string()).await;
+
+        let session = open_session(&server).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql(if empty {
+            "SELECT a, nested FROM array_values WHERE 1=0"
+        } else {
+            "SELECT a, nested FROM array_values"
+        });
+        let mut exec = stmt.execute().await.expect("execute");
+        schemas.push(exec.schema());
+        let batches = drain(exec.result_stream_mut()).await;
+        if empty {
+            assert!(batches.is_empty());
+        } else {
+            assert_eq!(batches.len(), 1);
+            assert_eq!(batches[0].num_rows(), 1);
+            for i in 0..batch.num_columns() {
+                assert_eq!(batches[0].column(i).to_data(), batch.column(i).to_data());
+            }
+        }
+        exec.close().await.expect("close");
+    }
+
+    assert_eq!(schemas[0], schemas[1]);
 }
 
 #[tokio::test]
