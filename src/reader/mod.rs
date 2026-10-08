@@ -1329,6 +1329,32 @@ mod tests {
     }
 
     #[test]
+    fn test_extract_physical_schema_preserves_array_child_fields() {
+        for child_name in ["element", "item"] {
+            let mut manifest = make_manifest(vec![make_column_info(
+                "a",
+                "ARRAY",
+                "ARRAY<INT>",
+                0,
+                None,
+                None,
+                None,
+            )]);
+            let schema = Schema::new(vec![Field::new(
+                "a",
+                DataType::List(Arc::new(Field::new(child_name, DataType::Int32, false))),
+                true,
+            )]);
+            manifest.arrow_schema = Some(schema_ipc(&schema));
+
+            let physical =
+                ResultReaderFactory::extract_physical_schema_from_manifest(Some(&manifest))
+                    .unwrap();
+            assert_eq!(physical.as_ref(), &schema);
+        }
+    }
+
+    #[test]
     fn test_extract_physical_schema_rejects_invalid_or_mismatched_ipc() {
         let mut manifest = make_manifest(vec![make_column_info(
             "value", "STRING", "STRING", 0, None, None, None,
