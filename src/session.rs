@@ -78,7 +78,7 @@ use std::time::{Duration, Instant};
 use tracing::{info_span, Instrument, Span};
 
 const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
-    "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForAdbc";
+    "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForKernel";
 
 fn telemetry_enabled(config: &TelemetryConfig, feature_flag: Option<bool>) -> bool {
     config.enabled.or(feature_flag).unwrap_or(false)
