@@ -23,6 +23,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Add authenticated connector-service feature flags with a bounded,
   process-wide workspace cache and kernel-internal typed readers for all six
   SAFE types.
+- Result schemas now carry the Thrift-compatible `Spark:DataType:SqlName`
+  field metadata key, set to the manifest's `type_text`, matching Thrift
+  results and the C# ADBC SEA path.
 
 ### Changed
 
