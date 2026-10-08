@@ -400,10 +400,13 @@ pub struct ConnectionOptions {
     /// Overall retry budget in whole seconds. Maps onto
     /// [`HttpConfig::overall_timeout`].
     pub retry_overall_timeout_secs: Option<u32>,
-    /// Enable kernel telemetry export. Omitted / `false` keeps telemetry
-    /// disabled. When enabled, the kernel records operation telemetry below the
-    /// binding layer and exports through the Databricks SQL driver telemetry
-    /// endpoint.
+    /// Enable kernel telemetry export. Tri-state: an explicit `true` or `false`
+    /// takes precedence; when omitted, export defers to the
+    /// `enableTelemetryForKernel` workspace feature flag, falling back to
+    /// disabled when the flag is absent. Only an explicit `false` guarantees
+    /// telemetry stays disabled. When enabled, the kernel records operation
+    /// telemetry below the binding layer and exports through the Databricks SQL
+    /// driver telemetry endpoint.
     pub telemetry_enabled: Option<bool>,
     /// Number of telemetry events buffered before a flush. Omitted ⇒ kernel
     /// default. Must be greater than zero when supplied.
@@ -655,8 +658,10 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
 ///
 /// Returns `None` when the caller did not mention telemetry at all, preserving
 /// the kernel default. A caller may set telemetry knobs while leaving
-/// `telemetry_enabled` false; the config is still passed through, but telemetry
-/// remains disabled until explicitly enabled.
+/// `telemetry_enabled` unset; the config is still passed through, and whether
+/// export actually runs is then decided by the tri-state precedence
+/// (explicit setting → `enableTelemetryForKernel` workspace feature flag →
+/// disabled). Only an explicit `false` guarantees telemetry stays disabled.
 fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<TelemetryConfig>> {
     let mentioned = options.telemetry_enabled.is_some()
         || options.telemetry_batch_size.is_some()
