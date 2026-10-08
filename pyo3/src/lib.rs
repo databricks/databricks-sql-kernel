@@ -40,6 +40,7 @@ mod logging;
 mod metadata;
 mod params;
 mod result_stream;
+mod runtime;
 mod session;
 mod statement;
 

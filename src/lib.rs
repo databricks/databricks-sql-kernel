@@ -121,6 +121,7 @@ pub mod telemetry;
 pub mod types;
 
 pub mod config;
+mod feature_flags;
 pub mod kernel_error;
 pub mod metadata_v0;
 pub mod result_stream;

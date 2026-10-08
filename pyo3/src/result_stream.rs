@@ -26,12 +26,12 @@
 //! the same code path through its `result_stream_mut()` borrow.
 
 use crate::fetch;
+use crate::runtime::KernelRuntime;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::ResultStream as KResultStream;
 use pyo3::prelude::*;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 /// Python-facing borrowed result stream.
 #[pyclass(name = "ResultStream")]
@@ -44,12 +44,12 @@ pub(crate) struct ResultStream {
 
 struct ResultStreamInner {
     stream: KResultStream,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
     exhausted: bool,
 }
 
 impl ResultStream {
-    pub(crate) fn new(stream: KResultStream, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(stream: KResultStream, runtime: Arc<KernelRuntime>) -> Self {
         let schema = stream.schema();
         Self {
             schema,
@@ -98,13 +98,14 @@ impl ResultStream {
 
     /// Release client-side resources. Idempotent. Subsequent calls
     /// on this handle raise `KernelError`.
-    fn close(&mut self) {
+    fn close(&mut self, py: Python<'_>) {
         if let Some(inner) = self.inner.take() {
             // ResultStream::close() is sync (no server RPC) and
             // consumes self; the kernel's Drop performs the same
             // cleanup, but the explicit call is cheaper to reason
             // about.
             inner.stream.close();
+            KernelRuntime::release(inner.runtime, py);
         }
     }
 

@@ -82,6 +82,7 @@ rand = "0.10"
 
 # Concurrent data structures
 dashmap = "6"
+moka = { version = "0.12.16", features = ["future"] }
 
 # Async utilities
 futures = "0.3"

@@ -25,6 +25,10 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Fixed
 
+- Fixed an intermittent hang in `Session.close()` (or when Python frees a
+  handle) when a runtime worker was forwarding a log record to Python
+  `logging` at the moment the session's runtime shut down.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here
