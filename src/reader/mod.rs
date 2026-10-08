@@ -87,7 +87,8 @@ impl ResultReaderFactory {
     /// the kernel does on the way out to consumers:
     ///
     /// - manifest-driven metadata attachment (`databricks.type_name`,
-    ///   `databricks.type_text`, precision / scale / interval kind);
+    ///   `databricks.type_text`, precision / scale / interval kind,
+    ///   `Spark:DataType:SqlName`);
     /// - optional complex-type JSON stringification when the session
     ///   has `complex_types_as_json = true`.
     ///
@@ -885,13 +886,18 @@ impl ResultReader for EmptyReader {
 /// without reverse-engineering from Arrow type IDs.
 ///
 /// Keys use the `databricks.` prefix to avoid conflicts with other metadata
-/// conventions (e.g., Arrow's own `ARROW:extension:name`).
+/// conventions (e.g., Arrow's own `ARROW:extension:name`), except
+/// [`SPARK_SQL_NAME`](metadata_keys::SPARK_SQL_NAME), which mirrors the Thrift
+/// server's key.
 pub mod metadata_keys {
     pub const TYPE_NAME: &str = "databricks.type_name";
     pub const TYPE_TEXT: &str = "databricks.type_text";
     pub const TYPE_PRECISION: &str = "databricks.type_precision";
     pub const TYPE_SCALE: &str = "databricks.type_scale";
     pub const TYPE_INTERVAL_TYPE: &str = "databricks.type_interval_type";
+    /// Thrift-compatible type key, set to the same value as [`TYPE_TEXT`].
+    /// Consumers written against Thrift results (e.g. Power BI, JDBC) read it.
+    pub const SPARK_SQL_NAME: &str = "Spark:DataType:SqlName";
 }
 
 /// Adapter to make ResultReader work as arrow's RecordBatchReader.
@@ -926,7 +932,8 @@ impl ResultReaderAdapter {
     ///   positional placeholders (`col_0`, …) in the Arrow payload; the
     ///   authoritative names live in the manifest;
     /// - attach `databricks.*` type metadata (type_name, type_text,
-    ///   precision, scale, interval_type) for the Arrow C Data FFI boundary.
+    ///   precision, scale, interval_type) for the Arrow C Data FFI boundary;
+    /// - attach the Thrift-compatible `Spark:DataType:SqlName` (= type_text).
     ///
     /// Fields with no matching `ColumnInfo` are left unchanged.
     pub(crate) fn augment_schema_with_manifest(
@@ -956,6 +963,12 @@ impl ResultReaderAdapter {
                             .insert(metadata_keys::TYPE_NAME.to_string(), info.type_name.clone());
                         metadata
                             .insert(metadata_keys::TYPE_TEXT.to_string(), info.type_text.clone());
+                        // SEA copies `type_text` from the Thrift server's
+                        // `Spark:DataType:SqlName`, so this matches Thrift results.
+                        metadata.insert(
+                            metadata_keys::SPARK_SQL_NAME.to_string(),
+                            info.type_text.clone(),
+                        );
                         if let Some(prec) = info.type_precision {
                             metadata.insert(
                                 metadata_keys::TYPE_PRECISION.to_string(),
@@ -1521,6 +1534,51 @@ mod tests {
         assert_eq!(
             field.metadata().get(metadata_keys::TYPE_SCALE),
             Some(&"2".to_string())
+        );
+    }
+
+    /// Thrift consumers read the literal `Spark:DataType:SqlName` key, so pin
+    /// the wire string rather than the constant.
+    #[test]
+    fn test_augment_schema_sets_thrift_sql_name_from_type_text() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("amount", DataType::Decimal128(10, 2), true),
+            Field::new(
+                "tags",
+                DataType::List(Arc::new(Field::new("item", DataType::Utf8, true))),
+                true,
+            ),
+        ]));
+        let manifest = make_manifest(vec![
+            make_column_info(
+                "amount",
+                "DECIMAL",
+                "DECIMAL(10,2)",
+                0,
+                Some(10),
+                Some(2),
+                None,
+            ),
+            make_column_info("tags", "ARRAY", "ARRAY<STRING>", 1, None, None, None),
+        ]);
+
+        let augmented = ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+
+        assert_eq!(
+            augmented
+                .field(0)
+                .metadata()
+                .get("Spark:DataType:SqlName")
+                .map(String::as_str),
+            Some("DECIMAL(10,2)")
+        );
+        assert_eq!(
+            augmented
+                .field(1)
+                .metadata()
+                .get("Spark:DataType:SqlName")
+                .map(String::as_str),
+            Some("ARRAY<STRING>")
         );
     }
 
