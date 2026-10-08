@@ -98,13 +98,14 @@ impl ResultStream {
 
     /// Release client-side resources. Idempotent. Subsequent calls
     /// on this handle raise `KernelError`.
-    fn close(&mut self) {
+    fn close(&mut self, py: Python<'_>) {
         if let Some(inner) = self.inner.take() {
             // ResultStream::close() is sync (no server RPC) and
             // consumes self; the kernel's Drop performs the same
             // cleanup, but the explicit call is cheaper to reason
             // about.
             inner.stream.close();
+            KernelRuntime::release(inner.runtime, py);
         }
     }
 

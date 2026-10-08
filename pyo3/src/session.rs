@@ -719,11 +719,7 @@ impl Session {
             "Session.close: closing kernel session (GIL released)"
         );
         let result = run_kernel!(py, rt, session.close());
-        // Last handle: wait for the workers so none is still logging into
-        // Python after close() returns (e.g. while the interpreter exits).
-        if let Ok(rt) = Arc::try_unwrap(rt) {
-            py.detach(|| rt.shutdown_timeout(std::time::Duration::from_secs(1)));
-        }
+        KernelRuntime::release(rt, py);
         result
     }
 

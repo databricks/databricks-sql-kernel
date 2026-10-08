@@ -135,6 +135,7 @@ impl ExecutedAsyncStatement {
         let runtime = inner.runtime.clone();
         let res = run_kernel!(py, runtime, KExecutedAsyncStatement::close(&mut inner.exec));
         self.inner = None;
+        KernelRuntime::release(runtime, py);
         res.map(|_| ())
     }
 

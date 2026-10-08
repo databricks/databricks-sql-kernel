@@ -270,8 +270,9 @@ impl Statement {
         // CancelStatement + CloseStatement against the tracked
         // executed handle), so we route it through the standard
         // py.detach + block_on path.
-        run_kernel!(py, runtime, stmt.close())?;
-        Ok(())
+        let result = run_kernel!(py, runtime, stmt.close());
+        KernelRuntime::release(runtime, py);
+        result
     }
 }
 
@@ -401,6 +402,7 @@ impl ExecutedStatement {
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.
         self.inner = None;
+        KernelRuntime::release(runtime, py);
         res.map(|_| ())
     }
 
