@@ -39,6 +39,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Kernel telemetry enablement now follows the connector-service Kernel feature
   flag when the client leaves it unspecified; explicit client enable/disable
   settings take precedence.
+- **Breaking (Rust API):** `TelemetryConfig::enabled` changes type from `bool`
+  to `Option<bool>`, where `None` defers to the workspace feature flag. Direct
+  Rust consumers that read or assign this public field must migrate (e.g. use
+  the new `with_enabled`/`set_enabled` helpers or wrap values in `Some(..)`).
 - Added a backward-compatible C telemetry-config v2 setter whose nullable
   config and `has_enabled` field preserve unspecified client enablement.
 
