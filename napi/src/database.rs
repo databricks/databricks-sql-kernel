@@ -1596,7 +1596,7 @@ mod tests {
             .expect("valid telemetry config")
             .expect("telemetry mentioned");
 
-        assert!(telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(true));
         assert_eq!(telemetry.batch_size, 25);
         assert_eq!(
             telemetry.flush_interval,
@@ -1624,31 +1624,28 @@ mod tests {
     #[test]
     fn telemetry_enabled_omitted_leaves_feature_flag_in_control() {
         // Omitting `telemetryEnabled` while touching another telemetry knob must
-        // leave `enabled` at its default `false` without recording an explicit
-        // override, so the workspace feature flag still decides. An explicit
-        // value, by contrast, pins `enabled`. The kernel's `enabled_override`
-        // field is `pub(crate)` and not observable from this crate, so we assert
-        // the public `enabled` bool — the same contract the pyo3 binding checks.
+        // leave `enabled` as `None`, so the workspace feature flag still
+        // decides. An explicit value, by contrast, pins `enabled`.
         let mut omitted = base();
         omitted.telemetry_batch_size = Some(25);
         let telemetry = build_telemetry_config(&omitted)
             .expect("valid telemetry config")
             .expect("telemetry mentioned");
-        assert!(!telemetry.enabled);
+        assert_eq!(telemetry.enabled, None);
 
         let mut explicit_true = base();
         explicit_true.telemetry_enabled = Some(true);
         let telemetry = build_telemetry_config(&explicit_true)
             .expect("valid telemetry config")
             .expect("telemetry mentioned");
-        assert!(telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(true));
 
         let mut explicit_false = base();
         explicit_false.telemetry_enabled = Some(false);
         let telemetry = build_telemetry_config(&explicit_false)
             .expect("valid telemetry config")
             .expect("telemetry mentioned");
-        assert!(!telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(false));
     }
 
     #[test]

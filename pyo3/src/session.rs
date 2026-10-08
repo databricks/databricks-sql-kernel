@@ -761,7 +761,7 @@ mod send_sync_tests {
         })
         .expect("valid telemetry config");
 
-        assert!(telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(true));
         assert_eq!(telemetry.batch_size, 25);
         assert_eq!(
             telemetry.flush_interval,
