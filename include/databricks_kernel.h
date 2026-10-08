@@ -348,9 +348,9 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
  * representation. `enabled = true` requests Arrow
  * `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT in
  * Arrow UTF-8 values. Omitting this setter uses the enabled kernel default.
- * Binary mode requires the native Reyden Arrow path; legacy text-only results
- * cannot be reconstructed as WKB. This client-side setting is never sent to
- * SEA. A raw `EnableGeoSpatialSupport` entry set through
+ * The kernel normalizes both standard-warehouse text and Reyden native Arrow
+ * results locally; this setting is never sent to SEA. A raw
+ * `EnableGeoSpatialSupport` entry set through
  * kernel_session_config_set_session_conf remains server-bound and is forwarded
  * unchanged. */
 KernelStatusCode kernel_session_config_set_enable_geospatial_support(

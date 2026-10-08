@@ -12,30 +12,32 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Local rendering of Reyden GEOMETRY / GEOGRAPHY Arrow results.
+//! Reconciliation of GEOMETRY / GEOGRAPHY Arrow results.
 //!
-//! Reyden encodes each value as
-//! `struct<srid:int32 not null,wkb:binary not null>`. Reyder's structured
-//! manifest retains the logical `GEOMETRY(...)` / `GEOGRAPHY(...)` type and is
-//! the source of truth for interpreting result attachments. An attachment can
-//! contain the same struct without the canonical Arrow tags. This module uses
-//! the logical schema to reconstruct the tags in binary mode without copying
-//! child buffers, or to recursively render each declared geo value as EWKT in
-//! string mode.
+//! Reyden encodes each value as `struct<srid:int32 not null,wkb:binary not
+//! null>`, while the standard DBSQL path encodes it as WKT / EWKT in Arrow
+//! `Utf8`. Reyder's structured manifest retains the logical `GEOMETRY(...)` /
+//! `GEOGRAPHY(...)` type and is the source of truth for interpreting either
+//! result attachment. This module recursively normalizes both physical inputs
+//! to the client-requested representation.
 
 use crate::config::GeospatialResultRepresentation;
 use crate::kernel_error::{Error, Result};
-use arrow_array::builder::StringBuilder;
+use arrow_array::builder::{BinaryBuilder, Int32Builder, StringBuilder};
 use arrow_array::{
     Array, ArrayRef, BinaryArray, FixedSizeListArray, Int32Array, LargeListArray,
-    LargeListViewArray, ListArray, ListViewArray, MapArray, StructArray,
+    LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
+    StructArray,
 };
+use arrow_buffer::NullBufferBuilder;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use geo_traits::{
     CoordTrait, Dimensions, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
     MultiLineStringTrait, MultiPointTrait, MultiPolygonTrait, PointTrait, PolygonTrait,
 };
+use std::borrow::Cow;
 use std::fmt::Write as _;
+use std::str::FromStr;
 use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -129,19 +131,19 @@ fn plan_data_type(
     let physical_tag = native_geo_tag(physical)?;
 
     if let Some(expected) = logical_tag {
-        // DBR/legacy SEA paths can already serialize geo values as EWKT even
-        // though the structured manifest declares GEOMETRY / GEOGRAPHY. That
-        // satisfies string mode without another conversion. Binary mode must
-        // fail explicitly: an EWKT attachment cannot be losslessly turned back
-        // into Reyden's canonical `struct<srid,wkb>` representation here.
+        // The standard DBSQL path serializes geo values as WKT / EWKT even
+        // though the structured manifest declares GEOMETRY / GEOGRAPHY. Keep
+        // that physical type in string mode, or parse it into the same
+        // canonical native struct that Reyden returns in binary mode.
         if matches!(physical, DataType::Utf8 | DataType::LargeUtf8) {
-            if target == GeospatialResultRepresentation::Binary {
-                return Err(Error::not_implemented().message(format!(
-                    "binary geospatial result representation is unavailable for '{path}': the server returned {physical:?}"
-                )));
-            }
+            let output_type = match target {
+                GeospatialResultRepresentation::String => physical.clone(),
+                GeospatialResultRepresentation::Binary => {
+                    logical.expect("logical_tag implies a logical type").clone()
+                }
+            };
             return Ok(TypePlan {
-                output_type: physical.clone(),
+                output_type,
                 contains_geo: true,
                 is_root_geo: true,
             });
@@ -480,6 +482,9 @@ fn native_geo_family(data_type: &DataType) -> Result<Option<GeoFamily>> {
 
 fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result<ArrayRef> {
     if let Some(output_tag) = native_geo_tag(output_type)? {
+        if matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
+            return text_to_native(array, output_type, path);
+        }
         validate_geo_source(array.data_type(), output_tag, path)?;
         if array.data_type() == output_type {
             return Ok(array.clone());
@@ -623,6 +628,218 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
             "geospatial rewrite for '{path}' cannot map Arrow type {source:?} to {output:?}"
         ))),
     }
+}
+
+fn text_to_native(array: &ArrayRef, output_type: &DataType, path: &str) -> Result<ArrayRef> {
+    let DataType::Struct(output_fields) = output_type else {
+        unreachable!("a geo tag is only valid on a struct")
+    };
+
+    match array.data_type() {
+        DataType::Utf8 => {
+            let values = downcast::<StringArray>(array, path, "StringArray")?;
+            ewkt_values_to_native(values.iter(), values.len(), output_fields, path)
+        }
+        DataType::LargeUtf8 => {
+            let values = downcast::<LargeStringArray>(array, path, "LargeStringArray")?;
+            ewkt_values_to_native(values.iter(), values.len(), output_fields, path)
+        }
+        other => Err(Error::internal().message(format!(
+            "geospatial text conversion for '{path}' received unexpected Arrow type {other:?}"
+        ))),
+    }
+}
+
+fn ewkt_values_to_native<'a>(
+    values: impl Iterator<Item = Option<&'a str>>,
+    len: usize,
+    output_fields: &Fields,
+    path: &str,
+) -> Result<ArrayRef> {
+    let mut srids = Int32Builder::with_capacity(len);
+    let mut wkbs = BinaryBuilder::with_capacity(len, len.saturating_mul(32));
+    let mut nulls = NullBufferBuilder::new(len);
+
+    for (row, value) in values.enumerate() {
+        let Some(value) = value else {
+            // Geo struct children are non-nullable. Use ignored placeholders
+            // beneath a null outer struct, matching Reyden's representation.
+            srids.append_value(0);
+            wkbs.append_value([]);
+            nulls.append_null();
+            continue;
+        };
+
+        let (srid, wkt_body) = split_ewkt(value)
+            .map_err(|detail| malformed_text(path, row, &format!("has invalid EWKT: {detail}")))?;
+        let normalized = normalize_multipoint_empty_members(wkt_body);
+        let geometry = wkt::Wkt::<f64>::from_str(&normalized).map_err(|error| {
+            malformed_text(path, row, &format!("contains invalid WKT: {error}"))
+        })?;
+        let mut wkb = Vec::with_capacity(wkb::writer::geometry_wkb_size(&geometry));
+        wkb::writer::write_geometry(&mut wkb, &geometry, &Default::default()).map_err(|error| {
+            malformed_text(
+                path,
+                row,
+                &format!("could not be encoded as OGC WKB: {error}"),
+            )
+        })?;
+
+        srids.append_value(srid);
+        wkbs.append_value(wkb);
+        nulls.append_non_null();
+    }
+
+    let output = StructArray::try_new(
+        output_fields.clone(),
+        vec![Arc::new(srids.finish()), Arc::new(wkbs.finish())],
+        nulls.finish(),
+    )
+    .map_err(|error| rebuild_error(path, error))?;
+    Ok(Arc::new(output))
+}
+
+/// The `wkt` parser currently rejects empty point members inside a
+/// `MULTIPOINT`, even though Databricks emits valid values such as
+/// `MULTIPOINT(EMPTY,(1 2))`. WKB represents an empty point as an all-NaN
+/// coordinate, so substitute parseable NaN coordinates before handing the
+/// value to the generic WKT-to-WKB pipeline.
+fn normalize_multipoint_empty_members(value: &str) -> Cow<'_, str> {
+    let bytes = value.as_bytes();
+    let mut replacements = Vec::new();
+    let mut cursor = 0;
+
+    while cursor < bytes.len() {
+        if !bytes[cursor].is_ascii_alphabetic() {
+            cursor += 1;
+            continue;
+        }
+
+        let word_start = cursor;
+        while cursor < bytes.len() && bytes[cursor].is_ascii_alphabetic() {
+            cursor += 1;
+        }
+        let word = &bytes[word_start..cursor];
+        let (mut dimension, mut body_start) = if word.eq_ignore_ascii_case(b"MULTIPOINT") {
+            (2, skip_ascii_whitespace(bytes, cursor))
+        } else if word.eq_ignore_ascii_case(b"MULTIPOINTZ")
+            || word.eq_ignore_ascii_case(b"MULTIPOINTM")
+        {
+            (3, skip_ascii_whitespace(bytes, cursor))
+        } else if word.eq_ignore_ascii_case(b"MULTIPOINTZM") {
+            (4, skip_ascii_whitespace(bytes, cursor))
+        } else {
+            continue;
+        };
+
+        if dimension == 2 {
+            let dimension_end = bytes[body_start..]
+                .iter()
+                .position(|byte| !byte.is_ascii_alphabetic())
+                .map(|offset| body_start + offset)
+                .unwrap_or(bytes.len());
+            let dimension_word = &bytes[body_start..dimension_end];
+            if dimension_word.eq_ignore_ascii_case(b"Z")
+                || dimension_word.eq_ignore_ascii_case(b"M")
+            {
+                dimension = 3;
+                body_start = skip_ascii_whitespace(bytes, dimension_end);
+            } else if dimension_word.eq_ignore_ascii_case(b"ZM") {
+                dimension = 4;
+                body_start = skip_ascii_whitespace(bytes, dimension_end);
+            }
+        }
+
+        // `MULTIPOINT EMPTY` describes an empty collection. Only a parenthesized
+        // body can contain empty point members that need normalization.
+        if bytes.get(body_start) != Some(&b'(') {
+            continue;
+        }
+
+        let mut depth = 1;
+        let mut index = body_start + 1;
+        while index < bytes.len() && depth != 0 {
+            match bytes[index] {
+                b'(' => {
+                    depth += 1;
+                    index += 1;
+                }
+                b')' => {
+                    depth -= 1;
+                    index += 1;
+                }
+                byte if byte.is_ascii_alphabetic() => {
+                    let start = index;
+                    while index < bytes.len() && bytes[index].is_ascii_alphabetic() {
+                        index += 1;
+                    }
+                    if bytes[start..index].eq_ignore_ascii_case(b"EMPTY") {
+                        replacements.push((start, index, dimension));
+                    }
+                }
+                _ => index += 1,
+            }
+        }
+        cursor = index;
+    }
+
+    if replacements.is_empty() {
+        return Cow::Borrowed(value);
+    }
+
+    let mut output = String::with_capacity(value.len() + replacements.len() * 16);
+    let mut copied_through = 0;
+    for (start, end, dimension) in replacements {
+        output.push_str(&value[copied_through..start]);
+        for ordinate in 0..dimension {
+            if ordinate != 0 {
+                output.push(' ');
+            }
+            // A leading `+` makes `NaN` number-like to the `wkt` tokenizer.
+            output.push_str("+NaN");
+        }
+        copied_through = end;
+    }
+    output.push_str(&value[copied_through..]);
+    Cow::Owned(output)
+}
+
+fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
+    while index < bytes.len() && bytes[index].is_ascii_whitespace() {
+        index += 1;
+    }
+    index
+}
+
+/// Split a standard-warehouse WKT / EWKT value into its row SRID and WKT
+/// body. Databricks omits the EWKT prefix for SRID 0, including values in a
+/// `GEOMETRY(ANY)` column, so an absent prefix deliberately maps to zero.
+fn split_ewkt(value: &str) -> std::result::Result<(i32, &str), String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("value is empty".to_string());
+    }
+
+    let Some(prefix) = value.get(..5) else {
+        return Ok((0, value));
+    };
+    if !prefix.eq_ignore_ascii_case("SRID=") {
+        return Ok((0, value));
+    }
+
+    let rest = &value[5..];
+    let separator = rest
+        .find(';')
+        .ok_or_else(|| "SRID prefix is missing ';'".to_string())?;
+    let srid_text = rest[..separator].trim();
+    let srid = srid_text
+        .parse::<i32>()
+        .map_err(|error| format!("invalid SRID '{srid_text}': {error}"))?;
+    let wkt_body = rest[separator + 1..].trim();
+    if wkt_body.is_empty() {
+        return Err("WKT body is empty".to_string());
+    }
+    Ok((srid, wkt_body))
 }
 
 fn native_to_ewkt(array: &ArrayRef, path: &str) -> Result<ArrayRef> {
@@ -974,6 +1191,12 @@ fn malformed_native(path: &str, detail: &str) -> Error {
     ))
 }
 
+fn malformed_text(path: &str, row: usize, detail: &str) -> Error {
+    Error::data_loss().message(format!(
+        "geospatial value '{path}' row {row} has malformed text data: {detail}"
+    ))
+}
+
 fn rebuild_error(path: &str, error: arrow_schema::ArrowError) -> Error {
     Error::data_loss().message(format!(
         "failed to rebuild Arrow container '{path}' after geospatial conversion: {error}"
@@ -983,8 +1206,7 @@ fn rebuild_error(path: &str, error: arrow_schema::ArrowError) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow_array::builder::{BinaryBuilder, Int32Builder};
-    use arrow_buffer::NullBuffer;
+    use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use std::collections::HashMap;
 
     const POINT_1_2_WKB: &[u8] = &[
@@ -1134,18 +1356,15 @@ mod tests {
             assert!(!string.needs_rewrite);
             assert_eq!(string.output_type, text_type);
 
-            let error = plan(
+            let binary = plan(
                 &text,
                 Some(&logical),
                 GeospatialResultRepresentation::Binary,
             )
-            .unwrap_err();
-            assert!(
-                error
-                    .message
-                    .contains(&format!("server returned {text_type:?}")),
-                "{error:?}"
-            );
+            .unwrap()
+            .unwrap();
+            assert!(binary.needs_rewrite);
+            assert_eq!(binary.output_type, logical.data_type().clone());
         }
 
         assert!(
@@ -1202,6 +1421,146 @@ mod tests {
             .downcast_ref::<arrow_array::StringArray>()
             .unwrap();
         assert_eq!(output.value(0), "POINT(1 2)");
+    }
+
+    #[test]
+    fn text_geometry_converts_to_native_and_preserves_outer_null() {
+        for array in [
+            Arc::new(StringArray::from(vec![
+                Some("SRID=4326;POINT (1 2)"),
+                Some("POINT ZM (1 2 3 4)"),
+                None,
+            ])) as ArrayRef,
+            Arc::new(LargeStringArray::from(vec![
+                Some("SRID=4326;POINT (1 2)"),
+                Some("POINT ZM (1 2 3 4)"),
+                None,
+            ])) as ArrayRef,
+        ] {
+            let output_type = geo_type(GeoFamily::Geometry, -1);
+            let output = rewrite(&array, &output_type, "g").unwrap();
+            let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+            assert_eq!(output.data_type(), &output_type);
+            assert_eq!(output.null_count(), 1);
+            assert!(output.is_null(2));
+
+            let srids = output
+                .column_by_name("srid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(srids.values(), &[4326, 0, 0]);
+            assert_eq!(srids.null_count(), 0);
+
+            let wkbs = output
+                .column_by_name("wkb")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+            assert_eq!(wkbs.null_count(), 0);
+            let geometry = wkb::reader::read_wkb(wkbs.value(1)).unwrap();
+            let mut rendered = String::new();
+            write_ogc_wkt(&mut rendered, &geometry).unwrap();
+            assert_eq!(rendered, "POINT ZM (1 2 3 4)");
+        }
+    }
+
+    #[test]
+    fn text_geometry_converts_to_native_inside_nested_container() {
+        let values: ArrayRef =
+            Arc::new(StringArray::from(vec![Some("SRID=3857;POINT(1 2)"), None]));
+        let list: ArrayRef = Arc::new(ListArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, true)),
+            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 2])),
+            values,
+            Some(NullBuffer::from(vec![true, false])),
+        ));
+        let output_type = DataType::List(Arc::new(Field::new(
+            "item",
+            geo_type(GeoFamily::Geometry, -1),
+            true,
+        )));
+
+        let output = rewrite(&list, &output_type, "nested_geometry").unwrap();
+        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+        assert_eq!(output.data_type(), &output_type);
+        assert!(output.is_null(1));
+
+        let values = output
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(values.is_null(1));
+        let srids = values
+            .column_by_name("srid")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let wkbs = values
+            .column_by_name("wkb")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(srids.value(0), 3857);
+        assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+    }
+
+    #[test]
+    fn text_to_native_handles_every_ogc_family_dimensions_and_empties() {
+        let cases = [
+            "POINT EMPTY",
+            "POINT Z (1 2 3)",
+            "LINESTRING M (0 1 2,3 4 5)",
+            "POLYGON ZM ((0 0 1 2,0 1 2 3,1 0 3 4,0 0 1 2))",
+            "MULTIPOINT((1 2),EMPTY,(3 4))",
+            "MULTIPOINT Z ((1 2 3),EMPTY,(4 5 6))",
+            "MULTIPOINT M (EMPTY,(1 2 3),EMPTY)",
+            "MULTIPOINT ZM ((1 2 3 4),EMPTY,(5 6 7 8))",
+            "MULTILINESTRING(EMPTY,(1 2,3 4))",
+            "MULTIPOLYGON(EMPTY,((0 0,0 1,1 0,0 0)))",
+            "GEOMETRYCOLLECTION(POINT(1 2),LINESTRING EMPTY)",
+            "GEOMETRYCOLLECTION ZM (POINT ZM EMPTY,MULTIPOINT ZM (EMPTY,(1 2 3 4)),GEOMETRYCOLLECTION ZM (MULTIPOINT ZM ((5 6 7 8),EMPTY)))",
+        ];
+
+        for expected in cases {
+            let array: ArrayRef = Arc::new(StringArray::from(vec![expected]));
+            let output = rewrite(&array, &geo_type(GeoFamily::Geometry, -1), "geometry")
+                .unwrap_or_else(|error| panic!("failed to convert {expected}: {error:?}"));
+            let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+            let wkbs = output
+                .column_by_name("wkb")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            let geometry = wkb::reader::read_wkb(wkbs.value(0)).unwrap();
+            let mut actual = String::new();
+            write_ogc_wkt(&mut actual, &geometry).unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
+
+    #[test]
+    fn malformed_text_is_reported_as_data_loss_without_echoing_the_value() {
+        for value in [
+            "SRID=invalid;POINT(1 2)",
+            "SRID=4326POINT(1 2)",
+            "SRID=4326;",
+            "not sensitive result contents",
+        ] {
+            let array: ArrayRef = Arc::new(StringArray::from(vec![value]));
+            let error =
+                rewrite(&array, &geo_type(GeoFamily::Geometry, -1), "geometry").unwrap_err();
+            assert_eq!(error.code, crate::kernel_error::ErrorCode::DataLoss);
+            assert!(error.message.contains("'geometry' row 0"), "{error:?}");
+            assert!(!error.message.contains(value), "{error:?}");
+        }
     }
 
     #[test]

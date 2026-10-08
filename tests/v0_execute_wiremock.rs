@@ -836,7 +836,7 @@ async fn execute_legacy_geospatial_text_is_preserved() {
 }
 
 #[tokio::test]
-async fn execute_legacy_geospatial_text_rejects_binary_mode() {
+async fn execute_standard_warehouse_geospatial_text_converts_to_binary_mode() {
     for data_type in [DataType::Utf8, DataType::LargeUtf8] {
         for include_rows in [true, false] {
             let server = MockServer::start().await;
@@ -857,18 +857,52 @@ async fn execute_legacy_geospatial_text_rejects_binary_mode() {
             let session =
                 open_session_with_geospatial(&server, GeospatialResultRepresentation::Binary).await;
             let mut stmt = session.statement();
-            stmt.spec().sql("SELECT geom FROM legacy_geo_values");
-            let error = match stmt.execute().await {
-                Ok(_) => panic!("binary mode must reject a legacy {data_type:?} geo attachment"),
-                Err(error) => error,
-            };
-            assert_eq!(error.code, ErrorCode::InvalidArgument);
-            assert!(
-                error
-                    .message
-                    .contains(&format!("server returned {data_type:?}")),
-                "{error:?}"
-            );
+            stmt.spec()
+                .sql("SELECT geom, geog FROM standard_geo_values");
+            let mut exec = stmt.execute().await.expect("execute");
+
+            let schema = exec.schema();
+            for (index, family, type_srid) in [(0, "geometry", "-1"), (1, "geography", "4326")] {
+                let DataType::Struct(fields) = schema.field(index).data_type() else {
+                    panic!("binary geo field must use the tagged struct encoding")
+                };
+                assert_eq!(
+                    fields[1].metadata().get(family).map(String::as_str),
+                    Some("true")
+                );
+                assert_eq!(
+                    fields[1].metadata().get("srid").map(String::as_str),
+                    Some(type_srid)
+                );
+            }
+
+            let batches = drain(exec.result_stream_mut()).await;
+            if include_rows {
+                assert_eq!(batches.len(), 1);
+                let geometry = batches[0]
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StructArray>()
+                    .unwrap();
+                let srids = geometry
+                    .column_by_name("srid")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                let wkbs = geometry
+                    .column_by_name("wkb")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                assert_eq!(srids.value(0), 3857);
+                assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+                assert!(geometry.is_null(1));
+            } else {
+                assert!(batches.is_empty());
+            }
+            exec.close().await.expect("close");
         }
     }
 }

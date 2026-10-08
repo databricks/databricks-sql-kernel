@@ -1098,11 +1098,11 @@ pub unsafe extern "C" fn kernel_session_config_set_session_conf(
 /// `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT in
 /// Arrow `Utf8` values.
 ///
-/// Omitting this setter uses the enabled kernel default. Binary mode requires
-/// the native Reyden Arrow path. The choice is applied locally and never sent
-/// to SEA. A raw `EnableGeoSpatialSupport` entry supplied through
-/// [`kernel_session_config_set_session_conf`] remains server-bound and is
-/// forwarded unchanged.
+/// Omitting this setter uses the enabled kernel default. The kernel normalizes
+/// both standard-warehouse text and Reyden native Arrow results locally and
+/// never sends this choice to SEA. A raw `EnableGeoSpatialSupport` entry
+/// supplied through [`kernel_session_config_set_session_conf`] remains
+/// server-bound and is forwarded unchanged.
 ///
 /// # Safety
 /// `config` must be a live config handle.

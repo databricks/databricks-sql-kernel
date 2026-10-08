@@ -340,9 +340,9 @@ impl Session {
     /// `enable_geospatial_support` selects whether `GEOMETRY` / `GEOGRAPHY`
     /// results use their native Arrow representation. `True` (the default)
     /// requests Arrow `struct<srid: int32, wkb: binary>` values; `False`
-    /// requests WKT / EWKT in Arrow UTF-8 values. Binary mode requires the
-    /// native Reyden Arrow path. This choice is applied locally and never sent
-    /// to SEA.
+    /// requests WKT / EWKT in Arrow UTF-8 values. The kernel normalizes both
+    /// standard-warehouse text and Reyden native Arrow results locally and
+    /// never sends this choice to SEA.
     #[new]
     #[pyo3(signature = (
         host,

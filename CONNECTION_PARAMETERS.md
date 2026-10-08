@@ -188,19 +188,14 @@ Arrow representation of `GEOMETRY` and `GEOGRAPHY` values.
 | `GeospatialResultRepresentation::String` | Arrow `Utf8` containing WKT / EWKT. |
 | `GeospatialResultRepresentation::Binary` | Arrow `struct<srid: int32 not null, wkb: binary not null>` containing the SRID and little-endian OGC WKB. The WKB itself is not EWKB. This is the default. |
 
-Reyden returns every geo value as that native struct. The physical attachment
-can omit the canonical Arrow tags, while Reyder's structured manifest reports
-the logical `GEOMETRY(...)` or `GEOGRAPHY(...)` type and is the source of
-truth. The kernel reconciles the attachment with that logical schema: binary
-mode attaches `geometry=true` or `geography=true` and the type-level `srid`
-(`-1` for `ANY`) to the `wkb` field, and string mode recursively converts the
-WKB to EWKT. Every row's sibling `srid` carries the actual value. Nested values
-in arrays, maps, and structs and null outer structs are preserved.
-
-On legacy SEA paths that already return geospatial columns as Arrow `Utf8`,
-string mode preserves those values. Binary mode requires Reyden's native
-`struct<srid,wkb>` attachment and returns an error when only text is available;
-the kernel does not parse server-rendered text back into WKB.
+Reyden returns every geo value as that native struct; standard DBSQL warehouses
+return WKT / EWKT as Arrow `Utf8` or `LargeUtf8`. The structured manifest
+reports the logical `GEOMETRY(...)` or `GEOGRAPHY(...)` type and is the source
+of truth for either attachment. The kernel normalizes both paths: binary mode
+attaches the canonical tags to a Reyden struct or parses standard-warehouse
+text into the same tagged SRID+WKB struct, while string mode preserves existing
+text or renders a native struct as EWKT. Nested values in arrays, maps, and
+structs, per-row SRIDs, and null outer values are preserved.
 
 This is entirely client-side and is never forwarded to SEA. Set it through
 the typed kernel or binding API. An `EnableGeoSpatialSupport` entry placed

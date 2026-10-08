@@ -1503,14 +1503,11 @@ pub enum TransportMode {
 ///   `struct<srid: int32 not null, wkb: binary not null>` values.
 ///
 /// This is a client-side result setting and is never sent to SEA. Reyden
-/// returns `struct<srid,wkb>` values, and Reyder's structured manifest carries
-/// their logical `GEOMETRY(...)` / `GEOGRAPHY(...)` types. The manifest is the
-/// source of truth when an attachment omits the canonical tags. The kernel
-/// reconciles the two, then exposes tagged binary values or recursively renders
-/// EWKT strings. Legacy SEA paths that already return `Utf8` EWKT satisfy
-/// string mode directly; requesting binary mode on such a path returns an
-/// error because the original WKB cannot be recovered losslessly. Empty and
-/// non-empty results use the same client-facing schema.
+/// returns `struct<srid,wkb>` values, while standard DBSQL warehouses return
+/// `Utf8` WKT / EWKT. The structured manifest carries the logical
+/// `GEOMETRY(...)` / `GEOGRAPHY(...)` type and is the source of truth for both
+/// paths. The kernel normalizes either physical representation to the requested
+/// client schema. Empty and non-empty results use the same schema.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GeospatialResultRepresentation {
@@ -1518,8 +1515,7 @@ pub enum GeospatialResultRepresentation {
     String,
     /// Arrow `struct<srid: int32, wkb: binary>` containing little-endian OGC
     /// WKB. The SRID is carried by the sibling `srid` value, not by EWKB.
-    /// This is the kernel default and requires the native Reyden Arrow result
-    /// path.
+    /// This is the kernel default.
     #[default]
     Binary,
 }

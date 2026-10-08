@@ -322,8 +322,9 @@ export interface ConnectionOptions {
    * Select whether `GEOMETRY` / `GEOGRAPHY` results use their native Arrow
    * representation. `true` (the default) requests Arrow
    * `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT
-   * in Arrow UTF-8 values. Binary mode requires the native Reyden Arrow
-   * path. This choice is applied locally and never sent to SEA.
+   * in Arrow UTF-8 values. The kernel normalizes both standard-warehouse
+   * text and Reyden native Arrow results locally and never sends this choice
+   * to SEA.
    */
   enableGeoSpatialSupport?: boolean
   /**
