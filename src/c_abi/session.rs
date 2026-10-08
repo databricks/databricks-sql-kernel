@@ -2827,7 +2827,7 @@ mod tests {
             );
 
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert!(telemetry.enabled);
+            assert_eq!(telemetry.enabled, Some(true));
             assert_eq!(telemetry.batch_size, 25);
             assert_eq!(telemetry.flush_interval, Duration::from_millis(1_000));
             assert_eq!(telemetry.max_retries, 2);
@@ -2868,7 +2868,7 @@ mod tests {
             );
 
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert_eq!(telemetry.enabled_override(), None);
+            assert_eq!(telemetry.enabled, None);
             assert_eq!(telemetry.batch_size, 25);
             assert_eq!(telemetry.flush_interval, Duration::from_millis(1_000));
 
@@ -2898,10 +2898,7 @@ mod tests {
                 kernel_session_config_set_telemetry_config_v2(config, &telemetry_config),
                 KernelStatusCode::Success
             );
-            assert_eq!(
-                config.as_ref().unwrap().telemetry.enabled_override(),
-                Some(false)
-            );
+            assert_eq!(config.as_ref().unwrap().telemetry.enabled, Some(false));
 
             kernel_session_config_free(config);
         }
@@ -2921,7 +2918,7 @@ mod tests {
                 KernelStatusCode::Success
             );
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert_eq!(telemetry.enabled_override(), None);
+            assert_eq!(telemetry.enabled, None);
             assert_eq!(telemetry.batch_size, 100);
 
             kernel_session_config_free(config);
@@ -2979,7 +2976,7 @@ mod tests {
             );
 
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert!(telemetry.enabled);
+            assert_eq!(telemetry.enabled, Some(true));
             assert_eq!(telemetry.batch_size, 10);
             assert!(
                 !telemetry.circuit_breaker_enabled,
@@ -3046,7 +3043,7 @@ mod tests {
                 KernelStatusCode::InvalidArgument
             );
             assert!(
-                !config.as_ref().unwrap().telemetry.enabled,
+                config.as_ref().unwrap().telemetry.enabled.is_none(),
                 "rejected calls must leave default disabled telemetry"
             );
 
@@ -3082,7 +3079,7 @@ mod tests {
 
             let exporter = CapturingTelemetryExporter::default();
             let telemetry = TelemetryConfig {
-                enabled: true,
+                enabled: Some(true),
                 ..Default::default()
             }
             .with_exporter(std::sync::Arc::new(exporter.clone()));

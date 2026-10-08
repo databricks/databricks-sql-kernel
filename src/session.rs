@@ -81,7 +81,7 @@ const TELEMETRY_ENABLED_FEATURE_FLAG: &str =
     "databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForAdbc";
 
 fn telemetry_enabled(config: &TelemetryConfig, feature_flag: Option<bool>) -> bool {
-    config.enabled_override().or(feature_flag).unwrap_or(false)
+    config.enabled.or(feature_flag).unwrap_or(false)
 }
 
 /// Crate-internal session state. Wrapped in `Arc` and shared with
@@ -439,7 +439,8 @@ impl Session {
             Some(flags) => flags.get_bool(TELEMETRY_ENABLED_FEATURE_FLAG).await,
             None => None,
         };
-        telemetry_config.enabled = telemetry_enabled(&telemetry_config, telemetry_feature_flag);
+        telemetry_config.enabled =
+            Some(telemetry_enabled(&telemetry_config, telemetry_feature_flag));
         let create_started = Instant::now();
         let session_info = transport
             .create_session(
@@ -2621,7 +2622,7 @@ mod is_open_tests {
         let exporter = CapturingTelemetryExporter::default();
 
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2658,7 +2659,7 @@ mod is_open_tests {
         mount_session_create_delete(&server, "sess-telemetry-system-config").await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2702,7 +2703,7 @@ mod is_open_tests {
         let server = MockServer::start().await;
         mount_session_create_delete(&server, "sess-telemetry-failure").await;
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(FailingTelemetryExporter));
@@ -2727,7 +2728,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2784,7 +2785,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2832,7 +2833,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2883,7 +2884,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -2950,7 +2951,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3000,7 +3001,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3039,7 +3040,7 @@ mod is_open_tests {
         mount_execute(&server, running_body("stmt-telemetry-async-drop")).await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3078,7 +3079,7 @@ mod is_open_tests {
             .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3124,7 +3125,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3175,7 +3176,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3222,7 +3223,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3267,7 +3268,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3343,7 +3344,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3405,7 +3406,7 @@ mod is_open_tests {
         .await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3448,7 +3449,7 @@ mod is_open_tests {
         mount_session_create_delete(&server, "sess-telemetry-metadata-error").await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));
@@ -3496,7 +3497,7 @@ mod is_open_tests {
         mount_session_create_delete(&server, "sess-telemetry-metadata-table-types").await;
         let exporter = CapturingTelemetryExporter::default();
         let telemetry = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..Default::default()
         }
         .with_exporter(std::sync::Arc::new(exporter.clone()));

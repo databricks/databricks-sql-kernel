@@ -1387,13 +1387,8 @@ pub struct LoggingConfig {
 /// errors are logged at trace/debug level and never change user operation
 /// results.
 ///
-/// To express an explicit on/off choice that takes precedence over the
-/// workspace feature flag, use [`set_enabled`] / [`with_enabled`]. Assigning
-/// the [`enabled`] field directly is **not** a full override: a direct
-/// `enabled = false` does not suppress the server flag (see that field's docs
-/// for the backward-compatibility rationale). Direct writers who previously
-/// relied on `enabled = false` as a hard off-switch should migrate to
-/// `set_enabled(false)`.
+/// An explicit [`enabled`] value takes precedence over the workspace feature
+/// flag. `None` defers to that flag and ultimately defaults to disabled.
 ///
 /// [`set_enabled`]: Self::set_enabled
 /// [`with_enabled`]: Self::with_enabled
@@ -1401,29 +1396,8 @@ pub struct LoggingConfig {
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {
-    /// Default telemetry state used only when no explicit client choice
-    /// and no server feature flag are present.
-    ///
-    /// This is **not** an explicit override. Assigning this field directly
-    /// (e.g. `config.telemetry.enabled = false`) does *not* suppress the
-    /// workspace feature flag: with no override recorded, [`enabled_override`]
-    /// falls through to the server flag, which may still enable telemetry.
-    /// Only assigning `true` is honoured directly (for backward compatibility
-    /// with callers that enabled telemetry via this field before the explicit
-    /// setter existed).
-    ///
-    /// To express an explicit choice that takes precedence over the server
-    /// feature flag — in particular, to *disable* telemetry unconditionally —
-    /// use [`set_enabled`] / [`with_enabled`] rather than assigning this field.
-    ///
-    /// [`enabled_override`]: Self::enabled_override
-    /// [`set_enabled`]: Self::set_enabled
-    /// [`with_enabled`]: Self::with_enabled
-    pub enabled: bool,
-
-    /// Explicit client choice. Private so the kernel can distinguish an
-    /// explicit `false` from the default.
-    pub(crate) enabled_override: Option<bool>,
+    /// Explicit client choice. `None` defers to the workspace feature flag.
+    pub enabled: Option<bool>,
 
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
@@ -1482,8 +1456,7 @@ impl std::fmt::Debug for TelemetryConfig {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
-            enabled_override: None,
+            enabled: None,
             batch_size: 100,
             flush_interval: Duration::from_secs(5),
             max_retries: 3,
@@ -1503,20 +1476,13 @@ impl TelemetryConfig {
     ///
     /// This setting takes precedence over workspace feature flags.
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-        self.enabled_override = Some(enabled);
+        self.enabled = Some(enabled);
     }
 
     /// Builder-style form of [`Self::set_enabled`].
     pub fn with_enabled(mut self, enabled: bool) -> Self {
         self.set_enabled(enabled);
         self
-    }
-
-    pub(crate) fn enabled_override(&self) -> Option<bool> {
-        // Preserve compatibility for callers that assigned `enabled = true`
-        // before the explicit setter existed.
-        self.enabled_override.or(self.enabled.then_some(true))
     }
 
     #[cfg(test)]

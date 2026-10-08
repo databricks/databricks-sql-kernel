@@ -312,7 +312,7 @@ fn valid_config(config: &TelemetryConfig) -> bool {
     // telemetry, whereas `CircuitBreakerConfig::from_telemetry_config` degrades
     // the same state to "breaker off" and lets telemetry flow unwrapped. Keep
     // the two paths consistent by only validating the core telemetry knobs here.
-    config.enabled
+    config.enabled.unwrap_or(false)
         && config.batch_size > 0
         && !config.flush_interval.is_zero()
         && !config.close_flush_timeout.is_zero()
@@ -519,13 +519,13 @@ mod tests {
         );
 
         let enabled = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
         assert!(valid_config(&enabled));
 
         let zero_interval = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             flush_interval: Duration::ZERO,
             ..TelemetryConfig::default()
         };
@@ -535,7 +535,7 @@ mod tests {
         // telemetry config: it degrades to "breaker off" (see
         // `CircuitBreakerConfig::from_telemetry_config`), so telemetry stays on.
         let zero_breaker_threshold = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             circuit_breaker_enabled: true,
             circuit_breaker_threshold: 0,
             ..TelemetryConfig::default()
@@ -543,7 +543,7 @@ mod tests {
         assert!(valid_config(&zero_breaker_threshold));
 
         let zero_breaker_timeout = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             circuit_breaker_timeout: Duration::ZERO,
             ..TelemetryConfig::default()
         };
