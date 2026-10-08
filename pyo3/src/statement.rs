@@ -23,6 +23,7 @@ use crate::errors::to_py_err;
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::fetch;
 use crate::params::parse_typed_value;
+use crate::runtime::KernelRuntime;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
@@ -32,7 +33,6 @@ use databricks_sql_kernel::{
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::runtime::Runtime;
 
 /// Python-facing mutable statement.
 ///
@@ -46,11 +46,11 @@ pub(crate) struct Statement {
 
 struct StatementInner {
     stmt: KStatement,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
 }
 
 impl Statement {
-    pub(crate) fn new(stmt: KStatement, runtime: Arc<Runtime>) -> Self {
+    pub(crate) fn new(stmt: KStatement, runtime: Arc<KernelRuntime>) -> Self {
         Self {
             inner: Some(StatementInner { stmt, runtime }),
         }
@@ -270,8 +270,9 @@ impl Statement {
         // CancelStatement + CloseStatement against the tracked
         // executed handle), so we route it through the standard
         // py.detach + block_on path.
-        run_kernel!(py, runtime, stmt.close())?;
-        Ok(())
+        let result = run_kernel!(py, runtime, stmt.close());
+        KernelRuntime::release(runtime, py);
+        result
     }
 }
 
@@ -296,12 +297,12 @@ pub(crate) struct ExecutedStatement {
 
 struct ExecutedInner {
     exec: KExecutedStatement,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
     exhausted: bool,
 }
 
 impl ExecutedStatement {
-    fn new(exec: KExecutedStatement, runtime: Arc<Runtime>) -> Self {
+    fn new(exec: KExecutedStatement, runtime: Arc<KernelRuntime>) -> Self {
         let statement_id = exec.statement_id().to_owned();
         let schema = exec.schema();
         let num_modified_rows = exec.num_modified_rows();
@@ -401,6 +402,7 @@ impl ExecutedStatement {
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.
         self.inner = None;
+        KernelRuntime::release(runtime, py);
         res.map(|_| ())
     }
 
@@ -427,7 +429,7 @@ impl ExecutedStatement {
 #[pyclass(name = "StatementCanceller")]
 pub(crate) struct StatementCanceller {
     inner: KStatementCanceller,
-    runtime: Arc<Runtime>,
+    runtime: Arc<KernelRuntime>,
 }
 
 #[pymethods]

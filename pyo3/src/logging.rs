@@ -56,9 +56,19 @@
 //! cache so the new level takes effect. The connector calls this after
 //! it adjusts logging; most customers configure logging before
 //! connecting and never need it.
+//!
+//! ## Interpreter exit
+//!
+//! Runtime workers can outlive their handle (`KernelRuntime`'s `Drop`
+//! doesn't wait for them), and pyo3's finalization check is compiled out
+//! under `abi3-py39`, so a worker forwarding a record while the
+//! interpreter finalizes can abort the process. An `atexit` hook, which
+//! runs before finalization starts, makes the bridge drop records from
+//! then on.
 
 use pyo3::prelude::*;
 use pyo3_log::{Caching, Logger, ResetHandle};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Logger target the kernel tags every event with. Maps to the Python
@@ -105,6 +115,39 @@ fn lock_state() -> std::sync::MutexGuard<'static, LogState> {
         .get_or_init(|| Mutex::new(LogState::NotInstalled))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Set by an `atexit` hook; see "Interpreter exit" above.
+static INTERPRETER_EXITING: AtomicBool = AtomicBool::new(false);
+
+#[pyfunction]
+fn mark_interpreter_exiting() {
+    INTERPRETER_EXITING.store(true, Ordering::SeqCst);
+}
+
+fn register_exit_hook(py: Python<'_>) -> PyResult<()> {
+    let hook = wrap_pyfunction!(mark_interpreter_exiting, py)?;
+    py.import("atexit")?.call_method1("register", (hook,))?;
+    Ok(())
+}
+
+/// Forwards to `pyo3_log` until the interpreter starts exiting.
+struct ExitGuard<L>(L);
+
+impl<L: log::Log> log::Log for ExitGuard<L> {
+    fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+        !INTERPRETER_EXITING.load(Ordering::SeqCst) && self.0.enabled(metadata)
+    }
+
+    fn log(&self, record: &log::Record<'_>) {
+        if !INTERPRETER_EXITING.load(Ordering::SeqCst) {
+            self.0.log(record);
+        }
+    }
+
+    fn flush(&self) {
+        self.0.flush();
+    }
 }
 
 /// Install the `tracing`/`log` -> Python `logging` bridge.
@@ -161,14 +204,19 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
             return false;
         }
     };
-    let handle = logger
+    let logger = logger
         .filter(log::LevelFilter::Trace)
-        .filter_target(KERNEL_TARGET.to_owned(), log::LevelFilter::Trace)
-        .install();
+        .filter_target(KERNEL_TARGET.to_owned(), log::LevelFilter::Trace);
 
-    match handle {
-        Ok(h) => {
-            *state = LogState::Installed(h);
+    // What `Logger::install()` does, but behind `ExitGuard`. `Trace` is the
+    // highest filter set above.
+    let handle = logger.reset_handle();
+    match log::set_boxed_logger(Box::new(ExitGuard(logger))) {
+        Ok(()) => {
+            log::set_max_level(log::LevelFilter::Trace);
+            // Best effort: without the hook, records still flow until exit.
+            let _ = register_exit_hook(py);
+            *state = LogState::Installed(handle);
             true
         }
         Err(_) => {
@@ -195,7 +243,31 @@ pub(crate) fn reset_logging() {
 
 #[cfg(test)]
 mod tests {
-    use super::KERNEL_TARGET;
+    use super::{mark_interpreter_exiting, ExitGuard, KERNEL_TARGET};
+    use log::Log;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn exit_guard_drops_records_once_interpreter_exits() {
+        struct Count(AtomicUsize);
+        impl Log for Count {
+            fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+                true
+            }
+            fn log(&self, _: &log::Record<'_>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+            fn flush(&self) {}
+        }
+
+        let guard = ExitGuard(Count(AtomicUsize::new(0)));
+        let record = log::Record::builder().level(log::Level::Error).build();
+        guard.log(&record);
+        mark_interpreter_exiting();
+        guard.log(&record);
+        assert!(!guard.enabled(record.metadata()));
+        assert_eq!(guard.0 .0.load(Ordering::SeqCst), 1);
+    }
 
     /// Layer 2 of the logger-name drift guard (see also the kernel's
     /// `klog::tests::klog_emits_contract_target` and the Python
