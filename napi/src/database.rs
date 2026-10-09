@@ -400,10 +400,13 @@ pub struct ConnectionOptions {
     /// Overall retry budget in whole seconds. Maps onto
     /// [`HttpConfig::overall_timeout`].
     pub retry_overall_timeout_secs: Option<u32>,
-    /// Enable kernel telemetry export. Omitted / `false` keeps telemetry
-    /// disabled. When enabled, the kernel records operation telemetry below the
-    /// binding layer and exports through the Databricks SQL driver telemetry
-    /// endpoint.
+    /// Enable kernel telemetry export. Tri-state: an explicit `true` or `false`
+    /// takes precedence; when omitted, export defers to the
+    /// `enableTelemetryForKernel` workspace feature flag, falling back to
+    /// disabled when the flag is absent. Only an explicit `false` guarantees
+    /// telemetry stays disabled. When enabled, the kernel records operation
+    /// telemetry below the binding layer and exports through the Databricks SQL
+    /// driver telemetry endpoint.
     pub telemetry_enabled: Option<bool>,
     /// Number of telemetry events buffered before a flush. Omitted ⇒ kernel
     /// default. Must be greater than zero when supplied.
@@ -655,8 +658,10 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
 ///
 /// Returns `None` when the caller did not mention telemetry at all, preserving
 /// the kernel default. A caller may set telemetry knobs while leaving
-/// `telemetry_enabled` false; the config is still passed through, but telemetry
-/// remains disabled until explicitly enabled.
+/// `telemetry_enabled` unset; the config is still passed through, and whether
+/// export actually runs is then decided by the tri-state precedence
+/// (explicit setting → `enableTelemetryForKernel` workspace feature flag →
+/// disabled). Only an explicit `false` guarantees telemetry stays disabled.
 fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<TelemetryConfig>> {
     let mentioned = options.telemetry_enabled.is_some()
         || options.telemetry_batch_size.is_some()
@@ -704,7 +709,9 @@ fn build_telemetry_config(options: &ConnectionOptions) -> napi::Result<Option<Te
     }
 
     let mut telemetry = TelemetryConfig::default();
-    telemetry.enabled = options.telemetry_enabled.unwrap_or(false);
+    if let Some(enabled) = options.telemetry_enabled {
+        telemetry.set_enabled(enabled);
+    }
     if let Some(v) = options.telemetry_batch_size {
         telemetry.batch_size = v as usize;
     }
@@ -1594,7 +1601,7 @@ mod tests {
             .expect("valid telemetry config")
             .expect("telemetry mentioned");
 
-        assert!(telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(true));
         assert_eq!(telemetry.batch_size, 25);
         assert_eq!(
             telemetry.flush_interval,
@@ -1617,6 +1624,33 @@ mod tests {
     #[test]
     fn telemetry_options_unmentioned_returns_none() {
         assert!(build_telemetry_config(&base()).unwrap().is_none());
+    }
+
+    #[test]
+    fn telemetry_enabled_omitted_leaves_feature_flag_in_control() {
+        // Omitting `telemetryEnabled` while touching another telemetry knob must
+        // leave `enabled` as `None`, so the workspace feature flag still
+        // decides. An explicit value, by contrast, pins `enabled`.
+        let mut omitted = base();
+        omitted.telemetry_batch_size = Some(25);
+        let telemetry = build_telemetry_config(&omitted)
+            .expect("valid telemetry config")
+            .expect("telemetry mentioned");
+        assert_eq!(telemetry.enabled, None);
+
+        let mut explicit_true = base();
+        explicit_true.telemetry_enabled = Some(true);
+        let telemetry = build_telemetry_config(&explicit_true)
+            .expect("valid telemetry config")
+            .expect("telemetry mentioned");
+        assert_eq!(telemetry.enabled, Some(true));
+
+        let mut explicit_false = base();
+        explicit_false.telemetry_enabled = Some(false);
+        let telemetry = build_telemetry_config(&explicit_false)
+            .expect("valid telemetry config")
+            .expect("telemetry mentioned");
+        assert_eq!(telemetry.enabled, Some(false));
     }
 
     #[test]
