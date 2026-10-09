@@ -334,16 +334,27 @@ ADBC's conservative default: telemetry is disabled unless local config or a
 merged feature flag enables it.
 
 The final feature flag endpoint and flag name are product decisions. The kernel
-should follow ADBC unless product owners choose a kernel-specific endpoint:
+follows the per-driver-family convention the resolver already implements:
 
-- Endpoint format currently used by ADBC:
-`/api/2.0/connector-service/feature-flags/ADBC/{driver_version}`.
-- Existing server-side flag:
-`databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForKernel`.
+- Endpoint format:
+`/api/2.0/connector-service/feature-flags/{client_type}/{driver_version}`, where
+`{client_type}` is the driver-family segment produced by
+`ClientType::as_endpoint_segment` (`GOLANG` / `NODEJS` / `ODBC` / `PYTHON`, see
+`src/feature_flags/mod.rs`). There is no `ADBC` or `KERNEL` client type: the
+kernel is served under the driver family of its outer host driver.
+- Flag name: the kernel keys enablement off
+`databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForKernel`
+(`TELEMETRY_ENABLED_FEATURE_FLAG` in `src/session.rs`). This is a
+kernel-specific flag — distinct from ADBC's existing `enableTelemetryForAdbc` —
+and must be published server-side under the relevant driver-family client types
+before remote enablement can take effect.
 
-If the kernel needs separate rollout from ADBC, introduce a kernel-specific flag
-only after the backend/dashboard owner confirms the split. Do not fall back to
-JDBC endpoint or flag names in kernel code.
+Enablement is fail-open: an absent flag resolves to `None` → telemetry disabled,
+so a not-yet-published flag is a silent no-op rather than a correctness risk.
+Confirm with the backend/dashboard owner that `enableTelemetryForKernel` is
+actually published under the relevant client types before relying on
+feature-flag-driven enablement. Do not fall back to JDBC endpoint or flag names
+in kernel code.
 
 ## Telemetry Data Model
 
