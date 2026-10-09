@@ -1465,6 +1465,17 @@ impl Default for TelemetryConfig {
 }
 
 impl TelemetryConfig {
+    /// Explicitly enable or disable telemetry for this client.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+
+    /// Builder-style form of [`Self::set_enabled`].
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.set_enabled(enabled);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_exporter(
         mut self,
