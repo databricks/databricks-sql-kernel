@@ -96,7 +96,7 @@ jobs:
           components: clippy
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: cargo clippy
         run: cargo clippy --all-targets -- -D warnings
@@ -121,7 +121,7 @@ jobs:
           toolchain: stable
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: cargo test
         # Runs every test the default suite executes: unit tests,
@@ -150,7 +150,7 @@ jobs:
           toolchain: stable
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: make c-abi-test
         # Builds the cdylib and compiles + runs the hand-written C smoke
@@ -180,7 +180,7 @@ jobs:
           components: clippy
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       - name: cargo check (tls-rustls)
         # Default features pull in `tls-native`; the napi binding crate

@@ -103,7 +103,7 @@ jobs:
           cache-key: "py${{ matrix.python-version }}"
 
       - name: Setup sccache
-        uses: Mozilla-Actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
+        uses: Mozilla-Actions/sccache-action@fc920bf0ec8de6ee65d409111f7ec508035751ba # v0.0.11
 
       # uv is the Python package manager the kernel pyo3 sub-crate
       # uses for env management. uv itself is installed via
