@@ -50,6 +50,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- `list_tables` now matches `table_types` case-sensitively, matching Thrift
+  `GetTables`: `["table"]` no longer matches `TABLE` rows.
+
 ---
 *Note: When making changes, please add your change under the appropriate
 section with a brief description. At release time, move the entries here
