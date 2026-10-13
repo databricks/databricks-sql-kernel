@@ -336,6 +336,12 @@ author, follow-up, and review runs.
 - **Context:** PR #390 added the `Spark:DataType:SqlName` field-metadata key to result schemas, set to the manifest's `type_text`, to match Thrift results and the C# ADBC SEA path.
   **Rule:** Thrift-compatible result-schema metadata keys must use the literal server key name (`Spark:DataType:SqlName`), NOT the kernel's `databricks.`-prefixed convention — Thrift-era consumers (Power BI, JDBC) read the literal key. Pin the literal wire string in tests rather than the Rust constant, so a rename can't silently break downstream readers.
 
+### 2026-10-13: learnings since 2026-10-12T07:56:10Z
+- **Context:** PR #393 reversed `list_tables`'s `table_types` filter from case-insensitive (`eq_ignore_ascii_case`) to exact case-sensitive matching (`types.contains`), so `["table"]` no longer matches `TABLE` rows — matching Thrift `GetTables` and the JDBC client-side filter.
+  **Rule:** For SEA metadata ops, mirror Thrift server semantics exactly rather than adding convenience leniency (e.g. case-insensitive matching); a "helpful" relaxation silently diverges from Thrift/JDBC parity and must be case-sensitive to match.
+- **Context:** PR #396 copied the SEA manifest's `type_json` into the Thrift-compatible `Spark:DataType:JsonType` field-metadata key, following the existing `Spark:DataType:SqlName` (= `type_text`) pattern, so Thrift-written consumers (Power BI, JDBC) read the same keys off SEA result schemas.
+  **Rule:** When the SEA manifest exposes column type info the Thrift server also provides, mirror it under the Thrift server's `Spark:DataType:*` metadata key (not only the `databricks.*` key) so Thrift-oriented consumers keep working on the SEA path.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
