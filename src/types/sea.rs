@@ -234,6 +234,8 @@ pub struct ColumnInfo {
     pub type_scale: Option<i64>,
     #[serde(default)]
     pub type_interval_type: Option<String>,
+    #[serde(default)]
+    pub type_json: Option<String>,
 }
 
 /// Information about a result chunk (metadata only).
@@ -794,7 +796,8 @@ mod tests {
             "type_text": "DECIMAL(10,2)",
             "position": 0,
             "type_precision": 10,
-            "type_scale": 2
+            "type_scale": 2,
+            "type_json": "\"decimal(10,2)\""
         }"#;
 
         let col: ColumnInfo = serde_json::from_str(json).unwrap();
@@ -805,6 +808,7 @@ mod tests {
         assert_eq!(col.type_precision, Some(10));
         assert_eq!(col.type_scale, Some(2));
         assert_eq!(col.type_interval_type, None);
+        assert_eq!(col.type_json.as_deref(), Some("\"decimal(10,2)\""));
     }
 
     #[test]
@@ -821,6 +825,21 @@ mod tests {
         assert_eq!(col.type_precision, None);
         assert_eq!(col.type_scale, None);
         assert_eq!(col.type_interval_type, None);
+        assert_eq!(col.type_json, None);
+    }
+
+    #[test]
+    fn test_column_info_with_null_json_type() {
+        let json = r#"{
+            "name": "id",
+            "type_name": "INT",
+            "type_text": "INT",
+            "position": 0,
+            "type_json": null
+        }"#;
+
+        let col: ColumnInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(col.type_json, None);
     }
 
     #[test]

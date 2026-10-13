@@ -26,6 +26,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Result schemas now carry the Thrift-compatible `Spark:DataType:SqlName`
   field metadata key, set to the manifest's `type_text`, matching Thrift
   results and the C# ADBC SEA path.
+- Result schemas copy the manifest's optional `type_json` into the
+  Thrift-compatible `Spark:DataType:JsonType` field metadata key.
 
 ### Changed
 
