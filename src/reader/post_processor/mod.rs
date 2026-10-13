@@ -490,6 +490,7 @@ mod tests {
             type_precision: None,
             type_scale: None,
             type_interval_type: None,
+            type_json: None,
         }
     }
 

@@ -887,8 +887,9 @@ impl ResultReader for EmptyReader {
 ///
 /// Keys use the `databricks.` prefix to avoid conflicts with other metadata
 /// conventions (e.g., Arrow's own `ARROW:extension:name`), except
-/// [`SPARK_SQL_NAME`](metadata_keys::SPARK_SQL_NAME), which mirrors the Thrift
-/// server's key.
+/// [`SPARK_SQL_NAME`](metadata_keys::SPARK_SQL_NAME) and
+/// [`SPARK_JSON_TYPE`](metadata_keys::SPARK_JSON_TYPE), which mirror the Thrift
+/// server's keys.
 pub mod metadata_keys {
     pub const TYPE_NAME: &str = "databricks.type_name";
     pub const TYPE_TEXT: &str = "databricks.type_text";
@@ -898,6 +899,8 @@ pub mod metadata_keys {
     /// Thrift-compatible type key, set to the same value as [`TYPE_TEXT`].
     /// Consumers written against Thrift results (e.g. Power BI, JDBC) read it.
     pub const SPARK_SQL_NAME: &str = "Spark:DataType:SqlName";
+    /// Thrift-compatible JSON type, copied from the manifest's `type_json`.
+    pub const SPARK_JSON_TYPE: &str = "Spark:DataType:JsonType";
 }
 
 /// Adapter to make ResultReader work as arrow's RecordBatchReader.
@@ -934,6 +937,7 @@ impl ResultReaderAdapter {
     /// - attach `databricks.*` type metadata (type_name, type_text,
     ///   precision, scale, interval_type) for the Arrow C Data FFI boundary;
     /// - attach the Thrift-compatible `Spark:DataType:SqlName` (= type_text).
+    /// - attach `Spark:DataType:JsonType` when the manifest provides `type_json`.
     ///
     /// Fields with no matching `ColumnInfo` are left unchanged.
     pub(crate) fn augment_schema_with_manifest(
@@ -969,6 +973,12 @@ impl ResultReaderAdapter {
                             metadata_keys::SPARK_SQL_NAME.to_string(),
                             info.type_text.clone(),
                         );
+                        if let Some(ref json_type) = info.type_json {
+                            metadata.insert(
+                                metadata_keys::SPARK_JSON_TYPE.to_string(),
+                                json_type.clone(),
+                            );
+                        }
                         if let Some(prec) = info.type_precision {
                             metadata.insert(
                                 metadata_keys::TYPE_PRECISION.to_string(),
@@ -1428,6 +1438,7 @@ mod tests {
             type_precision: precision,
             type_scale: scale,
             type_interval_type: interval_type.map(|s| s.to_string()),
+            type_json: None,
         }
     }
 
@@ -1605,6 +1616,90 @@ mod tests {
                 .get("Spark:DataType:SqlName")
                 .map(String::as_str),
             Some("ARRAY<STRING>")
+        );
+    }
+
+    #[test]
+    fn test_augment_schema_sets_thrift_json_type_from_manifest() {
+        for (type_name, type_text, data_type, json_type) in [
+            ("INT", "INT", DataType::Int32, r#""integer""#),
+            (
+                "DECIMAL",
+                "DECIMAL(10,2)",
+                DataType::Decimal128(10, 2),
+                r#""decimal(10,2)""#,
+            ),
+            (
+                "ARRAY",
+                "ARRAY<INT>",
+                DataType::List(Arc::new(Field::new("item", DataType::Int32, true))),
+                r#"{ "type": "array", "elementType": "integer", "containsNull": true }"#,
+            ),
+        ] {
+            let mut metadata = std::collections::HashMap::new();
+            metadata.insert("Spark:DataType:JsonType".to_string(), "stale".to_string());
+            metadata.insert("custom.key".to_string(), "preserved".to_string());
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("col_0", data_type, true).with_metadata(metadata)
+            ]));
+            let column: ColumnInfo = serde_json::from_value(serde_json::json!({
+                "name": "value",
+                "type_name": type_name,
+                "type_text": type_text,
+                "position": 0,
+                "type_json": json_type,
+            }))
+            .unwrap();
+
+            let augmented = ResultReaderAdapter::augment_schema_with_manifest(
+                &schema,
+                &make_manifest(vec![column]),
+            );
+
+            let field = augmented.field(0);
+            assert_eq!(
+                field
+                    .metadata()
+                    .get("Spark:DataType:JsonType")
+                    .map(String::as_str),
+                Some(json_type),
+            );
+            assert_eq!(
+                field.metadata().get("custom.key").map(String::as_str),
+                Some("preserved"),
+            );
+            assert_eq!(field.data_type(), schema.field(0).data_type());
+        }
+    }
+
+    #[test]
+    fn test_augment_schema_without_json_type_preserves_payload_metadata() {
+        let metadata = std::collections::HashMap::from([(
+            "Spark:DataType:JsonType".to_string(),
+            r#""integer""#.to_string(),
+        )]);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int32, true),
+            Field::new("col_1", DataType::Int32, true).with_metadata(metadata),
+        ]));
+        let manifest = make_manifest(vec![
+            make_column_info("id", "INT", "INT", 0, None, None, None),
+            make_column_info("existing", "INT", "INT", 1, None, None, None),
+        ]);
+
+        let augmented = ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+
+        assert!(!augmented
+            .field(0)
+            .metadata()
+            .contains_key("Spark:DataType:JsonType"));
+        assert_eq!(
+            augmented
+                .field(1)
+                .metadata()
+                .get("Spark:DataType:JsonType")
+                .map(String::as_str),
+            Some(r#""integer""#),
         );
     }
 
