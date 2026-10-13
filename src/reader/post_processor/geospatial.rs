@@ -29,7 +29,7 @@ use arrow_array::{
     LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
     StructArray,
 };
-use arrow_buffer::NullBufferBuilder;
+use arrow_buffer::{NullBuffer, NullBufferBuilder};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use geo_traits::{
     CoordTrait, Dimensions, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
@@ -118,7 +118,7 @@ pub(super) fn rewrite(
     output_type: &DataType,
     column_name: &str,
 ) -> Result<ArrayRef> {
-    rewrite_array(array, output_type, column_name)
+    rewrite_array(array, output_type, column_name, None)
 }
 
 fn plan_data_type(
@@ -480,10 +480,15 @@ fn native_geo_family(data_type: &DataType) -> Result<Option<GeoFamily>> {
     Ok(native_geo_tag(data_type)?.map(|tag| tag.family))
 }
 
-fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result<ArrayRef> {
+fn rewrite_array(
+    array: &ArrayRef,
+    output_type: &DataType,
+    path: &str,
+    parent_validity: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
     if let Some(output_tag) = native_geo_tag(output_type)? {
         if matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return text_to_native(array, output_type, path);
+            return text_to_native(array, output_type, output_tag.srid, path, parent_validity);
         }
         validate_geo_source(array.data_type(), output_tag, path)?;
         if array.data_type() == output_type {
@@ -503,7 +508,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
     }
 
     if output_type == &DataType::Utf8 && is_geo_struct_shape(array.data_type()) {
-        return native_to_ewkt(array, path);
+        return native_to_ewkt(array, path, parent_validity);
     }
 
     if native_geo_family(array.data_type())?.is_some() {
@@ -515,6 +520,11 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
     match (array.data_type(), output_type) {
         (DataType::Struct(source_fields), DataType::Struct(output_fields)) => {
             let values = downcast::<StructArray>(array, path, "StructArray")?;
+            // A child slot under a null struct is an unspecified placeholder,
+            // even when that child is declared non-nullable. Carry the
+            // effective ancestor validity into geo conversions so placeholder
+            // text or WKB is never parsed as a real value.
+            let child_validity = NullBuffer::union(parent_validity, values.nulls());
             let columns = values
                 .columns()
                 .iter()
@@ -525,6 +535,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
                         column,
                         output.data_type(),
                         &format!("{path}.{}", source.name()),
+                        child_validity.as_ref(),
                     )
                 })
                 .collect::<Result<Vec<_>>>()?;
@@ -535,7 +546,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         }
         (DataType::List(_), DataType::List(output_field)) => {
             let values = downcast::<ListArray>(array, path, "ListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path)?;
+            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
             let output = ListArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -547,7 +558,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         }
         (DataType::LargeList(_), DataType::LargeList(output_field)) => {
             let values = downcast::<LargeListArray>(array, path, "LargeListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path)?;
+            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
             let output = LargeListArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -559,7 +570,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         }
         (DataType::ListView(_), DataType::ListView(output_field)) => {
             let values = downcast::<ListViewArray>(array, path, "ListViewArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path)?;
+            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
             let output = ListViewArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -572,7 +583,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         }
         (DataType::LargeListView(_), DataType::LargeListView(output_field)) => {
             let values = downcast::<LargeListViewArray>(array, path, "LargeListViewArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path)?;
+            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
             let output = LargeListViewArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -588,7 +599,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
             DataType::FixedSizeList(output_field, output_size),
         ) if source_size == output_size => {
             let values = downcast::<FixedSizeListArray>(array, path, "FixedSizeListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path)?;
+            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
             let output = FixedSizeListArray::try_new(
                 output_field.clone(),
                 *output_size,
@@ -603,7 +614,7 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
         {
             let values = downcast::<MapArray>(array, path, "MapArray")?;
             let entries: ArrayRef = Arc::new(values.entries().clone());
-            let entries = rewrite_array(&entries, output_field.data_type(), path)?;
+            let entries = rewrite_array(&entries, output_field.data_type(), path, None)?;
             let entries = entries
                 .as_any()
                 .downcast_ref::<StructArray>()
@@ -630,7 +641,13 @@ fn rewrite_array(array: &ArrayRef, output_type: &DataType, path: &str) -> Result
     }
 }
 
-fn text_to_native(array: &ArrayRef, output_type: &DataType, path: &str) -> Result<ArrayRef> {
+fn text_to_native(
+    array: &ArrayRef,
+    output_type: &DataType,
+    type_srid: i32,
+    path: &str,
+    parent_validity: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
     let DataType::Struct(output_fields) = output_type else {
         unreachable!("a geo tag is only valid on a struct")
     };
@@ -638,11 +655,25 @@ fn text_to_native(array: &ArrayRef, output_type: &DataType, path: &str) -> Resul
     match array.data_type() {
         DataType::Utf8 => {
             let values = downcast::<StringArray>(array, path, "StringArray")?;
-            ewkt_values_to_native(values.iter(), values.len(), output_fields, path)
+            ewkt_values_to_native(
+                values.iter(),
+                values.len(),
+                output_fields,
+                type_srid,
+                path,
+                parent_validity,
+            )
         }
         DataType::LargeUtf8 => {
             let values = downcast::<LargeStringArray>(array, path, "LargeStringArray")?;
-            ewkt_values_to_native(values.iter(), values.len(), output_fields, path)
+            ewkt_values_to_native(
+                values.iter(),
+                values.len(),
+                output_fields,
+                type_srid,
+                path,
+                parent_validity,
+            )
         }
         other => Err(Error::internal().message(format!(
             "geospatial text conversion for '{path}' received unexpected Arrow type {other:?}"
@@ -654,13 +685,22 @@ fn ewkt_values_to_native<'a>(
     values: impl Iterator<Item = Option<&'a str>>,
     len: usize,
     output_fields: &Fields,
+    type_srid: i32,
     path: &str,
+    parent_validity: Option<&NullBuffer>,
 ) -> Result<ArrayRef> {
     let mut srids = Int32Builder::with_capacity(len);
     let mut wkbs = BinaryBuilder::with_capacity(len, len.saturating_mul(32));
     let mut nulls = NullBufferBuilder::new(len);
+    let fallback_srid = if type_srid >= 0 { type_srid } else { 0 };
 
     for (row, value) in values.enumerate() {
+        if parent_validity.is_some_and(|validity| validity.is_null(row)) {
+            srids.append_value(0);
+            wkbs.append_value([]);
+            nulls.append_non_null();
+            continue;
+        }
         let Some(value) = value else {
             // Geo struct children are non-nullable. Use ignored placeholders
             // beneath a null outer struct, matching Reyden's representation.
@@ -670,7 +710,7 @@ fn ewkt_values_to_native<'a>(
             continue;
         };
 
-        let (srid, wkt_body) = split_ewkt(value)
+        let (srid, wkt_body) = split_ewkt(value, fallback_srid)
             .map_err(|detail| malformed_text(path, row, &format!("has invalid EWKT: {detail}")))?;
         let normalized = normalize_multipoint_empty_members(wkt_body);
         let geometry = wkt::Wkt::<f64>::from_str(&normalized).map_err(|error| {
@@ -812,19 +852,19 @@ fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
 }
 
 /// Split a standard-warehouse WKT / EWKT value into its row SRID and WKT
-/// body. Databricks omits the EWKT prefix for SRID 0, including values in a
-/// `GEOMETRY(ANY)` column, so an absent prefix deliberately maps to zero.
-fn split_ewkt(value: &str) -> std::result::Result<(i32, &str), String> {
+/// body. An absent prefix uses the fixed logical SRID when one exists; `ANY`
+/// columns use zero because their type does not supply a row SRID.
+fn split_ewkt(value: &str, fallback_srid: i32) -> std::result::Result<(i32, &str), String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("value is empty".to_string());
     }
 
     let Some(prefix) = value.get(..5) else {
-        return Ok((0, value));
+        return Ok((fallback_srid, value));
     };
     if !prefix.eq_ignore_ascii_case("SRID=") {
-        return Ok((0, value));
+        return Ok((fallback_srid, value));
     }
 
     let rest = &value[5..];
@@ -842,7 +882,11 @@ fn split_ewkt(value: &str) -> std::result::Result<(i32, &str), String> {
     Ok((srid, wkt_body))
 }
 
-fn native_to_ewkt(array: &ArrayRef, path: &str) -> Result<ArrayRef> {
+fn native_to_ewkt(
+    array: &ArrayRef,
+    path: &str,
+    parent_validity: Option<&NullBuffer>,
+) -> Result<ArrayRef> {
     let values = downcast::<StructArray>(array, path, "StructArray")?;
     let srids = values
         .column_by_name("srid")
@@ -855,6 +899,10 @@ fn native_to_ewkt(array: &ArrayRef, path: &str) -> Result<ArrayRef> {
 
     let mut output = StringBuilder::with_capacity(values.len(), values.len() * 32);
     for row in 0..values.len() {
+        if parent_validity.is_some_and(|validity| validity.is_null(row)) {
+            output.append_value("");
+            continue;
+        }
         if values.is_null(row) {
             output.append_null();
             continue;
@@ -1465,6 +1513,181 @@ mod tests {
             let mut rendered = String::new();
             write_ogc_wkt(&mut rendered, &geometry).unwrap();
             assert_eq!(rendered, "POINT ZM (1 2 3 4)");
+        }
+    }
+
+    #[test]
+    fn unprefixed_text_uses_fixed_type_srid_and_any_uses_zero() {
+        for (type_srid, expected_row_srid) in [(4326, 4326), (-1, 0)] {
+            let array: ArrayRef = Arc::new(StringArray::from(vec!["POINT (1 2)"]));
+            let output = rewrite(
+                &array,
+                &geo_type(GeoFamily::Geography, type_srid),
+                "geography",
+            )
+            .unwrap();
+            let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+            let srids = output
+                .column_by_name("srid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            assert_eq!(srids.value(0), expected_row_srid);
+        }
+    }
+
+    #[test]
+    fn null_parent_struct_masks_invalid_geo_placeholders() {
+        let text_child: ArrayRef = Arc::new(StringArray::from(vec!["not valid WKT"]));
+        let text_parent_type = DataType::Struct(Fields::from(vec![Field::new(
+            "geom",
+            DataType::Utf8,
+            false,
+        )]));
+        let DataType::Struct(text_parent_fields) = &text_parent_type else {
+            unreachable!()
+        };
+        let text_parent: ArrayRef = Arc::new(StructArray::new(
+            text_parent_fields.clone(),
+            vec![text_child],
+            Some(NullBuffer::new_null(1)),
+        ));
+        let native_parent_type = DataType::Struct(Fields::from(vec![Field::new(
+            "geom",
+            geo_type(GeoFamily::Geometry, 4326),
+            false,
+        )]));
+
+        let native = rewrite(&text_parent, &native_parent_type, "value").unwrap();
+        let native = native.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(native.is_null(0));
+        let geom = native
+            .column_by_name("geom")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        assert!(geom.is_valid(0));
+        assert_eq!(
+            geom.column_by_name("srid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .value(0),
+            0
+        );
+        assert_eq!(
+            geom.column_by_name("wkb")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap()
+                .value(0),
+            b""
+        );
+
+        let DataType::Struct(plain_geo_fields) = plain_geo_type() else {
+            unreachable!()
+        };
+        let invalid_native: ArrayRef = Arc::new(StructArray::new(
+            plain_geo_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![4326])),
+                Arc::new(BinaryArray::from(vec![&b"not WKB"[..]])),
+            ],
+            None,
+        ));
+        let native_parent: ArrayRef = Arc::new(StructArray::new(
+            Fields::from(vec![Field::new("geom", plain_geo_type(), false)]),
+            vec![invalid_native],
+            Some(NullBuffer::new_null(1)),
+        ));
+        let string_parent_type = DataType::Struct(Fields::from(vec![Field::new(
+            "geom",
+            DataType::Utf8,
+            false,
+        )]));
+
+        let string = rewrite(&native_parent, &string_parent_type, "value").unwrap();
+        let string = string.as_any().downcast_ref::<StructArray>().unwrap();
+        assert!(string.is_null(0));
+        let geom = string
+            .column_by_name("geom")
+            .unwrap()
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        assert!(geom.is_valid(0));
+        assert_eq!(geom.value(0), "");
+    }
+
+    #[test]
+    fn non_nullable_untagged_nested_geo_is_recovered_in_both_modes() {
+        let DataType::Struct(plain_fields) = plain_geo_type() else {
+            unreachable!()
+        };
+        let geom: ArrayRef = Arc::new(StructArray::new(
+            plain_fields,
+            vec![
+                Arc::new(Int32Array::from(vec![4326])),
+                Arc::new(BinaryArray::from(vec![POINT_1_2_WKB])),
+            ],
+            None,
+        ));
+        let physical_type = DataType::Struct(Fields::from(vec![Field::new(
+            "geom",
+            plain_geo_type(),
+            false,
+        )]));
+        let DataType::Struct(physical_fields) = &physical_type else {
+            unreachable!()
+        };
+        let physical: ArrayRef =
+            Arc::new(StructArray::new(physical_fields.clone(), vec![geom], None));
+        let logical_type = DataType::Struct(Fields::from(vec![Field::new(
+            "geom",
+            geo_type(GeoFamily::Geometry, 4326),
+            false,
+        )]));
+        let physical_field = Field::new("value", physical_type, true);
+        let logical_field = Field::new("value", logical_type, true);
+
+        for representation in [
+            GeospatialResultRepresentation::Binary,
+            GeospatialResultRepresentation::String,
+        ] {
+            let plan = plan(&physical_field, Some(&logical_field), representation)
+                .unwrap()
+                .unwrap();
+            let output = rewrite(&physical, &plan.output_type, "value").unwrap();
+            let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+            let DataType::Struct(fields) = output.data_type() else {
+                unreachable!()
+            };
+            assert!(!fields[0].is_nullable());
+
+            match representation {
+                GeospatialResultRepresentation::Binary => {
+                    assert_eq!(
+                        native_geo_tag(fields[0].data_type()).unwrap(),
+                        Some(GeoTag {
+                            family: GeoFamily::Geometry,
+                            srid: 4326,
+                        })
+                    );
+                }
+                GeospatialResultRepresentation::String => {
+                    assert_eq!(fields[0].data_type(), &DataType::Utf8);
+                    let values = output
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap();
+                    assert_eq!(values.value(0), "SRID=4326;POINT(1 2)");
+                }
+            }
         }
     }
 
