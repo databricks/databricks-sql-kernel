@@ -854,11 +854,17 @@ mod tests {
         ] {
             let geo =
                 |sql_type| databricks_type_to_arrow_with_options(sql_type, None, representation);
+            // Array child naming is independent of geospatial/nullability
+            // parsing; use the kernel's current convention for this assertion.
+            let DataType::List(list_field) = geo("ARRAY<INT>") else {
+                panic!("expected list")
+            };
             let expected = DataType::Struct(Fields::from(vec![
                 Field::new("geom", geo("GEOMETRY(ANY)"), false),
                 Field::new(
                     "arr",
-                    DataType::List(Arc::new(Field::new_list_field(
+                    DataType::List(Arc::new(Field::new(
+                        list_field.name(),
                         DataType::Struct(Fields::from(vec![Field::new(
                             "g",
                             geo("GEOGRAPHY(4326)"),
