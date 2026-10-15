@@ -29,7 +29,7 @@ use arrow_array::{
     LargeListViewArray, LargeStringArray, ListArray, ListViewArray, MapArray, StringArray,
     StructArray,
 };
-use arrow_buffer::{NullBuffer, NullBufferBuilder};
+use arrow_buffer::{BooleanBufferBuilder, NullBuffer, NullBufferBuilder};
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use geo_traits::{
     CoordTrait, Dimensions, GeometryCollectionTrait, GeometryTrait, GeometryType, LineStringTrait,
@@ -546,7 +546,21 @@ fn rewrite_array(
         }
         (DataType::List(_), DataType::List(output_field)) => {
             let values = downcast::<ListArray>(array, path, "ListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                values.values().len(),
+                values
+                    .value_offsets()
+                    .windows(2)
+                    .map(|pair| pair[0] as usize..pair[1] as usize),
+            );
+            let child = rewrite_array(
+                values.values(),
+                output_field.data_type(),
+                path,
+                validity.as_ref(),
+            )?;
             let output = ListArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -558,7 +572,21 @@ fn rewrite_array(
         }
         (DataType::LargeList(_), DataType::LargeList(output_field)) => {
             let values = downcast::<LargeListArray>(array, path, "LargeListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                values.values().len(),
+                values
+                    .value_offsets()
+                    .windows(2)
+                    .map(|pair| pair[0] as usize..pair[1] as usize),
+            );
+            let child = rewrite_array(
+                values.values(),
+                output_field.data_type(),
+                path,
+                validity.as_ref(),
+            )?;
             let output = LargeListArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -570,7 +598,22 @@ fn rewrite_array(
         }
         (DataType::ListView(_), DataType::ListView(output_field)) => {
             let values = downcast::<ListViewArray>(array, path, "ListViewArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                values.values().len(),
+                values
+                    .value_offsets()
+                    .iter()
+                    .zip(values.value_sizes())
+                    .map(|(&offset, &size)| offset as usize..offset as usize + size as usize),
+            );
+            let child = rewrite_array(
+                values.values(),
+                output_field.data_type(),
+                path,
+                validity.as_ref(),
+            )?;
             let output = ListViewArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -583,7 +626,22 @@ fn rewrite_array(
         }
         (DataType::LargeListView(_), DataType::LargeListView(output_field)) => {
             let values = downcast::<LargeListViewArray>(array, path, "LargeListViewArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                values.values().len(),
+                values
+                    .value_offsets()
+                    .iter()
+                    .zip(values.value_sizes())
+                    .map(|(&offset, &size)| offset as usize..offset as usize + size as usize),
+            );
+            let child = rewrite_array(
+                values.values(),
+                output_field.data_type(),
+                path,
+                validity.as_ref(),
+            )?;
             let output = LargeListViewArray::try_new(
                 output_field.clone(),
                 values.offsets().clone(),
@@ -599,7 +657,19 @@ fn rewrite_array(
             DataType::FixedSizeList(output_field, output_size),
         ) if source_size == output_size => {
             let values = downcast::<FixedSizeListArray>(array, path, "FixedSizeListArray")?;
-            let child = rewrite_array(values.values(), output_field.data_type(), path, None)?;
+            let size = *source_size as usize;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                values.values().len(),
+                (0..values.len()).map(|row| row * size..(row + 1) * size),
+            );
+            let child = rewrite_array(
+                values.values(),
+                output_field.data_type(),
+                path,
+                validity.as_ref(),
+            )?;
             let output = FixedSizeListArray::try_new(
                 output_field.clone(),
                 *output_size,
@@ -614,7 +684,17 @@ fn rewrite_array(
         {
             let values = downcast::<MapArray>(array, path, "MapArray")?;
             let entries: ArrayRef = Arc::new(values.entries().clone());
-            let entries = rewrite_array(&entries, output_field.data_type(), path, None)?;
+            let validity = container_child_validity(
+                values,
+                parent_validity,
+                entries.len(),
+                values
+                    .value_offsets()
+                    .windows(2)
+                    .map(|pair| pair[0] as usize..pair[1] as usize),
+            );
+            let entries =
+                rewrite_array(&entries, output_field.data_type(), path, validity.as_ref())?;
             let entries = entries
                 .as_any()
                 .downcast_ref::<StructArray>()
@@ -639,6 +719,28 @@ fn rewrite_array(
             "geospatial rewrite for '{path}' cannot map Arrow type {source:?} to {output:?}"
         ))),
     }
+}
+
+/// Translate container-row validity into child positions. Start with no visible
+/// children so backing values outside a sliced array are ignored too. List-view
+/// ranges can overlap: a child is visible if *any* valid row references it.
+fn container_child_validity(
+    array: &dyn Array,
+    parent_validity: Option<&NullBuffer>,
+    child_len: usize,
+    ranges: impl Iterator<Item = std::ops::Range<usize>>,
+) -> Option<NullBuffer> {
+    let mut validity = BooleanBufferBuilder::new(child_len);
+    validity.append_n(child_len, false);
+    for (row, range) in ranges.enumerate() {
+        if array.is_valid(row) && parent_validity.is_none_or(|mask| mask.is_valid(row)) {
+            for child in range {
+                validity.set_bit(child, true);
+            }
+        }
+    }
+    let validity = NullBuffer::new(validity.finish());
+    (validity.null_count() != 0).then_some(validity)
 }
 
 fn text_to_native(
@@ -712,6 +814,7 @@ fn ewkt_values_to_native<'a>(
 
         let (srid, wkt_body) = split_ewkt(value, fallback_srid)
             .map_err(|detail| malformed_text(path, row, &format!("has invalid EWKT: {detail}")))?;
+        validate_wkt_boundary(wkt_body).map_err(|detail| malformed_text(path, row, detail))?;
         let normalized = normalize_multipoint_empty_members(wkt_body);
         let geometry = wkt::Wkt::<f64>::from_str(&normalized).map_err(|error| {
             malformed_text(path, row, &format!("contains invalid WKT: {error}"))
@@ -737,6 +840,52 @@ fn ewkt_values_to_native<'a>(
     )
     .map_err(|error| rebuild_error(path, error))?;
     Ok(Arc::new(output))
+}
+
+/// `wkt::Wkt::from_str` accepts a valid geometry followed by arbitrary tokens.
+/// Check the top-level boundary before parsing; the parser validates its body.
+fn validate_wkt_boundary(value: &str) -> std::result::Result<(), &'static str> {
+    let invalid = "contains invalid WKT or trailing input";
+    if value.contains('\0') {
+        return Err(invalid);
+    }
+    let type_end = value
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(value.len());
+    let mut body = value[type_end..].trim_start();
+    let word_end = body
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(body.len());
+    if ["Z", "M", "ZM"]
+        .iter()
+        .any(|dim| body[..word_end].eq_ignore_ascii_case(dim))
+    {
+        body = body[word_end..].trim_start();
+    }
+    if body.eq_ignore_ascii_case("EMPTY") {
+        return Ok(());
+    }
+    if !body.starts_with('(') {
+        return Err(invalid);
+    }
+    let mut depth = 0;
+    for (index, byte) in body.bytes().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return if body[index + 1..].trim().is_empty() {
+                        Ok(())
+                    } else {
+                        Err(invalid)
+                    };
+                }
+            }
+            _ => {}
+        }
+    }
+    Err(invalid)
 }
 
 /// The `wkt` parser currently rejects empty point members inside a
@@ -874,7 +1023,7 @@ fn split_ewkt(value: &str, fallback_srid: i32) -> std::result::Result<(i32, &str
     let srid_text = rest[..separator].trim();
     let srid = srid_text
         .parse::<i32>()
-        .map_err(|error| format!("invalid SRID '{srid_text}': {error}"))?;
+        .map_err(|error| format!("invalid SRID: {error}"))?;
     let wkt_body = rest[separator + 1..].trim();
     if wkt_body.is_empty() {
         return Err("WKT body is empty".to_string());
@@ -1623,6 +1772,213 @@ mod tests {
         assert_eq!(geom.value(0), "");
     }
 
+    fn containers_with_geo_child(child: ArrayRef) -> Vec<ArrayRef> {
+        let field = Arc::new(Field::new("item", child.data_type().clone(), false));
+        let nulls = Some(NullBuffer::from(vec![true, true, true, false, true, true]));
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 1, 2, 3, 4, 5, 6]));
+        let large_offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0_i64, 1, 2, 3, 4, 5, 6]));
+        let entries = StructArray::new(
+            Fields::from(vec![
+                Field::new("key", DataType::Int32, false),
+                Field::new("value", child.data_type().clone(), false),
+            ]),
+            vec![
+                Arc::new(Int32Array::from(vec![0, 1, 2, 3, 4, 5])),
+                child.clone(),
+            ],
+            None,
+        );
+        vec![
+            Arc::new(ListArray::new(
+                field.clone(),
+                offsets.clone(),
+                child.clone(),
+                nulls.clone(),
+            )),
+            Arc::new(LargeListArray::new(
+                field.clone(),
+                large_offsets,
+                child.clone(),
+                nulls.clone(),
+            )),
+            Arc::new(ListViewArray::new(
+                field.clone(),
+                vec![0_i32, 1, 2, 3, 4, 5].into(),
+                vec![1_i32; 6].into(),
+                child.clone(),
+                nulls.clone(),
+            )),
+            Arc::new(LargeListViewArray::new(
+                field.clone(),
+                vec![0_i64, 1, 2, 3, 4, 5].into(),
+                vec![1_i64; 6].into(),
+                child.clone(),
+                nulls.clone(),
+            )),
+            Arc::new(FixedSizeListArray::new(field, 1, child, nulls.clone())),
+            Arc::new(MapArray::new(
+                Arc::new(Field::new("entries", entries.data_type().clone(), false)),
+                offsets,
+                entries,
+                nulls,
+                false,
+            )),
+        ]
+    }
+
+    #[test]
+    fn container_nulls_and_slices_mask_invalid_geo_placeholders_in_both_modes() {
+        for family in [GeoFamily::Geometry, GeoFamily::Geography] {
+            let text: ArrayRef = Arc::new(StringArray::from(vec![
+                "invalid outside slice",
+                "SRID=4326;POINT(1 2)",
+                "invalid under null struct",
+                "invalid under null container",
+                "SRID=4326;POINT(1 2)",
+                "invalid outside slice",
+            ]));
+            let DataType::Struct(fields) = geo_type(family, 4326) else {
+                unreachable!()
+            };
+            let native: ArrayRef = Arc::new(StructArray::new(
+                fields,
+                vec![
+                    Arc::new(Int32Array::from(vec![4326; 6])),
+                    Arc::new(BinaryArray::from(vec![
+                        &b""[..],
+                        POINT_1_2_WKB,
+                        &b""[..],
+                        &b""[..],
+                        POINT_1_2_WKB,
+                        &b""[..],
+                    ])),
+                ],
+                None,
+            ));
+
+            for (source, target) in [(text.clone(), native.clone()), (native, text)] {
+                for (container, target_container) in containers_with_geo_child(source.clone())
+                    .into_iter()
+                    .zip(containers_with_geo_child(target.clone()))
+                {
+                    let parent: ArrayRef = Arc::new(StructArray::new(
+                        Fields::from(vec![Field::new("g", container.data_type().clone(), true)]),
+                        vec![container],
+                        Some(NullBuffer::from(vec![true, true, false, true, true, true])),
+                    ));
+                    let output_type = DataType::Struct(Fields::from(vec![Field::new(
+                        "g",
+                        target_container.data_type().clone(),
+                        true,
+                    )]));
+                    let output = rewrite(&parent.slice(1, 4), &output_type, "value").unwrap();
+                    let parent = output.as_any().downcast_ref::<StructArray>().unwrap();
+                    assert_eq!(parent.null_count(), 1);
+                    assert!(parent.is_null(1));
+                    let container = parent.column(0);
+                    assert_eq!(container.null_count(), 1);
+                    assert!(container.is_null(2));
+                    let child = match container.data_type() {
+                        DataType::List(_) => container
+                            .as_any()
+                            .downcast_ref::<ListArray>()
+                            .unwrap()
+                            .values(),
+                        DataType::LargeList(_) => container
+                            .as_any()
+                            .downcast_ref::<LargeListArray>()
+                            .unwrap()
+                            .values(),
+                        DataType::ListView(_) => container
+                            .as_any()
+                            .downcast_ref::<ListViewArray>()
+                            .unwrap()
+                            .values(),
+                        DataType::LargeListView(_) => container
+                            .as_any()
+                            .downcast_ref::<LargeListViewArray>()
+                            .unwrap()
+                            .values(),
+                        DataType::FixedSizeList(_, _) => container
+                            .as_any()
+                            .downcast_ref::<FixedSizeListArray>()
+                            .unwrap()
+                            .values(),
+                        DataType::Map(_, _) => container
+                            .as_any()
+                            .downcast_ref::<MapArray>()
+                            .unwrap()
+                            .entries()
+                            .column(1),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(
+                        child.null_count(),
+                        0,
+                        "non-nullable child stays non-nullable"
+                    );
+                    if let Some(values) = child.as_any().downcast_ref::<StringArray>() {
+                        assert_eq!(
+                            values
+                                .iter()
+                                .filter(|value| *value == Some("SRID=4326;POINT(1 2)"))
+                                .count(),
+                            2
+                        );
+                    } else {
+                        let values = child
+                            .as_any()
+                            .downcast_ref::<StructArray>()
+                            .unwrap()
+                            .column(1)
+                            .as_any()
+                            .downcast_ref::<BinaryArray>()
+                            .unwrap();
+                        assert_eq!(
+                            values
+                                .iter()
+                                .filter(|value| *value == Some(POINT_1_2_WKB))
+                                .count(),
+                            2
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn overlapping_list_view_ranges_keep_children_referenced_by_valid_rows() {
+        let child: ArrayRef = Arc::new(StringArray::from(vec!["ignored", "POINT(1 2)", "ignored"]));
+        let list: ArrayRef = Arc::new(ListViewArray::new(
+            Arc::new(Field::new("item", DataType::Utf8, false)),
+            vec![1, 0, 1].into(),
+            vec![1, 3, 1].into(),
+            child,
+            Some(NullBuffer::from(vec![true, false, true])),
+        ));
+        let output_type = DataType::ListView(Arc::new(Field::new(
+            "item",
+            geo_type(GeoFamily::Geometry, 0),
+            false,
+        )));
+        let output = rewrite(&list, &output_type, "g").unwrap();
+        let list = output.as_any().downcast_ref::<ListViewArray>().unwrap();
+        let values = list
+            .values()
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let wkbs = values
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(wkbs.value(0), b"");
+        assert_eq!(wkbs.value(1), POINT_1_2_WKB);
+        assert_eq!(wkbs.value(2), b"");
+    }
+
     #[test]
     fn non_nullable_untagged_nested_geo_is_recovered_in_both_modes() {
         let DataType::Struct(plain_fields) = plain_geo_type() else {
@@ -1738,6 +2094,12 @@ mod tests {
     fn text_to_native_handles_every_ogc_family_dimensions_and_empties() {
         let cases = [
             "POINT EMPTY",
+            "POINT Z EMPTY",
+            "POINT M EMPTY",
+            "POINT ZM EMPTY",
+            "LINESTRING Z EMPTY",
+            "POLYGON M EMPTY",
+            "GEOMETRYCOLLECTION ZM EMPTY",
             "POINT Z (1 2 3)",
             "LINESTRING M (0 1 2,3 4 5)",
             "POLYGON ZM ((0 0 1 2,0 1 2 3,1 0 3 4,0 0 1 2))",
@@ -1772,10 +2134,18 @@ mod tests {
     #[test]
     fn malformed_text_is_reported_as_data_loss_without_echoing_the_value() {
         for value in [
-            "SRID=invalid;POINT(1 2)",
+            "SRID=sensitive_srid_marker;POINT(1 2)",
             "SRID=4326POINT(1 2)",
             "SRID=4326;",
             "not sensitive result contents",
+            "POINT(1 2))",
+            "POINT(1 2)POINT(3 4)",
+            "POINT EMPTY trailing",
+            "POINT EMPTY(1 2)",
+            "POINT Z EMPTY POINT Z (1 2 3)",
+            "POINT(1 2)\0ignored",
+            "GEOMETRYCOLLECTION(POINT EMPTY))",
+            "GEOMETRYCOLLECTION(POINT(1 2)",
         ] {
             let array: ArrayRef = Arc::new(StringArray::from(vec![value]));
             let error =
@@ -1783,6 +2153,10 @@ mod tests {
             assert_eq!(error.code, crate::kernel_error::ErrorCode::DataLoss);
             assert!(error.message.contains("'geometry' row 0"), "{error:?}");
             assert!(!error.message.contains(value), "{error:?}");
+            assert!(
+                !error.message.contains("sensitive_srid_marker"),
+                "{error:?}"
+            );
         }
     }
 
