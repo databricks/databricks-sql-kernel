@@ -32,10 +32,14 @@ use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
+use crate::client::retry::{is_non_retryable_status, RequestType};
 use crate::kernel_error::{Error, Result};
 use crate::util::runtime::block_on_in_runtime;
 use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, Scope, TokenResponse, TokenUrl};
+use oauth2::{
+    AuthUrl, ClientId, ClientSecret, HttpRequest, HttpResponse, RequestTokenError, Scope,
+    TokenResponse, TokenUrl,
+};
 use std::sync::Arc;
 use tokio::runtime::Handle as RuntimeHandle;
 
@@ -339,15 +343,21 @@ impl AuthProvider for ClientCredentialsProvider {
                     token_request = token_request.add_scope(Scope::new(scope.clone()));
                 }
 
-                // Execute the token exchange using inner reqwest client
-                let token_response = token_request
-                    .request_async(http_client.inner())
-                    .await
-                    .map_err(|e| {
-                        Error::unauthenticated()
-                            .message(format!("M2M token exchange failed: {}", e))
-                            .context("client credentials grant")
-                    })?;
+                // `oauth2` builds the request; the kernel client sends it so the
+                // Auth retry ladder covers 429 / 5xx / network failures.
+                let send = |request: HttpRequest| send_token_request(&http_client, request);
+                let token_response =
+                    token_request
+                        .request_async(&send)
+                        .await
+                        .map_err(|e| match e {
+                            RequestTokenError::Request(e) => {
+                                token_exchange_error(e, "M2M token exchange")
+                            }
+                            other => Error::unauthenticated()
+                                .message(format!("M2M token exchange failed: {}", other))
+                                .context("client credentials grant"),
+                        })?;
 
                 // Convert to OAuthToken
                 let access_token = token_response.access_token().secret().to_string();
@@ -377,6 +387,44 @@ impl AuthProvider for ClientCredentialsProvider {
     }
 }
 
+/// Send an `oauth2`-built token request through the kernel's retrying client.
+/// Plugged into `request_async` so the wire format stays the crate's own.
+async fn send_token_request(
+    http_client: &DatabricksHttpClient,
+    request: HttpRequest,
+) -> Result<HttpResponse> {
+    let request = reqwest::Request::try_from(request).map_err(|e| {
+        Error::invalid_argument().message(format!("failed to build token request: {e}"))
+    })?;
+    let response = http_client
+        .execute_without_auth(request, RequestType::AuthTokenRequest)
+        .await?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.bytes().await.map_err(|e| {
+        Error::network_error().message(format!("failed to read token response: {e}"))
+    })?;
+    let mut http_response = HttpResponse::new(body.to_vec());
+    *http_response.status_mut() = status;
+    *http_response.headers_mut() = headers;
+    Ok(http_response)
+}
+
+/// Classify a client-credentials token-endpoint failure. A status the retry
+/// ladder refuses to retry (e.g. 401 `invalid_client`) is a rejection and
+/// becomes `Unauthenticated`; anything it retried and gave up on (429, 5xx,
+/// network errors) keeps its own code so it isn't reported as bad credentials.
+pub(super) fn token_exchange_error(e: Error, what: &str) -> Error {
+    let message = format!("{what} failed: {}", e.message);
+    match e.http_status {
+        Some(status) if is_non_retryable_status(status) => Error::unauthenticated()
+            .message(message)
+            .with_http_status(status),
+        _ => Error { message, ..e },
+    }
+    .context("client credentials grant")
+}
+
 /// Fetch an Azure AD **v1.0** `resource=` client-credentials token directly,
 /// tolerating the v1.0 endpoint's quirk of returning `expires_in` (and the
 /// other lifetime fields) as JSON *strings* rather than numbers — which the
@@ -393,7 +441,7 @@ async fn fetch_v1_resource_token(
     client_secret: &str,
     resource: &str,
 ) -> Result<OAuthToken> {
-    let response = http_client
+    let request = http_client
         .inner()
         .post(token_endpoint)
         .form(&[
@@ -402,15 +450,17 @@ async fn fetch_v1_resource_token(
             ("client_secret", client_secret),
             ("resource", resource),
         ])
-        .send()
-        .await
+        .build()
         .map_err(|e| {
-            Error::unauthenticated()
-                .message(format!("Azure v1.0 resource token exchange failed: {}", e))
-                .context("client credentials grant")
+            Error::invalid_argument().message(format!("failed to build token request: {e}"))
         })?;
 
-    let status = response.status();
+    // Non-2xx responses come back as `Err` once retries are exhausted.
+    let response = http_client
+        .execute_without_auth(request, RequestType::AuthTokenRequest)
+        .await
+        .map_err(|e| token_exchange_error(e, "Azure v1.0 resource token exchange"))?;
+
     let body = response.text().await.map_err(|e| {
         Error::unauthenticated()
             .message(format!(
@@ -419,15 +469,6 @@ async fn fetch_v1_resource_token(
             ))
             .context("client credentials grant")
     })?;
-    if !status.is_success() {
-        return Err(Error::unauthenticated()
-            .message(format!(
-                "Azure v1.0 resource token exchange failed: HTTP {}: {}",
-                status.as_u16(),
-                body
-            ))
-            .context("client credentials grant"));
-    }
 
     // Parse leniently: `expires_in` may be a string ("3599") or a number.
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
@@ -472,9 +513,46 @@ mod tests {
     use super::*;
     use crate::client::http::HttpClientConfig;
     use crate::client::retry::{build_retry_configs, RetryConfig};
+    use crate::kernel_error::ErrorCode;
     use std::collections::HashMap;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
     use wiremock::matchers::{body_string_contains, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    /// HTTP client whose retry ladder uses millisecond waits.
+    fn fast_retry_http_client(max_retries: u32) -> Arc<DatabricksHttpClient> {
+        let retry = RetryConfig {
+            min_wait: Duration::from_millis(10),
+            max_wait: Duration::from_millis(50),
+            max_retries,
+            ..RetryConfig::default()
+        };
+        Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .expect("Failed to create HTTP client"),
+        )
+    }
+
+    /// M2M provider pointed straight at `{server}/oidc/v1/token`, skipping discovery.
+    async fn provider_at(
+        mock_server: &MockServer,
+        http_client: Arc<DatabricksHttpClient>,
+    ) -> ClientCredentialsProvider {
+        ClientCredentialsProvider::new_with_full_config(
+            &mock_server.uri(),
+            "test-client-id",
+            "test-client-secret",
+            http_client,
+            vec!["all-apis".to_string()],
+            Some(format!("{}/oidc/v1/token", mock_server.uri())),
+        )
+        .await
+        .expect("Failed to create provider")
+    }
 
     /// Helper to create a mock OIDC discovery response
     fn mock_oidc_discovery(mock_server: &MockServer) -> String {
@@ -926,5 +1004,147 @@ mod tests {
 
         let auth_header = provider.get_auth_header().expect("get auth header");
         assert_eq!(auth_header, "Bearer azure-access-token");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_token_exchange_retries_transient_failures() {
+        use base64::Engine as _;
+        let mock_server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+
+        // Every attempt must carry the same `oauth2`-encoded request:
+        // HTTP Basic client auth plus the client-credentials form body.
+        let basic =
+            base64::engine::general_purpose::STANDARD.encode("test-client-id:test-client-secret");
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .and(header("authorization", format!("Basic {basic}").as_str()))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("scope=all-apis"))
+            .respond_with(move |_req: &wiremock::Request| {
+                match counter.fetch_add(1, Ordering::SeqCst) {
+                    0 => ResponseTemplate::new(429),
+                    1 => ResponseTemplate::new(503),
+                    _ => ResponseTemplate::new(200).set_body_json(mock_token_response_body()),
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider_at(&mock_server, fast_retry_http_client(3)).await;
+
+        assert_eq!(
+            provider
+                .get_auth_header()
+                .expect("retried exchange succeeds"),
+            "Bearer test-access-token-m2m"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_token_exchange_does_not_retry_rejected_credentials() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(serde_json::json!({
+                "error": "invalid_client",
+                "error_description": "Client authentication failed",
+            })))
+            .expect(1)
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider_at(&mock_server, fast_retry_http_client(3)).await;
+
+        let err = provider
+            .get_auth_header()
+            .expect_err("bad credentials fail");
+        assert_eq!(err.code, ErrorCode::Unauthenticated);
+        assert_eq!(err.http_status, Some(401));
+        assert!(err.message.contains("invalid_client"), "{}", err.message);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_token_exchange_exhausted_throttling_is_not_an_auth_error() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(429))
+            .expect(3) // 1 attempt + 2 retries
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider_at(&mock_server, fast_retry_http_client(2)).await;
+
+        let err = provider
+            .get_auth_header()
+            .expect_err("throttled exchange fails");
+        assert_eq!(err.code, ErrorCode::ResourceExhausted);
+        assert_eq!(err.http_status, Some(429));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_token_exchange_exhausted_retryable_4xx_is_not_an_auth_error() {
+        // 408 is a 4xx the retry ladder retries, so it is transient, not a
+        // credentials rejection.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(408))
+            .expect(3) // 1 attempt + 2 retries
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider_at(&mock_server, fast_retry_http_client(2)).await;
+
+        let err = provider
+            .get_auth_header()
+            .expect_err("timed-out exchange fails");
+        assert_ne!(err.code, ErrorCode::Unauthenticated);
+        assert_eq!(err.http_status, Some(408));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn v1_resource_grant_retries_transient_failures() {
+        let mock_server = MockServer::start().await;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let counter = calls.clone();
+        Mock::given(method("POST"))
+            .and(path("/tenant-abc/oauth2/token"))
+            .and(body_string_contains("grant_type=client_credentials"))
+            .and(body_string_contains("management.core.windows.net"))
+            .respond_with(move |_req: &wiremock::Request| {
+                if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "token_type": "Bearer",
+                        "expires_in": "3599",
+                        "access_token": "mgmt-access-token",
+                    }))
+                }
+            })
+            .mount(&mock_server)
+            .await;
+
+        let provider = ClientCredentialsProvider::new_with_resource_v1(
+            "sp-client-id",
+            "sp-client-secret",
+            fast_retry_http_client(3),
+            "https://management.core.windows.net/".to_string(),
+            format!("{}/tenant-abc/oauth2/token", mock_server.uri()),
+        )
+        .await
+        .expect("provider builds");
+
+        assert_eq!(
+            provider
+                .get_auth_header()
+                .expect("retried exchange succeeds"),
+            "Bearer mgmt-access-token"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }
