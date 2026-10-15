@@ -32,7 +32,7 @@ use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
-use crate::client::retry::RequestType;
+use crate::client::retry::{is_non_retryable_status, RequestType};
 use crate::kernel_error::{Error, Result};
 use crate::util::runtime::block_on_in_runtime;
 use oauth2::basic::BasicClient;
@@ -410,14 +410,14 @@ async fn send_token_request(
     Ok(http_response)
 }
 
-/// Classify a token-endpoint failure that outlasted the retry ladder. A
-/// rejected request (4xx other than 429, e.g. `invalid_client`) means bad
-/// credentials and stays `Unauthenticated`; throttling, 5xx, and network
-/// errors keep their own codes so they aren't reported as auth failures.
-fn token_exchange_error(e: Error, what: &str) -> Error {
+/// Classify a client-credentials token-endpoint failure. A status the retry
+/// ladder refuses to retry (e.g. 401 `invalid_client`) is a rejection and
+/// becomes `Unauthenticated`; anything it retried and gave up on (429, 5xx,
+/// network errors) keeps its own code so it isn't reported as bad credentials.
+pub(super) fn token_exchange_error(e: Error, what: &str) -> Error {
     let message = format!("{what} failed: {}", e.message);
     match e.http_status {
-        Some(status @ 400..=499) if status != 429 => Error::unauthenticated()
+        Some(status) if is_non_retryable_status(status) => Error::unauthenticated()
             .message(message)
             .with_http_status(status),
         _ => Error { message, ..e },
@@ -1083,6 +1083,27 @@ mod tests {
             .expect_err("throttled exchange fails");
         assert_eq!(err.code, ErrorCode::ResourceExhausted);
         assert_eq!(err.http_status, Some(429));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_token_exchange_exhausted_retryable_4xx_is_not_an_auth_error() {
+        // 408 is a 4xx the retry ladder retries, so it is transient, not a
+        // credentials rejection.
+        let mock_server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(408))
+            .expect(3) // 1 attempt + 2 retries
+            .mount(&mock_server)
+            .await;
+
+        let provider = provider_at(&mock_server, fast_retry_http_client(2)).await;
+
+        let err = provider
+            .get_auth_header()
+            .expect_err("timed-out exchange fails");
+        assert_ne!(err.code, ErrorCode::Unauthenticated);
+        assert_eq!(err.http_status, Some(408));
     }
 
     #[tokio::test(flavor = "multi_thread")]

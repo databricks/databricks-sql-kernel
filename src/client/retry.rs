@@ -194,6 +194,12 @@ const IDEMPOTENT_NON_RETRYABLE: &[u16] = &[
     400, 401, 403, 404, 405, 409, 410, 411, 412, 413, 414, 415, 416,
 ];
 
+/// Whether `status` is a rejection that idempotent requests never retry,
+/// ignoring any per-session `override_retryable_codes`.
+pub(crate) fn is_non_retryable_status(status: u16) -> bool {
+    IDEMPOTENT_NON_RETRYABLE.contains(&status)
+}
+
 /// Determines whether a request should be retried based on the error type
 /// and the request's idempotency classification.
 pub struct RetryStrategy {
@@ -230,7 +236,7 @@ impl RetryStrategy {
 
         match self.idempotency {
             // Idempotent: retry everything except known non-retryable codes
-            RequestIdempotency::Idempotent => !IDEMPOTENT_NON_RETRYABLE.contains(&code),
+            RequestIdempotency::Idempotent => !is_non_retryable_status(code),
             // Non-idempotent:
             // - 429: always retryable (rate-limited = request was not executed)
             // - 503: only retryable with Retry-After header (ambiguous whether
