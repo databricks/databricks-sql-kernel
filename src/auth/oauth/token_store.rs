@@ -89,6 +89,7 @@ impl Drop for RefreshGuard {
 pub(crate) struct TokenStore {
     /// The current token, protected by a read-write lock.
     token: Arc<RwLock<Option<OAuthToken>>>,
+    refresh_error: Arc<RwLock<Option<Error>>>,
     /// Flag indicating whether a refresh is currently in progress.
     /// This prevents concurrent refresh attempts.
     refreshing: Arc<AtomicBool>,
@@ -99,6 +100,7 @@ impl TokenStore {
     pub fn new() -> Self {
         Self {
             token: Arc::new(RwLock::new(None)),
+            refresh_error: Arc::new(RwLock::new(None)),
             refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -213,8 +215,24 @@ impl TokenStore {
                 refreshing: self.refreshing.clone(),
             };
 
+            // A previous leader may have finished after our initial cache read.
+            if let Some(token) = self
+                .token
+                .read()
+                .map_err(|_| Error::invalid_state().message("token store lock poisoned"))?
+                .as_ref()
+                .filter(|token| !token.is_expired())
+            {
+                return Ok(token.clone());
+            }
+
             // We won the race: perform the refresh
             let result = refresh_fn();
+            *self
+                .refresh_error
+                .write()
+                .map_err(|_| Error::invalid_state().message("token store lock poisoned"))? =
+                result.as_ref().err().cloned();
 
             // Store the new token if successful
             if let Ok(ref new_token) = result {
@@ -230,8 +248,13 @@ impl TokenStore {
 
             result
         } else {
-            // Another thread is already refreshing: wait for it to complete
-            self.wait_for_refresh()
+            // Waiting must release a runtime worker, just like the leader's
+            // HTTP exchange, or concurrent sessions can starve its I/O.
+            if tokio::runtime::Handle::try_current().is_ok() {
+                tokio::task::block_in_place(|| self.wait_for_refresh())
+            } else {
+                self.wait_for_refresh()
+            }
         }
     }
 
@@ -254,6 +277,7 @@ impl TokenStore {
             // Clone Arc pointers to move into the task
             let token = self.token.clone();
             let refreshing = self.refreshing.clone();
+            let refresh_error = self.refresh_error.clone();
 
             // Spawn on tokio's blocking thread pool (reuses threads, cheaper than std::thread::spawn)
             tokio::task::spawn_blocking(move || {
@@ -262,7 +286,19 @@ impl TokenStore {
                     refreshing: refreshing.clone(),
                 };
 
+                if token
+                    .read()
+                    .ok()
+                    .and_then(|token| token.as_ref().map(|t| !t.is_expired() && !t.is_stale()))
+                    .unwrap_or(false)
+                {
+                    return;
+                }
+
                 let result = refresh_fn();
+                if let Ok(mut error) = refresh_error.write() {
+                    *error = result.as_ref().err().cloned();
+                }
 
                 // Store the new token if successful (ignore errors in background)
                 if let Ok(new_token) = result {
@@ -286,6 +322,15 @@ impl TokenStore {
         // Poll until the refresh completes, sleeping to avoid busy-waiting
         while self.refreshing.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+
+        if let Some(error) = self
+            .refresh_error
+            .read()
+            .map_err(|_| Error::invalid_state().message("token store lock poisoned"))?
+            .as_ref()
+        {
+            return Err(error.clone());
         }
 
         // Read the refreshed token
@@ -440,6 +485,38 @@ mod tests {
         for token in &tokens {
             assert_eq!(token.access_token, "token-3600");
         }
+    }
+
+    #[test]
+    fn blocking_refresh_rechecks_a_token_fetched_by_another_caller() {
+        let store = TokenStore::new();
+        *store.token.write().unwrap() = Some(create_token_with_ttl(3600));
+        let token = store
+            .blocking_refresh(|| panic!("another caller already refreshed the token"))
+            .unwrap();
+        assert_eq!(token.access_token, "token-3600");
+    }
+
+    #[test]
+    fn waiting_callers_receive_refresh_error_instead_of_expired_token() {
+        let store = Arc::new(TokenStore::new());
+        *store.token.write().unwrap() = Some(create_token_with_ttl(30));
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let leader_store = store.clone();
+        let leader_barrier = barrier.clone();
+        let leader = std::thread::spawn(move || {
+            leader_store.get_or_refresh(move || {
+                leader_barrier.wait();
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                Err(Error::resource_exhausted().with_http_status(429))
+            })
+        });
+        barrier.wait();
+        let follower_error = store.wait_for_refresh().unwrap_err();
+        let leader_error = leader.join().unwrap().unwrap_err();
+        assert_eq!(follower_error.code, leader_error.code);
+        assert_eq!(follower_error.http_status, Some(429));
+        assert!(follower_error.retryable);
     }
 
     #[tokio::test(flavor = "multi_thread")]

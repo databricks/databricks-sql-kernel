@@ -30,6 +30,7 @@ pub(crate) mod jwt;
 pub(crate) mod jwt_key;
 pub mod jwt_m2m;
 pub mod m2m;
+mod m2m_cache;
 pub mod oidc;
 #[cfg(test)]
 pub(crate) mod test_keys;

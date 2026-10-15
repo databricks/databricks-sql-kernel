@@ -56,18 +56,17 @@ fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error
     // Parse the body once into a `Value`, then try both envelope shapes
     // off it (bare `ServiceError`, then the `{"error": ...}` wrapper) —
     // avoids re-walking the raw string twice.
-    let svc: Option<ServiceError> = serde_json::from_str::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            serde_json::from_value::<ServiceError>(v.clone())
-                .ok()
-                .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
-                .or_else(|| {
-                    serde_json::from_value::<ErrorWrapper>(v)
-                        .ok()
-                        .map(|w| w.error)
-                })
-        });
+    let json = serde_json::from_str::<serde_json::Value>(body).ok();
+    let svc: Option<ServiceError> = json.as_ref().and_then(|v| {
+        serde_json::from_value::<ServiceError>(v.clone())
+            .ok()
+            .filter(|e| e.error_code.is_some() || e.message.is_some() || e.sql_state.is_some())
+            .or_else(|| {
+                serde_json::from_value::<ErrorWrapper>(v.clone())
+                    .ok()
+                    .map(|w| w.error)
+            })
+    });
 
     let mut err = Error::from_http_status(status);
     match svc {
@@ -99,6 +98,26 @@ fn http_error(status: u16, body: &str, context: impl std::fmt::Display) -> Error
             }
         }
         None => {
+            if let Some(code) = json
+                .as_ref()
+                .and_then(|v| v.get("error"))
+                .and_then(|v| v.as_str())
+            {
+                if matches!(status, 400 | 401 | 403)
+                    && matches!(
+                        code,
+                        "invalid_client"
+                            | "invalid_grant"
+                            | "unauthorized_client"
+                            | "access_denied"
+                    )
+                {
+                    err = Error::unauthenticated().with_http_status(status);
+                }
+                return err
+                    .with_error_code(code)
+                    .message(format!("{context}: OAuth {code}"));
+            }
             // Not a recognised envelope — preserve today's behavior
             // (raw body folded into the message).
             err = err.message(format!("{context}: {body}"));

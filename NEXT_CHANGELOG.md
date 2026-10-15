@@ -52,6 +52,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Share OAuth client-credentials tokens and discovery across connections with
+  matching authentication settings. Token exchanges now use auth retries and
+  preserve HTTP error metadata, including for callers waiting on a refresh.
 - `list_tables` now matches `table_types` case-sensitively, matching Thrift
   `GetTables`: `["table"]` no longer matches `TABLE` rows.
 

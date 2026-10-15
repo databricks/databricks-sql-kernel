@@ -22,20 +22,28 @@
 //! 3. Cache token in TokenStore with refresh lifecycle
 //! 4. Re-authenticate using client credentials when token expires (no refresh_token)
 //!
+//! Connections with the same authentication identity share discovery and token
+//! state in a bounded process-wide cache. Concurrent token refreshes are coalesced.
+//! The identity includes the workspace, credentials, scopes, endpoint override,
+//! resource, and TLS/proxy/header settings. Up to 256 identities are retained,
+//! expiring after one idle hour; HTTP clients and runtimes remain connection-owned.
+//!
 //! M2M tokens are not cached to disk because:
 //! - Credentials (client_id/secret) are always available for re-authentication
 //! - Tokens are typically short-lived
 //! - Caching adds security risk without significant benefit
 
+use crate::auth::oauth::m2m_cache::shared_state;
 use crate::auth::oauth::oidc::OidcEndpoints;
 use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
+use crate::client::retry::RequestType;
 use crate::kernel_error::{Error, Result};
 use crate::util::runtime::block_on_in_runtime;
 use oauth2::basic::BasicClient;
-use oauth2::{AuthUrl, ClientId, ClientSecret, Scope, TokenResponse, TokenUrl};
+use oauth2::{AuthUrl, ClientId, ClientSecret, RequestTokenError, Scope, TokenResponse, TokenUrl};
 use std::sync::Arc;
 use tokio::runtime::Handle as RuntimeHandle;
 
@@ -77,7 +85,6 @@ use tokio::runtime::Handle as RuntimeHandle;
 /// # Ok(())
 /// # }
 /// ```
-#[derive(Debug)]
 pub struct ClientCredentialsProvider {
     /// Client ID for OAuth
     client_id: String,
@@ -87,7 +94,7 @@ pub struct ClientCredentialsProvider {
     token_endpoint: String,
     auth_endpoint: String,
     /// Thread-safe token store managing the token lifecycle
-    token_store: TokenStore,
+    token_store: Arc<TokenStore>,
     /// HTTP client for token endpoint requests
     http_client: Arc<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis"). Empty when `resource`
@@ -107,6 +114,17 @@ pub struct ClientCredentialsProvider {
     /// caller is already inside a runtime (see
     /// `crate::util::runtime::block_on_in_runtime`).
     runtime_handle: RuntimeHandle,
+}
+
+impl std::fmt::Debug for ClientCredentialsProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClientCredentialsProvider")
+            .field("client_id", &self.client_id)
+            .field("token_endpoint", &self.token_endpoint)
+            .field("scopes", &self.scopes)
+            .field("resource", &self.resource)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ClientCredentialsProvider {
@@ -203,6 +221,16 @@ impl ClientCredentialsProvider {
         scopes: Vec<String>,
         token_endpoint_override: Option<String>,
     ) -> Result<Self> {
+        let state = shared_state(
+            host,
+            client_id,
+            client_secret,
+            &scopes,
+            token_endpoint_override.as_deref(),
+            None,
+            http_client.config(),
+        )
+        .await?;
         // Discover OIDC endpoints, or skip discovery entirely when the token
         // endpoint is overridden. The client-credentials grant never uses the
         // authorization endpoint, so when a caller pins the token endpoint
@@ -214,8 +242,14 @@ impl ClientCredentialsProvider {
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
             None => {
-                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-                (endpoints.token_endpoint, endpoints.authorization_endpoint)
+                let endpoints = state
+                    .endpoints
+                    .get_or_try_init(|| OidcEndpoints::discover(host, &http_client))
+                    .await?;
+                (
+                    endpoints.token_endpoint.clone(),
+                    endpoints.authorization_endpoint.clone(),
+                )
             }
         };
 
@@ -224,7 +258,7 @@ impl ClientCredentialsProvider {
             client_secret: client_secret.to_string(),
             token_endpoint,
             auth_endpoint,
-            token_store: TokenStore::new(),
+            token_store: state.tokens.clone(),
             http_client,
             scopes,
             resource: None,
@@ -254,12 +288,22 @@ impl ClientCredentialsProvider {
         resource: String,
         token_endpoint: String,
     ) -> Result<Self> {
+        let state = shared_state(
+            &token_endpoint,
+            client_id,
+            client_secret,
+            &[],
+            Some(&token_endpoint),
+            Some(&resource),
+            http_client.config(),
+        )
+        .await?;
         Ok(Self {
             client_id: client_id.to_string(),
             client_secret: client_secret.to_string(),
             auth_endpoint: token_endpoint.clone(),
             token_endpoint,
-            token_store: TokenStore::new(),
+            token_store: state.tokens.clone(),
             http_client,
             scopes: Vec::new(),
             resource: Some(resource),
@@ -339,14 +383,18 @@ impl AuthProvider for ClientCredentialsProvider {
                     token_request = token_request.add_scope(Scope::new(scope.clone()));
                 }
 
-                // Execute the token exchange using inner reqwest client
+                // OAuth protocol encoding stays with oauth2; transport retries
+                // and error metadata come from the kernel's Auth policy.
                 let token_response = token_request
-                    .request_async(http_client.inner())
+                    .request_async(&|request| oauth_token_request(&http_client, request))
                     .await
-                    .map_err(|e| {
-                        Error::unauthenticated()
-                            .message(format!("M2M token exchange failed: {}", e))
-                            .context("client credentials grant")
+                    .map_err(|e| match e {
+                        RequestTokenError::Request(error) => {
+                            error.context("M2M token exchange failed")
+                        }
+                        RequestTokenError::ServerResponse(error) => Error::unauthenticated()
+                            .message(format!("M2M token exchange failed: {error}")),
+                        _ => Error::data_loss().message("Failed to parse M2M token response"),
                     })?;
 
                 // Convert to OAuthToken
@@ -377,6 +425,29 @@ impl AuthProvider for ClientCredentialsProvider {
     }
 }
 
+async fn oauth_token_request(
+    http_client: &DatabricksHttpClient,
+    request: oauth2::HttpRequest,
+) -> Result<oauth2::HttpResponse> {
+    let request = request
+        .try_into()
+        .map_err(|_| Error::invalid_argument().message("Could not build M2M token request"))?;
+    let response = http_client
+        .execute_without_auth(request, RequestType::AuthTokenRequest)
+        .await?;
+    let mut result = oauth2::http::Response::builder().status(response.status());
+    for (name, value) in response.headers() {
+        result = result.header(name, value);
+    }
+    let body = response
+        .bytes()
+        .await
+        .map_err(|_| Error::network_error().message("Could not read M2M token response"))?;
+    result
+        .body(body.to_vec())
+        .map_err(|_| Error::data_loss().message("Could not decode M2M token response"))
+}
+
 /// Fetch an Azure AD **v1.0** `resource=` client-credentials token directly,
 /// tolerating the v1.0 endpoint's quirk of returning `expires_in` (and the
 /// other lifetime fields) as JSON *strings* rather than numbers — which the
@@ -393,7 +464,7 @@ async fn fetch_v1_resource_token(
     client_secret: &str,
     resource: &str,
 ) -> Result<OAuthToken> {
-    let response = http_client
+    let request = http_client
         .inner()
         .post(token_endpoint)
         .form(&[
@@ -402,32 +473,24 @@ async fn fetch_v1_resource_token(
             ("client_secret", client_secret),
             ("resource", resource),
         ])
-        .send()
-        .await
+        .build()
         .map_err(|e| {
-            Error::unauthenticated()
+            Error::invalid_argument()
                 .message(format!("Azure v1.0 resource token exchange failed: {}", e))
                 .context("client credentials grant")
         })?;
+    let response = http_client
+        .execute_without_auth(request, RequestType::AuthTokenRequest)
+        .await?;
 
-    let status = response.status();
     let body = response.text().await.map_err(|e| {
-        Error::unauthenticated()
+        Error::network_error()
             .message(format!(
                 "Azure v1.0 resource token: reading response body: {}",
                 e
             ))
             .context("client credentials grant")
     })?;
-    if !status.is_success() {
-        return Err(Error::unauthenticated()
-            .message(format!(
-                "Azure v1.0 resource token exchange failed: HTTP {}: {}",
-                status.as_u16(),
-                body
-            ))
-            .context("client credentials grant"));
-    }
 
     // Parse leniently: `expires_in` may be a string ("3599") or a number.
     let json: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
@@ -496,6 +559,122 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn separate_providers_coalesce_expired_token_refresh() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(mock_token_response_body())
+                    .set_delay(std::time::Duration::from_millis(100)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut providers = Vec::new();
+        for _ in 0..16 {
+            providers.push(
+                ClientCredentialsProvider::new_with_full_config(
+                    &server.uri(),
+                    "expiry-client",
+                    "secret",
+                    Arc::new(
+                        DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                            .unwrap(),
+                    ),
+                    vec!["all-apis".into()],
+                    Some(format!("{}/token", server.uri())),
+                )
+                .await
+                .unwrap(),
+            );
+        }
+        providers[0]
+            .token_store
+            .get_or_refresh(|| {
+                Ok(OAuthToken::new(
+                    "expired".into(),
+                    "Bearer".into(),
+                    30,
+                    None,
+                    vec![],
+                ))
+            })
+            .unwrap();
+        let tasks: Vec<_> = providers
+            .into_iter()
+            .map(|provider| {
+                tokio::task::spawn_blocking(move || provider.get_auth_header().unwrap())
+            })
+            .collect();
+        for task in tasks {
+            assert_eq!(task.await.unwrap(), "Bearer test-access-token-m2m");
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resource_v1_tokens_share_retry_and_isolate_resources() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("resource=first"))
+            .respond_with(move |_: &wiremock::Request| {
+                if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                    ResponseTemplate::new(503)
+                } else {
+                    ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                        "access_token": "first-token", "expires_in": "3600",
+                    }))
+                }
+            })
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/token"))
+            .and(body_string_contains("resource=second"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "access_token": "second-token", "expires_in": "3600",
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        for resource in ["first", "first", "second"] {
+            let retry = RetryConfig {
+                max_retries: 1,
+                min_wait: std::time::Duration::ZERO,
+                max_wait: std::time::Duration::ZERO,
+                ..RetryConfig::default()
+            };
+            let client = Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(&retry, &HashMap::new()),
+                )
+                .unwrap(),
+            );
+            let provider = ClientCredentialsProvider::new_with_resource_v1(
+                "resource-client",
+                "secret",
+                client,
+                resource.into(),
+                format!("{}/token", server.uri()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                provider.get_auth_header().unwrap(),
+                format!("Bearer {resource}-token")
+            );
+        }
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_m2m_token_exchange() {
         let mock_server = MockServer::start().await;
         let token_endpoint = mock_oidc_discovery(&mock_server);
@@ -527,7 +706,7 @@ mod tests {
 
         let provider = ClientCredentialsProvider::new(
             &mock_server.uri(),
-            "test-client-id",
+            "test_m2m_token_exchange",
             "test-client-secret",
             http_client,
         )
@@ -641,7 +820,7 @@ mod tests {
 
         let provider = ClientCredentialsProvider::new(
             &mock_server.uri(),
-            "test-client-id",
+            "test_m2m_auto_refresh",
             "test-client-secret",
             http_client,
         )
@@ -693,7 +872,7 @@ mod tests {
         // Provider creation should discover endpoints
         let result = ClientCredentialsProvider::new(
             &mock_server.uri(),
-            "test-client-id",
+            "test_m2m_oidc_discovery",
             "test-client-secret",
             http_client,
         )
@@ -735,7 +914,7 @@ mod tests {
         // Provider creation should fail with descriptive error
         let result = ClientCredentialsProvider::new(
             &mock_server.uri(),
-            "test-client-id",
+            "test_m2m_oidc_discovery_failure",
             "test-client-secret",
             http_client,
         )
@@ -781,7 +960,7 @@ mod tests {
         let provider = Arc::new(
             ClientCredentialsProvider::new(
                 &mock_server.uri(),
-                "test-client-id",
+                "test_m2m_concurrent_token_fetch",
                 "test-client-secret",
                 http_client,
             )
@@ -789,10 +968,7 @@ mod tests {
             .expect("Failed to create provider"),
         );
 
-        // Spawn multiple OS threads (not tokio tasks) to test concurrency.
-        // get_auth_header() is sync and uses block_in_place + block_on internally,
-        // which would deadlock if called from multiple tokio tasks on the same runtime.
-        // Each thread enters the tokio runtime context via Handle::enter().
+        // Exercise sync auth calls from plain threads with an entered runtime.
         let handle = tokio::runtime::Handle::current();
         let mut handles = vec![];
         for _ in 0..10 {
@@ -857,7 +1033,7 @@ mod tests {
         // Create provider with custom scopes
         let provider = ClientCredentialsProvider::new_with_scopes(
             &mock_server.uri(),
-            "test-client-id",
+            "test_m2m_custom_scopes",
             "test-client-secret",
             http_client,
             vec!["custom-scope-1".to_string(), "custom-scope-2".to_string()],
