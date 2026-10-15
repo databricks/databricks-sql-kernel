@@ -388,8 +388,7 @@ fn parse_map(
 }
 
 /// Parse `STRUCT<name:type, name:type, ...>` into `Struct(Fields::from([Field; N]))`.
-/// Each child field is nullable (SEA's manifest doesn't carry per-field
-/// nullability) — same convention used elsewhere in the kernel.
+/// Fields are nullable unless SEA's type text includes a `NOT NULL` qualifier.
 fn parse_struct(
     s: &str,
     type_interval_type: Option<&str>,
@@ -407,7 +406,7 @@ fn parse_struct(
         // composites (none today, but be defensive).
         let colon_idx = depth_zero_colon(part)?;
         let name = part[..colon_idx].trim();
-        let type_text = part[colon_idx + 1..].trim();
+        let (type_text, nullable) = struct_field_nullability(part[colon_idx + 1..].trim());
         if name.is_empty() {
             return None;
         }
@@ -417,9 +416,25 @@ fn parse_struct(
             geospatial_representation,
             depth + 1,
         )?;
-        fields.push(Field::new(name, dt, true));
+        fields.push(Field::new(name, dt, nullable));
     }
     Some(DataType::Struct(Fields::from(fields)))
+}
+
+/// Remove only a complete, whitespace-delimited `NOT NULL` field suffix.
+/// In particular, leave malformed/trailing geospatial qualifiers for the strict
+/// type parser to reject rather than assigning them canonical Arrow tags.
+fn struct_field_nullability(type_text: &str) -> (&str, bool) {
+    if let Some((prefix, null)) = type_text.rsplit_once(char::is_whitespace) {
+        if null.eq_ignore_ascii_case("NULL") {
+            if let Some((sql_type, not)) = prefix.trim_end().rsplit_once(char::is_whitespace) {
+                if not.eq_ignore_ascii_case("NOT") {
+                    return (sql_type.trim_end(), false);
+                }
+            }
+        }
+    }
+    (type_text, true)
 }
 
 /// Native Arrow representation emitted by DBR and Reyden.
@@ -829,6 +844,82 @@ mod tests {
             panic!("expected geography list")
         };
         assert_eq!(string_items.data_type(), &DataType::Utf8);
+    }
+
+    #[test]
+    fn test_nested_geospatial_fields_with_not_null_qualifiers() {
+        for representation in [
+            GeospatialResultRepresentation::Binary,
+            GeospatialResultRepresentation::String,
+        ] {
+            let geo =
+                |sql_type| databricks_type_to_arrow_with_options(sql_type, None, representation);
+            let expected = DataType::Struct(Fields::from(vec![
+                Field::new("geom", geo("GEOMETRY(ANY)"), false),
+                Field::new(
+                    "arr",
+                    DataType::List(Arc::new(Field::new_list_field(
+                        DataType::Struct(Fields::from(vec![Field::new(
+                            "g",
+                            geo("GEOGRAPHY(4326)"),
+                            false,
+                        )])),
+                        true,
+                    ))),
+                    false,
+                ),
+                Field::new(
+                    "map",
+                    DataType::Map(
+                        Arc::new(Field::new(
+                            "entries",
+                            DataType::Struct(Fields::from(vec![
+                                Field::new("key", DataType::Utf8, false),
+                                Field::new(
+                                    "value",
+                                    DataType::Struct(Fields::from(vec![Field::new(
+                                        "g",
+                                        geo("GEOMETRY(0)"),
+                                        false,
+                                    )])),
+                                    true,
+                                ),
+                            ])),
+                            false,
+                        )),
+                        false,
+                    ),
+                    true,
+                ),
+                Field::new("blob", DataType::Binary, false),
+                Field::new("amount", DataType::Decimal128(10, 2), true),
+            ]));
+            assert_eq!(
+                geo("STRUCT<geom: GEOMETRY(ANY) NOT NULL, \
+                     arr: ARRAY<STRUCT<g: GEOGRAPHY(4326) not\t null>> NOT NULL, \
+                     map: MAP<STRING,STRUCT<g: GEOMETRY(0) NOT NULL>>, \
+                     blob: BINARY NOT NULL, amount: DECIMAL(10,2)>"),
+                expected,
+            );
+        }
+
+        for invalid in [
+            "GEOMETRY(0) NOTNULL",
+            "GEOMETRY(0)NOT NULL",
+            "GEOMETRY(0) NOT NOT NULL",
+            "GEOMETRY(0) NOT NULL trailing",
+            "GEOMETRY(garbage) NOT NULL",
+        ] {
+            assert_eq!(
+                databricks_type_to_arrow_with_options(
+                    &format!("STRUCT<g:{invalid}>"),
+                    None,
+                    GeospatialResultRepresentation::Binary,
+                ),
+                DataType::Utf8,
+                "malformed field type must not acquire geospatial tags: {invalid}",
+            );
+        }
     }
 
     #[test]
