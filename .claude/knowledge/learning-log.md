@@ -342,6 +342,12 @@ author, follow-up, and review runs.
 - **Context:** PR #396 copied the SEA manifest's `type_json` into the Thrift-compatible `Spark:DataType:JsonType` field-metadata key, following the existing `Spark:DataType:SqlName` (= `type_text`) pattern, so Thrift-written consumers (Power BI, JDBC) read the same keys off SEA result schemas.
   **Rule:** When the SEA manifest exposes column type info the Thrift server also provides, mirror it under the Thrift server's `Spark:DataType:*` metadata key (not only the `databricks.*` key) so Thrift-oriented consumers keep working on the SEA path.
 
+### 2026-10-16: learnings since 2026-10-15T07:32:52Z
+- **Context:** PR #399 routed M2M / Azure-v1 OAuth token exchanges through the kernel's retrying HTTP client and added `token_exchange_error` to classify the final failure: only a non-retryable rejection (e.g. 401 `invalid_client`) becomes `Unauthenticated`, while failures the ladder retried and exhausted (429, 5xx, retryable 4xx like 408) keep their own code.
+  **Rule:** When mapping a token-endpoint / auth exchange failure to an error code, only map genuine non-retryable rejections to Unauthenticated; an exhausted-transient failure (throttling, 5xx, retryable 4xx) must retain its own code so it isn't misreported as bad credentials.
+- **Context:** In PR #399 a reviewer flagged (F1) that `token_exchange_error` classifies via `is_non_retryable_status`, which reads the static `IDEMPOTENT_NON_RETRYABLE` list and ignores per-session `override_retryable_codes` that the actual `RetryStrategy` honors — so the post-exhaustion label can disagree with what the retry ladder actually did (e.g. an overridden-retryable 400 gets mislabeled a hard auth rejection).
+  **Rule:** Classify a post-retry failure from what the retry ladder actually decided (carry a retryable / retries-exhausted marker on the Error), not by re-deriving from a static status-code list — the two diverge whenever per-session retry overrides are in play.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
