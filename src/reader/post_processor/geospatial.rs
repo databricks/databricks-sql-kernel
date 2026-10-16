@@ -816,17 +816,11 @@ fn ewkt_values_to_native<'a>(
             .map_err(|detail| malformed_text(path, row, &format!("has invalid EWKT: {detail}")))?;
         validate_wkt_boundary(wkt_body).map_err(|detail| malformed_text(path, row, detail))?;
         let normalized = normalize_multipoint_empty_members(wkt_body);
-        let geometry = wkt::Wkt::<f64>::from_str(&normalized).map_err(|error| {
-            malformed_text(path, row, &format!("contains invalid WKT: {error}"))
-        })?;
+        let geometry = wkt::Wkt::<f64>::from_str(&normalized)
+            .map_err(|_| malformed_text(path, row, "contains invalid WKT"))?;
         let mut wkb = Vec::with_capacity(wkb::writer::geometry_wkb_size(&geometry));
-        wkb::writer::write_geometry(&mut wkb, &geometry, &Default::default()).map_err(|error| {
-            malformed_text(
-                path,
-                row,
-                &format!("could not be encoded as OGC WKB: {error}"),
-            )
-        })?;
+        wkb::writer::write_geometry(&mut wkb, &geometry, &Default::default())
+            .map_err(|_| malformed_text(path, row, "could not be encoded as OGC WKB"))?;
 
         srids.append_value(srid);
         wkbs.append_value(wkb);
@@ -2157,6 +2151,25 @@ mod tests {
                 !error.message.contains("sensitive_srid_marker"),
                 "{error:?}"
             );
+        }
+    }
+
+    #[test]
+    fn malformed_wkt_body_errors_do_not_echo_result_contents() {
+        for value in [
+            "POINT(sensitive_coordinate 2)",
+            "GEOMETRYCOLLECTION(POINT(1 sensitive_coordinate))",
+        ] {
+            // These pass boundary validation and fail inside the third-party parser.
+            validate_wkt_boundary(value).unwrap();
+            assert!(wkt::Wkt::<f64>::from_str(value).is_err());
+            let array: ArrayRef = Arc::new(StringArray::from(vec![value]));
+            let error =
+                rewrite(&array, &geo_type(GeoFamily::Geometry, -1), "geometry").unwrap_err();
+            assert_eq!(error.code, crate::kernel_error::ErrorCode::DataLoss);
+            assert!(error.message.contains("'geometry' row 0"), "{error:?}");
+            assert!(error.message.contains("contains invalid WKT"), "{error:?}");
+            assert!(!error.message.contains("sensitive_coordinate"), "{error:?}");
         }
     }
 
