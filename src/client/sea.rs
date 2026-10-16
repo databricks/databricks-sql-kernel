@@ -317,7 +317,7 @@ impl SeaRestTransport {
     }
 
     /// Convert SEA response to internal ExecuteResultData.
-    fn convert_result_data(result: &crate::types::sea::ResultData) -> Result<ExecuteResultData> {
+    fn convert_result_data(result: crate::types::sea::ResultData) -> Result<ExecuteResultData> {
         let external_links = if let Some(ref links) = result.external_links {
             let converted: Result<Vec<CloudFetchLink>> = links
                 .iter()
@@ -329,9 +329,9 @@ impl SeaRestTransport {
         };
 
         Ok(ExecuteResultData {
-            next_chunk_internal_link: result.next_chunk_internal_link.clone(),
+            next_chunk_internal_link: result.next_chunk_internal_link,
             external_links,
-            inline_arrow_data: result.attachment.clone(),
+            inline_arrow_data: result.attachment,
             inline_chunk_index: result.chunk_index,
             inline_row_offset: result.row_offset,
             inline_row_count: result.row_count,
@@ -365,15 +365,18 @@ impl SeaRestTransport {
             .http_client
             .execute(request, RequestType::GetStatementStatus)
             .await?;
+        // Parse the raw bytes: `text()` would copy a multi-MB inline-Arrow
+        // body into a `String` first.
         let body = response
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let sea_response: StatementExecutionResponse =
-            serde_json::from_str(&body).map_err(|e| {
+            serde_json::from_slice(&body).map_err(|e| {
                 Error::data_loss().message(format!(
-                    "Failed to parse status response: {e} - body: {body}"
+                    "Failed to parse status response: {e} - body: {}",
+                    String::from_utf8_lossy(&body)
                 ))
             })?;
 
@@ -692,15 +695,18 @@ impl SeaRestTransport {
         })?;
 
         let response = self.http_client.execute(request, request_type).await?;
+        // Parse the raw bytes: `text()` would copy a multi-MB inline-Arrow
+        // body into a `String` first.
         let body = response
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
         let sea_response: StatementExecutionResponse =
-            serde_json::from_str(&body).map_err(|e| {
+            serde_json::from_slice(&body).map_err(|e| {
                 Error::data_loss().message(format!(
-                    "Failed to parse execute response: {e} - body: {body}"
+                    "Failed to parse execute response: {e} - body: {}",
+                    String::from_utf8_lossy(&body)
                 ))
             })?;
 
@@ -716,11 +722,7 @@ impl SeaRestTransport {
 
     /// Convert SEA response to internal ExecuteResponse.
     fn convert_response(response: StatementExecutionResponse) -> Result<ExecuteResponse> {
-        let result = if let Some(ref result) = response.result {
-            Some(Self::convert_result_data(result)?)
-        } else {
-            None
-        };
+        let result = response.result.map(Self::convert_result_data).transpose()?;
 
         Ok(ExecuteResponse {
             statement_id: response.statement_id,
@@ -1438,14 +1440,17 @@ impl Transport for SeaRestTransport {
             .http_client
             .execute(request, RequestType::GetResultChunks)
             .await?;
+        // Parse the raw bytes: `text()` would copy a multi-MB inline-Arrow
+        // body into a `String` first.
         let body = response
-            .text()
+            .bytes()
             .await
             .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
-        let chunks_response: GetChunksResponse = serde_json::from_str(&body).map_err(|e| {
+        let chunks_response: GetChunksResponse = serde_json::from_slice(&body).map_err(|e| {
             Error::data_loss().message(format!(
-                "Failed to parse inline chunk response: {e} - body: {body}"
+                "Failed to parse inline chunk response: {e} - body: {}",
+                String::from_utf8_lossy(&body)
             ))
         })?;
 
@@ -1459,7 +1464,8 @@ impl Transport for SeaRestTransport {
                 "Inline chunk {} response missing `attachment` field — \
                  server may have ignored the INLINE disposition and \
                  returned a CloudFetch response. Body: {}",
-                chunk_index, body
+                chunk_index,
+                String::from_utf8_lossy(&body)
             ))
         })?;
 
@@ -1484,7 +1490,8 @@ impl Transport for SeaRestTransport {
             Error::data_loss().message(format!(
                 "Inline chunk {} response carries `attachment` but no `row_count` — \
                  cannot derive next-fetch row_offset safely. Body: {}",
-                chunk_idx, body,
+                chunk_idx,
+                String::from_utf8_lossy(&body),
             ))
         })?;
         let next_chunk_index = chunks_response.next_chunk_index;
@@ -2297,7 +2304,7 @@ mod tests {
             attachment: None,
         };
 
-        let converted = SeaRestTransport::convert_result_data(&result).unwrap();
+        let converted = SeaRestTransport::convert_result_data(result).unwrap();
         assert!(converted.external_links.is_none());
         assert!(converted.inline_arrow_data.is_none());
     }
@@ -2317,7 +2324,7 @@ mod tests {
             attachment: Some(test_data.clone()),
         };
 
-        let converted = SeaRestTransport::convert_result_data(&result).unwrap();
+        let converted = SeaRestTransport::convert_result_data(result).unwrap();
         assert!(converted.inline_arrow_data.is_some());
         assert_eq!(converted.inline_arrow_data.unwrap(), test_data);
     }

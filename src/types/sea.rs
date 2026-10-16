@@ -286,18 +286,43 @@ pub struct ResultData {
 }
 
 /// Deserialize base64-encoded attachment field from JSON.
+///
+/// Decodes from the JSON string in place (borrowed when it has no escapes)
+/// rather than first copying a multi-MB attachment into an owned `String`.
 fn deserialize_base64_attachment<'de, D>(deserializer: D) -> Result<Option<Vec<u8>>, D::Error>
 where
     D: Deserializer<'de>,
 {
-    let opt: Option<String> = Option::deserialize(deserializer)?;
-    match opt {
-        Some(s) if !s.is_empty() => STANDARD
-            .decode(&s)
-            .map(Some)
-            .map_err(serde::de::Error::custom),
-        _ => Ok(None),
+    struct Base64Attachment;
+
+    impl<'de> serde::de::Visitor<'de> for Base64Attachment {
+        type Value = Option<Vec<u8>>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a base64-encoded string or null")
+        }
+
+        fn visit_str<E: serde::de::Error>(self, s: &str) -> Result<Self::Value, E> {
+            if s.is_empty() {
+                return Ok(None);
+            }
+            STANDARD.decode(s).map(Some).map_err(E::custom)
+        }
+
+        fn visit_none<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_unit<E: serde::de::Error>(self) -> Result<Self::Value, E> {
+            Ok(None)
+        }
+
+        fn visit_some<D2: Deserializer<'de>>(self, d: D2) -> Result<Self::Value, D2::Error> {
+            d.deserialize_str(self)
+        }
     }
+
+    deserializer.deserialize_option(Base64Attachment)
 }
 
 /// External link for CloudFetch download.
@@ -786,6 +811,28 @@ mod tests {
 
         let result: ResultData = serde_json::from_str(json).unwrap();
         assert!(result.attachment.is_none());
+    }
+
+    #[test]
+    fn test_result_data_with_escaped_base64_attachment() {
+        // `/` escaped as `\/` forces serde_json off the borrowed-str path.
+        // "\xff\xfe\xfd" in base64 is "//79".
+        let json = br#"{"attachment": "\/\/79"}"#;
+
+        let result: ResultData = serde_json::from_slice(json).unwrap();
+        assert_eq!(result.attachment.unwrap(), b"\xff\xfe\xfd");
+    }
+
+    #[test]
+    fn test_result_data_rejects_invalid_base64_attachment() {
+        let json = r#"{"attachment": "not base64!"}"#;
+        assert!(serde_json::from_str::<ResultData>(json).is_err());
+    }
+
+    #[test]
+    fn test_result_data_rejects_non_string_attachment() {
+        let json = r#"{"attachment": 42}"#;
+        assert!(serde_json::from_str::<ResultData>(json).is_err());
     }
 
     #[test]
