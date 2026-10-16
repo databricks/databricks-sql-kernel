@@ -488,7 +488,7 @@ fn rewrite_array(
 ) -> Result<ArrayRef> {
     if let Some(output_tag) = native_geo_tag(output_type)? {
         if matches!(array.data_type(), DataType::Utf8 | DataType::LargeUtf8) {
-            return text_to_native(array, output_type, output_tag.srid, path, parent_validity);
+            return text_to_native(array, output_type, output_tag, path, parent_validity);
         }
         validate_geo_source(array.data_type(), output_tag, path)?;
         if array.data_type() == output_type {
@@ -746,7 +746,7 @@ fn container_child_validity(
 fn text_to_native(
     array: &ArrayRef,
     output_type: &DataType,
-    type_srid: i32,
+    tag: GeoTag,
     path: &str,
     parent_validity: Option<&NullBuffer>,
 ) -> Result<ArrayRef> {
@@ -761,7 +761,7 @@ fn text_to_native(
                 values.iter(),
                 values.len(),
                 output_fields,
-                type_srid,
+                tag,
                 path,
                 parent_validity,
             )
@@ -772,7 +772,7 @@ fn text_to_native(
                 values.iter(),
                 values.len(),
                 output_fields,
-                type_srid,
+                tag,
                 path,
                 parent_validity,
             )
@@ -787,14 +787,21 @@ fn ewkt_values_to_native<'a>(
     values: impl Iterator<Item = Option<&'a str>>,
     len: usize,
     output_fields: &Fields,
-    type_srid: i32,
+    tag: GeoTag,
     path: &str,
     parent_validity: Option<&NullBuffer>,
 ) -> Result<ArrayRef> {
     let mut srids = Int32Builder::with_capacity(len);
     let mut wkbs = BinaryBuilder::with_capacity(len, len.saturating_mul(32));
     let mut nulls = NullBufferBuilder::new(len);
-    let fallback_srid = if type_srid >= 0 { type_srid } else { 0 };
+    let fallback_srid = if tag.srid >= 0 {
+        tag.srid
+    } else {
+        match tag.family {
+            GeoFamily::Geography => 4326,
+            GeoFamily::Geometry => 0,
+        }
+    };
 
     for (row, value) in values.enumerate() {
         if parent_validity.is_some_and(|validity| validity.is_null(row)) {
@@ -996,7 +1003,7 @@ fn skip_ascii_whitespace(bytes: &[u8], mut index: usize) -> usize {
 
 /// Split a standard-warehouse WKT / EWKT value into its row SRID and WKT
 /// body. An absent prefix uses the fixed logical SRID when one exists; `ANY`
-/// columns use zero because their type does not supply a row SRID.
+/// columns use the family default (4326 for geography, zero for geometry).
 fn split_ewkt(value: &str, fallback_srid: i32) -> std::result::Result<(i32, &str), String> {
     let value = value.trim();
     if value.is_empty() {
@@ -1660,23 +1667,36 @@ mod tests {
     }
 
     #[test]
-    fn unprefixed_text_uses_fixed_type_srid_and_any_uses_zero() {
-        for (type_srid, expected_row_srid) in [(4326, 4326), (-1, 0)] {
-            let array: ArrayRef = Arc::new(StringArray::from(vec!["POINT (1 2)"]));
-            let output = rewrite(
-                &array,
-                &geo_type(GeoFamily::Geography, type_srid),
-                "geography",
-            )
-            .unwrap();
-            let output = output.as_any().downcast_ref::<StructArray>().unwrap();
-            let srids = output
-                .column_by_name("srid")
-                .unwrap()
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .unwrap();
-            assert_eq!(srids.value(0), expected_row_srid);
+    fn unprefixed_text_uses_fixed_srid_or_family_default() {
+        for (family, type_srid, expected_row_srid) in [
+            (GeoFamily::Geography, 4326, 4326),
+            (GeoFamily::Geography, -1, 4326),
+            (GeoFamily::Geometry, 0, 0),
+            (GeoFamily::Geometry, 3857, 3857),
+            (GeoFamily::Geometry, -1, 0),
+        ] {
+            for array in [
+                Arc::new(StringArray::from(vec![Some("POINT (1 2)"), None])) as ArrayRef,
+                Arc::new(LargeStringArray::from(vec![Some("POINT (1 2)"), None])) as ArrayRef,
+            ] {
+                let output = rewrite(&array, &geo_type(family, type_srid), "g").unwrap();
+                let output = output.as_any().downcast_ref::<StructArray>().unwrap();
+                assert!(output.is_null(1));
+                let srids = output
+                    .column_by_name("srid")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                assert_eq!(srids.value(0), expected_row_srid);
+                let wkbs = output
+                    .column_by_name("wkb")
+                    .unwrap()
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap();
+                assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+            }
         }
     }
 
@@ -2042,46 +2062,49 @@ mod tests {
     }
 
     #[test]
-    fn text_geometry_converts_to_native_inside_nested_container() {
-        let values: ArrayRef =
-            Arc::new(StringArray::from(vec![Some("SRID=3857;POINT(1 2)"), None]));
-        let list: ArrayRef = Arc::new(ListArray::new(
-            Arc::new(Field::new("item", DataType::Utf8, true)),
-            OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 2])),
-            values,
-            Some(NullBuffer::from(vec![true, false])),
-        ));
-        let output_type = DataType::List(Arc::new(Field::new(
-            "item",
-            geo_type(GeoFamily::Geometry, -1),
-            true,
-        )));
+    fn text_geo_converts_to_native_inside_nested_container() {
+        for (family, text, expected_srid) in [
+            (GeoFamily::Geometry, "SRID=3857;POINT(1 2)", 3857),
+            (GeoFamily::Geometry, "POINT(1 2)", 0),
+            (GeoFamily::Geography, "SRID=4326;POINT(1 2)", 4326),
+            (GeoFamily::Geography, "POINT(1 2)", 4326),
+        ] {
+            let values: ArrayRef = Arc::new(StringArray::from(vec![Some(text), None]));
+            let list: ArrayRef = Arc::new(ListArray::new(
+                Arc::new(Field::new("item", DataType::Utf8, true)),
+                OffsetBuffer::new(ScalarBuffer::from(vec![0_i32, 2, 2])),
+                values,
+                Some(NullBuffer::from(vec![true, false])),
+            ));
+            let output_type =
+                DataType::List(Arc::new(Field::new("item", geo_type(family, -1), true)));
 
-        let output = rewrite(&list, &output_type, "nested_geometry").unwrap();
-        let output = output.as_any().downcast_ref::<ListArray>().unwrap();
-        assert_eq!(output.data_type(), &output_type);
-        assert!(output.is_null(1));
+            let output = rewrite(&list, &output_type, "nested_geo").unwrap();
+            let output = output.as_any().downcast_ref::<ListArray>().unwrap();
+            assert_eq!(output.data_type(), &output_type);
+            assert!(output.is_null(1));
 
-        let values = output
-            .values()
-            .as_any()
-            .downcast_ref::<StructArray>()
-            .unwrap();
-        assert!(values.is_null(1));
-        let srids = values
-            .column_by_name("srid")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<Int32Array>()
-            .unwrap();
-        let wkbs = values
-            .column_by_name("wkb")
-            .unwrap()
-            .as_any()
-            .downcast_ref::<BinaryArray>()
-            .unwrap();
-        assert_eq!(srids.value(0), 3857);
-        assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+            let values = output
+                .values()
+                .as_any()
+                .downcast_ref::<StructArray>()
+                .unwrap();
+            assert!(values.is_null(1));
+            let srids = values
+                .column_by_name("srid")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap();
+            let wkbs = values
+                .column_by_name("wkb")
+                .unwrap()
+                .as_any()
+                .downcast_ref::<BinaryArray>()
+                .unwrap();
+            assert_eq!(srids.value(0), expected_srid);
+            assert_eq!(wkbs.value(0), POINT_1_2_WKB);
+        }
     }
 
     #[test]
