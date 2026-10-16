@@ -323,7 +323,7 @@ impl ResultReaderFactory {
                         });
                         return self.create_inline_streaming_reader(
                             statement_id,
-                            inline_data.clone(),
+                            inline_data,
                             inline_chunk_index,
                             inline_row_offset,
                             inline_row_count,
@@ -548,12 +548,8 @@ impl ResultReaderFactory {
             total_row_count
         );
 
-        let provider = InlineArrowProvider::new(
-            statement_id,
-            inline_data.to_vec(),
-            compression,
-            total_row_count,
-        )?;
+        let provider =
+            InlineArrowProvider::new(statement_id, inline_data, compression, total_row_count)?;
 
         Ok(Box::new(InlineArrowReader::new(provider)))
     }
@@ -571,7 +567,7 @@ impl ResultReaderFactory {
     fn create_inline_streaming_reader(
         &self,
         statement_id: &str,
-        initial_attachment: Vec<u8>,
+        initial_attachment: &[u8],
         initial_chunk_index: i64,
         initial_row_offset: i64,
         initial_row_count: i64,

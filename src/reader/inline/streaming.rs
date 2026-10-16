@@ -225,7 +225,7 @@ impl InlineStreamingProvider {
     pub(crate) fn new(
         source: Arc<dyn InlineChunkSource>,
         statement_id: impl Into<String>,
-        initial_attachment: Vec<u8>,
+        initial_attachment: &[u8],
         initial_chunk_index: i64,
         initial_row_offset: i64,
         initial_row_count: i64,
@@ -237,7 +237,7 @@ impl InlineStreamingProvider {
     ) -> Result<Arc<Self>> {
         // Decode the initial chunk synchronously so we can return a
         // schema-bearing provider to the caller.
-        let initial_batches = parse_arrow_ipc(&initial_attachment, compression)?;
+        let initial_batches = parse_arrow_ipc(initial_attachment, compression)?;
 
         // Schema source priority:
         // 1. The first batch of the initial chunk (most-authoritative,
@@ -678,7 +678,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -715,7 +715,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -755,7 +755,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial.bytes.clone(),
+            &initial.bytes,
             initial.chunk_index,
             initial.row_offset,
             initial.row_count,
@@ -783,7 +783,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -822,7 +822,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -864,7 +864,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -910,7 +910,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            empty_bytes,
+            &empty_bytes,
             0,
             0,
             0,
@@ -944,7 +944,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -1005,7 +1005,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             c0.chunk_index,
             c0.row_offset,
             c0.row_count,
@@ -1075,7 +1075,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            initial_bytes,
+            &initial_bytes,
             0, // initial_chunk_index
             0, // initial_row_offset
             1, // initial_row_count
@@ -1148,7 +1148,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            build_ipc_bytes(&[10, 20]),
+            &build_ipc_bytes(&[10, 20]),
             0, // initial_chunk_index
             0, // initial_row_offset
             2, // initial_row_count
@@ -1183,7 +1183,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            build_ipc_bytes(&[1]),
+            &build_ipc_bytes(&[1]),
             0,
             0,
             1,
@@ -1243,7 +1243,7 @@ mod tests {
         let provider = InlineStreamingProvider::new(
             source,
             "stmt-1",
-            build_ipc_bytes(&[7, 8]),
+            &build_ipc_bytes(&[7, 8]),
             0,       // initial_chunk_index
             0,       // initial_row_offset
             2,       // initial_row_count

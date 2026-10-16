@@ -99,7 +99,7 @@ impl InlineArrowProvider {
     /// - If Arrow IPC parsing fails
     pub fn new(
         statement_id: &str,
-        attachment: Vec<u8>,
+        attachment: &[u8],
         compression: CompressionCodec,
         total_row_count: Option<i64>,
     ) -> Result<Self> {
@@ -123,7 +123,7 @@ impl InlineArrowProvider {
         );
 
         // Reuse the shared Arrow IPC parser (same format as CloudFetch)
-        let parsed = parse_arrow_ipc(&attachment, compression).map_err(|e| {
+        let parsed = parse_arrow_ipc(attachment, compression).map_err(|e| {
             Error::io().message(format!("Failed to parse inline Arrow data: {}", e))
         })?;
 
@@ -214,7 +214,7 @@ mod tests {
         let ipc_data = create_test_arrow_ipc(&[batch]);
 
         let mut provider =
-            InlineArrowProvider::new("test-stmt", ipc_data, CompressionCodec::None, None).unwrap();
+            InlineArrowProvider::new("test-stmt", &ipc_data, CompressionCodec::None, None).unwrap();
 
         // Check schema
         assert!(provider.schema().is_some());
@@ -247,7 +247,7 @@ mod tests {
         }
 
         let mut provider =
-            InlineArrowProvider::new("test-stmt", compressed, CompressionCodec::Lz4Frame, None)
+            InlineArrowProvider::new("test-stmt", &compressed, CompressionCodec::Lz4Frame, None)
                 .unwrap();
 
         let batch = provider.next_batch().unwrap().unwrap();
@@ -261,7 +261,7 @@ mod tests {
         let ipc_data = create_test_arrow_ipc(&[batch1, batch2]);
 
         let mut provider =
-            InlineArrowProvider::new("test-stmt", ipc_data, CompressionCodec::None, None).unwrap();
+            InlineArrowProvider::new("test-stmt", &ipc_data, CompressionCodec::None, None).unwrap();
 
         // First batch
         let batch = provider.next_batch().unwrap().unwrap();
@@ -278,7 +278,7 @@ mod tests {
     #[test]
     fn test_inline_provider_with_empty_data() {
         let provider =
-            InlineArrowProvider::new("test-stmt", vec![], CompressionCodec::None, None).unwrap();
+            InlineArrowProvider::new("test-stmt", &[], CompressionCodec::None, None).unwrap();
 
         assert!(provider.schema().is_none());
         assert!(!provider.has_more());
@@ -289,7 +289,7 @@ mod tests {
         let invalid_data = b"this is not valid arrow ipc data".to_vec();
 
         let result =
-            InlineArrowProvider::new("test-stmt", invalid_data, CompressionCodec::None, None);
+            InlineArrowProvider::new("test-stmt", &invalid_data, CompressionCodec::None, None);
         assert!(result.is_err());
     }
 
@@ -329,7 +329,7 @@ mod tests {
         let batch = create_test_batch(11);
         let ipc = create_test_arrow_ipc(&[batch]);
         let mut provider =
-            InlineArrowProvider::new("test-stmt", ipc, CompressionCodec::None, Some(10)).unwrap();
+            InlineArrowProvider::new("test-stmt", &ipc, CompressionCodec::None, Some(10)).unwrap();
         let mut total = 0;
         while let Some(b) = provider.next_batch().unwrap() {
             total += b.num_rows();
