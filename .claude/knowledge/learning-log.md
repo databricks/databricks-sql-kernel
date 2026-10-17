@@ -348,6 +348,12 @@ author, follow-up, and review runs.
 - **Context:** In PR #399 a reviewer flagged (F1) that `token_exchange_error` classifies via `is_non_retryable_status`, which reads the static `IDEMPOTENT_NON_RETRYABLE` list and ignores per-session `override_retryable_codes` that the actual `RetryStrategy` honors — so the post-exhaustion label can disagree with what the retry ladder actually did (e.g. an overridden-retryable 400 gets mislabeled a hard auth rejection).
   **Rule:** Classify a post-retry failure from what the retry ladder actually decided (carry a retryable / retries-exhausted marker on the Error), not by re-deriving from a static status-code list — the two diverge whenever per-session retry overrides are in play.
 
+### 2026-10-17: learnings since 2026-10-16T07:30:35Z
+- **Context:** PR #401 reworked SEA response parsing to avoid copying multi-MB inline-Arrow bodies: `response.text()` + `serde_json::from_str` became `response.bytes()` + `serde_json::from_slice`, and `convert_result_data` / the inline provider constructors switched from taking `Vec<u8>`/`.clone()` to borrowing `&[u8]`.
+  **Rule:** When parsing large HTTP response bodies (inline Arrow / CloudFetch payloads), read with `response.bytes()` and deserialize via `serde_json::from_slice` rather than `.text()` + `from_str`, and thread the attachment as `&[u8]` down to the Arrow parser instead of owning/cloning it — `.text()` forces a full UTF-8 copy of the body and `Vec<u8>` params add avoidable clones.
+- **Context:** PR #401 replaced the `Option<String>`-based base64 attachment deserializer with a custom serde `Visitor` so the base64 decodes directly from serde_json's borrowed `&str` (zero-copy when the JSON string has no escapes). The added test deliberately used `"\/\/79"` (an escaped `/`) because an escape sequence forces serde_json off its borrowed-string fast path onto the owned-string path.
+  **Rule:** A zero-copy/borrowing serde deserializer has two code paths (borrowed `&str` vs owned `String`); to exercise the non-borrowed path in tests, feed JSON containing an escape sequence (e.g. `\/`) — plain unescaped strings only ever hit the borrowed path and silently leave the owned branch untested.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
