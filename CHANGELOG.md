@@ -14,6 +14,67 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.2.0] - 2026-10-19
+
+### Added
+- Thrift-native metadata routing with compatible public-schema casts and
+  one-based `getColumns` ordinals.
+- Native Arrow `GEOMETRY` / `GEOGRAPHY` results as tagged `struct<srid,wkb>`
+  values, including nested values and empty-result schemas. The kernel uses
+  the structured logical manifest to reconcile attachments without copying
+  child buffers.
+- Typed client-side `GEOMETRY` / `GEOGRAPHY` result representation selection.
+  The kernel normalizes both standard-warehouse WKT / EWKT and Reyden's native
+  SRID+WKB struct to the requested representation. No representation setting
+  is sent to SEA.
+- The default-enabled `kernel_session_config_set_enable_geospatial_support()`
+  C ABI setting selects native SRID+WKB Arrow results when enabled and
+  WKT / EWKT strings when disabled.
+- Authenticated connector-service feature flags with a bounded, process-wide
+  workspace cache and kernel-internal typed readers for all six SAFE types.
+- Result schemas carry the Thrift-compatible `Spark:DataType:SqlName` and
+  optional `Spark:DataType:JsonType` field metadata from the SEA manifest.
+- Caller-driven asynchronous statement submission, status polling, result
+  materialization, query IDs, row counts, cancellation, and close over the C ABI.
+- Nonblocking result-batch fetching through Rust `try_next_batch()` and the C ABI.
+- `Statement::submit_with_timeout()` enforces one client deadline across
+  submission and asynchronous status polling, with cancellation on expiry.
+
+### Changed
+- Native SRID+WKB is now the default geospatial result representation.
+- Route function metadata through the Thrift-native metadata path when
+  supported by the server.
+- Authenticated SEA requests use `Accept-Encoding: identity` by default to
+  avoid gzipping inline LZ4-compressed Arrow results. Response compression can
+  be re-enabled through `HttpConfig` or the C ABI.
+- Feature flags are fetched after kernel authentication and before session
+  creation; sessions read process-cache values instead of retaining snapshots.
+- Kernel telemetry enablement follows the connector-service feature flag when
+  the client leaves it unspecified; explicit client settings take precedence.
+- **Breaking (Rust API):** `TelemetryConfig::enabled` changes from `bool` to
+  `Option<bool>`. `None` defers to the workspace feature flag; use
+  `with_enabled` / `set_enabled` or wrap explicit values in `Some(...)`.
+- A backward-compatible C telemetry-config v2 setter uses nullable config and
+  `has_enabled` to preserve unspecified client enablement.
+- Synchronous `execute()` waits for a terminal server state without the implicit
+  600-second client timeout; explicit execution deadlines remain supported.
+- Inline Arrow result decoding avoids redundant response and attachment copies.
+
+### Updated
+- Updated `quinn-proto` to 0.11.18 to address security scan findings.
+
+### Fixed
+- `list_tables` matches `table_types` case-sensitively, matching Thrift
+  `GetTables`: `["table"]` no longer matches `TABLE` rows.
+- Primary-key metadata resolves missing catalog and schema independently from
+  the current session and preserves explicit empty names.
+- Foreign-key metadata preserves server-provided update and delete rules as
+  nullable `Int16` values.
+- Empty ARRAY result schemas use the Thrift-compatible `element` child name,
+  including nested arrays.
+- M2M and Azure service-principal token exchanges retry transient failures;
+  exhausted transient failures retain their status-based error codes.
+
 ## [v1.1.0] - 2026-09-23
 
 ### Added

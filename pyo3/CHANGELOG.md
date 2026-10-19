@@ -14,6 +14,24 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.2.0] - 2026-10-19
+
+### Added
+- The default-enabled `Session(..., enable_geospatial_support=...)` argument
+  selects native SRID+WKB Arrow results when enabled and WKT / EWKT strings
+  when disabled.
+- `Session(..., sea_response_compression_enabled=...)` opts back into HTTP
+  compression for bandwidth-constrained SEA connections.
+
+### Changed
+- An omitted `telemetry_enabled` allows workspace feature-flag enablement;
+  an explicit `True` or `False` still takes precedence.
+
+### Fixed
+- Fixed an intermittent hang in `Session.close()` or handle cleanup when a
+  runtime worker was forwarding a log record to Python `logging` during
+  runtime shutdown.
+
 ## [v1.1.0] - 2026-09-23
 
 ### Added
