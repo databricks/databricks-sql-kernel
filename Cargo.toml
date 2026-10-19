@@ -60,6 +60,8 @@ arrow-ipc = "59"
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+prost = "0.13"
+tonic = { version = "0.12", default-features = false, features = ["codegen", "prost", "transport", "tls-native-roots"] }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -211,6 +213,9 @@ tls-rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
 [lib]
 name = "databricks_sql_kernel"
 crate-type = ["lib", "cdylib", "staticlib"]
+
+[build-dependencies]
+tonic-build = "0.12"
 
 # Workspace — the kernel is its own single-member workspace root.
 #

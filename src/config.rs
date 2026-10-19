@@ -1509,6 +1509,8 @@ pub enum TransportMode {
     /// Statement Execution API over REST. Default.
     #[default]
     SeaRest,
+    /// Statement Execution API over gRPC.
+    SeaGrpc,
 }
 
 // ─── Client-side result representation ─────────────────────────────────────

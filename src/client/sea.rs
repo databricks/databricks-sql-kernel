@@ -17,6 +17,7 @@
 //! This module implements the `Transport` trait using the Databricks
 //! SQL Statement Execution API (REST-based).
 
+use crate::client::grpc::SeaGrpcClient;
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
@@ -174,6 +175,7 @@ pub(crate) struct SeaRestTransport {
     session_version: AtomicI64,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
+    grpc_client: Option<SeaGrpcClient>,
 }
 
 impl std::fmt::Debug for SeaRestTransport {
@@ -215,7 +217,29 @@ impl SeaRestTransport {
             session_version: AtomicI64::new(NO_SESSION_VERSION),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
+            grpc_client: None,
         }
+    }
+
+    pub fn new_grpc(
+        http_client: Arc<DatabricksHttpClient>,
+        host: impl Into<String>,
+        warehouse_id: impl Into<String>,
+        config: TransportConfig,
+    ) -> Result<Self> {
+        let host = host.into();
+        let warehouse_id = warehouse_id.into();
+        let grpc_client = SeaGrpcClient::new(&host, warehouse_id.clone(), http_client.clone())?;
+        Ok(Self {
+            http_client,
+            host,
+            warehouse_id,
+            config,
+            session_version: AtomicI64::new(NO_SESSION_VERSION),
+            reader_factory: OnceLock::new(),
+            runtime_handle: OnceLock::new(),
+            grpc_client: Some(grpc_client),
+        })
     }
 
     /// Set the reader factory and runtime handle. Must be called once after wrapping in `Arc`.
@@ -348,6 +372,13 @@ impl SeaRestTransport {
         statement_id: &str,
         session_attribution: SessionAttribution,
     ) -> Result<ExecuteResponse> {
+        if let Some(grpc) = &self.grpc_client {
+            let sea_response = grpc.get_statement_result(statement_id).await?;
+            if session_attribution == SessionAttribution::Current {
+                self.observe_session_version(sea_response.status.session_version);
+            }
+            return Self::convert_response(sea_response);
+        }
         let url = format!("{}/statements/{}", self.base_url(), statement_id);
 
         debug!("Getting statement status at {}", url);
@@ -611,6 +642,30 @@ impl SeaRestTransport {
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
+        if let Some(grpc) = &self.grpc_client {
+            let mut headers = Vec::new();
+            if request_type == RequestType::ExecuteMetadataQuery {
+                headers.push((SEA_SYNC_METADATA_HEADER, "true"));
+            }
+            if let Some(operation) = metadata_operation {
+                headers.push((METADATA_OPERATION_HEADER, operation.header_value()));
+                if operation.supports_thrift_native() {
+                    headers.push((REQUIRE_THRIFT_NATIVE_METADATA_HEADER, "true"));
+                }
+            }
+            let sea_response = grpc
+                .execute_statement(
+                    session_id,
+                    self.current_session_version().map(|v| v.version_id),
+                    sql,
+                    params,
+                    self.config.cloudfetch_enabled,
+                    &headers,
+                )
+                .await?;
+            self.observe_session_version(sea_response.status.session_version);
+            return Self::convert_response(sea_response);
+        }
         let url = format!("{}/statements", self.base_url());
 
         // Select the result disposition per statement from the
@@ -1101,6 +1156,16 @@ impl Transport for SeaRestTransport {
         schema: Option<&str>,
         session_config: HashMap<String, String>,
     ) -> Result<SessionInfo> {
+        if let Some(grpc) = &self.grpc_client {
+            let response = grpc.create_session(catalog, schema, session_config).await?;
+            let session_id = response.session_id.ok_or_else(|| {
+                Error::data_loss().message("gRPC CreateSession response missing session_id")
+            })?;
+            self.observe_session_version(response.session_version.map(|v| SessionVersion {
+                version_id: v.version_id.unwrap_or_default(),
+            }));
+            return Ok(SessionInfo { session_id });
+        }
         let url = format!("{}/sessions", self.base_url());
 
         let request_body = CreateSessionRequest {
@@ -1149,6 +1214,12 @@ impl Transport for SeaRestTransport {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
+        if let Some(grpc) = &self.grpc_client {
+            if let Err(e) = grpc.terminate_session(session_id).await {
+                crate::klog::warn!(session_id = %session_id, error = %e, "terminate_session failed; server-side session will be reclaimed by idle timeout");
+            }
+            return Ok(());
+        }
         // SEA requires `warehouse_id` as a query parameter on
         // `DELETE /api/2.0/sql/sessions/{id}`. Without it the server
         // returns HTTP 400 ("Required field is not specified:
@@ -1354,6 +1425,12 @@ impl Transport for SeaRestTransport {
         chunk_index: i64,
         row_offset: i64,
     ) -> Result<ChunkLinkFetchResult> {
+        if let Some(grpc) = &self.grpc_client {
+            let chunks_response = grpc
+                .get_result_data(statement_id, chunk_index, row_offset)
+                .await?;
+            return derive_chunk_fetch_result(chunks_response);
+        }
         let url = self.result_chunks_url(statement_id, chunk_index, row_offset);
 
         debug!("Getting result chunks at {}", url);
@@ -1399,6 +1476,30 @@ impl Transport for SeaRestTransport {
         chunk_index: i64,
         row_offset: i64,
     ) -> Result<InlineChunkFetchResult> {
+        if let Some(grpc) = &self.grpc_client {
+            let chunks_response = grpc
+                .get_result_data(statement_id, chunk_index, row_offset.max(0))
+                .await?;
+            let bytes = chunks_response.attachment.ok_or_else(|| {
+                Error::data_loss().message(format!(
+                    "gRPC inline chunk {chunk_index} response missing attachment"
+                ))
+            })?;
+            let chunk_index = chunks_response.chunk_index.unwrap_or(chunk_index);
+            let row_offset = chunks_response.row_offset.unwrap_or(row_offset.max(0));
+            let row_count = chunks_response.row_count.ok_or_else(|| {
+                Error::data_loss().message(format!(
+                    "gRPC inline chunk {chunk_index} response missing row_count"
+                ))
+            })?;
+            return Ok(InlineChunkFetchResult {
+                bytes,
+                chunk_index,
+                row_offset,
+                row_count,
+                next_chunk_index: chunks_response.next_chunk_index,
+            });
+        }
         // Same endpoint as CloudFetch chunk-link fetching, but on
         // the inline-Arrow path the response carries Arrow IPC bytes
         // in `attachment` instead of `external_links`. `row_offset`
@@ -1519,6 +1620,9 @@ impl Transport for SeaRestTransport {
     }
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
+        if let Some(grpc) = &self.grpc_client {
+            return grpc.cancel_statement(statement_id).await;
+        }
         let url = format!("{}/statements/{}/cancel", self.base_url(), statement_id);
 
         debug!("Canceling statement at {}", url);
@@ -1542,6 +1646,9 @@ impl Transport for SeaRestTransport {
     }
 
     async fn close_statement(&self, statement_id: &str) -> Result<()> {
+        if let Some(grpc) = &self.grpc_client {
+            return grpc.close_statement(statement_id).await;
+        }
         let url = format!("{}/statements/{}", self.base_url(), statement_id);
 
         debug!("Closing statement at {}", url);

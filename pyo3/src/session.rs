@@ -410,6 +410,7 @@ impl Session {
         telemetry_circuit_breaker_enabled=None,
         telemetry_circuit_breaker_threshold=None,
         telemetry_circuit_breaker_timeout_ms=None,
+        use_sea_grpc=false,
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -477,6 +478,7 @@ impl Session {
         telemetry_circuit_breaker_enabled: Option<bool>,
         telemetry_circuit_breaker_threshold: Option<u32>,
         telemetry_circuit_breaker_timeout_ms: Option<u64>,
+        use_sea_grpc: bool,
     ) -> PyResult<Self> {
         // Resolve auth_type. Explicit `auth_type` always wins. When
         // omitted, default to "pat" if `access_token` was passed
@@ -654,6 +656,9 @@ impl Session {
             builder = builder.geospatial_result_representation(geospatial_result_representation(
                 enable_geospatial_support,
             ));
+            if use_sea_grpc {
+                builder = builder.transport(databricks_sql_kernel::TransportMode::SeaGrpc);
+            }
             // Merge result-config knobs into one `ResultConfig` so two
             // toggles don't clobber each other when both are set.
             if complex_types_as_json || intervals_as_string {

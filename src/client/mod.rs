@@ -31,6 +31,8 @@
 //! [`transport`]: self::transport
 //! [`sea`]: self::sea
 
+pub(crate) mod grpc;
+pub(crate) mod grpc_proto;
 pub mod http;
 pub mod retry;
 pub mod sea;

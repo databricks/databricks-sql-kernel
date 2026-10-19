@@ -395,12 +395,20 @@ impl Session {
             cloudfetch_enabled: config.result.cloudfetch_enabled,
             ..TransportConfig::default()
         };
-        let sea = Arc::new(SeaRestTransport::new(
-            http_client.clone(),
-            host.clone(),
-            warehouse_id.clone(),
-            transport_config,
-        ));
+        let sea = Arc::new(match config.transport.unwrap_or_default() {
+            TransportMode::SeaRest => SeaRestTransport::new(
+                http_client.clone(),
+                host.clone(),
+                warehouse_id.clone(),
+                transport_config,
+            ),
+            TransportMode::SeaGrpc => SeaRestTransport::new_grpc(
+                http_client.clone(),
+                host.clone(),
+                warehouse_id.clone(),
+                transport_config,
+            )?,
+        });
         let reader_factory = ResultReaderFactory::new(
             sea.clone() as Arc<dyn Transport>,
             http_client.clone(),
