@@ -54,7 +54,7 @@ pub(crate) struct SessionInner {
 
 #[derive(Default)]
 struct TelemetryKwargs {
-    enabled: bool,
+    enabled: Option<bool>,
     batch_size: Option<usize>,
     flush_interval_ms: Option<u64>,
     max_retries: Option<u32>,
@@ -67,7 +67,7 @@ struct TelemetryKwargs {
 
 impl TelemetryKwargs {
     fn is_mentioned(&self) -> bool {
-        self.enabled
+        self.enabled.is_some()
             || self.batch_size.is_some()
             || self.flush_interval_ms.is_some()
             || self.max_retries.is_some()
@@ -113,7 +113,9 @@ fn build_telemetry_config(
     }
 
     let mut telemetry = databricks_sql_kernel::TelemetryConfig::default();
-    telemetry.enabled = options.enabled;
+    if let Some(enabled) = options.enabled {
+        telemetry.set_enabled(enabled);
+    }
     if let Some(v) = options.batch_size {
         telemetry.batch_size = v;
     }
@@ -399,7 +401,7 @@ impl Session {
         process_name=None,
         complex_types_as_json=false,
         intervals_as_string=false,
-        telemetry_enabled=false,
+        telemetry_enabled=None,
         telemetry_batch_size=None,
         telemetry_flush_interval_ms=None,
         telemetry_max_retries=None,
@@ -466,7 +468,7 @@ impl Session {
         process_name: Option<String>,
         complex_types_as_json: bool,
         intervals_as_string: bool,
-        telemetry_enabled: bool,
+        telemetry_enabled: Option<bool>,
         telemetry_batch_size: Option<usize>,
         telemetry_flush_interval_ms: Option<u64>,
         telemetry_max_retries: Option<u32>,
@@ -779,7 +781,7 @@ mod send_sync_tests {
     #[test]
     fn telemetry_kwargs_map_to_kernel_config() {
         let telemetry = build_telemetry_config(TelemetryKwargs {
-            enabled: true,
+            enabled: Some(true),
             batch_size: Some(25),
             flush_interval_ms: Some(1_000),
             max_retries: Some(2),
@@ -791,7 +793,7 @@ mod send_sync_tests {
         })
         .expect("valid telemetry config");
 
-        assert!(telemetry.enabled);
+        assert_eq!(telemetry.enabled, Some(true));
         assert_eq!(telemetry.batch_size, 25);
         assert_eq!(
             telemetry.flush_interval,

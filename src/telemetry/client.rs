@@ -169,7 +169,7 @@ mod tests {
     async fn batch_size_triggers_background_flush() {
         let exporter = CapturingTelemetryExporter::default();
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             batch_size: 2,
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
@@ -199,7 +199,7 @@ mod tests {
     async fn enqueue_from_non_runtime_thread_uses_client_runtime() {
         let exporter = CapturingTelemetryExporter::default();
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             batch_size: 1,
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
@@ -232,7 +232,7 @@ mod tests {
     async fn interval_triggers_flush_before_batch_size() {
         let exporter = CapturingTelemetryExporter::default();
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             batch_size: 100,
             flush_interval: Duration::from_millis(20),
             ..TelemetryConfig::default()
@@ -260,7 +260,7 @@ mod tests {
     async fn close_flushes_pending_events_and_drops_late_enqueue() {
         let exporter = CapturingTelemetryExporter::default();
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             batch_size: 100,
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()

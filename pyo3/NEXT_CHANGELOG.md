@@ -21,6 +21,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Changed
 
+- An omitted `telemetry_enabled` now allows workspace feature-flag enablement;
+  an explicit `True` or `False` still takes precedence.
+
 ### Updated
 
 ### Fixed

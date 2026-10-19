@@ -182,7 +182,7 @@ mod tests {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
 
@@ -200,7 +200,7 @@ mod tests {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
 
@@ -223,7 +223,7 @@ mod tests {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
 
@@ -239,7 +239,7 @@ mod tests {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
 
@@ -260,7 +260,7 @@ mod tests {
         let manager = Box::leak(Box::new(TelemetryClientManager::default()));
         let exporter: Arc<dyn TelemetryExporter> = Arc::new(CapturingTelemetryExporter::default());
         let config = TelemetryConfig {
-            enabled: true,
+            enabled: Some(true),
             ..TelemetryConfig::default()
         };
 

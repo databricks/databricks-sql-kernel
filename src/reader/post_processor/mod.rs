@@ -492,6 +492,7 @@ mod tests {
             type_precision: None,
             type_scale: None,
             type_interval_type: None,
+            type_json: None,
         }
     }
 
@@ -573,6 +574,13 @@ mod tests {
                 .field(0)
                 .metadata()
                 .get(metadata_keys::TYPE_NAME),
+            Some(&"VARIANT".to_string())
+        );
+        assert_eq!(
+            out.schema()
+                .field(0)
+                .metadata()
+                .get(metadata_keys::SPARK_SQL_NAME),
             Some(&"VARIANT".to_string())
         );
     }

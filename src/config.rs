@@ -1386,11 +1386,18 @@ pub struct LoggingConfig {
 /// driver telemetry envelope. Telemetry failures are fail-open: export
 /// errors are logged at trace/debug level and never change user operation
 /// results.
+///
+/// An explicit [`enabled`] value takes precedence over the workspace feature
+/// flag. `None` defers to that flag and ultimately defaults to disabled.
+///
+/// [`set_enabled`]: Self::set_enabled
+/// [`with_enabled`]: Self::with_enabled
+/// [`enabled`]: Self::enabled
 #[non_exhaustive]
 #[derive(Clone)]
 pub struct TelemetryConfig {
-    /// Whether telemetry collection is enabled.
-    pub enabled: bool,
+    /// Explicit client choice. `None` defers to the workspace feature flag.
+    pub enabled: Option<bool>,
 
     /// Number of telemetry events to buffer before triggering a flush.
     pub batch_size: usize,
@@ -1449,7 +1456,7 @@ impl std::fmt::Debug for TelemetryConfig {
 impl Default for TelemetryConfig {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: None,
             batch_size: 100,
             flush_interval: Duration::from_secs(5),
             max_retries: 3,
@@ -1465,6 +1472,19 @@ impl Default for TelemetryConfig {
 }
 
 impl TelemetryConfig {
+    /// Explicitly enable or disable telemetry for this client.
+    ///
+    /// This setting takes precedence over workspace feature flags.
+    pub fn set_enabled(&mut self, enabled: bool) {
+        self.enabled = Some(enabled);
+    }
+
+    /// Builder-style form of [`Self::set_enabled`].
+    pub fn with_enabled(mut self, enabled: bool) -> Self {
+        self.set_enabled(enabled);
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn with_exporter(
         mut self,

@@ -22,6 +22,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Changed
 
+- An omitted `telemetryEnabled` now allows workspace feature-flag enablement;
+  an explicit `true` or `false` still takes precedence.
+
 ### Updated
 
 ### Fixed

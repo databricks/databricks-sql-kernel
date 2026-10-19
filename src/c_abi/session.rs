@@ -44,6 +44,22 @@ pub struct kernel_session_t {
     _private: [u8; 0],
 }
 
+/// C-compatible telemetry configuration with optional enablement.
+///
+/// `has_enabled = false` applies the tuning fields without overriding the
+/// workspace feature flag. A null pointer to this struct leaves telemetry
+/// configuration unchanged.
+#[repr(C)]
+pub struct KernelTelemetryConfig {
+    pub has_enabled: bool,
+    pub enabled: bool,
+    pub batch_size: usize,
+    pub flush_interval_ms: u64,
+    pub max_retries: u32,
+    pub retry_delay_ms: u64,
+    pub close_flush_timeout_ms: u64,
+}
+
 /// How the caller chose to identify the warehouse.
 enum ConnectionSpec {
     /// `host` + bare `warehouse_id`.
@@ -768,39 +784,66 @@ pub unsafe extern "C" fn kernel_session_config_set_telemetry_config(
     retry_delay_ms: u64,
     close_flush_timeout_ms: u64,
 ) -> KernelStatusCode {
-    set_on_config(config, |c| {
-        if batch_size == 0 {
-            return Err(Error::invalid_argument().message("telemetry batch_size must be > 0"));
-        }
-        if flush_interval_ms == 0 {
-            return Err(
-                Error::invalid_argument().message("telemetry flush_interval_ms must be > 0")
-            );
-        }
-        if close_flush_timeout_ms == 0 {
-            return Err(
-                Error::invalid_argument().message("telemetry close_flush_timeout_ms must be > 0")
-            );
-        }
+    let telemetry_config = KernelTelemetryConfig {
+        has_enabled: true,
+        enabled,
+        batch_size,
+        flush_interval_ms,
+        max_retries,
+        retry_delay_ms,
+        close_flush_timeout_ms,
+    };
+    set_on_config(config, |c| apply_telemetry_config(c, &telemetry_config))
+}
 
-        // Preserve any circuit breaker knobs already set on this config so the
-        // two telemetry setters are order-independent: calling
-        // `set_telemetry_circuit_breaker_config` before this setter no longer
-        // silently discards the breaker configuration.
-        c.telemetry = TelemetryConfig {
-            enabled,
-            batch_size,
-            flush_interval: Duration::from_millis(flush_interval_ms),
-            max_retries,
-            retry_delay: Duration::from_millis(retry_delay_ms),
-            close_flush_timeout: Duration::from_millis(close_flush_timeout_ms),
-            circuit_breaker_enabled: c.telemetry.circuit_breaker_enabled,
-            circuit_breaker_threshold: c.telemetry.circuit_breaker_threshold,
-            circuit_breaker_timeout: c.telemetry.circuit_breaker_timeout,
-            ..Default::default()
+/// Configure telemetry through a nullable C-compatible config object.
+///
+/// Passing `telemetry_config = NULL` leaves the kernel defaults untouched.
+/// When `has_enabled` is false, the tuning fields are applied without setting a
+/// local enablement override, so the workspace feature flag remains effective.
+///
+/// # Safety
+/// `config` must be a live config handle. A non-null `telemetry_config` must
+/// point to a readable [`KernelTelemetryConfig`] for the duration of this call.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_telemetry_config_v2(
+    config: *mut KernelSessionConfig,
+    telemetry_config: *const KernelTelemetryConfig,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        let Some(telemetry_config) = telemetry_config.as_ref() else {
+            return Ok(());
         };
-        Ok(())
+        apply_telemetry_config(c, telemetry_config)
     })
+}
+
+fn apply_telemetry_config(
+    config: &mut KernelSessionConfig,
+    telemetry_config: &KernelTelemetryConfig,
+) -> crate::Result<()> {
+    if telemetry_config.batch_size == 0 {
+        return Err(Error::invalid_argument().message("telemetry batch_size must be > 0"));
+    }
+    if telemetry_config.flush_interval_ms == 0 {
+        return Err(Error::invalid_argument().message("telemetry flush_interval_ms must be > 0"));
+    }
+    if telemetry_config.close_flush_timeout_ms == 0 {
+        return Err(
+            Error::invalid_argument().message("telemetry close_flush_timeout_ms must be > 0")
+        );
+    }
+
+    config.telemetry.batch_size = telemetry_config.batch_size;
+    config.telemetry.flush_interval = Duration::from_millis(telemetry_config.flush_interval_ms);
+    config.telemetry.max_retries = telemetry_config.max_retries;
+    config.telemetry.retry_delay = Duration::from_millis(telemetry_config.retry_delay_ms);
+    config.telemetry.close_flush_timeout =
+        Duration::from_millis(telemetry_config.close_flush_timeout_ms);
+    if telemetry_config.has_enabled {
+        config.telemetry.set_enabled(telemetry_config.enabled);
+    }
+    Ok(())
 }
 
 /// Configure telemetry circuit breaker behavior.
@@ -2859,7 +2902,7 @@ mod tests {
             );
 
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert!(telemetry.enabled);
+            assert_eq!(telemetry.enabled, Some(true));
             assert_eq!(telemetry.batch_size, 25);
             assert_eq!(telemetry.flush_interval, Duration::from_millis(1_000));
             assert_eq!(telemetry.max_retries, 2);
@@ -2871,6 +2914,87 @@ mod tests {
             );
             assert_eq!(telemetry.circuit_breaker_threshold, 5);
             assert_eq!(telemetry.circuit_breaker_timeout, Duration::from_secs(60));
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_v2_preserves_unspecified_enablement() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let telemetry_config = KernelTelemetryConfig {
+                has_enabled: false,
+                enabled: false,
+                batch_size: 25,
+                flush_interval_ms: 1_000,
+                max_retries: 2,
+                retry_delay_ms: 50,
+                close_flush_timeout_ms: 2_500,
+            };
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_config_v2(config, &telemetry_config),
+                KernelStatusCode::Success
+            );
+
+            let telemetry = &config.as_ref().unwrap().telemetry;
+            assert_eq!(telemetry.enabled, None);
+            assert_eq!(telemetry.batch_size, 25);
+            assert_eq!(telemetry.flush_interval, Duration::from_millis(1_000));
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_v2_explicit_false_overrides_feature_flag() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            let telemetry_config = KernelTelemetryConfig {
+                has_enabled: true,
+                enabled: false,
+                batch_size: 100,
+                flush_interval_ms: 5_000,
+                max_retries: 3,
+                retry_delay_ms: 100,
+                close_flush_timeout_ms: 5_000,
+            };
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_config_v2(config, &telemetry_config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(config.as_ref().unwrap().telemetry.enabled, Some(false));
+
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn set_telemetry_config_v2_null_leaves_defaults_untouched() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+
+            assert_eq!(
+                kernel_session_config_set_telemetry_config_v2(config, std::ptr::null()),
+                KernelStatusCode::Success
+            );
+            let telemetry = &config.as_ref().unwrap().telemetry;
+            assert_eq!(telemetry.enabled, None);
+            assert_eq!(telemetry.batch_size, 100);
 
             kernel_session_config_free(config);
         }
@@ -2927,7 +3051,7 @@ mod tests {
             );
 
             let telemetry = &config.as_ref().unwrap().telemetry;
-            assert!(telemetry.enabled);
+            assert_eq!(telemetry.enabled, Some(true));
             assert_eq!(telemetry.batch_size, 10);
             assert!(
                 !telemetry.circuit_breaker_enabled,
@@ -2994,7 +3118,7 @@ mod tests {
                 KernelStatusCode::InvalidArgument
             );
             assert!(
-                !config.as_ref().unwrap().telemetry.enabled,
+                config.as_ref().unwrap().telemetry.enabled.is_none(),
                 "rejected calls must leave default disabled telemetry"
             );
 
@@ -3030,7 +3154,7 @@ mod tests {
 
             let exporter = CapturingTelemetryExporter::default();
             let telemetry = TelemetryConfig {
-                enabled: true,
+                enabled: Some(true),
                 ..Default::default()
             }
             .with_exporter(std::sync::Arc::new(exporter.clone()));

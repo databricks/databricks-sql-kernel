@@ -27,6 +27,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - Add authenticated connector-service feature flags with a bounded,
   process-wide workspace cache and kernel-internal typed readers for all six
   SAFE types.
+- Result schemas now carry the Thrift-compatible `Spark:DataType:SqlName`
+  field metadata key, set to the manifest's `type_text`, matching Thrift
+  results and the C# ADBC SEA path.
+- Result schemas copy the manifest's optional `type_json` into the
+  Thrift-compatible `Spark:DataType:JsonType` field metadata key.
 
 ### Changed
 
@@ -39,10 +44,22 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - Feature flags are fetched after kernel authentication and before session
   creation; sessions read process-cache values instead of retaining snapshots.
+- Kernel telemetry enablement now follows the connector-service Kernel feature
+  flag when the client leaves it unspecified; explicit client enable/disable
+  settings take precedence.
+- **Breaking (Rust API):** `TelemetryConfig::enabled` changes type from `bool`
+  to `Option<bool>`, where `None` defers to the workspace feature flag. Direct
+  Rust consumers that read or assign this public field must migrate (e.g. use
+  the new `with_enabled`/`set_enabled` helpers or wrap values in `Some(..)`).
+- Added a backward-compatible C telemetry-config v2 setter whose nullable
+  config and `has_enabled` field preserve unspecified client enablement.
 
 ### Updated
 
 ### Fixed
+
+- `list_tables` now matches `table_types` case-sensitively, matching Thrift
+  `GetTables`: `["table"]` no longer matches `TABLE` rows.
 
 ---
 *Note: When making changes, please add your change under the appropriate

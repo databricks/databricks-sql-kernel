@@ -41,6 +41,7 @@ use oauth2::{EmptyExtraTokenFields, StandardTokenResponse, TokenResponse as _};
 use tokio::runtime::Handle as RuntimeHandle;
 
 use crate::auth::oauth::jwt_key::JwtSigningKey;
+use crate::auth::oauth::m2m::token_exchange_error;
 use crate::auth::oauth::oidc::OidcEndpoints;
 use crate::auth::oauth::token::OAuthToken;
 use crate::auth::oauth::token_store::TokenStore;
@@ -277,11 +278,13 @@ impl AuthProvider for JwtClientCredentialsProvider {
                 // `{"error":"invalid_client",…}` body from the token
                 // endpoint) is already turned into an `Err` — with the
                 // status and parsed server body embedded by `http_error` —
-                // and surfaced here via `?`. So there is no non-success
-                // branch to handle: a returned `response` is a success.
+                // and classified here like the client-secret M2M flow. So
+                // there is no non-success branch to handle: a returned
+                // `response` is a success.
                 let response = http_client
                     .execute_without_auth(request, RequestType::AuthTokenRequest)
-                    .await?;
+                    .await
+                    .map_err(|e| token_exchange_error(e, "JWT M2M token exchange"))?;
 
                 let parsed: TokenResponse = response.json().await.map_err(|e| {
                     Error::io().message(format!("Failed to retrieve custom M2M token: {e}"))
@@ -629,5 +632,40 @@ mod tests {
             msg.contains("invalid_client"),
             "expected server error body in error: {msg}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn jwt_m2m_rejected_assertion_is_unauthenticated() {
+        let server = MockServer::start().await;
+        mock_oidc(&server).await;
+
+        // RFC 6749 lets the token endpoint reject client auth with a 400.
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "invalid_client"
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let (_dir, key_path) = write_test_key();
+        let provider = JwtClientCredentialsProvider::new(
+            &server.uri(),
+            "test-client-id",
+            &key_path,
+            "test-kid",
+            None,
+            None,
+            http_client(),
+            vec!["all-apis".to_string()],
+            None,
+        )
+        .await
+        .expect("provider");
+
+        let err = provider.get_auth_header().expect_err("should fail on 400");
+        assert_eq!(err.code, crate::kernel_error::ErrorCode::Unauthenticated);
+        assert_eq!(err.http_status, Some(400));
     }
 }

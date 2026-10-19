@@ -339,7 +339,7 @@ should follow ADBC unless product owners choose a kernel-specific endpoint:
 - Endpoint format currently used by ADBC:
 `/api/2.0/connector-service/feature-flags/ADBC/{driver_version}`.
 - Existing server-side flag:
-`databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForAdbc`.
+`databricks.partnerplatform.clientConfigsFeatureFlags.enableTelemetryForKernel`.
 
 If the kernel needs separate rollout from ADBC, introduce a kernel-specific flag
 only after the backend/dashboard owner confirms the split. Do not fall back to

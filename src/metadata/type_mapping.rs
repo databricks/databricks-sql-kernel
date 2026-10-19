@@ -326,13 +326,8 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     parts
 }
 
-/// Parse `ARRAY<inner>` into a `List(Field("item", inner, true))`.
-/// Field name `"item"` matches arrow-rs's canonical default
-/// (`Field::new_list_field`) and every other call site in this
-/// kernel (`reader/post_processor/`). pyarrow's
-/// `list_(t)` default also uses `"item"`. Using anything else would
-/// make the empty-result schema fail field-level equality against
-/// the non-empty Arrow IPC payload.
+/// Parse `ARRAY<inner>` using DBSQL's Arrow child name, `element`, so
+/// manifest-only empty results match the non-empty IPC schema.
 fn parse_array(
     s: &str,
     type_interval_type: Option<&str>,
@@ -346,8 +341,8 @@ fn parse_array(
         geospatial_representation,
         depth + 1,
     )?;
-    Some(DataType::List(Arc::new(Field::new_list_field(
-        inner_dt, true,
+    Some(DataType::List(Arc::new(Field::new(
+        "element", inner_dt, true,
     ))))
 }
 
@@ -930,40 +925,32 @@ mod tests {
 
     #[test]
     fn test_databricks_type_to_arrow_array_nested() {
-        // ARRAY<INT> → List<Int32>. Field name is "item" — the
-        // arrow-rs canonical default; matches the non-empty wire
-        // payload and every other call site in this kernel.
         assert_eq!(
             databricks_type_to_arrow("ARRAY<INT>"),
-            DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)))
+            DataType::List(Arc::new(Field::new("element", DataType::Int32, true)))
         );
-        // ARRAY<STRING>
         assert_eq!(
             databricks_type_to_arrow("ARRAY<STRING>"),
-            DataType::List(Arc::new(Field::new_list_field(DataType::Utf8, true)))
+            DataType::List(Arc::new(Field::new("element", DataType::Utf8, true)))
         );
-        // Nested: ARRAY<ARRAY<INT>>
         assert_eq!(
             databricks_type_to_arrow("ARRAY<ARRAY<INT>>"),
-            DataType::List(Arc::new(Field::new_list_field(
-                DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true))),
+            DataType::List(Arc::new(Field::new(
+                "element",
+                DataType::List(Arc::new(Field::new("element", DataType::Int32, true))),
                 true,
             )))
         );
     }
 
     #[test]
-    fn test_array_field_name_is_item_not_element() {
-        // Lock in the field-name convention. The non-empty-result
-        // schema (wire payload) uses "item"; if this regresses,
-        // empty-result and non-empty-result schemas stop being
-        // field-equal — directly defeats the empty-result schema-fix
-        // goal of bucket A/E in the comparator parity tasklist.
+    fn test_array_field_name_matches_databricks_arrow_schema() {
         let dt = databricks_type_to_arrow("ARRAY<INT>");
         let DataType::List(field) = dt else {
             panic!("expected List, got {dt:?}");
         };
-        assert_eq!(field.name(), "item", "list field name must be 'item'");
+        assert_eq!(field.name(), "element");
+        assert!(field.is_nullable());
     }
 
     #[test]
@@ -1008,6 +995,23 @@ mod tests {
     }
 
     #[test]
+    fn test_databricks_type_to_arrow_map_with_array_values() {
+        let dt = databricks_type_to_arrow("MAP<STRING, ARRAY<INT>>");
+        let DataType::Map(entries, _) = dt else {
+            panic!("expected Map");
+        };
+        let DataType::Struct(fields) = entries.data_type() else {
+            panic!("expected Struct");
+        };
+        assert_eq!(fields[0].name(), "key");
+        assert_eq!(fields[1].name(), "value");
+        assert_eq!(
+            fields[1].data_type(),
+            &DataType::List(Arc::new(Field::new("element", DataType::Int32, true)))
+        );
+    }
+
+    #[test]
     fn test_databricks_type_to_arrow_struct() {
         // STRUCT<x:INT,y:STRING>
         let dt = databricks_type_to_arrow("STRUCT<x:INT,y:STRING>");
@@ -1034,7 +1038,10 @@ mod tests {
         };
         assert_eq!(fields.len(), 2);
         assert_eq!(fields[0].name(), "a");
-        assert!(matches!(fields[0].data_type(), DataType::List(_)));
+        assert_eq!(
+            fields[0].data_type(),
+            &DataType::List(Arc::new(Field::new("element", DataType::Int32, true)))
+        );
         assert_eq!(fields[1].name(), "b");
         assert!(matches!(fields[1].data_type(), DataType::Map(_, _)));
     }
@@ -1048,6 +1055,7 @@ mod tests {
         let DataType::List(field) = dt else {
             panic!("expected List");
         };
+        assert_eq!(field.name(), "element");
         let DataType::Struct(fields) = field.data_type() else {
             panic!("expected Struct inside List");
         };
