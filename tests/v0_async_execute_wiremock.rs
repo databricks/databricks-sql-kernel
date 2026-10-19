@@ -1398,6 +1398,92 @@ async fn attach_seeds_status_and_reports_server_state() {
 }
 
 #[tokio::test]
+async fn attached_statement_inline_continuations_use_the_sessions_selected_prefix() {
+    use wiremock::matchers::query_param;
+
+    for realtime in [true, false] {
+        let server = MockServer::start().await;
+        let mut create_response =
+            ResponseTemplate::new(200).set_body_json(json!({ "session_id": "sess-test" }));
+        if realtime {
+            create_response = create_response.insert_header("x-databricks-rt-session", "true");
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+            .respond_with(create_response)
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let prefix = if realtime {
+            "/api/2.0/sql/warehouses/test_wh/sessions/sess-test"
+        } else {
+            "/api/2.0/sql"
+        };
+        let first_batch = int64_batch("n", vec![1, 2]);
+        let last_batch = int64_batch("n", vec![3, 4]);
+        let mut status: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-attach", &first_batch)).unwrap();
+        status["manifest"]["total_chunk_count"] = json!(2);
+        status["manifest"]["total_row_count"] = json!(4);
+        status["result"]["next_chunk_index"] = json!(1);
+        Mock::given(method("GET"))
+            .and(path(format!("{prefix}/statements/stmt-attach")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(status))
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "{prefix}/statements/stmt-attach/result/chunks/1"
+            )))
+            .and(query_param("row_offset", "2"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk_index": 1,
+                "row_offset": 2,
+                "row_count": 2,
+                "attachment": STANDARD.encode(arrow_ipc_bytes(&last_batch)),
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let close_path = if realtime {
+            prefix.to_string()
+        } else {
+            format!("{prefix}/sessions/sess-test")
+        };
+        Mock::given(method("DELETE"))
+            .and(path(close_path))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = open_session(&server).await;
+        let attached = session
+            .attach_async_statement("stmt-attach")
+            .await
+            .expect("attach");
+        let mut stream = attached.fetch_result().await.expect("fetch_result");
+        let batches = drain(&mut stream).await;
+        let values: Vec<i64> = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .values()
+                    .iter()
+                    .copied()
+            })
+            .collect();
+        assert_eq!(values, vec![1, 2, 3, 4]);
+        session.close().await.expect("session close");
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn attach_reports_closed_for_a_closed_statement() {
     // The connector relies on this: a closed async command must report
     // CLOSED from the *server*, not from connector-side bookkeeping.

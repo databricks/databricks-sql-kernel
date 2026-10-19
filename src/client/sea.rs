@@ -244,36 +244,24 @@ impl SeaRestTransport {
     }
 
     fn base_url(&self) -> String {
-        format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
+        match self.session_route() {
+            SessionRoute::Realtime { session_url } => session_url.clone(),
+            SessionRoute::Standard => {
+                format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
+            }
+        }
     }
 
     fn warehouse_sessions_url(&self) -> String {
         format!(
-            "{}/warehouses/{}/sessions",
-            self.base_url(),
+            "{}/api/2.0/sql/warehouses/{}/sessions",
+            self.host.trim_end_matches('/'),
             self.warehouse_id
         )
     }
 
     fn session_route(&self) -> &SessionRoute {
         self.session_route.get().unwrap_or(&SessionRoute::Standard)
-    }
-
-    fn statements_url(&self, session_attribution: SessionAttribution) -> String {
-        match (self.session_route(), session_attribution) {
-            (SessionRoute::Realtime { session_url }, SessionAttribution::Current) => {
-                format!("{session_url}/statements")
-            }
-            _ => format!("{}/statements", self.base_url()),
-        }
-    }
-
-    fn statement_url(&self, statement_id: &str, session_attribution: SessionAttribution) -> String {
-        format!(
-            "{}/{}",
-            self.statements_url(session_attribution),
-            statement_id
-        )
     }
 
     fn current_session_version(&self) -> Option<SessionVersion> {
@@ -330,26 +318,26 @@ impl SeaRestTransport {
     /// when adding more.
     ///
     /// See: <https://docs.databricks.com/api/workspace/statementexecution>
-    fn result_chunks_url(
-        &self,
-        statement_id: &str,
-        chunk_index: i64,
-        row_offset: i64,
-        session_attribution: SessionAttribution,
-    ) -> String {
+    fn result_chunks_url(&self, statement_id: &str, chunk_index: i64, row_offset: i64) -> String {
         debug_assert!(
             row_offset >= 0,
             "row_offset must be non-negative on the SEA wire (got {row_offset})",
         );
-        let url = format!(
-            "{}/result/chunks/{}",
-            self.statement_url(statement_id, session_attribution),
-            chunk_index
-        );
         if row_offset > 0 {
-            format!("{url}?row_offset={row_offset}")
+            format!(
+                "{}/statements/{}/result/chunks/{}?row_offset={}",
+                self.base_url(),
+                statement_id,
+                chunk_index,
+                row_offset
+            )
         } else {
-            url
+            format!(
+                "{}/statements/{}/result/chunks/{}",
+                self.base_url(),
+                statement_id,
+                chunk_index
+            )
         }
     }
 
@@ -385,7 +373,7 @@ impl SeaRestTransport {
         statement_id: &str,
         session_attribution: SessionAttribution,
     ) -> Result<ExecuteResponse> {
-        let url = self.statement_url(statement_id, session_attribution);
+        let url = format!("{}/statements/{}", self.base_url(), statement_id);
 
         debug!("Getting statement status at {}", url);
 
@@ -441,8 +429,7 @@ impl SeaRestTransport {
         let mut response = self
             .get_statement_status_raw(statement_id, session_attribution)
             .await?;
-        self.enrich_num_modified_rows(&mut response, session_attribution)
-            .await;
+        self.enrich_num_modified_rows(&mut response).await;
         Ok(response)
     }
 
@@ -458,11 +445,7 @@ impl SeaRestTransport {
     ///
     /// Gated on the manifest's column signature so SELECTs (real columns) never
     /// hit the decode path; a DML-count result is always tiny and inline.
-    async fn enrich_num_modified_rows(
-        &self,
-        response: &mut ExecuteResponse,
-        session_attribution: SessionAttribution,
-    ) {
+    async fn enrich_num_modified_rows(&self, response: &mut ExecuteResponse) {
         if response.status.num_modified_rows.is_some() {
             return;
         }
@@ -477,7 +460,7 @@ impl SeaRestTransport {
         // any later fetch the caller makes (a fresh GetStatement builds its own
         // reader), so result consumption is unaffected.
         let reader = match factory
-            .create_reader(&response.statement_id, response, session_attribution)
+            .create_reader(&response.statement_id, response)
             .await
         {
             Ok(r) => r,
@@ -653,7 +636,7 @@ impl SeaRestTransport {
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
-        let url = self.statements_url(SessionAttribution::Current);
+        let url = format!("{}/statements", self.base_url());
 
         // Select the result disposition per statement from the
         // connection-level CloudFetch setting, mirroring the reference
@@ -882,11 +865,7 @@ impl SeaRestTransport {
         // rewrite in the same pass and can eagerly download CloudFetch chunk 0
         // to extract its schema.
         let reader = reader_factory
-            .create_reader(
-                &response.statement_id,
-                &response,
-                SessionAttribution::Current,
-            )
+            .create_reader(&response.statement_id, &response)
             .await?;
 
         // Carry the full status forward so the executed handle can skip a
@@ -1024,8 +1003,7 @@ impl SeaRestTransport {
         // after terminal mapping, keeping this result work out of the execution
         // phase without shifting it onto the public result stream.
         if response_from_poll {
-            self.enrich_num_modified_rows(&mut response, SessionAttribution::Current)
-                .await;
+            self.enrich_num_modified_rows(&mut response).await;
         }
 
         let reader_factory = self.reader_factory()?;
@@ -1345,10 +1323,7 @@ impl Transport for SeaRestTransport {
             // reader from the inline result (no extra GetStatementResult).
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
-                let reader = match reader_factory
-                    .create_reader(&r.statement_id, &r, SessionAttribution::Current)
-                    .await
-                {
+                let reader = match reader_factory.create_reader(&r.statement_id, &r).await {
                     Ok(reader) => reader,
                     Err(e) => {
                         self.close_orphaned_statement(&statement_id, "create_reader (direct)")
@@ -1390,9 +1365,7 @@ impl Transport for SeaRestTransport {
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;
-                let reader = reader_factory
-                    .create_reader(&r.statement_id, &r, session_attribution)
-                    .await?;
+                let reader = reader_factory.create_reader(&r.statement_id, &r).await?;
                 let telemetry_result_format = Self::telemetry_result_format(&r);
                 let telemetry_is_compressed = Self::telemetry_is_compressed(&r);
                 Ok(Some(ExecuteResult {
@@ -1423,10 +1396,8 @@ impl Transport for SeaRestTransport {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
-        session_attribution: SessionAttribution,
     ) -> Result<ChunkLinkFetchResult> {
-        let url =
-            self.result_chunks_url(statement_id, chunk_index, row_offset, session_attribution);
+        let url = self.result_chunks_url(statement_id, chunk_index, row_offset);
 
         debug!("Getting result chunks at {}", url);
 
@@ -1470,7 +1441,6 @@ impl Transport for SeaRestTransport {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
-        session_attribution: SessionAttribution,
     ) -> Result<InlineChunkFetchResult> {
         // Same endpoint as CloudFetch chunk-link fetching, but on
         // the inline-Arrow path the response carries Arrow IPC bytes
@@ -1488,8 +1458,9 @@ impl Transport for SeaRestTransport {
         );
         let row_offset = row_offset.max(0);
         let url = format!(
-            "{}/result/chunks/{}?row_offset={}",
-            self.statement_url(statement_id, session_attribution),
+            "{}/statements/{}/result/chunks/{}?row_offset={}",
+            self.base_url(),
+            statement_id,
             chunk_index,
             row_offset,
         );
@@ -1591,10 +1562,7 @@ impl Transport for SeaRestTransport {
     }
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/cancel",
-            self.statement_url(statement_id, SessionAttribution::Current)
-        );
+        let url = format!("{}/statements/{}/cancel", self.base_url(), statement_id);
 
         debug!("Canceling statement at {}", url);
 
@@ -1617,7 +1585,7 @@ impl Transport for SeaRestTransport {
     }
 
     async fn close_statement(&self, statement_id: &str) -> Result<()> {
-        let url = self.statement_url(statement_id, SessionAttribution::Current);
+        let url = format!("{}/statements/{}", self.base_url(), statement_id);
 
         debug!("Closing statement at {}", url);
 
@@ -2614,7 +2582,7 @@ mod tests {
         // CloudFetch path: row_offset=0 is the kernel default and must
         // produce the legacy URL shape (no `?row_offset=...`).
         assert_eq!(
-            client.result_chunks_url("01abc", 7, 0, SessionAttribution::Current),
+            client.result_chunks_url("01abc", 7, 0),
             "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/7"
         );
     }
@@ -2635,7 +2603,7 @@ mod tests {
         // the right rowOffset.
         let client = create_test_client();
         assert_eq!(
-            client.result_chunks_url("01abc", 3, 12345, SessionAttribution::Current),
+            client.result_chunks_url("01abc", 3, 12345),
             "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=12345"
         );
     }
@@ -2647,7 +2615,7 @@ mod tests {
         // would still match `12345` and `i64::MAX`) is caught.
         let client = create_test_client();
         assert_eq!(
-            client.result_chunks_url("01abc", 3, 1, SessionAttribution::Current),
+            client.result_chunks_url("01abc", 3, 1),
             "https://test.databricks.com/api/2.0/sql/statements/01abc/result/chunks/3?row_offset=1"
         );
     }
@@ -2660,7 +2628,7 @@ mod tests {
         // offsets at request-time. The URL builder must not panic
         // or truncate for the legal range.
         let client = create_test_client();
-        let url = client.result_chunks_url("01abc", 0, i64::MAX, SessionAttribution::Current);
+        let url = client.result_chunks_url("01abc", 0, i64::MAX);
         assert!(
             url.ends_with(&format!("?row_offset={}", i64::MAX)),
             "i64::MAX must serialise as decimal: got {url}",
@@ -2798,11 +2766,11 @@ mod tests {
             .await
             .expect("owned status must succeed");
         transport
-            .get_result_chunks("statement-1", 0, 0, SessionAttribution::Current)
+            .get_result_chunks("statement-1", 0, 0)
             .await
             .expect("owned chunk fetch must succeed");
         transport
-            .get_inline_chunk("inline-statement", 1, 3, SessionAttribution::Current)
+            .get_inline_chunk("inline-statement", 1, 3)
             .await
             .expect("owned inline chunk fetch must succeed");
         transport
@@ -2925,7 +2893,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn detached_statement_requests_use_standard_urls() {
+    async fn attached_statement_reads_use_session_prefix_without_advancing_session_version() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2935,16 +2903,24 @@ mod tests {
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
-                    .set_body_json(json!({ "session_id": "session-1" })),
+                    .set_body_json(json!({
+                        "session_id": "session-1",
+                        "session_version": { "version_id": 7 },
+                    })),
             )
             .expect(1)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path("/api/2.0/sql/statements/detached"))
+            .and(path(
+                "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements/attached",
+            ))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "statement_id": "detached",
-                "status": { "state": "RUNNING" },
+                "statement_id": "attached",
+                "status": {
+                    "state": "RUNNING",
+                    "session_version": { "version_id": 11 },
+                },
             })))
             .expect(1)
             .mount(&server)
@@ -2956,16 +2932,15 @@ mod tests {
             .await
             .expect("session creation must succeed");
         transport
-            .get_statement_status("detached", SessionAttribution::Detached)
+            .get_statement_status("attached", SessionAttribution::Detached)
             .await
-            .expect("detached status must succeed");
+            .expect("attached status must succeed");
 
-        let requests = server.received_requests().await.unwrap();
-        let detached = requests
-            .iter()
-            .find(|request| request.url.path() == "/api/2.0/sql/statements/detached")
-            .expect("detached status request must be recorded");
-        assert!(detached.headers.get(REALTIME_SESSION_HEADER).is_none());
+        assert_eq!(
+            transport.current_session_version(),
+            Some(SessionVersion { version_id: 7 })
+        );
+        server.verify().await;
     }
 
     #[tokio::test]
@@ -3198,7 +3173,7 @@ mod tests {
 
         let transport = create_test_client_against(&server.uri());
         let _ = transport
-            .get_result_chunks("01abc", 3, 100, SessionAttribution::Current)
+            .get_result_chunks("01abc", 3, 100)
             .await
             .expect("get_result_chunks must succeed against the mock");
 
@@ -3236,7 +3211,7 @@ mod tests {
 
         let transport = create_test_client_against(&server.uri());
         let _ = transport
-            .get_result_chunks("01abc", 3, 0, SessionAttribution::Current)
+            .get_result_chunks("01abc", 3, 0)
             .await
             .expect("get_result_chunks must succeed against the mock");
 

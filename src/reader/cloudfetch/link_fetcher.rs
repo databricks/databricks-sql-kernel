@@ -40,7 +40,7 @@
 //! 3. Check if prefetch should be triggered (async, non-blocking)
 //! 4. Background task fetches links and caches them
 
-use crate::client::{ChunkLinkFetchResult, SessionAttribution, Transport};
+use crate::client::{ChunkLinkFetchResult, Transport};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, error};
 use crate::types::cloudfetch::CloudFetchLink;
@@ -157,7 +157,6 @@ pub(crate) struct SeaChunkLinkFetcher {
     client: Arc<dyn Transport>,
     /// Statement ID this fetcher is bound to
     statement_id: String,
-    session_attribution: SessionAttribution,
     /// Cached links by chunk index
     links: DashMap<i64, CloudFetchLink>,
     /// Next chunk index to ask the server for. Initialised from the
@@ -359,7 +358,6 @@ impl SeaChunkLinkFetcher {
     ///   confident the bounded-API server is live.
     /// * `link_prefetch_window` - Number of chunks to prefetch ahead of consumer
     /// * `runtime_handle` - Tokio runtime handle for spawning prefetch tasks
-    #[cfg(test)]
     pub(crate) fn new(
         client: Arc<dyn Transport>,
         statement_id: impl Into<String>,
@@ -367,26 +365,6 @@ impl SeaChunkLinkFetcher {
         total_chunk_count: Option<i64>,
         link_prefetch_window: i64,
         runtime_handle: tokio::runtime::Handle,
-    ) -> Self {
-        Self::new_with_attribution(
-            client,
-            statement_id,
-            initial_links,
-            total_chunk_count,
-            link_prefetch_window,
-            runtime_handle,
-            SessionAttribution::Current,
-        )
-    }
-
-    pub(crate) fn new_with_attribution(
-        client: Arc<dyn Transport>,
-        statement_id: impl Into<String>,
-        initial_links: &[CloudFetchLink],
-        total_chunk_count: Option<i64>,
-        link_prefetch_window: i64,
-        runtime_handle: tokio::runtime::Handle,
-        session_attribution: SessionAttribution,
     ) -> Self {
         let statement_id = statement_id.into();
         let links = DashMap::new();
@@ -455,7 +433,6 @@ impl SeaChunkLinkFetcher {
         let fetcher = Self {
             client,
             statement_id,
-            session_attribution,
             links,
             next_server_fetch_index: AtomicI64::new(next_server_fetch_index),
             all_links_fetched: AtomicBool::new(all_links_fetched),
@@ -770,12 +747,7 @@ impl SeaChunkLinkFetcher {
 
             match self
                 .client
-                .get_result_chunks(
-                    &self.statement_id,
-                    server_fetch_idx,
-                    row_offset,
-                    self.session_attribution,
-                )
+                .get_result_chunks(&self.statement_id, server_fetch_idx, row_offset)
                 .await
             {
                 Ok(result) => {
@@ -968,12 +940,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         );
         let result = fetcher
             .client
-            .get_result_chunks(
-                &fetcher.statement_id,
-                start_chunk_index,
-                start_row_offset,
-                fetcher.session_attribution,
-            )
+            .get_result_chunks(&fetcher.statement_id, start_chunk_index, start_row_offset)
             .await?;
 
         // Cache the new links.
@@ -1036,12 +1003,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         let result = self
             .inner
             .client
-            .get_result_chunks(
-                &self.inner.statement_id,
-                chunk_index,
-                0,
-                self.inner.session_attribution,
-            )
+            .get_result_chunks(&self.inner.statement_id, chunk_index, 0)
             .await?;
 
         let link = result
@@ -1066,12 +1028,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         let result = self
             .inner
             .client
-            .get_result_chunks(
-                &self.inner.statement_id,
-                chunk_index,
-                row_offset,
-                self.inner.session_attribution,
-            )
+            .get_result_chunks(&self.inner.statement_id, chunk_index, row_offset)
             .await?;
 
         // The SEA contract today caps the number of links in a
@@ -1143,25 +1100,17 @@ mod tests {
     use crate::types::sea::{ExecuteParams, StatementState, StatementStatus};
     use arrow_schema::Schema;
     use std::collections::HashMap;
-    use std::sync::{Arc as StdArc, Mutex as StdMutex};
+    use std::sync::Arc as StdArc;
 
     /// Mock Transport for testing
     #[derive(Debug)]
     struct MockDatabricksClient {
         chunks: Vec<Vec<CloudFetchLink>>,
-        session_attributions: StdMutex<Vec<SessionAttribution>>,
     }
 
     impl MockDatabricksClient {
         fn new(chunks: Vec<Vec<CloudFetchLink>>) -> Self {
-            Self {
-                chunks,
-                session_attributions: StdMutex::new(Vec::new()),
-            }
-        }
-
-        fn session_attributions(&self) -> Vec<SessionAttribution> {
-            self.session_attributions.lock().unwrap().clone()
+            Self { chunks }
         }
     }
 
@@ -1246,12 +1195,7 @@ mod tests {
             _statement_id: &str,
             chunk_index: i64,
             _row_offset: i64,
-            session_attribution: SessionAttribution,
         ) -> Result<ChunkLinkFetchResult> {
-            self.session_attributions
-                .lock()
-                .unwrap()
-                .push(session_attribution);
             let index = chunk_index as usize;
             if index >= self.chunks.len() {
                 return Ok(ChunkLinkFetchResult::end_of_stream());
@@ -1278,7 +1222,6 @@ mod tests {
             _statement_id: &str,
             _chunk_index: i64,
             _row_offset: i64,
-            _session_attribution: SessionAttribution,
         ) -> Result<crate::client::InlineChunkFetchResult> {
             unimplemented!("get_inline_chunk not used by the link-fetcher mock")
         }
@@ -1543,29 +1486,6 @@ mod tests {
 
         // Link should now be cached
         assert!(handle.inner.has_link(1));
-    }
-
-    #[tokio::test]
-    async fn detached_attribution_is_preserved_for_lazy_link_fetches() {
-        let links = vec![vec![create_test_link_terminal(0)]];
-        let client = Arc::new(MockDatabricksClient::new(links));
-        let fetcher = SeaChunkLinkFetcher::new_with_attribution(
-            client.clone(),
-            "test-statement",
-            &[],
-            None,
-            -1,
-            tokio::runtime::Handle::current(),
-            SessionAttribution::Detached,
-        );
-        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
-
-        handle.refetch_link(0, 0).await.unwrap();
-
-        assert_eq!(
-            client.session_attributions(),
-            vec![SessionAttribution::Detached]
-        );
     }
 
     #[tokio::test]

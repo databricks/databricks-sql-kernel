@@ -675,13 +675,9 @@ impl Session {
     ///
     /// This is the resume path: a caller (or a different process) that
     /// holds only the statement id can re-attach and drive it to
-    /// completion, fetch its result, or read its terminal state. Server
-    /// statement state is keyed solely by the id — every
-    /// `GetStatementStatus` / `GetStatementResult` / cancel / close RPC
-    /// takes just the id — so the only thing the originating handle
-    /// carried that a bare id does not is *this session's* transport
-    /// (auth, retry, poll cadence). Binding the id to this session is
-    /// exactly what `attach` does.
+    /// completion, fetch its result, or read its terminal state.
+    /// Realtime sessions require a statement from this session because their
+    /// URLs include its session ID.
     ///
     /// Issues a single `GetStatementStatus` to seed the handle's initial
     /// status (mirrors how `submit` seeds it from the submit response),

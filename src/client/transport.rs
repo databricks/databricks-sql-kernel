@@ -398,7 +398,6 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
-        session_attribution: SessionAttribution,
     ) -> Result<ChunkLinkFetchResult>;
 
     /// Fetch one inline-Arrow chunk by `chunk_index` (+ server-side
@@ -420,7 +419,6 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         statement_id: &str,
         chunk_index: i64,
         row_offset: i64,
-        session_attribution: SessionAttribution,
     ) -> Result<InlineChunkFetchResult>;
 
     /// Polling cadence + ceiling the kernel should use when driving
