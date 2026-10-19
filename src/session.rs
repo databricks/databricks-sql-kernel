@@ -2124,7 +2124,6 @@ mod is_open_tests {
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .and(body_json(json!({
-                "warehouse_id": "test_wh",
                 "execution_mode": "FAST",
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2551,7 +2550,7 @@ mod is_open_tests {
                     .iter()
                     .position(|request| {
                         request.method.as_str() == "POST"
-                            && request.url.path() == "/api/2.0/sql/sessions"
+                            && request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
                     })
                     .expect("CreateSession must be sent");
                 assert!(
@@ -2581,7 +2580,8 @@ mod is_open_tests {
         let create_session_requests = requests
             .iter()
             .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/sessions"
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
             })
             .count();
         assert_eq!(feature_flag_requests, 1, "sessions share the flag cache");

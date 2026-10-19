@@ -118,7 +118,7 @@ enum StatementOutcome {
 #[derive(Debug)]
 enum SessionRoute {
     Standard,
-    Realtime(String),
+    Realtime { session_url: String },
 }
 
 /// Mapped terminal outcome from the synchronous execution phase.
@@ -249,30 +249,31 @@ impl SeaRestTransport {
 
     fn warehouse_sessions_url(&self) -> String {
         format!(
-            "{}/api/2.0/sql/warehouses/{}/sessions",
-            self.host.trim_end_matches('/'),
+            "{}/warehouses/{}/sessions",
+            self.base_url(),
             self.warehouse_id
         )
     }
 
-    fn realtime_session_id(&self) -> Option<&str> {
-        match self.session_route.get() {
-            Some(SessionRoute::Realtime(session_id)) => Some(session_id),
-            _ => None,
-        }
+    fn session_route(&self) -> &SessionRoute {
+        self.session_route.get().unwrap_or(&SessionRoute::Standard)
     }
 
     fn statements_url(&self, session_attribution: SessionAttribution) -> String {
-        if session_attribution == SessionAttribution::Current {
-            if let Some(session_id) = self.realtime_session_id() {
-                return format!(
-                    "{}/{}/statements",
-                    self.warehouse_sessions_url(),
-                    session_id
-                );
+        match (self.session_route(), session_attribution) {
+            (SessionRoute::Realtime { session_url }, SessionAttribution::Current) => {
+                format!("{session_url}/statements")
             }
+            _ => format!("{}/statements", self.base_url()),
         }
-        format!("{}/statements", self.base_url())
+    }
+
+    fn statement_url(&self, statement_id: &str, session_attribution: SessionAttribution) -> String {
+        format!(
+            "{}/{}",
+            self.statements_url(session_attribution),
+            statement_id
+        )
     }
 
     fn current_session_version(&self) -> Option<SessionVersion> {
@@ -340,21 +341,15 @@ impl SeaRestTransport {
             row_offset >= 0,
             "row_offset must be non-negative on the SEA wire (got {row_offset})",
         );
+        let url = format!(
+            "{}/result/chunks/{}",
+            self.statement_url(statement_id, session_attribution),
+            chunk_index
+        );
         if row_offset > 0 {
-            format!(
-                "{}/{}/result/chunks/{}?row_offset={}",
-                self.statements_url(session_attribution),
-                statement_id,
-                chunk_index,
-                row_offset
-            )
+            format!("{url}?row_offset={row_offset}")
         } else {
-            format!(
-                "{}/{}/result/chunks/{}",
-                self.statements_url(session_attribution),
-                statement_id,
-                chunk_index
-            )
+            url
         }
     }
 
@@ -390,11 +385,7 @@ impl SeaRestTransport {
         statement_id: &str,
         session_attribution: SessionAttribution,
     ) -> Result<ExecuteResponse> {
-        let url = format!(
-            "{}/{}",
-            self.statements_url(session_attribution),
-            statement_id
-        );
+        let url = self.statement_url(statement_id, session_attribution);
 
         debug!("Getting statement status at {}", url);
 
@@ -688,10 +679,17 @@ impl SeaRestTransport {
         } else {
             "INLINE"
         };
+        let (warehouse_id, session_id) = match self.session_route() {
+            SessionRoute::Standard => (
+                Some(self.warehouse_id.clone()),
+                Some(session_id.to_string()),
+            ),
+            SessionRoute::Realtime { .. } => (None, None),
+        };
         let request_body = ExecuteStatementRequest {
-            warehouse_id: self.warehouse_id.clone(),
+            warehouse_id,
             statement: sql.to_string(),
-            session_id: Some(session_id.to_string()),
+            session_id,
             session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
@@ -1160,7 +1158,7 @@ impl Transport for SeaRestTransport {
         let url = self.warehouse_sessions_url();
 
         let request_body = CreateSessionRequest {
-            warehouse_id: self.warehouse_id.clone(),
+            warehouse_id: None,
             catalog: catalog.map(|s| s.to_string()),
             schema: schema.map(|s| s.to_string()),
             session_confs: session_config,
@@ -1200,7 +1198,9 @@ impl Transport for SeaRestTransport {
             ))
         })?;
         let route = if realtime {
-            SessionRoute::Realtime(session_response.session_id.clone())
+            SessionRoute::Realtime {
+                session_url: format!("{}/{}", url, session_response.session_id),
+            }
         } else {
             SessionRoute::Standard
         };
@@ -1217,15 +1217,14 @@ impl Transport for SeaRestTransport {
     }
 
     async fn delete_session(&self, session_id: &str) -> Result<()> {
-        let url = if let Some(realtime_session_id) = self.realtime_session_id() {
-            format!("{}/{}", self.warehouse_sessions_url(), realtime_session_id)
-        } else {
-            format!(
+        let url = match self.session_route() {
+            SessionRoute::Realtime { session_url } => session_url.clone(),
+            SessionRoute::Standard => format!(
                 "{}/sessions/{}?warehouse_id={}",
                 self.base_url(),
                 session_id,
                 self.warehouse_id
-            )
+            ),
         };
 
         debug!("Deleting session at {}", url);
@@ -1489,9 +1488,8 @@ impl Transport for SeaRestTransport {
         );
         let row_offset = row_offset.max(0);
         let url = format!(
-            "{}/{}/result/chunks/{}?row_offset={}",
-            self.statements_url(session_attribution),
-            statement_id,
+            "{}/result/chunks/{}?row_offset={}",
+            self.statement_url(statement_id, session_attribution),
             chunk_index,
             row_offset,
         );
@@ -1594,9 +1592,8 @@ impl Transport for SeaRestTransport {
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
         let url = format!(
-            "{}/{}/cancel",
-            self.statements_url(SessionAttribution::Current),
-            statement_id
+            "{}/cancel",
+            self.statement_url(statement_id, SessionAttribution::Current)
         );
 
         debug!("Canceling statement at {}", url);
@@ -1620,11 +1617,7 @@ impl Transport for SeaRestTransport {
     }
 
     async fn close_statement(&self, statement_id: &str) -> Result<()> {
-        let url = format!(
-            "{}/{}",
-            self.statements_url(SessionAttribution::Current),
-            statement_id
-        );
+        let url = self.statement_url(statement_id, SessionAttribution::Current);
 
         debug!("Closing statement at {}", url);
 
@@ -2694,12 +2687,13 @@ mod tests {
 
     #[tokio::test]
     async fn realtime_session_uses_warehouse_urls_for_owned_lifecycle() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_json, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
+            .and(body_json(json!({ "execution_mode": "FAST" })))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header(REALTIME_SESSION_HEADER, "true")
@@ -2716,6 +2710,15 @@ mod tests {
             .and(path(
                 "/api/2.0/sql/warehouses/warehouse-123/sessions/session-1/statements",
             ))
+            .and(body_json(json!({
+                "statement": "SELECT 1",
+                "session_version": { "version_id": 7 },
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "statement_id": "statement-1",
                 "status": { "state": "PENDING" },
@@ -2833,7 +2836,7 @@ mod tests {
 
     #[tokio::test]
     async fn create_session_response_selects_session_statement_urls() {
-        use wiremock::matchers::{method, path, query_param};
+        use wiremock::matchers::{body_json, method, path, query_param};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let cases = [(Some("TRUE"), true), (Some("false"), false), (None, false)];
@@ -2849,6 +2852,7 @@ mod tests {
 
             Mock::given(method("POST"))
                 .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
+                .and(body_json(json!({ "execution_mode": "FAST" })))
                 .respond_with(create_response)
                 .expect(1)
                 .mount(&server)
@@ -2858,8 +2862,21 @@ mod tests {
             } else {
                 "/api/2.0/sql/statements"
             };
+            let mut statement_body = json!({
+                "statement": "SELECT 1",
+                "disposition": "INLINE_OR_EXTERNAL_LINKS",
+                "format": "ARROW_STREAM",
+                "wait_timeout": "0s",
+                "on_wait_timeout": "CONTINUE",
+                "result_compression": "LZ4_FRAME",
+            });
+            if !realtime {
+                statement_body["warehouse_id"] = json!("warehouse-123");
+                statement_body["session_id"] = json!("session-1");
+            }
             Mock::given(method("POST"))
                 .and(path(statement_path))
+                .and(body_json(statement_body))
                 .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                     "statement_id": "statement-1",
                     "status": { "state": "PENDING" },
@@ -2961,7 +2978,6 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/warehouses/warehouse-123/sessions"))
             .and(body_json(json!({
-                "warehouse_id": "warehouse-123",
                 "execution_mode": "FAST",
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({

@@ -14,6 +14,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Changed
 
 - SQL sessions open through the warehouse sessions URL and use warehouse statement URLs when the create response enables real-time routing.
+- Warehouse session requests carry parent IDs only in the URL. The Rust wire request structs now use `Option<String>` for `warehouse_id`; use `Some(id)` when building a standard SQL request body.
 
 ### Updated
 

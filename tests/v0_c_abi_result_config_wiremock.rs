@@ -207,7 +207,8 @@ fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
     let create = recorded
         .iter()
         .find(|request| {
-            request.url.path() == "/api/2.0/sql/sessions" && request.method.as_str() == "POST"
+            request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
+                && request.method.as_str() == "POST"
         })
         .expect("a POST /sessions request was made");
     let body: serde_json::Value =

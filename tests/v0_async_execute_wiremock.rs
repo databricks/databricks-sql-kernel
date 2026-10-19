@@ -377,7 +377,6 @@ async fn owning_async_status_advances_session_version_for_next_execute() {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .and(body_json(json!({
-            "warehouse_id": "test_wh",
             "execution_mode": "FAST",
         })))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({
