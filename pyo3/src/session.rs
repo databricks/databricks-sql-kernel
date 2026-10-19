@@ -25,7 +25,7 @@ use crate::executed_async::ExecutedAsyncStatement;
 use crate::metadata::Metadata;
 use crate::runtime::KernelRuntime;
 use crate::statement::Statement;
-use databricks_sql_kernel::Session as KSession;
+use databricks_sql_kernel::{GeospatialResultRepresentation, Session as KSession};
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -141,6 +141,14 @@ fn build_telemetry_config(
         telemetry.circuit_breaker_timeout = std::time::Duration::from_millis(v);
     }
     Ok(telemetry)
+}
+
+fn geospatial_result_representation(enabled: bool) -> GeospatialResultRepresentation {
+    if enabled {
+        GeospatialResultRepresentation::Binary
+    } else {
+        GeospatialResultRepresentation::String
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -331,6 +339,13 @@ impl Session {
     /// presets, etc. The kernel does not validate keys; the server
     /// rejects unknown ones with a `KernelError(code='SqlError')`
     /// when it picks them up.
+    ///
+    /// `enable_geospatial_support` selects whether `GEOMETRY` / `GEOGRAPHY`
+    /// results use their native Arrow representation. `True` (the default)
+    /// requests Arrow `struct<srid: int32, wkb: binary>` values; `False`
+    /// requests WKT / EWKT in Arrow UTF-8 values. The kernel normalizes both
+    /// standard-warehouse text and Reyden native Arrow results locally and
+    /// never sends this choice to SEA.
     #[new]
     #[pyo3(signature = (
         host,
@@ -371,6 +386,7 @@ impl Session {
         catalog=None,
         schema=None,
         session_conf=None,
+        enable_geospatial_support=true,
         driver_name=None,
         driver_version=None,
         runtime_name=None,
@@ -437,6 +453,7 @@ impl Session {
         catalog: Option<String>,
         schema: Option<String>,
         session_conf: Option<HashMap<String, String>>,
+        enable_geospatial_support: bool,
         driver_name: Option<String>,
         driver_version: Option<String>,
         runtime_name: Option<String>,
@@ -634,6 +651,9 @@ impl Session {
             if let Some(conf) = session_conf {
                 builder = builder.session_conf(conf);
             }
+            builder = builder.geospatial_result_representation(geospatial_result_representation(
+                enable_geospatial_support,
+            ));
             // Merge result-config knobs into one `ResultConfig` so two
             // toggles don't clobber each other when both are set.
             if complex_types_as_json || intervals_as_string {
@@ -747,6 +767,18 @@ mod send_sync_tests {
     }
 
     #[test]
+    fn enable_geospatial_support_maps_to_kernel_representation() {
+        assert_eq!(
+            geospatial_result_representation(true),
+            GeospatialResultRepresentation::Binary
+        );
+        assert_eq!(
+            geospatial_result_representation(false),
+            GeospatialResultRepresentation::String
+        );
+    }
+
+    #[test]
     fn telemetry_kwargs_map_to_kernel_config() {
         let telemetry = build_telemetry_config(TelemetryKwargs {
             enabled: Some(true),
@@ -826,12 +858,16 @@ mod send_sync_tests {
     #[test]
     fn request_timeout_kwarg_maps_to_http_config() {
         let default = databricks_sql_kernel::HttpConfig::default();
-        assert!(build_http_config(false, None, None, None, None, None, None, None)
-            .unwrap()
-            .is_none());
-        assert!(build_http_config(false, Some(0.0), None, None, None, None, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            build_http_config(false, None, None, None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            build_http_config(false, Some(0.0), None, None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
 
         let http = build_http_config(false, Some(0.5), None, None, None, None, None, None)
             .unwrap()
@@ -841,17 +877,26 @@ mod send_sync_tests {
         assert_eq!(http.overall_timeout, default.overall_timeout);
 
         let one_ns = std::time::Duration::from_nanos(1).as_secs_f64();
-        assert!(
-            build_http_config(false, Some(one_ns / 1_000.0), None, None, None, None, None, None)
-                .is_err()
-        );
+        assert!(build_http_config(
+            false,
+            Some(one_ns / 1_000.0),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None
+        )
+        .is_err());
         let http = build_http_config(false, Some(one_ns), None, None, None, None, None, None)
             .unwrap()
             .expect("one-nanosecond request timeout should be accepted");
         assert_eq!(http.request_timeout, std::time::Duration::from_nanos(1));
 
         assert!(build_http_config(false, Some(-1.0), None, None, None, None, None, None).is_err());
-        assert!(build_http_config(false, Some(f64::NAN), None, None, None, None, None, None).is_err());
+        assert!(
+            build_http_config(false, Some(f64::NAN), None, None, None, None, None, None).is_err()
+        );
     }
 
     #[test]
@@ -868,9 +913,11 @@ mod send_sync_tests {
 
     #[test]
     fn sea_response_compression_kwarg_maps_to_http_config() {
-        assert!(build_http_config(false, None, None, None, None, None, None, None)
-            .unwrap()
-            .is_none());
+        assert!(
+            build_http_config(false, None, None, None, None, None, None, None)
+                .unwrap()
+                .is_none()
+        );
         let http = build_http_config(true, None, None, None, None, None, None, None)
             .unwrap()
             .expect("enabling SEA response compression should build an HTTP config");

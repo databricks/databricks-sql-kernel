@@ -459,7 +459,9 @@ mod tests {
     use arrow_array::builder::{
         BinaryBuilder, Int32Builder, ListBuilder, MapBuilder, StringBuilder,
     };
-    use arrow_array::{Array, Int32Array, ListArray, MapArray, StringArray, StructArray};
+    use arrow_array::{
+        Array, BinaryArray, Int32Array, ListArray, MapArray, StringArray, StructArray,
+    };
     use arrow_buffer::{NullBuffer, OffsetBuffer, ScalarBuffer};
     use arrow_schema::Fields;
 
@@ -909,10 +911,13 @@ mod tests {
             column_info("geog", "GEOGRAPHY", "GEOGRAPHY(4326)", 1),
         ]);
 
-        let mut pp =
-            ResultPostProcessor::new(inner, Some(&manifest), PostProcessOptions::default())
-                .await
-                .unwrap();
+        let options = PostProcessOptions {
+            geospatial_result_representation: GeospatialResultRepresentation::String,
+            ..Default::default()
+        };
+        let mut pp = ResultPostProcessor::new(inner, Some(&manifest), options)
+            .await
+            .unwrap();
         assert_eq!(
             pp.schema().await.unwrap().field(0).data_type(),
             &DataType::Utf8
@@ -1049,6 +1054,7 @@ mod tests {
         ]);
         let options = PostProcessOptions {
             complex_types_as_json: true,
+            geospatial_result_representation: GeospatialResultRepresentation::String,
             ..Default::default()
         };
 
@@ -1066,5 +1072,76 @@ mod tests {
         assert_eq!(value(0), "[\"SRID=4326;POINT(1 2)\",null]");
         assert_eq!(value(1), "{\"g\":\"POINT(1 2)\"}");
         assert_eq!(value(2), "{\"k\":\"SRID=4326;POINT(1 2)\"}");
+    }
+
+    #[tokio::test]
+    async fn manifest_not_null_geo_text_is_converted_without_changing_siblings() {
+        let blob: ArrayRef = Arc::new(BinaryArray::from(vec![&b"\x00\x80\xff"[..]; 2]));
+        let timestamp: ArrayRef = Arc::new(
+            arrow_array::TimestampMicrosecondArray::from(vec![1234567_i64, 7654321])
+                .with_timezone("Etc/UTC"),
+        );
+        let fields = Fields::from(vec![
+            Field::new("geom", DataType::Utf8, false),
+            Field::new("blob", DataType::Binary, false),
+            Field::new("ts", timestamp.data_type().clone(), false),
+        ]);
+        let values = StructArray::new(
+            fields.clone(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    "POINT(1 2)",
+                    "SRID=3857;POINT(1 2)",
+                ])),
+                blob.clone(),
+                timestamp.clone(),
+            ],
+            None,
+        );
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "col_0",
+            DataType::Struct(fields),
+            true,
+        )]));
+        let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+        let manifest = make_manifest(vec![column_info(
+            "value",
+            "STRUCT",
+            "STRUCT<geom: GEOMETRY(ANY) NOT NULL, blob: BINARY NOT NULL, ts: TIMESTAMP NOT NULL>",
+            0,
+        )]);
+        let mut pp = ResultPostProcessor::new(
+            Box::new(MockReader::new(vec![batch])),
+            Some(&manifest),
+            PostProcessOptions::default(),
+        )
+        .await
+        .unwrap();
+        let advertised = pp.schema().await.unwrap();
+        let out = pp.next_batch().await.unwrap().unwrap();
+        assert_eq!(out.schema(), advertised);
+        let values = out
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let geo = values
+            .column(0)
+            .as_any()
+            .downcast_ref::<StructArray>()
+            .unwrap();
+        let srids = geo.column(0).as_any().downcast_ref::<Int32Array>().unwrap();
+        assert_eq!(srids.values(), &[0, 3857]);
+        let wkb = geo
+            .column(1)
+            .as_any()
+            .downcast_ref::<BinaryArray>()
+            .unwrap();
+        assert_eq!(wkb.value(0), POINT_1_2_WKB);
+        assert_eq!(wkb.value(1), POINT_1_2_WKB);
+        assert!(Arc::ptr_eq(values.column(1), &blob));
+        assert!(Arc::ptr_eq(values.column(2), &timestamp));
+        assert!(!values.fields()[0].is_nullable());
+        assert!(pp.next_batch().await.unwrap().is_none());
     }
 }

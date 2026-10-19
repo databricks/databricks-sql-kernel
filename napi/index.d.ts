@@ -319,6 +319,15 @@ export interface ConnectionOptions {
    */
   sessionConf?: Record<string, string>
   /**
+   * Select whether `GEOMETRY` / `GEOGRAPHY` results use their native Arrow
+   * representation. `true` (the default) requests Arrow
+   * `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT
+   * in Arrow UTF-8 values. The kernel normalizes both standard-warehouse
+   * text and Reyden native Arrow results locally and never sends this choice
+   * to SEA.
+   */
+  enableGeoSpatialSupport?: boolean
+  /**
    * Driver name reported in telemetry system configuration. Omitted ⇒
    * kernel default.
    */

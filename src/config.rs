@@ -1523,23 +1523,20 @@ pub enum TransportMode {
 ///   `struct<srid: int32 not null, wkb: binary not null>` values.
 ///
 /// This is a client-side result setting and is never sent to SEA. Reyden
-/// returns `struct<srid,wkb>` values, and Reyder's structured manifest carries
-/// their logical `GEOMETRY(...)` / `GEOGRAPHY(...)` types. The manifest is the
-/// source of truth when an attachment omits the canonical tags. The kernel
-/// reconciles the two, then exposes tagged binary values or recursively renders
-/// EWKT strings. Legacy SEA paths that already return `Utf8` EWKT satisfy
-/// string mode directly; requesting binary mode on such a path returns an
-/// error because the original WKB cannot be recovered losslessly. Empty and
-/// non-empty results use the same client-facing schema.
+/// returns `struct<srid,wkb>` values, while standard DBSQL warehouses return
+/// `Utf8` WKT / EWKT. The structured manifest carries the logical
+/// `GEOMETRY(...)` / `GEOGRAPHY(...)` type and is the source of truth for both
+/// paths. The kernel normalizes either physical representation to the requested
+/// client schema. Empty and non-empty results use the same schema.
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum GeospatialResultRepresentation {
-    /// Arrow `Utf8` containing EWKT. This is the kernel default.
-    #[default]
+    /// Arrow `Utf8` containing EWKT.
     String,
     /// Arrow `struct<srid: int32, wkb: binary>` containing little-endian OGC
     /// WKB. The SRID is carried by the sibling `srid` value, not by EWKB.
-    /// Requires the native Reyden Arrow result path.
+    /// This is the kernel default.
+    #[default]
     Binary,
 }
 
@@ -1593,7 +1590,7 @@ pub struct SessionConfig {
     /// Optional typed override for the physical representation of
     /// `GEOMETRY` / `GEOGRAPHY` values in Arrow results.
     ///
-    /// `None` uses [`GeospatialResultRepresentation::String`]. The
+    /// `None` uses [`GeospatialResultRepresentation::Binary`]. The
     /// choice is applied locally and is not forwarded to SEA.
     pub geospatial_result_representation: Option<GeospatialResultRepresentation>,
 
@@ -1611,6 +1608,14 @@ pub struct SessionConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn geospatial_result_representation_defaults_to_binary() {
+        assert_eq!(
+            GeospatialResultRepresentation::default(),
+            GeospatialResultRepresentation::Binary
+        );
+    }
 
     // ─── token cache policy ────────────────────────────────────────
 

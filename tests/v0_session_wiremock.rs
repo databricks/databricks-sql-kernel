@@ -521,7 +521,7 @@ async fn create_session_keeps_geospatial_string_mode_client_side() {
 
     let body = create_session_body(&server).await;
     assert!(body
-        .pointer("/session_confs/geospatial_as_string")
+        .pointer("/session_confs/EnableGeoSpatialSupport")
         .is_none());
 }
 
@@ -540,7 +540,7 @@ async fn create_session_keeps_geospatial_binary_mode_client_side() {
 
     let body = create_session_body(&server).await;
     assert!(body
-        .pointer("/session_confs/geospatial_as_string")
+        .pointer("/session_confs/EnableGeoSpatialSupport")
         .is_none());
 }
 
@@ -559,7 +559,7 @@ async fn create_session_omits_geospatial_conf_when_unset() {
         .is_some_and(|confs| {
             confs
                 .keys()
-                .any(|key| key.eq_ignore_ascii_case("geospatial_as_string"))
+                .any(|key| key.eq_ignore_ascii_case("EnableGeoSpatialSupport"))
         });
     assert!(
         !has_geospatial_conf,
@@ -573,8 +573,8 @@ async fn typed_geospatial_config_does_not_reinterpret_raw_session_conf() {
     mount_geospatial_session(&server, "sess-geo-pass-through").await;
 
     let session_conf = std::collections::HashMap::from([
-        ("GEOSPATIAL_AS_STRING".to_string(), "true".to_string()),
-        ("Geospatial_As_String".to_string(), "false".to_string()),
+        ("ENABLEGEOSPATIALSUPPORT".to_string(), "true".to_string()),
+        ("EnableGeoSpatialSupport".to_string(), "false".to_string()),
         ("ansi_mode".to_string(), "true".to_string()),
     ]);
     let session = open_session_with_geospatial_config(
@@ -592,13 +592,13 @@ async fn typed_geospatial_config_does_not_reinterpret_raw_session_conf() {
         .expect("session_confs object");
     assert_eq!(
         confs
-            .get("GEOSPATIAL_AS_STRING")
+            .get("ENABLEGEOSPATIALSUPPORT")
             .and_then(|value| value.as_str()),
         Some("true")
     );
     assert_eq!(
         confs
-            .get("Geospatial_As_String")
+            .get("EnableGeoSpatialSupport")
             .and_then(|value| value.as_str()),
         Some("false")
     );

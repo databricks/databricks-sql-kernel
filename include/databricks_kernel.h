@@ -344,6 +344,18 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
                                                         const char* key,
                                                         const char* value);
 
+/* Select whether GEOMETRY / GEOGRAPHY results use their native Arrow
+ * representation. `enabled = true` requests Arrow
+ * `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT in
+ * Arrow UTF-8 values. Omitting this setter uses the enabled kernel default.
+ * The kernel normalizes both standard-warehouse text and Reyden native Arrow
+ * results locally; this setting is never sent to SEA. A raw
+ * `EnableGeoSpatialSupport` entry set through
+ * kernel_session_config_set_session_conf remains server-bound and is forwarded
+ * unchanged. */
+KernelStatusCode kernel_session_config_set_enable_geospatial_support(
+    KernelSessionConfig* config, bool enabled);
+
 /* Append one HTTP header sent on every request. Call once per header
  * (order preserved); `name` and `value` are both required. */
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,

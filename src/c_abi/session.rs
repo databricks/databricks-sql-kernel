@@ -27,8 +27,8 @@
 
 use super::{block_on_ffi, KernelStatusCode};
 use crate::config::{
-    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, ResultConfig, TelemetryConfig,
-    TlsConfig, TokenCacheConfig,
+    AuthConfig, ConnectionConfig, GeospatialResultRepresentation, HttpConfig, ProxyConfig,
+    ResultConfig, TelemetryConfig, TlsConfig, TokenCacheConfig,
 };
 use crate::kernel_error::Error;
 use crate::logging::{LoggingOutcome, LoggingSink};
@@ -138,6 +138,9 @@ pub struct KernelSessionConfig {
     connection: Option<ConnectionSpec>,
     auth: Option<AuthSpec>,
     session_conf: HashMap<String, String>,
+    /// Optional client-facing representation for GEOMETRY / GEOGRAPHY results.
+    /// `None` uses the kernel native/binary default.
+    geospatial_result_representation: Option<GeospatialResultRepresentation>,
     /// Programmatic HTTP proxy (populated by `..._set_proxy`). `None` ⇒
     /// reqwest's env-var proxy behaviour.
     proxy: Option<ProxySpec>,
@@ -280,6 +283,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         connection: None,
         auth: None,
         session_conf: HashMap::new(),
+        geospatial_result_representation: None,
         proxy: None,
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
@@ -1132,6 +1136,34 @@ pub unsafe extern "C" fn kernel_session_config_set_session_conf(
     })
 }
 
+/// Select whether `GEOMETRY` and `GEOGRAPHY` result columns use their native
+/// Arrow representation. `enabled = true` requests Arrow
+/// `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT in
+/// Arrow `Utf8` values.
+///
+/// Omitting this setter uses the enabled kernel default. The kernel normalizes
+/// both standard-warehouse text and Reyden native Arrow results locally and
+/// never sends this choice to SEA. A raw `EnableGeoSpatialSupport` entry
+/// supplied through [`kernel_session_config_set_session_conf`] remains
+/// server-bound and is forwarded unchanged.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_enable_geospatial_support(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.geospatial_result_representation = Some(if enabled {
+            GeospatialResultRepresentation::Binary
+        } else {
+            GeospatialResultRepresentation::String
+        });
+        Ok(())
+    })
+}
+
 /// Read an optional C string: null → `None`, else an owned `String`
 /// (errors on non-UTF-8).
 ///
@@ -1615,6 +1647,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         connection,
         auth,
         session_conf,
+        geospatial_result_representation,
         proxy,
         tls,
         custom_headers,
@@ -1676,6 +1709,9 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
                 });
             if let Some(system_configuration) = driver_system_configuration {
                 builder = builder.driver_system_configuration(system_configuration);
+            }
+            if let Some(representation) = geospatial_result_representation {
+                builder = builder.geospatial_result_representation(representation);
             }
 
             // Skip `.http()` when no HTTP override was set, so the kernel's
@@ -2431,6 +2467,45 @@ mod tests {
             assert_eq!(
                 *got, expected,
                 "headers must be appended in order, duplicates kept"
+            );
+            kernel_session_config_free(config);
+        }
+    }
+
+    #[test]
+    fn enable_geospatial_support_setter_records_both_representations() {
+        unsafe {
+            let mut config: *mut KernelSessionConfig = std::ptr::null_mut();
+            assert_eq!(
+                kernel_session_config_new(&mut config),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config.as_ref().unwrap().geospatial_result_representation,
+                None
+            );
+
+            assert_eq!(
+                kernel_session_config_set_enable_geospatial_support(config, true),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config.as_ref().unwrap().geospatial_result_representation,
+                Some(GeospatialResultRepresentation::Binary)
+            );
+
+            assert_eq!(
+                kernel_session_config_set_enable_geospatial_support(config, false),
+                KernelStatusCode::Success
+            );
+            assert_eq!(
+                config.as_ref().unwrap().geospatial_result_representation,
+                Some(GeospatialResultRepresentation::String)
+            );
+
+            assert_eq!(
+                kernel_session_config_set_enable_geospatial_support(std::ptr::null_mut(), true),
+                KernelStatusCode::InvalidArgument
             );
             kernel_session_config_free(config);
         }

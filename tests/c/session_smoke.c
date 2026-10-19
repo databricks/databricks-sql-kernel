@@ -294,6 +294,22 @@ static void test_client_conf_setter(void) {
   CHECK(rc == KernelStatusCode_InvalidArgument, "set_client_conf(NULL cfg) → InvalidArgument");
 }
 
+/* Geospatial support maps true to SRID+WKB and false to WKT / EWKT strings. */
+static void test_enable_geospatial_support_setter(void) {
+  KernelSessionConfig* config = NULL;
+  (void)kernel_session_config_new(&config);
+
+  KernelStatusCode rc = kernel_session_config_set_enable_geospatial_support(config, true);
+  CHECK(rc == KernelStatusCode_Success, "set_enable_geospatial_support(true) succeeds");
+  rc = kernel_session_config_set_enable_geospatial_support(config, false);
+  CHECK(rc == KernelStatusCode_Success, "set_enable_geospatial_support(false) succeeds");
+  kernel_session_config_free(config);
+
+  rc = kernel_session_config_set_enable_geospatial_support(NULL, true);
+  CHECK(rc == KernelStatusCode_InvalidArgument,
+        "set_enable_geospatial_support(NULL cfg) -> InvalidArgument");
+}
+
 static void capture_log(const char* level, const char* target,
                         const char* message, void* user_data) {
   (void)level;
@@ -375,6 +391,7 @@ int main(void) {
   test_u2m_and_header_setters();
   test_identity_federation_client_id_setter();
   test_client_conf_setter();
+  test_enable_geospatial_support_setter();
   test_init_logging();
   test_is_open_null_guards();
   test_submit_stub_rejects();

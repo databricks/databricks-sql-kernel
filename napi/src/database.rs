@@ -34,8 +34,9 @@ use napi::bindgen_prelude::Buffer;
 type Buffer = Vec<u8>;
 
 use databricks_sql_kernel::{
-    AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError, HttpConfig,
-    ProxyConfig, ResultConfig, Session, TelemetryConfig, TlsConfig, TokenCacheConfig,
+    AuthConfig, DefaultOpts, DriverSystemConfiguration, Error as KernelError,
+    GeospatialResultRepresentation, HttpConfig, ProxyConfig, ResultConfig, Session,
+    TelemetryConfig, TlsConfig, TokenCacheConfig,
 };
 
 /// NodeJS-driver-appropriate default for `pool_max_idle_per_host`.
@@ -231,6 +232,13 @@ pub struct ConnectionOptions {
     /// query-tag presets, …). Forwarded verbatim to SEA
     /// `session_confs`. Unknown keys are rejected server-side.
     pub session_conf: Option<HashMap<String, String>>,
+    /// Select whether `GEOMETRY` / `GEOGRAPHY` results use their native Arrow
+    /// representation. `true` (the default) requests Arrow
+    /// `struct<srid: int32, wkb: binary>` values; `false` requests WKT / EWKT
+    /// in Arrow UTF-8 values. The kernel normalizes both standard-warehouse
+    /// text and Reyden native Arrow results locally and never sends this choice
+    /// to SEA.
+    pub enable_geo_spatial_support: Option<bool>,
     /// Driver name reported in telemetry system configuration. Omitted ⇒
     /// kernel default.
     pub driver_name: Option<String>,
@@ -775,6 +783,14 @@ fn build_driver_system_configuration(
     })
 }
 
+fn geospatial_result_representation(enabled: Option<bool>) -> GeospatialResultRepresentation {
+    if enabled.unwrap_or(true) {
+        GeospatialResultRepresentation::Binary
+    } else {
+        GeospatialResultRepresentation::String
+    }
+}
+
 /// Open a Databricks SQL session and return an opaque `Connection`
 /// wrapping the kernel `Session`. Authentication is selected by
 /// `options.auth_mode` (PAT / OAuth M2M / OAuth U2M) — see
@@ -835,6 +851,9 @@ pub async fn open_session(mut options: ConnectionOptions) -> napi::Result<Connec
         if let Some(conf) = options.session_conf {
             builder = builder.session_conf(conf);
         }
+        builder = builder.geospatial_result_representation(geospatial_result_representation(
+            options.enable_geo_spatial_support,
+        ));
         // Result-config knobs (interval / complex-type rendering). Merge
         // into one `ResultConfig` so the two toggles don't clobber each
         // other when both are set. Only wire it when at least one is
@@ -913,6 +932,7 @@ mod tests {
             catalog: None,
             schema: None,
             session_conf: None,
+            enable_geo_spatial_support: None,
             driver_name: None,
             driver_version: None,
             runtime_name: None,
@@ -951,6 +971,22 @@ mod tests {
             proxy: None,
             socket_timeout_ms: None,
         }
+    }
+
+    #[test]
+    fn enable_geospatial_support_maps_to_kernel_representation() {
+        assert_eq!(
+            geospatial_result_representation(None),
+            GeospatialResultRepresentation::Binary
+        );
+        assert_eq!(
+            geospatial_result_representation(Some(true)),
+            GeospatialResultRepresentation::Binary
+        );
+        assert_eq!(
+            geospatial_result_representation(Some(false)),
+            GeospatialResultRepresentation::String
+        );
     }
 
     /// Assert a `build_auth_config` failure surfaces as a kernel
