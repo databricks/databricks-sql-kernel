@@ -11,55 +11,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
-- Added Thrift-native metadata routing with compatible public-schema casts and one-based `getColumns` ordinals.
-- Added native Arrow `GEOMETRY` / `GEOGRAPHY` results as tagged
-  `struct<srid,wkb>` values, including nested values and empty-result schemas.
-  The kernel treats Reyder's structured logical manifest as authoritative and
-  reconciles attachments that omit the canonical tags without copying child
-  buffers.
-- Added typed client-side `GEOMETRY` / `GEOGRAPHY` result representation
-  selection. The kernel normalizes both standard-warehouse WKT / EWKT and
-  Reyden's native SRID+WKB struct to the requested representation. No
-  representation setting is sent to SEA.
-- Added the default-enabled
-  `kernel_session_config_set_enable_geospatial_support` C ABI setting. Enabled
-  returns native SRID+WKB Arrow results; disabled returns WKT / EWKT strings.
-- Add authenticated connector-service feature flags with a bounded,
-  process-wide workspace cache and kernel-internal typed readers for all six
-  SAFE types.
-- Result schemas now carry the Thrift-compatible `Spark:DataType:SqlName`
-  field metadata key, set to the manifest's `type_text`, matching Thrift
-  results and the C# ADBC SEA path.
-- Result schemas copy the manifest's optional `type_json` into the
-  Thrift-compatible `Spark:DataType:JsonType` field metadata key.
-
 ### Changed
-
-- Native SRID+WKB is now the default geospatial result representation.
-
-- Route function metadata through the Thrift-native metadata path when supported by the server.
-- Authenticated SEA requests now use `Accept-Encoding: identity` by default to
-  avoid gzipping inline LZ4-compressed Arrow results. Response compression can
-  be re-enabled through `HttpConfig` or the C ABI.
-
-- Feature flags are fetched after kernel authentication and before session
-  creation; sessions read process-cache values instead of retaining snapshots.
-- Kernel telemetry enablement now follows the connector-service Kernel feature
-  flag when the client leaves it unspecified; explicit client enable/disable
-  settings take precedence.
-- **Breaking (Rust API):** `TelemetryConfig::enabled` changes type from `bool`
-  to `Option<bool>`, where `None` defers to the workspace feature flag. Direct
-  Rust consumers that read or assign this public field must migrate (e.g. use
-  the new `with_enabled`/`set_enabled` helpers or wrap values in `Some(..)`).
-- Added a backward-compatible C telemetry-config v2 setter whose nullable
-  config and `has_enabled` field preserve unspecified client enablement.
 
 ### Updated
 
 ### Fixed
-
-- `list_tables` now matches `table_types` case-sensitively, matching Thrift
-  `GetTables`: `["table"]` no longer matches `TABLE` rows.
 
 ---
 *Note: When making changes, please add your change under the appropriate

@@ -14,6 +14,27 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.2.0] - 2026-10-19
+
+### Added
+- The default-enabled `ConnectionOptions.enableGeoSpatialSupport` option
+  selects native SRID+WKB Arrow results when enabled and WKT / EWKT strings
+  when disabled.
+- `ConnectionOptions.seaResponseCompressionEnabled` opts back into HTTP
+  compression for bandwidth-constrained SEA connections.
+
+### Changed
+- An omitted `telemetryEnabled` allows workspace feature-flag enablement;
+  an explicit `true` or `false` still takes precedence.
+
+### Fixed
+- `getCrossReference` allows the foreign-key side to be omitted, returning an
+  empty result without issuing a server statement.
+- `getPrimaryKeys` accepts null or undefined catalog and schema values, resolving
+  them from the current session, and preserves explicit empty names.
+- `listFunctions` accepts an empty catalog and forwards it to native
+  `GetFunctions` for Thrift-compatible behavior.
+
 ## [v1.1.0] - 2026-09-23
 
 No Node.js-binding-specific changes.
