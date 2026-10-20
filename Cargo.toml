@@ -216,7 +216,7 @@ name = "databricks_sql_kernel"
 crate-type = ["lib", "cdylib", "staticlib"]
 
 [build-dependencies]
-tonic-prost-build = "0.14"
+tonic-prost-build = { version = "0.14", default-features = false, features = ["transport"] }
 
 # Workspace — the kernel is its own single-member workspace root.
 #
