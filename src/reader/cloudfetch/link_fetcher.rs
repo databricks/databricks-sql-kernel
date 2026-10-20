@@ -1127,7 +1127,7 @@ mod tests {
             })
         }
 
-        async fn delete_session(&self, _session_id: &str) -> Result<()> {
+        async fn delete_session(&self) -> Result<()> {
             Ok(())
         }
 

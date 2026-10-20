@@ -239,9 +239,8 @@ impl SessionInner {
             return; // already closed / closing
         }
         let transport = Arc::clone(&self.transport);
-        let session_id = self.session_id.clone();
         self.runtime_handle.spawn(async move {
-            let _ = transport.delete_session(&session_id).await;
+            let _ = transport.delete_session().await;
         });
     }
 }
@@ -786,12 +785,7 @@ impl Session {
         async {
             let telemetry = self.inner.telemetry.connection();
             let delete_started = Instant::now();
-            if let Err(error) = self
-                .inner
-                .transport
-                .delete_session(&self.inner.session_id)
-                .await
-            {
+            if let Err(error) = self.inner.transport.delete_session().await {
                 telemetry.emit_operation(
                     OperationType::DeleteSession,
                     delete_started.elapsed(),

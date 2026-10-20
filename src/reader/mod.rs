@@ -1916,7 +1916,7 @@ mod tests {
         ) -> Result<SessionInfo> {
             unreachable!("PanickingTransport: not used by these tests")
         }
-        async fn delete_session(&self, _: &str) -> Result<()> {
+        async fn delete_session(&self) -> Result<()> {
             unreachable!()
         }
         async fn execute_statement(

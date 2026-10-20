@@ -117,7 +117,7 @@ enum StatementOutcome {
 
 #[derive(Debug)]
 enum SessionRoute {
-    Standard,
+    Standard { session_url: String },
     Realtime { session_url: String },
 }
 
@@ -244,9 +244,9 @@ impl SeaRestTransport {
     }
 
     fn base_url(&self) -> String {
-        match self.session_route() {
-            SessionRoute::Realtime { session_url } => session_url.clone(),
-            SessionRoute::Standard => {
+        match self.session_route.get() {
+            Some(SessionRoute::Realtime { session_url }) => session_url.clone(),
+            Some(SessionRoute::Standard { .. }) | None => {
                 format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
             }
         }
@@ -258,10 +258,6 @@ impl SeaRestTransport {
             self.host.trim_end_matches('/'),
             self.warehouse_id
         )
-    }
-
-    fn session_route(&self) -> &SessionRoute {
-        self.session_route.get().unwrap_or(&SessionRoute::Standard)
     }
 
     fn current_session_version(&self) -> Option<SessionVersion> {
@@ -662,12 +658,12 @@ impl SeaRestTransport {
         } else {
             "INLINE"
         };
-        let (warehouse_id, session_id) = match self.session_route() {
-            SessionRoute::Standard => (
+        let (warehouse_id, session_id) = match self.session_route.get() {
+            Some(SessionRoute::Standard { .. }) | None => (
                 Some(self.warehouse_id.clone()),
                 Some(session_id.to_string()),
             ),
-            SessionRoute::Realtime { .. } => (None, None),
+            Some(SessionRoute::Realtime { .. }) => (None, None),
         };
         let request_body = ExecuteStatementRequest {
             warehouse_id,
@@ -1180,7 +1176,14 @@ impl Transport for SeaRestTransport {
                 session_url: format!("{}/{}", url, session_response.session_id),
             }
         } else {
-            SessionRoute::Standard
+            SessionRoute::Standard {
+                session_url: format!(
+                    "{}/sessions/{}?warehouse_id={}",
+                    self.base_url(),
+                    session_response.session_id,
+                    self.warehouse_id
+                ),
+            }
         };
         self.session_route.set(route).map_err(|_| {
             Error::invalid_state().message("SQL transport already created a session")
@@ -1194,15 +1197,14 @@ impl Transport for SeaRestTransport {
         })
     }
 
-    async fn delete_session(&self, session_id: &str) -> Result<()> {
-        let url = match self.session_route() {
-            SessionRoute::Realtime { session_url } => session_url.clone(),
-            SessionRoute::Standard => format!(
-                "{}/sessions/{}?warehouse_id={}",
-                self.base_url(),
-                session_id,
-                self.warehouse_id
-            ),
+    async fn delete_session(&self) -> Result<()> {
+        let route = self.session_route.get().ok_or_else(|| {
+            Error::invalid_state().message("SQL transport has not created a session")
+        })?;
+        let url = match route {
+            SessionRoute::Standard { session_url } | SessionRoute::Realtime { session_url } => {
+                session_url
+            }
         };
 
         debug!("Deleting session at {}", url);
@@ -1210,7 +1212,7 @@ impl Transport for SeaRestTransport {
         let request = self
             .http_client
             .inner()
-            .request(Method::DELETE, &url)
+            .request(Method::DELETE, url.as_str())
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1229,12 +1231,12 @@ impl Transport for SeaRestTransport {
             .await
         {
             crate::klog::warn!(
-                session_id = %session_id,
+                session_url = %url,
                 error = %e,
                 "delete_session failed after HTTP retries; server-side session will be reclaimed by idle timeout"
             );
         } else {
-            debug!("Deleted session: {}", session_id);
+            debug!("Deleted session at {}", url);
         }
 
         Ok(())
@@ -2782,7 +2784,7 @@ mod tests {
             .await
             .expect("statement close must succeed");
         transport
-            .delete_session(&session.session_id)
+            .delete_session()
             .await
             .expect("session close must succeed");
 
@@ -2877,7 +2879,7 @@ mod tests {
                 .await
                 .expect("execute must succeed");
             transport
-                .delete_session(&session.session_id)
+                .delete_session()
                 .await
                 .expect("session close must succeed");
 

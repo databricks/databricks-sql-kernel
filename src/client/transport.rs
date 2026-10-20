@@ -298,8 +298,8 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         session_config: HashMap<String, String>,
     ) -> Result<SessionInfo>;
 
-    /// Delete/close a session.
-    async fn delete_session(&self, session_id: &str) -> Result<()>;
+    /// Close the session created by this transport.
+    async fn delete_session(&self) -> Result<()>;
 
     // --- Statement Execution ---
 
