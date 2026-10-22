@@ -191,7 +191,10 @@ impl ResultPostProcessor {
                 // (DATATYPE-041).
                 null_columns.push(i);
                 schema_changed = true;
-                normalized_field.clone().with_data_type(DataType::Utf8)
+                normalized_field
+                    .clone()
+                    .with_data_type(DataType::Utf8)
+                    .with_nullable(true)
             } else {
                 normalized_field.clone()
             };
@@ -732,6 +735,47 @@ mod tests {
             .expect("untyped_null rewritten to StringArray");
         assert_eq!(col.len(), 1);
         assert!(col.is_null(0));
+    }
+
+    #[tokio::test]
+    async fn non_nullable_null_ipc_column_becomes_nullable_utf8() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "untyped_null",
+            DataType::Null,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(arrow_array::NullArray::new(2)) as _],
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let batch = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        assert!(!batch.schema().field(0).is_nullable());
+        let manifest = make_manifest(vec![column_info("untyped_null", "NULL", "VOID", 0)]);
+
+        for manifest in [None, Some(&manifest)] {
+            let inner = Box::new(MockReader::new(vec![batch.clone()]));
+            let mut pp = ResultPostProcessor::new(inner, manifest, PostProcessOptions::default())
+                .await
+                .unwrap();
+            let advertised = pp.schema().await.unwrap();
+            let out = pp.next_batch().await.unwrap().unwrap();
+            assert_eq!(advertised.field(0).data_type(), &DataType::Utf8);
+            assert!(advertised.field(0).is_nullable());
+            assert_eq!(out.schema(), advertised);
+            assert_eq!(out.num_rows(), 2);
+            assert_eq!(out.column(0).null_count(), 2);
+        }
     }
 
     #[tokio::test]

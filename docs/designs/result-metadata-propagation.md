@@ -122,8 +122,8 @@ Values are string-encoded because Arrow field metadata is `HashMap<String, Strin
 
 Manifest `nullable` overrides the Arrow field's nullability when provided. If it is
 absent or null, the physical Arrow value is preserved; empty results without an
-Arrow schema default to nullable. Nullability survives result type conversions
-and propagates to the advertised schema and returned batches.
+Arrow schema default to nullable. Nullability propagates through type conversions
+to the advertised schema and returned batches; Null → Utf8 fields remain nullable.
 
 ---
 
