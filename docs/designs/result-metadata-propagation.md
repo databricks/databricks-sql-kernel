@@ -378,8 +378,8 @@ std::string AdbcResultSetMetadata::GetTypeName(int column_position, int16_t data
 | `databricks.type_scale` | Correct DECIMAL scale from server |
 | Manifest `nullable` | Used for empty results without `arrow_schema` |
 
-Result schemas retain Arrow nullability. Empty results without `arrow_schema` use
-manifest `nullable`, defaulting to nullable when it is absent or null.
+Empty results without `arrow_schema` use manifest `nullable`, defaulting to nullable
+when absent or null. Inline-streaming fallback schemas do not use manifest nullability.
 
 ---
 

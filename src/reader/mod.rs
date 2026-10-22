@@ -177,7 +177,7 @@ impl ResultReaderFactory {
                 statement_id,
                 "Manifest reports total_chunk_count=0; short-circuiting to empty reader",
             );
-            let schema = Self::extract_physical_schema_from_manifest(response.manifest.as_ref())?;
+            let schema = Self::extract_empty_schema_from_manifest(response.manifest.as_ref())?;
             return Ok(Box::new(EmptyReader::new(schema)));
         }
 
@@ -373,8 +373,7 @@ impl ResultReaderFactory {
                     "Using empty reader: no result data present for {:?} statement",
                     response.status.state
                 );
-                let schema =
-                    Self::extract_physical_schema_from_manifest(response.manifest.as_ref())?;
+                let schema = Self::extract_empty_schema_from_manifest(response.manifest.as_ref())?;
                 Ok(Box::new(EmptyReader::new(schema)))
             }
             StatementState::Pending | StatementState::Running => Err(Error::invalid_state()
@@ -438,7 +437,7 @@ impl ResultReaderFactory {
                         col.type_interval_type.as_deref(),
                         GeospatialResultRepresentation::Binary,
                     );
-                Field::new(&col.name, data_type, col.nullable.unwrap_or(true))
+                Field::new(&col.name, data_type, true) // nullable by default
             })
             .collect();
 
@@ -481,6 +480,35 @@ impl ResultReaderFactory {
             )));
         }
         Ok(physical)
+    }
+
+    /// Apply manifest nullability only to empty results without `arrow_schema`.
+    fn extract_empty_schema_from_manifest(manifest: Option<&ResultManifest>) -> Result<SchemaRef> {
+        let schema = Self::extract_physical_schema_from_manifest(manifest)?;
+        let Some(manifest) = manifest.filter(|manifest| {
+            manifest
+                .arrow_schema
+                .as_deref()
+                .unwrap_or_default()
+                .is_empty()
+        }) else {
+            return Ok(schema);
+        };
+        let fields: Vec<Field> = schema
+            .fields()
+            .iter()
+            .zip(&manifest.schema.columns)
+            .map(|(field, column)| {
+                field
+                    .as_ref()
+                    .clone()
+                    .with_nullable(column.nullable.unwrap_or(true))
+            })
+            .collect();
+        Ok(Arc::new(Schema::new_with_metadata(
+            fields,
+            schema.metadata().clone(),
+        )))
     }
 
     fn create_cloudfetch_reader(

@@ -699,8 +699,14 @@ async fn execute_succeeded_inline_returns_one_row() {
 }
 
 #[tokio::test]
-async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
-    for mode in ["inline", "cloudfetch", "empty", "empty_with_arrow_schema"] {
+async fn execute_uses_manifest_nullability_only_for_empty_results_without_arrow_schema() {
+    for mode in [
+        "inline",
+        "cloudfetch",
+        "empty",
+        "empty_without_chunk_count",
+        "empty_with_arrow_schema",
+    ] {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
         mount_delete_session(&server).await;
@@ -745,7 +751,7 @@ async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
                     .mount(&server)
                     .await;
             }
-            "empty" | "empty_with_arrow_schema" => {
+            "empty" | "empty_without_chunk_count" | "empty_with_arrow_schema" => {
                 body.as_object_mut().unwrap().remove("result");
                 body["manifest"]["total_row_count"] = json!(0);
                 body["manifest"]["total_chunk_count"] = json!(0);
@@ -753,6 +759,11 @@ async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
                 if mode == "empty_with_arrow_schema" {
                     body["manifest"]["arrow_schema"] =
                         json!(STANDARD.encode(arrow_schema_ipc_bytes(&schema)));
+                } else if mode == "empty_without_chunk_count" {
+                    body["manifest"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("total_chunk_count");
                 }
             }
             _ => {}
@@ -763,10 +774,23 @@ async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
         statement.spec().sql("SELECT id, label, legacy FROM values");
         let mut executed = statement.execute().await.expect("execute");
         let advertised = executed.result_stream_mut().schema();
+        let uses_manifest_nullability = matches!(mode, "empty" | "empty_without_chunk_count");
         assert_eq!(advertised.field(0).name(), "id", "{mode}");
-        assert_eq!(advertised.field(0).is_nullable(), mode != "empty", "{mode}");
-        assert_eq!(advertised.field(1).is_nullable(), mode == "empty", "{mode}");
-        assert_eq!(advertised.field(2).is_nullable(), mode == "empty", "{mode}");
+        assert_eq!(
+            advertised.field(0).is_nullable(),
+            !uses_manifest_nullability,
+            "{mode}"
+        );
+        assert_eq!(
+            advertised.field(1).is_nullable(),
+            uses_manifest_nullability,
+            "{mode}"
+        );
+        assert_eq!(
+            advertised.field(2).is_nullable(),
+            uses_manifest_nullability,
+            "{mode}"
+        );
         let batches = drain(executed.result_stream_mut()).await;
         if mode.starts_with("empty") {
             assert!(batches.is_empty(), "{mode}");
@@ -784,6 +808,60 @@ async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
         }
         executed.close().await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn execute_inline_streaming_fallback_does_not_apply_manifest_nullability() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "col_0",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![None::<i64>]))],
+    )
+    .unwrap();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-streaming", &batch)).unwrap();
+    body["manifest"]["schema"]["columns"][0]["nullable"] = json!(false);
+    body["manifest"]["total_chunk_count"] = json!(2);
+    let empty_chunk = arrow_schema_ipc_bytes(&schema);
+    body["result"]["attachment"] = json!(STANDARD.encode(&empty_chunk));
+    body["result"]["byte_count"] = json!(empty_chunk.len());
+    body["result"]["row_count"] = json!(0);
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/2.0/sql/statements/stmt-streaming/result/chunks/1",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk_index": 1,
+            "row_offset": 0,
+            "row_count": 1,
+            "attachment": STANDARD.encode(arrow_ipc_bytes(&batch)),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement.spec().sql("SELECT value FROM nullable_values");
+    let mut executed = statement.execute().await.expect("execute");
+    let advertised = executed.schema();
+    let batches = drain(executed.result_stream_mut()).await;
+    assert!(advertised.field(0).is_nullable());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema(), advertised);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(batches[0].column(0).null_count(), 1);
+    executed.close().await.unwrap();
 }
 
 #[tokio::test]
