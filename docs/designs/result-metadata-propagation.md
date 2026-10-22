@@ -120,6 +120,11 @@ databricks.type_interval_type "YEAR_MONTH"  (optional, for INTERVAL types)
 These keys are additive — they don't conflict with any existing Arrow metadata conventions.
 Values are string-encoded because Arrow field metadata is `HashMap<String, String>`.
 
+Manifest `nullable` overrides the Arrow field's nullability when provided. If it is
+absent or null, the physical Arrow value is preserved; empty results without an
+Arrow schema default to nullable. Nullability survives result type conversions
+and propagates to the advertised schema and returned batches.
+
 ---
 
 ## Detailed Design
@@ -376,12 +381,11 @@ std::string AdbcResultSetMetadata::GetTypeName(int column_position, int16_t data
 | `databricks.type_text` | Full type text including parameters ("DECIMAL(10,2)", "ARRAY<INT>") |
 | `databricks.type_precision` | Correct DECIMAL precision from server, not Arrow physical type |
 | `databricks.type_scale` | Correct DECIMAL scale from server |
-| (nullable default) | Default to SQL_NULLABLE for all result columns (matches JDBC) |
+| Manifest `nullable` | Propagated through the Arrow field's nullability |
 
-The nullable fix is a policy change in the ODBC driver (default to NULLABLE) rather than
-a metadata propagation issue — the SEA manifest doesn't include per-column nullability either.
-The JDBC driver simply defaults all result columns to NULLABLE, which is the correct semantic
-for query results (any expression can return NULL).
+Consumers can read nullability from the Arrow field. When the manifest omits it,
+the kernel preserves physical Arrow nullability, or defaults to nullable if no
+physical schema is available.
 
 ---
 

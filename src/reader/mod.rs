@@ -438,7 +438,7 @@ impl ResultReaderFactory {
                         col.type_interval_type.as_deref(),
                         GeospatialResultRepresentation::Binary,
                     );
-                Field::new(&col.name, data_type, true) // nullable by default
+                Field::new(&col.name, data_type, col.nullable.unwrap_or(true))
             })
             .collect();
 
@@ -934,6 +934,7 @@ impl ResultReaderAdapter {
     ///   precision, scale, interval_type) for the Arrow C Data FFI boundary;
     /// - attach the Thrift-compatible `Spark:DataType:SqlName` (= type_text).
     /// - attach `Spark:DataType:JsonType` when the manifest provides `type_json`.
+    /// - apply manifest nullability when provided.
     ///
     /// Fields with no matching `ColumnInfo` are left unchanged.
     pub(crate) fn augment_schema_with_manifest(
@@ -997,6 +998,7 @@ impl ResultReaderAdapter {
                             .as_ref()
                             .clone()
                             .with_name(info.name.clone())
+                            .with_nullable(info.nullable.unwrap_or(field.is_nullable()))
                             .with_metadata(metadata)
                     }
                     None => field.as_ref().clone(),
@@ -1435,6 +1437,7 @@ mod tests {
             type_scale: scale,
             type_interval_type: interval_type.map(|s| s.to_string()),
             type_json: None,
+            nullable: None,
         }
     }
 
@@ -1697,6 +1700,69 @@ mod tests {
                 .map(String::as_str),
             Some(r#""integer""#),
         );
+    }
+
+    #[test]
+    fn test_augment_schema_applies_optional_nullability_by_position() {
+        for nullable in [Some(false), Some(true), None] {
+            for physical_nullable in [false, true] {
+                let field_metadata = std::collections::HashMap::from([(
+                    "custom.key".to_string(),
+                    "preserved".to_string(),
+                )]);
+                let schema = Arc::new(Schema::new_with_metadata(
+                    vec![
+                        Field::new("col_0", DataType::Int32, physical_nullable)
+                            .with_metadata(field_metadata.clone()),
+                        Field::new("col_1", DataType::Utf8, true),
+                        Field::new("unmatched", DataType::Int64, false)
+                            .with_metadata(field_metadata),
+                    ],
+                    std::collections::HashMap::from([(
+                        "schema.key".to_string(),
+                        "preserved".to_string(),
+                    )]),
+                ));
+                let mut column = make_column_info("id", "INT", "INT", 0, None, None, None);
+                column.nullable = nullable;
+                let manifest = make_manifest(vec![
+                    make_column_info("name", "STRING", "STRING", 1, None, None, None),
+                    column,
+                ]);
+
+                let augmented =
+                    ResultReaderAdapter::augment_schema_with_manifest(&schema, &manifest);
+                let field = augmented.field(0);
+                assert_eq!(field.name(), "id");
+                assert_eq!(field.is_nullable(), nullable.unwrap_or(physical_nullable));
+                assert_eq!(
+                    field.metadata().get("custom.key").map(String::as_str),
+                    Some("preserved"),
+                );
+                assert!(augmented.field(1).is_nullable());
+                assert_eq!(augmented.field(2), schema.field(2));
+                assert_eq!(augmented.metadata(), schema.metadata());
+            }
+        }
+    }
+
+    #[test]
+    fn test_extract_logical_schema_uses_manifest_nullability() {
+        let mut required = make_column_info("required", "INT", "INT", 0, None, None, None);
+        required.nullable = Some(false);
+        let mut optional = make_column_info("optional", "INT", "INT", 1, None, None, None);
+        optional.nullable = Some(true);
+        let manifest = make_manifest(vec![
+            required,
+            optional,
+            make_column_info("unknown", "INT", "INT", 2, None, None, None),
+        ]);
+
+        let schema =
+            ResultReaderFactory::extract_logical_schema_from_manifest(Some(&manifest)).unwrap();
+        assert!(!schema.field(0).is_nullable());
+        assert!(schema.field(1).is_nullable());
+        assert!(schema.field(2).is_nullable());
     }
 
     #[test]

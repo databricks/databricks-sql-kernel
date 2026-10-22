@@ -699,6 +699,94 @@ async fn execute_succeeded_inline_returns_one_row() {
 }
 
 #[tokio::test]
+async fn execute_preserves_manifest_nullability_across_result_readers() {
+    for mode in ["inline", "cloudfetch", "empty", "empty_with_arrow_schema"] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int64, true),
+            Field::new("col_1", DataType::Utf8, false),
+            Field::new("col_2", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![42])) as _,
+                Arc::new(StringArray::from(vec!["label"])) as _,
+                Arc::new(StringArray::from(vec!["legacy"])) as _,
+            ],
+        )
+        .unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-metadata", &batch)).unwrap();
+        body["manifest"]["schema"]["columns"] = json!([
+            {"name": "id", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0,
+             "nullable": false},
+            {"name": "label", "type_name": "STRING", "type_text": "STRING", "position": 1,
+             "nullable": true},
+            {"name": "legacy", "type_name": "STRING", "type_text": "STRING", "position": 2,
+             "nullable": null},
+        ]);
+        match mode {
+            "cloudfetch" => {
+                let ipc = arrow_ipc_bytes(&batch);
+                body["result"] = json!({"external_links": [{
+                    "external_link": format!("{}/chunk.arrow", server.uri()),
+                    "expiration": "2099-01-01T00:00:00.000Z",
+                    "chunk_index": 0, "row_offset": 0, "row_count": 1,
+                    "byte_count": ipc.len(),
+                }]});
+                Mock::given(method("GET"))
+                    .and(path("/chunk.arrow"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            "empty" | "empty_with_arrow_schema" => {
+                body.as_object_mut().unwrap().remove("result");
+                body["manifest"]["total_row_count"] = json!(0);
+                body["manifest"]["total_chunk_count"] = json!(0);
+                body["manifest"]["total_byte_count"] = json!(0);
+                if mode == "empty_with_arrow_schema" {
+                    body["manifest"]["arrow_schema"] =
+                        json!(STANDARD.encode(arrow_schema_ipc_bytes(&schema)));
+                }
+            }
+            _ => {}
+        }
+        mount_execute(&server, body.to_string()).await;
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT id, label, legacy FROM values");
+        let mut executed = statement.execute().await.expect("execute");
+        let advertised = executed.result_stream_mut().schema();
+        assert_eq!(advertised.field(0).name(), "id", "{mode}");
+        assert!(!advertised.field(0).is_nullable(), "{mode}");
+        assert!(advertised.field(1).is_nullable(), "{mode}");
+        assert_eq!(advertised.field(2).is_nullable(), mode == "empty", "{mode}");
+        let batches = drain(executed.result_stream_mut()).await;
+        if mode.starts_with("empty") {
+            assert!(batches.is_empty(), "{mode}");
+        } else {
+            assert_eq!(batches.len(), 1, "{mode}");
+            assert_eq!(batches[0].schema(), advertised, "{mode}");
+            assert_eq!(batches[0].num_rows(), 1, "{mode}");
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+                42
+            );
+        }
+        executed.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn execute_geospatial_string_mode_uses_manifest_tags_for_untagged_arrow_ipc() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

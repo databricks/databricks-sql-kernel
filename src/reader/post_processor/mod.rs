@@ -173,13 +173,11 @@ impl ResultPostProcessor {
             {
                 json_columns.push(i);
                 schema_changed = true;
-                Field::new(field.name(), DataType::Utf8, true)
-                    .with_metadata(field.metadata().clone())
+                normalized_field.clone().with_data_type(DataType::Utf8)
             } else if options.intervals_as_string && is_interval_or_duration_type(normalized_type) {
                 interval_columns.push(i);
                 schema_changed = true;
-                Field::new(field.name(), DataType::Utf8, true)
-                    .with_metadata(field.metadata().clone())
+                normalized_field.clone().with_data_type(DataType::Utf8)
             } else if matches!(normalized_type, DataType::Null) {
                 // Untyped NULL (`SELECT NULL` / VOID) arrives as an Arrow
                 // `Null`-typed column, but the server reports it as STRING
@@ -193,8 +191,7 @@ impl ResultPostProcessor {
                 // (DATATYPE-041).
                 null_columns.push(i);
                 schema_changed = true;
-                Field::new(field.name(), DataType::Utf8, true)
-                    .with_metadata(field.metadata().clone())
+                normalized_field.clone().with_data_type(DataType::Utf8)
             } else {
                 normalized_field.clone()
             };
@@ -306,9 +303,7 @@ impl ResultReader for ResultPostProcessor {
 }
 
 /// Compare schemas by their field sequence including per-field
-/// metadata. Faster than serialising both sides; sufficient because
-/// the augmenter only rewrites `Field::metadata` (and the JSON path
-/// rewrites field type, which `Field::eq` already covers).
+/// metadata, names, and nullability. `Field::eq` also covers rewritten types.
 fn schemas_field_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
     if Arc::ptr_eq(a, b) {
         return true;
@@ -493,6 +488,7 @@ mod tests {
             type_scale: None,
             type_interval_type: None,
             type_json: None,
+            nullable: None,
         }
     }
 
@@ -583,6 +579,53 @@ mod tests {
                 .get(metadata_keys::SPARK_SQL_NAME),
             Some(&"VARIANT".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn manifest_nullability_survives_type_conversions() {
+        for nullable in [false, true] {
+            let mut lists = ListBuilder::new(Int32Builder::new());
+            lists.values().append_value(42);
+            lists.append(true);
+            let lists = lists.finish();
+            let intervals = arrow_array::DurationMicrosecondArray::from(vec![1_000_000]);
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("col_0", lists.data_type().clone(), !nullable),
+                Field::new("col_1", intervals.data_type().clone(), !nullable),
+            ]));
+            let batch =
+                RecordBatch::try_new(schema, vec![Arc::new(lists) as _, Arc::new(intervals) as _])
+                    .unwrap();
+            let inner = Box::new(MockReader::new(vec![batch.clone(), batch]));
+            let mut columns = vec![
+                column_info("values", "ARRAY", "ARRAY<INT>", 0),
+                column_info("duration", "INTERVAL", "INTERVAL DAY TO SECOND", 1),
+            ];
+            for column in &mut columns {
+                column.nullable = Some(nullable);
+            }
+            let manifest = make_manifest(columns);
+            let options = PostProcessOptions {
+                complex_types_as_json: true,
+                intervals_as_string: true,
+                ..Default::default()
+            };
+            let mut processor = ResultPostProcessor::new(inner, Some(&manifest), options)
+                .await
+                .unwrap();
+            let schema = processor.schema().await.unwrap();
+            for field in schema.fields() {
+                assert_eq!(field.data_type(), &DataType::Utf8);
+                assert_eq!(field.is_nullable(), nullable);
+            }
+            let batch = processor.next_batch().await.unwrap().unwrap();
+            assert_eq!(batch.schema(), schema);
+            let TryNextBatch::Ready(batch) = processor.try_next_batch().unwrap() else {
+                panic!("expected a buffered batch");
+            };
+            assert_eq!(batch.schema(), schema);
+            assert!(processor.next_batch().await.unwrap().is_none());
+        }
     }
 
     #[tokio::test]
