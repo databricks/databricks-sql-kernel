@@ -120,11 +120,6 @@ databricks.type_interval_type "YEAR_MONTH"  (optional, for INTERVAL types)
 These keys are additive — they don't conflict with any existing Arrow metadata conventions.
 Values are string-encoded because Arrow field metadata is `HashMap<String, String>`.
 
-Manifest `nullable` overrides the Arrow field's nullability when provided. If it is
-absent or null, the physical Arrow value is preserved; empty results without an
-Arrow schema default to nullable. Nullability propagates through type conversions
-to the advertised schema and returned batches; Null → Utf8 fields remain nullable.
-
 ---
 
 ## Detailed Design
@@ -381,11 +376,10 @@ std::string AdbcResultSetMetadata::GetTypeName(int column_position, int16_t data
 | `databricks.type_text` | Full type text including parameters ("DECIMAL(10,2)", "ARRAY<INT>") |
 | `databricks.type_precision` | Correct DECIMAL precision from server, not Arrow physical type |
 | `databricks.type_scale` | Correct DECIMAL scale from server |
-| Manifest `nullable` | Propagated through the Arrow field's nullability |
+| Manifest `nullable` | Used for empty results without `arrow_schema` |
 
-Consumers can read nullability from the Arrow field. When the manifest omits it,
-the kernel preserves physical Arrow nullability, or defaults to nullable if no
-physical schema is available.
+Result schemas retain Arrow nullability. Empty results without `arrow_schema` use
+manifest `nullable`, defaulting to nullable when it is absent or null.
 
 ---
 

@@ -699,7 +699,7 @@ async fn execute_succeeded_inline_returns_one_row() {
 }
 
 #[tokio::test]
-async fn execute_preserves_manifest_nullability_across_result_readers() {
+async fn execute_uses_manifest_nullability_only_without_arrow_schema() {
     for mode in ["inline", "cloudfetch", "empty", "empty_with_arrow_schema"] {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
@@ -764,8 +764,8 @@ async fn execute_preserves_manifest_nullability_across_result_readers() {
         let mut executed = statement.execute().await.expect("execute");
         let advertised = executed.result_stream_mut().schema();
         assert_eq!(advertised.field(0).name(), "id", "{mode}");
-        assert!(!advertised.field(0).is_nullable(), "{mode}");
-        assert!(advertised.field(1).is_nullable(), "{mode}");
+        assert_eq!(advertised.field(0).is_nullable(), mode != "empty", "{mode}");
+        assert_eq!(advertised.field(1).is_nullable(), mode == "empty", "{mode}");
         assert_eq!(advertised.field(2).is_nullable(), mode == "empty", "{mode}");
         let batches = drain(executed.result_stream_mut()).await;
         if mode.starts_with("empty") {

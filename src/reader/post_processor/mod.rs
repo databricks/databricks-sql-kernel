@@ -173,11 +173,13 @@ impl ResultPostProcessor {
             {
                 json_columns.push(i);
                 schema_changed = true;
-                normalized_field.clone().with_data_type(DataType::Utf8)
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
             } else if options.intervals_as_string && is_interval_or_duration_type(normalized_type) {
                 interval_columns.push(i);
                 schema_changed = true;
-                normalized_field.clone().with_data_type(DataType::Utf8)
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
             } else if matches!(normalized_type, DataType::Null) {
                 // Untyped NULL (`SELECT NULL` / VOID) arrives as an Arrow
                 // `Null`-typed column, but the server reports it as STRING
@@ -191,10 +193,8 @@ impl ResultPostProcessor {
                 // (DATATYPE-041).
                 null_columns.push(i);
                 schema_changed = true;
-                normalized_field
-                    .clone()
-                    .with_data_type(DataType::Utf8)
-                    .with_nullable(true)
+                Field::new(field.name(), DataType::Utf8, true)
+                    .with_metadata(field.metadata().clone())
             } else {
                 normalized_field.clone()
             };
@@ -306,7 +306,9 @@ impl ResultReader for ResultPostProcessor {
 }
 
 /// Compare schemas by their field sequence including per-field
-/// metadata, names, and nullability. `Field::eq` also covers rewritten types.
+/// metadata. Faster than serialising both sides; sufficient because
+/// the augmenter only rewrites `Field::metadata` (and the JSON path
+/// rewrites field type, which `Field::eq` already covers).
 fn schemas_field_equal(a: &SchemaRef, b: &SchemaRef) -> bool {
     if Arc::ptr_eq(a, b) {
         return true;
@@ -585,53 +587,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn manifest_nullability_survives_type_conversions() {
-        for nullable in [false, true] {
-            let mut lists = ListBuilder::new(Int32Builder::new());
-            lists.values().append_value(42);
-            lists.append(true);
-            let lists = lists.finish();
-            let intervals = arrow_array::DurationMicrosecondArray::from(vec![1_000_000]);
-            let schema = Arc::new(Schema::new(vec![
-                Field::new("col_0", lists.data_type().clone(), !nullable),
-                Field::new("col_1", intervals.data_type().clone(), !nullable),
-            ]));
-            let batch =
-                RecordBatch::try_new(schema, vec![Arc::new(lists) as _, Arc::new(intervals) as _])
-                    .unwrap();
-            let inner = Box::new(MockReader::new(vec![batch.clone(), batch]));
-            let mut columns = vec![
-                column_info("values", "ARRAY", "ARRAY<INT>", 0),
-                column_info("duration", "INTERVAL", "INTERVAL DAY TO SECOND", 1),
-            ];
-            for column in &mut columns {
-                column.nullable = Some(nullable);
-            }
-            let manifest = make_manifest(columns);
-            let options = PostProcessOptions {
-                complex_types_as_json: true,
-                intervals_as_string: true,
-                ..Default::default()
-            };
-            let mut processor = ResultPostProcessor::new(inner, Some(&manifest), options)
-                .await
-                .unwrap();
-            let schema = processor.schema().await.unwrap();
-            for field in schema.fields() {
-                assert_eq!(field.data_type(), &DataType::Utf8);
-                assert_eq!(field.is_nullable(), nullable);
-            }
-            let batch = processor.next_batch().await.unwrap().unwrap();
-            assert_eq!(batch.schema(), schema);
-            let TryNextBatch::Ready(batch) = processor.try_next_batch().unwrap() else {
-                panic!("expected a buffered batch");
-            };
-            assert_eq!(batch.schema(), schema);
-            assert!(processor.next_batch().await.unwrap().is_none());
-        }
-    }
-
-    #[tokio::test]
     async fn manifest_overlays_real_names_onto_positional_columns_and_batches() {
         // Real names must appear on both the advertised schema and the
         // yielded batch (rebuilt onto the renamed schema), not the col_N
@@ -735,47 +690,6 @@ mod tests {
             .expect("untyped_null rewritten to StringArray");
         assert_eq!(col.len(), 1);
         assert!(col.is_null(0));
-    }
-
-    #[tokio::test]
-    async fn non_nullable_null_ipc_column_becomes_nullable_utf8() {
-        let schema = Arc::new(Schema::new(vec![Field::new(
-            "untyped_null",
-            DataType::Null,
-            false,
-        )]));
-        let batch = RecordBatch::try_new(
-            schema.clone(),
-            vec![Arc::new(arrow_array::NullArray::new(2)) as _],
-        )
-        .unwrap();
-        let mut ipc = Vec::new();
-        {
-            let mut writer = arrow_ipc::writer::StreamWriter::try_new(&mut ipc, &schema).unwrap();
-            writer.write(&batch).unwrap();
-            writer.finish().unwrap();
-        }
-        let batch = arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(ipc), None)
-            .unwrap()
-            .next()
-            .unwrap()
-            .unwrap();
-        assert!(!batch.schema().field(0).is_nullable());
-        let manifest = make_manifest(vec![column_info("untyped_null", "NULL", "VOID", 0)]);
-
-        for manifest in [None, Some(&manifest)] {
-            let inner = Box::new(MockReader::new(vec![batch.clone()]));
-            let mut pp = ResultPostProcessor::new(inner, manifest, PostProcessOptions::default())
-                .await
-                .unwrap();
-            let advertised = pp.schema().await.unwrap();
-            let out = pp.next_batch().await.unwrap().unwrap();
-            assert_eq!(advertised.field(0).data_type(), &DataType::Utf8);
-            assert!(advertised.field(0).is_nullable());
-            assert_eq!(out.schema(), advertised);
-            assert_eq!(out.num_rows(), 2);
-            assert_eq!(out.column(0).null_count(), 2);
-        }
     }
 
     #[tokio::test]
