@@ -14,6 +14,15 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.3.0] - 2026-10-23
+
+### Updated
+- Bundle the kernel's TLS and runtime dependency security updates.
+
+### Fixed
+- Preserve manifest column nullability in empty-result Arrow schemas when
+  no Arrow schema is supplied.
+
 ## [v1.2.0] - 2026-10-19
 
 ### Added
