@@ -14,6 +14,17 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.3.0] - 2026-10-23
+
+### Updated
+- Update `rustls` to `0.23.46`, `tokio` to `1.53.3`, `rustls-webpki` to
+  `0.103.16`, and `webpki-roots` to `1.0.11` for security fixes; enforce
+  the webpki minimums for `tls-rustls` consumers.
+
+### Fixed
+- Preserve manifest column nullability for empty results without an Arrow
+  schema, defaulting to nullable when unspecified.
+
 ## [v1.2.0] - 2026-10-19
 
 ### Added
