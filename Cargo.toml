@@ -60,6 +60,9 @@ arrow-ipc = "59"
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+# Enforce TLS dependency minimums for consumers with their own lockfiles.
+rustls-webpki = { version = "0.103.16", optional = true, default-features = false }
+webpki-roots = { version = "1.0.11", optional = true, default-features = false }
 tokio = { version = "1", features = ["full", "sync"] }
 
 # Serialization
@@ -206,7 +209,12 @@ tls-native = ["reqwest/native-tls"]
 # fallback lost). This gives the aarch64 cross-build — the only Linux arch on
 # `tls-rustls` — system-CA parity with the x86_64/i686 OpenSSL builds. See
 # odbc#323.
-tls-rustls = ["reqwest/rustls-tls", "reqwest/rustls-tls-native-roots"]
+tls-rustls = [
+    "reqwest/rustls-tls",
+    "reqwest/rustls-tls-native-roots",
+    "dep:rustls-webpki",
+    "dep:webpki-roots",
+]
 
 [lib]
 name = "databricks_sql_kernel"
