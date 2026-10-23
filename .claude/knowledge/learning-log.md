@@ -366,6 +366,10 @@ author, follow-up, and review runs.
 - **Context:** PR #361's Node option field `enable_geo_spatial_support` auto-generated the TS name `enableGeoSpatialSupport`, diverging from Python/C `enable_geospatial_support`; reviewers noted renaming after publish is a breaking change for Node consumers.
   **Rule:** napi-rs derives the public TypeScript option name directly from the Rust field identifier, so word-splitting/casing is locked in at publish time and can't change without a breaking release — choose binding field names for cross-binding (Python/C/Node) spelling parity before the first publish.
 
+### 2026-10-23: learnings since 2026-10-22T07:35:08Z
+- **Context:** PR #410 switched empty-result schema construction to stamp the SEA manifest's per-column `nullable` flag onto Arrow fields (previously every result column was forced to NULLABLE). Reviewers flagged that the tightened field flows into the post-processor, which rebuilds every batch via `RecordBatch::try_new`.
+  **Rule:** In arrow-rs (59+), declaring an Arrow field non-nullable over a column whose physical array actually contains nulls makes `RecordBatch::try_new` hard-fail (or silently violates the invariant at the C-Data/FFI boundary, where consumers like pyarrow misread/reject it) — before tightening nullability from a server/manifest hint, confirm the invariant (`nullable:false` ⇒ zero nulls) holds against real data, and add a test exercising `nullable:false` against a null-bearing column, since null-free test data hides the failure.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
