@@ -1398,7 +1398,7 @@ async fn attach_seeds_status_and_reports_server_state() {
 }
 
 #[tokio::test]
-async fn attached_statement_inline_continuations_use_the_sessions_selected_prefix() {
+async fn attached_statement_inline_reads_use_standard_urls() {
     use wiremock::matchers::query_param;
 
     for realtime in [true, false] {
@@ -1415,7 +1415,7 @@ async fn attached_statement_inline_continuations_use_the_sessions_selected_prefi
             .mount(&server)
             .await;
 
-        let prefix = if realtime {
+        let session_prefix = if realtime {
             "/api/2.0/sql/warehouses/test_wh/sessions/sess-test"
         } else {
             "/api/2.0/sql"
@@ -1428,15 +1428,13 @@ async fn attached_statement_inline_continuations_use_the_sessions_selected_prefi
         status["manifest"]["total_row_count"] = json!(4);
         status["result"]["next_chunk_index"] = json!(1);
         Mock::given(method("GET"))
-            .and(path(format!("{prefix}/statements/stmt-attach")))
+            .and(path("/api/2.0/sql/statements/stmt-attach"))
             .respond_with(ResponseTemplate::new(200).set_body_json(status))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path(format!(
-                "{prefix}/statements/stmt-attach/result/chunks/1"
-            )))
+            .and(path("/api/2.0/sql/statements/stmt-attach/result/chunks/1"))
             .and(query_param("row_offset", "2"))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
                 "chunk_index": 1,
@@ -1448,14 +1446,31 @@ async fn attached_statement_inline_continuations_use_the_sessions_selected_prefi
             .mount(&server)
             .await;
         let close_path = if realtime {
-            prefix.to_string()
+            session_prefix.to_string()
         } else {
-            format!("{prefix}/sessions/sess-test")
+            format!("{session_prefix}/sessions/sess-test")
         };
         Mock::given(method("DELETE"))
             .and(path(close_path))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path(format!("{session_prefix}/statements")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("stmt-owned")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("{session_prefix}/statements/stmt-owned")))
+            .respond_with(ResponseTemplate::new(200).set_body_string(running_body("stmt-owned")))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path(format!("{session_prefix}/statements/stmt-owned")))
+            .respond_with(ResponseTemplate::new(200))
             .mount(&server)
             .await;
 
@@ -1464,6 +1479,10 @@ async fn attached_statement_inline_continuations_use_the_sessions_selected_prefi
             .attach_async_statement("stmt-attach")
             .await
             .expect("attach");
+        assert!(matches!(
+            attached.status().await.expect("status"),
+            StatementStatus::Succeeded
+        ));
         let mut stream = attached.fetch_result().await.expect("fetch_result");
         let batches = drain(&mut stream).await;
         let values: Vec<i64> = batches
@@ -1478,9 +1497,106 @@ async fn attached_statement_inline_continuations_use_the_sessions_selected_prefi
             })
             .collect();
         assert_eq!(values, vec![1, 2, 3, 4]);
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT 5");
+        let owned = statement.submit().await.expect("owned submit");
+        assert!(matches!(
+            owned.status().await.expect("owned status"),
+            StatementStatus::Running
+        ));
+        owned.close().await.expect("owned close");
         session.close().await.expect("session close");
         server.verify().await;
     }
+}
+
+#[tokio::test]
+async fn attached_cloudfetch_pagination_and_refresh_use_standard_urls() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-databricks-rt-session", "true")
+                .set_body_json(json!({ "session_id": "session-b" })),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions/session-b"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let batches = [int64_batch("n", vec![1, 2]), int64_batch("n", vec![3, 4])];
+    let mut links = Vec::new();
+    for (index, batch) in batches.iter().enumerate() {
+        let bytes = arrow_ipc_bytes(batch);
+        let chunk_path = format!("/cloud-fetch/chunk-{index}.arrow");
+        links.push(json!({
+            "external_link": format!("{}{chunk_path}", server.uri()),
+            "expiration": "2099-01-01T00:00:00.000Z",
+            "chunk_index": index,
+            "row_offset": index * 2,
+            "row_count": 2,
+            "byte_count": bytes.len(),
+            "next_chunk_index": if index == 0 { Some(1) } else { None },
+        }));
+        Mock::given(method("GET"))
+            .and(path(chunk_path))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/2.0/sql/statements/statement-a/result/chunks/{index}"
+            )))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "external_links": [links[index].clone()],
+            })))
+            .expect(1..)
+            .mount(&server)
+            .await;
+    }
+    let mut expired_link = links[0].clone();
+    expired_link["external_link"] = json!(format!("{}/expired-link", server.uri()));
+    expired_link["expiration"] = json!("2000-01-01T00:00:00.000Z");
+    let mut response: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("statement-a", &batches[0])).unwrap();
+    response["manifest"]["total_chunk_count"] = json!(2);
+    response["manifest"]["total_row_count"] = json!(4);
+    response["result"] = json!({ "external_links": [expired_link] });
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/statement-a"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let attached = session
+        .attach_async_statement("statement-a")
+        .await
+        .expect("attach");
+    let mut stream = attached.fetch_result().await.expect("fetch_result");
+    let fetched = drain(&mut stream).await;
+    let values: Vec<i64> = fetched
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .values()
+                .iter()
+                .copied()
+        })
+        .collect();
+    assert_eq!(values, vec![1, 2, 3, 4]);
+    session.close().await.expect("session close");
+    server.verify().await;
 }
 
 #[tokio::test]

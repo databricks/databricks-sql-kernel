@@ -40,7 +40,7 @@
 //! 3. Check if prefetch should be triggered (async, non-blocking)
 //! 4. Background task fetches links and caches them
 
-use crate::client::{ChunkLinkFetchResult, Transport};
+use crate::client::{ChunkLinkFetchResult, SessionAttribution, Transport};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, error};
 use crate::types::cloudfetch::CloudFetchLink;
@@ -157,6 +157,7 @@ pub(crate) struct SeaChunkLinkFetcher {
     client: Arc<dyn Transport>,
     /// Statement ID this fetcher is bound to
     statement_id: String,
+    session_attribution: SessionAttribution,
     /// Cached links by chunk index
     links: DashMap<i64, CloudFetchLink>,
     /// Next chunk index to ask the server for. Initialised from the
@@ -365,6 +366,7 @@ impl SeaChunkLinkFetcher {
         total_chunk_count: Option<i64>,
         link_prefetch_window: i64,
         runtime_handle: tokio::runtime::Handle,
+        session_attribution: SessionAttribution,
     ) -> Self {
         let statement_id = statement_id.into();
         let links = DashMap::new();
@@ -433,6 +435,7 @@ impl SeaChunkLinkFetcher {
         let fetcher = Self {
             client,
             statement_id,
+            session_attribution,
             links,
             next_server_fetch_index: AtomicI64::new(next_server_fetch_index),
             all_links_fetched: AtomicBool::new(all_links_fetched),
@@ -747,7 +750,12 @@ impl SeaChunkLinkFetcher {
 
             match self
                 .client
-                .get_result_chunks(&self.statement_id, server_fetch_idx, row_offset)
+                .get_result_chunks(
+                    &self.statement_id,
+                    server_fetch_idx,
+                    row_offset,
+                    self.session_attribution,
+                )
                 .await
             {
                 Ok(result) => {
@@ -940,7 +948,12 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         );
         let result = fetcher
             .client
-            .get_result_chunks(&fetcher.statement_id, start_chunk_index, start_row_offset)
+            .get_result_chunks(
+                &fetcher.statement_id,
+                start_chunk_index,
+                start_row_offset,
+                fetcher.session_attribution,
+            )
             .await?;
 
         // Cache the new links.
@@ -1003,7 +1016,12 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         let result = self
             .inner
             .client
-            .get_result_chunks(&self.inner.statement_id, chunk_index, 0)
+            .get_result_chunks(
+                &self.inner.statement_id,
+                chunk_index,
+                0,
+                self.inner.session_attribution,
+            )
             .await?;
 
         let link = result
@@ -1028,7 +1046,12 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         let result = self
             .inner
             .client
-            .get_result_chunks(&self.inner.statement_id, chunk_index, row_offset)
+            .get_result_chunks(
+                &self.inner.statement_id,
+                chunk_index,
+                row_offset,
+                self.inner.session_attribution,
+            )
             .await?;
 
         // The SEA contract today caps the number of links in a
@@ -1195,6 +1218,7 @@ mod tests {
             _statement_id: &str,
             chunk_index: i64,
             _row_offset: i64,
+            _session_attribution: SessionAttribution,
         ) -> Result<ChunkLinkFetchResult> {
             let index = chunk_index as usize;
             if index >= self.chunks.len() {
@@ -1222,6 +1246,7 @@ mod tests {
             _statement_id: &str,
             _chunk_index: i64,
             _row_offset: i64,
+            _session_attribution: SessionAttribution,
         ) -> Result<crate::client::InlineChunkFetchResult> {
             unimplemented!("get_inline_chunk not used by the link-fetcher mock")
         }
@@ -1391,6 +1416,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1427,6 +1453,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1451,6 +1478,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1477,6 +1505,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1499,6 +1528,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1535,6 +1565,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1566,6 +1597,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1601,6 +1633,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1651,6 +1684,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         let handle = SeaChunkLinkFetcherHandle::new(fetcher);
 
@@ -1679,6 +1713,7 @@ mod tests {
             None,
             128,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
 
         // Should be marked as all fetched since we have all chunks
@@ -1711,6 +1746,7 @@ mod tests {
             None,
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         assert!(
             fetcher.all_links_fetched(),
@@ -1743,6 +1779,7 @@ mod tests {
             None,
             /* link_prefetch_window = */ 0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         // Wrap directly in the handle without triggering the prefetch
         // bell — `link_prefetch_window=0` keeps it idle anyway.
@@ -1805,6 +1842,7 @@ mod tests {
             None,
             /* link_prefetch_window = */ 0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         assert_eq!(
             fetcher.next_row_offset.load(Ordering::Acquire),
@@ -1853,6 +1891,7 @@ mod tests {
             /* total_chunk_count = */ Some(2),
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         // Crucial: fetcher must NOT mark all_links_fetched at
         // construction even though the per-link signal would say so.
@@ -1990,6 +2029,7 @@ mod tests {
             None,
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         assert!(
             fetcher.next_server_fetch_index.load(Ordering::Acquire) >= 6,
@@ -2019,6 +2059,7 @@ mod tests {
             None, // total_chunk_count also absent
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         assert!(
             fetcher.silent_eos_warned.load(Ordering::Acquire),
@@ -2044,6 +2085,7 @@ mod tests {
             Some(1), // total says we're at the last chunk
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         assert!(
             !fetcher.silent_eos_warned.load(Ordering::Acquire),
@@ -2065,6 +2107,7 @@ mod tests {
             None,
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
 
         // Each warn helper takes the swap-true path on first
@@ -2097,6 +2140,7 @@ mod tests {
             Some(50),
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         // 10 × 50 = 500, but floor = 10_000 wins
         assert_eq!(with_small_total.runaway_prefetch_ceiling(), 10_000);
@@ -2108,6 +2152,7 @@ mod tests {
             Some(5_000),
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         // 10 × 5_000 = 50_000 beats the floor
         assert_eq!(with_large_total.runaway_prefetch_ceiling(), 50_000);
@@ -2119,6 +2164,7 @@ mod tests {
             None,
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
         // No hint → hard floor only
         assert_eq!(without_total.runaway_prefetch_ceiling(), 10_000);
@@ -2137,6 +2183,7 @@ mod tests {
             None,
             0,
             tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
         );
 
         // Pre-seed the cursor to a high value (simulates a fast

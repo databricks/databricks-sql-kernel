@@ -675,8 +675,8 @@ impl Session {
     /// This is the resume path: a caller (or a different process) that
     /// holds only the statement id can re-attach and drive it to
     /// completion, fetch its result, or read its terminal state.
-    /// Realtime sessions require a statement from this session because their
-    /// URLs include its session ID.
+    /// Attached reads use standard SQL URLs because the statement ID does not
+    /// identify its originating session.
     ///
     /// Issues a single `GetStatementStatus` to seed the handle's initial
     /// status (mirrors how `submit` seeds it from the submit response),
