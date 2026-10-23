@@ -236,6 +236,8 @@ pub struct ColumnInfo {
     pub type_interval_type: Option<String>,
     #[serde(default)]
     pub type_json: Option<String>,
+    #[serde(default)]
+    pub nullable: Option<bool>,
 }
 
 /// Information about a result chunk (metadata only).
@@ -844,7 +846,8 @@ mod tests {
             "position": 0,
             "type_precision": 10,
             "type_scale": 2,
-            "type_json": "\"decimal(10,2)\""
+            "type_json": "\"decimal(10,2)\"",
+            "nullable": false
         }"#;
 
         let col: ColumnInfo = serde_json::from_str(json).unwrap();
@@ -856,6 +859,7 @@ mod tests {
         assert_eq!(col.type_scale, Some(2));
         assert_eq!(col.type_interval_type, None);
         assert_eq!(col.type_json.as_deref(), Some("\"decimal(10,2)\""));
+        assert_eq!(col.nullable, Some(false));
     }
 
     #[test]
@@ -873,20 +877,36 @@ mod tests {
         assert_eq!(col.type_scale, None);
         assert_eq!(col.type_interval_type, None);
         assert_eq!(col.type_json, None);
+        assert_eq!(col.nullable, None);
     }
 
     #[test]
-    fn test_column_info_with_null_json_type() {
+    fn test_column_info_with_null_optional_metadata() {
         let json = r#"{
             "name": "id",
             "type_name": "INT",
             "type_text": "INT",
             "position": 0,
-            "type_json": null
+            "type_json": null,
+            "nullable": null
         }"#;
 
         let col: ColumnInfo = serde_json::from_str(json).unwrap();
         assert_eq!(col.type_json, None);
+        assert_eq!(col.nullable, None);
+    }
+
+    #[test]
+    fn test_column_info_with_nullable_true() {
+        let col: ColumnInfo = serde_json::from_value(serde_json::json!({
+            "name": "value",
+            "type_name": "STRING",
+            "type_text": "STRING",
+            "position": 0,
+            "nullable": true,
+        }))
+        .unwrap();
+        assert_eq!(col.nullable, Some(true));
     }
 
     #[test]

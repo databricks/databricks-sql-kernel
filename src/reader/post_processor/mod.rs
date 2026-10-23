@@ -493,6 +493,7 @@ mod tests {
             type_scale: None,
             type_interval_type: None,
             type_json: None,
+            nullable: None,
         }
     }
 

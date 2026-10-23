@@ -699,6 +699,241 @@ async fn execute_succeeded_inline_returns_one_row() {
 }
 
 #[tokio::test]
+async fn execute_uses_manifest_nullability_only_for_empty_results_without_arrow_schema() {
+    for mode in [
+        "inline",
+        "cloudfetch",
+        "empty",
+        "empty_without_chunk_count",
+        "empty_with_arrow_schema",
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("col_0", DataType::Int64, true),
+            Field::new("col_1", DataType::Utf8, false),
+            Field::new("col_2", DataType::Utf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![42])) as _,
+                Arc::new(StringArray::from(vec!["label"])) as _,
+                Arc::new(StringArray::from(vec!["legacy"])) as _,
+            ],
+        )
+        .unwrap();
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-metadata", &batch)).unwrap();
+        body["manifest"]["schema"]["columns"] = json!([
+            {"name": "id", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0,
+             "nullable": false},
+            {"name": "label", "type_name": "STRING", "type_text": "STRING", "position": 1,
+             "nullable": true},
+            {"name": "legacy", "type_name": "STRING", "type_text": "STRING", "position": 2,
+             "nullable": null},
+        ]);
+        match mode {
+            "cloudfetch" => {
+                let ipc = arrow_ipc_bytes(&batch);
+                body["result"] = json!({"external_links": [{
+                    "external_link": format!("{}/chunk.arrow", server.uri()),
+                    "expiration": "2099-01-01T00:00:00.000Z",
+                    "chunk_index": 0, "row_offset": 0, "row_count": 1,
+                    "byte_count": ipc.len(),
+                }]});
+                Mock::given(method("GET"))
+                    .and(path("/chunk.arrow"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+            }
+            "empty" | "empty_without_chunk_count" | "empty_with_arrow_schema" => {
+                body.as_object_mut().unwrap().remove("result");
+                body["manifest"]["total_row_count"] = json!(0);
+                body["manifest"]["total_chunk_count"] = json!(0);
+                body["manifest"]["total_byte_count"] = json!(0);
+                if mode == "empty_with_arrow_schema" {
+                    body["manifest"]["arrow_schema"] =
+                        json!(STANDARD.encode(arrow_schema_ipc_bytes(&schema)));
+                } else if mode == "empty_without_chunk_count" {
+                    body["manifest"]
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("total_chunk_count");
+                }
+            }
+            _ => {}
+        }
+        mount_execute(&server, body.to_string()).await;
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT id, label, legacy FROM values");
+        let mut executed = statement.execute().await.expect("execute");
+        let advertised = executed.result_stream_mut().schema();
+        let uses_manifest_nullability = matches!(mode, "empty" | "empty_without_chunk_count");
+        assert_eq!(advertised.field(0).name(), "id", "{mode}");
+        assert_eq!(
+            advertised.field(0).is_nullable(),
+            !uses_manifest_nullability,
+            "{mode}"
+        );
+        assert_eq!(
+            advertised.field(1).is_nullable(),
+            uses_manifest_nullability,
+            "{mode}"
+        );
+        assert_eq!(
+            advertised.field(2).is_nullable(),
+            uses_manifest_nullability,
+            "{mode}"
+        );
+        let batches = drain(executed.result_stream_mut()).await;
+        if mode.starts_with("empty") {
+            assert!(batches.is_empty(), "{mode}");
+        } else {
+            assert_eq!(batches.len(), 1, "{mode}");
+            assert_eq!(batches[0].schema(), advertised, "{mode}");
+            assert_eq!(batches[0].num_rows(), 1, "{mode}");
+            assert_eq!(
+                batches[0]
+                    .column(0)
+                    .as_primitive::<arrow_array::types::Int64Type>()
+                    .value(0),
+                42
+            );
+        }
+        executed.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn execute_empty_result_string_conversions_keep_nullable_output() {
+    for (complex_types_as_json, intervals_as_string) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            json!({
+                "statement_id": "stmt-empty-converted",
+                "status": {"state": "SUCCEEDED"},
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {"column_count": 4, "columns": [
+                        {"name": "array_value", "type_name": "ARRAY", "type_text": "ARRAY<INT>",
+                         "position": 0, "nullable": false},
+                        {"name": "struct_value", "type_name": "STRUCT", "type_text": "STRUCT<value:INT>",
+                         "position": 1, "nullable": false},
+                        {"name": "interval_value", "type_name": "INTERVAL", "type_text": "INTERVAL YEAR TO MONTH",
+                         "type_interval_type": "YEAR_MONTH", "position": 2, "nullable": false},
+                        {"name": "id", "type_name": "BIGINT", "type_text": "BIGINT",
+                         "position": 3, "nullable": false},
+                    ]},
+                    "total_chunk_count": 0,
+                    "total_row_count": 0,
+                    "truncated": false,
+                },
+            })
+            .to_string(),
+        )
+        .await;
+        let mut result = ResultConfig::default();
+        result.complex_types_as_json = complex_types_as_json;
+        result.intervals_as_string = intervals_as_string;
+        let session = open_session_with_result(&server, result).await;
+        let mut statement = session.statement();
+        statement
+            .spec()
+            .sql("SELECT array_value, struct_value, interval_value, id FROM values WHERE 1=0");
+        let mut executed = statement.execute().await.expect("execute");
+        let schema = executed.schema();
+        for index in [0, 1] {
+            assert_eq!(schema.field(index).is_nullable(), complex_types_as_json);
+            if complex_types_as_json {
+                assert_eq!(schema.field(index).data_type(), &DataType::Utf8);
+            }
+        }
+        if !complex_types_as_json {
+            assert!(matches!(schema.field(0).data_type(), DataType::List(_)));
+            assert!(matches!(schema.field(1).data_type(), DataType::Struct(_)));
+        }
+        assert_eq!(schema.field(2).is_nullable(), intervals_as_string);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &if intervals_as_string {
+                DataType::Utf8
+            } else {
+                DataType::Interval(arrow_schema::IntervalUnit::YearMonth)
+            }
+        );
+        assert!(!schema.field(3).is_nullable());
+        assert!(drain(executed.result_stream_mut()).await.is_empty());
+        executed.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn execute_inline_streaming_fallback_does_not_apply_manifest_nullability() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let schema = Arc::new(Schema::new(vec![Field::new(
+        "col_0",
+        DataType::Int64,
+        true,
+    )]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![Arc::new(Int64Array::from(vec![None::<i64>]))],
+    )
+    .unwrap();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-streaming", &batch)).unwrap();
+    body["manifest"]["schema"]["columns"][0]["nullable"] = json!(false);
+    body["manifest"]["total_chunk_count"] = json!(2);
+    let empty_chunk = arrow_schema_ipc_bytes(&schema);
+    body["result"]["attachment"] = json!(STANDARD.encode(&empty_chunk));
+    body["result"]["byte_count"] = json!(empty_chunk.len());
+    body["result"]["row_count"] = json!(0);
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path(
+            "/api/2.0/sql/statements/stmt-streaming/result/chunks/1",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk_index": 1,
+            "row_offset": 0,
+            "row_count": 1,
+            "attachment": STANDARD.encode(arrow_ipc_bytes(&batch)),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement.spec().sql("SELECT value FROM nullable_values");
+    let mut executed = statement.execute().await.expect("execute");
+    let advertised = executed.schema();
+    let batches = drain(executed.result_stream_mut()).await;
+    assert!(advertised.field(0).is_nullable());
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].schema(), advertised);
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(batches[0].column(0).null_count(), 1);
+    executed.close().await.unwrap();
+}
+
+#[tokio::test]
 async fn execute_geospatial_string_mode_uses_manifest_tags_for_untagged_arrow_ipc() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

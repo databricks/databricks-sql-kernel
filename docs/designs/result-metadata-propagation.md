@@ -376,12 +376,12 @@ std::string AdbcResultSetMetadata::GetTypeName(int column_position, int16_t data
 | `databricks.type_text` | Full type text including parameters ("DECIMAL(10,2)", "ARRAY<INT>") |
 | `databricks.type_precision` | Correct DECIMAL precision from server, not Arrow physical type |
 | `databricks.type_scale` | Correct DECIMAL scale from server |
-| (nullable default) | Default to SQL_NULLABLE for all result columns (matches JDBC) |
+| Manifest `nullable` | Used for empty results without `arrow_schema` |
 
-The nullable fix is a policy change in the ODBC driver (default to NULLABLE) rather than
-a metadata propagation issue — the SEA manifest doesn't include per-column nullability either.
-The JDBC driver simply defaults all result columns to NULLABLE, which is the correct semantic
-for query results (any expression can return NULL).
+Empty results without `arrow_schema` use manifest `nullable`, defaulting to nullable
+when absent or null. Inline-streaming fallback schemas do not use manifest nullability.
+JSON and interval string conversions retain nullable `Utf8` fields, even for empty
+results whose manifest reports `nullable: false`.
 
 ---
 
