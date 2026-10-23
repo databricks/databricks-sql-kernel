@@ -380,6 +380,8 @@ std::string AdbcResultSetMetadata::GetTypeName(int column_position, int16_t data
 
 Empty results without `arrow_schema` use manifest `nullable`, defaulting to nullable
 when absent or null. Inline-streaming fallback schemas do not use manifest nullability.
+JSON and interval string conversions retain nullable `Utf8` fields, even for empty
+results whose manifest reports `nullable: false`.
 
 ---
 

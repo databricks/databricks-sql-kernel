@@ -811,6 +811,75 @@ async fn execute_uses_manifest_nullability_only_for_empty_results_without_arrow_
 }
 
 #[tokio::test]
+async fn execute_empty_result_string_conversions_keep_nullable_output() {
+    for (complex_types_as_json, intervals_as_string) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        mount_execute(
+            &server,
+            json!({
+                "statement_id": "stmt-empty-converted",
+                "status": {"state": "SUCCEEDED"},
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {"column_count": 4, "columns": [
+                        {"name": "array_value", "type_name": "ARRAY", "type_text": "ARRAY<INT>",
+                         "position": 0, "nullable": false},
+                        {"name": "struct_value", "type_name": "STRUCT", "type_text": "STRUCT<value:INT>",
+                         "position": 1, "nullable": false},
+                        {"name": "interval_value", "type_name": "INTERVAL", "type_text": "INTERVAL YEAR TO MONTH",
+                         "type_interval_type": "YEAR_MONTH", "position": 2, "nullable": false},
+                        {"name": "id", "type_name": "BIGINT", "type_text": "BIGINT",
+                         "position": 3, "nullable": false},
+                    ]},
+                    "total_chunk_count": 0,
+                    "total_row_count": 0,
+                    "truncated": false,
+                },
+            })
+            .to_string(),
+        )
+        .await;
+        let mut result = ResultConfig::default();
+        result.complex_types_as_json = complex_types_as_json;
+        result.intervals_as_string = intervals_as_string;
+        let session = open_session_with_result(&server, result).await;
+        let mut statement = session.statement();
+        statement
+            .spec()
+            .sql("SELECT array_value, struct_value, interval_value, id FROM values WHERE 1=0");
+        let mut executed = statement.execute().await.expect("execute");
+        let schema = executed.schema();
+        for index in [0, 1] {
+            assert_eq!(schema.field(index).is_nullable(), complex_types_as_json);
+            if complex_types_as_json {
+                assert_eq!(schema.field(index).data_type(), &DataType::Utf8);
+            }
+        }
+        if !complex_types_as_json {
+            assert!(matches!(schema.field(0).data_type(), DataType::List(_)));
+            assert!(matches!(schema.field(1).data_type(), DataType::Struct(_)));
+        }
+        assert_eq!(schema.field(2).is_nullable(), intervals_as_string);
+        assert_eq!(
+            schema.field(2).data_type(),
+            &if intervals_as_string {
+                DataType::Utf8
+            } else {
+                DataType::Interval(arrow_schema::IntervalUnit::YearMonth)
+            }
+        );
+        assert!(!schema.field(3).is_nullable());
+        assert!(drain(executed.result_stream_mut()).await.is_empty());
+        executed.close().await.unwrap();
+    }
+}
+
+#[tokio::test]
 async fn execute_inline_streaming_fallback_does_not_apply_manifest_nullability() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
