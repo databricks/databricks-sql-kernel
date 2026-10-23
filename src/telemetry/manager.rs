@@ -86,6 +86,15 @@ impl TelemetryClientManager {
             .expect("poisoned telemetry clients")
             .len()
     }
+
+    #[cfg(test)]
+    fn ref_count(&self, host: &str) -> Option<usize> {
+        self.clients
+            .lock()
+            .expect("poisoned telemetry clients")
+            .get(host)
+            .map(|holder| holder.ref_count)
+    }
 }
 
 struct TelemetryClientHolder {
@@ -132,7 +141,6 @@ impl TelemetryClientLease {
             return;
         }
 
-        self.client.flush_bounded().await;
         match (self.manager, self.host.as_deref()) {
             (Some(manager), Some(host)) => manager.release(host).await,
             _ => self.client.close().await,
@@ -151,7 +159,6 @@ impl Drop for TelemetryClientLease {
             (Some(manager), Some(host)) => {
                 if let Ok(handle) = tokio::runtime::Handle::try_current() {
                     handle.spawn(async move {
-                        client.flush_bounded().await;
                         if let Some(client_to_close) = manager.release_ref(&host) {
                             client_to_close.close().await;
                         }
@@ -174,6 +181,7 @@ impl Drop for TelemetryClientLease {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::telemetry::models::TelemetryFrontendLog;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use std::time::Duration;
 
@@ -273,6 +281,69 @@ mod tests {
 
         drop(second);
         wait_for_tracked_client_count(manager, 0).await;
+    }
+
+    #[tokio::test]
+    async fn shared_client_flushes_only_after_last_explicit_release() {
+        let manager = Box::leak(Box::new(TelemetryClientManager::default()));
+        let exporter = CapturingTelemetryExporter::default();
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 100,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let first =
+            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+        let second =
+            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+        first.client().enqueue(TelemetryFrontendLog::default());
+
+        first.release().await;
+        assert_eq!(manager.ref_count("example.com"), Some(1));
+        assert!(exporter.requests().is_empty());
+
+        second.release().await;
+        assert_eq!(manager.ref_count("example.com"), None);
+        assert_eq!(exporter.requests().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn shared_client_flushes_only_after_last_drop() {
+        let manager = Box::leak(Box::new(TelemetryClientManager::default()));
+        let exporter = CapturingTelemetryExporter::default();
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 100,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let first =
+            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+        let second =
+            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+        first.client().enqueue(TelemetryFrontendLog::default());
+
+        drop(first);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while manager.ref_count("example.com") != Some(1) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first lease should be released");
+        assert!(exporter.requests().is_empty());
+
+        drop(second);
+        wait_for_tracked_client_count(manager, 0).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while exporter.requests().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("last lease should flush");
+        assert_eq!(exporter.requests().len(), 1);
     }
 
     async fn wait_for_tracked_client_count(manager: &TelemetryClientManager, expected: usize) {
