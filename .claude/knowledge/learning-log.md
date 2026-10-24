@@ -370,6 +370,10 @@ author, follow-up, and review runs.
 - **Context:** PR #410 switched empty-result schema construction to stamp the SEA manifest's per-column `nullable` flag onto Arrow fields (previously every result column was forced to NULLABLE). Reviewers flagged that the tightened field flows into the post-processor, which rebuilds every batch via `RecordBatch::try_new`.
   **Rule:** In arrow-rs (59+), declaring an Arrow field non-nullable over a column whose physical array actually contains nulls makes `RecordBatch::try_new` hard-fail (or silently violates the invariant at the C-Data/FFI boundary, where consumers like pyarrow misread/reject it) — before tightening nullability from a server/manifest hint, confirm the invariant (`nullable:false` ⇒ zero nulls) holds against real data, and add a test exercising `nullable:false` against a null-bearing column, since null-free test data hides the failure.
 
+### 2026-10-24: learnings since 2026-10-23T07:34:23Z
+- **Context:** PR #411 hand-edited `version`/`checksum` lines in all three `Cargo.lock`s because the Artifactory/JFrog proxy rejected the new crate, and PR #412 regenerated a lockfile under that same degraded proxy — which silently *downgraded* unrelated transitive deps (`windows-sys` 0.61.2→0.52.0, plus `mio`/`rustix`/`tempfile`) and left a duplicate major version, outside the PR's stated scope. Reviewers flagged both.
+  **Rule:** Never trust a `Cargo.lock` change produced while the registry proxy is failing crates — a hand-edited entry can carry a wrong checksum (breaks every downstream fetch) or a stale `dependencies` block (fails `--locked` builds), and a regenerate in a degraded resolution env can silently downgrade/duplicate unrelated transitive crates; once the proxy is healthy, re-run `cargo update -p <crate>` (or a `--locked` build) and confirm the lockfile diff is limited to exactly the intended crates before merging.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
