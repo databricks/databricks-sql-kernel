@@ -239,9 +239,8 @@ impl SessionInner {
             return; // already closed / closing
         }
         let transport = Arc::clone(&self.transport);
-        let session_id = self.session_id.clone();
         self.runtime_handle.spawn(async move {
-            let _ = transport.delete_session(&session_id).await;
+            let _ = transport.delete_session().await;
         });
     }
 }
@@ -669,19 +668,20 @@ impl Session {
     }
 
     /// Adopt an already-submitted server statement by its id, producing
-    /// an [`ExecutedAsyncStatement`] that can poll [`status`] / await
-    /// results / cancel — without having been the handle that submitted
-    /// it.
+    /// an [`ExecutedAsyncStatement`] that can poll [`status`] and fetch
+    /// results without having been the handle that submitted it.
     ///
     /// This is the resume path: a caller (or a different process) that
     /// holds only the statement id can re-attach and drive it to
-    /// completion, fetch its result, or read its terminal state. Server
-    /// statement state is keyed solely by the id — every
-    /// `GetStatementStatus` / `GetStatementResult` / cancel / close RPC
-    /// takes just the id — so the only thing the originating handle
-    /// carried that a bare id does not is *this session's* transport
-    /// (auth, retry, poll cadence). Binding the id to this session is
-    /// exactly what `attach` does.
+    /// completion, fetch its result, or read its terminal state.
+    /// Attached reads use standard SQL URLs because the statement ID does not
+    /// identify its originating session.
+    ///
+    /// Lakehouse Real-Time supports asynchronous execution through the handle
+    /// returned by [`Statement::submit`]. Retain that handle for polling and result
+    /// fetching, or derive independent readers with [`ExecutedAsyncStatement::reader`].
+    /// Polling or fetching a Lakehouse Real-Time statement from another session
+    /// is not supported.
     ///
     /// Issues a single `GetStatementStatus` to seed the handle's initial
     /// status (mirrors how `submit` seeds it from the submit response),
@@ -790,12 +790,7 @@ impl Session {
         async {
             let telemetry = self.inner.telemetry.connection();
             let delete_started = Instant::now();
-            if let Err(error) = self
-                .inner
-                .transport
-                .delete_session(&self.inner.session_id)
-                .await
-            {
+            if let Err(error) = self.inner.transport.delete_session().await {
                 telemetry.emit_operation(
                     OperationType::DeleteSession,
                     delete_started.elapsed(),
@@ -2119,12 +2114,11 @@ mod is_open_tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[tokio::test]
-    async fn sessions_enable_version_exchange_on_standard_path() {
+    async fn sessions_enable_version_exchange() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .and(body_json(json!({
-                "warehouse_id": "test_wh",
                 "execution_mode": "FAST",
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -2149,7 +2143,7 @@ mod is_open_tests {
             })
             .open()
             .await
-            .expect("FAST session must open on the standard path");
+            .expect("FAST session must open");
 
         session.close().await.expect("FAST session must close");
     }
@@ -2166,7 +2160,7 @@ mod is_open_tests {
     async fn is_open_flips_true_to_false_on_delete() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-is-open","warehouse_id":"test_wh"}"#),
@@ -2217,7 +2211,7 @@ mod is_open_tests {
 
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-test-conn","warehouse_id":"test_wh"}"#),
@@ -2309,7 +2303,7 @@ mod is_open_tests {
     async fn test_connection_fails_when_server_unreachable() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-dead","warehouse_id":"test_wh"}"#),
@@ -2360,7 +2354,7 @@ mod is_open_tests {
     async fn transaction_controls_are_noop_when_ignored() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_string(r#"{"session_id":"sess-txn","warehouse_id":"test_wh"}"#),
@@ -2551,7 +2545,7 @@ mod is_open_tests {
                     .iter()
                     .position(|request| {
                         request.method.as_str() == "POST"
-                            && request.url.path() == "/api/2.0/sql/sessions"
+                            && request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
                     })
                     .expect("CreateSession must be sent");
                 assert!(
@@ -2581,7 +2575,8 @@ mod is_open_tests {
         let create_session_requests = requests
             .iter()
             .filter(|request| {
-                request.method.as_str() == "POST" && request.url.path() == "/api/2.0/sql/sessions"
+                request.method.as_str() == "POST"
+                    && request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
             })
             .count();
         assert_eq!(feature_flag_requests, 1, "sessions share the flag cache");
@@ -2894,6 +2889,17 @@ mod is_open_tests {
         stmt.spec().sql("SELECT 1 AS n");
         let async_exec = stmt.submit().await.expect("submit succeeds");
         let _ = async_exec.status().await.expect("status succeeds");
+        let reader = async_exec.reader().expect("reader");
+        let _ = reader.status().await.expect("reader status");
+        let mut read_stream = reader.await_result().await.expect("reader result");
+        while read_stream
+            .next_batch()
+            .await
+            .expect("reader batch")
+            .is_some()
+        {}
+        drop(read_stream);
+        drop(reader);
         let mut stream = async_exec.await_result().await.expect("await succeeds");
         assert!(stream.next_batch().await.expect("first batch").is_some());
         assert!(stream
@@ -2919,12 +2925,10 @@ mod is_open_tests {
             statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
             "stmt-telemetry-async"
         );
-        assert!(
-            detail["n_operation_status_calls"]
-                .as_i64()
-                .unwrap_or_default()
-                >= 2,
-            "status() plus await_result() should record status polls"
+        assert_eq!(
+            detail["n_operation_status_calls"].as_i64(),
+            Some(2),
+            "only owning status and await polls contribute to execution telemetry"
         );
         assert!(
             detail["operation_status_latency_millis"]
@@ -3555,7 +3559,7 @@ mod is_open_tests {
 
     async fn mount_session_create_delete(server: &MockServer, session_id: &str) {
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(ResponseTemplate::new(200).set_body_string(format!(
                 r#"{{"session_id":"{session_id}","warehouse_id":"test_wh"}}"#
             )))

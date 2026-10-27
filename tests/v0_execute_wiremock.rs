@@ -14,7 +14,7 @@
 
 //! Wiremock tests for the v0 `Statement::execute` path.
 //!
-//! Each test stubs SEA's `POST /sessions`, `POST /statements`, and
+//! Each test stubs SEA's `CreateSession`, `POST /statements`, and
 //! (where needed) `GET /statements/{id}`, then drives a
 //! `Statement::execute()` through the full pipeline:
 //! Session::open → Statement::execute → ExecutedStatement →
@@ -133,7 +133,7 @@ async fn recorded_execute_disposition(server: &MockServer) -> String {
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
@@ -985,7 +985,7 @@ async fn execute_geospatial_string_mode_uses_manifest_tags_for_untagged_arrow_ip
     let requests = server.received_requests().await.unwrap();
     let create = requests
         .iter()
-        .find(|request| request.url.path() == "/api/2.0/sql/sessions")
+        .find(|request| request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions")
         .expect("create-session request");
     let body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
     let forwarded_geo_setting = body

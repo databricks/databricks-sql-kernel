@@ -44,7 +44,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
@@ -207,9 +207,10 @@ fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
     let create = recorded
         .iter()
         .find(|request| {
-            request.url.path() == "/api/2.0/sql/sessions" && request.method.as_str() == "POST"
+            request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
+                && request.method.as_str() == "POST"
         })
-        .expect("a POST /sessions request was made");
+        .expect("a CreateSession request was made");
     let body: serde_json::Value =
         serde_json::from_slice(&create.body).expect("create-session body must be valid JSON");
     body.pointer("/session_confs/EnableGeoSpatialSupport")

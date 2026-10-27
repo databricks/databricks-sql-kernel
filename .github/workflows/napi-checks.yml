@@ -32,6 +32,7 @@ on:
     branches: [main]
     paths:
       - "napi/**"
+      - "src/**"
       # Root Cargo.toml change can affect napi via its `path = ".."`
       # kernel dep, so this workflow re-runs to catch mismatches.
       - "Cargo.toml"
@@ -40,6 +41,7 @@ on:
     branches: [main]
     paths:
       - "napi/**"
+      - "src/**"
       - "Cargo.toml"
       - ".github/workflows/napi-checks.yml"
 

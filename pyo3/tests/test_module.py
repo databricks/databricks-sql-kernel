@@ -30,6 +30,7 @@ def test_exports_expected_classes():
         "Statement",
         "ExecutedStatement",
         "ExecutedAsyncStatement",
+        "AsyncStatementReader",
         "Metadata",
         "ResultStream",
         "KernelError",

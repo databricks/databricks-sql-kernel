@@ -24,6 +24,7 @@ use crate::errors::to_py_err;
 use crate::result_stream::ResultStream;
 use crate::runtime::KernelRuntime;
 use databricks_sql_kernel::{
+    AsyncStatementReader as KAsyncStatementReader,
     ExecutedAsyncStatement as KExecutedAsyncStatement, ExecutedStatementHandle, StatementStatus,
 };
 use pyo3::prelude::*;
@@ -58,6 +59,16 @@ impl ExecutedAsyncStatement {
         &self.statement_id
     }
 
+    /// Create an independent read-only handle retaining this statement's session routing.
+    /// The owning handle controls cancellation, cleanup and execution telemetry.
+    fn reader(&self, py: Python<'_>) -> PyResult<AsyncStatementReader> {
+        let inner = alive!(self, "ExecutedAsyncStatement");
+        Ok(AsyncStatementReader {
+            inner: inner.exec.reader().map_err(|error| to_py_err(py, error))?,
+            runtime: Arc::clone(&inner.runtime),
+        })
+    }
+
     /// Single-shot status check. Returns a tuple
     /// `(state: str, failure: Optional[KernelError])` where:
     ///
@@ -78,22 +89,7 @@ impl ExecutedAsyncStatement {
         let inner = alive!(self, "ExecutedAsyncStatement");
         let runtime = inner.runtime.clone();
         let status = run_kernel!(py, runtime, inner.exec.status())?;
-        // String mapping lives on the kernel `StatementStatus::as_str`
-        // so all bindings share one taxonomy.
-        let state = status.as_str();
-        let failure: Bound<'py, PyAny> = match &status {
-            StatementStatus::Failed(err) => {
-                // Build the KernelError instance the same way every
-                // other failure path does, then hand it to Python as
-                // a plain value (not raised). Callers read .code /
-                // .sql_state / .query_id directly.
-                let py_err = to_py_err(py, err.clone());
-                py_err.value(py).clone().into_any()
-            }
-            _ => py.None().into_bound(py),
-        };
-        let tuple = pyo3::types::PyTuple::new(py, [state.into_pyobject(py)?.into_any(), failure])?;
-        Ok(tuple.into_any())
+        status_to_python(py, status)
     }
 
     /// Block until the statement reaches a terminal state, then
@@ -150,4 +146,48 @@ impl ExecutedAsyncStatement {
             self.statement_id
         )
     }
+}
+
+/// Independent status and result access without server lifecycle ownership.
+#[pyclass(name = "AsyncStatementReader")]
+pub(crate) struct AsyncStatementReader {
+    inner: KAsyncStatementReader,
+    runtime: Arc<KernelRuntime>,
+}
+
+#[pymethods]
+impl AsyncStatementReader {
+    #[getter]
+    fn statement_id(&self) -> &str {
+        self.inner.statement_id()
+    }
+
+    /// Read server status as `(state, failure)`.
+    fn status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let status = run_kernel!(py, Arc::clone(&self.runtime), self.inner.status())?;
+        status_to_python(py, status)
+    }
+
+    /// Poll until terminal and return a fresh result stream. Interrupted reads do not cancel.
+    fn await_result(&self, py: Python<'_>) -> PyResult<ResultStream> {
+        let runtime = Arc::clone(&self.runtime);
+        let stream = run_kernel!(py, runtime, self.inner.await_result())?;
+        Ok(ResultStream::new(stream, runtime))
+    }
+
+    /// Return a fresh result stream; raises InvalidState if execution is not terminal.
+    fn fetch_result(&self, py: Python<'_>) -> PyResult<ResultStream> {
+        let runtime = Arc::clone(&self.runtime);
+        let stream = run_kernel!(py, runtime, self.inner.fetch_result())?;
+        Ok(ResultStream::new(stream, runtime))
+    }
+}
+
+fn status_to_python<'py>(py: Python<'py>, status: StatementStatus) -> PyResult<Bound<'py, PyAny>> {
+    let state = status.as_str();
+    let failure = match &status {
+        StatementStatus::Failed(err) => to_py_err(py, err.clone()).value(py).clone().into_any(),
+        _ => py.None().into_bound(py),
+    };
+    Ok(pyo3::types::PyTuple::new(py, [state.into_pyobject(py)?.into_any(), failure])?.into_any())
 }

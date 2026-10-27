@@ -382,7 +382,8 @@ pub struct QueryTag {
 /// Request body for statement execution.
 #[derive(Debug, Clone, Serialize)]
 pub struct ExecuteStatementRequest {
-    pub warehouse_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warehouse_id: Option<String>,
     pub statement: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
@@ -473,7 +474,8 @@ pub struct SessionVersion {
 /// Request body for session creation.
 #[derive(Debug, Clone, Serialize)]
 pub struct CreateSessionRequest {
-    pub warehouse_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub warehouse_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub catalog: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -556,7 +558,7 @@ mod tests {
         let mut confs = HashMap::new();
         confs.insert("USE_CACHED_RESULT".to_string(), "false".to_string());
         let req = CreateSessionRequest {
-            warehouse_id: "wh-1".to_string(),
+            warehouse_id: None,
             catalog: None,
             schema: None,
             session_confs: confs,
@@ -585,7 +587,7 @@ mod tests {
     #[test]
     fn test_execute_statement_request_serialization() {
         let req = ExecuteStatementRequest {
-            warehouse_id: "abc123".to_string(),
+            warehouse_id: Some("abc123".to_string()),
             statement: "SELECT 1".to_string(),
             session_id: Some("session-1".to_string()),
             session_version: None,
@@ -612,7 +614,7 @@ mod tests {
     #[test]
     fn test_execute_statement_request_serializes_query_tags_as_array() {
         let req = ExecuteStatementRequest {
-            warehouse_id: "abc123".to_string(),
+            warehouse_id: Some("abc123".to_string()),
             statement: "SELECT 1".to_string(),
             session_id: Some("session-1".to_string()),
             session_version: None,
