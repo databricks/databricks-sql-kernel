@@ -63,7 +63,9 @@ impl CacheKey {
         hasher.update(json.as_bytes());
         let result = hasher.finalize();
 
-        // Encode the digest bytes as a lowercase hex filename.
+        // Convert to hex string. sha2 0.11's `finalize()` returns a
+        // `hybrid_array::Array` (no `LowerHex` impl), so format the
+        // bytes explicitly rather than via `{:x}`.
         format!("{}.json", hex::encode(result))
     }
 }
