@@ -17,9 +17,15 @@ Failed status."""
 
 from __future__ import annotations
 
+import base64
+import json
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import databricks_sql_kernel as k
+import pyarrow as pa
+import pytest
 
 from conftest import live
 
@@ -114,3 +120,125 @@ def test_use_after_close_raises_kernel_error(session):
     else:
         raise AssertionError("expected KernelError on use-after-close")
     stmt.close()
+
+
+@pytest.mark.parametrize("failed", [False, True], ids=["succeeded", "failed"])
+def test_reader_preserves_session_and_maps_errors(failed):
+    requests = []
+    statement_path = "/api/2.0/sql/warehouses/test-wh/sessions/test-session/statements/test-statement"
+    response = {
+        "statement_id": "test-statement",
+        "status": {
+            "state": "FAILED",
+            "sql_state": "42P01",
+            "error": {"message": "invalid query", "error_code": "TABLE_OR_VIEW_NOT_FOUND"},
+        },
+    }
+    if not failed:
+        batch = pa.record_batch([pa.array([1, 2], type=pa.int64())], names=["n"])
+        buffer = pa.BufferOutputStream()
+        with pa.ipc.new_stream(buffer, batch.schema) as writer:
+            writer.write_batch(batch)
+        attachment = base64.b64encode(buffer.getvalue()).decode()
+        response = {
+            "statement_id": "test-statement",
+            "status": {"state": "SUCCEEDED"},
+            "manifest": {
+                "format": "ARROW_STREAM",
+                "schema": {
+                    "column_count": 1,
+                    "columns": [{"name": "n", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0}],
+                },
+                "total_chunk_count": 1,
+                "total_row_count": 2,
+            },
+            "result": {"chunk_index": 0, "row_offset": 0, "row_count": 2, "attachment": attachment},
+        }
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self, body, realtime=False):
+            requests.append((self.command, self.path))
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            if realtime:
+                self.send_header("x-databricks-rt-session", "true")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            if self.path.endswith("/sessions"):
+                self.respond({"session_id": "test-session"}, realtime=True)
+            else:
+                self.respond({"statement_id": "test-statement", "status": {"state": "PENDING"}})
+
+        def do_GET(self):
+            self.respond(response)
+
+        def do_DELETE(self):
+            self.respond({})
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        worker = threading.Thread(target=server.serve_forever, daemon=True)
+        worker.start()
+        session = None
+        try:
+            session = k.Session(
+                host=f"http://127.0.0.1:{server.server_port}",
+                http_path="/sql/1.0/warehouses/test-wh",
+                access_token="test-token",
+                telemetry_enabled=False,
+            )
+            stmt = session.statement()
+            stmt.set_sql("SELECT 1")
+            owner = stmt.submit()
+            before_reader = len(requests)
+            reader = owner.reader()
+            assert len(requests) == before_reader
+            assert isinstance(reader, k.AsyncStatementReader)
+            assert reader.statement_id == owner.statement_id
+            assert not hasattr(reader, "cancel")
+            assert not hasattr(reader, "close")
+            state, failure = reader.status()
+            streams = []
+            if failed:
+                assert state == "Failed"
+                assert isinstance(failure, k.KernelError)
+                assert failure.code == "SqlError"
+                assert failure.sql_state == "42P01"
+                for read in (reader.await_result, reader.fetch_result):
+                    with pytest.raises(k.KernelError) as error:
+                        read()
+                    assert error.value.code == "SqlError"
+                    assert error.value.sql_state == "42P01"
+                del read
+            else:
+                assert (state, failure) == ("Succeeded", None)
+                streams = [reader.await_result(), reader.fetch_result()]
+                assert all(isinstance(stream, k.ResultStream) for stream in streams)
+            expected_reads = 3 if failed else 4
+            assert [path for method, path in requests if method == "GET"] == [statement_path] * expected_reads
+            stmt.close()
+            with pytest.raises(k.KernelError) as error:
+                owner.reader()
+            assert error.value.code == "InvalidStatementHandle"
+            owner.close()
+            session.close()
+            session = None
+            del owner, stmt
+            with pytest.raises(k.KernelError) as error:
+                reader.status()
+            assert error.value.code == "InvalidStatementHandle"
+            del reader
+            for stream in streams:
+                assert stream.fetch_all_arrow().to_pydict() == {"n": [1, 2]}
+                stream.close()
+        finally:
+            if session is not None:
+                session.close()
+            server.shutdown()
+            worker.join(timeout=5)

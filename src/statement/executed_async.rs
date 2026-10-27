@@ -199,6 +199,7 @@ pub struct ExecutedAsyncStatement {
     /// server-side cancel. (`Drop` / `close()` are already inert on
     /// attached handles via `closed=true`.)
     owning: bool,
+    session_attribution: SessionAttribution,
     /// Last SEA `StatementStatus` observed by this handle (initial
     /// `submit_statement` response or any subsequent `status()` /
     /// `await_result` poll). Read by the `num_modified_rows()` /
@@ -284,14 +285,6 @@ impl ExecutedAsyncStatement {
         error
     }
 
-    fn session_attribution(&self) -> SessionAttribution {
-        if self.owning {
-            SessionAttribution::Current
-        } else {
-            SessionAttribution::Detached
-        }
-    }
-
     /// Crate-internal constructor. Built by [`Statement::submit`].
     ///
     /// `closed` is shared with the parent [`Statement`] so flipping it
@@ -332,6 +325,7 @@ impl ExecutedAsyncStatement {
             closed,
             // The submitting handle owns the statement lifecycle.
             owning: true,
+            session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
@@ -364,13 +358,30 @@ impl ExecutedAsyncStatement {
         statement_id: String,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
+        Self::new_read_only(
+            session,
+            statement_id,
+            ValidityFlag::new(),
+            SessionAttribution::Detached,
+            initial_status,
+        )
+    }
+
+    fn new_read_only(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+        session_attribution: SessionAttribution,
+        initial_status: crate::types::sea::StatementStatus,
+    ) -> Self {
         let initial_terminal = initial_status.state.is_terminal();
         Self {
             session,
             statement_id,
-            valid: ValidityFlag::new(),
+            valid,
             closed: Arc::new(AtomicBool::new(true)),
             owning: false,
+            session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
@@ -379,6 +390,25 @@ impl ExecutedAsyncStatement {
             client_timeout_expired: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(initial_terminal),
         }
+    }
+
+    /// Create an independent [`AsyncStatementReader`] without a server request.
+    pub fn reader(&self) -> Result<AsyncStatementReader> {
+        self.valid.check()?;
+        let status = self
+            .latest_status
+            .lock()
+            .map_err(|error| Error::internal().message(format!("Statement status lock: {error}")))?
+            .clone();
+        Ok(AsyncStatementReader {
+            inner: Self::new_read_only(
+                Arc::clone(&self.session),
+                self.statement_id.clone(),
+                self.valid.clone(),
+                self.session_attribution,
+                status,
+            ),
+        })
     }
 
     /// Number of rows modified by the statement (UPDATE / INSERT /
@@ -521,7 +551,7 @@ impl ExecutedAsyncStatement {
             let poll = self
                 .session
                 .transport()
-                .statement_status(&self.statement_id, self.session_attribution());
+                .statement_status(&self.statement_id, self.session_attribution);
             let response = match self.client_deadline {
                 Some(deadline) if enforce_deadline => {
                     let poll_deadline = deadline
@@ -655,7 +685,7 @@ impl ExecutedAsyncStatement {
                 let poll = self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution());
+                    .statement_status(&self.statement_id, self.session_attribution);
                 let response = match self.client_deadline {
                     Some(deadline) if enforce_deadline => {
                         let poll_deadline = deadline
@@ -788,7 +818,7 @@ impl ExecutedAsyncStatement {
         match self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id, self.session_attribution())
+            .fetch_completed_result(&self.statement_id, self.session_attribution)
             .await?
         {
             Some(result) => {
@@ -836,7 +866,7 @@ impl ExecutedAsyncStatement {
                 let observed = match self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution())
+                    .statement_status(&self.statement_id, self.session_attribution)
                     .await
                 {
                     Ok(r) => match r.status.state {
@@ -854,6 +884,42 @@ impl ExecutedAsyncStatement {
                 )))
             }
         }
+    }
+}
+
+/// Independent read access to an asynchronous statement, created by
+/// [`ExecutedAsyncStatement::reader`].
+///
+/// Session attribution is inherited from the source handle, including unknown
+/// attribution for ID-only attachments. The reader shares parent-statement
+/// invalidation but has independent status and result state. It does not inherit
+/// the execution deadline or emit execution telemetry. Dropping a reader never
+/// cancels or closes the statement; the owner controls its server lifetime.
+pub struct AsyncStatementReader {
+    inner: ExecutedAsyncStatement,
+}
+
+impl AsyncStatementReader {
+    pub fn statement_id(&self) -> &str {
+        &self.inner.statement_id
+    }
+
+    /// Read the current server status. See [`ExecutedAsyncStatement::status`].
+    pub async fn status(&self) -> Result<StatementStatus> {
+        self.inner.status().await
+    }
+
+    /// Poll until terminal and return a fresh result stream.
+    ///
+    /// The session's polling timeout applies to this read. Timing out or
+    /// dropping the future leaves the server statement running.
+    pub async fn await_result(&self) -> Result<ResultStream> {
+        self.inner.await_result().await
+    }
+
+    /// Return a fresh result stream, or `InvalidState` if execution is not terminal.
+    pub async fn fetch_result(&self) -> Result<ResultStream> {
+        self.inner.fetch_result().await
     }
 }
 

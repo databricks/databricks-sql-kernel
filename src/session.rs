@@ -668,15 +668,20 @@ impl Session {
     }
 
     /// Adopt an already-submitted server statement by its id, producing
-    /// an [`ExecutedAsyncStatement`] that can poll [`status`] / await
-    /// results / cancel — without having been the handle that submitted
-    /// it.
+    /// an [`ExecutedAsyncStatement`] that can poll [`status`] and fetch
+    /// results without having been the handle that submitted it.
     ///
     /// This is the resume path: a caller (or a different process) that
     /// holds only the statement id can re-attach and drive it to
     /// completion, fetch its result, or read its terminal state.
     /// Attached reads use standard SQL URLs because the statement ID does not
     /// identify its originating session.
+    ///
+    /// Lakehouse Real-Time supports asynchronous execution through the handle
+    /// returned by [`Statement::submit`]. Retain that handle for polling and result
+    /// fetching, or derive independent readers with [`ExecutedAsyncStatement::reader`].
+    /// Polling or fetching a Lakehouse Real-Time statement from another session
+    /// is not supported.
     ///
     /// Issues a single `GetStatementStatus` to seed the handle's initial
     /// status (mirrors how `submit` seeds it from the submit response),
@@ -2884,6 +2889,17 @@ mod is_open_tests {
         stmt.spec().sql("SELECT 1 AS n");
         let async_exec = stmt.submit().await.expect("submit succeeds");
         let _ = async_exec.status().await.expect("status succeeds");
+        let reader = async_exec.reader().expect("reader");
+        let _ = reader.status().await.expect("reader status");
+        let mut read_stream = reader.await_result().await.expect("reader result");
+        while read_stream
+            .next_batch()
+            .await
+            .expect("reader batch")
+            .is_some()
+        {}
+        drop(read_stream);
+        drop(reader);
         let mut stream = async_exec.await_result().await.expect("await succeeds");
         assert!(stream.next_batch().await.expect("first batch").is_some());
         assert!(stream
@@ -2909,12 +2925,10 @@ mod is_open_tests {
             statement_log["entry"]["sql_driver_log"]["sql_statement_id"],
             "stmt-telemetry-async"
         );
-        assert!(
-            detail["n_operation_status_calls"]
-                .as_i64()
-                .unwrap_or_default()
-                >= 2,
-            "status() plus await_result() should record status polls"
+        assert_eq!(
+            detail["n_operation_status_calls"].as_i64(),
+            Some(2),
+            "only owning status and await polls contribute to execution telemetry"
         );
         assert!(
             detail["operation_status_latency_millis"]

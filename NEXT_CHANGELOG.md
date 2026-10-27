@@ -11,9 +11,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- `ExecutedAsyncStatement::reader()` creates independent read-only handles that retain session routing without owning cancellation, cleanup or execution telemetry.
+
 ### Changed
 
-- SQL sessions open through the warehouse sessions URL and use warehouse statement URLs for owned statements when the create response enables real-time routing. Detached statement reads use standard SQL URLs.
+- SQL sessions open through the warehouse sessions URL and use warehouse statement URLs for owned statements when the create response enables real-time routing. Detached statement reads use standard SQL URLs. Lakehouse Real-Time supports asynchronous execution through the original session and statement handle; cross-session polling and fetching are not supported.
 - Warehouse session requests carry parent IDs only in the URL. The Rust wire request structs now use `Option<String>` for `warehouse_id`; use `Some(id)` when building a standard SQL request body.
 
 ### Updated

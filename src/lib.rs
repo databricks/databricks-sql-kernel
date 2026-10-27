@@ -149,7 +149,7 @@ pub use result_stream::{OwnedBatchIter, ResultBatch, ResultStream, Row, SchemaRe
 pub use session::{Session, SessionBuilder};
 pub use statement::executed::ExecutedStatement;
 pub use statement::executed_async::{
-    AsyncStatementCanceller, ExecutedAsyncStatement, StatementStatus,
+    AsyncStatementCanceller, AsyncStatementReader, ExecutedAsyncStatement, StatementStatus,
 };
 pub use statement::handle::ExecutedStatementHandle;
 pub use statement::mutable::{DirectStatement, Statement, StatementCanceller};
@@ -175,6 +175,7 @@ const _: fn() = || {
     assert_send_sync::<Statement>();
     assert_send_sync::<ExecutedStatement>();
     assert_send_sync::<ExecutedAsyncStatement>();
+    assert_send_sync::<AsyncStatementReader>();
     assert_send_sync::<Metadata>();
     assert_send_sync::<ResultStream>();
 
@@ -215,6 +216,11 @@ const _: fn() = || {
         assert_send(&exec.status());
         assert_send(&exec.await_result());
         assert_send(&exec.fetch_result());
+    };
+    let _: fn(&AsyncStatementReader) = |reader| {
+        assert_send(&reader.status());
+        assert_send(&reader.await_result());
+        assert_send(&reader.fetch_result());
     };
     let _: fn(Session) = |session| {
         assert_send(&session.close());

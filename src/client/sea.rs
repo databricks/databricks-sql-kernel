@@ -1206,6 +1206,7 @@ impl Transport for SeaRestTransport {
             }
         } else {
             SessionRoute::Standard {
+                // SEA requires warehouse_id on standard session close to avoid HTTP 400.
                 session_url: format!(
                     "{}/sessions/{}?warehouse_id={}",
                     self.base_url(),
