@@ -16,8 +16,8 @@ use super::exporter::{export_batch, TelemetryExporter};
 use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
+use std::sync::{Arc, Mutex, OnceLock};
+use tokio::runtime::{Handle, Runtime};
 
 const STATE_ACTIVE: u8 = 0;
 const STATE_CLOSING: u8 = 1;
@@ -52,7 +52,7 @@ impl TelemetryClient {
             flush_lock: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
-            runtime_handle: Handle::current(),
+            runtime_handle: telemetry_runtime_handle(),
         });
         client.start_timer();
         client
@@ -84,6 +84,20 @@ impl TelemetryClient {
 
         let timeout = self.close_flush_timeout;
         let _ = tokio::time::timeout(timeout, self.flush_once_wait()).await;
+    }
+
+    pub(super) fn schedule_flush_bounded(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(self);
+        self.runtime_handle.spawn(async move {
+            client.flush_bounded().await;
+        })
+    }
+
+    pub(super) fn schedule_close(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(self);
+        self.runtime_handle.spawn(async move {
+            client.close().await;
+        })
     }
 
     pub(super) async fn close(self: &Arc<Self>) {
@@ -155,6 +169,25 @@ impl TelemetryClient {
             }
         });
         *self.timer.lock().expect("poisoned telemetry timer") = Some(handle);
+    }
+}
+
+fn telemetry_runtime_handle() -> Handle {
+    // A host client can outlive the session that created it. Keep its timer,
+    // batch tasks, and Drop cleanup independent of any session-owned runtime.
+    static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
+    match RUNTIME.get_or_init(|| {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .thread_name("dbx-sql-telemetry")
+            .enable_all()
+            .build()
+    }) {
+        Ok(runtime) => runtime.handle().clone(),
+        Err(error) => {
+            tracing::debug!(%error, "failed to create telemetry runtime; using session runtime");
+            Handle::current()
+        }
     }
 }
 
