@@ -37,11 +37,21 @@ pub(super) struct TelemetryClient {
 }
 
 impl TelemetryClient {
-    pub(super) fn new(config: &TelemetryConfig, exporter: Arc<dyn TelemetryExporter>) -> Arc<Self> {
+    pub(super) fn new(
+        config: &TelemetryConfig,
+        exporter: Arc<dyn TelemetryExporter>,
+    ) -> Option<Arc<Self>> {
         assert!(
             !config.flush_interval.is_zero(),
             "TelemetryClient requires a non-zero flush interval; TelemetryRuntime should filter invalid configs"
         );
+        let runtime_handle = match telemetry_runtime_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::debug!(%error, "failed to create telemetry runtime; disabling telemetry");
+                return None;
+            }
+        };
         let client = Arc::new(Self {
             exporter,
             batch_size: config.batch_size,
@@ -52,10 +62,10 @@ impl TelemetryClient {
             flush_lock: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
-            runtime_handle: telemetry_runtime_handle(),
+            runtime_handle,
         });
         client.start_timer();
-        client
+        Some(client)
     }
 
     pub(super) fn enqueue(self: &Arc<Self>, log: TelemetryFrontendLog) {
@@ -172,23 +182,21 @@ impl TelemetryClient {
     }
 }
 
-fn telemetry_runtime_handle() -> Handle {
+fn telemetry_runtime_handle() -> std::io::Result<Handle> {
     // A host client can outlive the session that created it. Keep its timer,
     // batch tasks, and Drop cleanup independent of any session-owned runtime.
     static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-    match RUNTIME.get_or_init(|| {
-        tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(1)
-            .thread_name("dbx-sql-telemetry")
-            .enable_all()
-            .build()
-    }) {
-        Ok(runtime) => runtime.handle().clone(),
-        Err(error) => {
-            tracing::debug!(%error, "failed to create telemetry runtime; using session runtime");
-            Handle::current()
-        }
-    }
+    RUNTIME
+        .get_or_init(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("dbx-sql-telemetry")
+                .enable_all()
+                .build()
+        })
+        .as_ref()
+        .map(|runtime| runtime.handle().clone())
+        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
 }
 
 #[cfg(test)]
@@ -207,7 +215,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
         assert!(exporter.requests().is_empty());
@@ -237,7 +246,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         let worker_client = Arc::clone(&client);
         std::thread::spawn(move || {
@@ -270,7 +280,8 @@ mod tests {
             flush_interval: Duration::from_millis(20),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
 
@@ -298,7 +309,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
         client.close().await;

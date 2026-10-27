@@ -36,22 +36,28 @@ impl TelemetryClientManager {
         config: &TelemetryConfig,
         exporter: Arc<dyn TelemetryExporter>,
         bypass_cache: bool,
-    ) -> TelemetryClientLease {
+    ) -> Option<TelemetryClientLease> {
         if bypass_cache {
             // Used only for injected test exporters. A fresh unmanaged client
             // prevents tests that share a mock host from reusing a global host
             // client that points at another test's capturing exporter.
-            return TelemetryClientLease::unmanaged(TelemetryClient::new(config, exporter));
+            return Some(TelemetryClientLease::unmanaged(TelemetryClient::new(
+                config, exporter,
+            )?));
         }
 
         let mut clients = self.clients.lock().expect("poisoned telemetry clients");
         if let Some(holder) = clients.get_mut(host) {
             holder.session_count += 1;
             holder.lease_count += 1;
-            return TelemetryClientLease::managed(host, Arc::clone(&holder.client), self);
+            return Some(TelemetryClientLease::managed(
+                host,
+                Arc::clone(&holder.client),
+                self,
+            ));
         }
 
-        let client = TelemetryClient::new(config, exporter);
+        let client = TelemetryClient::new(config, exporter)?;
         clients.insert(
             host.to_string(),
             TelemetryClientHolder {
@@ -60,7 +66,19 @@ impl TelemetryClientManager {
                 lease_count: 1,
             },
         );
-        TelemetryClientLease::managed(host, client, self)
+        Some(TelemetryClientLease::managed(host, client, self))
+    }
+
+    #[cfg(test)]
+    fn get_or_create_test(
+        &'static self,
+        host: &str,
+        config: &TelemetryConfig,
+        exporter: Arc<dyn TelemetryExporter>,
+        bypass_cache: bool,
+    ) -> TelemetryClientLease {
+        self.get_or_create(host, config, exporter, bypass_cache)
+            .expect("telemetry runtime should start")
     }
 
     fn release_session(&self, host: &str) -> Option<Arc<TelemetryClient>> {
@@ -108,7 +126,7 @@ impl TelemetryClientManager {
     }
 
     #[cfg(test)]
-    fn ref_count(&self, host: &str) -> Option<usize> {
+    fn session_count(&self, host: &str) -> Option<usize> {
         self.clients
             .lock()
             .expect("poisoned telemetry clients")
@@ -218,8 +236,8 @@ mod tests {
             ..TelemetryConfig::default()
         };
 
-        let first = manager.get_or_create("example.com", &config, exporter.clone(), false);
-        let second = manager.get_or_create("example.com", &config, exporter, false);
+        let first = manager.get_or_create_test("example.com", &config, exporter.clone(), false);
+        let second = manager.get_or_create_test("example.com", &config, exporter, false);
 
         assert!(Arc::ptr_eq(first.client(), second.client()));
         assert_eq!(manager.tracked_client_count(), 1);
@@ -236,8 +254,8 @@ mod tests {
             ..TelemetryConfig::default()
         };
 
-        let first = manager.get_or_create("example.com", &config, exporter, false);
-        let second = manager.get_or_create(
+        let first = manager.get_or_create_test("example.com", &config, exporter, false);
+        let second = manager.get_or_create_test(
             "example.com",
             &config,
             Arc::new(CapturingTelemetryExporter::default()) as Arc<dyn TelemetryExporter>,
@@ -262,7 +280,7 @@ mod tests {
             ..TelemetryConfig::default()
         };
 
-        let lease = manager.get_or_create("example.com", &config, exporter, false);
+        let lease = manager.get_or_create_test("example.com", &config, exporter, false);
         assert_eq!(manager.tracked_client_count(), 1);
 
         drop(lease);
@@ -278,8 +296,8 @@ mod tests {
             ..TelemetryConfig::default()
         };
 
-        let first = manager.get_or_create("example.com", &config, exporter.clone(), false);
-        let second = manager.get_or_create("example.com", &config, exporter, false);
+        let first = manager.get_or_create_test("example.com", &config, exporter.clone(), false);
+        let second = manager.get_or_create_test("example.com", &config, exporter, false);
 
         first.release().await;
         assert_eq!(manager.tracked_client_count(), 1);
@@ -301,8 +319,8 @@ mod tests {
             ..TelemetryConfig::default()
         };
 
-        let first = manager.get_or_create("example.com", &config, exporter.clone(), false);
-        let second = manager.get_or_create("example.com", &config, exporter, false);
+        let first = manager.get_or_create_test("example.com", &config, exporter.clone(), false);
+        let second = manager.get_or_create_test("example.com", &config, exporter, false);
 
         drop(first);
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -323,21 +341,21 @@ mod tests {
             ..TelemetryConfig::default()
         };
         let first =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         let second =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         first.client().enqueue(TelemetryFrontendLog::default());
 
         first.release().await;
-        assert_eq!(manager.ref_count("example.com"), Some(1));
+        assert_eq!(manager.session_count("example.com"), Some(1));
         assert!(exporter.requests().is_empty());
 
         second.release().await;
-        assert_eq!(manager.ref_count("example.com"), Some(0));
+        assert_eq!(manager.session_count("example.com"), Some(0));
         assert_eq!(exporter.requests().len(), 1);
         drop(first);
         drop(second);
-        assert_eq!(manager.ref_count("example.com"), None);
+        assert_eq!(manager.session_count("example.com"), None);
     }
 
     #[tokio::test]
@@ -351,14 +369,14 @@ mod tests {
             ..TelemetryConfig::default()
         };
         let first =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         let second =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         first.client().enqueue(TelemetryFrontendLog::default());
 
         drop(first);
         tokio::time::timeout(Duration::from_secs(1), async {
-            while manager.ref_count("example.com") != Some(1) {
+            while manager.session_count("example.com") != Some(1) {
                 tokio::task::yield_now().await;
             }
         })
@@ -393,10 +411,10 @@ mod tests {
             .build()
             .expect("creator runtime");
         let first = creator_runtime.block_on(async {
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false)
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false)
         });
         let second =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         drop(creator_runtime);
         drop(first);
         second.client().enqueue(TelemetryFrontendLog::default());
@@ -421,7 +439,7 @@ mod tests {
             .build()
             .expect("session runtime");
         let lease = runtime.block_on(async {
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false)
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false)
         });
         lease.client().enqueue(TelemetryFrontendLog::default());
         drop(runtime);
@@ -442,7 +460,7 @@ mod tests {
             ..TelemetryConfig::default()
         };
         let lease =
-            manager.get_or_create("example.com", &config, Arc::new(exporter.clone()), false);
+            manager.get_or_create_test("example.com", &config, Arc::new(exporter.clone()), false);
         lease.release().await;
         lease.client().enqueue(TelemetryFrontendLog::default());
         drop(lease);

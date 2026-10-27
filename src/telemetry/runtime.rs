@@ -67,12 +67,14 @@ impl TelemetryRuntime {
             auth_type: auth_type(auth),
         });
         let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
-        let lease = TelemetryClientManager::global().get_or_create(
+        let Some(lease) = TelemetryClientManager::global().get_or_create(
             &connection.host,
             config,
             exporter,
             bypass_cache,
-        );
+        ) else {
+            return Self::disabled();
+        };
 
         Self {
             connection: Arc::new(RealConnectionTelemetry {
