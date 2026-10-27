@@ -360,7 +360,7 @@ async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
             r.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
                 && r.method.as_str() == "POST"
         })
-        .expect("a POST /sessions request was made");
+        .expect("a CreateSession request was made");
     let body: serde_json::Value =
         serde_json::from_slice(&create.body).expect("create-session body must be valid JSON");
     if let Some(obj) = body.get("session_confs").and_then(|v| v.as_object()) {
@@ -387,7 +387,7 @@ async fn create_session_body(server: &MockServer) -> serde_json::Value {
             r.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
                 && r.method.as_str() == "POST"
         })
-        .expect("a POST /sessions request was made");
+        .expect("a CreateSession request was made");
     serde_json::from_slice(&create.body).expect("create-session body must be valid JSON")
 }
 

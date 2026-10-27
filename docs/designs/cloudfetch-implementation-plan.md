@@ -124,7 +124,7 @@ Implements `DatabricksClient` for the Databricks SQL Statement Execution API (RE
 
 | Endpoint | Purpose |
 |----------|---------|
-| `POST /api/2.0/sql/sessions` | Create session |
+| `POST /api/2.0/sql/warehouses/{warehouse_id}/sessions` | Create session |
 | `DELETE /api/2.0/sql/sessions/{id}` | Delete session |
 | `POST /api/2.0/sql/statements` | Execute statement |
 | `GET /api/2.0/sql/statements/{id}` | Get status |

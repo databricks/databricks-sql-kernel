@@ -210,7 +210,7 @@ fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
             request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions"
                 && request.method.as_str() == "POST"
         })
-        .expect("a POST /sessions request was made");
+        .expect("a CreateSession request was made");
     let body: serde_json::Value =
         serde_json::from_slice(&create.body).expect("create-session body must be valid JSON");
     body.pointer("/session_confs/EnableGeoSpatialSupport")

@@ -222,11 +222,18 @@ def test_reader_preserves_session_and_maps_errors(failed):
                 assert all(isinstance(stream, k.ResultStream) for stream in streams)
             expected_reads = 3 if failed else 4
             assert [path for method, path in requests if method == "GET"] == [statement_path] * expected_reads
-            stmt.close()
+            owner.close()
+            before_release_reads = len(requests)
+            for read in (reader.status, reader.await_result, reader.fetch_result):
+                with pytest.raises(k.KernelError) as error:
+                    read()
+                assert error.value.code == "InvalidStatementHandle"
+            del read
             with pytest.raises(k.KernelError) as error:
                 owner.reader()
             assert error.value.code == "InvalidStatementHandle"
-            owner.close()
+            assert len(requests) == before_release_reads
+            stmt.close()
             session.close()
             session = None
             del owner, stmt

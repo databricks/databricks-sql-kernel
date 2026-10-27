@@ -15,7 +15,7 @@
 //! Wiremock tests for the v0 `Statement::submit` / `ExecutedAsyncStatement`
 //! path.
 //!
-//! Each test stubs SEA's `POST /sessions`, `POST /statements`, and the
+//! Each test stubs SEA's `CreateSession`, `POST /statements`, and the
 //! `GET /statements/{id}` / `POST /statements/{id}/cancel` /
 //! `DELETE /statements/{id}` endpoints as needed, then drives a
 //! `Statement::submit()` through the async pipeline:
@@ -1544,6 +1544,84 @@ async fn async_readers_preserve_session_routes() {
 }
 
 #[tokio::test]
+async fn owner_release_invalidates_readers() {
+    use std::time::Duration;
+    use tokio::sync::Notify;
+
+    for close_owner in [true, false] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_submit(&server, pending_body("stmt-reader")).await;
+        let polled = Arc::new(Notify::new());
+        let notify = Arc::clone(&polled);
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-reader"))
+            .respond_with(move |_: &wiremock::Request| {
+                notify.notify_one();
+                ResponseTemplate::new(200).set_body_string(running_body("stmt-reader"))
+            })
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements/stmt-reader/cancel"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/stmt-reader"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("SELECT 1");
+        let mut owner = Some(statement.submit().await.unwrap());
+        let reader = owner.as_ref().unwrap().reader().unwrap();
+        let release_owner = async {
+            polled.notified().await;
+            if close_owner {
+                let owner = owner.as_mut().unwrap();
+                owner.close().await.unwrap();
+                assert_eq!(
+                    owner.reader().err().unwrap().code,
+                    ErrorCode::InvalidStatementHandle
+                );
+            } else {
+                drop(owner.take());
+            }
+        };
+        let (result, ()) = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(reader.await_result(), release_owner)
+        })
+        .await
+        .expect("reader stops polling after owner release");
+        assert_eq!(
+            result.err().unwrap().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        for result in [
+            reader.status().await.map(|_| ()),
+            reader.await_result().await.map(|_| ()),
+            reader.fetch_result().await.map(|_| ()),
+        ] {
+            assert_eq!(result.unwrap_err().code, ErrorCode::InvalidStatementHandle);
+        }
+        assert_eq!(
+            wait_for_close_delete(&server, "stmt-reader", 1, Duration::from_secs(5)).await,
+            1
+        );
+        statement.close().await.unwrap();
+        session.close().await.unwrap();
+        server.verify().await;
+    }
+}
+
+#[tokio::test]
 async fn reader_timeout_and_drop_leave_statement_owned() {
     use std::time::Duration;
 
@@ -1808,6 +1886,7 @@ async fn attached_cloudfetch_pagination_and_refresh_use_standard_urls() {
         .await
         .expect("attach");
     let reader = attached.reader().expect("reader");
+    drop(attached);
     let mut stream = reader.fetch_result().await.expect("fetch_result");
     let fetched = drain(&mut stream).await;
     let values: Vec<i64> = fetched
@@ -2046,6 +2125,9 @@ async fn await_result_closed_status_skips_close_statement() {
                 .value(0),
             7
         );
+        let reader = async_exec.reader().expect("reader after server auto-close");
+        let mut refetched = reader.fetch_result().await.expect("refetch closed result");
+        assert_eq!(drain(&mut refetched).await, batches);
         // An explicit close() on a CLOSED statement must also be a no-op.
         async_exec.close().await.expect("close");
         // async_exec (and stmt) drop here — a redundant close guard fires now.

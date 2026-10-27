@@ -15,7 +15,7 @@
 //! Wiremock end-to-end tests for the v0 `Metadata::*` surface.
 //!
 //! For each wire-driven `Metadata::*` RPC, we stub the SEA
-//! `POST /sessions` and `POST /statements` endpoints, encoding a
+//! `CreateSession` and `POST /statements` endpoints, encoding a
 //! synthesised Databricks Arrow batch as inline base64. We then drive
 //! the call through `Session::open` + `Metadata::*` and assert that
 //! the returned `ResultStream` exposes the **Thrift-compatible**

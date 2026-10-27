@@ -14,7 +14,7 @@
 
 //! Wiremock tests for the v0 `Statement::execute` path.
 //!
-//! Each test stubs SEA's `POST /sessions`, `POST /statements`, and
+//! Each test stubs SEA's `CreateSession`, `POST /statements`, and
 //! (where needed) `GET /statements/{id}`, then drives a
 //! `Statement::execute()` through the full pipeline:
 //! Session::open → Statement::execute → ExecutedStatement →

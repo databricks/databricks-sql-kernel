@@ -706,7 +706,7 @@ mod tests {
     async fn build_statement_forwards_raw_params_and_rejects_mixed_binding() {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!({ "session_id": "sess-napi-raw" })),
             )
