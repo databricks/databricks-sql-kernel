@@ -278,6 +278,7 @@ impl ExecutedAsyncStatement {
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
+        self.owner_released.store(true, Ordering::Release);
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
             self.session
                 .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
@@ -921,7 +922,7 @@ impl ExecutedAsyncStatement {
 /// invalidation but has independent status and result state. It does not inherit
 /// the execution deadline or emit execution telemetry. Dropping a reader never
 /// cancels or closes the statement; the owner controls its server lifetime.
-/// Closing or dropping the owner invalidates derived readers.
+/// Derived readers become invalid when the owner closes, drops, or starts timeout cleanup.
 pub struct AsyncStatementReader {
     inner: ExecutedAsyncStatement,
 }

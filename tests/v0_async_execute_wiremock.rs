@@ -1622,6 +1622,68 @@ async fn owner_release_invalidates_readers() {
 }
 
 #[tokio::test]
+async fn owner_query_timeout_invalidates_readers() {
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_submit(&server, pending_body("stmt-reader-timeout")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-reader-timeout"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(closed_body("stmt-reader-timeout")),
+        )
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-reader-timeout/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement.spec().sql("SELECT 1");
+    let owner = statement
+        .submit_with_timeout(Duration::from_secs(1))
+        .await
+        .unwrap();
+    let reader = owner.reader().unwrap();
+
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let error = owner.status().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::Timeout);
+    assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+    assert_eq!(
+        owner.reader().err().unwrap().code,
+        ErrorCode::InvalidStatementHandle
+    );
+    for result in [
+        reader.status().await.map(|_| ()),
+        reader.await_result().await.map(|_| ()),
+        reader.fetch_result().await.map(|_| ()),
+    ] {
+        assert_eq!(result.unwrap_err().code, ErrorCode::InvalidStatementHandle);
+    }
+    let error = owner.await_result().await.err().unwrap();
+    assert_eq!(error.code, ErrorCode::Timeout);
+    assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+    assert_eq!(
+        wait_for_close_delete(&server, "stmt-reader-timeout", 1, Duration::from_secs(5)).await,
+        1
+    );
+
+    owner.close().await.unwrap();
+    statement.close().await.unwrap();
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
 async fn reader_timeout_and_drop_leave_statement_owned() {
     use std::time::Duration;
 
