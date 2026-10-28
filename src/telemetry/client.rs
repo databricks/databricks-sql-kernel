@@ -16,7 +16,7 @@ use super::exporter::{export_batch, TelemetryExporter};
 use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::{Handle, Runtime};
 
 const STATE_ACTIVE: u8 = 0;
@@ -185,18 +185,24 @@ impl TelemetryClient {
 fn telemetry_runtime_handle() -> std::io::Result<Handle> {
     // A host client can outlive the session that created it. Keep its timer,
     // batch tasks, and Drop cleanup independent of any session-owned runtime.
-    static RUNTIME: OnceLock<std::io::Result<Runtime>> = OnceLock::new();
-    RUNTIME
-        .get_or_init(|| {
-            tokio::runtime::Builder::new_multi_thread()
-                .worker_threads(1)
-                .thread_name("dbx-sql-telemetry")
-                .enable_all()
-                .build()
-        })
-        .as_ref()
-        .map(|runtime| runtime.handle().clone())
-        .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+    //
+    // Only a successfully-built runtime is cached. A build failure is NOT
+    // memoized, so a transient failure (e.g. the OS momentarily can't spawn
+    // the worker thread under resource pressure) is retried on the next
+    // session rather than poisoning telemetry for the rest of the process.
+    static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+    let mut runtime = RUNTIME.lock().expect("poisoned telemetry runtime");
+    if let Some(runtime) = runtime.as_ref() {
+        return Ok(runtime.handle().clone());
+    }
+    let built = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("dbx-sql-telemetry")
+        .enable_all()
+        .build()?;
+    let handle = built.handle().clone();
+    *runtime = Some(built);
+    Ok(handle)
 }
 
 #[cfg(test)]
