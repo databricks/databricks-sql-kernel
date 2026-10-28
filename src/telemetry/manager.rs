@@ -85,7 +85,9 @@ impl TelemetryClientManager {
         let mut clients = self.clients.lock().expect("poisoned telemetry clients");
         let holder = clients.get_mut(host)?;
         debug_assert!(holder.session_count > 0);
-        holder.session_count -= 1;
+        // saturating_sub (not `-= 1`) so a future double-decrement degrades
+        // gracefully in release builds, where the debug_assert is compiled out.
+        holder.session_count = holder.session_count.saturating_sub(1);
         if holder.session_count == 0 {
             Some(Arc::clone(&holder.client))
         } else {
@@ -100,10 +102,14 @@ impl TelemetryClientManager {
         };
         if !session_released {
             debug_assert!(holder.session_count > 0);
-            holder.session_count -= 1;
+            holder.session_count = holder.session_count.saturating_sub(1);
         }
         debug_assert!(holder.lease_count > 0);
-        holder.lease_count -= 1;
+        // saturating_sub (not `-= 1`) so a future double-decrement can't wrap
+        // usize in release builds (debug_assert compiled out): wrapping would
+        // leave lease_count > 0 forever, so the holder is never removed and
+        // schedule_close() never runs — leaking the client and its flush timer.
+        holder.lease_count = holder.lease_count.saturating_sub(1);
         if holder.lease_count == 0 {
             return clients
                 .remove(host)
