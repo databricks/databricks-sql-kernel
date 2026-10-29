@@ -17,7 +17,7 @@ use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
+use tokio::runtime::{Handle, Runtime};
 
 const STATE_ACTIVE: u8 = 0;
 const STATE_CLOSING: u8 = 1;
@@ -37,11 +37,21 @@ pub(super) struct TelemetryClient {
 }
 
 impl TelemetryClient {
-    pub(super) fn new(config: &TelemetryConfig, exporter: Arc<dyn TelemetryExporter>) -> Arc<Self> {
+    pub(super) fn new(
+        config: &TelemetryConfig,
+        exporter: Arc<dyn TelemetryExporter>,
+    ) -> Option<Arc<Self>> {
         assert!(
             !config.flush_interval.is_zero(),
             "TelemetryClient requires a non-zero flush interval; TelemetryRuntime should filter invalid configs"
         );
+        let runtime_handle = match telemetry_runtime_handle() {
+            Ok(handle) => handle,
+            Err(error) => {
+                tracing::debug!(%error, "failed to create telemetry runtime; disabling telemetry");
+                return None;
+            }
+        };
         let client = Arc::new(Self {
             exporter,
             batch_size: config.batch_size,
@@ -52,10 +62,10 @@ impl TelemetryClient {
             flush_lock: tokio::sync::Mutex::new(()),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
-            runtime_handle: Handle::current(),
+            runtime_handle,
         });
         client.start_timer();
-        client
+        Some(client)
     }
 
     pub(super) fn enqueue(self: &Arc<Self>, log: TelemetryFrontendLog) {
@@ -84,6 +94,20 @@ impl TelemetryClient {
 
         let timeout = self.close_flush_timeout;
         let _ = tokio::time::timeout(timeout, self.flush_once_wait()).await;
+    }
+
+    pub(super) fn schedule_flush_bounded(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(self);
+        self.runtime_handle.spawn(async move {
+            client.flush_bounded().await;
+        })
+    }
+
+    pub(super) fn schedule_close(self: &Arc<Self>) -> tokio::task::JoinHandle<()> {
+        let client = Arc::clone(self);
+        self.runtime_handle.spawn(async move {
+            client.close().await;
+        })
     }
 
     pub(super) async fn close(self: &Arc<Self>) {
@@ -158,12 +182,46 @@ impl TelemetryClient {
     }
 }
 
+// A real HTTP telemetry export needs more than a tiny stack: a host running
+// with e.g. RUST_MIN_STACK=16384 would otherwise overflow the worker stack and
+// abort the process. The worker stack floor is shared with the C-ABI runtime
+// via `crate::util::runtime` (single source of truth); see that module for the
+// floor-not-cap semantics and the #326 / #328 history.
+use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
+
+fn telemetry_runtime_handle() -> std::io::Result<Handle> {
+    // A host client can outlive the session that created it. Keep its timer,
+    // batch tasks, and Drop cleanup independent of any session-owned runtime.
+    //
+    // Only a successfully-built runtime is cached. A build failure is NOT
+    // memoized, so a transient failure (e.g. the OS momentarily can't spawn
+    // the worker thread under resource pressure) is retried on the next
+    // session rather than poisoning telemetry for the rest of the process.
+    static RUNTIME: Mutex<Option<Runtime>> = Mutex::new(None);
+    let mut runtime = RUNTIME.lock().expect("poisoned telemetry runtime");
+    if let Some(runtime) = runtime.as_ref() {
+        return Ok(runtime.handle().clone());
+    }
+    let built = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .thread_name("dbx-sql-telemetry")
+        .thread_stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
+        .enable_all()
+        .build()?;
+    let handle = built.handle().clone();
+    *runtime = Some(built);
+    Ok(handle)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::telemetry::test_support::CapturingTelemetryExporter;
     use crate::telemetry::TelemetryRequest;
     use std::time::Duration;
+
+    // The pure floor-not-cap resolution (#326 / #328) is exercised once over
+    // the shared helper in `crate::util::runtime`.
 
     #[tokio::test]
     async fn batch_size_triggers_background_flush() {
@@ -174,7 +232,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
         assert!(exporter.requests().is_empty());
@@ -204,7 +263,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         let worker_client = Arc::clone(&client);
         std::thread::spawn(move || {
@@ -237,7 +297,8 @@ mod tests {
             flush_interval: Duration::from_millis(20),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
 
@@ -265,7 +326,8 @@ mod tests {
             flush_interval: Duration::from_secs(60),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()));
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
 
         client.enqueue(sample_log("one"));
         client.close().await;
