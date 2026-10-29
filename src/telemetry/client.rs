@@ -182,34 +182,12 @@ impl TelemetryClient {
     }
 }
 
-// Tokio normally gives runtime workers a 2 MiB stack, but without an explicit
-// override its thread builder honours the embedding process's RUST_MIN_STACK.
 // A real HTTP telemetry export needs more than a tiny stack: a host running
 // with e.g. RUST_MIN_STACK=16384 would otherwise overflow the worker stack and
-// abort the process. Mirror the C-ABI runtime's guard (see `c_abi`).
-const TELEMETRY_RUNTIME_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
-
-/// Resolve the worker-thread stack size for the telemetry runtime from the
-/// ambient `RUST_MIN_STACK` value (parsed to `Some(bytes)`, or `None` when
-/// unset or unparseable).
-///
-/// [`TELEMETRY_RUNTIME_THREAD_STACK_SIZE`] (2 MiB) is a **floor, not a cap**: a
-/// too-small ambient `RUST_MIN_STACK` is clamped up to the floor, while a host
-/// that deliberately asked for *more* than 2 MiB keeps its larger stack rather
-/// than being silently shrunk.
-fn telemetry_runtime_thread_stack_size(ambient_rust_min_stack: Option<usize>) -> usize {
-    ambient_rust_min_stack
-        .unwrap_or(0)
-        .max(TELEMETRY_RUNTIME_THREAD_STACK_SIZE)
-}
-
-/// Read and parse the ambient `RUST_MIN_STACK` env var into `Some(bytes)`, or
-/// `None` when it is unset or not a valid `usize`.
-fn ambient_rust_min_stack() -> Option<usize> {
-    std::env::var("RUST_MIN_STACK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-}
+// abort the process. The worker stack floor is shared with the C-ABI runtime
+// via `crate::util::runtime` (single source of truth); see that module for the
+// floor-not-cap semantics and the #326 / #328 history.
+use crate::util::runtime::{ambient_rust_min_stack, runtime_thread_stack_size};
 
 fn telemetry_runtime_handle() -> std::io::Result<Handle> {
     // A host client can outlive the session that created it. Keep its timer,
@@ -227,7 +205,7 @@ fn telemetry_runtime_handle() -> std::io::Result<Handle> {
     let built = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(1)
         .thread_name("dbx-sql-telemetry")
-        .thread_stack_size(telemetry_runtime_thread_stack_size(ambient_rust_min_stack()))
+        .thread_stack_size(runtime_thread_stack_size(ambient_rust_min_stack()))
         .enable_all()
         .build()?;
     let handle = built.handle().clone();
@@ -242,33 +220,8 @@ mod tests {
     use crate::telemetry::TelemetryRequest;
     use std::time::Duration;
 
-    #[test]
-    fn runtime_stack_size_clamps_small_rust_min_stack_up_to_floor() {
-        // A too-small (or unset) ambient RUST_MIN_STACK must clamp UP to the
-        // 2 MiB floor so a real HTTP export doesn't overflow the worker stack.
-        assert_eq!(
-            telemetry_runtime_thread_stack_size(Some(16_384)),
-            TELEMETRY_RUNTIME_THREAD_STACK_SIZE,
-            "a RUST_MIN_STACK below the floor must clamp up to 2 MiB"
-        );
-        assert_eq!(
-            telemetry_runtime_thread_stack_size(None),
-            TELEMETRY_RUNTIME_THREAD_STACK_SIZE,
-            "an unset RUST_MIN_STACK must default to the 2 MiB floor"
-        );
-    }
-
-    #[test]
-    fn runtime_stack_size_preserves_larger_rust_min_stack() {
-        // Floor, not cap: a host that deliberately asked for more than 2 MiB
-        // keeps its larger stack rather than being silently shrunk.
-        let larger = TELEMETRY_RUNTIME_THREAD_STACK_SIZE + 1_024 * 1_024;
-        assert_eq!(
-            telemetry_runtime_thread_stack_size(Some(larger)),
-            larger,
-            "a RUST_MIN_STACK larger than the 2 MiB floor must be preserved, not shrunk"
-        );
-    }
+    // The pure floor-not-cap resolution (#326 / #328) is exercised once over
+    // the shared helper in `crate::util::runtime`.
 
     #[tokio::test]
     async fn batch_size_triggers_background_flush() {

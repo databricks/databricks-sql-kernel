@@ -112,3 +112,75 @@ where
         Err(_) => futures::executor::block_on(fut),
     }
 }
+
+/// Tokio normally gives runtime workers a 2 MiB stack, but without an explicit
+/// override its thread builder honours the embedding process's `RUST_MIN_STACK`.
+/// Native consumers may set that variable for their own thread pools; the
+/// kernel-owned runtimes (the C-ABI runtime in [`crate::c_abi`] and the
+/// telemetry runtime in [`crate::telemetry`]) must not be shrunk below Tokio's
+/// supported default, or a real HTTP export / query can overflow the worker
+/// stack and abort the process.
+///
+/// This is a single source of truth deliberately shared by both runtimes: two
+/// independent copies of a safety-critical stack floor can silently drift (see
+/// databricks/databricks-sql-kernel#328, the floor-not-cap bug).
+pub(crate) const RUNTIME_THREAD_STACK_SIZE: usize = 2 * 1024 * 1024;
+
+/// Resolve the worker-thread stack size for a kernel-owned tokio runtime from
+/// the ambient `RUST_MIN_STACK` value (parsed to `Some(bytes)`, or `None` when
+/// unset or unparseable).
+///
+/// [`RUNTIME_THREAD_STACK_SIZE`] (2 MiB) is a **floor, not a cap**: a too-small
+/// ambient `RUST_MIN_STACK` is clamped up to the floor (preserving
+/// databricks/databricks-sql-kernel#326), while a host that deliberately asked
+/// for *more* than 2 MiB keeps its larger stack rather than being silently
+/// shrunk (databricks/databricks-sql-kernel#328).
+pub(crate) fn runtime_thread_stack_size(ambient_rust_min_stack: Option<usize>) -> usize {
+    ambient_rust_min_stack
+        .unwrap_or(0)
+        .max(RUNTIME_THREAD_STACK_SIZE)
+}
+
+/// Read and parse the ambient `RUST_MIN_STACK` env var into `Some(bytes)`, or
+/// `None` when it is unset or not a valid `usize`.
+pub(crate) fn ambient_rust_min_stack() -> Option<usize> {
+    std::env::var("RUST_MIN_STACK")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Floor preserved (databricks/databricks-sql-kernel#326): a too-small or
+    /// unset ambient `RUST_MIN_STACK` is clamped UP to the 2 MiB floor so a
+    /// real HTTP export / query doesn't overflow the worker stack.
+    #[test]
+    fn runtime_stack_size_clamps_small_rust_min_stack_up_to_floor() {
+        assert_eq!(
+            runtime_thread_stack_size(Some(16_384)),
+            RUNTIME_THREAD_STACK_SIZE,
+            "a RUST_MIN_STACK below the floor must clamp up to 2 MiB"
+        );
+        assert_eq!(
+            runtime_thread_stack_size(None),
+            RUNTIME_THREAD_STACK_SIZE,
+            "an unset RUST_MIN_STACK must default to the 2 MiB floor"
+        );
+    }
+
+    /// Floor, not cap (databricks/databricks-sql-kernel#328): a host that
+    /// deliberately asked for more than 2 MiB keeps its larger stack rather
+    /// than being silently shrunk. The databricks-odbc partner runs with
+    /// `RUST_MIN_STACK=3194880`.
+    #[test]
+    fn runtime_stack_size_preserves_larger_rust_min_stack() {
+        let larger = RUNTIME_THREAD_STACK_SIZE + 1_024 * 1_024;
+        assert_eq!(
+            runtime_thread_stack_size(Some(larger)),
+            larger,
+            "a RUST_MIN_STACK larger than the 2 MiB floor must be preserved, not shrunk"
+        );
+    }
+}
