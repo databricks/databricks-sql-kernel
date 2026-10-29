@@ -405,7 +405,7 @@ mod tests {
 
     async fn open_mock_connection(server: &MockServer) -> Connection {
         Mock::given(method("POST"))
-            .and(path("/api/2.0/sql/sessions"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
             .respond_with(
                 ResponseTemplate::new(200)
                     .set_body_json(json!({ "session_id": "sess-napi-metadata" })),

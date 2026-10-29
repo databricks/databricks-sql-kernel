@@ -63,7 +63,7 @@
 //! respectively. End-of-stream is the absence of `next_chunk_index`
 //! on a fetched chunk — never synthesised from `chunk_index + 1`.
 
-use crate::client::{InlineChunkFetchResult, Transport};
+use crate::client::InlineChunkFetchResult;
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, error};
 use crate::reader::cloudfetch::parse_arrow_ipc;
@@ -80,8 +80,7 @@ use tracing::instrument;
 ///
 /// Lets the streaming provider depend on just the one method it
 /// needs (so tests don't have to build a full `Transport` mock with
-/// `unreachable!()` for the 20-odd metadata RPCs). Production code
-/// uses the blanket impl on `Arc<dyn Transport>`.
+/// `unreachable!()` for the 20-odd metadata RPCs).
 #[async_trait]
 pub(crate) trait InlineChunkSource: Send + Sync + std::fmt::Debug {
     async fn get_inline_chunk(
@@ -90,18 +89,6 @@ pub(crate) trait InlineChunkSource: Send + Sync + std::fmt::Debug {
         chunk_index: i64,
         row_offset: i64,
     ) -> Result<InlineChunkFetchResult>;
-}
-
-#[async_trait]
-impl InlineChunkSource for Arc<dyn Transport> {
-    async fn get_inline_chunk(
-        &self,
-        statement_id: &str,
-        chunk_index: i64,
-        row_offset: i64,
-    ) -> Result<InlineChunkFetchResult> {
-        Transport::get_inline_chunk(self.as_ref(), statement_id, chunk_index, row_offset).await
-    }
 }
 
 /// One pre-decoded inline-Arrow chunk sitting in the rolling window.

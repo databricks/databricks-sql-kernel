@@ -695,13 +695,9 @@ impl Session {
 
     /// Re-attach to an already-submitted server statement by its id,
     /// returning an `ExecutedAsyncStatement` the caller can poll
-    /// (`status()`), await (`await_result()`), or cancel/close — without
-    /// having been the handle that submitted it.
-    ///
-    /// This is the resume path the connector uses for
-    /// `get_query_state` / `get_async_execution_result`: server
-    /// statement state is keyed solely by the id, so a caller holding
-    /// only the id can recover a working handle bound to this session.
+    /// (`status()`) or await (`await_result()`) without lifecycle ownership.
+    /// ID-only reads use standard SQL URLs. Use `ExecutedAsyncStatement.reader()`
+    /// to retain the originating session's routing for independent reads.
     ///
     /// Issues one `GetStatementStatus` to seed the handle. Raises
     /// `KernelError` with code `NotFound` if the server doesn't

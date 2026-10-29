@@ -182,6 +182,8 @@ pub struct ExecutedAsyncStatement {
     /// short-circuited) `close()`. Tells `Drop` to skip its
     /// fire-and-forget cleanup.
     closed: Arc<AtomicBool>,
+    /// Server auto-close can retain results, so owner release has a separate flag.
+    owner_released: Arc<AtomicBool>,
     /// Whether this handle *owns* the server statement's lifecycle.
     ///
     /// `true` for handles produced by [`Statement::submit`] (the
@@ -199,6 +201,7 @@ pub struct ExecutedAsyncStatement {
     /// server-side cancel. (`Drop` / `close()` are already inert on
     /// attached handles via `closed=true`.)
     owning: bool,
+    session_attribution: SessionAttribution,
     /// Last SEA `StatementStatus` observed by this handle (initial
     /// `submit_statement` response or any subsequent `status()` /
     /// `await_result` poll). Read by the `num_modified_rows()` /
@@ -275,6 +278,7 @@ impl ExecutedAsyncStatement {
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
+        self.owner_released.store(true, Ordering::Release);
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
             self.session
                 .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
@@ -282,14 +286,6 @@ impl ExecutedAsyncStatement {
         let error = crate::statement::timeout::client_query_timeout_error(Some(&self.statement_id));
         self.statement_telemetry.finalize(Some(&error));
         error
-    }
-
-    fn session_attribution(&self) -> SessionAttribution {
-        if self.owning {
-            SessionAttribution::Current
-        } else {
-            SessionAttribution::Detached
-        }
     }
 
     /// Crate-internal constructor. Built by [`Statement::submit`].
@@ -330,8 +326,10 @@ impl ExecutedAsyncStatement {
             statement_id,
             valid,
             closed,
+            owner_released: Arc::new(AtomicBool::new(false)),
             // The submitting handle owns the statement lifecycle.
             owning: true,
+            session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
@@ -364,13 +362,33 @@ impl ExecutedAsyncStatement {
         statement_id: String,
         initial_status: crate::types::sea::StatementStatus,
     ) -> Self {
+        Self::new_read_only(
+            session,
+            statement_id,
+            ValidityFlag::new(),
+            Arc::new(AtomicBool::new(false)),
+            SessionAttribution::Detached,
+            initial_status,
+        )
+    }
+
+    fn new_read_only(
+        session: Arc<SessionInner>,
+        statement_id: String,
+        valid: ValidityFlag,
+        owner_released: Arc<AtomicBool>,
+        session_attribution: SessionAttribution,
+        initial_status: crate::types::sea::StatementStatus,
+    ) -> Self {
         let initial_terminal = initial_status.state.is_terminal();
         Self {
             session,
             statement_id,
-            valid: ValidityFlag::new(),
+            valid,
             closed: Arc::new(AtomicBool::new(true)),
+            owner_released,
             owning: false,
+            session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
@@ -379,6 +397,44 @@ impl ExecutedAsyncStatement {
             client_timeout_expired: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(initial_terminal),
         }
+    }
+
+    /// Create an independent [`AsyncStatementReader`] without a server request.
+    pub fn reader(&self) -> Result<AsyncStatementReader> {
+        self.valid.check()?;
+        self.check_owner_available()?;
+        let status = self
+            .latest_status
+            .lock()
+            .map_err(|error| Error::internal().message(format!("Statement status lock: {error}")))?
+            .clone();
+        Ok(AsyncStatementReader {
+            inner: Self::new_read_only(
+                Arc::clone(&self.session),
+                self.statement_id.clone(),
+                self.valid.clone(),
+                Arc::clone(&self.owner_released),
+                self.session_attribution,
+                status,
+            ),
+        })
+    }
+
+    fn check_owner_available(&self) -> Result<()> {
+        if self.owner_released.load(Ordering::Acquire) {
+            return Err(Error::invalid_statement_handle()
+                .message("the owning asynchronous statement has been closed or dropped")
+                .with_query_id(&self.statement_id));
+        }
+        Ok(())
+    }
+
+    fn check_read_validity(&self) -> Result<()> {
+        self.valid.check()?;
+        if !self.owning {
+            self.check_owner_available()?;
+        }
+        Ok(())
     }
 
     /// Number of rows modified by the statement (UPDATE / INSERT /
@@ -500,7 +556,7 @@ impl ExecutedAsyncStatement {
     pub async fn status(&self) -> Result<StatementStatus> {
         let span = self.session.log_span().clone();
         let result = async {
-            self.valid.check()?;
+            self.check_read_validity()?;
             // The client deadline governs only the pre-terminal window
             // ("initial submit through observed terminal status"). Once
             // this handle has observed a terminal state, `status()`
@@ -521,7 +577,7 @@ impl ExecutedAsyncStatement {
             let poll = self
                 .session
                 .transport()
-                .statement_status(&self.statement_id, self.session_attribution());
+                .statement_status(&self.statement_id, self.session_attribution);
             let response = match self.client_deadline {
                 Some(deadline) if enforce_deadline => {
                     let poll_deadline = deadline
@@ -539,6 +595,7 @@ impl ExecutedAsyncStatement {
                 }
                 _ => poll.await?,
             };
+            self.check_read_validity()?;
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
             // Cache the wire status so the extended-field accessors
@@ -603,7 +660,7 @@ impl ExecutedAsyncStatement {
     pub async fn await_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
         let result = async {
-            self.valid.check()?;
+            self.check_read_validity()?;
 
             let cfg = self.session.transport().poll_config();
             let start = std::time::Instant::now();
@@ -630,7 +687,7 @@ impl ExecutedAsyncStatement {
             };
 
             loop {
-                self.valid.check()?;
+                self.check_read_validity()?;
                 // The client deadline governs only the pre-terminal
                 // window. Once this handle has observed a terminal state
                 // (here or via a prior `status()` / initial-submit
@@ -655,7 +712,7 @@ impl ExecutedAsyncStatement {
                 let poll = self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution());
+                    .statement_status(&self.statement_id, self.session_attribution);
                 let response = match self.client_deadline {
                     Some(deadline) if enforce_deadline => {
                         let poll_deadline = deadline
@@ -680,6 +737,7 @@ impl ExecutedAsyncStatement {
                     }
                     _ => poll.await?,
                 };
+                self.check_read_validity()?;
                 self.statement_telemetry
                     .record_poll(status_started.elapsed());
                 // Cache the wire status so the extended-field
@@ -767,12 +825,7 @@ impl ExecutedAsyncStatement {
     /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        let result = async {
-            self.valid.check()?;
-            self.materialise_result().await
-        }
-        .instrument(span)
-        .await;
+        let result = self.materialise_result().instrument(span).await;
         if let Err(error) = &result {
             self.statement_telemetry.finalize(Some(error));
         }
@@ -785,12 +838,14 @@ impl ExecutedAsyncStatement {
     /// status so callers don't have to re-query, and points at the
     /// actionable follow-up.
     async fn materialise_result(&self) -> Result<ResultStream> {
-        match self
+        self.check_read_validity()?;
+        let result = self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id, self.session_attribution())
-            .await?
-        {
+            .fetch_completed_result(&self.statement_id, self.session_attribution)
+            .await?;
+        self.check_read_validity()?;
+        match result {
             Some(result) => {
                 self.statement_telemetry.on_result_metadata(
                     result.telemetry_result_format,
@@ -824,6 +879,7 @@ impl ExecutedAsyncStatement {
                         }
                     }
                 }
+                self.check_read_validity()?;
                 self.result_stream_owns_success_telemetry
                     .store(true, Ordering::Release);
                 Ok(stream)
@@ -836,7 +892,7 @@ impl ExecutedAsyncStatement {
                 let observed = match self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution())
+                    .statement_status(&self.statement_id, self.session_attribution)
                     .await
                 {
                     Ok(r) => match r.status.state {
@@ -846,6 +902,7 @@ impl ExecutedAsyncStatement {
                     },
                     Err(_) => "non-terminal",
                 };
+                self.check_read_validity()?;
                 Err(Error::invalid_state().message(format!(
                     "Statement {} is not terminal yet (status: {}); call await_result() to \
                      block until done, or poll status() and re-call fetch_result() once it \
@@ -854,6 +911,43 @@ impl ExecutedAsyncStatement {
                 )))
             }
         }
+    }
+}
+
+/// Independent read access to an asynchronous statement, created by
+/// [`ExecutedAsyncStatement::reader`].
+///
+/// Session attribution is inherited from the source handle, including unknown
+/// attribution for ID-only attachments. The reader shares parent-statement
+/// invalidation but has independent status and result state. It does not inherit
+/// the execution deadline or emit execution telemetry. Dropping a reader never
+/// cancels or closes the statement; the owner controls its server lifetime.
+/// Derived readers become invalid when the owner closes, drops, or starts timeout cleanup.
+pub struct AsyncStatementReader {
+    inner: ExecutedAsyncStatement,
+}
+
+impl AsyncStatementReader {
+    pub fn statement_id(&self) -> &str {
+        &self.inner.statement_id
+    }
+
+    /// Read the current server status. See [`ExecutedAsyncStatement::status`].
+    pub async fn status(&self) -> Result<StatementStatus> {
+        self.inner.status().await
+    }
+
+    /// Poll until terminal and return a fresh result stream.
+    ///
+    /// The session's polling timeout applies to this read. Timing out or
+    /// dropping the future leaves the server statement running.
+    pub async fn await_result(&self) -> Result<ResultStream> {
+        self.inner.await_result().await
+    }
+
+    /// Return a fresh result stream, or `InvalidState` if execution is not terminal.
+    pub async fn fetch_result(&self) -> Result<ResultStream> {
+        self.inner.fetch_result().await
     }
 }
 
@@ -959,6 +1053,9 @@ impl ExecutedAsyncStatement {
     }
 
     async fn close_server_statement(&self) -> Result<()> {
+        if self.owning {
+            self.owner_released.store(true, Ordering::Release);
+        }
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
         //
@@ -1081,6 +1178,9 @@ impl AsyncStatementCanceller {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
+        if self.owning {
+            self.owner_released.store(true, Ordering::Release);
+        }
         // Ensure submit-and-drop / status-only async statements still
         // emit one terminal telemetry event. Once a result stream has
         // been returned, that stream owns success finalization so it can

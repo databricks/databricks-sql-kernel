@@ -15,7 +15,7 @@
 //! Wiremock end-to-end tests for the v0 `Metadata::*` surface.
 //!
 //! For each wire-driven `Metadata::*` RPC, we stub the SEA
-//! `POST /sessions` and `POST /statements` endpoints, encoding a
+//! `CreateSession` and `POST /statements` endpoints, encoding a
 //! synthesised Databricks Arrow batch as inline base64. We then drive
 //! the call through `Session::open` + `Metadata::*` and assert that
 //! the returned `ResultStream` exposes the **Thrift-compatible**
@@ -74,7 +74,7 @@ async fn open_session_with_default_catalog(server: &MockServer, catalog: Option<
 
 async fn mount_create_session(server: &MockServer) {
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
         .respond_with(
             ResponseTemplate::new(200)
                 .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),

@@ -227,7 +227,7 @@ async fn auth_config_federation_client_id_reaches_exchange() {
         .mount(&server)
         .await;
     Mock::given(method("POST"))
-        .and(path("/api/2.0/sql/sessions"))
+        .and(path("/api/2.0/sql/warehouses/warehouse-id/sessions"))
         .and(header("authorization", "Bearer wif-token"))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
             "session_id": "session-id",
