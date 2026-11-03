@@ -82,19 +82,21 @@ on:
     types: [opened, synchronize, reopened, labeled]
   merge_group:
 
-# Concurrency model:
+# Concurrency model (job-level only):
+# - No workflow-level group. Every run joins a workflow-level group, even
+#   one whose jobs are all skipped, so a no-op `labeled` run (e.g. a bot
+#   adding `ai-assisted` right after the PR opens) cancelled the `opened`
+#   run's auto-pass and left the required check unposted. Skipped jobs
+#   never join a job-level group.
 # - Dispatch-side jobs (`skip-integration-tests-pr`,
 #   `trigger-tests-pr`, `merge-queue-kernel`) coalesce per PR / merge
-#   group / branch so push-spam and label cycles don't burn through
-#   the GitHub App rate limit. `cancel-in-progress: true` lets a
-#   newer push supersede a stale dispatch.
+#   group so push-spam and label cycles don't burn through the GitHub
+#   App rate limit. `cancel-in-progress: true` lets a newer push
+#   supersede a stale dispatch.
 # - The label-cleanup job (`remove-label-on-new-commit`) runs in its
 #   own group with `cancel-in-progress: false` — cancelling
 #   mid-flight could leave the label attached after a push, which
 #   would defeat the "re-review on each push" security contract.
-concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_sha || github.ref }}
-  cancel-in-progress: true
 
 jobs:
   # =============================================================================
@@ -106,7 +108,7 @@ jobs:
     name: Reset integration-test label on push
     if: github.event_name == 'pull_request' && github.event.action == 'synchronize'
     # Own concurrency group with `cancel-in-progress: false` — see the
-    # workflow-level comment above. The label-cleanup is a
+    # concurrency comment above. The label-cleanup is a
     # security-critical action; it MUST run to completion on every
     # push regardless of how quickly subsequent pushes arrive.
     concurrency:
@@ -202,6 +204,9 @@ jobs:
       github.event_name == 'pull_request' &&
       github.event.action != 'labeled' &&
       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name
+    concurrency:
+      group: ${{ github.workflow }}-autopass-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -298,6 +303,9 @@ jobs:
       github.event.action == 'labeled' &&
       contains(github.event.pull_request.labels.*.name, 'integration-test') &&
       vars.INTEGRATION_TESTS_ENABLED == 'true'
+    concurrency:
+      group: ${{ github.workflow }}-dispatch-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -444,6 +452,9 @@ jobs:
   merge-queue-kernel:
     name: Dispatch integration tests (merge queue)
     if: github.event_name == 'merge_group'
+    concurrency:
+      group: ${{ github.workflow }}-merge-queue-${{ github.event.merge_group.head_sha }}
+      cancel-in-progress: true
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest

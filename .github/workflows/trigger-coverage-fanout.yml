@@ -25,8 +25,9 @@
 # ------------------------------------------------------------------
 # This dispatch is fire-and-forget: no check is posted and there is no
 # `if: failure()` fallback, so a cancellation silently drops the coverage
-# fan-out. trigger-integration-tests.yml carries a workflow-level
-# concurrency group keyed on PR number with `cancel-in-progress: true`.
+# fan-out. trigger-integration-tests.yml used to carry a workflow-level
+# concurrency group keyed on PR number with `cancel-in-progress: true`
+# (it now uses job-level groups only).
 # Workflow-level and job-level concurrency operate independently: a
 # job-level group CANNOT exempt a job from a workflow-run-level
 # cancellation. So while this job lived in that workflow, a stray
