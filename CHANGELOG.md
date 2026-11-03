@@ -14,6 +14,31 @@ cadences and may not move in lockstep with the crate.
 
 ### Fixed
 
+## [v1.4.0] - 2026-11-03
+
+### Added
+- `ExecutedAsyncStatement::reader()` creates independent read-only handles
+  that retain session routing without owning cancellation, cleanup or
+  execution telemetry.
+
+### Changed
+- SQL sessions open through the warehouse sessions URL and use warehouse
+  statement URLs for owned statements when the create response enables
+  real-time routing. Detached statement reads use standard SQL URLs.
+  Lakehouse Real-Time supports asynchronous execution through the original
+  session and statement handle; cross-session polling and fetching are not
+  supported.
+- Warehouse session requests carry parent IDs only in the URL. The Rust wire
+  request structs now use `Option<String>` for `warehouse_id`; use
+  `Some(id)` when building a standard SQL request body.
+
+### Fixed
+- Telemetry events are no longer lost when a session is dropped outside a
+  Tokio runtime, when the runtime that created a host's shared telemetry
+  client shuts down, or when statements and result streams emit events after
+  `Session::close()`. Closing a session waits for a bounded telemetry flush
+  only when it is the last open session for its host.
+
 ## [v1.3.0] - 2026-10-23
 
 ### Updated
