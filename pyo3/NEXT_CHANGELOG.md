@@ -13,8 +13,6 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
-- `ExecutedAsyncStatement.reader()` returns an independent `AsyncStatementReader` for status and result reads with the source handle's session routing.
-
 ### Changed
 
 ### Updated

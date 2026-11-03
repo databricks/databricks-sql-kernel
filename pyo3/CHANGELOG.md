@@ -14,6 +14,27 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.4.0] - 2026-11-03
+
+### Added
+- `ExecutedAsyncStatement.reader()` returns an independent
+  `AsyncStatementReader` for status and result reads with the source
+  handle's session routing.
+
+### Changed
+- Sessions open through the warehouse sessions URL and keep Lakehouse
+  Real-Time session affinity for statements they own. Asynchronous
+  execution on Real-Time works through the original session and statement
+  handle; cross-session polling and fetching are not supported.
+
+### Updated
+- Bundle the kernel's `ctutils` 0.4.4 security update.
+
+### Fixed
+- Telemetry from statements and result streams that outlive their `Session`
+  is flushed instead of dropped, and `Session.close()` waits for a telemetry
+  flush only when it closes the last open session for its host.
+
 ## [v1.3.0] - 2026-10-23
 
 ### Updated

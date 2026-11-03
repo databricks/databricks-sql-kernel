@@ -14,6 +14,21 @@ they ship on independent cadences.
 
 ### Fixed
 
+## [v1.4.0] - 2026-11-03
+
+### Changed
+- Connections open through the warehouse sessions URL and keep Lakehouse
+  Real-Time session affinity for statements they own.
+
+### Updated
+- Bundle the kernel's `ctutils` 0.4.4 security update.
+
+### Fixed
+- Telemetry from statements and result streams that outlive their
+  `Connection` is flushed instead of dropped, and `Connection.close()` waits
+  for a telemetry flush only when it closes the last open connection for its
+  host.
+
 ## [v1.3.0] - 2026-10-23
 
 ### Updated
