@@ -25,20 +25,10 @@
 # ------------------------------------------------------------------
 # This dispatch is fire-and-forget: no check is posted and there is no
 # `if: failure()` fallback, so a cancellation silently drops the coverage
-# fan-out. trigger-integration-tests.yml used to carry a workflow-level
-# concurrency group keyed on PR number with `cancel-in-progress: true`
-# (it now uses job-level groups only).
-# Workflow-level and job-level concurrency operate independently: a
-# job-level group CANNOT exempt a job from a workflow-run-level
-# cancellation. So while this job lived in that workflow, a stray
-# post-merge `pull_request` event on the same PR number — e.g. a bot
-# label action landing during the token-mint + dispatch window (`labeled`
-# is in that workflow's trigger `types`) — would start a new run in the
-# shared PR-number group and cancel the entire prior run, including this
-# dispatch. Isolating it in its own workflow file removes it from that
-# shared group entirely; its own concurrency group below (keyed on the
-# merge commit, `cancel-in-progress: false`) then lets the dispatch always
-# run to completion.
+# fan-out. In its own workflow, no other PR event (e.g. a bot label
+# landing during the token-mint + dispatch window) can cancel it, and its
+# concurrency group below (keyed on the merge commit,
+# `cancel-in-progress: false`) lets the dispatch always run to completion.
 #
 # ------------------------------------------------------------------
 # Fork-merge assumption (why the fire-and-forget dispatch is safe here)
