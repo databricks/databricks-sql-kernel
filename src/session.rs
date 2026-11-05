@@ -378,6 +378,11 @@ impl Session {
         let auth_provider: Arc<dyn AuthProvider> =
             build_auth_provider(&config.auth, &host, http_client.clone()).await?;
         http_client.set_auth_provider(auth_provider);
+        // Authenticate before the feature-flag prefetch, which swallows its
+        // errors: otherwise a failed token request is sent again by
+        // CreateSession. Both reuse the token cached here.
+        http_client.auth_header()?;
+        http_client.auth_extra_headers()?;
 
         // 3. Transport. Two-phase: SeaRestTransport needs an
         //    Arc<dyn Transport> to build the result-reader factory,
@@ -2581,6 +2586,105 @@ mod is_open_tests {
             .count();
         assert_eq!(feature_flag_requests, 1, "sessions share the flag cache");
         assert_eq!(create_session_requests, 2, "each open creates a session");
+    }
+
+    fn m2m_session_builder(
+        server: &MockServer,
+        workspace_id: &str,
+        driver_version: &str,
+    ) -> SessionBuilder {
+        Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(
+                    server.uri(),
+                    &format!("/sql/1.0/warehouses/test_wh?o={workspace_id}"),
+                )
+                .expect("valid http_path"),
+            )
+            .auth(AuthConfig::OAuthM2M {
+                client_id: "test-client-id".into(),
+                client_secret: "test-client-secret".into(),
+                scopes: None,
+                token_url_override: Some(format!("{}/oidc/v1/token", server.uri())),
+                identity_federation_client_id: None,
+            })
+            .driver_system_configuration(DriverSystemConfiguration {
+                driver_name: Some("databricks-sql-go".to_string()),
+                driver_version: Some(driver_version.to_string()),
+                ..DriverSystemConfiguration::default()
+            })
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn failed_m2m_token_request_is_sent_once_when_feature_flags_are_enabled() {
+        // Test-specific workspace id keeps the process-wide flag cache cold.
+        const WORKSPACE_ID: &str = "3762431";
+        let server = MockServer::start().await;
+        // apiproxy's auth-shedding reply. Retry-After exceeds the auth retry
+        // budget, so this request must not be retried by anyone.
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "60"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+
+        let err = m2m_session_builder(&server, WORKSPACE_ID, "m2m-token-failure")
+            .open()
+            .await
+            .expect_err("open must fail when the token request fails");
+
+        assert_eq!(err.http_status, Some(503), "{}", err.message);
+        server.verify().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn m2m_session_open_uses_one_token_for_feature_flags_and_create_session() {
+        const WORKSPACE_ID: &str = "3762432";
+        const DRIVER_VERSION: &str = "m2m-single-token";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "access_token": "m2m-token",
+                "token_type": "Bearer",
+                "expires_in": 3600
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!(
+                "/api/2.0/connector-service/feature-flags/GOLANG/{DRIVER_VERSION}"
+            )))
+            .and(header("authorization", "Bearer m2m-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "flags": [],
+                "ttl_seconds": 300
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        mount_session_create_delete(&server, "sess-m2m-single-token").await;
+
+        let session = m2m_session_builder(&server, WORKSPACE_ID, DRIVER_VERSION)
+            .open()
+            .await
+            .expect("session must open");
+        session.close().await.expect("close succeeds");
+
+        server.verify().await;
     }
 
     #[tokio::test]
