@@ -21,14 +21,14 @@ name: Security Scan
 #
 # Scanner: OSV-Scanner v2.3.8 (purl-based via OSV.dev; federates
 # GHSA, NVD, RustSec, PyPA, Go vuln DB). Reads CycloneDX SBOMs
-# produced by `cargo cyclonedx` over the kernel's three standalone
-# workspaces:
+# produced by `cargo cyclonedx` over the repository's four standalone
+# workspace views:
 #
-#   1. Kernel root `Cargo.toml` (members = ["."]) — emits one SBOM
-#      for `databricks-sql-kernel`.
-#   2. pyo3/ standalone workspace — emits one SBOM for
+#   1. Kernel root `Cargo.toml` — emits one SBOM for `databricks-sql-kernel`.
+#   2. adbc/ standalone workspace — emits one SBOM for `databricks-adbc`.
+#   3. pyo3/ standalone workspace — emits one SBOM for
 #      `databricks-sql-kernel-pyo3` (built with `tls-rustls`).
-#   3. napi/ standalone workspace — emits one SBOM for
+#   4. napi/ standalone workspace — emits one SBOM for
 #      `databricks-sql-kernel-napi` (also `tls-rustls`).
 #
 # The bindings are deliberately NOT members of the kernel's root
@@ -107,10 +107,11 @@ jobs:
       - name: Install cargo-cyclonedx
         run: cargo install cargo-cyclonedx --version 0.5.7 --locked
 
-      # Two cyclonedx invocations cover all three published artifacts:
+      # Four cyclonedx invocations cover all four published artifacts:
       #
-      #   - From repo root: writes one SBOM (kernel root is now a
-      #     single-member workspace) — databricks-sql-kernel.cdx.json.
+      #   - From repo root: writes databricks-sql-kernel.cdx.json.
+      #
+      #   - From adbc/: writes databricks-adbc.cdx.json.
       #
       #   - From pyo3/: standalone workspace, writes one SBOM
       #     (databricks-sql-kernel-pyo3.cdx.json).
@@ -127,9 +128,9 @@ jobs:
           set -euo pipefail
           mkdir -p /tmp/sboms
 
-          # The kernel root, pyo3, and napi are each their own
-          # standalone single-member workspaces (see the workspace
-          # comment in each Cargo.toml — pyo3 and napi need
+          # The kernel, ADBC, pyo3, and napi standalone workspaces cover all
+          # Rust artifacts (see the workspace comment in each Cargo.toml —
+          # pyo3 and napi need
           # `tls-rustls` while the kernel default is `tls-native`,
           # and Cargo feature unification across a shared workspace
           # would trip the mutual-exclusion `compile_error!` in
@@ -147,6 +148,11 @@ jobs:
             cp "$f" "/tmp/sboms/$(basename "$f")"
           done
 
+          ( cd adbc && cargo cyclonedx --format json )
+          for f in adbc/*.cdx.json; do
+            cp "$f" "/tmp/sboms/$(basename "$f")"
+          done
+
           ( cd pyo3 && cargo cyclonedx --format json )
           for f in pyo3/*.cdx.json; do
             cp "$f" "/tmp/sboms/$(basename "$f")"
@@ -160,8 +166,8 @@ jobs:
           echo "SBOMs:"
           ls -lh /tmp/sboms/
           # Hard-stop if we lost coverage by accident.
-          test "$(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)" -ge 3 || {
-            echo "::error::expected >=3 SBOMs (root crate + pyo3 + napi), got $(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)"
+          test "$(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)" -ge 4 || {
+            echo "::error::expected >=4 SBOMs (kernel + ADBC + pyo3 + napi), got $(ls /tmp/sboms/*.cdx.json 2>/dev/null | wc -l)"
             exit 1
           }
 
@@ -194,6 +200,7 @@ jobs:
             --format=json \
             --output-file=/tmp/osv-out.json \
             --sbom=/tmp/sboms/databricks-sql-kernel.cdx.json \
+            --sbom=/tmp/sboms/databricks-adbc.cdx.json \
             --sbom=/tmp/sboms/databricks-sql-kernel-pyo3.cdx.json \
             --sbom=/tmp/sboms/databricks-sql-kernel-napi.cdx.json || RC=$?
           if [[ "$RC" -gt 1 ]]; then

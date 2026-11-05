@@ -12,24 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-.PHONY: all build test fmt lint clean check coverage coverage-check c-abi-test
+.PHONY: all build test fmt lint clean check coverage coverage-check c-abi-test adbc-ffi-test
 
 all: build
 
 build:
 	cargo build
+	cargo build --manifest-path adbc/Cargo.toml
 
 test:
 	cargo test
+	cargo test --manifest-path adbc/Cargo.toml
 
 fmt:
-	cargo fmt
+	cargo fmt --all
+	cargo fmt --manifest-path adbc/Cargo.toml
 
 fmt-check:
-	cargo fmt -- --check
+	cargo fmt --all -- --check
+	cargo fmt --manifest-path adbc/Cargo.toml -- --check
 
 lint:
-	cargo clippy -- -D warnings
+	cargo clippy --all-targets -- -D warnings
+	cargo clippy --manifest-path adbc/Cargo.toml --all-targets -- -D warnings
 
 # Compile the hand-written C smoke tests against the cdylib and run them.
 # Proves the C ABI in `src/ffi/` links and behaves from a real C consumer
@@ -44,10 +49,18 @@ c-abi-test:
 		LD_LIBRARY_PATH=target/debug DYLD_LIBRARY_PATH=target/debug ./target/c-abi/$$name || exit 1; \
 	done
 
-check: fmt-check lint test c-abi-test
+# Prove that the ADBC crate exports a loadable ADBC 1.1 C driver while its
+# internal kernel integration remains native Rust.
+adbc-ffi-test:
+	cargo test --manifest-path adbc/Cargo.toml --features ffi
+	cargo build --manifest-path adbc/Cargo.toml --features ffi --lib --example ffi_smoke
+	./adbc/target/debug/examples/ffi_smoke "$(CURDIR)/adbc/target/debug/libdatabricks_adbc.so"
+
+check: fmt-check lint test c-abi-test adbc-ffi-test
 
 clean:
 	cargo clean
+	cargo clean --manifest-path adbc/Cargo.toml
 
 coverage:
 	cargo llvm-cov --all-features --ignore-filename-regex "tests/" --html --open

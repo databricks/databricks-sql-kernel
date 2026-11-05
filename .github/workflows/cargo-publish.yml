@@ -115,8 +115,8 @@ jobs:
           fi
           # `--registry jfrog` matches the `[registries.jfrog]` block
           # that setup-jfrog writes into ~/.cargo/config.toml. The
-          # workspace's other members (pyo3/) have their own publish
-          # workflows / are not part of this release; --no-verify
+          # The standalone ADBC crate remains non-publishable in this release;
+          # pyo3 and napi have their own workspace release paths. `--no-verify`
           # skips re-compiling the crate during the package step
           # since CI has already done that elsewhere.
           cargo publish \

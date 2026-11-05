@@ -1,0 +1,53 @@
+[package]
+name = "databricks-adbc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.89"
+authors = ["Databricks"]
+license = "Apache-2.0"
+description = "ADBC driver for Databricks built on the Databricks SQL Kernel"
+repository = "https://github.com/databricks/databricks-sql-kernel"
+readme = "README.md"
+keywords = ["databricks", "adbc", "arrow", "database", "sql"]
+categories = ["database"]
+include = [
+    "/src/**",
+    "/tests/**",
+    "/examples/**",
+    "/README.md",
+    "/LICENSE",
+    "/PACKAGING.md",
+]
+# Remove only after the public kernel crate and release process are available.
+publish = false
+
+[dependencies]
+adbc_core = "0.24"
+adbc_ffi = { version = "0.24", optional = true }
+arrow-array = "59"
+arrow-buffer = "59"
+arrow-schema = "59"
+# Native Rust integration with the kernel crate in this repository. The
+# version is retained so Cargo can replace the path when packaging after both
+# crates become publishable.
+databricks-sql-kernel = { version = "1.4.0", path = ".." }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[dev-dependencies]
+adbc_driver_manager = "0.24"
+
+[features]
+default = []
+ffi = ["dep:adbc_ffi"]
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[[example]]
+name = "ffi_smoke"
+required-features = ["ffi"]
+
+[workspace]
+members = ["."]
+resolver = "2"
