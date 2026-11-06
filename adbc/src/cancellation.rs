@@ -80,17 +80,17 @@ impl CancellationRegistry {
             .lock()
             .map_err(|_| adbc_error("connection cancellation lock is poisoned", Status::Internal))?
             .values()
-            .filter(|entry| (entry.is_active)())
             .cloned()
             .collect::<Vec<_>>();
-        if active.is_empty() {
-            return Err(adbc_error(
-                "connection has no active operation to cancel",
-                Status::InvalidState,
-            ));
-        }
+        let mut found_active = false;
         let mut first_error = None;
         for entry in active {
+            // User-provided activity and cancellation callbacks must run after
+            // releasing the registry lock because they may re-enter it.
+            if !(entry.is_active)() {
+                continue;
+            }
+            found_active = true;
             if !(entry.is_active)() {
                 continue;
             }
@@ -104,6 +104,12 @@ impl CancellationRegistry {
                 }
                 Err(_) => {}
             }
+        }
+        if !found_active {
+            return Err(adbc_error(
+                "connection has no active operation to cancel",
+                Status::InvalidState,
+            ));
         }
         first_error.map_or(Ok(()), Err)
     }
@@ -169,6 +175,24 @@ mod tests {
         assert_eq!(calls.load(Ordering::Relaxed), 2);
         drop(guards);
         assert_eq!(registry.cancel().unwrap_err().status, Status::InvalidState);
+    }
+
+    #[test]
+    fn activity_checks_run_without_holding_registry_lock() {
+        let registry = Arc::new(CancellationRegistry::default());
+        let activity_registry = Arc::clone(&registry);
+        let _guard = registry
+            .register_while(
+                Arc::new(|| Ok(())),
+                Arc::new(move || {
+                    let reentrant = activity_registry.register(Arc::new(|| Ok(()))).unwrap();
+                    drop(reentrant);
+                    true
+                }),
+            )
+            .unwrap();
+
+        registry.cancel().unwrap();
     }
 
     #[test]

@@ -25,7 +25,7 @@ surface) for direct Rust use, the PyO3 (Python) and napi-rs (Node.js)
 wrappers, and a C ABI for ODBC / Go consumers. See
 [`docs/spec-v0.md`](docs/spec-v0.md) for the API spec.
 
-The standalone [`adbc/`](adbc/) workspace implements ADBC 1.1 directly over this
+The separate [`adbc/`](adbc/) Cargo workspace implements ADBC 1.1 directly over this
 native Rust API. It provides both Rust traits and an optional standard ADBC C
 entry point for driver managers and other languages; the kernel boundary does
 not use FFI.
@@ -40,6 +40,9 @@ Early. Expect breaking changes.
 cargo build
 cargo test --workspace
 make check    # workspace fmt + clippy + tests and native ABI smoke tests
+
+# ADBC is a separate Cargo workspace and is validated explicitly by make check.
+cargo test --manifest-path adbc/Cargo.toml --features ffi
 ```
 
 Native consumers that statically link the kernel and publish separate crash

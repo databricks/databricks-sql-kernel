@@ -25,7 +25,7 @@ use databricks_sql_kernel as kernel;
 
 use crate::cancellation::CancellationRegistry;
 use crate::error::{adbc_error, map_kernel_error, option_not_found, unsupported};
-use crate::runtime::RuntimeExt as _;
+use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 use crate::Statement;
 
 #[path = "metadata.rs"]
@@ -33,7 +33,7 @@ pub(crate) mod metadata;
 
 pub struct Connection {
     session: Option<kernel::Session>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     catalog: Option<String>,
     schema: Option<String>,
     vendor_version: Mutex<Option<String>>,
@@ -44,7 +44,7 @@ pub struct Connection {
 impl Connection {
     pub(crate) fn new(
         session: kernel::Session,
-        runtime: Arc<tokio::runtime::Runtime>,
+        runtime: Arc<RuntimeHandle>,
         catalog: Option<String>,
         schema: Option<String>,
         escape_catalog_name: bool,

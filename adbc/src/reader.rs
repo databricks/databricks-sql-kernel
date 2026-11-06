@@ -24,7 +24,7 @@ use databricks_sql_kernel::ExecutedStatementHandle as _;
 
 use crate::cancellation::OperationGuard;
 use crate::error::adbc_error;
-use crate::runtime::RuntimeExt as _;
+use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 use crate::statement::{execute_bound_row, ParameterStyle};
 
 pub(crate) struct BoundRows {
@@ -140,7 +140,7 @@ pub(crate) struct KernelReader {
     executed: kernel::ExecutedStatement,
     // The executed handle must drop first so it can schedule cleanup while
     // the final runtime owner is still alive.
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     schema: SchemaRef,
     lifecycle: ResultLifecycle,
 }
@@ -149,7 +149,7 @@ pub(crate) struct AsyncKernelReader {
     connection_operation: Option<OperationGuard>,
     executed: kernel::ExecutedAsyncStatement,
     stream: kernel::ResultStream,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     schema: SchemaRef,
     lifecycle: ResultLifecycle,
 }
@@ -240,7 +240,7 @@ impl ResultLifecycle {
 
 impl KernelReader {
     pub(crate) fn new(
-        runtime: Arc<tokio::runtime::Runtime>,
+        runtime: Arc<RuntimeHandle>,
         executed: kernel::ExecutedStatement,
         generation: Arc<AtomicU64>,
         expected_generation: u64,
@@ -340,7 +340,7 @@ impl RecordBatchReader for KernelReader {
 
 impl AsyncKernelReader {
     pub(crate) fn new(
-        runtime: Arc<tokio::runtime::Runtime>,
+        runtime: Arc<RuntimeHandle>,
         executed: kernel::ExecutedAsyncStatement,
         stream: kernel::ResultStream,
         generation: Arc<AtomicU64>,
@@ -441,7 +441,7 @@ impl RecordBatchReader for AsyncKernelReader {
 pub(crate) struct SequenceReader {
     connection_operation: Option<OperationGuard>,
     inner: Arc<Mutex<kernel::Statement>>,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     lifecycle: ResultLifecycle,
     base_spec: kernel::StatementSpec,
     parameter_style: ParameterStyle,
@@ -455,7 +455,7 @@ impl SequenceReader {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Arc<Mutex<kernel::Statement>>,
-        runtime: Arc<tokio::runtime::Runtime>,
+        runtime: Arc<RuntimeHandle>,
         generation: Arc<AtomicU64>,
         expected_generation: u64,
         base_spec: kernel::StatementSpec,

@@ -54,7 +54,14 @@ c-abi-test:
 adbc-ffi-test:
 	cargo test --manifest-path adbc/Cargo.toml --features ffi
 	cargo build --manifest-path adbc/Cargo.toml --features ffi --lib --example ffi_smoke
-	./adbc/target/debug/examples/ffi_smoke "$(CURDIR)/adbc/target/debug/libdatabricks_adbc.so"
+	@case "$$(uname -s)" in \
+		Darwin*) library=libdatabricks_adbc.dylib ;; \
+		MINGW*|MSYS*|CYGWIN*) library=databricks_adbc.dll ;; \
+		*) library=libdatabricks_adbc.so ;; \
+	esac; \
+	LD_LIBRARY_PATH="$(CURDIR)/adbc/target/debug" \
+	DYLD_LIBRARY_PATH="$(CURDIR)/adbc/target/debug" \
+	./adbc/target/debug/examples/ffi_smoke "$(CURDIR)/adbc/target/debug/$$library"
 
 check: fmt-check lint test c-abi-test adbc-ffi-test
 

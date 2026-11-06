@@ -13,9 +13,60 @@
 // limitations under the License.
 
 use std::future::Future;
+use std::ops::Deref;
 use std::panic::resume_unwind;
+use std::sync::Arc;
 
 use tokio::runtime::{Handle, Runtime, RuntimeFlavor};
+
+pub(crate) const DEFAULT_WORKER_THREADS: usize = 2;
+
+/// A Tokio runtime used by the synchronous ADBC surface.
+///
+/// Driver-owned runtimes are shut down in the background so the last ADBC
+/// handle can safely be dropped from within an asynchronous context. Injected
+/// runtimes remain owned and managed by their caller.
+#[derive(Debug)]
+pub(crate) enum RuntimeHandle {
+    Owned(Option<Runtime>),
+    Injected(Arc<Runtime>),
+}
+
+impl RuntimeHandle {
+    pub(crate) fn create() -> std::io::Result<Arc<Self>> {
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(DEFAULT_WORKER_THREADS)
+            .enable_all()
+            .build()
+            .map(|runtime| Arc::new(Self::Owned(Some(runtime))))
+    }
+
+    pub(crate) fn injected(runtime: Arc<Runtime>) -> Arc<Self> {
+        Arc::new(Self::Injected(runtime))
+    }
+}
+
+impl Deref for RuntimeHandle {
+    type Target = Runtime;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Owned(Some(runtime)) => runtime,
+            Self::Owned(None) => unreachable!("owned runtime is only taken during drop"),
+            Self::Injected(runtime) => runtime,
+        }
+    }
+}
+
+impl Drop for RuntimeHandle {
+    fn drop(&mut self) {
+        if let Self::Owned(runtime) = self {
+            if let Some(runtime) = runtime.take() {
+                runtime.shutdown_background();
+            }
+        }
+    }
+}
 
 pub(crate) trait RuntimeExt {
     fn block_on_safe<F>(&self, future: F) -> F::Output
@@ -40,6 +91,16 @@ impl RuntimeExt for Runtime {
             }
             _ => self.block_on(future),
         }
+    }
+}
+
+impl RuntimeExt for RuntimeHandle {
+    fn block_on_safe<F>(&self, future: F) -> F::Output
+    where
+        F: Future + Send,
+        F::Output: Send,
+    {
+        self.deref().block_on_safe(future)
     }
 }
 
@@ -83,5 +144,37 @@ mod tests {
             caller.block_on(async { private.block_on_safe(async { 42 }) }),
             42
         );
+    }
+
+    #[test]
+    fn owned_runtime_drops_inside_multithread_tokio() {
+        let caller = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async { drop(RuntimeHandle::create().unwrap()) });
+    }
+
+    #[test]
+    fn owned_runtime_drops_inside_current_thread_tokio() {
+        let caller = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        caller.block_on(async { drop(RuntimeHandle::create().unwrap()) });
+    }
+
+    #[test]
+    fn injected_runtime_is_not_shut_down_by_handle() {
+        let runtime = Arc::new(private_runtime());
+        drop(RuntimeHandle::injected(Arc::clone(&runtime)));
+        assert_eq!(runtime.block_on(async { 42 }), 42);
+    }
+
+    #[test]
+    fn injected_runtime_can_be_used_from_within_itself() {
+        let runtime = Arc::new(private_runtime());
+        let handle = RuntimeHandle::injected(Arc::clone(&runtime));
+        assert_eq!(runtime.block_on(async { handle.block_on_safe(async { 42 }) }), 42);
     }
 }

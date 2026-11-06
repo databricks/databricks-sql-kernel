@@ -93,7 +93,7 @@ jobs:
         # as `pr-checks.yml`'s `test` job.
         run: |
           cargo llvm-cov --workspace --lcov --output-path lcov.info
-          cargo llvm-cov --manifest-path adbc/Cargo.toml --lcov --output-path adbc-lcov.info
+          cargo llvm-cov --manifest-path adbc/Cargo.toml --features ffi --lcov --output-path adbc-lcov.info
 
       # Codecov upload.
       #

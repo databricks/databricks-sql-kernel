@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use adbc_core::error::Result;
 use adbc_core::options::{OptionConnection, OptionDatabase, OptionValue};
@@ -21,7 +21,7 @@ use databricks_sql_kernel as kernel;
 
 use crate::config::DatabaseConfig;
 use crate::error::option_not_found;
-use crate::runtime::RuntimeExt as _;
+use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 use crate::Connection;
 
 const DRIVER_NAME: &str = "Databricks ADBC Driver for Rust";
@@ -34,12 +34,53 @@ fn driver_system_configuration() -> kernel::DriverSystemConfiguration {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct Database {
     config: DatabaseConfig,
+    runtime: Arc<Mutex<Option<Arc<RuntimeHandle>>>>,
 }
 
 impl Database {
+    /// Create a database that executes kernel work on a caller-owned runtime.
+    ///
+    /// All connections created from this database share the runtime. Dropping
+    /// the database or its connections never shuts down an injected runtime.
+    pub fn with_runtime(runtime: Arc<tokio::runtime::Runtime>) -> Result<Self> {
+        if !matches!(
+            runtime.handle().runtime_flavor(),
+            tokio::runtime::RuntimeFlavor::MultiThread
+        ) {
+            return Err(adbc_core::error::Error::with_message_and_status(
+                "an injected runtime must use the Tokio multi-thread scheduler",
+                adbc_core::error::Status::InvalidArguments,
+            ));
+        }
+        Ok(Self {
+            config: DatabaseConfig::default(),
+            runtime: Arc::new(Mutex::new(Some(RuntimeHandle::injected(runtime)))),
+        })
+    }
+
+    fn runtime(&self) -> Result<Arc<RuntimeHandle>> {
+        let mut runtime = self.runtime.lock().map_err(|_| {
+            adbc_core::error::Error::with_message_and_status(
+                "database runtime lock is poisoned",
+                adbc_core::error::Status::Internal,
+            )
+        })?;
+        if let Some(runtime) = runtime.as_ref() {
+            return Ok(Arc::clone(runtime));
+        }
+        let created = RuntimeHandle::create().map_err(|source| {
+            adbc_core::error::Error::with_message_and_status(
+                source.to_string(),
+                adbc_core::error::Status::Internal,
+            )
+        })?;
+        *runtime = Some(Arc::clone(&created));
+        Ok(created)
+    }
+
     fn open(&self) -> Result<Connection> {
         let resolved = self.config.resolve()?;
         let mut builder = kernel::Session::builder()
@@ -69,17 +110,7 @@ impl Database {
             defaults.schema.clone_from(&resolved.schema);
             builder = builder.defaults(defaults);
         }
-        let runtime = Arc::new(
-            tokio::runtime::Builder::new_multi_thread()
-                .enable_all()
-                .build()
-                .map_err(|source| {
-                    adbc_core::error::Error::with_message_and_status(
-                        source.to_string(),
-                        adbc_core::error::Status::Internal,
-                    )
-                })?,
-        );
+        let runtime = self.runtime()?;
         let session = runtime
             .block_on_safe(builder.open())
             .map_err(crate::error::map_kernel_error)?;
@@ -90,6 +121,15 @@ impl Database {
             resolved.schema,
             resolved.escape_catalog_name,
         ))
+    }
+}
+
+impl Default for Database {
+    fn default() -> Self {
+        Self {
+            config: DatabaseConfig::default(),
+            runtime: Arc::new(Mutex::new(None)),
+        }
     }
 }
 
@@ -136,7 +176,7 @@ impl adbc_core::Database for Database {
 
 #[cfg(test)]
 mod tests {
-    use adbc_core::{Database as _, Driver as _, Optionable as _};
+    use adbc_core::{Database as _, Driver as _};
 
     use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH};
     use crate::Driver;
@@ -207,6 +247,50 @@ mod tests {
         assert_eq!(
             identity.driver_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn clones_share_driver_owned_runtime() {
+        let database = Database::default();
+        let clone = database.clone();
+        assert!(Arc::ptr_eq(
+            &database.runtime().unwrap(),
+            &clone.runtime().unwrap()
+        ));
+    }
+
+    #[test]
+    fn injected_runtime_is_shared_by_database_clones() {
+        let injected = Arc::new(
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        let database = Database::with_runtime(Arc::clone(&injected)).unwrap();
+        let clone = database.clone();
+        assert!(Arc::ptr_eq(
+            &database.runtime().unwrap(),
+            &clone.runtime().unwrap()
+        ));
+        drop(database);
+        drop(clone);
+        assert_eq!(injected.block_on(async { 42 }), 42);
+    }
+
+    #[test]
+    fn current_thread_runtime_cannot_be_injected() {
+        let runtime = Arc::new(
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap(),
+        );
+        assert_eq!(
+            Database::with_runtime(runtime).unwrap_err().status,
+            adbc_core::error::Status::InvalidArguments
         );
     }
 }

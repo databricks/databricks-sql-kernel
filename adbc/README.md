@@ -33,6 +33,12 @@ crates are published; publish the matching kernel version first.
 Create a `Driver`, then create a database with a workspace URI, one
 warehouse selector, and authentication options:
 
+Native Rust applications may instead create a database with
+`Database::with_runtime(Arc<tokio::runtime::Runtime>)`. The runtime must use
+Tokio's multi-thread scheduler, remains owned by the application, and is shared
+by every connection created from that database. The standard ADBC `Driver`
+surface creates a bounded driver-owned runtime shared at database scope.
+
 ```rust,no_run
 use adbc_core::options::{OptionDatabase, OptionValue};
 use adbc_core::{Database as _, Driver as _};

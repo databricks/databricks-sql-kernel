@@ -30,7 +30,7 @@ use crate::cancellation::{CancellationRegistry, OperationGuard};
 use crate::connection::metadata;
 use crate::error::{adbc_error, map_kernel_error, option_not_found, unsupported};
 use crate::reader::{AsyncKernelReader, BoundRows, KernelReader, SequenceReader, SlicingReader};
-use crate::runtime::RuntimeExt as _;
+use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 
 const PARAMETER_STYLE_OPTION: &str = "adbc.databricks.statement.parameter_style";
 const QUERY_TAGS_OPTION: &str = "adbc.databricks.statement.query_tags";
@@ -71,7 +71,7 @@ pub struct Statement {
     inner: Arc<Mutex<kernel::Statement>>,
     metadata: kernel::Metadata,
     canceller: kernel::StatementCanceller,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     binding: Option<Binding>,
     parameter_style: ParameterStyle,
     prepared: bool,
@@ -226,7 +226,7 @@ impl SubmittedStatement<'_> {
 #[derive(Clone)]
 pub struct StatementCancellationHandle {
     canceller: kernel::StatementCanceller,
-    runtime: Arc<tokio::runtime::Runtime>,
+    runtime: Arc<RuntimeHandle>,
     current_cancellation: Arc<AtomicBool>,
     blocking_execute: Arc<AtomicBool>,
     cancellation_notify: Arc<Notify>,
@@ -324,7 +324,7 @@ impl Statement {
     pub(crate) fn new(
         inner: kernel::Statement,
         metadata: kernel::Metadata,
-        runtime: Arc<tokio::runtime::Runtime>,
+        runtime: Arc<RuntimeHandle>,
         connection_cancellation: Arc<CancellationRegistry>,
         escape_catalog_name: bool,
     ) -> Self {
@@ -1118,7 +1118,7 @@ fn is_valid_named_parameter(name: &str) -> bool {
 
 pub(crate) fn execute_bound_row(
     inner: &Arc<Mutex<kernel::Statement>>,
-    runtime: &Arc<tokio::runtime::Runtime>,
+    runtime: &Arc<RuntimeHandle>,
     base_spec: &kernel::StatementSpec,
     row: &RecordBatch,
     style: ParameterStyle,
