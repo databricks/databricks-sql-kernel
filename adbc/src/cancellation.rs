@@ -91,9 +91,6 @@ impl CancellationRegistry {
                 continue;
             }
             found_active = true;
-            if !(entry.is_active)() {
-                continue;
-            }
             match (entry.cancel)() {
                 Ok(()) => entry.cancelled.store(true, Ordering::Release),
                 Err(error) if first_error.is_none() => {
@@ -115,9 +112,10 @@ impl CancellationRegistry {
     }
 
     fn remove(&self, id: u64) {
-        if let Ok(mut active) = self.active.lock() {
-            active.remove(&id);
-        }
+        self.active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&id);
     }
 }
 
@@ -193,6 +191,25 @@ mod tests {
             .unwrap();
 
         registry.cancel().unwrap();
+    }
+
+    #[test]
+    fn guard_removes_entry_from_poisoned_registry() {
+        let registry = Arc::new(CancellationRegistry::default());
+        let guard = registry.register(Arc::new(|| Ok(()))).unwrap();
+        let poisoning_registry = Arc::clone(&registry);
+        let _ = std::panic::catch_unwind(move || {
+            let _lock = poisoning_registry.active.lock().unwrap();
+            panic!("poison registry for test");
+        });
+
+        drop(guard);
+
+        assert!(registry
+            .active
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty());
     }
 
     #[test]

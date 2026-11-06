@@ -14,7 +14,7 @@
 
 use std::{env, fs};
 
-use adbc_core::options::{OptionDatabase, OptionStatement, OptionValue};
+use adbc_core::options::{OptionConnection, OptionDatabase, OptionStatement, OptionValue};
 use adbc_core::{Connection as _, Database as _, Driver as _, Optionable as _, Statement as _};
 use arrow_array::{Array as _, Int8Array, ListArray, StringArray};
 use databricks_adbc::{Connection, Driver};
@@ -136,6 +136,37 @@ fn select_one_fetches_the_complete_result() {
     }
     assert!(batches >= 1, "SELECT 1 should return a batch");
     assert_eq!(rows, 1, "SELECT 1 should return exactly one row");
+}
+
+#[test]
+#[ignore = "requires an explicitly configured live Databricks warehouse"]
+fn namespace_getters_reflect_direct_use_statements() {
+    let catalog = env::var("DATABRICKS_TEST_CATALOG").unwrap_or_else(|_| "samples".to_owned());
+    let schema = env::var("DATABRICKS_TEST_SCHEMA").unwrap_or_else(|_| "tpch".to_owned());
+    let mut connection = live_connection();
+    let mut statement = connection.new_statement().expect("create statement");
+    statement
+        .set_sql_query(format!("USE CATALOG `{}`", catalog.replace('`', "``")))
+        .expect("set catalog SQL");
+    statement.execute_update().expect("change catalog");
+    statement
+        .set_sql_query(format!("USE SCHEMA `{}`", schema.replace('`', "``")))
+        .expect("set schema SQL");
+    statement.execute_update().expect("change schema");
+    drop(statement);
+
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::CurrentCatalog)
+            .expect("read current catalog"),
+        catalog
+    );
+    assert_eq!(
+        connection
+            .get_option_string(OptionConnection::CurrentSchema)
+            .expect("read current schema"),
+        schema
+    );
 }
 
 #[test]

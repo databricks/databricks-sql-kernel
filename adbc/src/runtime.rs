@@ -175,6 +175,9 @@ mod tests {
     fn injected_runtime_can_be_used_from_within_itself() {
         let runtime = Arc::new(private_runtime());
         let handle = RuntimeHandle::injected(Arc::clone(&runtime));
-        assert_eq!(runtime.block_on(async { handle.block_on_safe(async { 42 }) }), 42);
+        assert_eq!(
+            runtime.block_on(async { handle.block_on_safe(async { 42 }) }),
+            42
+        );
     }
 }

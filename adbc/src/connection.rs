@@ -19,8 +19,9 @@ use std::{
 
 use adbc_core::error::{Result, Status};
 use adbc_core::options::{InfoCode, ObjectDepth, OptionConnection, OptionValue};
-use arrow_array::RecordBatchReader;
-use arrow_schema::Schema;
+use arrow_array::cast::AsArray as _;
+use arrow_array::{Array as _, RecordBatch, RecordBatchReader};
+use arrow_schema::{DataType, Schema};
 use databricks_sql_kernel as kernel;
 
 use crate::cancellation::CancellationRegistry;
@@ -34,8 +35,6 @@ pub(crate) mod metadata;
 pub struct Connection {
     session: Option<kernel::Session>,
     runtime: Arc<RuntimeHandle>,
-    catalog: Option<String>,
-    schema: Option<String>,
     vendor_version: Mutex<Option<String>>,
     escape_catalog_name: bool,
     cancellation: Arc<CancellationRegistry>,
@@ -45,15 +44,11 @@ impl Connection {
     pub(crate) fn new(
         session: kernel::Session,
         runtime: Arc<RuntimeHandle>,
-        catalog: Option<String>,
-        schema: Option<String>,
         escape_catalog_name: bool,
     ) -> Self {
         Self {
             session: Some(session),
             runtime,
-            catalog,
-            schema,
             vendor_version: Mutex::new(None),
             escape_catalog_name,
             cancellation: Arc::new(CancellationRegistry::default()),
@@ -99,17 +94,71 @@ impl Connection {
 
     fn set_current_catalog(&mut self, value: String) -> Result<()> {
         let quoted = quote_session_identifier(&value)?;
-        let result = self.execute_session_command(format!("USE CATALOG {quoted}"));
-        update_after_success(&mut self.catalog, value, result)?;
-        // USE CATALOG changes the server's current schema. Do not report the stale old value.
-        self.schema = None;
-        Ok(())
+        self.execute_session_command(format!("USE CATALOG {quoted}"))
     }
 
     fn set_current_schema(&mut self, value: String) -> Result<()> {
         let quoted = quote_session_identifier(&value)?;
-        let result = self.execute_session_command(format!("USE SCHEMA {quoted}"));
-        update_after_success(&mut self.schema, value, result)
+        self.execute_session_command(format!("USE SCHEMA {quoted}"))
+    }
+
+    fn current_namespace(&self) -> Result<(String, String)> {
+        let mut statement = self.session()?.statement();
+        let canceller = statement.canceller();
+        let runtime = Arc::clone(&self.runtime);
+        let _operation = self.cancellation.register(Arc::new(move || {
+            let dispatched = runtime
+                .block_on_safe(canceller.cancel())
+                .map_err(map_kernel_error)?;
+            if dispatched {
+                Ok(())
+            } else {
+                Err(adbc_error(
+                    "connection cancellation raced before the server statement identifier was available",
+                    Status::Unknown,
+                ))
+            }
+        }))?;
+        statement
+            .spec()
+            .sql("SELECT current_catalog(), current_schema()");
+        let mut executed = self
+            .runtime
+            .block_on_safe(statement.execute())
+            .map_err(map_kernel_error)?;
+        let namespace = match self
+            .runtime
+            .block_on_safe(executed.next_batch())
+            .map_err(map_kernel_error)?
+        {
+            Some(kernel::ResultBatch::Arrow(batch))
+                if batch.num_rows() > 0 && batch.num_columns() >= 2 =>
+            {
+                (
+                    required_namespace_value(batch, 0, "current catalog")?,
+                    required_namespace_value(batch, 1, "current schema")?,
+                )
+            }
+            Some(_) => {
+                return Err(adbc_error(
+                    "current namespace query returned an invalid result",
+                    Status::InvalidData,
+                ));
+            }
+            None => {
+                return Err(adbc_error(
+                    "current namespace query returned no result",
+                    Status::InvalidData,
+                ));
+            }
+        };
+        while self
+            .runtime
+            .block_on_safe(executed.next_batch())
+            .map_err(map_kernel_error)?
+            .is_some()
+        {}
+        Ok(namespace)
     }
 }
 
@@ -146,14 +195,22 @@ fn quote_session_identifier(value: &str) -> Result<String> {
     Ok(format!("`{}`", value.replace('`', "``")))
 }
 
-fn update_after_success(
-    slot: &mut Option<String>,
-    value: String,
-    operation: Result<()>,
-) -> Result<()> {
-    operation?;
-    *slot = Some(value);
-    Ok(())
+fn required_namespace_value(batch: &RecordBatch, column: usize, label: &str) -> Result<String> {
+    let value = batch.column(column);
+    if value.is_null(0) {
+        return Err(adbc_error(
+            format!("current namespace query returned null {label}"),
+            Status::InvalidData,
+        ));
+    }
+    match value.data_type() {
+        DataType::Utf8 => Ok(value.as_string::<i32>().value(0).to_owned()),
+        DataType::LargeUtf8 => Ok(value.as_string::<i64>().value(0).to_owned()),
+        other => Err(adbc_error(
+            format!("current namespace query returned {other} for {label}, expected UTF-8"),
+            Status::InvalidData,
+        )),
+    }
 }
 
 fn string_option(value: OptionValue, key: &str) -> Result<String> {
@@ -198,14 +255,10 @@ impl adbc_core::Optionable for Connection {
     fn get_option_string(&self, key: OptionConnection) -> Result<String> {
         match key {
             OptionConnection::AutoCommit => Ok(self.session()?.autocommit().to_string()),
-            OptionConnection::CurrentCatalog => self
-                .catalog
-                .clone()
-                .ok_or_else(|| adbc_error("current catalog is not configured", Status::NotFound)),
-            OptionConnection::CurrentSchema => self
-                .schema
-                .clone()
-                .ok_or_else(|| adbc_error("current schema is not configured", Status::NotFound)),
+            OptionConnection::CurrentCatalog => {
+                self.current_namespace().map(|(catalog, _)| catalog)
+            }
+            OptionConnection::CurrentSchema => self.current_namespace().map(|(_, schema)| schema),
             _ => Err(option_not_found("connection string", key.as_ref())),
         }
     }
@@ -331,13 +384,27 @@ mod tests {
     }
 
     #[test]
-    fn option_state_changes_only_after_server_success() {
-        let mut state = Some("old".to_owned());
-        let failure = Err(adbc_error("server rejected command", Status::InvalidState));
-        assert!(update_after_success(&mut state, "new".into(), failure).is_err());
-        assert_eq!(state.as_deref(), Some("old"));
+    fn namespace_values_accept_both_arrow_string_widths() {
+        let schema = Arc::new(Schema::new(vec![
+            arrow_schema::Field::new("catalog", DataType::Utf8, false),
+            arrow_schema::Field::new("schema", DataType::LargeUtf8, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema,
+            vec![
+                Arc::new(arrow_array::StringArray::from(vec!["catalog"])),
+                Arc::new(arrow_array::LargeStringArray::from(vec!["schema"])),
+            ],
+        )
+        .unwrap();
 
-        update_after_success(&mut state, "new".into(), Ok(())).unwrap();
-        assert_eq!(state.as_deref(), Some("new"));
+        assert_eq!(
+            required_namespace_value(&batch, 0, "catalog").unwrap(),
+            "catalog"
+        );
+        assert_eq!(
+            required_namespace_value(&batch, 1, "schema").unwrap(),
+            "schema"
+        );
     }
 }

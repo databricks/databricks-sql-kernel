@@ -15,8 +15,8 @@ over the same Rust implementation.
 ## Build
 
 ```text
-cargo build -p databricks-adbc --release
-cargo build -p databricks-adbc --release --features ffi
+cargo build --manifest-path adbc/Cargo.toml --release
+cargo build --manifest-path adbc/Cargo.toml --release --features ffi
 ```
 
 The `ffi` build exports both `AdbcDatabricksInit` and the conventional

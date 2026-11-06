@@ -117,8 +117,6 @@ impl Database {
         Ok(Connection::new(
             session,
             runtime,
-            resolved.catalog,
-            resolved.schema,
             resolved.escape_catalog_name,
         ))
     }

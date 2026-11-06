@@ -12,10 +12,10 @@ continues to call the SQL kernel through its native Rust API.
 
 Repository CI must validate all of the following before release:
 
-1. `cargo test -p databricks-adbc --features ffi` passes on the declared MSRV.
+1. `cargo test --manifest-path adbc/Cargo.toml --features ffi` passes on the declared MSRV.
 2. A release `cdylib` dynamically loads through both exported entry points
    using `adbc_driver_manager` and allocates an ADBC database.
-3. `cargo package -p databricks-adbc --list` contains only the manifest's
+3. `cargo package --manifest-path adbc/Cargo.toml --list` contains only the manifest's
    source, tests, examples, documentation, and license files.
 4. Repository license, advisory, and SBOM checks explicitly scan the standalone
    ADBC dependency graph.
