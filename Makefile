@@ -22,7 +22,7 @@ build:
 
 test:
 	cargo test
-	cargo test --manifest-path adbc/Cargo.toml
+	cargo test --manifest-path adbc/Cargo.toml --features ffi
 
 fmt:
 	cargo fmt --all
@@ -34,7 +34,7 @@ fmt-check:
 
 lint:
 	cargo clippy --all-targets -- -D warnings
-	cargo clippy --manifest-path adbc/Cargo.toml --all-targets -- -D warnings
+	cargo clippy --manifest-path adbc/Cargo.toml --all-targets --features ffi -- -D warnings
 
 # Compile the hand-written C smoke tests against the cdylib and run them.
 # Proves the C ABI in `src/ffi/` links and behaves from a real C consumer

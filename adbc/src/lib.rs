@@ -38,11 +38,17 @@ unsafe fn initialize_ffi_driver(
     error: *mut adbc_ffi::FFI_AdbcError,
 ) -> adbc_core::error::AdbcStatusCode {
     let version = adbc_ffi::check_err!(adbc_core::options::AdbcVersion::try_from(version), error);
-    if version != adbc_core::options::AdbcVersion::V110 {
+    if !matches!(
+        version,
+        adbc_core::options::AdbcVersion::V100 | adbc_core::options::AdbcVersion::V110
+    ) {
         let error_value = adbc_core::error::Error::with_message_and_status(
             format!(
-                "Unsupported ADBC version: got={version:?} expected={:?}",
-                adbc_core::options::AdbcVersion::V110
+                "Unsupported ADBC version: got={version:?} expected one of {:?}",
+                [
+                    adbc_core::options::AdbcVersion::V100,
+                    adbc_core::options::AdbcVersion::V110,
+                ]
             ),
             adbc_core::error::Status::NotImplemented,
         );
@@ -58,13 +64,24 @@ unsafe fn initialize_ffi_driver(
     // NOT_IMPLEMENTED fallbacks.
     ffi_driver.ConnectionCancel = None;
     ffi_driver.StatementCancel = None;
+    let size = match version {
+        adbc_core::options::AdbcVersion::V100 => {
+            std::mem::offset_of!(adbc_ffi::FFI_AdbcDriver, ErrorGetDetailCount)
+        }
+        adbc_core::options::AdbcVersion::V110 => std::mem::size_of::<adbc_ffi::FFI_AdbcDriver>(),
+        _ => unreachable!("unsupported versions return before driver initialization"),
+    };
     unsafe {
-        std::ptr::write_unaligned(driver as *mut adbc_ffi::FFI_AdbcDriver, ffi_driver);
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&ffi_driver).cast::<u8>(),
+            driver.cast::<u8>(),
+            size,
+        );
     }
     adbc_core::constants::ADBC_STATUS_OK
 }
 
-/// Initialize the Databricks ADBC 1.1 C driver.
+/// Initialize the Databricks ADBC 1.0 or 1.1 C driver.
 ///
 /// # Safety
 ///
@@ -128,6 +145,26 @@ mod ffi_tests {
             let mut statement = adbc_ffi::FFI_AdbcStatement::default();
             let status = unsafe { statement_cancel(&mut statement, &mut error) };
             assert_eq!(status, adbc_core::constants::ADBC_STATUS_NOT_IMPLEMENTED);
+        }
+    }
+
+    #[test]
+    fn ffi_v100_initialization_writes_only_the_v100_prefix() {
+        const CANARY_SIZE: usize = 32;
+        let prefix_size = std::mem::offset_of!(adbc_ffi::FFI_AdbcDriver, ErrorGetDetailCount);
+        for initialize in [AdbcDatabricksInit, AdbcDriverInit] {
+            let mut storage = vec![0xa5_u8; prefix_size + CANARY_SIZE];
+            let mut error = adbc_ffi::FFI_AdbcError::default();
+            let status = unsafe {
+                initialize(
+                    AdbcVersion::V100.into(),
+                    storage.as_mut_ptr().cast(),
+                    &mut error,
+                )
+            };
+            assert_eq!(status, adbc_core::constants::ADBC_STATUS_OK);
+            assert!(storage[..prefix_size].iter().any(|byte| *byte != 0xa5));
+            assert!(storage[prefix_size..].iter().all(|byte| *byte == 0xa5));
         }
     }
 }

@@ -80,18 +80,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .into());
         }
 
-        let mut driver = ManagedDriver::load_dynamic_from_filename(
-            &library,
-            Some(entrypoint),
-            AdbcVersion::V110,
-        )?;
-        let _database = driver.new_database()?;
-        let result = format!(
-            "{{\"entrypoint\":\"{entrypoint_name}\",\"adbc_version\":\"1.1\",\"driver_manager_version\":\"0.24.0\",\"database_allocated\":true,\"connection_cancel\":\"not_implemented\",\"statement_cancel\":\"not_implemented\"}}"
-        );
-        println!("{result}");
-        evidence.push_str(&result);
-        evidence.push('\n');
+        for (version, version_name) in [(AdbcVersion::V100, "1.0"), (AdbcVersion::V110, "1.1")] {
+            let mut driver =
+                ManagedDriver::load_dynamic_from_filename(&library, Some(entrypoint), version)?;
+            let _database = driver.new_database()?;
+            let result = format!(
+                "{{\"entrypoint\":\"{entrypoint_name}\",\"adbc_version\":\"{version_name}\",\"driver_manager_version\":\"0.24.0\",\"database_allocated\":true}}"
+            );
+            println!("{result}");
+            evidence.push_str(&result);
+            evidence.push('\n');
+        }
     }
 
     if let Some(output) = std::env::args_os().nth(2) {

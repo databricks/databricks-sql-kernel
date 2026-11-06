@@ -312,6 +312,7 @@ impl Iterator for KernelReader {
             }
             Ok(None) => {
                 self.finish();
+                self.close();
                 None
             }
             Err(source) => {
