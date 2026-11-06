@@ -22,6 +22,10 @@ async API (`Session` → `Statement` → `ExecutedStatement` /
 surface) intended for direct Rust use, PyO3 / napi-rs wrappers, and a
 custom C ABI (skeleton today) for ODBC / Go consumers.
 
+The standalone `adbc/` workspace implements ADBC 1.1 directly against that native
+Rust API. Its optional standard ADBC C ABI is an outer compatibility surface;
+the ADBC-to-kernel boundary remains native Rust.
+
 The repo was seeded from `adbc-drivers/databricks` (Rust subtree); the
 v0 surface lives at the crate root and the legacy ADBC layer has been
 removed.
@@ -76,6 +80,7 @@ Session -> Metadata (flat per-method catalog API)
 | `metadata/` | Shared SQL builders + schemas for `Metadata` |
 | `ffi/` | Custom C ABI for ODBC / Go (skeleton) |
 | `telemetry/` | Metrics collection |
+| `adbc/` | Native Rust ADBC driver and optional driver-manager C ABI |
 
 ## Error handling
 

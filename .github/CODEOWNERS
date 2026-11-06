@@ -24,6 +24,9 @@
 /deny.toml                 @databricks/eng-oss-sql-driver
 /about.toml                @databricks/eng-oss-sql-driver
 
+# Native ADBC driver, including its public Rust and C ABI surfaces.
+/adbc/                     @databricks/eng-oss-sql-driver
+
 # PyO3 sub-crate manifests — pip / Python dep changes flow through here.
 /pyo3/Cargo.toml           @databricks/eng-oss-sql-driver
 /pyo3/pyproject.toml       @databricks/eng-oss-sql-driver

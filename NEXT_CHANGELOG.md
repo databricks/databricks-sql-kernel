@@ -11,6 +11,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Added
 
+- A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
+  ABI for driver-manager loading from other languages.
+
 ### Changed
 
 ### Updated

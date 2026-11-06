@@ -24,7 +24,7 @@
 # Modeled on adbc-drivers/databricks's `trigger-integration-tests.yml`
 # (the C# ADBC equivalent). Differences:
 #   - Single language (Rust) — no per-language path-filter fan-out.
-#   - Source paths are kernel-relative: src/**, napi/**, pyo3/**,
+#   - Source paths are kernel-relative: src/**, adbc/**, napi/**, pyo3/**,
 #     Cargo.{toml,lock}, .github/workflows/**.
 #   - Dispatched event-type is `kernel-pr-test`.
 #   - Check-run name is "Kernel Integration Tests" — must match the
@@ -512,10 +512,10 @@ jobs:
           fi
           # Path set mirrors the in-repo rust-e2e.yml's source filter
           # (src/**, tests/**, Cargo.toml, Cargo.lock, workflow files)
-          # plus napi/ and pyo3/ wrappers. `tests/` is included because a
+          # plus adbc/, napi/, and pyo3/ wrappers. `tests/` is included because a
           # test-only change can still break kernel-protocol invariants
           # that integration tests catch.
-          if echo "$CHANGED" | grep -qE "^(src/|tests/|napi/|pyo3/|Cargo\.toml|Cargo\.lock|\.github/workflows/)"; then
+          if echo "$CHANGED" | grep -qE "^(src/|tests/|adbc/|napi/|pyo3/|Cargo\.toml|Cargo\.lock|\.github/workflows/)"; then
             echo "changed=true" >> "$GITHUB_OUTPUT"
             echo "kernel source files changed"
           else

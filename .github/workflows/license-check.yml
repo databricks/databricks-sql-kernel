@@ -30,6 +30,8 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "adbc/Cargo.toml"
+      - "adbc/Cargo.lock"
       - "deny.toml"
       # napi/ is a standalone workspace with its own lockfile; its
       # dependency graph is invisible to a root `cargo deny` run, so
@@ -42,6 +44,8 @@ on:
     paths:
       - "Cargo.toml"
       - "Cargo.lock"
+      - "adbc/Cargo.toml"
+      - "adbc/Cargo.lock"
       - "deny.toml"
       - "napi/Cargo.toml"
       - "napi/Cargo.lock"
@@ -92,9 +96,11 @@ jobs:
         # `licenses` is the load-bearing check; `advisories` flags
         # RustSec security advisories; `bans` and `sources` are
         # empty-permissive in our deny.toml today but the slots are
-        # there for future hardening. The root workspace covers the
-        # kernel + pyo3 (pyo3 is a root workspace member).
+        # there for future hardening. The root workspace covers the kernel.
         run: cargo deny check
+
+      - name: Check licenses, advisories, bans, sources (ADBC workspace)
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/adbc/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check
 
       - name: Check licenses, advisories, bans, sources (napi workspace)
         # napi/ is a separate Cargo workspace (its own Cargo.lock) so
