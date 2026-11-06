@@ -767,11 +767,8 @@ mod tests {
             DataType::Int64,
             false,
         )]));
-        let batch = RecordBatch::try_new(
-            batch_schema,
-            vec![Arc::new(Int64Array::from(vec![1]))],
-        )
-        .unwrap();
+        let batch =
+            RecordBatch::try_new(batch_schema, vec![Arc::new(Int64Array::from(vec![1]))]).unwrap();
 
         let error = normalize_result_batch(&batch, &advertised_schema).unwrap_err();
         assert!(matches!(error, ArrowError::SchemaError(_)));
