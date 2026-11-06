@@ -18,6 +18,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -34,6 +35,20 @@ const DEFAULT_WARMUPS: usize = 2;
 const DEFAULT_SAMPLES: usize = 10;
 const PAYLOAD_BYTES: u64 = 1024;
 const LOGICAL_BYTES_PER_ROW: u64 = PAYLOAD_BYTES + 8;
+
+fn kernel_revision() -> String {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    else {
+        return "unavailable".into();
+    };
+    if !output.status.success() {
+        return "unavailable".into();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
 
 #[derive(Clone)]
 struct LiveConfig {
@@ -409,7 +424,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "http_path": config.http_path,
             "credentials": "token read from DATABRICKS_TOKEN_FILE; value not retained",
             "driver_version": env!("CARGO_PKG_VERSION"),
-            "kernel_version": "1.4.0",
+            "kernel_revision": kernel_revision(),
             "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
             "concurrency": concurrency,
             "size_mib": size_mib,

@@ -18,6 +18,7 @@ use std::env;
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use adbc_core::options::{OptionDatabase, OptionValue};
@@ -29,6 +30,20 @@ use serde_json::{json, Value};
 const DEFAULT_SIZES: &str = "0.25,0.5,1,2,3,4,5,10,25,50,100";
 const PAYLOAD_BYTES: u64 = 1024;
 const LOGICAL_BYTES_PER_ROW: u64 = PAYLOAD_BYTES + 8;
+
+fn kernel_revision() -> String {
+    let Ok(output) = Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .current_dir(env!("CARGO_MANIFEST_DIR"))
+        .output()
+    else {
+        return "unavailable".into();
+    };
+    if !output.status.success() {
+        return "unavailable".into();
+    }
+    String::from_utf8_lossy(&output.stdout).trim().to_owned()
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Implementation {
@@ -488,7 +503,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let report = json!({"schema_version": 1, "metadata": {
         "started_at_unix_ms": started_at_unix_ms, "host": config.host, "http_path": config.http_path,
         "credentials": "token read from DATABRICKS_TOKEN_FILE; value not retained",
-        "driver_version": env!("CARGO_PKG_VERSION"), "kernel_version": "1.4.0",
+        "driver_version": env!("CARGO_PKG_VERSION"),
+        "kernel_revision": kernel_revision(),
         "build_profile": if cfg!(debug_assertions) { "debug" } else { "release" },
         "client_os": env::consts::OS, "client_arch": env::consts::ARCH,
         "logical_bytes_per_row": LOGICAL_BYTES_PER_ROW, "sizes_mib": sizes,

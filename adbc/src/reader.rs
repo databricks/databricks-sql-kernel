@@ -301,7 +301,14 @@ impl Iterator for KernelReader {
         }
         match self.runtime.block_on_safe(self.executed.next_batch()) {
             Ok(Some(kernel::ResultBatch::Arrow(batch))) => {
-                Some(normalize_result_batch(batch, &self.schema))
+                match normalize_result_batch(batch, &self.schema) {
+                    Ok(batch) => Some(Ok(batch)),
+                    Err(error) => {
+                        self.finish();
+                        self.close();
+                        Some(Err(error))
+                    }
+                }
             }
             Ok(Some(_)) => {
                 self.finish();
@@ -401,7 +408,14 @@ impl Iterator for AsyncKernelReader {
         }
         match self.runtime.block_on_safe(self.stream.next_batch()) {
             Ok(Some(kernel::ResultBatch::Arrow(batch))) => {
-                Some(normalize_result_batch(batch, &self.schema))
+                match normalize_result_batch(batch, &self.schema) {
+                    Ok(batch) => Some(Ok(batch)),
+                    Err(error) => {
+                        self.finish();
+                        self.close();
+                        Some(Err(error))
+                    }
+                }
             }
             Ok(Some(_)) => {
                 self.finish();
@@ -535,7 +549,10 @@ impl Iterator for SequenceReader {
             if let Some(executed) = &mut self.current {
                 match self.runtime.block_on_safe(executed.next_batch()) {
                     Ok(Some(kernel::ResultBatch::Arrow(batch))) => {
-                        return Some(normalize_result_batch(batch, &self.schema));
+                        return match normalize_result_batch(batch, &self.schema) {
+                            Ok(batch) => Some(Ok(batch)),
+                            Err(error) => self.fail(error),
+                        };
                     }
                     Ok(Some(_)) => {
                         return self.fail(ArrowError::NotYetImplemented(
@@ -736,6 +753,28 @@ mod tests {
             &schema,
             &normalize_result_schema(Arc::clone(&schema))
         ));
+    }
+
+    #[test]
+    fn result_batch_with_unexpected_schema_is_rejected() {
+        let advertised_schema = Arc::new(Schema::new(vec![Field::new(
+            "value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            "different_value",
+            DataType::Int64,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            batch_schema,
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .unwrap();
+
+        let error = normalize_result_batch(&batch, &advertised_schema).unwrap_err();
+        assert!(matches!(error, ArrowError::SchemaError(_)));
     }
 
     #[test]
