@@ -25,6 +25,21 @@ use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 use crate::Connection;
 
 const DRIVER_NAME: &str = "Databricks ADBC Driver for Rust";
+const DRIVER_USER_AGENT_NAME: &str = "RustADBCDatabricksDriver";
+
+fn driver_user_agent() -> String {
+    format!(
+        "{DRIVER_USER_AGENT_NAME}/{} REST",
+        env!("CARGO_PKG_VERSION")
+    )
+}
+
+fn set_driver_user_agent(http: &mut kernel::HttpConfig) {
+    http.custom_headers
+        .retain(|(name, _)| !name.eq_ignore_ascii_case("user-agent"));
+    http.custom_headers
+        .push(("User-Agent".into(), driver_user_agent()));
+}
 
 fn driver_system_configuration() -> kernel::DriverSystemConfiguration {
     kernel::DriverSystemConfiguration {
@@ -82,7 +97,8 @@ impl Database {
     }
 
     fn open(&self) -> Result<Connection> {
-        let resolved = self.config.resolve()?;
+        let mut resolved = self.config.resolve()?;
+        set_driver_user_agent(&mut resolved.http);
         let mut builder = kernel::Session::builder()
             .auth(resolved.auth)
             .http(resolved.http)
@@ -245,6 +261,31 @@ mod tests {
         assert_eq!(
             identity.driver_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
+        );
+    }
+
+    #[test]
+    fn kernel_receives_rust_adbc_user_agent() {
+        let mut http = kernel::HttpConfig::default();
+        http.custom_headers = vec![
+            ("x-test-header".into(), "test-value".into()),
+            ("user-agent".into(), "caller-agent".into()),
+        ];
+
+        set_driver_user_agent(&mut http);
+
+        assert_eq!(
+            http.custom_headers,
+            vec![
+                ("x-test-header".into(), "test-value".into()),
+                (
+                    "User-Agent".into(),
+                    format!(
+                        "{DRIVER_USER_AGENT_NAME}/{} REST",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                ),
+            ]
         );
     }
 
