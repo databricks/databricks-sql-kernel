@@ -28,10 +28,7 @@ const DRIVER_NAME: &str = "Databricks ADBC Driver for Rust";
 const DRIVER_USER_AGENT_NAME: &str = "RustADBCDatabricksDriver";
 
 fn driver_user_agent() -> String {
-    format!(
-        "{DRIVER_USER_AGENT_NAME}/{} REST",
-        env!("CARGO_PKG_VERSION")
-    )
+    format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"))
 }
 
 fn set_driver_user_agent(http: &mut kernel::HttpConfig) {
@@ -280,10 +277,7 @@ mod tests {
                 ("x-test-header".into(), "test-value".into()),
                 (
                     "User-Agent".into(),
-                    format!(
-                        "{DRIVER_USER_AGENT_NAME}/{} REST",
-                        env!("CARGO_PKG_VERSION")
-                    ),
+                    format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION")),
                 ),
             ]
         );

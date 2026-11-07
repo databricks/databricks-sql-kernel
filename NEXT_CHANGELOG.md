@@ -16,7 +16,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version> REST`.
+- Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`.
 
 ### Updated
 
