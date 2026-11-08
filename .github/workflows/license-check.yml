@@ -38,6 +38,8 @@ on:
       # changes there must re-trigger this workflow to scan it.
       - "napi/Cargo.toml"
       - "napi/Cargo.lock"
+      - "pyo3/Cargo.toml"
+      - "pyo3/Cargo.lock"
       - ".github/workflows/license-check.yml"
   pull_request:
     branches: [main]
@@ -49,6 +51,8 @@ on:
       - "deny.toml"
       - "napi/Cargo.toml"
       - "napi/Cargo.lock"
+      - "pyo3/Cargo.toml"
+      - "pyo3/Cargo.lock"
       - ".github/workflows/license-check.yml"
 
 concurrency:
@@ -116,3 +120,6 @@ jobs:
         # (a relative `--config` would otherwise resolve against the
         # manifest dir and look for napi/deny.toml).
         run: cargo deny --manifest-path "$GITHUB_WORKSPACE/napi/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check
+
+      - name: Check licenses, advisories, bans, sources (PyO3 workspace)
+        run: cargo deny --manifest-path "$GITHUB_WORKSPACE/pyo3/Cargo.toml" --config "$GITHUB_WORKSPACE/deny.toml" check
