@@ -16,6 +16,8 @@ name: Trigger Rust ADBC Integration Tests
 
 # The native kernel gate dispatches separately. Only changes to the Rust ADBC
 # driver (or this workflow) request the full live ADBC suite in driver-test.
+# Advisory check; do not require it on ordinary, unlabeled PRs.
+# Enable RUST_ADBC_INTEGRATION_TESTS_ENABLED after driver-test#1957 lands.
 on:
   pull_request:
     types: [labeled]
@@ -26,7 +28,8 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}-${{ github.event.label.name || github.event_name }}
-  cancel-in-progress: true
+  # Finish the dispatch before a later run can reuse its pending check.
+  cancel-in-progress: false
 
 jobs:
   dispatch:
@@ -57,7 +60,7 @@ jobs:
             }
 
       - name: Checkout changed revision
-        if: vars.INTEGRATION_TESTS_ENABLED == 'true'
+        if: vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.target.outputs.head_sha }}
@@ -66,7 +69,7 @@ jobs:
 
       - name: Detect Rust ADBC changes
         id: changed
-        if: vars.INTEGRATION_TESTS_ENABLED == 'true'
+        if: vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.target.outputs.base_sha }}
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
@@ -99,11 +102,26 @@ jobs:
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
-          TESTS_ENABLED: ${{ vars.INTEGRATION_TESTS_ENABLED }}
+          TESTS_ENABLED: ${{ vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED }}
           ADBC_CHANGED: ${{ steps.changed.outputs.changed }}
+          APP_ID: ${{ secrets.INTEGRATION_TEST_APP_ID }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              ...context.repo,
+              ref: process.env.HEAD_SHA,
+              check_name: 'Rust ADBC Integration Tests',
+              per_page: 100
+            });
+            const pending = checks.find(check =>
+              check.app?.id === Number(process.env.APP_ID) && check.status !== 'completed'
+            );
+            if (pending) {
+              core.info(`Rust ADBC check ${pending.id} is already pending for this commit.`);
+              core.setOutput('dispatch', 'false');
+              return pending.id;
+            }
             const enabled = process.env.TESTS_ENABLED === 'true';
             const runTests = enabled && process.env.ADBC_CHANGED === 'true';
             const timestamp = new Date().toISOString();
@@ -118,7 +136,7 @@ jobs:
                 title: 'Rust ADBC integration tests skipped',
                 summary: enabled
                   ? 'No Rust ADBC driver or trigger workflow changes.'
-                  : 'INTEGRATION_TESTS_ENABLED is not true.'
+                  : 'RUST_ADBC_INTEGRATION_TESTS_ENABLED is not true.'
               }
             };
             const { data: check } = await github.rest.checks.create({
@@ -128,11 +146,12 @@ jobs:
               ...state,
               details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
+            core.setOutput('dispatch', String(runTests));
             return check.id;
 
       - name: Build Rust ADBC payload
         id: payload
-        if: steps.changed.outputs.changed == 'true'
+        if: steps.check.outputs.dispatch == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
@@ -148,7 +167,7 @@ jobs:
 
       - name: Dispatch Rust ADBC tests
         id: dispatch
-        if: steps.changed.outputs.changed == 'true'
+        if: steps.check.outputs.dispatch == 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
           token: ${{ steps.app-token.outputs.token }}
@@ -157,7 +176,7 @@ jobs:
           client-payload: ${{ steps.payload.outputs.json }}
 
       - name: Report incomplete dispatch
-        if: (failure() || cancelled()) && steps.check.outputs.result != '' && steps.changed.outputs.changed == 'true' && steps.dispatch.outcome != 'success'
+        if: (failure() || cancelled()) && steps.check.outputs.dispatch == 'true' && steps.check.outputs.result != '' && steps.dispatch.outcome != 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           CHECK_RUN_ID: ${{ steps.check.outputs.result }}
