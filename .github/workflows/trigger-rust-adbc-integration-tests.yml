@@ -244,11 +244,12 @@ jobs:
               }
             });
 
-      - name: Report setup failure
-        if: failure() && steps.check.outputs.result == '' && steps.app-token.outcome == 'success'
+      - name: Report incomplete setup
+        if: (failure() || cancelled()) && steps.check.outputs.result == '' && steps.app-token.outcome == 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           HEAD_SHA: ${{ steps.target.outputs.head_sha || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          CONCLUSION: ${{ job.status == 'cancelled' && 'cancelled' || 'failure' }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -257,12 +258,12 @@ jobs:
               name: 'Rust ADBC Integration Tests',
               head_sha: process.env.HEAD_SHA,
               status: 'completed',
-              conclusion: 'failure',
+              conclusion: process.env.CONCLUSION,
               completed_at: new Date().toISOString(),
               details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
               output: {
-                title: 'Rust ADBC dispatch setup failed',
-                summary: 'Could not prepare Rust ADBC integration tests. Check the sender workflow logs.'
+                title: 'Rust ADBC dispatch setup incomplete',
+                summary: `Rust ADBC dispatch setup ${process.env.CONCLUSION}. Check the sender workflow logs.`
               }
             });
 
@@ -293,12 +294,25 @@ jobs:
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
-            const prs = await github.paginate(github.rest.pulls.list, {
-              ...context.repo, state: 'open', per_page: 100
-            });
-            const { data: refs } = await github.rest.git.listMatchingRefs({
-              ...context.repo, ref: 'heads/gh-readonly-queue/'
-            });
+            let failures = 0;
+            let prs = [];
+            let refs = [];
+            try {
+              prs = await github.paginate(github.rest.pulls.list, {
+                ...context.repo, state: 'open', per_page: 100
+              });
+            } catch (error) {
+              core.warning(`Could not list PR revisions: ${error.message}`);
+              failures++;
+            }
+            try {
+              ({ data: refs } = await github.rest.git.listMatchingRefs({
+                ...context.repo, ref: 'heads/gh-readonly-queue/'
+              }));
+            } catch (error) {
+              core.warning(`Could not list merge-queue revisions: ${error.message}`);
+              failures++;
+            }
             const fullName = `${context.repo.owner}/${context.repo.repo}`;
             const revisions = new Set([
               ...prs.filter(pr => pr.head.repo?.full_name === fullName).map(pr => pr.head.sha),
@@ -313,22 +327,29 @@ jobs:
                   filter: 'all', status: 'in_progress', per_page: 100
                 });
               } catch (error) {
-                if (error.status === 404) continue;
-                throw error;
+                core.warning(`Could not inspect Rust ADBC checks at ${ref}: ${error.message}`);
+                if (error.status !== 404 && error.status !== 422) failures++;
+                continue;
               }
               for (const check of checks) {
                 const started = Date.parse(check.started_at || check.created_at || '');
                 if (check.app?.id !== Number(process.env.APP_ID) || started > expiresBefore) continue;
-                await github.rest.checks.update({
-                  ...context.repo,
-                  check_run_id: check.id,
-                  status: 'completed',
-                  conclusion: 'cancelled',
-                  completed_at: new Date().toISOString(),
-                  output: {
-                    title: 'Rust ADBC check timed out',
-                    summary: `No result within ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours. Re-add integration-test to retry.`
-                  }
-                });
+                try {
+                  await github.rest.checks.update({
+                    ...context.repo,
+                    check_run_id: check.id,
+                    status: 'completed',
+                    conclusion: 'cancelled',
+                    completed_at: new Date().toISOString(),
+                    output: {
+                      title: 'Rust ADBC check timed out',
+                      summary: `No result within ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours. Re-add integration-test to retry.`
+                    }
+                  });
+                } catch (error) {
+                  core.warning(`Could not expire Rust ADBC check ${check.id}: ${error.message}`);
+                  failures++;
+                }
               }
             }
+            if (failures) core.setFailed(`Rust ADBC maintenance had ${failures} API failures; see warnings.`);
