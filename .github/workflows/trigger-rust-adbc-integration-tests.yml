@@ -14,8 +14,8 @@
 
 name: Trigger Rust ADBC Integration Tests
 
-# The native kernel gate dispatches separately. Only changes to the Rust ADBC
-# driver (or this workflow) request the full live ADBC suite in driver-test.
+# Kernel-only changes intentionally skip this suite, matching Python/Node/Go.
+# Full nightly ADBC coverage catches regressions from shared kernel changes.
 # Advisory check; do not require it on ordinary, unlabeled PRs.
 # Enable RUST_ADBC_INTEGRATION_TESTS_ENABLED after driver-test#1957 lands.
 on:
