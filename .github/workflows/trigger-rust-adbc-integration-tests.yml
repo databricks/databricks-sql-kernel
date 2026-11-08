@@ -35,7 +35,8 @@ jobs:
   dispatch:
     if: |
       github.event_name == 'merge_group' ||
-      (github.event_name == 'pull_request' && github.event.label.name == 'integration-test')
+      (github.event_name == 'pull_request' && github.event.label.name == 'integration-test' &&
+       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -114,13 +115,33 @@ jobs:
               check_name: 'Rust ADBC Integration Tests',
               per_page: 100
             });
-            const pending = checks.find(check =>
+            const pending = checks.filter(check =>
               check.app?.id === Number(process.env.APP_ID) && check.status !== 'completed'
             );
-            if (pending) {
-              core.info(`Rust ADBC check ${pending.id} is already pending for this commit.`);
+            // Allow 120 minutes of tests plus an hour for queueing and reporting.
+            const expiresBefore = Date.now() - 3 * 60 * 60 * 1000;
+            const expired = check => {
+              const started = Date.parse(check.started_at || check.created_at || '');
+              return !Number.isFinite(started) || started <= expiresBefore;
+            };
+            for (const check of pending.filter(expired)) {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: check.id,
+                status: 'completed',
+                conclusion: 'cancelled',
+                completed_at: new Date().toISOString(),
+                output: {
+                  title: 'Previous Rust ADBC run expired',
+                  summary: 'Superseded by a new request after three hours.'
+                }
+              });
+            }
+            const active = pending.find(check => !expired(check));
+            if (active) {
+              core.info(`Rust ADBC check ${active.id} is already pending for this commit.`);
               core.setOutput('dispatch', 'false');
-              return pending.id;
+              return active.id;
             }
             const enabled = process.env.TESTS_ENABLED === 'true';
             const runTests = enabled && process.env.ADBC_CHANGED === 'true';
