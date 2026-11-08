@@ -25,15 +25,14 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}-${{ github.event.label.name || github.event_name }}
   cancel-in-progress: true
 
 jobs:
   dispatch:
     if: |
-      vars.INTEGRATION_TESTS_ENABLED == 'true' &&
-      (github.event_name == 'merge_group' ||
-       (github.event_name == 'pull_request' && github.event.label.name == 'integration-test'))
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'integration-test')
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
@@ -58,6 +57,7 @@ jobs:
             }
 
       - name: Checkout changed revision
+        if: vars.INTEGRATION_TESTS_ENABLED == 'true'
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           ref: ${{ steps.target.outputs.head_sha }}
@@ -66,12 +66,13 @@ jobs:
 
       - name: Detect Rust ADBC changes
         id: changed
+        if: vars.INTEGRATION_TESTS_ENABLED == 'true'
         env:
           BASE_SHA: ${{ steps.target.outputs.base_sha }}
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
         run: |
           set -euo pipefail
-          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+          if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
             adbc/ .github/workflows/trigger-rust-adbc-integration-tests.yml; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else
@@ -82,7 +83,6 @@ jobs:
 
       - name: Generate integration App token
         id: app-token
-        if: steps.changed.outputs.changed == 'true'
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         with:
           app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
@@ -96,19 +96,36 @@ jobs:
 
       - name: Create Rust ADBC check
         id: check
-        if: steps.changed.outputs.changed == 'true'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+          TESTS_ENABLED: ${{ vars.INTEGRATION_TESTS_ENABLED }}
+          ADBC_CHANGED: ${{ steps.changed.outputs.changed }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
+            const enabled = process.env.TESTS_ENABLED === 'true';
+            const runTests = enabled && process.env.ADBC_CHANGED === 'true';
+            const timestamp = new Date().toISOString();
+            const state = runTests ? {
+              status: 'in_progress',
+              started_at: timestamp
+            } : {
+              status: 'completed',
+              conclusion: 'skipped',
+              completed_at: timestamp,
+              output: {
+                title: 'Rust ADBC integration tests skipped',
+                summary: enabled
+                  ? 'No Rust ADBC driver or trigger workflow changes.'
+                  : 'INTEGRATION_TESTS_ENABLED is not true.'
+              }
+            };
             const { data: check } = await github.rest.checks.create({
               ...context.repo,
               name: 'Rust ADBC Integration Tests',
               head_sha: process.env.HEAD_SHA,
-              status: 'in_progress',
-              started_at: new Date().toISOString(),
+              ...state,
               details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
             });
             return check.id;
@@ -130,6 +147,7 @@ jobs:
             }));
 
       - name: Dispatch Rust ADBC tests
+        id: dispatch
         if: steps.changed.outputs.changed == 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
@@ -138,11 +156,12 @@ jobs:
           event-type: rust-adbc-pr-test
           client-payload: ${{ steps.payload.outputs.json }}
 
-      - name: Report dispatch failure
-        if: failure() && steps.check.outputs.result != ''
+      - name: Report incomplete dispatch
+        if: (failure() || cancelled()) && steps.check.outputs.result != '' && steps.changed.outputs.changed == 'true' && steps.dispatch.outcome != 'success'
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         env:
           CHECK_RUN_ID: ${{ steps.check.outputs.result }}
+          CONCLUSION: ${{ job.status == 'cancelled' && 'cancelled' || 'failure' }}
         with:
           github-token: ${{ steps.app-token.outputs.token }}
           script: |
@@ -150,10 +169,10 @@ jobs:
               ...context.repo,
               check_run_id: Number(process.env.CHECK_RUN_ID),
               status: 'completed',
-              conclusion: 'failure',
+              conclusion: process.env.CONCLUSION,
               completed_at: new Date().toISOString(),
               output: {
-                title: 'Rust ADBC dispatch failed',
-                summary: 'Could not dispatch Rust ADBC integration tests. Check the sender workflow logs.'
+                title: 'Rust ADBC dispatch incomplete',
+                summary: `Rust ADBC integration dispatch ${process.env.CONCLUSION}. Check the sender workflow logs.`
               }
             });
