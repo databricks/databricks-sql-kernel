@@ -1,0 +1,159 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Trigger Rust ADBC Integration Tests
+
+# The native kernel gate dispatches separately. Only changes to the Rust ADBC
+# driver (or this workflow) request the full live ADBC suite in driver-test.
+on:
+  pull_request:
+    types: [labeled]
+  merge_group:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    if: |
+      vars.INTEGRATION_TESTS_ENABLED == 'true' &&
+      (github.event_name == 'merge_group' ||
+       (github.event_name == 'pull_request' && github.event.label.name == 'integration-test'))
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    steps:
+      - name: Resolve test target
+        id: target
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              core.setOutput('base_sha', pr.base.sha);
+              core.setOutput('head_sha', pr.head.sha);
+              core.setOutput('pr_number', pr.number);
+            } else {
+              const group = context.payload.merge_group;
+              const match = /^refs\/heads\/gh-readonly-queue\/.+\/pr-(\d+)-[0-9a-f]+$/.exec(group.head_ref);
+              if (!match) throw new Error(`Unexpected merge-group ref: ${group.head_ref}`);
+              core.setOutput('base_sha', group.base_sha);
+              core.setOutput('head_sha', group.head_sha);
+              core.setOutput('pr_number', match[1]);
+            }
+
+      - name: Checkout changed revision
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.target.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect Rust ADBC changes
+        id: changed
+        env:
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$BASE_SHA" "$HEAD_SHA" -- \
+            adbc/ .github/workflows/trigger-rust-adbc-integration-tests.yml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            diff_status=$?
+            if [ "$diff_status" -ne 1 ]; then exit "$diff_status"; fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Generate integration App token
+        id: app-token
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: |
+            databricks-sql-kernel
+            databricks-driver-test
+          permission-contents: write
+          permission-checks: write
+
+      - name: Create Rust ADBC check
+        id: check
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const { data: check } = await github.rest.checks.create({
+              ...context.repo,
+              name: 'Rust ADBC Integration Tests',
+              head_sha: process.env.HEAD_SHA,
+              status: 'in_progress',
+              started_at: new Date().toISOString(),
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+            return check.id;
+
+      - name: Build Rust ADBC payload
+        id: payload
+        if: steps.changed.outputs.changed == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          CHECK_RUN_ID: ${{ steps.check.outputs.result }}
+        with:
+          script: |
+            core.setOutput('json', JSON.stringify({
+              commit_sha: process.env.HEAD_SHA,
+              pr_number: process.env.PR_NUMBER,
+              check_run_id: process.env.CHECK_RUN_ID
+            }));
+
+      - name: Dispatch Rust ADBC tests
+        if: steps.changed.outputs.changed == 'true'
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        with:
+          token: ${{ steps.app-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: rust-adbc-pr-test
+          client-payload: ${{ steps.payload.outputs.json }}
+
+      - name: Report dispatch failure
+        if: failure() && steps.check.outputs.result != ''
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CHECK_RUN_ID: ${{ steps.check.outputs.result }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: Number(process.env.CHECK_RUN_ID),
+              status: 'completed',
+              conclusion: 'failure',
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Rust ADBC dispatch failed',
+                summary: 'Could not dispatch Rust ADBC integration tests. Check the sender workflow logs.'
+              }
+            });
