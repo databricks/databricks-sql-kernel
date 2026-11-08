@@ -45,18 +45,16 @@ jobs:
     runs-on:
       group: databricks-protected-runner-group
       labels: linux-ubuntu-latest
+    timeout-minutes: 10
     steps:
-      - name: Generate integration App token
+      - name: Generate kernel checks App token
         id: app-token
         uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
         with:
           app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
           private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
           owner: databricks
-          repositories: |
-            databricks-sql-kernel
-            databricks-driver-test
-          permission-contents: write
+          repositories: databricks-sql-kernel
           permission-checks: write
 
       - name: Resolve test target
@@ -119,6 +117,7 @@ jobs:
               ...context.repo,
               ref: process.env.HEAD_SHA,
               check_name: 'Rust ADBC Integration Tests',
+              filter: 'all',
               per_page: 100
             });
             const pending = checks.filter(check =>
@@ -203,12 +202,23 @@ jobs:
             if (process.env.MERGE_GROUP_REF) payload.merge_group_ref = process.env.MERGE_GROUP_REF;
             core.setOutput('json', JSON.stringify(payload));
 
+      - name: Generate driver-test dispatch token
+        id: dispatch-token
+        if: steps.check.outputs.dispatch == 'true'
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+          permission-contents: write
+
       - name: Dispatch Rust ADBC tests
         id: dispatch
         if: steps.check.outputs.dispatch == 'true'
         uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
         with:
-          token: ${{ steps.app-token.outputs.token }}
+          token: ${{ steps.dispatch-token.outputs.token }}
           repository: databricks/databricks-driver-test
           event-type: rust-adbc-pr-test
           client-payload: ${{ steps.payload.outputs.json }}
@@ -257,6 +267,7 @@ jobs:
             });
 
   expire-stalled-checks:
+    # Keep maintenance active when dispatch is disabled so existing checks expire.
     if: github.event_name == 'schedule'
     runs-on:
       group: databricks-protected-runner-group
