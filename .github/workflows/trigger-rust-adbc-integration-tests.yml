@@ -22,9 +22,14 @@ on:
   pull_request:
     types: [labeled]
   merge_group:
+  schedule:
+    - cron: '17 * * * *'
 
 permissions:
   contents: read
+
+env:
+  RUST_ADBC_CHECK_TIMEOUT_HOURS: "3"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}-${{ github.event.label.name || github.event_name }}
@@ -66,11 +71,9 @@ jobs:
               core.setOutput('pr_number', pr.number);
             } else {
               const group = context.payload.merge_group;
-              const match = /^refs\/heads\/gh-readonly-queue\/.+\/pr-(\d+)-[0-9a-f]+$/.exec(group.head_ref);
-              if (!match) throw new Error(`Unexpected merge-group ref: ${group.head_ref}`);
               core.setOutput('base_sha', group.base_sha);
               core.setOutput('head_sha', group.head_sha);
-              core.setOutput('pr_number', match[1]);
+              core.setOutput('merge_group_ref', group.head_ref);
             }
 
       - name: Checkout changed revision
@@ -122,11 +125,12 @@ jobs:
               check.app?.id === Number(process.env.APP_ID) && check.status !== 'completed'
             );
             // Allow 120 minutes of tests plus an hour for queueing and reporting.
-            const expiresBefore = Date.now() - 3 * 60 * 60 * 1000;
+            const expiresBefore = Date.now() - Number(process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS) * 60 * 60 * 1000;
             const expired = check => {
               const started = Date.parse(check.started_at || check.created_at || '');
               return !Number.isFinite(started) || started <= expiresBefore;
             };
+            // The companion receiver preserves cancelled checks and cancels older PR runs.
             for (const check of pending.filter(check => retry || expired(check))) {
               await github.rest.checks.update({
                 ...context.repo,
@@ -138,7 +142,7 @@ jobs:
                   title: 'Previous Rust ADBC run superseded',
                   summary: retry
                     ? 'A maintainer requested a fresh Rust ADBC run.'
-                    : 'Pending check expired after three hours.'
+                    : `Pending check expired after ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours.`
                 }
               });
             }
@@ -187,14 +191,17 @@ jobs:
         env:
           HEAD_SHA: ${{ steps.target.outputs.head_sha }}
           PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          MERGE_GROUP_REF: ${{ steps.target.outputs.merge_group_ref }}
           CHECK_RUN_ID: ${{ steps.check.outputs.result }}
         with:
           script: |
-            core.setOutput('json', JSON.stringify({
+            const payload = {
               commit_sha: process.env.HEAD_SHA,
-              pr_number: process.env.PR_NUMBER,
               check_run_id: process.env.CHECK_RUN_ID
-            }));
+            };
+            if (process.env.PR_NUMBER) payload.pr_number = process.env.PR_NUMBER;
+            if (process.env.MERGE_GROUP_REF) payload.merge_group_ref = process.env.MERGE_GROUP_REF;
+            core.setOutput('json', JSON.stringify(payload));
 
       - name: Dispatch Rust ADBC tests
         id: dispatch
@@ -248,3 +255,69 @@ jobs:
                 summary: 'Could not prepare Rust ADBC integration tests. Check the sender workflow logs.'
               }
             });
+
+  expire-stalled-checks:
+    if: github.event_name == 'schedule'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate check maintenance App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-sql-kernel
+          permission-contents: read
+          permission-pull-requests: read
+          permission-checks: write
+
+      - name: Cancel expired Rust ADBC checks on active revisions
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          APP_ID: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const prs = await github.paginate(github.rest.pulls.list, {
+              ...context.repo, state: 'open', per_page: 100
+            });
+            const { data: refs } = await github.rest.git.listMatchingRefs({
+              ...context.repo, ref: 'heads/gh-readonly-queue/'
+            });
+            const fullName = `${context.repo.owner}/${context.repo.repo}`;
+            const revisions = new Set([
+              ...prs.filter(pr => pr.head.repo?.full_name === fullName).map(pr => pr.head.sha),
+              ...refs.map(ref => ref.object.sha)
+            ]);
+            const expiresBefore = Date.now() - Number(process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS) * 60 * 60 * 1000;
+            for (const ref of revisions) {
+              let checks;
+              try {
+                checks = await github.paginate(github.rest.checks.listForRef, {
+                  ...context.repo, ref, check_name: 'Rust ADBC Integration Tests',
+                  filter: 'all', status: 'in_progress', per_page: 100
+                });
+              } catch (error) {
+                if (error.status === 404) continue;
+                throw error;
+              }
+              for (const check of checks) {
+                const started = Date.parse(check.started_at || check.created_at || '');
+                if (check.app?.id !== Number(process.env.APP_ID) || started > expiresBefore) continue;
+                await github.rest.checks.update({
+                  ...context.repo,
+                  check_run_id: check.id,
+                  status: 'completed',
+                  conclusion: 'cancelled',
+                  completed_at: new Date().toISOString(),
+                  output: {
+                    title: 'Rust ADBC check timed out',
+                    summary: `No result within ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours. Re-add integration-test to retry.`
+                  }
+                });
+              }
+            }
