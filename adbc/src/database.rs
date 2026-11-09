@@ -25,6 +25,20 @@ use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 use crate::Connection;
 
 const DRIVER_NAME: &str = "Databricks ADBC Driver for Rust";
+const DRIVER_USER_AGENT_NAME: &str = "RustADBCDatabricksDriver";
+
+fn driver_user_agent(entry: Option<&str>) -> String {
+    let base = format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"));
+    match entry.map(str::trim).filter(|entry| !entry.is_empty()) {
+        Some(entry) => format!("{base} ({entry})"),
+        None => base,
+    }
+}
+
+fn set_driver_user_agent(http: &mut kernel::HttpConfig, entry: Option<&str>) {
+    http.custom_headers
+        .push(("User-Agent".into(), driver_user_agent(entry)));
+}
 
 fn driver_system_configuration() -> kernel::DriverSystemConfiguration {
     kernel::DriverSystemConfiguration {
@@ -82,7 +96,8 @@ impl Database {
     }
 
     fn open(&self) -> Result<Connection> {
-        let resolved = self.config.resolve()?;
+        let mut resolved = self.config.resolve()?;
+        set_driver_user_agent(&mut resolved.http, resolved.user_agent_entry.as_deref());
         let mut builder = kernel::Session::builder()
             .auth(resolved.auth)
             .http(resolved.http)
@@ -174,9 +189,13 @@ impl adbc_core::Database for Database {
 
 #[cfg(test)]
 mod tests {
-    use adbc_core::{Database as _, Driver as _};
+    use std::sync::mpsc;
 
-    use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH};
+    use adbc_core::{Database as _, Driver as _};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH, USER_AGENT_ENTRY};
     use crate::Driver;
 
     use super::*;
@@ -191,6 +210,10 @@ mod tests {
                     "/sql/1.0/warehouses/abc".into(),
                 ),
                 (OptionDatabase::Other(ACCESS_TOKEN.into()), "secret".into()),
+                (
+                    OptionDatabase::Other(USER_AGENT_ENTRY.into()),
+                    "partner+product".into(),
+                ),
             ])
             .unwrap();
         assert_eq!(
@@ -202,6 +225,12 @@ mod tests {
                 .get_option_string(OptionDatabase::Other(ESCAPE_CATALOG_NAME.into()))
                 .unwrap(),
             "true"
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(USER_AGENT_ENTRY.into()))
+                .unwrap(),
+            "partner+product"
         );
 
         let mut database = database;
@@ -246,6 +275,86 @@ mod tests {
             identity.driver_version.as_deref(),
             Some(env!("CARGO_PKG_VERSION"))
         );
+    }
+
+    #[test]
+    fn kernel_receives_rust_adbc_user_agent() {
+        assert_eq!(
+            driver_user_agent(None),
+            format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(driver_user_agent(Some("  ")), driver_user_agent(None));
+
+        let mut http = kernel::HttpConfig::default();
+        http.custom_headers = vec![("x-test-header".into(), "test-value".into())];
+
+        set_driver_user_agent(&mut http, Some("partner+product"));
+
+        assert_eq!(
+            http.custom_headers,
+            vec![
+                ("x-test-header".into(), "test-value".into()),
+                (
+                    "User-Agent".into(),
+                    format!(
+                        "{DRIVER_USER_AGENT_NAME}/{} (partner+product)",
+                        env!("CARGO_PKG_VERSION")
+                    ),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn rust_adbc_user_agent_reaches_session_request() {
+        let expected_user_agent = format!(
+            "{DRIVER_USER_AGENT_NAME}/{} (partner+product)",
+            env!("CARGO_PKG_VERSION")
+        );
+        let (uri_sender, uri_receiver) = mpsc::sync_channel(1);
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        let server_thread = std::thread::spawn({
+            let expected_user_agent = expected_user_agent.clone();
+            move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        let server = MockServer::start().await;
+                        Mock::given(method("POST"))
+                            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+                            .and(header("user-agent", expected_user_agent.as_str()))
+                            .respond_with(ResponseTemplate::new(200).set_body_string(
+                                r#"{"session_id":"sess-user-agent","warehouse_id":"test_wh"}"#,
+                            ))
+                            .expect(1)
+                            .mount(&server)
+                            .await;
+                        uri_sender.send(server.uri()).unwrap();
+                        tokio::task::spawn_blocking(move || stop_receiver.recv().unwrap())
+                            .await
+                            .unwrap();
+                    });
+            }
+        });
+
+        let database = Driver
+            .new_database_with_opts([
+                (OptionDatabase::Uri, uri_receiver.recv().unwrap().into()),
+                (
+                    OptionDatabase::Other(HTTP_PATH.into()),
+                    "/sql/1.0/warehouses/test_wh".into(),
+                ),
+                (OptionDatabase::Other(ACCESS_TOKEN.into()), "secret".into()),
+                (
+                    OptionDatabase::Other(USER_AGENT_ENTRY.into()),
+                    "partner+product".into(),
+                ),
+            ])
+            .unwrap();
+        let connection = database.new_connection().unwrap();
+        drop(connection);
+        stop_sender.send(()).unwrap();
+        server_thread.join().unwrap();
     }
 
     #[test]

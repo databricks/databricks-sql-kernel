@@ -16,6 +16,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
+  with an optional partner entry from `adbc.databricks.user_agent_entry`
+  (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
+  `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+
 ### Updated
 
 ### Fixed
