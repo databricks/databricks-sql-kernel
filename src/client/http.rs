@@ -24,7 +24,8 @@
 
 use crate::auth::AuthProvider;
 use crate::client::retry::{
-    calculate_backoff, RequestCategory, RequestType, RetryConfig, RetryStrategy,
+    calculate_backoff, is_permanent_connection_error, RequestCategory, RequestType, RetryConfig,
+    RetryStrategy,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -1020,8 +1021,7 @@ impl DatabricksHttpClient {
                         .collect::<Vec<_>>();
                     causes.dedup();
                     let error_message = causes.join(": ");
-                    let retryable = strategy.is_retryable_error(&e);
-                    if retryable && attempts < max_attempts {
+                    if strategy.is_retryable_error(&e) && attempts < max_attempts {
                         let elapsed = start_time.elapsed();
                         let wait = calculate_backoff(config, attempts, None);
 
@@ -1060,7 +1060,7 @@ impl DatabricksHttpClient {
                         error_message
                     );
                     return Err(Error::network_error()
-                        .with_retryable(retryable)
+                        .with_retryable(!is_permanent_connection_error(&e))
                         .message(format!(
                             "HTTP request failed after {} attempts: {}",
                             attempts, error_message
@@ -1976,6 +1976,70 @@ lGrv15pBcePj
                 "server must observe the retry before its task is awaited"
             );
             server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn test_non_idempotent_read_timeout_preserves_retryable_flag() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(path("/test"))
+                .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+                .mount(&server)
+                .await;
+            let client = test_client_with_http_config(
+                fast_retry_config(2),
+                HttpClientConfig {
+                    read_timeout: Duration::from_millis(75),
+                    ..HttpClientConfig::default()
+                },
+            );
+            let request = client
+                .inner()
+                .post(format!("{}/test", server.uri()))
+                .build()
+                .unwrap();
+            let error = client
+                .execute(request, RequestType::ExecuteStatement)
+                .await
+                .expect_err("response must time out after the request is sent");
+
+            assert_eq!(server.received_requests().await.unwrap().len(), 1);
+            assert!(error.message.contains("after 1 attempts"), "{error}");
+            assert!(error.message.contains("timed out"), "{error}");
+            assert!(
+                error.retryable,
+                "preserve the existing network-error flag: {error}"
+            );
+        }
+
+        #[tokio::test]
+        async fn test_redirect_failure_preserves_retryable_flag() {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/test"))
+                .respond_with(
+                    ResponseTemplate::new(302)
+                        .insert_header("Location", format!("{}/test", server.uri())),
+                )
+                .mount(&server)
+                .await;
+            let client = test_client(&server, fast_retry_config(2));
+            let request = client
+                .inner()
+                .get(format!("{}/test", server.uri()))
+                .build()
+                .unwrap();
+            let error = client
+                .execute(request, RequestType::GetStatementStatus)
+                .await
+                .expect_err("redirect loop must fail");
+
+            assert!(error.message.contains("after 1 attempts"), "{error}");
+            assert!(error.message.contains("redirect"), "{error}");
+            assert!(
+                error.retryable,
+                "preserve the existing network-error flag: {error}"
+            );
         }
 
         #[tokio::test]
