@@ -276,8 +276,8 @@ fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)
 
         #[cfg(feature = "tls-native")]
         if let Some(error) = error.downcast_ref::<native_tls::Error>() {
-            // native-tls hides the platform verification result. Restrict text
-            // matching to TLS errors so ordinary connect/timeout errors still retry.
+            // Restrict platform-message matching to TLS errors so ordinary
+            // connect/timeout errors still retry.
             return is_native_certificate_verification_failure(&error.to_string());
         }
         false
@@ -286,6 +286,28 @@ fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)
 
 #[cfg(feature = "tls-native")]
 fn is_native_certificate_verification_failure(message: &str) -> bool {
+    // native-tls hides SChannel's io::Error, but Display retains the OS code
+    // even when Windows localizes the message.
+    if let Some(code) = message
+        .rsplit_once(" (os error ")
+        .and_then(|(_, code)| code.strip_suffix(')'))
+        .and_then(|code| code.parse::<i32>().ok())
+    {
+        return matches!(
+            code as u32,
+            0x80090322 // SEC_E_WRONG_PRINCIPAL
+                | 0x80090325 // SEC_E_UNTRUSTED_ROOT
+                | 0x80090328 // SEC_E_CERT_EXPIRED
+                | 0x800B0101 // CERT_E_EXPIRED
+                | 0x800B0109 // CERT_E_UNTRUSTEDROOT
+                | 0x800B010A // CERT_E_CHAINING
+                | 0x800B010F // CERT_E_CN_NO_MATCH
+                | 0x800B0112 // CERT_E_UNTRUSTEDCA
+        );
+    }
+
+    // native-tls also hides OpenSSL's X509VerifyResult and Secure Transport's
+    // status code, so their fallback depends on English verification messages.
     // Match local verification failures, not peer-sent certificate alerts.
     let message = message.to_ascii_lowercase();
     [
@@ -494,11 +516,32 @@ mod tests {
             "wrong version number",
             "SSL routines:tls_process_server_certificate:unexpected eof while reading",
             "Connection reset by peer",
+            "TLS-Fehler (os error -2146893018)", // SEC_E_ILLEGAL_MESSAGE
+            "TLS-Fehler (os error -2146893048)", // SEC_E_INVALID_TOKEN
+            "Verbindung abgelehnt (os error 10061)",
+            "Zeitüberschreitung (os error 10060)",
         ] {
             assert!(
                 !is_native_certificate_verification_failure(message),
                 "{message}"
             );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn localized_schannel_certificate_failures_are_permanent() {
+        for message in [
+            "Die Zertifikatskette wurde von einer nicht vertrauenswürdigen Zertifizierungsstelle ausgestellt. (os error -2146893019)",
+            "Zertifikatsfehler (os error -2146762487)",
+            "Der Zielprinzipalname ist falsch. (os error -2146893022)",
+            "Le nom CN du certificat ne correspond pas à la valeur passée. (os error -2146762481)",
+            "Zertifikat abgelaufen (os error -2146893016)",
+            "Certificat expiré (os error -2146762495)",
+            "Zertifikatskette unvollständig (os error -2146762486)",
+            "Autorité de certification non approuvée (os error -2146762478)",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
         }
     }
 
@@ -509,6 +552,7 @@ mod tests {
             std::io::Error::from(std::io::ErrorKind::TimedOut),
             std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
             std::io::Error::other("certificate verify failed"),
+            std::io::Error::from_raw_os_error(-2146893019),
         ] {
             assert!(!is_certificate_verification_failure(&error));
         }
