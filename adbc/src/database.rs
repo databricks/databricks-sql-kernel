@@ -189,7 +189,11 @@ impl adbc_core::Database for Database {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::mpsc;
+
     use adbc_core::{Database as _, Driver as _};
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH, USER_AGENT_ENTRY};
     use crate::Driver;
@@ -299,6 +303,58 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn rust_adbc_user_agent_reaches_session_request() {
+        let expected_user_agent = format!(
+            "{DRIVER_USER_AGENT_NAME}/{} (partner+product)",
+            env!("CARGO_PKG_VERSION")
+        );
+        let (uri_sender, uri_receiver) = mpsc::sync_channel(1);
+        let (stop_sender, stop_receiver) = mpsc::sync_channel(1);
+        let server_thread = std::thread::spawn({
+            let expected_user_agent = expected_user_agent.clone();
+            move || {
+                tokio::runtime::Runtime::new()
+                    .unwrap()
+                    .block_on(async move {
+                        let server = MockServer::start().await;
+                        Mock::given(method("POST"))
+                            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+                            .and(header("user-agent", expected_user_agent.as_str()))
+                            .respond_with(ResponseTemplate::new(200).set_body_string(
+                                r#"{"session_id":"sess-user-agent","warehouse_id":"test_wh"}"#,
+                            ))
+                            .expect(1)
+                            .mount(&server)
+                            .await;
+                        uri_sender.send(server.uri()).unwrap();
+                        tokio::task::spawn_blocking(move || stop_receiver.recv().unwrap())
+                            .await
+                            .unwrap();
+                    });
+            }
+        });
+
+        let database = Driver
+            .new_database_with_opts([
+                (OptionDatabase::Uri, uri_receiver.recv().unwrap().into()),
+                (
+                    OptionDatabase::Other(HTTP_PATH.into()),
+                    "/sql/1.0/warehouses/test_wh".into(),
+                ),
+                (OptionDatabase::Other(ACCESS_TOKEN.into()), "secret".into()),
+                (
+                    OptionDatabase::Other(USER_AGENT_ENTRY.into()),
+                    "partner+product".into(),
+                ),
+            ])
+            .unwrap();
+        let connection = database.new_connection().unwrap();
+        drop(connection);
+        stop_sender.send(()).unwrap();
+        server_thread.join().unwrap();
     }
 
     #[test]

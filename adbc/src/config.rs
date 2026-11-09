@@ -289,10 +289,12 @@ impl DatabaseConfig {
                 .set(SecretString::new(string_value(value, key)?), false),
             CATALOG => self.catalog.set(string_value(value, key)?, false),
             SCHEMA => self.schema.set(string_value(value, key)?, false),
-            USER_AGENT_ENTRY => self.user_agent_entry.set(string_value(value, key)?, true),
-            USER_AGENT_ENTRY_ALIAS => {
-                self.user_agent_entry.set(string_value(value, key)?, false)
-            }
+            USER_AGENT_ENTRY => self
+                .user_agent_entry
+                .set(user_agent_entry(value, key)?, true),
+            USER_AGENT_ENTRY_ALIAS => self
+                .user_agent_entry
+                .set(user_agent_entry(value, key)?, false),
             "adbc.connection.catalog" => self.catalog.set(string_value(value, key)?, true),
             "adbc.connection.db_schema" => self.schema.set(string_value(value, key)?, true),
             AUTH_TYPE => self
@@ -910,6 +912,16 @@ fn string_value(value: OptionValue, key: &str) -> Result<String> {
             Status::InvalidArguments,
         )),
     }
+}
+fn user_agent_entry(value: OptionValue, key: &str) -> Result<String> {
+    let value = string_value(value, key)?;
+    if value.chars().any(char::is_control) {
+        return Err(adbc_error(
+            format!("option {key:?} must not contain control characters"),
+            Status::InvalidArguments,
+        ));
+    }
+    Ok(value)
 }
 fn bytes_value(value: OptionValue, key: &str) -> Result<Vec<u8>> {
     match value {
@@ -1669,6 +1681,18 @@ mod tests {
     }
 
     #[test]
+    fn user_agent_entry_rejects_control_characters() {
+        for key in [USER_AGENT_ENTRY, USER_AGENT_ENTRY_ALIAS] {
+            for value in ["partner\nproduct", "partner\rproduct", "partner\0product"] {
+                let mut config = DatabaseConfig::default();
+                let error = config.set_option(key, value.into()).unwrap_err();
+                assert_eq!(error.status, Status::InvalidArguments, "{key}: {value:?}");
+                assert!(error.message.contains(key), "{key}: {value:?}");
+            }
+        }
+    }
+
+    #[test]
     fn http_pool_and_custom_headers_reach_kernel_config() {
         let mut config = DatabaseConfig::default();
         set(&mut config, HOST, "https://example.databricks.com");
@@ -1688,7 +1712,10 @@ mod tests {
 
         let resolved = config.resolve().unwrap();
         assert_eq!(resolved.http.pool_max_idle_per_host, 37);
-        assert_eq!(resolved.user_agent_entry.as_deref(), Some("partner+product"));
+        assert_eq!(
+            resolved.user_agent_entry.as_deref(),
+            Some("partner+product")
+        );
         assert_eq!(
             resolved.http.custom_headers,
             vec![("x-databricks-test".into(), "sentinel".into())]
