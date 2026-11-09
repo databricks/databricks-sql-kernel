@@ -236,5 +236,5 @@ jobs:
         # versa.
         run: cargo clippy -p databricks-sql-kernel --no-default-features --features tls-rustls --all-targets -- -D warnings
 
-      - name: Test TLS failure handling (tls-rustls)
-        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::http::tls_tests
+      - name: Test client behavior (tls-rustls)
+        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::
