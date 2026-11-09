@@ -1,0 +1,355 @@
+# Copyright (c) 2026 Databricks, Inc.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: Trigger Rust ADBC Integration Tests
+
+# Kernel-only changes intentionally skip this suite, matching Python/Node/Go.
+# Full nightly ADBC coverage catches regressions from shared kernel changes.
+# Advisory check; do not require it on ordinary, unlabeled PRs.
+# Enable RUST_ADBC_INTEGRATION_TESTS_ENABLED after driver-test#1957 lands.
+on:
+  pull_request:
+    types: [labeled]
+  merge_group:
+  schedule:
+    - cron: '17 * * * *'
+
+permissions:
+  contents: read
+
+env:
+  RUST_ADBC_CHECK_TIMEOUT_HOURS: "3"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.event.merge_group.head_ref || github.ref }}-${{ github.event.label.name || github.event_name }}
+  # Finish the dispatch before a later run can reuse its pending check.
+  cancel-in-progress: false
+
+jobs:
+  dispatch:
+    if: |
+      github.event_name == 'merge_group' ||
+      (github.event_name == 'pull_request' && github.event.label.name == 'integration-test' &&
+       github.event.pull_request.head.repo.full_name == github.event.pull_request.base.repo.full_name)
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate kernel checks App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-sql-kernel
+          permission-checks: write
+
+      - name: Resolve test target
+        id: target
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            if (context.eventName === 'pull_request') {
+              const pr = context.payload.pull_request;
+              core.setOutput('base_sha', pr.base.sha);
+              core.setOutput('head_sha', pr.head.sha);
+              core.setOutput('pr_number', pr.number);
+            } else {
+              const group = context.payload.merge_group;
+              core.setOutput('base_sha', group.base_sha);
+              core.setOutput('head_sha', group.head_sha);
+              core.setOutput('merge_group_ref', group.head_ref);
+            }
+
+      - name: Checkout changed revision
+        if: vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED == 'true'
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ steps.target.outputs.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Detect Rust ADBC changes
+        id: changed
+        if: vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED == 'true'
+        env:
+          BASE_SHA: ${{ steps.target.outputs.base_sha }}
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet "$BASE_SHA...$HEAD_SHA" -- \
+            adbc/ .github/workflows/trigger-rust-adbc-integration-tests.yml; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          else
+            diff_status=$?
+            if [ "$diff_status" -ne 1 ]; then exit "$diff_status"; fi
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create Rust ADBC check
+        id: check
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+          TESTS_ENABLED: ${{ vars.RUST_ADBC_INTEGRATION_TESTS_ENABLED }}
+          ADBC_CHANGED: ${{ steps.changed.outputs.changed }}
+          APP_ID: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            const enabled = process.env.TESTS_ENABLED === 'true';
+            const runTests = enabled && process.env.ADBC_CHANGED === 'true';
+            const retry = runTests && context.eventName === 'pull_request';
+            const checks = await github.paginate(github.rest.checks.listForRef, {
+              ...context.repo,
+              ref: process.env.HEAD_SHA,
+              check_name: 'Rust ADBC Integration Tests',
+              filter: 'all',
+              per_page: 100
+            });
+            const pending = checks.filter(check =>
+              check.app?.id === Number(process.env.APP_ID) && check.status !== 'completed'
+            );
+            // Allow 120 minutes of tests plus an hour for queueing and reporting.
+            const expiresBefore = Date.now() - Number(process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS) * 60 * 60 * 1000;
+            const expired = check => {
+              const started = Date.parse(check.started_at || check.created_at || '');
+              return !Number.isFinite(started) || started <= expiresBefore;
+            };
+            // The companion receiver preserves cancelled checks and cancels older PR runs.
+            for (const check of pending.filter(check => retry || expired(check))) {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: check.id,
+                status: 'completed',
+                conclusion: 'cancelled',
+                completed_at: new Date().toISOString(),
+                output: {
+                  title: 'Previous Rust ADBC run superseded',
+                  summary: retry
+                    ? 'A maintainer requested a fresh Rust ADBC run.'
+                    : `Pending check expired after ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours.`
+                }
+              });
+            }
+            const active = pending.find(check => !retry && !expired(check));
+            if (active) {
+              await github.rest.checks.update({
+                ...context.repo,
+                check_run_id: active.id,
+                output: {
+                  title: 'Rust ADBC integration tests already running',
+                  summary: 'An existing run covers this commit. Re-add integration-test on the PR to request a fresh run.'
+                }
+              });
+              core.setOutput('dispatch', 'false');
+              return active.id;
+            }
+            const timestamp = new Date().toISOString();
+            const state = runTests ? {
+              status: 'in_progress',
+              started_at: timestamp
+            } : {
+              status: 'completed',
+              conclusion: 'skipped',
+              completed_at: timestamp,
+              output: {
+                title: 'Rust ADBC integration tests skipped',
+                summary: enabled
+                  ? 'No Rust ADBC driver or trigger workflow changes.'
+                  : 'RUST_ADBC_INTEGRATION_TESTS_ENABLED is not true.'
+              }
+            };
+            const { data: check } = await github.rest.checks.create({
+              ...context.repo,
+              name: 'Rust ADBC Integration Tests',
+              head_sha: process.env.HEAD_SHA,
+              ...state,
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`
+            });
+            core.setOutput('dispatch', String(runTests));
+            return check.id;
+
+      - name: Build Rust ADBC payload
+        id: payload
+        if: steps.check.outputs.dispatch == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head_sha }}
+          PR_NUMBER: ${{ steps.target.outputs.pr_number }}
+          MERGE_GROUP_REF: ${{ steps.target.outputs.merge_group_ref }}
+          CHECK_RUN_ID: ${{ steps.check.outputs.result }}
+        with:
+          script: |
+            const payload = {
+              commit_sha: process.env.HEAD_SHA,
+              check_run_id: process.env.CHECK_RUN_ID
+            };
+            if (process.env.PR_NUMBER) payload.pr_number = process.env.PR_NUMBER;
+            if (process.env.MERGE_GROUP_REF) payload.merge_group_ref = process.env.MERGE_GROUP_REF;
+            core.setOutput('json', JSON.stringify(payload));
+
+      - name: Generate driver-test dispatch token
+        id: dispatch-token
+        if: steps.check.outputs.dispatch == 'true'
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-driver-test
+          permission-contents: write
+
+      - name: Dispatch Rust ADBC tests
+        id: dispatch
+        if: steps.check.outputs.dispatch == 'true'
+        uses: peter-evans/repository-dispatch@ff45666b9427631e3450c54a1bcbee4d9ff4d7c0 # v3.0.0
+        with:
+          token: ${{ steps.dispatch-token.outputs.token }}
+          repository: databricks/databricks-driver-test
+          event-type: rust-adbc-pr-test
+          client-payload: ${{ steps.payload.outputs.json }}
+
+      - name: Report incomplete dispatch
+        if: (failure() || cancelled()) && steps.check.outputs.dispatch == 'true' && steps.check.outputs.result != '' && steps.dispatch.outcome != 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          CHECK_RUN_ID: ${{ steps.check.outputs.result }}
+          CONCLUSION: ${{ job.status == 'cancelled' && 'cancelled' || 'failure' }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.checks.update({
+              ...context.repo,
+              check_run_id: Number(process.env.CHECK_RUN_ID),
+              status: 'completed',
+              conclusion: process.env.CONCLUSION,
+              completed_at: new Date().toISOString(),
+              output: {
+                title: 'Rust ADBC dispatch incomplete',
+                summary: `Rust ADBC integration dispatch ${process.env.CONCLUSION}. Check the sender workflow logs.`
+              }
+            });
+
+      - name: Report incomplete setup
+        if: (failure() || cancelled()) && steps.check.outputs.result == '' && steps.app-token.outcome == 'success'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          HEAD_SHA: ${{ steps.target.outputs.head_sha || github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          CONCLUSION: ${{ job.status == 'cancelled' && 'cancelled' || 'failure' }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            await github.rest.checks.create({
+              ...context.repo,
+              name: 'Rust ADBC Integration Tests',
+              head_sha: process.env.HEAD_SHA,
+              status: 'completed',
+              conclusion: process.env.CONCLUSION,
+              completed_at: new Date().toISOString(),
+              details_url: `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`,
+              output: {
+                title: 'Rust ADBC dispatch setup incomplete',
+                summary: `Rust ADBC dispatch setup ${process.env.CONCLUSION}. Check the sender workflow logs.`
+              }
+            });
+
+  expire-stalled-checks:
+    # Keep maintenance active when dispatch is disabled so existing checks expire.
+    if: github.event_name == 'schedule'
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: linux-ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Generate check maintenance App token
+        id: app-token
+        uses: actions/create-github-app-token@f8d387b68d61c58ab83c6c016672934102569859 # v3.0.0
+        with:
+          app-id: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+          private-key: ${{ secrets.INTEGRATION_TEST_PRIVATE_KEY }}
+          owner: databricks
+          repositories: databricks-sql-kernel
+          permission-contents: read
+          permission-pull-requests: read
+          permission-checks: write
+
+      - name: Cancel expired Rust ADBC checks on active revisions
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          APP_ID: ${{ secrets.INTEGRATION_TEST_APP_ID }}
+        with:
+          github-token: ${{ steps.app-token.outputs.token }}
+          script: |
+            let failures = 0;
+            let prs = [];
+            let refs = [];
+            try {
+              prs = await github.paginate(github.rest.pulls.list, {
+                ...context.repo, state: 'open', per_page: 100
+              });
+            } catch (error) {
+              core.warning(`Could not list PR revisions: ${error.message}`);
+              failures++;
+            }
+            try {
+              ({ data: refs } = await github.rest.git.listMatchingRefs({
+                ...context.repo, ref: 'heads/gh-readonly-queue/'
+              }));
+            } catch (error) {
+              core.warning(`Could not list merge-queue revisions: ${error.message}`);
+              failures++;
+            }
+            const fullName = `${context.repo.owner}/${context.repo.repo}`;
+            const revisions = new Set([
+              ...prs.filter(pr => pr.head.repo?.full_name === fullName).map(pr => pr.head.sha),
+              ...refs.map(ref => ref.object.sha)
+            ]);
+            const expiresBefore = Date.now() - Number(process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS) * 60 * 60 * 1000;
+            for (const ref of revisions) {
+              let checks;
+              try {
+                checks = await github.paginate(github.rest.checks.listForRef, {
+                  ...context.repo, ref, check_name: 'Rust ADBC Integration Tests',
+                  filter: 'all', status: 'in_progress', per_page: 100
+                });
+              } catch (error) {
+                core.warning(`Could not inspect Rust ADBC checks at ${ref}: ${error.message}`);
+                if (error.status !== 404 && error.status !== 422) failures++;
+                continue;
+              }
+              for (const check of checks) {
+                const started = Date.parse(check.started_at || check.created_at || '');
+                if (check.app?.id !== Number(process.env.APP_ID) || started > expiresBefore) continue;
+                try {
+                  await github.rest.checks.update({
+                    ...context.repo,
+                    check_run_id: check.id,
+                    status: 'completed',
+                    conclusion: 'cancelled',
+                    completed_at: new Date().toISOString(),
+                    output: {
+                      title: 'Rust ADBC check timed out',
+                      summary: `No result within ${process.env.RUST_ADBC_CHECK_TIMEOUT_HOURS} hours. Re-add integration-test to retry.`
+                    }
+                  });
+                } catch (error) {
+                  core.warning(`Could not expire Rust ADBC check ${check.id}: ${error.message}`);
+                  failures++;
+                }
+              }
+            }
+            if (failures) core.setFailed(`Rust ADBC maintenance had ${failures} API failures; see warnings.`);
