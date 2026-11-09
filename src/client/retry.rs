@@ -293,16 +293,33 @@ fn is_native_certificate_verification_failure(message: &str) -> bool {
         .and_then(|(_, code)| code.strip_suffix(')'))
         .and_then(|code| code.parse::<i32>().ok())
     {
+        // Revocation-check availability errors remain retryable.
         return matches!(
             code as u32,
             0x80090322 // SEC_E_WRONG_PRINCIPAL
                 | 0x80090325 // SEC_E_UNTRUSTED_ROOT
                 | 0x80090328 // SEC_E_CERT_EXPIRED
+                | 0x80092010 // CRYPT_E_REVOKED
+                | 0x80096004 // TRUST_E_CERT_SIGNATURE
+                | 0x80096019 // TRUST_E_BASIC_CONSTRAINTS
                 | 0x800B0101 // CERT_E_EXPIRED
+                | 0x800B0102 // CERT_E_VALIDITYPERIODNESTING
+                | 0x800B0103 // CERT_E_ROLE
+                | 0x800B0104 // CERT_E_PATHLENCONST
+                | 0x800B0105 // CERT_E_CRITICAL
+                | 0x800B0106 // CERT_E_PURPOSE
+                | 0x800B0107 // CERT_E_ISSUERCHAINING
+                | 0x800B0108 // CERT_E_MALFORMED
                 | 0x800B0109 // CERT_E_UNTRUSTEDROOT
                 | 0x800B010A // CERT_E_CHAINING
+                | 0x800B010C // CERT_E_REVOKED
+                | 0x800B010D // CERT_E_UNTRUSTEDTESTROOT
                 | 0x800B010F // CERT_E_CN_NO_MATCH
+                | 0x800B0110 // CERT_E_WRONG_USAGE
+                | 0x800B0111 // TRUST_E_EXPLICIT_DISTRUST
                 | 0x800B0112 // CERT_E_UNTRUSTEDCA
+                | 0x800B0113 // CERT_E_INVALID_POLICY
+                | 0x800B0114 // CERT_E_INVALID_NAME
         );
     }
 
@@ -520,11 +537,39 @@ mod tests {
             "TLS-Fehler (os error -2146893048)", // SEC_E_INVALID_TOKEN
             "Verbindung abgelehnt (os error 10061)",
             "Zeitüberschreitung (os error 10060)",
+            "The revocation function was unable to check revocation for the certificate. (os error -2146762482)",
+            "The revocation function was unable to check revocation because the revocation server was offline. (os error -2146885613)",
+            "The certificate's revocation status could not be determined. (os error -2146892973)",
         ] {
             assert!(
                 !is_native_certificate_verification_failure(message),
                 "{message}"
             );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn schannel_certificate_policy_failures_are_permanent() {
+        for message in [
+            "The certificate is not valid for the requested usage. (os error -2146762480)",
+            "A certificate was explicitly revoked by its issuer. (os error -2146762484)",
+            "The signature of the certificate cannot be verified. (os error -2146869244)",
+            "The certificate is revoked. (os error -2146885616)",
+            "The basic constraints of the certificate are invalid or missing. (os error -2146869223)",
+            "Das Zertifikat wurde ausdrücklich als nicht vertrauenswürdig markiert. (os error -2146762479)",
+            "Une extension critique du certificat est inconnue. (os error -2146762491)",
+            "The validity periods of the certification chain do not nest correctly. (os error -2146762494)",
+            "A certificate that can only be used as an end-entity is being used as a CA or vice versa. (os error -2146762493)",
+            "A path length constraint in the certification chain has been violated. (os error -2146762492)",
+            "A certificate is being used for a purpose other than the ones specified by its CA. (os error -2146762490)",
+            "A parent of a given certificate did not issue that child certificate. (os error -2146762489)",
+            "A certificate is missing or has an empty value for an important field. (os error -2146762488)",
+            "The certification path terminates with the test root which is not trusted. (os error -2146762483)",
+            "The certificate has invalid policy. (os error -2146762477)",
+            "The certificate has an invalid name. (os error -2146762476)",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
         }
     }
 
