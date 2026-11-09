@@ -278,15 +278,35 @@ fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)
         if let Some(error) = error.downcast_ref::<native_tls::Error>() {
             // native-tls hides the platform verification result. Restrict text
             // matching to TLS errors so ordinary connect/timeout errors still retry.
-            let message = error.to_string().to_ascii_lowercase();
-            return message.contains("certificate")
-                || message.contains("hostname mismatch")
-                || message.contains("ip address mismatch")
-                || message.contains("untrusted root")
-                || message.contains("target principal name is incorrect");
+            return is_native_certificate_verification_failure(&error.to_string());
         }
         false
     })
+}
+
+#[cfg(feature = "tls-native")]
+fn is_native_certificate_verification_failure(message: &str) -> bool {
+    // Match local verification failures, not peer-sent certificate alerts.
+    let message = message.to_ascii_lowercase();
+    [
+        "certificate verify failed",
+        "hostname mismatch",
+        "ip address mismatch",
+        "invalid certificate chain",
+        "certificate for this server is invalid",
+        "unknown root certificate",
+        "root certificate is not trusted",
+        "certificate was not trusted",
+        "certificate has expired",
+        "certificate is not yet valid",
+        "certificate chain was issued by an authority that is not trusted",
+        "root certificate which is not trusted",
+        "untrusted root",
+        "target principal name is incorrect",
+        "certificate's cn name does not match",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 /// Heuristic: is this network error a permanent DNS lookup failure (the host
@@ -403,6 +423,82 @@ mod tests {
         ] {
             let error = std::io::Error::other(std::io::Error::other(error));
             assert!(is_certificate_verification_failure(&error));
+        }
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn peer_certificate_alerts_are_not_local_verification_failures() {
+        use rustls::AlertDescription::*;
+        for alert in [
+            BadCertificate,
+            UnsupportedCertificate,
+            CertificateRevoked,
+            CertificateExpired,
+            CertificateUnknown,
+            UnknownCA,
+            CertificateUnobtainable,
+            BadCertificateStatusResponse,
+            BadCertificateHashValue,
+            CertificateRequired,
+        ] {
+            let error = std::io::Error::other(rustls::Error::AlertReceived(alert));
+            assert!(!is_certificate_verification_failure(&error), "{alert:?}");
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_certificate_verification_messages_are_permanent() {
+        for message in [
+            // OpenSSL.
+            "error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed (unable to get local issuer certificate)",
+            "certificate verify failed (self-signed certificate)",
+            "certificate verify failed (hostname mismatch)",
+            "certificate verify failed (IP address mismatch)",
+            // Secure Transport.
+            "Invalid certificate chain",
+            "The certificate for this server is invalid.",
+            "Unknown root certificate",
+            "The root certificate is not trusted.",
+            "The certificate was not trusted.",
+            "The certificate has expired.",
+            "The certificate is not yet valid.",
+            // SChannel.
+            "The certificate chain was issued by an authority that is not trusted. (os error -2146893019)",
+            "A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider. (os error -2146762487)",
+            "Untrusted root certificate",
+            "The target principal name is incorrect. (os error -2146893022)",
+            "The certificate's CN name does not match the passed value. (os error -2146762481)",
+            "CERTIFICATE VERIFY FAILED",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_peer_alerts_and_other_tls_failures_are_not_local_verification_failures() {
+        for message in [
+            "sslv3 alert bad certificate",
+            "sslv3 alert unsupported certificate",
+            "sslv3 alert certificate revoked",
+            "sslv3 alert certificate expired",
+            "sslv3 alert certificate unknown",
+            "tlsv1 alert unknown ca",
+            "tlsv1 alert certificate unobtainable",
+            "tlsv1 alert bad certificate status response",
+            "tlsv1 alert bad certificate hash value",
+            "tlsv13 alert certificate required",
+            "unexpected eof while reading",
+            "wrong version number",
+            "SSL routines:tls_process_server_certificate:unexpected eof while reading",
+            "Connection reset by peer",
+        ] {
+            assert!(
+                !is_native_certificate_verification_failure(message),
+                "{message}"
+            );
         }
     }
 
