@@ -276,12 +276,48 @@ fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)
 
         #[cfg(feature = "tls-native")]
         if let Some(error) = error.downcast_ref::<native_tls::Error>() {
+            #[cfg(target_vendor = "apple")]
+            if let Some(permanent) = apple_certificate_verification_failure(&format!("{error:?}")) {
+                return permanent;
+            }
             // Restrict platform-message matching to TLS errors so ordinary
             // connect/timeout errors still retry.
             return is_native_certificate_verification_failure(&error.to_string());
         }
         false
     })
+}
+
+#[cfg(all(feature = "tls-native", any(target_vendor = "apple", test)))]
+fn apple_certificate_verification_failure(debug: &str) -> Option<bool> {
+    // native-tls forwards security-framework's Debug, which retains OSStatus
+    // even when Display contains only a localized message.
+    let code = debug
+        .strip_prefix("Error { code: ")?
+        .split_once([',', '}'])?
+        .0
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    Some(matches!(
+        code,
+        -9807 // errSSLXCertChainInvalid
+            | -9808 // errSSLBadCert
+            | -9812 // errSSLUnknownRootCert
+            | -9813 // errSSLNoRootCert
+            | -9814 // errSSLCertExpired
+            | -9815 // errSSLCertNotYetValid
+            | -9843 // errSSLHostNameMismatch
+            | -25318 // errSecCreateChainFailed
+            | -67602 // errSecHostNameMismatch
+            | -67609 // errSecInvalidExtendedKeyUsage
+            | -67654 // errSecTrustSettingDeny
+            | -67808 // errSecVerifyFailed
+            | -67818 // errSecCertificateExpired
+            | -67819 // errSecCertificateNotValidYet
+            | -67820 // errSecCertificateRevoked
+            | -67843 // errSecNotTrusted
+    ))
 }
 
 #[cfg(feature = "tls-native")]
@@ -323,13 +359,14 @@ fn is_native_certificate_verification_failure(message: &str) -> bool {
         );
     }
 
-    // native-tls also hides OpenSSL's X509VerifyResult and Secure Transport's
-    // status code, so their fallback depends on English verification messages.
+    // OpenSSL's X509VerifyResult is hidden; this fallback depends on English
+    // messages if no platform status code is available.
     // Match local verification failures, not peer-sent certificate alerts.
     let message = message.to_ascii_lowercase();
     [
         "certificate verify failed",
         "hostname mismatch",
+        "host name mismatch",
         "ip address mismatch",
         "invalid certificate chain",
         "certificate for this server is invalid",
@@ -488,6 +525,71 @@ mod tests {
 
     #[cfg(feature = "tls-native")]
     #[test]
+    fn apple_certificate_status_codes_are_permanent() {
+        for debug in [
+            "Error { code: -67602, message: \"A host name mismatch has occurred.\" }",
+            "Error { code: -67602, message: \"Der Hostname stimmt nicht überein.\" }",
+            "Error { code: -67843, message: \"Certificat non approuvé.\" }",
+            "Error { code: -67818, message: \"Zertifikat abgelaufen.\" }",
+            "Error { code: -67819 }",
+            "Error { code: -67820 }",
+            "Error { code: -67609 }",
+            "Error { code: -67654 }",
+            "Error { code: -67808 }",
+            "Error { code: -25318 }",
+            "Error { code: -9807 }",
+            "Error { code: -9808 }",
+            "Error { code: -9812 }",
+            "Error { code: -9813 }",
+            "Error { code: -9814 }",
+            "Error { code: -9815 }",
+            "Error { code: -9843 }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                Some(true),
+                "{debug}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn apple_peer_alerts_and_other_errors_are_not_local_verification_failures() {
+        for debug in [
+            "Error { code: -9825, message: \"Peer bad certificate\" }",
+            "Error { code: -9827 }", // errSSLPeerCertRevoked
+            "Error { code: -9828 }", // errSSLPeerCertExpired
+            "Error { code: -9829 }", // errSSLPeerCertUnknown
+            "Error { code: -9831 }", // errSSLPeerUnknownCA
+            "Error { code: -9803 }", // errSSLWouldBlock
+            "Error { code: -9844 }", // errSSLConnectionRefused
+            "Error { code: -36 }",   // errSecIO
+            "Error { code: -50, message: \"bad parameter\" }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                Some(false),
+                "{debug}"
+            );
+        }
+        for debug in [
+            "A host name mismatch has occurred.",
+            "Error { message: \"code: -67602\" }",
+            "Error { code: invalid }",
+            "Error { code: -67602",
+            "Os { code: -67602, kind: Other }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                None,
+                "{debug}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
     fn native_certificate_verification_messages_are_permanent() {
         for message in [
             // OpenSSL.
@@ -503,6 +605,7 @@ mod tests {
             "The certificate was not trusted.",
             "The certificate has expired.",
             "The certificate is not yet valid.",
+            "A host name mismatch has occurred.",
             // SChannel.
             "The certificate chain was issued by an authority that is not trusted. (os error -2146893019)",
             "A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider. (os error -2146762487)",

@@ -122,7 +122,8 @@ pub enum ErrorCode {
 
     /// Transport-layer failure — DNS resolution, TCP handshake, TLS
     /// negotiation. Distinct from `Unavailable` (which is server-
-    /// reported transient). Retryable with backoff.
+    /// reported transient). Retryability depends on the cause: certificate
+    /// verification and permanent DNS failures are not retryable.
     NetworkError,
 
     /// Server-reported SQL execution error. `sql_state` and
@@ -359,7 +360,8 @@ impl Error {
         Self::empty(ErrorCode::InvalidStatementHandle)
     }
 
-    /// `ErrorCode::NetworkError`. Default `retryable=true`.
+    /// `ErrorCode::NetworkError`. Defaults to retryable; override with
+    /// [`Self::with_retryable`] for permanent transport failures.
     pub fn network_error() -> Self {
         Self::empty(ErrorCode::NetworkError).with_retryable(true)
     }

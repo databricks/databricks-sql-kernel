@@ -1020,7 +1020,8 @@ impl DatabricksHttpClient {
                         .collect::<Vec<_>>();
                     causes.dedup();
                     let error_message = causes.join(": ");
-                    if strategy.is_retryable_error(&e) && attempts < max_attempts {
+                    let retryable = strategy.is_retryable_error(&e);
+                    if retryable && attempts < max_attempts {
                         let elapsed = start_time.elapsed();
                         let wait = calculate_backoff(config, attempts, None);
 
@@ -1058,10 +1059,12 @@ impl DatabricksHttpClient {
                         start_time.elapsed().as_secs_f64(),
                         error_message
                     );
-                    return Err(Error::network_error().message(format!(
-                        "HTTP request failed after {} attempts: {}",
-                        attempts, error_message
-                    )));
+                    return Err(Error::network_error()
+                        .with_retryable(retryable)
+                        .message(format!(
+                            "HTTP request failed after {} attempts: {}",
+                            attempts, error_message
+                        )));
                 }
             }
         }

@@ -37,11 +37,79 @@ fn test_client(config: HttpClientConfig, overall_timeout: Duration) -> Databrick
         overall_timeout,
         ..Default::default()
     };
-    DatabricksHttpClient::new(config, HashMap::from([(RequestCategory::Sea, retry)])).unwrap()
+    DatabricksHttpClient::new(
+        config,
+        HashMap::from([
+            (RequestCategory::Sea, retry.clone()),
+            (RequestCategory::CloudFetch, retry),
+        ]),
+    )
+    .unwrap()
+}
+
+async fn download_cloudfetch_chunk(client: DatabricksHttpClient, url: String) -> Result<()> {
+    use crate::client::ChunkLinkFetchResult;
+    use crate::reader::cloudfetch::{
+        ChunkDownloader, ChunkLinkFetcher, StreamingCloudFetchProvider,
+    };
+    use crate::types::cloudfetch::{CloudFetchConfig, CloudFetchLink};
+    use crate::types::sea::CompressionCodec;
+
+    #[derive(Debug)]
+    struct SingleLink(CloudFetchLink);
+
+    #[async_trait::async_trait]
+    impl ChunkLinkFetcher for SingleLink {
+        async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+            Ok(ChunkLinkFetchResult {
+                links: vec![self.0.clone()],
+                ..ChunkLinkFetchResult::end_of_stream()
+            })
+        }
+
+        async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+            panic!("certificate failure must not refresh the signed URL")
+        }
+
+        async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+            panic!("certificate failure must not refresh the signed URL")
+        }
+    }
+
+    let fetcher = Arc::new(SingleLink(CloudFetchLink {
+        url,
+        chunk_index: 0,
+        row_offset: 0,
+        row_count: 1,
+        byte_count: 0,
+        expiration: chrono::Utc::now() + chrono::Duration::hours(1),
+        http_headers: HashMap::new(),
+        next_chunk_index: None,
+    }));
+    let downloader = Arc::new(ChunkDownloader::new(
+        Arc::new(client),
+        CompressionCodec::None,
+        0.1,
+    ));
+    let provider = StreamingCloudFetchProvider::new(
+        CloudFetchConfig {
+            retry_delay: Duration::from_millis(1),
+            ..CloudFetchConfig::default()
+        },
+        fetcher,
+        downloader,
+        Some(1),
+        tokio::runtime::Handle::current(),
+    );
+    provider.next_batch().await.map(|_| ())
 }
 
 async fn assert_certificate_failure(failure: CertificateFailure) {
-    for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
+    for request_type in [
+        RequestType::CreateSession,
+        RequestType::ExecuteStatement,
+        RequestType::CloudFetchDownload,
+    ] {
         let mut ca_params = CertificateParams::new(Vec::new()).unwrap();
         ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         ca_params
@@ -127,18 +195,29 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
         } else {
             format!("https://{address}")
         };
-        let request = client
-            .inner()
-            .post(format!("{host}/api/2.0/sql/sessions"))
-            .build()
-            .unwrap();
-        let result = client.execute_without_auth(request, request_type).await;
+        let result = if matches!(request_type, RequestType::CloudFetchDownload) {
+            download_cloudfetch_chunk(client, format!("{host}/chunk.arrow")).await
+        } else {
+            let request = client
+                .inner()
+                .post(format!("{host}/api/2.0/sql/sessions"))
+                .build()
+                .unwrap();
+            client
+                .execute_without_auth(request, request_type)
+                .await
+                .map(|_| ())
+        };
         shutdown.send(()).unwrap();
         let (attempts, requests) = server.await.unwrap();
         let error = result.expect_err("invalid server certificate must be rejected");
         assert_eq!(attempts, 1, "certificate failure must not retry: {error}");
         assert_eq!(requests, 0, "HTTP request must not reach the TLS server");
         assert!(error.message.contains("after 1 attempts"), "{error}");
+        assert!(
+            !error.retryable,
+            "permanent certificate error must not be retryable: {error}"
+        );
 
         let expected_causes: &[&str] = match failure {
             CertificateFailure::UnknownCa => &[
@@ -233,6 +312,10 @@ async fn tls_handshake_timeout_still_retries() {
             .execute_without_auth(request, request_type)
             .await
             .unwrap_err();
+        assert!(
+            error.retryable,
+            "handshake timeouts remain retryable: {error}"
+        );
         shutdown.send(()).unwrap();
         assert_eq!(server.await.unwrap(), 3, "{error}");
         assert!(error.message.contains("after 3 attempts"), "{error}");
@@ -259,6 +342,10 @@ async fn retry_timeout_preserves_connect_cause() {
         .await
         .unwrap_err();
     assert!(
+        error.retryable,
+        "connection refusal remains retryable: {error}"
+    );
+    assert!(
         error
             .message
             .contains("retry timeout exceeded after 1 attempts"),
@@ -268,4 +355,48 @@ async fn retry_timeout_preserves_connect_cause() {
         error.message.to_ascii_lowercase().contains("refused"),
         "connect cause missing: {error}"
     );
+}
+
+#[tokio::test]
+async fn permanent_dns_failure_is_not_retryable() {
+    use reqwest::dns::{Name, Resolve, Resolving};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[derive(Debug, Default)]
+    struct NxDomain(AtomicUsize);
+
+    impl Resolve for NxDomain {
+        fn resolve(&self, _: Name) -> Resolving {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async {
+                Err(Box::new(std::io::Error::other("NXDOMAIN"))
+                    as Box<dyn std::error::Error + Send + Sync>)
+            })
+        }
+    }
+
+    for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
+        let resolver = Arc::new(NxDomain::default());
+        let mut client = test_client(HttpClientConfig::default(), Duration::from_secs(10));
+        client.client = reqwest::Client::builder()
+            .no_proxy()
+            .dns_resolver(resolver.clone())
+            .build()
+            .unwrap();
+        let request = client
+            .inner()
+            .get("http://missing.invalid/")
+            .build()
+            .unwrap();
+        let error = client
+            .execute_without_auth(request, request_type)
+            .await
+            .unwrap_err();
+        assert_eq!(resolver.0.load(Ordering::SeqCst), 1, "{error}");
+        assert!(
+            !error.retryable,
+            "permanent DNS errors must not be retryable: {error}"
+        );
+        assert!(error.message.contains("NXDOMAIN"), "{error}");
+    }
 }
