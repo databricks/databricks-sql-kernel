@@ -1114,7 +1114,7 @@ impl StreamingCloudFetchProvider {
                     return Ok(batches);
                 }
                 Err(e) => {
-                    // Refreshing a signed URL cannot repair permanent transport failures.
+                    // Refreshing a signed URL cannot repair certificate verification failures.
                     if e.code == ErrorCode::NetworkError && !e.retryable {
                         return Err(e);
                     }

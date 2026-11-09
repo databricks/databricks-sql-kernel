@@ -47,7 +47,10 @@ fn test_client(config: HttpClientConfig, overall_timeout: Duration) -> Databrick
     .unwrap()
 }
 
-async fn download_cloudfetch_chunk(client: DatabricksHttpClient, url: String) -> Result<()> {
+async fn download_cloudfetch_chunk(
+    client: DatabricksHttpClient,
+    url: String,
+) -> Result<Option<arrow_array::RecordBatch>> {
     use crate::client::ChunkLinkFetchResult;
     use crate::reader::cloudfetch::{
         ChunkDownloader, ChunkLinkFetcher, StreamingCloudFetchProvider,
@@ -68,11 +71,11 @@ async fn download_cloudfetch_chunk(client: DatabricksHttpClient, url: String) ->
         }
 
         async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
-            panic!("certificate failure must not refresh the signed URL")
+            panic!("unexpired signed URL must not be refreshed")
         }
 
         async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
-            panic!("certificate failure must not refresh the signed URL")
+            panic!("unexpired signed URL must not be refreshed")
         }
     }
 
@@ -101,7 +104,7 @@ async fn download_cloudfetch_chunk(client: DatabricksHttpClient, url: String) ->
         Some(1),
         tokio::runtime::Handle::current(),
     );
-    provider.next_batch().await.map(|_| ())
+    provider.next_batch().await
 }
 
 async fn assert_certificate_failure(failure: CertificateFailure) {
@@ -196,7 +199,9 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
             format!("https://{address}")
         };
         let result = if matches!(request_type, RequestType::CloudFetchDownload) {
-            download_cloudfetch_chunk(client, format!("{host}/chunk.arrow")).await
+            download_cloudfetch_chunk(client, format!("{host}/chunk.arrow"))
+                .await
+                .map(|_| ())
         } else {
             let request = client
                 .inner()
@@ -358,45 +363,127 @@ async fn retry_timeout_preserves_connect_cause() {
 }
 
 #[tokio::test]
-async fn permanent_dns_failure_is_not_retryable() {
+async fn dns_failure_preserves_retryable_flag_without_http_retry() {
     use reqwest::dns::{Name, Resolve, Resolving};
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    #[derive(Debug, Default)]
-    struct NxDomain(AtomicUsize);
+    #[derive(Debug)]
+    struct DnsFailure {
+        calls: AtomicUsize,
+        message: &'static str,
+    }
 
-    impl Resolve for NxDomain {
+    impl Resolve for DnsFailure {
         fn resolve(&self, _: Name) -> Resolving {
-            self.0.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async {
-                Err(Box::new(std::io::Error::other("NXDOMAIN"))
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let message = self.message;
+            Box::pin(async move {
+                Err(Box::new(std::io::Error::other(message))
                     as Box<dyn std::error::Error + Send + Sync>)
             })
         }
     }
 
-    for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
-        let resolver = Arc::new(NxDomain::default());
+    for message in ["nodename nor servname provided, or not known", "NXDOMAIN"] {
+        for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
+            let resolver = Arc::new(DnsFailure {
+                calls: AtomicUsize::new(0),
+                message,
+            });
+            let mut client = test_client(HttpClientConfig::default(), Duration::from_secs(10));
+            client.client = reqwest::Client::builder()
+                .no_proxy()
+                .dns_resolver(resolver.clone())
+                .build()
+                .unwrap();
+            let request = client
+                .inner()
+                .get("http://missing.invalid/")
+                .build()
+                .unwrap();
+            let error = client
+                .execute_without_auth(request, request_type)
+                .await
+                .unwrap_err();
+            assert_eq!(resolver.calls.load(Ordering::SeqCst), 1, "{error}");
+            assert!(error.retryable, "preserve the existing DNS flag: {error}");
+            assert!(error.message.contains(message), "{error}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn cloudfetch_recovers_after_dns_failure() {
+    use arrow_array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow_ipc::writer::StreamWriter;
+    use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[derive(Debug)]
+    struct FailOnceResolver {
+        calls: AtomicUsize,
+        message: &'static str,
+        address: SocketAddr,
+    }
+
+    impl Resolve for FailOnceResolver {
+        fn resolve(&self, _: Name) -> Resolving {
+            let fail = self.calls.fetch_add(1, Ordering::SeqCst) == 0;
+            let message = self.message;
+            let address = self.address;
+            Box::pin(async move {
+                if fail {
+                    Err(Box::new(std::io::Error::other(message))
+                        as Box<dyn std::error::Error + Send + Sync>)
+                } else {
+                    Ok(Box::new(std::iter::once(address)) as Addrs)
+                }
+            })
+        }
+    }
+
+    let expected =
+        RecordBatch::try_from_iter([("id", Arc::new(Int32Array::from(vec![42])) as ArrayRef)])
+            .unwrap();
+    let mut ipc = Vec::new();
+    {
+        let mut writer = StreamWriter::try_new(&mut ipc, &expected.schema()).unwrap();
+        writer.write(&expected).unwrap();
+        writer.finish().unwrap();
+    }
+
+    for message in ["nodename nor servname provided, or not known", "NXDOMAIN"] {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk.arrow"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc.clone()))
+            .mount(&server)
+            .await;
+        let resolver = Arc::new(FailOnceResolver {
+            calls: AtomicUsize::new(0),
+            message,
+            address: *server.address(),
+        });
         let mut client = test_client(HttpClientConfig::default(), Duration::from_secs(10));
         client.client = reqwest::Client::builder()
             .no_proxy()
             .dns_resolver(resolver.clone())
             .build()
             .unwrap();
-        let request = client
-            .inner()
-            .get("http://missing.invalid/")
-            .build()
-            .unwrap();
-        let error = client
-            .execute_without_auth(request, request_type)
-            .await
-            .unwrap_err();
-        assert_eq!(resolver.0.load(Ordering::SeqCst), 1, "{error}");
-        assert!(
-            !error.retryable,
-            "permanent DNS errors must not be retryable: {error}"
+        let url = format!(
+            "http://storage.invalid:{}/chunk.arrow",
+            server.address().port()
         );
-        assert!(error.message.contains("NXDOMAIN"), "{error}");
+        let batch = download_cloudfetch_chunk(client, url)
+            .await
+            .expect("CloudFetch must retry after a DNS failure")
+            .expect("downloaded chunk must yield a batch");
+
+        assert_eq!(batch, expected, "{message}");
+        assert_eq!(resolver.calls.load(Ordering::SeqCst), 2, "{message}");
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
     }
 }

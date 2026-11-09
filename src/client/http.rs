@@ -24,8 +24,8 @@
 
 use crate::auth::AuthProvider;
 use crate::client::retry::{
-    calculate_backoff, is_permanent_connection_error, RequestCategory, RequestType, RetryConfig,
-    RetryStrategy,
+    calculate_backoff, is_certificate_verification_failure, RequestCategory, RequestType,
+    RetryConfig, RetryStrategy,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -1060,7 +1060,7 @@ impl DatabricksHttpClient {
                         error_message
                     );
                     return Err(Error::network_error()
-                        .with_retryable(!is_permanent_connection_error(&e))
+                        .with_retryable(!is_certificate_verification_failure(&e))
                         .message(format!(
                             "HTTP request failed after {} attempts: {}",
                             attempts, error_message

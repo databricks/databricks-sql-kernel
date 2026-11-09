@@ -122,8 +122,8 @@ pub enum ErrorCode {
 
     /// Transport-layer failure — DNS resolution, TCP handshake, TLS
     /// negotiation. Distinct from `Unavailable` (which is server-
-    /// reported transient). Retryability depends on the cause: certificate
-    /// verification and permanent DNS failures are not retryable.
+    /// reported transient). Retryable with backoff except for certificate
+    /// verification failures.
     NetworkError,
 
     /// Server-reported SQL execution error. `sql_state` and

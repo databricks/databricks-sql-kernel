@@ -249,7 +249,8 @@ impl RetryStrategy {
     pub fn is_retryable_error(&self, error: &reqwest::Error) -> bool {
         // Certificate verification and permanent DNS failures cannot recover
         // through retry, even though reqwest reports them as connect errors.
-        if is_permanent_connection_error(error) {
+        if is_certificate_verification_failure(error) || is_permanent_dns_resolution_failure(error)
+        {
             return false;
         }
         match self.idempotency {
@@ -263,11 +264,9 @@ impl RetryStrategy {
     }
 }
 
-pub(crate) fn is_permanent_connection_error(error: &reqwest::Error) -> bool {
-    is_certificate_verification_failure(error) || is_permanent_dns_resolution_failure(error)
-}
-
-fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+pub(crate) fn is_certificate_verification_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
     super::error_chain(error).any(|error| {
         #[cfg(feature = "tls-rustls")]
         if matches!(
