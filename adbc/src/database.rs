@@ -27,15 +27,17 @@ use crate::Connection;
 const DRIVER_NAME: &str = "Databricks ADBC Driver for Rust";
 const DRIVER_USER_AGENT_NAME: &str = "RustADBCDatabricksDriver";
 
-fn driver_user_agent() -> String {
-    format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"))
+fn driver_user_agent(entry: Option<&str>) -> String {
+    let base = format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"));
+    match entry.map(str::trim).filter(|entry| !entry.is_empty()) {
+        Some(entry) => format!("{base} ({entry})"),
+        None => base,
+    }
 }
 
-fn set_driver_user_agent(http: &mut kernel::HttpConfig) {
+fn set_driver_user_agent(http: &mut kernel::HttpConfig, entry: Option<&str>) {
     http.custom_headers
-        .retain(|(name, _)| !name.eq_ignore_ascii_case("user-agent"));
-    http.custom_headers
-        .push(("User-Agent".into(), driver_user_agent()));
+        .push(("User-Agent".into(), driver_user_agent(entry)));
 }
 
 fn driver_system_configuration() -> kernel::DriverSystemConfiguration {
@@ -95,7 +97,7 @@ impl Database {
 
     fn open(&self) -> Result<Connection> {
         let mut resolved = self.config.resolve()?;
-        set_driver_user_agent(&mut resolved.http);
+        set_driver_user_agent(&mut resolved.http, resolved.user_agent_entry.as_deref());
         let mut builder = kernel::Session::builder()
             .auth(resolved.auth)
             .http(resolved.http)
@@ -189,7 +191,7 @@ impl adbc_core::Database for Database {
 mod tests {
     use adbc_core::{Database as _, Driver as _};
 
-    use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH};
+    use crate::config::{ACCESS_TOKEN, ESCAPE_CATALOG_NAME, HTTP_PATH, USER_AGENT_ENTRY};
     use crate::Driver;
 
     use super::*;
@@ -204,6 +206,10 @@ mod tests {
                     "/sql/1.0/warehouses/abc".into(),
                 ),
                 (OptionDatabase::Other(ACCESS_TOKEN.into()), "secret".into()),
+                (
+                    OptionDatabase::Other(USER_AGENT_ENTRY.into()),
+                    "partner+product".into(),
+                ),
             ])
             .unwrap();
         assert_eq!(
@@ -215,6 +221,12 @@ mod tests {
                 .get_option_string(OptionDatabase::Other(ESCAPE_CATALOG_NAME.into()))
                 .unwrap(),
             "true"
+        );
+        assert_eq!(
+            database
+                .get_option_string(OptionDatabase::Other(USER_AGENT_ENTRY.into()))
+                .unwrap(),
+            "partner+product"
         );
 
         let mut database = database;
@@ -263,13 +275,16 @@ mod tests {
 
     #[test]
     fn kernel_receives_rust_adbc_user_agent() {
-        let mut http = kernel::HttpConfig::default();
-        http.custom_headers = vec![
-            ("x-test-header".into(), "test-value".into()),
-            ("user-agent".into(), "caller-agent".into()),
-        ];
+        assert_eq!(
+            driver_user_agent(None),
+            format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(driver_user_agent(Some("  ")), driver_user_agent(None));
 
-        set_driver_user_agent(&mut http);
+        let mut http = kernel::HttpConfig::default();
+        http.custom_headers = vec![("x-test-header".into(), "test-value".into())];
+
+        set_driver_user_agent(&mut http, Some("partner+product"));
 
         assert_eq!(
             http.custom_headers,
@@ -277,7 +292,10 @@ mod tests {
                 ("x-test-header".into(), "test-value".into()),
                 (
                     "User-Agent".into(),
-                    format!("{DRIVER_USER_AGENT_NAME}/{}", env!("CARGO_PKG_VERSION")),
+                    format!(
+                        "{DRIVER_USER_AGENT_NAME}/{} (partner+product)",
+                        env!("CARGO_PKG_VERSION")
+                    ),
                 ),
             ]
         );

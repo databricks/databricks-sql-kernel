@@ -96,6 +96,7 @@ The main database option families are:
 | Family | Options |
 | --- | --- |
 | Namespace | `adbc.databricks.catalog`, `adbc.databricks.schema` |
+| Attribution | `adbc.databricks.user_agent_entry` |
 | Session | `adbc.databricks.session_conf.<name>`, `adbc.databricks.ssp_ansi_mode`, `adbc.databricks.ssp_timezone`, `adbc.databricks.query_tags` |
 | HTTP | request/overall timeouts, idle pool size, retry limits/backoff, response compression, JSON custom headers |
 | Proxy | URL, username, password, bypass hosts |
@@ -105,6 +106,12 @@ The main database option families are:
 | Results | complex datatype support, geospatial representation, CloudFetch enablement and buffering |
 | Execution | `adbc.databricks.enable_direct_results` (default `true`); set `false` to use `wait_timeout=0s` and status polling |
 | Metadata | `adbc.databricks.metadata.escape_catalog_name` |
+
+The optional user-agent entry is appended to the driver-owned identity as
+`RustADBCDatabricksDriver/<version> (<entry>)`. Set it through
+`adbc.databricks.user_agent_entry`; `User-Agent` is not accepted in the generic
+custom-header option. `adbc.spark.user_agent_entry` is accepted as a
+compatibility alias; the canonical option wins when both are set.
 
 Proxy credentials must use the dedicated options; URL userinfo is rejected.
 Certificate and key options must be supplied as a pair. File-backed credential

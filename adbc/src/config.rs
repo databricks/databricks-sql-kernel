@@ -28,6 +28,8 @@ pub(crate) const WAREHOUSE_ID: &str = "adbc.databricks.warehouse_id";
 pub(crate) const ACCESS_TOKEN: &str = "adbc.databricks.auth.token";
 pub(crate) const CATALOG: &str = "adbc.databricks.catalog";
 pub(crate) const SCHEMA: &str = "adbc.databricks.schema";
+pub(crate) const USER_AGENT_ENTRY: &str = "adbc.databricks.user_agent_entry";
+const USER_AGENT_ENTRY_ALIAS: &str = "adbc.spark.user_agent_entry";
 const AUTH_TYPE: &str = "adbc.databricks.auth.type";
 const GRANT_TYPE: &str = "adbc.databricks.oauth.grant_type";
 const IDENTITY_FEDERATION_CLIENT_ID: &str = "adbc.databricks.identity_federation_client_id";
@@ -146,6 +148,7 @@ pub(crate) struct DatabaseConfig {
     warehouse_id: Option<String>,
     catalog: Preferred<String>,
     schema: Preferred<String>,
+    user_agent_entry: Preferred<String>,
     auth_mode: Preferred<AuthMode>,
     username: Option<String>,
     password: Option<SecretString>,
@@ -195,6 +198,7 @@ impl std::fmt::Debug for DatabaseConfig {
             .field("warehouse_id", &self.warehouse_id)
             .field("catalog", &self.catalog.get())
             .field("schema", &self.schema.get())
+            .field("user_agent_entry", &self.user_agent_entry.get())
             .field("auth_mode", &self.auth_mode.get())
             .field("token", &self.token.get())
             .field("oauth_client_secret", &self.oauth_client_secret)
@@ -228,6 +232,7 @@ pub(crate) struct ResolvedConfig {
     pub(crate) warehouse_id: Option<String>,
     pub(crate) catalog: Option<String>,
     pub(crate) schema: Option<String>,
+    pub(crate) user_agent_entry: Option<String>,
     pub(crate) auth: kernel::AuthConfig,
     pub(crate) http: kernel::HttpConfig,
     pub(crate) proxy: Option<kernel::ProxyConfig>,
@@ -284,6 +289,10 @@ impl DatabaseConfig {
                 .set(SecretString::new(string_value(value, key)?), false),
             CATALOG => self.catalog.set(string_value(value, key)?, false),
             SCHEMA => self.schema.set(string_value(value, key)?, false),
+            USER_AGENT_ENTRY => self.user_agent_entry.set(string_value(value, key)?, true),
+            USER_AGENT_ENTRY_ALIAS => {
+                self.user_agent_entry.set(string_value(value, key)?, false)
+            }
             "adbc.connection.catalog" => self.catalog.set(string_value(value, key)?, true),
             "adbc.connection.db_schema" => self.schema.set(string_value(value, key)?, true),
             AUTH_TYPE => self
@@ -521,6 +530,7 @@ impl DatabaseConfig {
                 WAREHOUSE_ID | "databricks.warehouse_id" => self.warehouse_id.clone(),
                 CATALOG | "adbc.connection.catalog" => self.catalog.get().cloned(),
                 SCHEMA | "adbc.connection.db_schema" => self.schema.get().cloned(),
+                USER_AGENT_ENTRY | USER_AGENT_ENTRY_ALIAS => self.user_agent_entry.get().cloned(),
                 AUTH_TYPE => self
                     .auth_mode
                     .get()
@@ -588,6 +598,7 @@ impl DatabaseConfig {
             warehouse_id,
             catalog: self.catalog.get().cloned(),
             schema: self.schema.get().cloned(),
+            user_agent_entry: self.user_agent_entry.get().cloned(),
             auth,
             http: self.http.clone(),
             proxy: self.proxy.url.as_ref().map(|_| self.proxy.clone()),
@@ -1079,6 +1090,7 @@ fn parse_headers(value: &str) -> Result<Vec<(String, String)>> {
                 "authorization"
                     | "host"
                     | "content-length"
+                    | "user-agent"
                     | "x-databricks-org-id"
                     | "x-request-id"
                     | "traceparent"
@@ -1627,15 +1639,33 @@ mod tests {
 
     #[test]
     fn headers_reject_security_sensitive_names() {
+        for name in ["Authorization", "User-Agent", "user-agent"] {
+            let mut config = DatabaseConfig::default();
+            let value = format!(r#"[{{"name":"{name}","value":"secret"}}]"#);
+            let error = config
+                .set_option("adbc.databricks.http.headers", value.into())
+                .unwrap_err();
+            assert_eq!(error.status, Status::InvalidArguments);
+            assert!(!error.message.contains("secret"));
+        }
+    }
+
+    #[test]
+    fn user_agent_entry_round_trips() {
         let mut config = DatabaseConfig::default();
-        let error = config
-            .set_option(
-                "adbc.databricks.http.headers",
-                r#"[{"name":"Authorization","value":"secret"}]"#.into(),
-            )
-            .unwrap_err();
-        assert_eq!(error.status, Status::InvalidArguments);
-        assert!(!error.message.contains("secret"));
+        set(&mut config, USER_AGENT_ENTRY_ALIAS, "legacy-entry");
+        set(&mut config, USER_AGENT_ENTRY, "partner+product");
+        for key in [USER_AGENT_ENTRY, USER_AGENT_ENTRY_ALIAS] {
+            assert_eq!(config.get_string(key).unwrap(), "partner+product");
+        }
+
+        let mut reverse = DatabaseConfig::default();
+        set(&mut reverse, USER_AGENT_ENTRY, "partner+product");
+        set(&mut reverse, USER_AGENT_ENTRY_ALIAS, "legacy-entry");
+        assert_eq!(
+            reverse.get_string(USER_AGENT_ENTRY).unwrap(),
+            "partner+product"
+        );
     }
 
     #[test]
@@ -1654,9 +1684,11 @@ mod tests {
             "adbc.databricks.http.headers",
             r#"[{"name":"x-databricks-test","value":"sentinel"}]"#,
         );
+        set(&mut config, USER_AGENT_ENTRY, "partner+product");
 
         let resolved = config.resolve().unwrap();
         assert_eq!(resolved.http.pool_max_idle_per_host, 37);
+        assert_eq!(resolved.user_agent_entry.as_deref(), Some("partner+product"));
         assert_eq!(
             resolved.http.custom_headers,
             vec![("x-databricks-test".into(), "sentinel".into())]
