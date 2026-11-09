@@ -148,15 +148,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 wiremock = "0.6"
 tempfile = "3"
 log = "0.4"
-# Test-only private-key generation for the JWT auth tests. Keys are
-# generated in-process (RSA + P-256, plus a PBES2-encrypted PKCS#8
-# variant) rather than committed as PEM fixtures, so the repo's secret
-# scanner has nothing to flag and the tests need no `openssl` CLI (which
-# the repo deliberately avoids — not present on Windows). These are the
-# RustCrypto siblings of the `pkcs8` runtime dep. dev-only: never linked
-# into the shipped crate.
+# Generate JWT test keys in-process to avoid PEM fixtures and an external
+# `openssl` dependency. `ring` already backs runtime JWT signing.
 rsa = { version = "0.9", features = ["pem"] }
-p256 = { version = "0.13", features = ["pkcs8", "pem"] }
+ring = "0.17"
 # Hermetic mTLS C-ABI tests generate a private CA and client/server identities
 # at runtime, then serve HTTPS with mandatory client-certificate verification.
 # This avoids committed credentials, external processes, and live workspaces.

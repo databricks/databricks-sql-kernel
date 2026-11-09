@@ -56,6 +56,8 @@ ignore = [
 # entry requires PR-description justification.
 allow = [
     "Apache-2.0",
+    # target-lexicon, used by PyO3's build configuration.
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     # CC0-1.0 is a public-domain dedication (no attribution or

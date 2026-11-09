@@ -14,7 +14,7 @@
 
 //! Test-only private-key generation for the JWT auth tests.
 //!
-//! Keys are generated **in-process** (via the RustCrypto `rsa` / `p256`
+//! Keys are generated **in-process** (via the `rsa` / `ring`
 //! dev-dependencies) rather than committed as PEM fixtures. Two reasons:
 //!
 //! 1. The repo's secret scanner blocks committed `BEGIN PRIVATE KEY`
@@ -33,7 +33,7 @@ use std::sync::OnceLock;
 
 use pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
 // Use the `rand_core` re-exported by `rsa` (v0.6) so keygen matches the
-// RNG trait version the RustCrypto keygen APIs expect — and so we don't
+// RNG trait version the RSA keygen API expects — and so we don't
 // pull in a second top-level `rand` that would clash with the kernel's
 // runtime `rand` (v0.10) in test builds.
 use rsa::rand_core::OsRng;
@@ -84,8 +84,14 @@ pub(crate) fn rsa_encrypted_pkcs8_pem() -> String {
 
 /// A fresh P-256 EC private key as PKCS#8 PEM (for `ES256`).
 pub(crate) fn ec_p256_pkcs8_pem() -> String {
-    let key = p256::SecretKey::random(&mut OsRng);
-    key.to_pkcs8_pem(LineEnding::LF)
+    let key = ring::signature::EcdsaKeyPair::generate_pkcs8(
+        &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+        &ring::rand::SystemRandom::new(),
+    )
+    .expect("generate test EC key");
+    pkcs8::SecretDocument::try_from(key.as_ref())
+        .expect("parse EC PKCS#8")
+        .to_pem("PRIVATE KEY", LineEnding::LF)
         .expect("encode EC PKCS#8 PEM")
         .to_string()
 }
