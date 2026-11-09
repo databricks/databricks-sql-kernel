@@ -25,6 +25,8 @@ enum CertificateFailure {
     UnknownCa,
     SelfSigned,
     HostnameMismatch,
+    DnsHostnameMismatch,
+    Expired,
 }
 
 fn test_client(config: HttpClientConfig, overall_timeout: Duration) -> DatabricksHttpClient {
@@ -50,10 +52,16 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
         let issuer = Issuer::new(ca_params, ca_key);
 
         let name = match failure {
-            CertificateFailure::HostnameMismatch => "wrong-host.invalid",
+            CertificateFailure::HostnameMismatch | CertificateFailure::DnsHostnameMismatch => {
+                "wrong-host.invalid"
+            }
             _ => "127.0.0.1",
         };
-        let server_params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        let mut server_params = CertificateParams::new(vec![name.to_string()]).unwrap();
+        if matches!(failure, CertificateFailure::Expired) {
+            server_params.not_before = rcgen::date_time_ymd(2000, 1, 1);
+            server_params.not_after = rcgen::date_time_ymd(2001, 1, 1);
+        }
         let server_key = KeyPair::generate().unwrap();
         let server_cert = match failure {
             CertificateFailure::SelfSigned => server_params.self_signed(&server_key).unwrap(),
@@ -96,13 +104,32 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
         });
 
         let mut config = HttpClientConfig::default();
-        if matches!(failure, CertificateFailure::HostnameMismatch) {
+        if matches!(
+            failure,
+            CertificateFailure::HostnameMismatch
+                | CertificateFailure::DnsHostnameMismatch
+                | CertificateFailure::Expired
+        ) {
             config.tls.trusted_certificate_pem = Some(ca_cert.pem().into_bytes());
         }
-        let client = test_client(config, Duration::from_secs(10));
+        let mut client = test_client(config, Duration::from_secs(10));
+        let host = if matches!(failure, CertificateFailure::DnsHostnameMismatch) {
+            // Preserve the DNS name in the URL and SNI while dialing loopback.
+            client.client = reqwest::Client::builder()
+                .no_proxy()
+                .add_root_certificate(
+                    reqwest::Certificate::from_pem(ca_cert.pem().as_bytes()).unwrap(),
+                )
+                .resolve("expected-host.invalid", address)
+                .build()
+                .unwrap();
+            format!("https://expected-host.invalid:{}", address.port())
+        } else {
+            format!("https://{address}")
+        };
         let request = client
             .inner()
-            .post(format!("https://{address}/api/2.0/sql/sessions"))
+            .post(format!("{host}/api/2.0/sql/sessions"))
             .build()
             .unwrap();
         let result = client.execute_without_auth(request, request_type).await;
@@ -131,7 +158,7 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
                 "unknown root",
                 "invalid certificate chain",
             ],
-            CertificateFailure::HostnameMismatch => &[
+            CertificateFailure::HostnameMismatch | CertificateFailure::DnsHostnameMismatch => &[
                 "notvalidforname",
                 "not valid for name",
                 "ip address mismatch",
@@ -142,6 +169,7 @@ async fn assert_certificate_failure(failure: CertificateFailure) {
                 "target principal name is incorrect",
                 "name in the certificate is invalid",
             ],
+            CertificateFailure::Expired => &["expired"],
         };
         let message = error.message.to_ascii_lowercase();
         assert!(
@@ -164,6 +192,16 @@ async fn self_signed_fails_once_with_certificate_cause() {
 #[tokio::test]
 async fn hostname_mismatch_fails_once_with_certificate_cause() {
     assert_certificate_failure(CertificateFailure::HostnameMismatch).await;
+}
+
+#[tokio::test]
+async fn dns_hostname_mismatch_fails_once_with_certificate_cause() {
+    assert_certificate_failure(CertificateFailure::DnsHostnameMismatch).await;
+}
+
+#[tokio::test]
+async fn expired_certificate_fails_once_with_certificate_cause() {
+    assert_certificate_failure(CertificateFailure::Expired).await;
 }
 
 #[tokio::test]
