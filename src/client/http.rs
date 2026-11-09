@@ -828,7 +828,6 @@ impl DatabricksHttpClient {
         let start_time = Instant::now();
 
         let mut attempts: u32 = 0;
-        let mut last_error: Option<String> = None;
 
         // Clone the request parts we need for retries
         let method = request.method().clone();
@@ -988,7 +987,6 @@ impl DatabricksHttpClient {
                             ));
                         }
 
-                        last_error = Some(format!("HTTP {}", status.as_u16()));
                         warn!(
                             "{:?}: HTTP {} (attempt {}/{}), waiting {:.1}s before retry",
                             request_type,
@@ -1017,6 +1015,11 @@ impl DatabricksHttpClient {
                     ));
                 }
                 Err(e) => {
+                    let mut causes = super::error_chain(&e)
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    causes.dedup();
+                    let error_message = causes.join(": ");
                     if strategy.is_retryable_error(&e) && attempts < max_attempts {
                         let elapsed = start_time.elapsed();
                         let wait = calculate_backoff(config, attempts, None);
@@ -1032,17 +1035,16 @@ impl DatabricksHttpClient {
                                 "HTTP request failed — retry timeout exceeded after {} attempts ({:.1}s): {}",
                                 attempts,
                                 elapsed.as_secs_f64(),
-                                last_error.unwrap_or_else(|| e.to_string())
+                                error_message
                             )));
                         }
 
-                        last_error = Some(e.to_string());
                         warn!(
                             "{:?}: error (attempt {}/{}): {}, waiting {:.1}s before retry",
                             request_type,
                             attempts,
                             max_attempts,
-                            e,
+                            error_message,
                             wait.as_secs_f64()
                         );
                         sleep(wait).await;
@@ -1054,18 +1056,21 @@ impl DatabricksHttpClient {
                         request_type,
                         attempts,
                         start_time.elapsed().as_secs_f64(),
-                        e
+                        error_message
                     );
                     return Err(Error::network_error().message(format!(
                         "HTTP request failed after {} attempts: {}",
-                        attempts,
-                        last_error.unwrap_or_else(|| e.to_string())
+                        attempts, error_message
                     )));
                 }
             }
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http_tls_tests.rs"]
+mod tls_tests;
 
 #[cfg(test)]
 mod tests {

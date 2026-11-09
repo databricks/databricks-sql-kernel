@@ -247,10 +247,10 @@ impl RetryStrategy {
 
     /// Whether the given network/client error is retryable.
     pub fn is_retryable_error(&self, error: &reqwest::Error) -> bool {
-        // A permanent DNS lookup failure (for example NXDOMAIN) cannot recover
-        // through retry. Temporary resolver failures remain ordinary connect
-        // errors and follow the request's idempotency policy below.
-        if is_permanent_dns_resolution_failure(error) {
+        // Certificate verification and permanent DNS failures cannot recover
+        // through retry, even though reqwest reports them as connect errors.
+        if is_certificate_verification_failure(error) || is_permanent_dns_resolution_failure(error)
+        {
             return false;
         }
         match self.idempotency {
@@ -262,6 +262,31 @@ impl RetryStrategy {
             RequestIdempotency::NonIdempotent => error.is_connect(),
         }
     }
+}
+
+fn is_certificate_verification_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    super::error_chain(error).any(|error| {
+        #[cfg(feature = "tls-rustls")]
+        if matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+        ) {
+            return true;
+        }
+
+        #[cfg(feature = "tls-native")]
+        if let Some(error) = error.downcast_ref::<native_tls::Error>() {
+            // native-tls hides the platform verification result. Restrict text
+            // matching to TLS errors so ordinary connect/timeout errors still retry.
+            let message = error.to_string().to_ascii_lowercase();
+            return message.contains("certificate")
+                || message.contains("hostname mismatch")
+                || message.contains("ip address mismatch")
+                || message.contains("untrusted root")
+                || message.contains("target principal name is incorrect");
+        }
+        false
+    })
 }
 
 /// Heuristic: is this network error a permanent DNS lookup failure (the host
@@ -366,6 +391,32 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn certificate_errors_are_detected_inside_io_errors() {
+        for error in [
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            rustls::Error::NoCertificatesPresented,
+        ] {
+            let error = std::io::Error::other(std::io::Error::other(error));
+            assert!(is_certificate_verification_failure(&error));
+        }
+    }
+
+    #[test]
+    fn ordinary_io_errors_are_not_certificate_failures() {
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            std::io::Error::other("certificate verify failed"),
+        ] {
+            assert!(!is_certificate_verification_failure(&error));
+        }
+    }
 
     // --- DNS-resolution detection tests ---
 

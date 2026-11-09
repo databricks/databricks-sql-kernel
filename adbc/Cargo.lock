@@ -657,6 +657,7 @@ dependencies = [
  "jsonwebtoken",
  "lz4_flex",
  "moka",
+ "native-tls",
  "oauth2",
  "open",
  "pbkdf2 0.13.0",
