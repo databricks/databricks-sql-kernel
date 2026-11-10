@@ -24,7 +24,7 @@
 //! enum, which the kernel resolves to a concrete `Transport` impl
 //! internally.
 
-use crate::kernel_error::Result;
+use crate::kernel_error::{Error, Result};
 use crate::reader::ResultReader;
 use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
@@ -143,6 +143,15 @@ pub(crate) struct ExecuteResult {
     /// `display_message` / etc. without a second GetStatementStatus
     /// round-trip.
     pub status: StatementStatus,
+}
+
+pub(crate) enum FetchResultOutcome {
+    Ready(ExecuteResult),
+    NotReady,
+    TerminalError {
+        error: Error,
+        status: StatementStatus,
+    },
 }
 
 impl std::fmt::Debug for ExecuteResult {
@@ -356,15 +365,8 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// Refresh status for an already-submitted statement and, if
     /// terminal-and-succeeded, materialise the reader.
     ///
-    /// Returns:
-    /// - `Ok(Some(ExecuteResult))` when the server reports
-    ///   `Succeeded` (or `Closed` with inline data, which the SEA
-    ///   server emits for one-batch results).
-    /// - `Ok(None)` when the server reports `Pending` / `Running` —
-    ///   the caller should `status()` again later.
-    /// - `Err(...)` on `Failed` / `Cancelled` / true `Closed`-without-data
-    ///   with the same structured error
-    ///   `Transport::execute_statement`'s polling path produces.
+    /// Errors after a terminal wire response retain its status so the owning
+    /// handle can cache the terminal observation before returning the error.
     ///
     /// Used by `ExecutedAsyncStatement::fetch_result` and inside the
     /// `await_result` poll loop.
@@ -372,7 +374,8 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
-    ) -> Result<Option<ExecuteResult>>;
+        infer_num_modified_rows: bool,
+    ) -> Result<FetchResultOutcome>;
 
     /// One-shot status check for an in-flight statement. Returns the
     /// full `ExecuteResponse` (status + manifest + initial result, if
@@ -382,6 +385,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
+        infer_num_modified_rows: bool,
     ) -> Result<ExecuteResponse>;
 
     // --- Result Fetching (CloudFetch) ---

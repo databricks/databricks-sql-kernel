@@ -53,12 +53,324 @@ const DML_COUNT_COLUMNS: [&str; 4] = [
 /// The total-affected column whose value maps to `num_modified_rows`.
 const AFFECTED_ROWS_COLUMN: &str = "num_affected_rows";
 
+/// SEA result aliases are ambiguous, so row-count extraction also requires DML SQL.
+pub(crate) fn sql_is_dml(sql: &str) -> bool {
+    outer_statement_keyword(sql).is_some_and(is_dml_keyword)
+}
+
+fn is_dml_keyword(keyword: &str) -> bool {
+    ["INSERT", "UPDATE", "DELETE", "MERGE"]
+        .iter()
+        .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
+}
+
+fn outer_statement_keyword(sql: &str) -> Option<&str> {
+    let mut cursor = SqlCursor::new(sql);
+    let first = cursor.next_keyword()?;
+    if first.eq_ignore_ascii_case("FROM") {
+        return cursor.has_multi_insert_body().then_some("INSERT");
+    }
+    if !first.eq_ignore_ascii_case("WITH") {
+        return Some(first);
+    }
+    cursor.skip_ctes()?;
+    let outer = cursor.next_keyword()?;
+    if outer.eq_ignore_ascii_case("FROM") {
+        cursor.has_multi_insert_body().then_some("INSERT")
+    } else {
+        Some(outer)
+    }
+}
+
+struct SqlCursor<'a> {
+    sql: &'a str,
+    index: usize,
+}
+
+fn is_identifier_char(character: char) -> bool {
+    character == '_' || character.is_alphabetic() || character.is_ascii_digit()
+}
+
+impl<'a> SqlCursor<'a> {
+    fn new(sql: &'a str) -> Self {
+        Self { sql, index: 0 }
+    }
+
+    fn current_char(&self) -> Option<char> {
+        self.sql[self.index..].chars().next()
+    }
+
+    fn advance_char(&mut self) {
+        if let Some(character) = self.current_char() {
+            self.index += character.len_utf8();
+        }
+    }
+
+    fn is_raw_string(&self) -> bool {
+        let mut preceding = self.sql[..self.index].chars().rev();
+        if !preceding.next().is_some_and(|c| matches!(c, 'R' | 'r')) {
+            return false;
+        }
+        !preceding.next().is_some_and(is_identifier_char)
+    }
+
+    fn skip_quoted(&mut self, quote: char, backslash_escaped: bool, doubled_quote: bool) {
+        self.index += 1;
+        while let Some(character) = self.current_char() {
+            if backslash_escaped && character == '\\' {
+                self.advance_char();
+                self.advance_char();
+            } else if character == quote {
+                self.advance_char();
+                if doubled_quote && self.current_char() == Some(quote) {
+                    self.advance_char();
+                } else {
+                    break;
+                }
+            } else {
+                self.advance_char();
+            }
+        }
+    }
+
+    fn skip_string(&mut self, quote: char) {
+        let raw = self.is_raw_string();
+        self.skip_quoted(quote, !raw, !raw);
+    }
+
+    fn skip_line_comment(&mut self) {
+        self.index += 2;
+        while self.index < self.sql.len() {
+            if self.sql.as_bytes()[self.index..].starts_with(b"\\\n") {
+                self.index += 2;
+            } else if matches!(self.current_char(), Some('\n' | '\r')) {
+                let has_carriage_return = self.current_char() == Some('\r');
+                self.advance_char();
+                if has_carriage_return && self.current_char() == Some('\n') {
+                    self.advance_char();
+                }
+                break;
+            } else {
+                self.advance_char();
+            }
+        }
+    }
+
+    fn skip_block_comment(&mut self) {
+        let bytes = self.sql.as_bytes();
+        self.index += 2;
+        let mut comment_depth = 1usize;
+        while self.index < bytes.len() && comment_depth > 0 {
+            if bytes[self.index..].starts_with(b"/*") {
+                comment_depth += 1;
+                self.index += 2;
+            } else if bytes[self.index..].starts_with(b"*/") {
+                comment_depth -= 1;
+                self.index += 2;
+            } else {
+                self.advance_char();
+            }
+        }
+    }
+
+    fn skip_trivia(&mut self) {
+        while self.index < self.sql.len() {
+            if self.sql.as_bytes()[self.index..].starts_with(b"--") {
+                self.skip_line_comment();
+                continue;
+            }
+            if self.sql.as_bytes()[self.index..].starts_with(b"/*") {
+                self.skip_block_comment();
+                continue;
+            }
+            if self.current_char().is_some_and(char::is_whitespace) {
+                self.advance_char();
+                continue;
+            }
+            break;
+        }
+    }
+
+    fn next_keyword(&mut self) -> Option<&'a str> {
+        self.skip_trivia();
+        let start = self.index;
+        if !self.current_char().is_some_and(is_identifier_char) {
+            return None;
+        }
+        self.advance_char();
+        while self.current_char().is_some_and(is_identifier_char) {
+            self.advance_char();
+        }
+        Some(&self.sql[start..self.index])
+    }
+
+    fn next_top_level_keyword(&mut self) -> Option<&'a str> {
+        loop {
+            self.skip_trivia();
+            match self.current_char()? {
+                quote @ ('\'' | '"') => self.skip_string(quote),
+                '`' => self.skip_quoted('`', false, true),
+                '(' => self.skip_parenthesized()?,
+                character if is_identifier_char(character) => return self.next_keyword(),
+                _ => self.advance_char(),
+            }
+        }
+    }
+
+    fn has_multi_insert_body(&mut self) -> bool {
+        while let Some(keyword) = self.next_top_level_keyword() {
+            if keyword.eq_ignore_ascii_case("SELECT") {
+                return false;
+            }
+            if keyword.eq_ignore_ascii_case("INSERT") {
+                if self.consume_keyword("WITH")
+                    && (!self.consume_keyword("SCHEMA") || !self.consume_keyword("EVOLUTION"))
+                {
+                    return false;
+                }
+                if self.consume_keyword("OVERWRITE") {
+                    return true;
+                }
+                self.consume_keyword("ONCE");
+                if self.consume_keyword("INTO") {
+                    self.consume_keyword("ONCE");
+                    return true;
+                }
+                return false;
+            }
+        }
+        false
+    }
+
+    fn consume_keyword(&mut self, expected: &str) -> bool {
+        let start = self.index;
+        let matched = self
+            .next_keyword()
+            .is_some_and(|keyword| keyword.eq_ignore_ascii_case(expected));
+        if !matched {
+            self.index = start;
+        }
+        matched
+    }
+
+    fn skip_identifier(&mut self) -> Option<()> {
+        self.skip_trivia();
+        match self.current_char()? {
+            quote @ ('"' | '`') => {
+                self.skip_quoted(quote, quote == '"', true);
+                Some(())
+            }
+            character if is_identifier_char(character) => {
+                self.next_keyword()?;
+                Some(())
+            }
+            _ => None,
+        }
+    }
+
+    fn skip_parenthesized(&mut self) -> Option<()> {
+        self.skip_trivia();
+        if self.current_char() != Some('(') {
+            return None;
+        }
+        self.advance_char();
+        let mut depth = 1usize;
+        while self.index < self.sql.len() {
+            if self.sql.as_bytes()[self.index..].starts_with(b"--") {
+                self.skip_line_comment();
+            } else if self.sql.as_bytes()[self.index..].starts_with(b"/*") {
+                self.skip_block_comment();
+            } else {
+                match self.current_char()? {
+                    quote @ ('\'' | '"') => self.skip_string(quote),
+                    '`' => self.skip_quoted('`', false, true),
+                    '(' => {
+                        depth += 1;
+                        self.advance_char();
+                    }
+                    ')' => {
+                        depth -= 1;
+                        self.advance_char();
+                        if depth == 0 {
+                            return Some(());
+                        }
+                    }
+                    _ => self.advance_char(),
+                }
+            }
+        }
+        None
+    }
+
+    fn skip_integer_value(&mut self) -> bool {
+        self.skip_trivia();
+        if self.current_char() == Some('?') {
+            self.advance_char();
+            return true;
+        }
+        if self.current_char() == Some(':') {
+            self.advance_char();
+            return self.skip_identifier().is_some();
+        }
+        let start = self.index;
+        while self.current_char().is_some_and(|c| c.is_ascii_digit()) {
+            self.advance_char();
+        }
+        self.index > start
+    }
+
+    fn skip_max_recursion_level(&mut self) -> Option<bool> {
+        if !self.consume_keyword("MAX") {
+            return Some(false);
+        }
+        if !self.consume_keyword("RECURSION")
+            || !self.consume_keyword("LEVEL")
+            || !self.skip_integer_value()
+        {
+            return None;
+        }
+        Some(true)
+    }
+
+    fn skip_ctes(&mut self) -> Option<()> {
+        self.consume_keyword("RECURSIVE");
+        loop {
+            self.skip_identifier()?;
+            self.skip_trivia();
+
+            if self.current_char() == Some('(') {
+                self.skip_parenthesized()?;
+                self.skip_trivia();
+                let body_follows = if self.skip_max_recursion_level()? {
+                    self.consume_keyword("AS");
+                    true
+                } else {
+                    self.consume_keyword("AS") || self.current_char() == Some('(')
+                };
+                if body_follows {
+                    self.skip_parenthesized()?;
+                }
+            } else {
+                self.skip_max_recursion_level()?;
+                self.consume_keyword("AS");
+                self.skip_parenthesized()?;
+            }
+
+            self.skip_trivia();
+            if self.current_char() != Some(',') {
+                return Some(());
+            }
+            self.advance_char();
+        }
+    }
+}
+
 /// Does this result `manifest` describe a DML row-count result?
 ///
 /// Same strict signature as [`read_dml_affected_rows`], but checked against
 /// the manifest's column metadata so a caller can decide whether the inline
-/// result is worth decoding *before* building a reader — keeping SELECTs (real
-/// columns) off the decode path entirely.
+/// result is worth decoding *before* building a reader. The submitted SQL must
+/// still be checked because a SELECT can use these exact aliases.
 pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
     let cols = &manifest.schema.columns;
     !cols.is_empty()
@@ -71,13 +383,11 @@ pub(crate) fn manifest_is_dml_count(manifest: &ResultManifest) -> bool {
 /// If `stream`'s result set is a DML row-count result, return its
 /// `num_affected_rows` value; otherwise `None`.
 ///
-/// Detection is deliberately strict — **every** column must be one of the
-/// known `num_*_rows` counters and `num_affected_rows` must be present —
-/// so a `SELECT 1 AS num_affected_rows` (a real query that merely aliases
-/// a column to that name) is not mistaken for a DML result. Thrift never
-/// faces this ambiguity because it reads the count from operation
-/// metadata rather than the result columns; the strict signature keeps us
-/// as close as the SEA wire shape allows.
+/// Detection is deliberately strict: **every** column must be one of the known
+/// `num_*_rows` counters and `num_affected_rows` must be present. This shape is
+/// still ambiguous with a SELECT that uses the same aliases, so callers must
+/// also gate extraction on the submitted SQL. Thrift does not face this
+/// ambiguity because its count comes from operation metadata.
 ///
 /// Non-consuming: peeks the first batch and buffers it, so the caller's
 /// subsequent fetch still sees the row.
@@ -128,6 +438,55 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
+
+    #[test]
+    fn classifies_direct_and_cte_dml() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "-- comment\nUPDATE t SET value = 1",
+            "/* outer /* nested */ comment */ DELETE FROM t",
+            "merge into t using s on t.id = s.id when matched then delete",
+            "WITH source AS (SELECT 1) INSERT INTO t SELECT * FROM source",
+            "WITH source (SELECT 1) INSERT INTO t SELECT * FROM source",
+            "WITH source(id) (SELECT 1) INSERT INTO t SELECT * FROM source",
+            "WITH source MAX RECURSION LEVEL 10 AS (SELECT 1) UPDATE t SET value = 1",
+            "WITH source(id) MAX RECURSION LEVEL :limit (SELECT 1) DELETE FROM t",
+            "WITH source MAX RECURSION LEVEL ? AS (SELECT 1) MERGE INTO t USING source ON false WHEN NOT MATCHED THEN INSERT *",
+            "WITH source AS (SELECT ') UPDATE t' AS value) UPDATE t SET value = 1",
+            "WITH source AS (SELECT R'\\' AS value) UPDATE t SET value = 1",
+            "WITH `source)`(`id)`) AS (SELECT 1) DELETE FROM t",
+            "WITH café AS (SELECT 1) UPDATE t SET value = 1",
+            "WITH `source\\` AS (SELECT 1) DELETE FROM t",
+            "WITH table AS (SELECT 1) UPDATE t SET value = 1",
+            "FROM source INSERT INTO target SELECT * FROM source",
+            "WITH source AS (SELECT 1) FROM source INSERT INTO target SELECT * FROM source",
+            "FROM source INSERT WITH SCHEMA EVOLUTION OVERWRITE target SELECT * FROM source",
+            "FROM source INSERT ONCE INTO ONCE target SELECT * FROM source",
+        ] {
+            assert!(sql_is_dml(sql), "expected DML: {sql}");
+        }
+    }
+
+    #[test]
+    fn rejects_queries_and_dml_words_inside_ctes() {
+        for sql in [
+            "SELECT 7 AS num_affected_rows",
+            "WITH source AS (SELECT 'INSERT INTO t' AS value) SELECT * FROM source",
+            "WITH source AS (SELECT 1 -- \\\n) UPDATE t\n) SELECT * FROM source",
+            "WITH update AS (SELECT 7 AS num_affected_rows) SELECT * FROM update",
+            "WITH source AS (SELECT 1) VALUES (2)",
+            "WITH source AS (SELECT 1) TABLE source",
+            "WITH source AS (SELECT 1) (SELECT * FROM source)",
+            "FROM source SELECT 'INSERT INTO target'",
+            "FROM insert SELECT *",
+            "WITH source AS (SELECT 1) FROM source SELECT *",
+            "EXPLAIN UPDATE t SET value = 1",
+            "CREATE TABLE t AS SELECT 1",
+            "WITH source AS (SELECT 1",
+        ] {
+            assert!(!sql_is_dml(sql), "expected non-DML: {sql}");
+        }
+    }
 
     /// Build a single-batch `ResultStream` from `(name, Int64 values)` columns.
     async fn count_stream(cols: &[(&str, &[i64])]) -> ResultStream {

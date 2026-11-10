@@ -1201,7 +1201,8 @@ mod tests {
             &self,
             _statement_id: &str,
             _session_attribution: crate::client::SessionAttribution,
-        ) -> Result<Option<ExecuteResult>> {
+            _infer_num_modified_rows: bool,
+        ) -> Result<crate::client::FetchResultOutcome> {
             unimplemented!("fetch_completed_result not used by the link-fetcher mock")
         }
 
@@ -1209,6 +1210,7 @@ mod tests {
             &self,
             _statement_id: &str,
             _session_attribution: crate::client::SessionAttribution,
+            _infer_num_modified_rows: bool,
         ) -> Result<crate::client::ExecuteResponse> {
             unimplemented!("statement_status not used by the link-fetcher mock")
         }

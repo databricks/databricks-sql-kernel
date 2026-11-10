@@ -1974,13 +1974,15 @@ mod tests {
             &self,
             _: &str,
             _: crate::client::SessionAttribution,
-        ) -> Result<Option<ExecuteResult>> {
+            _: bool,
+        ) -> Result<crate::client::FetchResultOutcome> {
             unreachable!()
         }
         async fn statement_status(
             &self,
             _: &str,
             _: crate::client::SessionAttribution,
+            _: bool,
         ) -> Result<ExecuteResponse> {
             unreachable!()
         }

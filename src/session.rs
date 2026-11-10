@@ -713,6 +713,9 @@ impl Session {
     /// what lets `get_query_state` re-attach on every poll without the
     /// poll loop closing the statement it's watching.)
     ///
+    /// Without submitted SQL, attached handles preserve wire-provided counts but
+    /// do not infer counts from result-column names.
+    ///
     /// [`status`]: ExecutedAsyncStatement::status
     /// [`close`]: ExecutedAsyncStatement::close
     /// [`cancel`]: ExecutedAsyncStatement::cancel
@@ -734,7 +737,7 @@ impl Session {
             let response = self
                 .inner
                 .transport()
-                .statement_status(&statement_id, SessionAttribution::Detached)
+                .statement_status(&statement_id, SessionAttribution::Detached, false)
                 .await
                 .map_err(|e| e.with_query_id(&statement_id))?;
             // NON-OWNING read-only adopt: `new_attached` gives the handle

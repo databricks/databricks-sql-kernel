@@ -31,7 +31,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle,
+    AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle,
     GeospatialResultRepresentation, HttpConfig, ResultBatch, ResultConfig, Session, TryNextBatch,
     TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
@@ -2155,6 +2155,78 @@ async fn executed_statement_status_fields_default_to_none() {
     assert_eq!(exec.error_details_json(), None);
 
     exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn select_alias_matching_dml_count_does_not_set_modified_rows() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    let batch = int64_batch("num_affected_rows", vec![7]);
+    mount_execute(
+        &server,
+        succeeded_inline_body("stmt-select-counter-alias", &batch),
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS num_affected_rows");
+    let mut exec = stmt.execute().await.expect("execute");
+
+    assert_eq!(exec.num_modified_rows(), None);
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        7
+    );
+
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_direct_running_select_only_uses_wire_modified_row_count() {
+    for (wire_count, expected) in [(None, None), (Some(11), Some(11))] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+
+        mount_execute(&server, running_body("stmt-direct-select-alias")).await;
+        let batch = int64_batch("num_affected_rows", vec![7]);
+        mount_status(
+            &server,
+            "stmt-direct-select-alias",
+            succeeded_inline_body_with_status(
+                "stmt-direct-select-alias",
+                &batch,
+                wire_count,
+                None,
+                None,
+                None,
+            ),
+        )
+        .await;
+
+        let session = open_session(&server).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 7 AS num_affected_rows");
+        let DirectStatement::Running(async_exec) =
+            stmt.execute_direct().await.expect("execute direct")
+        else {
+            panic!("running response must return an asynchronous handle");
+        };
+
+        async_exec.status().await.expect("status");
+        assert_eq!(async_exec.num_modified_rows(), expected);
+        async_exec.close().await.expect("close");
+    }
 }
 
 #[tokio::test]

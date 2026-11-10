@@ -66,12 +66,13 @@ use databricks_sql_kernel::c_abi::statement::{
     kernel_executed_async_statement_num_modified_rows, kernel_executed_async_statement_query_id,
     kernel_executed_async_statement_status, kernel_executed_async_statement_t,
     kernel_executed_statement_close, kernel_executed_statement_get_result_stream,
-    kernel_executed_statement_query_id, kernel_executed_statement_t,
-    kernel_statement_bind_parameter, kernel_statement_canceller_cancel,
-    kernel_statement_canceller_free, kernel_statement_canceller_new, kernel_statement_canceller_t,
-    kernel_statement_close, kernel_statement_execute, kernel_statement_execute_with_timeout_ms,
-    kernel_statement_set_sql, kernel_statement_submit, kernel_statement_submit_with_timeout_ms,
-    kernel_statement_t, KernelStatementStatusKind, MAX_CLIENT_QUERY_TIMEOUT_MS,
+    kernel_executed_statement_num_modified_rows, kernel_executed_statement_query_id,
+    kernel_executed_statement_t, kernel_statement_bind_parameter,
+    kernel_statement_canceller_cancel, kernel_statement_canceller_free,
+    kernel_statement_canceller_new, kernel_statement_canceller_t, kernel_statement_close,
+    kernel_statement_execute, kernel_statement_execute_with_timeout_ms, kernel_statement_set_sql,
+    kernel_statement_submit, kernel_statement_submit_with_timeout_ms, kernel_statement_t,
+    KernelStatementStatusKind, MAX_CLIENT_QUERY_TIMEOUT_MS,
 };
 use databricks_sql_kernel::c_abi::KernelStatusCode;
 use serde_json::json;
@@ -575,6 +576,64 @@ fn async_c_abi_num_modified_rows_after_materialise() {
         );
         assert_eq!(
             kernel_executed_async_statement_close(exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);
+        assert_eq!(kernel_session_close(session), KernelStatusCode::Success);
+    }
+}
+
+#[test]
+fn sync_c_abi_select_alias_is_not_a_modified_row_count() {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let server = rt.block_on(async {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any(&server).await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(succeeded_dml_count_body("stmt-select-alias", 7)),
+            )
+            .mount(&server)
+            .await;
+        server
+    });
+
+    unsafe {
+        let session = open_session_c_abi(&server.uri());
+        let mut stmt = std::ptr::null_mut();
+        assert_eq!(
+            kernel_session_new_statement(session, &mut stmt),
+            KernelStatusCode::Success
+        );
+        let sql = CString::new("SELECT 7 AS num_affected_rows").unwrap();
+        assert_eq!(
+            kernel_statement_set_sql(stmt, sql.as_ptr()),
+            KernelStatusCode::Success
+        );
+
+        let mut exec: *mut kernel_executed_statement_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_statement_execute(stmt, &mut exec),
+            KernelStatusCode::Success
+        );
+        assert_eq!(kernel_executed_statement_num_modified_rows(exec), -1);
+
+        let mut stream: *mut kernel_result_stream_t = std::ptr::null_mut();
+        assert_eq!(
+            kernel_executed_statement_get_result_stream(exec, &mut stream),
+            KernelStatusCode::Success
+        );
+        assert!(!stream.is_null());
+
+        assert_eq!(
+            kernel_result_stream_close(stream),
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            kernel_executed_statement_close(exec),
             KernelStatusCode::Success
         );
         assert_eq!(kernel_statement_close(stmt), KernelStatusCode::Success);

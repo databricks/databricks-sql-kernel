@@ -44,7 +44,7 @@
 //! class) can route through whichever handle their language idiom
 //! prefers; field availability is identical.
 
-use crate::client::{ExecuteResponse, ExecutionTimeout, SessionAttribution};
+use crate::client::{ExecuteResponse, ExecutionTimeout, FetchResultOutcome, SessionAttribution};
 use crate::kernel_error::{Error, Result};
 use crate::klog::warn;
 use crate::result_stream::ResultStream;
@@ -201,6 +201,7 @@ pub struct ExecutedAsyncStatement {
     /// server-side cancel. (`Drop` / `close()` are already inert on
     /// attached handles via `closed=true`.)
     owning: bool,
+    infer_num_modified_rows: bool,
     session_attribution: SessionAttribution,
     /// Last SEA `StatementStatus` observed by this handle (initial
     /// `submit_statement` response or any subsequent `status()` /
@@ -273,6 +274,20 @@ fn deadline_policy(timeout: ExecutionTimeout) -> (Option<std::time::Instant>, bo
     }
 }
 
+pub(crate) struct AsyncExecutionOptions {
+    timeout: ExecutionTimeout,
+    infer_num_modified_rows: bool,
+}
+
+impl AsyncExecutionOptions {
+    pub(crate) fn new(timeout: ExecutionTimeout, infer_num_modified_rows: bool) -> Self {
+        Self {
+            timeout,
+            infer_num_modified_rows,
+        }
+    }
+}
+
 impl ExecutedAsyncStatement {
     /// Produce the stable client query-timeout error and schedule bounded,
     /// best-effort server cleanup when a deadline retained across
@@ -317,8 +332,12 @@ impl ExecutedAsyncStatement {
         closed: Arc<AtomicBool>,
         initial_status: crate::types::sea::StatementStatus,
         statement_telemetry: StatementTelemetry,
-        timeout: ExecutionTimeout,
+        options: AsyncExecutionOptions,
     ) -> Self {
+        let AsyncExecutionOptions {
+            timeout,
+            infer_num_modified_rows,
+        } = options;
         let (client_deadline, poll_timeout_disabled) = deadline_policy(timeout);
         let initial_terminal = initial_status.state.is_terminal();
         Self {
@@ -329,6 +348,7 @@ impl ExecutedAsyncStatement {
             owner_released: Arc::new(AtomicBool::new(false)),
             // The submitting handle owns the statement lifecycle.
             owning: true,
+            infer_num_modified_rows,
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry,
@@ -369,6 +389,7 @@ impl ExecutedAsyncStatement {
             Arc::new(AtomicBool::new(false)),
             SessionAttribution::Detached,
             initial_status,
+            false,
         )
     }
 
@@ -379,6 +400,7 @@ impl ExecutedAsyncStatement {
         owner_released: Arc<AtomicBool>,
         session_attribution: SessionAttribution,
         initial_status: crate::types::sea::StatementStatus,
+        infer_num_modified_rows: bool,
     ) -> Self {
         let initial_terminal = initial_status.state.is_terminal();
         Self {
@@ -388,6 +410,7 @@ impl ExecutedAsyncStatement {
             closed: Arc::new(AtomicBool::new(true)),
             owner_released,
             owning: false,
+            infer_num_modified_rows,
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             statement_telemetry: StatementTelemetry::noop(),
@@ -416,6 +439,7 @@ impl ExecutedAsyncStatement {
                 Arc::clone(&self.owner_released),
                 self.session_attribution,
                 status,
+                self.infer_num_modified_rows,
             ),
         })
     }
@@ -504,15 +528,11 @@ impl ExecutedAsyncStatement {
             .and_then(|s| s.error_details_json.clone())
     }
 
-    /// Internal helper — overwrite the cached `StatementStatus` with
-    /// a fresh poll's response. Called by `status()` /
-    /// `await_result()` after every successful
-    /// `statement_status` RPC. Lock poisoning is intentionally
-    /// swallowed: a poisoned lock here would only happen if a panic
-    /// landed mid-write, and the recovery path is to keep the prior
-    /// status visible (worse: a fresh poll's status lost; better:
-    /// the handle's accessor surface keeps working).
+    /// A poisoned cache retains its last visible status so accessors remain usable.
     fn record_latest_status(&self, fresh: crate::types::sea::StatementStatus) {
+        if fresh.state.is_terminal() {
+            self.terminal_observed.store(true, Ordering::Release);
+        }
         if let Ok(mut guard) = self.latest_status.lock() {
             *guard = fresh;
         }
@@ -574,10 +594,11 @@ impl ExecutedAsyncStatement {
                 return Err(self.expire_client_query_timeout());
             }
             let status_started = std::time::Instant::now();
-            let poll = self
-                .session
-                .transport()
-                .statement_status(&self.statement_id, self.session_attribution);
+            let poll = self.session.transport().statement_status(
+                &self.statement_id,
+                self.session_attribution,
+                self.infer_num_modified_rows,
+            );
             let response = match self.client_deadline {
                 Some(deadline) if enforce_deadline => {
                     let poll_deadline = deadline
@@ -602,12 +623,6 @@ impl ExecutedAsyncStatement {
             // reflect what THIS handle has observed (instead of the
             // stale initial-submit snapshot).
             self.record_latest_status(response.status.clone());
-            // Latch the terminal observation so subsequent `status()`
-            // calls stop enforcing the client deadline against this
-            // already-finished statement.
-            if response.status.state.is_terminal() {
-                self.terminal_observed.store(true, Ordering::Release);
-            }
             let status = StatementStatus::from_sea_response(&response);
             if enforce_deadline
                 && matches!(status, StatementStatus::Pending | StatementStatus::Running)
@@ -709,10 +724,11 @@ impl ExecutedAsyncStatement {
                     return Err(self.expire_client_query_timeout());
                 }
                 let status_started = std::time::Instant::now();
-                let poll = self
-                    .session
-                    .transport()
-                    .statement_status(&self.statement_id, self.session_attribution);
+                let poll = self.session.transport().statement_status(
+                    &self.statement_id,
+                    self.session_attribution,
+                    self.infer_num_modified_rows,
+                );
                 let response = match self.client_deadline {
                     Some(deadline) if enforce_deadline => {
                         let poll_deadline = deadline
@@ -744,12 +760,6 @@ impl ExecutedAsyncStatement {
                 // accessors reflect THIS poll's observation — not the
                 // initial-submit snapshot that's now stale by minutes.
                 self.record_latest_status(response.status.clone());
-                // Latch the terminal observation so a later `status()`
-                // call stops enforcing the client deadline against this
-                // already-finished statement.
-                if response.status.state.is_terminal() {
-                    self.terminal_observed.store(true, Ordering::Release);
-                }
                 match StatementStatus::from_sea_response(&response) {
                     StatementStatus::Succeeded | StatementStatus::Closed => {
                         if let Some(g) = cancel_guard.take() {
@@ -842,15 +852,20 @@ impl ExecutedAsyncStatement {
         let result = self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id, self.session_attribution)
+            .fetch_completed_result(
+                &self.statement_id,
+                self.session_attribution,
+                self.infer_num_modified_rows,
+            )
             .await?;
         self.check_read_validity()?;
         match result {
-            Some(result) => {
+            FetchResultOutcome::Ready(result) => {
                 self.statement_telemetry.on_result_metadata(
                     result.telemetry_result_format,
                     result.telemetry_is_compressed,
                 );
+                self.record_latest_status(result.status.clone());
                 // If the server already auto-closed the statement
                 // (`state == Closed`), pre-set the shared `closed` flag so
                 // this handle's `close()` / `Drop` — and `invalidate_prior`
@@ -870,7 +885,7 @@ impl ExecutedAsyncStatement {
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
                 // `num_modified_rows()` matches the sync path / Thrift.
-                if self.num_modified_rows().is_none() {
+                if self.infer_num_modified_rows && self.num_modified_rows().is_none() {
                     if let Some(n) =
                         crate::statement::dml_count::read_dml_affected_rows(&mut stream).await?
                     {
@@ -884,7 +899,7 @@ impl ExecutedAsyncStatement {
                     .store(true, Ordering::Release);
                 Ok(stream)
             }
-            None => {
+            FetchResultOutcome::NotReady => {
                 // Re-read the status so the error message names the
                 // observed state (Pending vs Running). Best-effort —
                 // if the status call itself fails, fall back to the
@@ -892,7 +907,7 @@ impl ExecutedAsyncStatement {
                 let observed = match self
                     .session
                     .transport()
-                    .statement_status(&self.statement_id, self.session_attribution)
+                    .statement_status(&self.statement_id, self.session_attribution, false)
                     .await
                 {
                     Ok(r) => match r.status.state {
@@ -909,6 +924,10 @@ impl ExecutedAsyncStatement {
                      reports Succeeded / Closed",
                     self.statement_id, observed
                 )))
+            }
+            FetchResultOutcome::TerminalError { error, status } => {
+                self.record_latest_status(status);
+                Err(error)
             }
         }
     }

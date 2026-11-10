@@ -20,8 +20,8 @@
 use crate::client::retry::RequestType;
 use crate::client::{
     ChunkLinkFetchResult, DatabricksHttpClient, DirectOutcome, ExecuteResponse, ExecuteResult,
-    ExecuteResultData, ExecutionTimeout, InlineChunkFetchResult, SessionAttribution, SessionInfo,
-    Transport, TransportConfig,
+    ExecuteResultData, ExecutionTimeout, FetchResultOutcome, InlineChunkFetchResult,
+    SessionAttribution, SessionInfo, Transport, TransportConfig,
 };
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -128,10 +128,6 @@ enum SessionRoute {
 struct TerminalExecution {
     statement_id: String,
     outcome: TerminalExecutionOutcome,
-    /// Whether the terminal response came from GetStatementStatus. The old
-    /// synchronous path enriched those responses with a DML count, but not an
-    /// initial terminal ExecuteStatement response.
-    response_from_poll: bool,
 }
 
 /// Terminal-state mapping belongs to execution, while reader/schema creation
@@ -434,18 +430,19 @@ impl SeaRestTransport {
 
     /// Fetch statement status for callers that expose the status directly.
     ///
-    /// Unlike the synchronous execution loop, async status callers need the DML row
-    /// count before fetching the result, so this path retains the existing enrichment.
     async fn get_statement_status(
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
+        infer_num_modified_rows: bool,
     ) -> Result<ExecuteResponse> {
         let mut response = self
             .get_statement_status_raw(statement_id, session_attribution)
             .await?;
-        self.enrich_num_modified_rows(&mut response, session_attribution)
-            .await;
+        if infer_num_modified_rows {
+            self.enrich_num_modified_rows(&mut response, session_attribution)
+                .await;
+        }
         Ok(response)
     }
 
@@ -459,8 +456,8 @@ impl SeaRestTransport {
     /// explicit result fetch. No extra round-trip: the count rides on the status
     /// poll the caller already made.
     ///
-    /// Gated on the manifest's column signature so SELECTs (real columns) never
-    /// hit the decode path; a DML-count result is always tiny and inline.
+    /// Callers must enable this only for submitted DML because aliases can exactly
+    /// match the result signature.
     async fn enrich_num_modified_rows(
         &self,
         response: &mut ExecuteResponse,
@@ -587,10 +584,9 @@ impl SeaRestTransport {
         response: ExecuteResponse,
         timeout: ExecutionTimeout,
         status_request_in_flight: &AtomicBool,
-    ) -> Result<(ExecuteResponse, bool)> {
+    ) -> Result<ExecuteResponse> {
         let started = std::time::Instant::now();
         let mut current_response = response;
-        let mut response_from_poll = false;
 
         loop {
             match current_response.status.state {
@@ -635,13 +631,12 @@ impl SeaRestTransport {
                         .await;
                     status_request_in_flight.store(false, Ordering::Release);
                     current_response = status_result?;
-                    response_from_poll = true;
                 }
                 StatementState::Succeeded
                 | StatementState::Failed
                 | StatementState::Canceled
                 | StatementState::Closed => {
-                    return Ok((current_response, response_from_poll));
+                    return Ok(current_response);
                 }
             }
         }
@@ -846,7 +841,7 @@ impl SeaRestTransport {
             }
         }
 
-        let (response, response_from_poll) = self
+        let response = self
             .wait_for_terminal(response, timeout, status_request_in_flight)
             .await
             .map_err(|error| TerminalExecutionFailure {
@@ -865,7 +860,6 @@ impl SeaRestTransport {
         Ok(TerminalExecution {
             statement_id,
             outcome,
-            response_from_poll,
         })
     }
 
@@ -1012,9 +1006,8 @@ impl SeaRestTransport {
         let TerminalExecution {
             statement_id,
             outcome,
-            response_from_poll,
         } = terminal;
-        let mut response = match outcome {
+        let response = match outcome {
             TerminalExecutionOutcome::Succeeded(response) => response,
             TerminalExecutionOutcome::Failed(error) => {
                 self.close_orphaned_statement(&statement_id, "terminal_outcome")
@@ -1022,15 +1015,6 @@ impl SeaRestTransport {
                 return Err(error);
             }
         };
-        // Preserve the old sync behavior: a terminal GetStatementStatus response
-        // is DML-enriched before the result reader is handed off. It now happens
-        // after terminal mapping, keeping this result work out of the execution
-        // phase without shifting it onto the public result stream.
-        if response_from_poll {
-            self.enrich_num_modified_rows(&mut response, SessionAttribution::Current)
-                .await;
-        }
-
         let reader_factory = self.reader_factory()?;
         match self.materialise_response(reader_factory, response).await {
             Ok(result) => Ok(result),
@@ -1393,19 +1377,32 @@ impl Transport for SeaRestTransport {
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
-    ) -> Result<Option<ExecuteResult>> {
+        infer_num_modified_rows: bool,
+    ) -> Result<FetchResultOutcome> {
         let response = self
-            .get_statement_status(statement_id, session_attribution)
+            .get_statement_status(statement_id, session_attribution, infer_num_modified_rows)
             .await?;
+        let status = response.status.clone();
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
-                let reader_factory = self.reader_factory()?;
-                let reader = reader_factory
+                let reader_factory = match self.reader_factory() {
+                    Ok(reader_factory) => reader_factory,
+                    Err(error) => {
+                        return Ok(FetchResultOutcome::TerminalError { error, status });
+                    }
+                };
+                let reader = match reader_factory
                     .create_reader(&r.statement_id, &r, session_attribution)
-                    .await?;
+                    .await
+                {
+                    Ok(reader) => reader,
+                    Err(error) => {
+                        return Ok(FetchResultOutcome::TerminalError { error, status });
+                    }
+                };
                 let telemetry_result_format = Self::telemetry_result_format(&r);
                 let telemetry_is_compressed = Self::telemetry_is_compressed(&r);
-                Ok(Some(ExecuteResult {
+                Ok(FetchResultOutcome::Ready(ExecuteResult {
                     statement_id: r.statement_id,
                     reader,
                     manifest: r.manifest,
@@ -1414,8 +1411,8 @@ impl Transport for SeaRestTransport {
                     status: r.status,
                 }))
             }
-            StatementOutcome::NotReady(_) => Ok(None),
-            StatementOutcome::Err(e) => Err(e),
+            StatementOutcome::NotReady(_) => Ok(FetchResultOutcome::NotReady),
+            StatementOutcome::Err(error) => Ok(FetchResultOutcome::TerminalError { error, status }),
         }
     }
 
@@ -1423,8 +1420,9 @@ impl Transport for SeaRestTransport {
         &self,
         statement_id: &str,
         session_attribution: SessionAttribution,
+        infer_num_modified_rows: bool,
     ) -> Result<ExecuteResponse> {
-        self.get_statement_status(statement_id, session_attribution)
+        self.get_statement_status(statement_id, session_attribution, infer_num_modified_rows)
             .await
     }
 
@@ -1998,7 +1996,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn execute_statement_enriches_polled_dml_before_result_handoff() {
+    async fn execute_statement_leaves_dml_inference_to_statement_layer() {
         use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2047,12 +2045,8 @@ mod tests {
             .await
             .expect("polled DML execution must succeed");
 
-        // Assert at the transport boundary, before Statement::execute can
-        // derive the same value from its public ResultStream fallback.
-        assert_eq!(result.status.num_modified_rows, Some(9));
+        assert_eq!(result.status.num_modified_rows, None);
 
-        // Enrichment uses an independent throwaway reader. The reader handed
-        // to the caller must still contain the DML summary row.
         let mut stream = ResultStream::from_reader(result.reader)
             .await
             .expect("result reader must initialise");
@@ -2802,7 +2796,7 @@ mod tests {
             .await
             .expect("execute must succeed");
         transport
-            .get_statement_status("statement-1", SessionAttribution::Current)
+            .get_statement_status("statement-1", SessionAttribution::Current, false)
             .await
             .expect("owned status must succeed");
         transport
@@ -2933,8 +2927,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn attached_dml_reads_use_standard_urls_without_advancing_session_version() {
-        use wiremock::matchers::{method, path, query_param};
+    async fn attached_status_preserves_wire_count_without_advancing_session_version() {
+        use wiremock::matchers::{method, path};
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
         let server = MockServer::start().await;
@@ -2954,44 +2948,21 @@ mod tests {
 
         let mut response: serde_json::Value =
             serde_json::from_str(&succeeded_inline_dml_body("attached", 9)).unwrap();
-        let mut chunk = response["result"].clone();
-        chunk["chunk_index"] = json!(1);
-        let schema = Schema::new(vec![Field::new(
-            "num_affected_rows",
-            DataType::Int64,
-            false,
-        )]);
-        let mut empty_ipc = Vec::new();
-        StreamWriter::try_new(&mut empty_ipc, &schema)
-            .unwrap()
-            .finish()
-            .unwrap();
         response["status"]["session_version"] = json!({ "version_id": 11 });
-        response["manifest"]["total_chunk_count"] = json!(2);
-        response["result"]["attachment"] = json!(STANDARD.encode(&empty_ipc));
-        response["result"]["row_count"] = json!(0);
-        response["result"]["next_chunk_index"] = json!(1);
+        response["status"]["num_modified_rows"] = json!(9);
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/attached"))
             .respond_with(ResponseTemplate::new(200).set_body_json(response))
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path("/api/2.0/sql/statements/attached/result/chunks/1"))
-            .and(query_param("row_offset", "0"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(chunk))
-            .expect(1)
-            .mount(&server)
-            .await;
-
         let transport = create_ready_test_client_against(&server.uri(), TransportConfig::default());
         transport
             .create_session(None, None, HashMap::new())
             .await
             .expect("session creation must succeed");
         let status = transport
-            .get_statement_status("attached", SessionAttribution::Detached)
+            .get_statement_status("attached", SessionAttribution::Detached, false)
             .await
             .expect("attached status must succeed");
 
@@ -3090,7 +3061,7 @@ mod tests {
             .await
             .expect("FAST execution must send the initial session version");
         transport
-            .get_statement_status("statement-1", SessionAttribution::Current)
+            .get_statement_status("statement-1", SessionAttribution::Current, false)
             .await
             .expect("session-owned polling must observe the terminal version");
         assert_eq!(
@@ -3186,7 +3157,7 @@ mod tests {
         transport.observe_session_version(Some(SessionVersion { version_id: 7 }));
 
         transport
-            .get_statement_status("owned", SessionAttribution::Current)
+            .get_statement_status("owned", SessionAttribution::Current, false)
             .await
             .expect("session-owned polling must succeed");
         assert_eq!(
@@ -3195,7 +3166,7 @@ mod tests {
         );
 
         transport
-            .statement_status("detached", SessionAttribution::Detached)
+            .statement_status("detached", SessionAttribution::Detached, false)
             .await
             .expect("detached polling must succeed");
         assert_eq!(

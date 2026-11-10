@@ -60,7 +60,7 @@ use crate::klog::{debug, warn};
 use crate::result_stream::ResultStream;
 use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
-use crate::statement::executed_async::ExecutedAsyncStatement;
+use crate::statement::executed_async::{AsyncExecutionOptions, ExecutedAsyncStatement};
 use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
 use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec};
 use crate::statement::validity::ValidityFlag;
@@ -352,6 +352,7 @@ impl Statement {
         let result = async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
+            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -417,7 +418,7 @@ impl Statement {
             // result (non-consuming — the count row still reaches the
             // caller's fetch) so `num_modified_rows()` matches Thrift.
             let mut status = result.status;
-            if status.num_modified_rows.is_none() {
+            if infer_num_modified_rows && status.num_modified_rows.is_none() {
                 status.num_modified_rows =
                     crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
             }
@@ -479,6 +480,7 @@ impl Statement {
         let result = async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
+            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -548,7 +550,7 @@ impl Statement {
                 // the first poll.
                 response.status,
                 telemetry_for_body,
-                timeout,
+                AsyncExecutionOptions::new(timeout, infer_num_modified_rows),
             ))
         }
         .instrument(span)
@@ -603,6 +605,7 @@ impl Statement {
             // alive) is what makes the Completed arm's `close()` a no-op and lets
             // fire-and-forget DDL commit.
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
+            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -674,7 +677,10 @@ impl Statement {
                         closed,
                         resp.status,
                         telemetry_for_body,
-                        ExecutionTimeout::Default,
+                        AsyncExecutionOptions::new(
+                            ExecutionTimeout::Default,
+                            infer_num_modified_rows,
+                        ),
                     )))
                 }
             }

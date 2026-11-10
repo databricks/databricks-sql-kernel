@@ -1280,6 +1280,159 @@ async fn async_status_call_refreshes_cached_status() {
 }
 
 #[tokio::test]
+async fn async_fetch_result_caches_wire_modified_row_count() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-fetch-wire-count")).await;
+    let batch = int64_batch("value", vec![1]);
+    mount_status_sequence(
+        &server,
+        "stmt-fetch-wire-count",
+        vec![succeeded_inline_body_with_status(
+            "stmt-fetch-wire-count",
+            &batch,
+            Some(17),
+            None,
+            None,
+            None,
+        )],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let async_exec = stmt
+        .submit_with_timeout(std::time::Duration::from_millis(100))
+        .await
+        .expect("submit");
+    assert_eq!(async_exec.num_modified_rows(), None);
+
+    let mut stream = async_exec.fetch_result().await.expect("fetch result");
+    assert_eq!(drain(&mut stream).await.len(), 1);
+    assert_eq!(async_exec.num_modified_rows(), Some(17));
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let status = async_exec.status().await.unwrap();
+    assert!(matches!(status, StatementStatus::Succeeded), "{status:?}");
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_fetch_result_caches_failed_terminal_status() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-fetch-failed")).await;
+    mount_status_sequence(
+        &server,
+        "stmt-fetch-failed",
+        vec![failed_body("stmt-fetch-failed", "table not found", "42P01")],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT * FROM missing_table");
+    let async_exec = stmt
+        .submit_with_timeout(std::time::Duration::from_millis(100))
+        .await
+        .expect("submit");
+
+    let error = match async_exec.fetch_result().await {
+        Ok(_) => panic!("fetch_result on FAILED should error"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::SqlError);
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let status = async_exec.status().await.expect("status");
+    assert!(matches!(status, StatementStatus::Failed(_)), "{status:?}");
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_fetch_result_caches_terminal_status_when_reader_creation_fails() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-fetch-invalid-arrow")).await;
+    let batch = int64_batch("value", vec![1]);
+    let mut response: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-fetch-invalid-arrow", &batch)).unwrap();
+    response["result"]["attachment"] = json!(STANDARD.encode(b"not an Arrow stream"));
+    mount_status_sequence(
+        &server,
+        "stmt-fetch-invalid-arrow",
+        vec![response.to_string()],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1");
+    let async_exec = stmt
+        .submit_with_timeout(std::time::Duration::from_millis(100))
+        .await
+        .expect("submit");
+
+    assert!(
+        async_exec.fetch_result().await.is_err(),
+        "fetch_result with invalid Arrow data should error"
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let status = async_exec.status().await.expect("status");
+    assert!(matches!(status, StatementStatus::Succeeded), "{status:?}");
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn async_select_alias_matching_dml_count_does_not_set_modified_rows() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+
+    mount_submit(&server, pending_body("stmt-async-select-counter-alias")).await;
+    let batch = int64_batch("num_affected_rows", vec![7]);
+    mount_status_sequence(
+        &server,
+        "stmt-async-select-counter-alias",
+        vec![succeeded_inline_body(
+            "stmt-async-select-counter-alias",
+            &batch,
+        )],
+    )
+    .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS num_affected_rows");
+    let async_exec = stmt.submit().await.expect("submit");
+    let mut stream = async_exec.await_result().await.expect("await result");
+
+    assert_eq!(async_exec.num_modified_rows(), None);
+    let batches = drain(&mut stream).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        7
+    );
+
+    async_exec.close().await.expect("close");
+}
+
+#[tokio::test]
 async fn async_await_result_failed_carries_extended_status_fields_onto_error() {
     // Pins the async polling path's terminal-error contract,
     // companion to the sync-path `execute_failed_carries_extended_status_fields_onto_error`
@@ -1760,6 +1913,55 @@ async fn attach_seeds_status_and_reports_server_state() {
 
     let status = async_exec.status().await.expect("status");
     assert!(matches!(status, StatementStatus::Running), "{status:?}");
+}
+
+#[tokio::test]
+async fn attached_statement_only_uses_wire_modified_row_count() {
+    for (wire_count, expected) in [(None, None), (Some(11), Some(11))] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+
+        let batch = int64_batch("num_affected_rows", vec![7]);
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/stmt-attached-alias"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(
+                succeeded_inline_body_with_status(
+                    "stmt-attached-alias",
+                    &batch,
+                    wire_count,
+                    None,
+                    None,
+                    None,
+                ),
+            ))
+            .expect(2)
+            .mount(&server)
+            .await;
+
+        let session = open_session(&server).await;
+        let attached = session
+            .attach_async_statement("stmt-attached-alias")
+            .await
+            .expect("attach");
+
+        assert_eq!(attached.num_modified_rows(), expected);
+        let mut stream = attached.fetch_result().await.expect("fetch result");
+        let batches = drain(&mut stream).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(
+            batches[0]
+                .column(0)
+                .as_primitive::<arrow_array::types::Int64Type>()
+                .value(0),
+            7
+        );
+        assert_eq!(attached.num_modified_rows(), expected);
+
+        session.close().await.expect("session close");
+        server.verify().await;
+    }
 }
 
 #[tokio::test]
