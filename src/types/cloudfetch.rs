@@ -71,8 +71,7 @@ pub struct CloudFetchConfig {
     /// When > 0, consecutive small batches are concatenated into larger batches
     /// of approximately this many rows before being served to consumers.
     pub batch_merge_target_rows: usize,
-    /// Rolling-window bound for the multi-chunk inline-Arrow path
-    /// result path. Analogue of
+    /// Rolling-window bound for multi-chunk inline Arrow results. Analogue of
     /// [`Self::max_chunks_in_memory`] but for sequential inline
     /// prefetches rather than parallel cloud downloads.
     pub inline_max_chunks_in_memory: usize,
