@@ -1137,6 +1137,7 @@ impl Transport for SeaRestTransport {
         let url = self.warehouse_sessions_url();
 
         if !self.config.cloudfetch_enabled {
+            session_config.retain(|key, _| !key.eq_ignore_ascii_case("can_cloud_download"));
             session_config.insert("can_cloud_download".to_string(), "false".to_string());
         }
 
@@ -1517,15 +1518,10 @@ impl Transport for SeaRestTransport {
             ))
         })?;
 
-        // Inline-Arrow path: bytes must be present in `attachment`.
-        // If the server returned an external_links response on what
-        // we expected to be the inline path, surface a clear error
-        // (probably the `disposition = INLINE` on the execute request
-        // didn't take effect server-side).
         let bytes = chunks_response.attachment.ok_or_else(|| {
             Error::data_loss().message(format!(
                 "Inline chunk {} response missing `attachment` field — \
-                 server may have ignored the INLINE disposition and \
+                 server did not return inline Arrow data and \
                  returned a CloudFetch response. Body: {}",
                 chunk_index,
                 String::from_utf8_lossy(&body)

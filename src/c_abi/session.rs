@@ -1378,8 +1378,7 @@ pub unsafe extern "C" fn kernel_session_config_set_u2m_token_cache_config(
 /// Recognised keys (matched case-insensitively), mapping to
 /// [`ResultConfig`]:
 /// - `cloudfetch_enabled` = `"true"` / `"false"` — `false` serves every
-///   result inline (SEA `disposition = INLINE`), mirroring JDBC's
-///   `EnableQueryResultDownload=0`.
+///   result through paged inline delivery without cloud-storage downloads.
 /// - `cloudfetch_link_prefetch_window` = positive integer — presigned URLs
 ///   prefetched ahead of the consumer.
 /// - `cloudfetch_max_chunks_in_memory` = positive integer — decompressed

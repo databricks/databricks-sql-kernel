@@ -15,15 +15,8 @@
 //! C-ABI wiremock tests for the client-side result-config surface
 //! (`kernel_session_config_set_client_conf`).
 //!
-//! These prove the client-side knobs actually reach the wire / kernel
-//! behaviour through the C ABI — closing the gap where the C ABI
-//! previously could not reach `ResultConfig` at all (only the legacy
-//! `cloudfetch_max_chunks_in_memory` magic string). The headline check:
-//! opening a session with `cloudfetch_enabled = false` via
-//! `set_client_conf` makes every `ExecuteStatement` carry SEA
-//! `disposition = INLINE` (see #196 for why that, not a
-//! `can_cloud_download` session conf, is the correct mechanism), while the
-//! default carries `INLINE_OR_EXTERNAL_LINKS`.
+//! Verifies result configuration through the C ABI, including paged
+//! inline delivery when cloud-storage downloads are disabled.
 
 use std::ffi::CString;
 

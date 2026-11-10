@@ -400,10 +400,26 @@ async fn create_session_with_cloudfetch_disabled_requests_inline_results() {
 
     let mut result = ResultConfig::default();
     result.cloudfetch_enabled = false;
-    let session = open_session_with_result_cfg(&server, result)
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .session_conf(std::collections::HashMap::from([
+            ("Can_Cloud_Download".into(), "true".into()),
+            ("TIMEZONE".into(), "UTC".into()),
+        ]))
+        .open()
         .await
         .expect("session open with cloudfetch_enabled=false");
     assert_eq!(session.session_id(), "sess-cf-off");
+    let body = create_session_body(&server).await;
+    assert!(body["session_confs"].get("Can_Cloud_Download").is_none());
+    assert_eq!(body["session_confs"]["TIMEZONE"], "UTC");
 
     assert_eq!(
         create_session_body(&server)

@@ -391,11 +391,6 @@ impl Session {
         //    install factory.
         let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig {
-            // Thread the connection-level CloudFetch toggle onto the
-            // transport so every ExecuteStatement picks the right SEA
-            // disposition (INLINE_OR_EXTERNAL_LINKS vs INLINE). This is
-            // how cloud-fetch is disabled on SEA — see TransportConfig
-            // and issue #196; there is no CAN_CLOUD_DOWNLOAD session conf.
             cloudfetch_enabled: config.result.cloudfetch_enabled,
             ..TransportConfig::default()
         };

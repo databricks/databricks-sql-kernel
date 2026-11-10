@@ -1682,6 +1682,42 @@ async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
 }
 
 #[tokio::test]
+async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloading() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let batch = int64_batch("n", vec![7]);
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-cf-off", &batch)).unwrap();
+    body["result"] = json!({"external_links": [{
+        "external_link": format!("{}/storage/chunk.arrow", server.uri()),
+        "chunk_index": 0, "row_offset": 0, "row_count": 1,
+        "byte_count": 100, "expiration": "2099-01-01T00:00:00Z",
+    }]});
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path("/storage/chunk.arrow"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let error = match stmt.execute().await {
+        Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
+        Err(error) => error,
+    };
+    assert!(
+        error.to_string().contains("CloudFetch is disabled"),
+        "{error}"
+    );
+}
+
+#[tokio::test]
 async fn execute_running_then_succeeded_polls_status() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
