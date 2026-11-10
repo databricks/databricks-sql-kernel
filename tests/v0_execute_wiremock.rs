@@ -1716,7 +1716,7 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::InvalidArgument);
+    assert_eq!(error.code, ErrorCode::DataLoss);
     assert!(
         error.to_string().contains("CloudFetch is disabled"),
         "{error}"

@@ -1104,7 +1104,7 @@ pub struct ResultConfig {
     /// Maximum number of decompressed Arrow chunks the inline-Arrow
     /// streaming reader holds in memory at once. Analogue of
     /// [`Self::cloudfetch_max_chunks_in_memory`] for the inline path
-    /// (used when [`Self::cloudfetch_enabled`] is `false`).
+    /// result path.
     ///
     /// The inline path is sequential per the SEA contract — one
     /// `GetResultData` call at a time — so this knob bounds the
