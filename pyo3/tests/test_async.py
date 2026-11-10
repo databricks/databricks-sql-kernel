@@ -122,8 +122,8 @@ def test_use_after_close_raises_kernel_error(session):
     stmt.close()
 
 
-@pytest.mark.parametrize("failed", [False, True], ids=["succeeded", "failed"])
-def test_reader_preserves_session_and_maps_errors(failed):
+@pytest.mark.parametrize("failed,count", [(False, 0), (True, None)])
+def test_reader_preserves_session_and_maps_errors(failed, count):
     requests = []
     statement_path = "/api/2.0/sql/warehouses/test-wh/sessions/test-session/statements/test-statement"
     response = {
@@ -154,6 +154,8 @@ def test_reader_preserves_session_and_maps_errors(failed):
             },
             "result": {"chunk_index": 0, "row_offset": 0, "row_count": 2, "attachment": attachment},
         }
+        if count is not None:
+            response["status"]["num_modified_rows"] = count
 
     class Handler(BaseHTTPRequestHandler):
         def respond(self, body, realtime=False):
@@ -196,6 +198,7 @@ def test_reader_preserves_session_and_maps_errors(failed):
             stmt = session.statement()
             stmt.set_sql("SELECT 1")
             owner = stmt.submit()
+            assert owner.num_modified_rows is None
             before_reader = len(requests)
             reader = owner.reader()
             assert len(requests) == before_reader
@@ -203,7 +206,12 @@ def test_reader_preserves_session_and_maps_errors(failed):
             assert reader.statement_id == owner.statement_id
             assert not hasattr(reader, "cancel")
             assert not hasattr(reader, "close")
+            assert reader.num_modified_rows is None
             state, failure = reader.status()
+            assert reader.num_modified_rows == count
+            assert owner.num_modified_rows is None
+            owner.status()
+            assert owner.num_modified_rows == count
             streams = []
             if failed:
                 assert state == "Failed"
@@ -220,9 +228,15 @@ def test_reader_preserves_session_and_maps_errors(failed):
                 assert (state, failure) == ("Succeeded", None)
                 streams = [reader.await_result(), reader.fetch_result()]
                 assert all(isinstance(stream, k.ResultStream) for stream in streams)
-            expected_reads = 3 if failed else 4
+            expected_reads = 4 if failed else 5
             assert [path for method, path in requests if method == "GET"] == [statement_path] * expected_reads
             owner.close()
+            with pytest.raises(k.KernelError) as error:
+                _ = owner.num_modified_rows
+            assert error.value.code == "InvalidStatementHandle"
+            with pytest.raises(k.KernelError) as error:
+                _ = reader.num_modified_rows
+            assert error.value.code == "InvalidStatementHandle"
             before_release_reads = len(requests)
             for read in (reader.status, reader.await_result, reader.fetch_result):
                 with pytest.raises(k.KernelError) as error:
