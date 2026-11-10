@@ -219,13 +219,11 @@ fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
 }
 
 #[test]
-fn c_abi_client_conf_cloudfetch_disabled_sends_inline_disposition() {
-    // The headline: a C-ABI host that disables CloudFetch via
-    // set_client_conf("cloudfetch_enabled","false") gets SEA
-    // `disposition = INLINE` on the wire — proving the client-conf channel
-    // reaches the execute path (previously unreachable from the C ABI).
-    // Mirrors the Rust-crate coverage in tests/v0_execute_wiremock.rs.
-    assert_eq!(recorded_execute_disposition(Some(false)), "INLINE");
+fn c_abi_client_conf_cloudfetch_disabled_supports_paged_arrow_results() {
+    assert_eq!(
+        recorded_execute_disposition(Some(false)),
+        "INLINE_OR_EXTERNAL_LINKS"
+    );
 }
 
 #[test]

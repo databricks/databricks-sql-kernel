@@ -159,10 +159,9 @@ operation is pending. Client query deadlines and rows-per-block slicing apply
 equally to synchronous and submitted execution. Dropping a submitted handle or
 an incompletely consumed reader triggers best-effort server cleanup.
 
-`adbc.databricks.cloudfetch.enabled` is wired to the kernel result
-configuration. The current kernel/server combination does not yet support the
-`false` path because SEA rejects inline Arrow results; disabling CloudFetch is
-therefore not a production-supported configuration in this release.
+Set `adbc.databricks.cloudfetch.enabled` to `false` to fetch results through
+the SQL connection when the application cannot access cloud storage directly.
+Large results are read in pages.
 
 ## ADBC behavior
 

@@ -658,30 +658,6 @@ impl SeaRestTransport {
     ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements", self.base_url());
 
-        // Select the result disposition per statement from the
-        // connection-level CloudFetch setting, mirroring the reference
-        // JDBC driver's SEA path (`DatabricksSdkClient.getRequest`:
-        // `cloudFetch ? INLINE_OR_EXTERNAL_LINKS : INLINE`). This is the
-        // authoritative mechanism for disabling cloud-fetch on SEA —
-        // there is NO `CAN_CLOUD_DOWNLOAD` session conf (the server
-        // rejects it at ExecuteStatement with `CONFIG_NOT_AVAILABLE`,
-        // issue #196).
-        //
-        // `INLINE`: the server serves every result inline (Arrow bytes in
-        // the response `attachment`), regardless of size. `format` stays
-        // `ARROW_STREAM` — the kernel's inline reader consumes Arrow IPC
-        // from the attachment (the SEA inline-Arrow path), so unlike JDBC
-        // we keep Arrow rather than switching to `JSON_ARRAY`.
-        //
-        // `INLINE_OR_EXTERNAL_LINKS` (the CloudFetch-enabled default): not
-        // a public API disposition but enables returning all chunk links
-        // in a single response (requires the JDBC user agent). Once
-        // EXTERNAL_LINKS supports multi-link responses, switch back to it.
-        let disposition = if self.config.cloudfetch_enabled {
-            "INLINE_OR_EXTERNAL_LINKS"
-        } else {
-            "INLINE"
-        };
         let (warehouse_id, session_id) = match self.session_route.get() {
             Some(SessionRoute::Standard { .. }) | None => (
                 Some(self.warehouse_id.clone()),
@@ -696,7 +672,7 @@ impl SeaRestTransport {
             session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
-            disposition: disposition.to_string(),
+            disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
             format: "ARROW_STREAM".to_string(),
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
@@ -1156,9 +1132,13 @@ impl Transport for SeaRestTransport {
         &self,
         catalog: Option<&str>,
         schema: Option<&str>,
-        session_config: HashMap<String, String>,
+        mut session_config: HashMap<String, String>,
     ) -> Result<SessionInfo> {
         let url = self.warehouse_sessions_url();
+
+        if !self.config.cloudfetch_enabled {
+            session_config.insert("can_cloud_download".to_string(), "false".to_string());
+        }
 
         let request_body = CreateSessionRequest {
             warehouse_id: None,

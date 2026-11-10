@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1617,19 +1617,36 @@ async fn execute_with_cloudfetch_enabled_sends_inline_or_external_links_disposit
 }
 
 #[tokio::test]
-async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
-    // Regression test for issue #196. With cloudfetch_enabled=false the
-    // ExecuteStatement disposition must be INLINE — this is how the kernel
-    // (like the JDBC / Thrift reference drivers) disables cloud-fetch on
-    // SEA, NOT via a `can_cloud_download` session conf (which SEA rejects
-    // at ExecuteStatement with CONFIG_NOT_AVAILABLE). The server then
-    // serves results inline and the statement succeeds.
+async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     mount_close_any_statement(&server).await;
     let batch = int64_batch("n", vec![7]);
-    mount_execute(&server, succeeded_inline_body("stmt-cf-off", &batch)).await;
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-cf-off", &batch)).unwrap();
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_chunk_count");
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_row_count");
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off/result/chunks/1"))
+        .and(query_param("row_offset", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk_index": 1,
+            "row_offset": 1,
+            "row_count": 1,
+            "attachment": STANDARD.encode(arrow_ipc_bytes(&int64_batch("n", vec![8]))),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let mut result = ResultConfig::default();
     result.cloudfetch_enabled = false;
@@ -1641,6 +1658,7 @@ async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
         .await
         .expect("execute must succeed inline with cloudfetch disabled");
     let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 2);
     assert_eq!(
         batches[0]
             .column(0)
@@ -1648,9 +1666,19 @@ async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
             .value(0),
         7
     );
+    assert_eq!(
+        batches[1]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        8
+    );
     exec.close().await.expect("close");
 
-    assert_eq!(recorded_execute_disposition(&server).await, "INLINE");
+    assert_eq!(
+        recorded_execute_disposition(&server).await,
+        "INLINE_OR_EXTERNAL_LINKS",
+    );
 }
 
 #[tokio::test]
