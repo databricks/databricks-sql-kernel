@@ -122,7 +122,14 @@ def test_use_after_close_raises_kernel_error(session):
     stmt.close()
 
 
-@pytest.mark.parametrize("failed,count", [(False, 0), (True, None)])
+@pytest.mark.parametrize(
+    "failed,count",
+    [
+        pytest.param(False, 3, id="succeeded-positive"),
+        pytest.param(False, 0, id="succeeded-zero"),
+        pytest.param(True, None, id="failed"),
+    ],
+)
 def test_reader_preserves_session_and_maps_errors(failed, count):
     requests = []
     statement_path = "/api/2.0/sql/warehouses/test-wh/sessions/test-session/statements/test-statement"
