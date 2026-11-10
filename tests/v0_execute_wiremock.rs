@@ -1686,7 +1686,12 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
-    mount_close_any_statement(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
     let batch = int64_batch("n", vec![7]);
     let mut body: serde_json::Value =
         serde_json::from_str(&succeeded_inline_body("stmt-cf-off", &batch)).unwrap();
@@ -1711,9 +1716,16 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
         Err(error) => error,
     };
+    assert_eq!(error.code, ErrorCode::InvalidArgument);
     assert!(
         error.to_string().contains("CloudFetch is disabled"),
         "{error}"
+    );
+    stmt.close().await.expect("close statement");
+    session.close().await.expect("close session");
+    assert_eq!(
+        wait_for_close_delete(&server, "stmt-cf-off", 1, Duration::from_secs(2)).await,
+        1,
     );
 }
 
