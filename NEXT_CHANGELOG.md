@@ -26,6 +26,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
+- Closing a `Session` now frees its transport, HTTP client and tokio runtime handle. A reference cycle between the transport and its result-reader factory kept them alive, so bindings that run one tokio runtime per session (Python) leaked four file descriptors per closed session until the process hit `Too many open files`.
 
 ---
 *Note: When making changes, please add your change under the appropriate
