@@ -219,6 +219,13 @@ async fn transfer(
     } else {
         Some(allowed_path(local_file, paths)?)
     };
+    if operation == "GET"
+        && local
+            .as_ref()
+            .is_some_and(|path| path.parent().is_none() || path.is_dir())
+    {
+        return Err(Error::invalid_argument().message("Download destination must be a file"));
+    }
     let response = send_transfer(client, method, parsed, headers, local.as_deref()).await?;
     if !response.status().is_success()
         && !(operation == "REMOVE" && response.status().as_u16() == 404)
@@ -235,12 +242,14 @@ async fn transfer(
         let parent = destination.parent().ok_or_else(|| {
             Error::invalid_argument().message("Download destination must be a file")
         })?;
-        let mut builder = tempfile::Builder::new();
+        let builder = tempfile::Builder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::PermissionsExt;
+            let mut builder = builder;
             builder.permissions(std::fs::Permissions::from_mode(0o666));
-        }
+            builder
+        };
         let temporary = builder.tempfile_in(parent).map_err(file_error)?;
         let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(file_error)?);
         let mut body = response.bytes_stream();
@@ -439,6 +448,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"contents"))
+            .expect(2)
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
@@ -475,17 +485,19 @@ mod tests {
                 expected
             );
         }
-        let error = transfer(
-            &client(),
-            "GET",
-            &server.uri(),
-            &HashMap::new(),
-            Some("/"),
-            &["/".into()],
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        for destination in [Path::new("/"), dir.path()] {
+            let error = transfer(
+                &client(),
+                "GET",
+                &server.uri(),
+                &HashMap::new(),
+                destination.to_str(),
+                &["/".into()],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidArgument);
+        }
     }
 
     #[tokio::test]

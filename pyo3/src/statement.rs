@@ -66,10 +66,10 @@ impl Statement {
         Ok(())
     }
 
-    /// Set the local paths permitted for SQL PUT and GET transfers.
-    fn set_staging_allowed_local_paths(&mut self, paths: Vec<String>) -> PyResult<()> {
+    /// Set permitted local paths; ``None`` restores caller-managed transfers.
+    fn set_staging_allowed_local_paths(&mut self, paths: Option<Vec<String>>) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
-        inner.stmt.spec().staging_allowed_local_paths = Some(paths);
+        inner.stmt.spec().staging_allowed_local_paths = paths;
         Ok(())
     }
 

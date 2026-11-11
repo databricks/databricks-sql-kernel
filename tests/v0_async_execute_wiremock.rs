@@ -2331,3 +2331,84 @@ async fn file_transfer_completion_is_shared_by_independent_readers() {
     owner.close().await.unwrap();
     session.close().await.unwrap();
 }
+
+#[tokio::test]
+async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
+    use arrow_array::StringArray;
+    use databricks_sql_kernel::DirectStatement;
+    for direct in [false, true] {
+        for denied in [false, true] {
+            let server = MockServer::start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            mount_close_any_statement(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/storage/file"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"download"))
+                .expect(if denied { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("download");
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "operation",
+                    Arc::new(StringArray::from(vec!["GET"])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "url",
+                    Arc::new(StringArray::from(vec![format!(
+                        "{}/storage/file",
+                        server.uri()
+                    )])),
+                ),
+                ("headers", Arc::new(StringArray::from(vec!["{}"]))),
+                (
+                    "local",
+                    Arc::new(StringArray::from(vec![destination.to_str().unwrap()])),
+                ),
+            ])
+            .unwrap();
+            let mut body: serde_json::Value =
+                serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
+            body["manifest"]["is_volume_operation"] = json!(true);
+            mount_submit(&server, body.to_string()).await;
+            let session = open_session(&server).await;
+            let mut statement = session.statement();
+            statement
+                .spec()
+                .sql("GET '/Volumes/c/s/v/file' TO '/tmp/download'");
+            statement.spec().staging_allowed_local_paths = Some(if denied {
+                vec![]
+            } else {
+                vec![directory.path().to_str().unwrap().into()]
+            });
+            let result = if direct {
+                match statement.execute_direct().await {
+                    Ok(DirectStatement::Completed(executed)) => Ok(executed),
+                    Ok(DirectStatement::Running(_)) => panic!("expected inline completion"),
+                    Err(error) => Err(error),
+                }
+            } else {
+                statement.execute().await
+            };
+            if denied {
+                let error = result.err().expect("denied transfer");
+                assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+                assert_eq!(error.query_id.as_deref(), Some("transfer"));
+                assert!(!destination.exists());
+            } else {
+                let mut executed = result.unwrap();
+                assert!(executed
+                    .result_stream_mut()
+                    .next_batch()
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"download");
+                executed.close().await.unwrap();
+            }
+            session.close().await.unwrap();
+        }
+    }
+}

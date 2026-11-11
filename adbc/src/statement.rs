@@ -471,14 +471,15 @@ impl Statement {
         }
         match key {
             "adbc.databricks.statement.staging_allowed_local_paths" => {
-                let paths = serde_json::from_str::<Vec<String>>(&expect_string(value, key)?)
-                    .map_err(|_| {
-                        adbc_error(
-                            "Expected a JSON array of allowed local paths",
-                            Status::InvalidArguments,
-                        )
-                    })?;
-                self.inner()?.spec().staging_allowed_local_paths = Some(paths);
+                let paths =
+                    serde_json::from_str::<Option<Vec<String>>>(&expect_string(value, key)?)
+                        .map_err(|_| {
+                            adbc_error(
+                                "Expected a JSON array of allowed local paths or null",
+                                Status::InvalidArguments,
+                            )
+                        })?;
+                self.inner()?.spec().staging_allowed_local_paths = paths;
                 Ok(())
             }
             ENABLE_DIRECT_RESULTS_OPTION => {

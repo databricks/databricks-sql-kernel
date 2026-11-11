@@ -397,15 +397,14 @@ fn volume_files_round_trip_and_remove() {
         let option =
             OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
         if statement
-            .set_option(option.clone(), OptionValue::String("null".into()))
+            .set_option(option.clone(), OptionValue::String("{}".into()))
             .is_ok()
         {
             return Err("invalid path list was accepted".into());
         }
-        statement.set_option(
-            option,
-            OptionValue::String(serde_json::to_string(&vec![directory.to_str().unwrap()])?),
-        )?;
+        statement.set_option(option.clone(), OptionValue::String("null".into()))?;
+        let paths = serde_json::to_string(&vec![directory.to_str().unwrap()])?;
+        statement.set_option(option.clone(), OptionValue::String(paths.clone()))?;
         for sql in [
             format!(
                 "PUT {} INTO {} OVERWRITE",
@@ -427,6 +426,23 @@ fn volume_files_round_trip_and_remove() {
         if fs::read(&destination)? != payload {
             return Err("downloaded bytes differ".into());
         }
+        fs::remove_file(&destination)?;
+        statement.set_option(option.clone(), OptionValue::String("null".into()))?;
+        statement.set_sql_query(format!(
+            "GET {} TO {}",
+            literal(&remote),
+            literal(destination.to_str().unwrap())
+        ))?;
+        let rows: usize = statement
+            .execute()?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        if rows != 1 || destination.exists() {
+            return Err("clearing the option did not restore raw instructions".into());
+        }
+        statement.set_option(option, OptionValue::String(paths))?;
         for _ in 0..2 {
             statement.set_sql_query(format!("REMOVE {}", literal(&remote)))?;
             statement.execute_update()?;

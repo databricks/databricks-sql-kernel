@@ -163,7 +163,7 @@ pub enum KernelStatementStatusKind {
 /// `retain_result` keeps the instruction row readable after a successful transfer.
 ///
 /// # Safety
-/// `stmt` must be live and `paths_json` must be a NUL-terminated UTF-8 string.
+/// `stmt` must be live; non-null `paths_json` must be NUL-terminated UTF-8.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_statement_set_staging_allowed_local_paths(
     stmt: *mut kernel_statement_t,
@@ -172,15 +172,16 @@ pub unsafe extern "C" fn kernel_statement_set_staging_allowed_local_paths(
 ) -> KernelStatusCode {
     with_statement(stmt, |stmt| {
         if paths_json.is_null() {
-            return Err(Error::invalid_argument().message("paths_json must not be null"));
+            stmt.spec().staging_allowed_local_paths = None;
+            return Ok(());
         }
         let json = CStr::from_ptr(paths_json)
             .to_str()
             .map_err(|_| Error::invalid_argument().message("paths_json must be UTF-8"))?;
-        let paths: Vec<String> = serde_json::from_str(json).map_err(|_| {
-            Error::invalid_argument().message("paths_json must be an array of paths")
+        let paths: Option<Vec<String>> = serde_json::from_str(json).map_err(|_| {
+            Error::invalid_argument().message("paths_json must be an array of paths or null")
         })?;
-        stmt.spec().staging_allowed_local_paths = Some(paths);
+        stmt.spec().staging_allowed_local_paths = paths;
         stmt.spec().retain_volume_operation_result = retain_result;
         Ok(())
     })
