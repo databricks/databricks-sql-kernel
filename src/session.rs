@@ -1249,9 +1249,11 @@ fn build_retry_configs_for_session(
 /// Matched case-insensitively. If a host sets two spellings of the same key
 /// differing only in case, the lexicographically-last spelling wins
 /// deterministically and all variants are stripped.
+/// An explicit typed CloudFetch disable takes precedence over the mixed bag.
 fn apply_client_result_overrides(config: &mut SessionConfig) {
     use crate::config::ClientConfKey;
 
+    let cloudfetch_disabled = !config.result.cloudfetch_enabled;
     // Recognised client keys currently present in session_conf. A key is
     // "recognised" iff it parses to a ClientConfKey (case-insensitive).
     let mut present: Vec<String> = config
@@ -1282,6 +1284,9 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
                 "ignoring invalid client-side result knob in session_conf; keeping current value",
             );
         }
+    }
+    if cloudfetch_disabled {
+        config.result.cloudfetch_enabled = false;
     }
 }
 
@@ -2041,6 +2046,23 @@ mod retry_config_tests {
             cfg.result.cloudfetch_max_chunks_in_memory,
             crate::config::CLOUDFETCH_MAX_CHUNKS_CEILING,
         );
+    }
+
+    #[test]
+    fn typed_cloudfetch_disable_takes_precedence_over_session_conf() {
+        for key in ["cloudfetch_enabled", "CLOUDFETCH_ENABLED"] {
+            let mut cfg = config_with_session_conf(HashMap::from([
+                (key.to_string(), "true".to_string()),
+                ("TIMEZONE".to_string(), "UTC".to_string()),
+            ]));
+            cfg.result.cloudfetch_enabled = false;
+            apply_client_result_overrides(&mut cfg);
+            assert!(!cfg.result.cloudfetch_enabled);
+            assert_eq!(
+                cfg.session_conf,
+                HashMap::from([("TIMEZONE".to_string(), "UTC".to_string())])
+            );
+        }
     }
 
     /// All six client-side result knobs are recognised in session_conf,
