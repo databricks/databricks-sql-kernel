@@ -20,7 +20,7 @@
 //! - Memory management via chunk limits
 //! - Consumer API via RecordBatchReader trait
 
-use crate::kernel_error::{Error, Result};
+use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::{debug, error, info, warn};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
@@ -1114,6 +1114,10 @@ impl StreamingCloudFetchProvider {
                     return Ok(batches);
                 }
                 Err(e) => {
+                    // Refreshing a signed URL cannot repair certificate verification failures.
+                    if e.code == ErrorCode::NetworkError && !e.retryable {
+                        return Err(e);
+                    }
                     // Every completed download failure consumes the hard attempt
                     // budget, even when its link became stale while in flight.
                     attempts += 1;
@@ -1834,6 +1838,12 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_download_failure_is_bounded_when_links_expire_in_flight() {
+        for status in [403, 500] {
+            assert_persistent_download_failure_is_bounded(status).await;
+        }
+    }
+
+    async fn assert_persistent_download_failure_is_bounded(status: u16) {
         use crate::client::retry::{build_retry_configs, RetryConfig};
         use crate::client::{DatabricksHttpClient, HttpClientConfig};
         use crate::types::cloudfetch::LINK_EXPIRY_BUFFER_SECS;
@@ -1848,7 +1858,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/chunk-0.arrow"))
-            .respond_with(ResponseTemplate::new(500).set_delay(RESPONSE_DELAY))
+            .respond_with(ResponseTemplate::new(status).set_delay(RESPONSE_DELAY))
             .mount(&server)
             .await;
 
@@ -1933,9 +1943,9 @@ mod tests {
         .await
         .expect("persistent failures must exhaust the download attempt budget");
 
-        let error = result.expect_err("persistent HTTP 500 must be terminal");
+        let error = result.expect_err("persistent HTTP failure must be terminal");
         assert!(
-            error.message.contains("HTTP 500"),
+            error.message.contains(&format!("HTTP {status}")),
             "unexpected error: {error}"
         );
         assert_eq!(

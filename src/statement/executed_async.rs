@@ -454,6 +454,16 @@ impl ExecutedAsyncStatement {
             .and_then(|s| s.num_modified_rows)
     }
 
+    /// Returns [`ErrorCode::InvalidStatementHandle`](crate::ErrorCode::InvalidStatementHandle)
+    /// after parent-statement invalidation. Non-owning handles also fail after
+    /// their owner is released.
+    pub fn try_num_modified_rows(&self) -> Result<Option<i64>> {
+        self.check_read_validity()?;
+        let count = self.num_modified_rows();
+        self.check_read_validity()?;
+        Ok(count)
+    }
+
     /// Server-supplied user-facing message. Reflects the most recent
     /// SEA `StatementStatus` this handle has seen.
     ///
@@ -930,6 +940,12 @@ pub struct AsyncStatementReader {
 impl AsyncStatementReader {
     pub fn statement_id(&self) -> &str {
         &self.inner.statement_id
+    }
+
+    /// Returns [`ErrorCode::InvalidStatementHandle`](crate::ErrorCode::InvalidStatementHandle)
+    /// after parent-statement invalidation or owner release.
+    pub fn num_modified_rows(&self) -> Result<Option<i64>> {
+        self.inner.try_num_modified_rows()
     }
 
     /// Read the current server status. See [`ExecutedAsyncStatement::status`].

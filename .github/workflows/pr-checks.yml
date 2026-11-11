@@ -235,3 +235,6 @@ jobs:
         # under tls-native don't disappear under tls-rustls and vice
         # versa.
         run: cargo clippy -p databricks-sql-kernel --no-default-features --features tls-rustls --all-targets -- -D warnings
+
+      - name: Test client behavior (tls-rustls)
+        run: "cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::"

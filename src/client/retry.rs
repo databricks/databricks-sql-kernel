@@ -247,10 +247,10 @@ impl RetryStrategy {
 
     /// Whether the given network/client error is retryable.
     pub fn is_retryable_error(&self, error: &reqwest::Error) -> bool {
-        // A permanent DNS lookup failure (for example NXDOMAIN) cannot recover
-        // through retry. Temporary resolver failures remain ordinary connect
-        // errors and follow the request's idempotency policy below.
-        if is_permanent_dns_resolution_failure(error) {
+        // Certificate verification and permanent DNS failures cannot recover
+        // through retry, even though reqwest reports them as connect errors.
+        if is_certificate_verification_failure(error) || is_permanent_dns_resolution_failure(error)
+        {
             return false;
         }
         match self.idempotency {
@@ -262,6 +262,129 @@ impl RetryStrategy {
             RequestIdempotency::NonIdempotent => error.is_connect(),
         }
     }
+}
+
+pub(crate) fn is_certificate_verification_failure(
+    error: &(dyn std::error::Error + 'static),
+) -> bool {
+    super::error_chain(error).any(|error| {
+        #[cfg(feature = "tls-rustls")]
+        if matches!(
+            error.downcast_ref::<rustls::Error>(),
+            Some(rustls::Error::InvalidCertificate(_) | rustls::Error::NoCertificatesPresented)
+        ) {
+            return true;
+        }
+
+        #[cfg(feature = "tls-native")]
+        if let Some(error) = error.downcast_ref::<native_tls::Error>() {
+            #[cfg(target_vendor = "apple")]
+            if let Some(permanent) = apple_certificate_verification_failure(&format!("{error:?}")) {
+                return permanent;
+            }
+            // Restrict platform-message matching to TLS errors so ordinary
+            // connect/timeout errors still retry.
+            return is_native_certificate_verification_failure(&error.to_string());
+        }
+        false
+    })
+}
+
+#[cfg(all(feature = "tls-native", any(target_vendor = "apple", test)))]
+fn apple_certificate_verification_failure(debug: &str) -> Option<bool> {
+    // native-tls forwards security-framework's Debug, which retains OSStatus
+    // even when Display contains only a localized message.
+    let code = debug
+        .strip_prefix("Error { code: ")?
+        .split_once([',', '}'])?
+        .0
+        .trim()
+        .parse::<i32>()
+        .ok()?;
+    Some(matches!(
+        code,
+        -9807 // errSSLXCertChainInvalid
+            | -9808 // errSSLBadCert
+            | -9812 // errSSLUnknownRootCert
+            | -9813 // errSSLNoRootCert
+            | -9814 // errSSLCertExpired
+            | -9815 // errSSLCertNotYetValid
+            | -9843 // errSSLHostNameMismatch
+            | -25318 // errSecCreateChainFailed
+            | -67602 // errSecHostNameMismatch
+            | -67609 // errSecInvalidExtendedKeyUsage
+            | -67654 // errSecTrustSettingDeny
+            | -67808 // errSecVerifyFailed
+            | -67818 // errSecCertificateExpired
+            | -67819 // errSecCertificateNotValidYet
+            | -67820 // errSecCertificateRevoked
+            | -67843 // errSecNotTrusted
+    ))
+}
+
+#[cfg(feature = "tls-native")]
+fn is_native_certificate_verification_failure(message: &str) -> bool {
+    // native-tls hides SChannel's io::Error, but Display retains the OS code
+    // even when Windows localizes the message.
+    if let Some(code) = message
+        .rsplit_once(" (os error ")
+        .and_then(|(_, code)| code.strip_suffix(')'))
+        .and_then(|code| code.parse::<i32>().ok())
+    {
+        // Revocation-check availability errors remain retryable.
+        return matches!(
+            code as u32,
+            0x80090322 // SEC_E_WRONG_PRINCIPAL
+                | 0x80090325 // SEC_E_UNTRUSTED_ROOT
+                | 0x80090328 // SEC_E_CERT_EXPIRED
+                | 0x80092010 // CRYPT_E_REVOKED
+                | 0x80096004 // TRUST_E_CERT_SIGNATURE
+                | 0x80096019 // TRUST_E_BASIC_CONSTRAINTS
+                | 0x800B0101 // CERT_E_EXPIRED
+                | 0x800B0102 // CERT_E_VALIDITYPERIODNESTING
+                | 0x800B0103 // CERT_E_ROLE
+                | 0x800B0104 // CERT_E_PATHLENCONST
+                | 0x800B0105 // CERT_E_CRITICAL
+                | 0x800B0106 // CERT_E_PURPOSE
+                | 0x800B0107 // CERT_E_ISSUERCHAINING
+                | 0x800B0108 // CERT_E_MALFORMED
+                | 0x800B0109 // CERT_E_UNTRUSTEDROOT
+                | 0x800B010A // CERT_E_CHAINING
+                | 0x800B010C // CERT_E_REVOKED
+                | 0x800B010D // CERT_E_UNTRUSTEDTESTROOT
+                | 0x800B010F // CERT_E_CN_NO_MATCH
+                | 0x800B0110 // CERT_E_WRONG_USAGE
+                | 0x800B0111 // TRUST_E_EXPLICIT_DISTRUST
+                | 0x800B0112 // CERT_E_UNTRUSTEDCA
+                | 0x800B0113 // CERT_E_INVALID_POLICY
+                | 0x800B0114 // CERT_E_INVALID_NAME
+        );
+    }
+
+    // OpenSSL's X509VerifyResult is hidden; this fallback depends on English
+    // messages if no platform status code is available.
+    // Match local verification failures, not peer-sent certificate alerts.
+    let message = message.to_ascii_lowercase();
+    [
+        "certificate verify failed",
+        "hostname mismatch",
+        "host name mismatch",
+        "ip address mismatch",
+        "invalid certificate chain",
+        "certificate for this server is invalid",
+        "unknown root certificate",
+        "root certificate is not trusted",
+        "certificate was not trusted",
+        "certificate has expired",
+        "certificate is not yet valid",
+        "certificate chain was issued by an authority that is not trusted",
+        "root certificate which is not trusted",
+        "untrusted root",
+        "target principal name is incorrect",
+        "certificate's cn name does not match",
+    ]
+    .iter()
+    .any(|marker| message.contains(marker))
 }
 
 /// Heuristic: is this network error a permanent DNS lookup failure (the host
@@ -366,6 +489,224 @@ fn parse_retry_after(value: &str) -> Option<Duration> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn certificate_errors_are_detected_inside_io_errors() {
+        for error in [
+            rustls::Error::InvalidCertificate(rustls::CertificateError::UnknownIssuer),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::NotValidForName),
+            rustls::Error::InvalidCertificate(rustls::CertificateError::Expired),
+            rustls::Error::NoCertificatesPresented,
+        ] {
+            let error = std::io::Error::other(std::io::Error::other(error));
+            assert!(is_certificate_verification_failure(&error));
+        }
+    }
+
+    #[cfg(feature = "tls-rustls")]
+    #[test]
+    fn peer_certificate_alerts_are_not_local_verification_failures() {
+        use rustls::AlertDescription::*;
+        for alert in [
+            BadCertificate,
+            UnsupportedCertificate,
+            CertificateRevoked,
+            CertificateExpired,
+            CertificateUnknown,
+            UnknownCA,
+            CertificateUnobtainable,
+            BadCertificateStatusResponse,
+            BadCertificateHashValue,
+            CertificateRequired,
+        ] {
+            let error = std::io::Error::other(rustls::Error::AlertReceived(alert));
+            assert!(!is_certificate_verification_failure(&error), "{alert:?}");
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn apple_certificate_status_codes_are_permanent() {
+        for debug in [
+            "Error { code: -67602, message: \"A host name mismatch has occurred.\" }",
+            "Error { code: -67602, message: \"Der Hostname stimmt nicht überein.\" }",
+            "Error { code: -67843, message: \"Certificat non approuvé.\" }",
+            "Error { code: -67818, message: \"Zertifikat abgelaufen.\" }",
+            "Error { code: -67819 }",
+            "Error { code: -67820 }",
+            "Error { code: -67609 }",
+            "Error { code: -67654 }",
+            "Error { code: -67808 }",
+            "Error { code: -25318 }",
+            "Error { code: -9807 }",
+            "Error { code: -9808 }",
+            "Error { code: -9812 }",
+            "Error { code: -9813 }",
+            "Error { code: -9814 }",
+            "Error { code: -9815 }",
+            "Error { code: -9843 }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                Some(true),
+                "{debug}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn apple_peer_alerts_and_other_errors_are_not_local_verification_failures() {
+        for debug in [
+            "Error { code: -9825, message: \"Peer bad certificate\" }",
+            "Error { code: -9827 }", // errSSLPeerCertRevoked
+            "Error { code: -9828 }", // errSSLPeerCertExpired
+            "Error { code: -9829 }", // errSSLPeerCertUnknown
+            "Error { code: -9831 }", // errSSLPeerUnknownCA
+            "Error { code: -9803 }", // errSSLWouldBlock
+            "Error { code: -9844 }", // errSSLConnectionRefused
+            "Error { code: -36 }",   // errSecIO
+            "Error { code: -50, message: \"bad parameter\" }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                Some(false),
+                "{debug}"
+            );
+        }
+        for debug in [
+            "A host name mismatch has occurred.",
+            "Error { message: \"code: -67602\" }",
+            "Error { code: invalid }",
+            "Error { code: -67602",
+            "Os { code: -67602, kind: Other }",
+        ] {
+            assert_eq!(
+                apple_certificate_verification_failure(debug),
+                None,
+                "{debug}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_certificate_verification_messages_are_permanent() {
+        for message in [
+            // OpenSSL.
+            "error:0A000086:SSL routines:tls_post_process_server_certificate:certificate verify failed (unable to get local issuer certificate)",
+            "certificate verify failed (self-signed certificate)",
+            "certificate verify failed (hostname mismatch)",
+            "certificate verify failed (IP address mismatch)",
+            // Secure Transport.
+            "Invalid certificate chain",
+            "The certificate for this server is invalid.",
+            "Unknown root certificate",
+            "The root certificate is not trusted.",
+            "The certificate was not trusted.",
+            "The certificate has expired.",
+            "The certificate is not yet valid.",
+            "A host name mismatch has occurred.",
+            // SChannel.
+            "The certificate chain was issued by an authority that is not trusted. (os error -2146893019)",
+            "A certificate chain processed, but terminated in a root certificate which is not trusted by the trust provider. (os error -2146762487)",
+            "Untrusted root certificate",
+            "The target principal name is incorrect. (os error -2146893022)",
+            "The certificate's CN name does not match the passed value. (os error -2146762481)",
+            "CERTIFICATE VERIFY FAILED",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn native_peer_alerts_and_other_tls_failures_are_not_local_verification_failures() {
+        for message in [
+            "sslv3 alert bad certificate",
+            "sslv3 alert unsupported certificate",
+            "sslv3 alert certificate revoked",
+            "sslv3 alert certificate expired",
+            "sslv3 alert certificate unknown",
+            "tlsv1 alert unknown ca",
+            "tlsv1 alert certificate unobtainable",
+            "tlsv1 alert bad certificate status response",
+            "tlsv1 alert bad certificate hash value",
+            "tlsv13 alert certificate required",
+            "unexpected eof while reading",
+            "wrong version number",
+            "SSL routines:tls_process_server_certificate:unexpected eof while reading",
+            "Connection reset by peer",
+            "TLS-Fehler (os error -2146893018)", // SEC_E_ILLEGAL_MESSAGE
+            "TLS-Fehler (os error -2146893048)", // SEC_E_INVALID_TOKEN
+            "Verbindung abgelehnt (os error 10061)",
+            "Zeitüberschreitung (os error 10060)",
+            "The revocation function was unable to check revocation for the certificate. (os error -2146762482)",
+            "The revocation function was unable to check revocation because the revocation server was offline. (os error -2146885613)",
+            "The certificate's revocation status could not be determined. (os error -2146892973)",
+        ] {
+            assert!(
+                !is_native_certificate_verification_failure(message),
+                "{message}"
+            );
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn schannel_certificate_policy_failures_are_permanent() {
+        for message in [
+            "The certificate is not valid for the requested usage. (os error -2146762480)",
+            "A certificate was explicitly revoked by its issuer. (os error -2146762484)",
+            "The signature of the certificate cannot be verified. (os error -2146869244)",
+            "The certificate is revoked. (os error -2146885616)",
+            "The basic constraints of the certificate are invalid or missing. (os error -2146869223)",
+            "Das Zertifikat wurde ausdrücklich als nicht vertrauenswürdig markiert. (os error -2146762479)",
+            "Une extension critique du certificat est inconnue. (os error -2146762491)",
+            "The validity periods of the certification chain do not nest correctly. (os error -2146762494)",
+            "A certificate that can only be used as an end-entity is being used as a CA or vice versa. (os error -2146762493)",
+            "A path length constraint in the certification chain has been violated. (os error -2146762492)",
+            "A certificate is being used for a purpose other than the ones specified by its CA. (os error -2146762490)",
+            "A parent of a given certificate did not issue that child certificate. (os error -2146762489)",
+            "A certificate is missing or has an empty value for an important field. (os error -2146762488)",
+            "The certification path terminates with the test root which is not trusted. (os error -2146762483)",
+            "The certificate has invalid policy. (os error -2146762477)",
+            "The certificate has an invalid name. (os error -2146762476)",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
+        }
+    }
+
+    #[cfg(feature = "tls-native")]
+    #[test]
+    fn localized_schannel_certificate_failures_are_permanent() {
+        for message in [
+            "Die Zertifikatskette wurde von einer nicht vertrauenswürdigen Zertifizierungsstelle ausgestellt. (os error -2146893019)",
+            "Zertifikatsfehler (os error -2146762487)",
+            "Der Zielprinzipalname ist falsch. (os error -2146893022)",
+            "Le nom CN du certificat ne correspond pas à la valeur passée. (os error -2146762481)",
+            "Zertifikat abgelaufen (os error -2146893016)",
+            "Certificat expiré (os error -2146762495)",
+            "Zertifikatskette unvollständig (os error -2146762486)",
+            "Autorité de certification non approuvée (os error -2146762478)",
+        ] {
+            assert!(is_native_certificate_verification_failure(message), "{message}");
+        }
+    }
+
+    #[test]
+    fn ordinary_io_errors_are_not_certificate_failures() {
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::ConnectionRefused),
+            std::io::Error::from(std::io::ErrorKind::TimedOut),
+            std::io::Error::from(std::io::ErrorKind::UnexpectedEof),
+            std::io::Error::other("certificate verify failed"),
+            std::io::Error::from_raw_os_error(-2146893019),
+        ] {
+            assert!(!is_certificate_verification_failure(&error));
+        }
+    }
 
     // --- DNS-resolution detection tests ---
 
