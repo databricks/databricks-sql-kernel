@@ -418,10 +418,8 @@ impl Session {
             "creating session"
         );
 
-        // CloudFetch-disable is expressed per-statement via the SEA
-        // `disposition` (threaded onto `TransportConfig` above), not via a
-        // session conf. The kernel synthesises no geospatial session-conf
-        // entry; caller-supplied server-bound entries pass through unchanged.
+        // The kernel synthesises no geospatial session-conf entry;
+        // caller-supplied server-bound entries pass through unchanged.
         // Resolve connector-service flags after authentication and immediately
         // before CreateSession. The resolver populates the process-wide
         // workspace cache; the session retains no private snapshot.
