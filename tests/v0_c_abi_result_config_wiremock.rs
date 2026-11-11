@@ -169,6 +169,22 @@ fn recorded_execute_disposition(cloudfetch_enabled: Option<bool>) -> String {
     }
 
     let recorded = rt.block_on(async { server.received_requests().await.unwrap() });
+    let create = recorded
+        .iter()
+        .find(|request| request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions")
+        .expect("a CreateSession request was made");
+    let create_body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+    let expected = if cloudfetch_enabled == Some(false) {
+        Some("false")
+    } else {
+        None
+    };
+    assert_eq!(
+        create_body
+            .pointer("/session_confs/can_cloud_download")
+            .and_then(|value| value.as_str()),
+        expected,
+    );
     let exec = recorded
         .iter()
         .find(|r| r.url.path() == "/api/2.0/sql/statements" && r.method.as_str() == "POST")
