@@ -1522,9 +1522,8 @@ impl Transport for SeaRestTransport {
             Error::data_loss().message(format!(
                 "Inline chunk {} response missing `attachment` field — \
                  server did not return inline Arrow data and \
-                 returned a CloudFetch response. Body: {}",
-                chunk_index,
-                String::from_utf8_lossy(&body)
+                 returned a CloudFetch response",
+                chunk_index
             ))
         })?;
 

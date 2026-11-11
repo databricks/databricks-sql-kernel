@@ -200,7 +200,7 @@ impl ResultReaderFactory {
             if let Some(ref external_links) = result.external_links {
                 if !external_links.is_empty() {
                     if !self.config.enabled {
-                        return Err(Error::internal().message(
+                        return Err(Error::data_loss().message(
                             "CloudFetch is disabled, but the server returned cloud-storage result links",
                         ));
                     }

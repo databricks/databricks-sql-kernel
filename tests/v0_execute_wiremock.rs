@@ -1716,7 +1716,7 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::Internal);
+    assert_eq!(error.code, ErrorCode::DataLoss);
     assert!(
         error.to_string().contains("CloudFetch is disabled"),
         "{error}"
@@ -1727,6 +1727,70 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         wait_for_close_delete(&server, "stmt-cf-off", 1, Duration::from_secs(2)).await,
         1,
     );
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_rejects_continuation_links_without_exposing_them() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let mut body: serde_json::Value = serde_json::from_str(&succeeded_inline_body(
+        "stmt-cf-off",
+        &int64_batch("n", vec![7]),
+    ))
+    .unwrap();
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_chunk_count");
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_row_count");
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    let storage_link = format!(
+        "{}/storage/chunk.arrow?signature=private-value",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off/result/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "external_links": [{
+                "external_link": storage_link,
+                "chunk_index": 1, "row_offset": 1, "row_count": 1,
+                "byte_count": 100, "expiration": "2099-01-01T00:00:00Z",
+            }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/storage/chunk.arrow"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let mut exec = stmt.execute().await.expect("initial inline response");
+    let error = loop {
+        match exec.result_stream_mut().next_batch().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("continuation links must be rejected"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert!(error.to_string().contains("missing `attachment`"));
+    assert!(!error.to_string().contains("private-value"));
+    assert!(!error.to_string().contains(&storage_link));
+    exec.close().await.expect("close statement");
+    session.close().await.expect("close session");
 }
 
 #[tokio::test]
