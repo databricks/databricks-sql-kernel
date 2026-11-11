@@ -131,8 +131,8 @@ semantics.
 `adbc.databricks.statement.staging_allowed_local_paths` accepts a JSON array
 of local paths, for example `["/tmp/transfers"]`, and enables SQL PUT, GET,
 and REMOVE file transfers. An empty array permits REMOVE and denies local
-file access. Without the option, results remain available to callers that
-handle transfers themselves.
+file access. Successful transfers return no instruction rows. Without the
+option, results remain available to callers that handle transfers themselves.
 
 Statement options include positional or named parameter style, query tags,
 the portable `adbc.apache.statement.query_timeout_s` client deadline (with `0`

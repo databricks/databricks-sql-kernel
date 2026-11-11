@@ -160,6 +160,7 @@ pub enum KernelStatementStatusKind {
 }
 
 /// Configure permitted local paths from a JSON array for SQL file transfers.
+/// `retain_result` keeps the instruction row readable after a successful transfer.
 ///
 /// # Safety
 /// `stmt` must be live and `paths_json` must be a NUL-terminated UTF-8 string.

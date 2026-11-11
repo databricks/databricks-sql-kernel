@@ -176,7 +176,9 @@ fn allowed_path(local_file: Option<&str>, paths: &[String]) -> Result<PathBuf> {
     })?;
     let file = resolved_path(Path::new(file))?;
     for base in paths {
-        let base = resolved_path(Path::new(base))?;
+        let Ok(base) = resolved_path(Path::new(base)) else {
+            continue;
+        };
         if file.starts_with(base) {
             return Ok(file);
         }
@@ -248,7 +250,18 @@ async fn send_transfer(
     let strategy = RetryStrategy::for_request(RequestType::CloudFetchDownload, &config);
     let started = std::time::Instant::now();
     for attempt in 0..=config.max_retries {
-        let mut request = client.inner().request(method.clone(), url.clone());
+        let remaining = config.overall_timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            return Err(Error::new(
+                ErrorCode::Timeout,
+                "File transfer deadline exceeded",
+            ));
+        }
+        // Large files need the storage budget rather than the SQL request timeout.
+        let mut request = client
+            .inner()
+            .request(method.clone(), url.clone())
+            .timeout(remaining);
         for (name, value) in headers {
             request = request.header(name, value);
         }
@@ -501,6 +514,73 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.code, ErrorCode::PermissionDenied);
         assert!(!outside.exists());
+    }
+
+    #[tokio::test]
+    async fn download_body_uses_storage_deadline() {
+        use crate::client::retry::{RequestCategory, RetryConfig};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+        for (budget, succeeds) in [(1000, true), (40, false)] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(socket.read_u8().await.unwrap());
+                }
+                socket
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
+                    .await
+                    .unwrap();
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                let _ = socket.write_all(b"data").await;
+            });
+            let config = HttpClientConfig {
+                read_timeout: Duration::from_millis(10),
+                ..Default::default()
+            };
+            let retry = RetryConfig {
+                overall_timeout: Duration::from_millis(budget),
+                max_retries: 0,
+                ..Default::default()
+            };
+            let http = DatabricksHttpClient::new(
+                config,
+                HashMap::from([(RequestCategory::CloudFetch, retry)]),
+            )
+            .unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("download");
+            let result = transfer(
+                &http,
+                "GET",
+                &format!("http://{address}/file"),
+                &HashMap::new(),
+                file.to_str(),
+                &[dir.path().to_str().unwrap().into()],
+            )
+            .await;
+            assert_eq!(result.is_ok(), succeeds);
+            if succeeds {
+                assert_eq!(std::fs::read(&file).unwrap(), b"data");
+            } else {
+                assert_eq!(result.unwrap_err().code, ErrorCode::NetworkError);
+            }
+            server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn unresolvable_allowed_root_does_not_hide_later_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("download");
+        let paths = vec![
+            dir.path().join("missing/nested").to_str().unwrap().into(),
+            dir.path().to_str().unwrap().into(),
+        ];
+        assert_eq!(allowed_path(file.to_str(), &paths).unwrap(), file);
     }
 
     #[cfg(unix)]

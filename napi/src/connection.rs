@@ -102,6 +102,7 @@ pub struct ExecuteOptions {
     /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
     /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
     pub row_limit: Option<i64>,
+    /// Omit to handle instructions in the caller; an empty list denies local file access.
     pub staging_allowed_local_paths: Option<Vec<String>>,
     /// Positional parameters, in 1-based wire order. Index `i` in this
     /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
