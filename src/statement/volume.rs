@@ -63,8 +63,8 @@ pub(crate) async fn complete(
     async {
         let mut stream = ResultStream::from_reader(result.reader).await?;
         let schema = stream.schema();
-        let batch = match stream.next_batch().await? {
-            Some(ResultBatch::Arrow(batch)) if batch.num_rows() == 1 => batch.clone(),
+        let batch = match next_instruction_batch(&mut stream).await? {
+            Some(batch) if batch.num_rows() == 1 => batch,
             _ => {
                 return Err(Error::invalid_state().message("Expected one file transfer instruction"))
             }
@@ -83,7 +83,7 @@ pub(crate) async fn complete(
         } else {
             None
         };
-        if stream.next_batch().await?.is_some() {
+        if next_instruction_batch(&mut stream).await?.is_some() {
             return Err(Error::invalid_state().message("Expected one file transfer instruction"));
         }
         completion
@@ -112,6 +112,16 @@ pub(crate) async fn complete(
             .with_sql_state("HY000")
             .with_query_id(&statement_id)
     })
+}
+
+async fn next_instruction_batch(stream: &mut ResultStream) -> Result<Option<RecordBatch>> {
+    loop {
+        match stream.next_batch().await? {
+            Some(ResultBatch::Arrow(batch)) if batch.num_rows() == 0 => continue,
+            Some(ResultBatch::Arrow(batch)) => return Ok(Some(batch.clone())),
+            None => return Ok(None),
+        }
+    }
 }
 
 fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
@@ -150,10 +160,13 @@ fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
 
 fn file_error(error: std::io::Error) -> Error {
     Error::new(
-        if error.kind() == std::io::ErrorKind::NotFound {
-            ErrorCode::NotFound
-        } else {
-            ErrorCode::InvalidArgument
+        match error.kind() {
+            std::io::ErrorKind::NotFound => ErrorCode::NotFound,
+            std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
+            std::io::ErrorKind::InvalidInput => ErrorCode::InvalidArgument,
+            std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
+            std::io::ErrorKind::StorageFull => ErrorCode::ResourceExhausted,
+            _ => ErrorCode::Unavailable,
         },
         format!("File transfer failed: {error}"),
     )
@@ -217,7 +230,9 @@ async fn transfer(
                 .parse::<std::net::IpAddr>()
                 .is_ok_and(|ip| ip.is_loopback())
     });
-    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
+    if parsed.scheme() != "https"
+        && !(parsed.scheme() == "http" && loopback && client.config().tls.enabled == Some(false))
+    {
         return Err(Error::invalid_state().message("Invalid file transfer URL scheme"));
     }
     let local = if operation == "REMOVE" {
@@ -316,7 +331,7 @@ async fn send_transfer(
         }
         // Large files need the storage budget rather than the SQL request timeout.
         let mut request = client
-            .inner()
+            .volume_client()?
             .request(method.clone(), url.clone())
             .timeout(remaining);
         for (name, value) in headers {
@@ -374,7 +389,9 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client() -> DatabricksHttpClient {
-        DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap()
+        let mut config = HttpClientConfig::default();
+        config.tls.enabled = Some(false);
+        DatabricksHttpClient::with_default_retry(config).unwrap()
     }
 
     fn instruction(operation: &str, url: &str, local: &str) -> RecordBatch {
@@ -434,7 +451,16 @@ mod tests {
         let completion = OnceCell::new();
         let http = client();
         for _ in 0..2 {
-            let completed = complete(&http, result(batch.clone(), true), &options, &completion)
+            let mut execution = result(batch.clone(), true);
+            execution.reader = Box::new(InMemoryReader::new(
+                batch.schema(),
+                vec![
+                    RecordBatch::new_empty(batch.schema()),
+                    batch.clone(),
+                    RecordBatch::new_empty(batch.schema()),
+                ],
+            ));
+            let completed = complete(&http, execution, &options, &completion)
                 .await
                 .unwrap();
             let mut reader = ResultStream::from_reader(completed.reader).await.unwrap();
@@ -445,6 +471,49 @@ mod tests {
         let request = server.received_requests().await.unwrap().remove(0);
         assert!(!request.headers.contains_key("authorization"));
         assert_eq!(request.headers["x-file-header"], "value");
+    }
+
+    #[test]
+    fn file_errors_keep_their_category() {
+        use std::io::ErrorKind;
+        for (kind, code) in [
+            (ErrorKind::NotFound, ErrorCode::NotFound),
+            (ErrorKind::PermissionDenied, ErrorCode::PermissionDenied),
+            (ErrorKind::InvalidInput, ErrorCode::InvalidArgument),
+            (ErrorKind::StorageFull, ErrorCode::ResourceExhausted),
+            (ErrorKind::TimedOut, ErrorCode::Timeout),
+            (ErrorKind::Other, ErrorCode::Unavailable),
+        ] {
+            assert_eq!(file_error(std::io::Error::from(kind)).code, code);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_redirects_are_not_followed_and_plaintext_requires_opt_out() {
+        let server = MockServer::start().await;
+        Mock::given(path("/redirect"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/destination", server.uri())),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(path("/destination"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let url = format!("{}/redirect", server.uri());
+        let strict = DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap();
+        let error = transfer(&strict, "REMOVE", &url, &HashMap::new(), None, &[])
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("URL scheme"));
+        let error = transfer(&client(), "REMOVE", &url, &HashMap::new(), None, &[])
+            .await
+            .unwrap_err();
+        assert_eq!(error.http_status, Some(307));
     }
 
     #[cfg(unix)]
@@ -660,9 +729,11 @@ mod tests {
         use crate::client::retry::{RequestCategory, RetryConfig};
         use std::time::Duration;
         use tokio::io::AsyncReadExt;
-        for (budget, succeeds, existing) in
-            [(1000, true, false), (40, false, true), (40, false, false)]
-        {
+        for (budget, succeeds, existing) in [
+            (10_000, true, false),
+            (100, false, true),
+            (100, false, false),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -675,13 +746,18 @@ mod tests {
                     .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\n")
                     .await
                     .unwrap();
-                tokio::time::sleep(Duration::from_millis(100)).await;
-                let _ = socket.write_all(b"data").await;
+                if succeeds {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    socket.write_all(b"data").await.unwrap();
+                } else {
+                    std::future::pending::<()>().await;
+                }
             });
-            let config = HttpClientConfig {
+            let mut config = HttpClientConfig {
                 read_timeout: Duration::from_millis(10),
                 ..Default::default()
             };
+            config.tls.enabled = Some(false);
             let retry = RetryConfig {
                 overall_timeout: Duration::from_millis(budget),
                 max_retries: 0,
@@ -721,7 +797,11 @@ mod tests {
                 std::fs::read_dir(dir.path()).unwrap().count(),
                 usize::from(succeeds || existing)
             );
-            server.await.unwrap();
+            if succeeds {
+                server.await.unwrap();
+            } else {
+                server.abort();
+            }
         }
     }
 

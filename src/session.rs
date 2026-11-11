@@ -1088,6 +1088,10 @@ fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
 /// / `skip_hostname_verification` and is projected onto the internal
 /// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
+    let mut tls = HttpTlsConfig::from_public(&config.tls);
+    if config.connection.host.starts_with("http://") {
+        tls.enabled = Some(false);
+    }
     HttpClientConfig {
         sea_response_compression_enabled: config.http.sea_response_compression_enabled,
         connect_timeout: Duration::from_secs(30),
@@ -1096,7 +1100,7 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
         read_timeout: config.http.request_timeout,
         max_connections_per_host: config.http.pool_max_idle_per_host,
         proxy: build_proxy_config(config.proxy.as_ref()),
-        tls: HttpTlsConfig::from_public(&config.tls),
+        tls,
         org_id,
         custom_headers: config.http.custom_headers.clone(),
         ..HttpClientConfig::default()

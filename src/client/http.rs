@@ -383,6 +383,7 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 #[derive(Debug)]
 pub struct DatabricksHttpClient {
     client: Client,
+    volume_client: OnceLock<Result<Client>>,
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
@@ -499,6 +500,7 @@ impl DatabricksHttpClient {
 
         Ok(Self {
             client,
+            volume_client: OnceLock::new(),
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
@@ -734,6 +736,16 @@ impl DatabricksHttpClient {
     /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn volume_client(&self) -> Result<&Client> {
+        // Transfer instructions authorize one URL; redirects must not forward their headers.
+        self.volume_client
+            .get_or_init(|| {
+                Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())
+            })
+            .as_ref()
+            .map_err(Clone::clone)
     }
 
     pub(crate) fn storage_retry_config(&self) -> RetryConfig {
