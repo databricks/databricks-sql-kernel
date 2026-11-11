@@ -59,53 +59,59 @@ pub(crate) async fn complete(
     {
         return Ok(result);
     }
-    let mut stream = ResultStream::from_reader(result.reader).await?;
-    let schema = stream.schema();
-    let batch = match stream.next_batch().await? {
-        Some(ResultBatch::Arrow(batch)) if batch.num_rows() == 1 => batch.clone(),
-        _ => return Err(Error::invalid_state().message("Expected one file transfer instruction")),
-    };
-    let row = stream
-        .next_row_in_batch()
-        .ok_or_else(|| Error::invalid_state().message("Missing file transfer instruction"))?;
-    if !(3..=4).contains(&row.num_columns()) {
-        return Err(Error::invalid_state().message("Invalid file transfer instruction columns"));
+    let statement_id = result.statement_id.clone();
+    async {
+        let mut stream = ResultStream::from_reader(result.reader).await?;
+        let schema = stream.schema();
+        let batch = match stream.next_batch().await? {
+            Some(ResultBatch::Arrow(batch)) if batch.num_rows() == 1 => batch.clone(),
+            _ => {
+                return Err(Error::invalid_state().message("Expected one file transfer instruction"))
+            }
+        };
+        let row = stream
+            .next_row_in_batch()
+            .ok_or_else(|| Error::invalid_state().message("Missing file transfer instruction"))?;
+        if !(3..=4).contains(&row.num_columns()) {
+            return Err(Error::invalid_state().message("Invalid file transfer instruction columns"));
+        }
+        let operation = row.get_str(0)?.unwrap_or_default().to_owned();
+        let url = row.get_str(1)?.unwrap_or_default().to_owned();
+        let headers = instruction_headers(&batch)?;
+        let local_file = if row.num_columns() == 4 {
+            row.get_str(3)?.map(str::to_owned)
+        } else {
+            None
+        };
+        if stream.next_batch().await?.is_some() {
+            return Err(Error::invalid_state().message("Expected one file transfer instruction"));
+        }
+        completion
+            .get_or_init(|| {
+                transfer(
+                    client,
+                    &operation,
+                    &url,
+                    &headers,
+                    local_file.as_deref(),
+                    paths,
+                )
+            })
+            .await
+            .clone()?;
+        result.reader = if options.retain_result {
+            Box::new(InMemoryReader::new(schema, vec![batch]))
+        } else {
+            Box::new(EmptyReader::new(schema))
+        };
+        Ok(result)
     }
-    let operation = row.get_str(0)?.unwrap_or_default().to_owned();
-    let url = row.get_str(1)?.unwrap_or_default().to_owned();
-    let headers = instruction_headers(&batch)?;
-    let local_file = if row.num_columns() == 4 {
-        row.get_str(3)?.map(str::to_owned)
-    } else {
-        None
-    };
-    if stream.next_batch().await?.is_some() {
-        return Err(Error::invalid_state().message("Expected one file transfer instruction"));
-    }
-    completion
-        .get_or_init(|| {
-            transfer(
-                client,
-                &operation,
-                &url,
-                &headers,
-                local_file.as_deref(),
-                paths,
-            )
-        })
-        .await
-        .clone()
-        .map_err(|e| {
-            e.with_error_code("FILE_TRANSFER_ERROR")
-                .with_sql_state("HY000")
-                .with_query_id(&result.statement_id)
-        })?;
-    result.reader = if options.retain_result {
-        Box::new(InMemoryReader::new(schema, vec![batch]))
-    } else {
-        Box::new(EmptyReader::new(schema))
-    };
-    Ok(result)
+    .await
+    .map_err(|e: Error| {
+        e.with_error_code("FILE_TRANSFER_ERROR")
+            .with_sql_state("HY000")
+            .with_query_id(&statement_id)
+    })
 }
 
 fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
@@ -576,6 +582,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn malformed_instruction_keeps_transfer_error_context() {
+        let batch = RecordBatch::try_from_iter(vec![(
+            "operation",
+            Arc::new(StringArray::from(vec!["GET"])) as arrow_array::ArrayRef,
+        )])
+        .unwrap();
+        let error = complete(
+            &client(),
+            result(batch, true),
+            &VolumeOptions {
+                paths: Some(vec![]),
+                retain_result: false,
+            },
+            &OnceCell::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+        assert_eq!(error.query_id.as_deref(), Some("statement"));
+        assert_eq!(error.sql_state.as_deref(), Some("HY000"));
     }
 
     #[tokio::test]

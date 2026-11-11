@@ -229,6 +229,8 @@ pub struct StatementSpec {
     /// retry overall deadline, which defaults to 15 minutes.
     /// Completion, including a failure after retries, is final and shared by all
     /// readers of an execution. Re-execute the SQL to start a new transfer attempt.
+    /// Interrupted GET bodies are not retried. Allow only trusted roots whose
+    /// directory components cannot be modified by untrusted users during transfer.
     pub staging_allowed_local_paths: Option<Vec<String>>,
 
     /// Preserve the instruction row after a successful transfer for APIs
