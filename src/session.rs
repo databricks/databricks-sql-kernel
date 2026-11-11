@@ -713,8 +713,12 @@ impl Session {
     /// what lets `get_query_state` re-attach on every poll without the
     /// poll loop closing the statement it's watching.)
     ///
-    /// Without submitted SQL, attached handles preserve wire-provided counts but
-    /// do not infer counts from result-column names.
+    /// Attached handles do not have the submitted SQL needed to distinguish a
+    /// DML count result from a query using the same column names. Their
+    /// [`ExecutedAsyncStatement::num_modified_rows`] value therefore reflects
+    /// only a count supplied in status metadata and otherwise remains `None`,
+    /// including after result fetching. Retain the handle returned by
+    /// [`Statement::submit`] when inferred DML counts are required.
     ///
     /// [`status`]: ExecutedAsyncStatement::status
     /// [`close`]: ExecutedAsyncStatement::close

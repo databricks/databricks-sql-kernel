@@ -705,6 +705,12 @@ impl Session {
     /// *closed* statement is not an error — the server keeps reporting
     /// `CLOSED` (and terminal `SUCCEEDED`/`FAILED`) until GC, so the
     /// returned handle's `status()` surfaces the real server state.
+    ///
+    /// Because an ID-only attachment has no submitted SQL, it cannot safely
+    /// infer modified-row counts from ambiguous result-column names. Its
+    /// `num_modified_rows` is populated only when status metadata supplies a
+    /// count; retain the original submitted handle when inferred counts are
+    /// required.
     fn attach_async_statement(
         &self,
         py: Python<'_>,

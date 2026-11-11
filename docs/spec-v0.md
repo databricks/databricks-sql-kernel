@@ -705,6 +705,13 @@ impl ExecutedAsyncStatement {
     pub async fn fetch_result(&self) -> Result<ResultStream>;
 }
 
+// Session::attach_async_statement(statement_id) returns a non-owning handle
+// for resume-by-id workflows. An attached handle has no submitted SQL, so it
+// cannot distinguish a DML count result from a query using the same column
+// names. Its modified-row count reflects only status metadata and otherwise
+// remains unknown, including after result fetching. Callers that require
+// inferred DML counts retain the handle returned by Statement::submit().
+
 // `statement_id`, `cancel`, `close` come from `ExecutedStatementHandle`.
 
 // Both ExecutedStatement and ExecutedAsyncStatement fire fire-and-forget
