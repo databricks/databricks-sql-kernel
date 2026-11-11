@@ -1285,7 +1285,10 @@ fn apply_client_result_overrides(config: &mut SessionConfig) {
             );
         }
     }
-    if cloudfetch_disabled {
+    if cloudfetch_disabled && config.result.cloudfetch_enabled {
+        crate::klog::warn!(
+            "Ignoring cloudfetch_enabled=true in session configuration because the client option disables CloudFetch"
+        );
         config.result.cloudfetch_enabled = false;
     }
 }
