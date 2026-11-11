@@ -205,7 +205,13 @@ async fn transfer(
     };
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| Error::invalid_state().message("Invalid file transfer URL"))?;
-    if !matches!(parsed.scheme(), "https" | "http") {
+    let loopback = parsed.host_str().is_some_and(|host| {
+        host == "localhost"
+            || host
+                .parse::<std::net::IpAddr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    });
+    if parsed.scheme() != "https" && !(parsed.scheme() == "http" && loopback) {
         return Err(Error::invalid_state().message("Invalid file transfer URL scheme"));
     }
     let local = if operation == "REMOVE" {
@@ -225,18 +231,35 @@ async fn transfer(
         );
     }
     if operation == "GET" {
-        let mut file = tokio::fs::File::create(local.as_ref().unwrap())
-            .await
-            .map_err(file_error)?;
+        let destination = local.as_ref().unwrap();
+        let temporary =
+            tempfile::NamedTempFile::new_in(destination.parent().unwrap()).map_err(file_error)?;
+        let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(file_error)?);
         let mut body = response.bytes_stream();
         while let Some(bytes) = body.next().await {
-            let bytes = bytes
-                .map_err(|_| Error::new(ErrorCode::NetworkError, "File download interrupted"))?;
+            let bytes = bytes.map_err(transport_error)?;
             file.write_all(&bytes).await.map_err(file_error)?;
         }
         file.flush().await.map_err(file_error)?;
+        drop(file);
+        temporary
+            .persist(destination)
+            .map_err(|error| file_error(error.error))?;
     }
     Ok(())
+}
+
+fn transport_error(error: reqwest::Error) -> Error {
+    let message = if error.is_timeout() {
+        "File transfer timed out"
+    } else if error.is_connect() {
+        "File transfer connection failed"
+    } else if error.is_body() || error.is_decode() {
+        "File download interrupted"
+    } else {
+        "File transfer request failed"
+    };
+    Error::new(ErrorCode::NetworkError, message)
 }
 
 async fn send_transfer(
@@ -296,13 +319,11 @@ async fn send_transfer(
             Err(error) => (strategy.is_retryable_error(error), None),
         };
         if !retryable || attempt == config.max_retries {
-            return response
-                .map_err(|_| Error::new(ErrorCode::NetworkError, "File transfer request failed"));
+            return response.map_err(transport_error);
         }
         let delay = calculate_backoff(&config, attempt, retry_after);
         if started.elapsed().saturating_add(delay) >= config.overall_timeout {
-            return response
-                .map_err(|_| Error::new(ErrorCode::NetworkError, "File transfer request failed"));
+            return response.map_err(transport_error);
         }
         tokio::time::sleep(delay).await;
     }
@@ -521,7 +542,9 @@ mod tests {
         use crate::client::retry::{RequestCategory, RetryConfig};
         use std::time::Duration;
         use tokio::io::AsyncReadExt;
-        for (budget, succeeds) in [(1000, true), (40, false)] {
+        for (budget, succeeds, existing) in
+            [(1000, true, false), (40, false, true), (40, false, false)]
+        {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let address = listener.local_addr().unwrap();
             let server = tokio::spawn(async move {
@@ -553,6 +576,9 @@ mod tests {
             .unwrap();
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("download");
+            if existing {
+                std::fs::write(&file, b"original").unwrap();
+            }
             let result = transfer(
                 &http,
                 "GET",
@@ -567,9 +593,34 @@ mod tests {
                 assert_eq!(std::fs::read(&file).unwrap(), b"data");
             } else {
                 assert_eq!(result.unwrap_err().code, ErrorCode::NetworkError);
+                if existing {
+                    assert_eq!(std::fs::read(&file).unwrap(), b"original");
+                } else {
+                    assert!(!file.exists());
+                }
             }
+            assert_eq!(
+                std::fs::read_dir(dir.path()).unwrap().count(),
+                usize::from(succeeds || existing)
+            );
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_plaintext_storage_host() {
+        let error = transfer(
+            &client(),
+            "REMOVE",
+            "http://storage.example/file?signature=secret",
+            &HashMap::new(),
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
+        assert!(error.message.contains("scheme"));
+        assert!(!error.message.contains("secret"));
     }
 
     #[test]
