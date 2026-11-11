@@ -66,6 +66,13 @@ impl Statement {
         Ok(())
     }
 
+    /// Set the local paths permitted for SQL PUT and GET transfers.
+    fn set_staging_allowed_local_paths(&mut self, paths: Vec<String>) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        inner.stmt.spec().staging_allowed_local_paths = Some(paths);
+        Ok(())
+    }
+
     /// Set the server-side row cap for this statement. ``None`` clears it.
     fn set_row_limit(&mut self, row_limit: Option<i64>) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");

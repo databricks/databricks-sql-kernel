@@ -221,6 +221,8 @@ pub struct ExecutedAsyncStatement {
     /// don't `.await` and the poll loop releases the lock before
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
+    pub(crate) volume_options: super::volume::VolumeOptions,
+    volume_completion: Arc<tokio::sync::OnceCell<Result<()>>>,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -331,6 +333,8 @@ impl ExecutedAsyncStatement {
             owning: true,
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            volume_options: super::volume::VolumeOptions::default(),
+            volume_completion: Arc::new(tokio::sync::OnceCell::new()),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
@@ -390,6 +394,8 @@ impl ExecutedAsyncStatement {
             owning: false,
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            volume_options: super::volume::VolumeOptions::default(),
+            volume_completion: Arc::new(tokio::sync::OnceCell::new()),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,
@@ -408,16 +414,17 @@ impl ExecutedAsyncStatement {
             .lock()
             .map_err(|error| Error::internal().message(format!("Statement status lock: {error}")))?
             .clone();
-        Ok(AsyncStatementReader {
-            inner: Self::new_read_only(
-                Arc::clone(&self.session),
-                self.statement_id.clone(),
-                self.valid.clone(),
-                Arc::clone(&self.owner_released),
-                self.session_attribution,
-                status,
-            ),
-        })
+        let mut inner = Self::new_read_only(
+            Arc::clone(&self.session),
+            self.statement_id.clone(),
+            self.valid.clone(),
+            Arc::clone(&self.owner_released),
+            self.session_attribution,
+            status,
+        );
+        inner.volume_options = self.volume_options.clone();
+        inner.volume_completion = Arc::clone(&self.volume_completion);
+        Ok(AsyncStatementReader { inner })
     }
 
     fn check_owner_available(&self) -> Result<()> {
@@ -874,6 +881,13 @@ impl ExecutedAsyncStatement {
                 if result.status.state == crate::types::sea::StatementState::Closed {
                     self.closed.store(true, Ordering::Release);
                 }
+                let result = super::volume::complete(
+                    &self.session.http_client,
+                    result,
+                    &self.volume_options,
+                    &self.volume_completion,
+                )
+                .await?;
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a

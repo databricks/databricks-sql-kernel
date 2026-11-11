@@ -38,6 +38,7 @@
  * path is the one the production code uses.
  */
 export interface ExecuteOptions {
+  stagingAllowedLocalPaths?: string[]
   /**
    * Per-statement Spark conf overlay. Merged on top of the
    * session-level `sessionConf` at execute time; this map wins

@@ -35,6 +35,7 @@ pub mod spec;
 
 pub(crate) mod timeout;
 pub(crate) mod validity;
+pub(crate) mod volume;
 
 // Re-exports so wrappers can write `crate::statement::Statement` instead
 // of the deeper submodule paths. The crate-root re-exports in `lib.rs`

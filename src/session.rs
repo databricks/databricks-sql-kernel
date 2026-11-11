@@ -97,6 +97,7 @@ pub(crate) struct SessionInner {
     /// behind the trait object; future variants slot in via
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
+    pub(crate) http_client: Arc<DatabricksHttpClient>,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -460,7 +461,7 @@ impl Session {
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
-            http_client,
+            http_client.clone(),
             session_info.session_id.clone(),
         ));
         telemetry
@@ -480,6 +481,7 @@ impl Session {
         Ok(Session {
             inner: Arc::new(SessionInner {
                 transport,
+                http_client,
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,

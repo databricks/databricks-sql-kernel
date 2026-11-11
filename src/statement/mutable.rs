@@ -409,6 +409,13 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
+            let result = super::volume::complete(
+                &self.session.http_client,
+                result,
+                &super::volume::VolumeOptions::from(&self.spec),
+                &tokio::sync::OnceCell::new(),
+            )
+            .await?;
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
             result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
@@ -535,7 +542,7 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
-            Ok(ExecutedAsyncStatement::new(
+            let mut executed = ExecutedAsyncStatement::new(
                 Arc::clone(&self.session),
                 response.statement_id,
                 valid,
@@ -549,7 +556,9 @@ impl Statement {
                 response.status,
                 telemetry_for_body,
                 timeout,
-            ))
+            );
+            executed.volume_options = super::volume::VolumeOptions::from(&self.spec);
+            Ok(executed)
         }
         .instrument(span)
         .await;
@@ -644,6 +653,13 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
+                    let result = super::volume::complete(
+                        &self.session.http_client,
+                        result,
+                        &super::volume::VolumeOptions::from(&self.spec),
+                        &tokio::sync::OnceCell::new(),
+                    )
+                    .await?;
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let executed = ExecutedStatement::new(
@@ -667,7 +683,7 @@ impl Statement {
                     self.last_statement_id = Some(resp.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    Ok(DirectStatement::Running(ExecutedAsyncStatement::new(
+                    let mut executed = ExecutedAsyncStatement::new(
                         Arc::clone(&self.session),
                         resp.statement_id,
                         valid,
@@ -675,7 +691,9 @@ impl Statement {
                         resp.status,
                         telemetry_for_body,
                         ExecutionTimeout::Default,
-                    )))
+                    );
+                    executed.volume_options = super::volume::VolumeOptions::from(&self.spec);
+                    Ok(DirectStatement::Running(executed))
                 }
             }
         }

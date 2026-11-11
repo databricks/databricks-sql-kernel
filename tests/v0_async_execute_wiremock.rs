@@ -2274,3 +2274,60 @@ async fn await_result_succeeded_status_still_closes_statement() {
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
 }
+
+#[tokio::test]
+async fn file_transfer_completion_is_shared_by_independent_readers() {
+    use arrow_array::StringArray;
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/storage/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"download"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("download");
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "operation",
+            Arc::new(StringArray::from(vec!["GET"])) as arrow_array::ArrayRef,
+        ),
+        (
+            "url",
+            Arc::new(StringArray::from(vec![format!(
+                "{}/storage/file",
+                server.uri()
+            )])),
+        ),
+        ("headers", Arc::new(StringArray::from(vec!["{}"]))),
+        (
+            "local",
+            Arc::new(StringArray::from(vec![destination.to_str().unwrap()])),
+        ),
+    ])
+    .unwrap();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
+    body["manifest"]["is_volume_operation"] = json!(true);
+    mount_submit(&server, pending_body("transfer")).await;
+    mount_status_once(&server, "transfer", body.to_string()).await;
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement
+        .spec()
+        .sql("GET '/Volumes/c/s/v/file' TO '/tmp/download'");
+    statement.spec().staging_allowed_local_paths = Some(vec![dir.path().to_str().unwrap().into()]);
+    let owner = statement.submit().await.unwrap();
+    let first = owner.reader().unwrap();
+    let second = owner.reader().unwrap();
+    let (first, second) = tokio::join!(first.fetch_result(), second.fetch_result());
+    for stream in [first, second] {
+        assert!(stream.unwrap().next_batch().await.unwrap().is_none());
+    }
+    assert_eq!(std::fs::read(destination).unwrap(), b"download");
+    owner.close().await.unwrap();
+    session.close().await.unwrap();
+}

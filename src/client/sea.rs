@@ -2429,6 +2429,7 @@ mod tests {
                 error_details_json: None,
             },
             manifest: Some(ResultManifest {
+                is_volume_operation: false,
                 format: "ARROW_STREAM".to_string(),
                 schema: ResultSchema {
                     column_count: 0,

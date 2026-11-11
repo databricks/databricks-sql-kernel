@@ -159,6 +159,32 @@ pub enum KernelStatementStatusKind {
     Closed = 5,
 }
 
+/// Configure permitted local paths from a JSON array for SQL file transfers.
+///
+/// # Safety
+/// `stmt` must be live and `paths_json` must be a NUL-terminated UTF-8 string.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_set_staging_allowed_local_paths(
+    stmt: *mut kernel_statement_t,
+    paths_json: *const c_char,
+    retain_result: bool,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        if paths_json.is_null() {
+            return Err(Error::invalid_argument().message("paths_json must not be null"));
+        }
+        let json = CStr::from_ptr(paths_json)
+            .to_str()
+            .map_err(|_| Error::invalid_argument().message("paths_json must be UTF-8"))?;
+        let paths: Vec<String> = serde_json::from_str(json).map_err(|_| {
+            Error::invalid_argument().message("paths_json must be an array of paths")
+        })?;
+        stmt.spec().staging_allowed_local_paths = Some(paths);
+        stmt.spec().retain_volume_operation_result = retain_result;
+        Ok(())
+    })
+}
+
 // ─── Crate-internal raw-handle helpers ───────────────────────────────────────
 
 /// Box a [`Statement`] and erase it to the opaque C handle type.

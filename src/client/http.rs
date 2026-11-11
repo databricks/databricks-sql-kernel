@@ -736,6 +736,13 @@ impl DatabricksHttpClient {
         &self.client
     }
 
+    pub(crate) fn storage_retry_config(&self) -> RetryConfig {
+        self.retry_configs
+            .get(&RequestCategory::CloudFetch)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Get the authorization header value.
     ///
     /// Returns an error if the auth provider has not been set via `set_auth_provider()`.

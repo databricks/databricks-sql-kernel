@@ -222,6 +222,15 @@ pub struct StatementSpec {
 
     /// Result wire format.
     pub result_format: ResultFormat,
+
+    /// Local paths permitted for SQL file transfers. `None` leaves transfer
+    /// instructions available to a caller that handles them itself. An empty list
+    /// enables REMOVE while denying local file access.
+    pub staging_allowed_local_paths: Option<Vec<String>>,
+
+    /// Preserve the instruction row after a successful transfer for APIs
+    /// whose existing result contract includes that row.
+    pub retain_volume_operation_result: bool,
 }
 
 impl StatementSpec {
