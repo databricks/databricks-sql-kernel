@@ -16,6 +16,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
+- `Session::attach_async_statement` no longer infers modified-row counts from
+  ambiguous result-column names when the submitted SQL is unavailable. ID-only
+  attachments now report only counts supplied in statement status metadata;
+  retain the handle returned by `Statement::submit` when inferred DML counts
+  are required.
 - Rust ADBC requests identify themselves as `RustADBCDatabricksDriver/<version>`
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
