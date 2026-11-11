@@ -633,6 +633,7 @@ dependencies = [
  "pkcs8",
  "rand 0.10.2",
  "reqwest",
+ "rustls",
  "rustls-webpki",
  "serde",
  "serde_json",

@@ -60,6 +60,8 @@ arrow-ipc = "59"
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+native-tls = { version = "0.2", optional = true }
+rustls = { version = "0.23.41", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 # Enforce TLS dependency minimums for consumers with their own lockfiles.
 rustls-webpki = { version = "0.103.16", optional = true, default-features = false }
 webpki-roots = { version = "1.0.11", optional = true, default-features = false }
@@ -193,7 +195,7 @@ tokio-rustls = { version = "0.26.4", default-features = false, features = ["ring
 # guarantee — items 1 and 2 above are.
 [features]
 default = ["tls-native"]
-tls-native = ["reqwest/native-tls"]
+tls-native = ["reqwest/native-tls", "dep:native-tls"]
 # `rustls-tls` alone is `reqwest/rustls-tls-webpki-roots` — the bundled Mozilla
 # root set only, which does NOT read the OS system trust store. `tls-native`
 # (native-tls → OpenSSL) DOES read `/etc/ssl/...`, so a `tls-rustls` build behind
@@ -207,6 +209,7 @@ tls-native = ["reqwest/native-tls"]
 tls-rustls = [
     "reqwest/rustls-tls",
     "reqwest/rustls-tls-native-roots",
+    "dep:rustls",
     "dep:rustls-webpki",
     "dep:webpki-roots",
 ]
