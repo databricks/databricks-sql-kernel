@@ -352,7 +352,7 @@ impl Statement {
         let result = async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
-            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
+            let infer_num_modified_rows = crate::statement::dml_count::sql_may_modify_rows(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -480,7 +480,7 @@ impl Statement {
         let result = async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
-            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
+            let infer_num_modified_rows = crate::statement::dml_count::sql_may_modify_rows(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),
@@ -605,7 +605,7 @@ impl Statement {
             // alive) is what makes the Completed arm's `close()` a no-op and lets
             // fire-and-forget DDL commit.
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
-            let infer_num_modified_rows = crate::statement::dml_count::sql_is_dml(&sql);
+            let infer_num_modified_rows = crate::statement::dml_count::sql_may_modify_rows(&sql);
 
             let cancel_state = MidExecuteCancelState::new(
                 Arc::clone(&self.session),

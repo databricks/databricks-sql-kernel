@@ -26,6 +26,7 @@
 //! | UPDATE    | `num_affected_rows`                                                      |
 //! | DELETE    | `num_affected_rows`                                                      |
 //! | MERGE     | `num_affected_rows`, `num_updated_rows`, `num_deleted_rows`, `num_inserted_rows` |
+//! | COPY INTO, CTAS, RTAS | `num_affected_rows`, `num_inserted_rows`                     |
 //!
 //! `num_affected_rows` is the total, matching Thrift's `numModifiedRows`.
 //! Reading it here lets the kernel's `num_modified_rows()` accessor reach
@@ -53,33 +54,29 @@ const DML_COUNT_COLUMNS: [&str; 4] = [
 /// The total-affected column whose value maps to `num_modified_rows`.
 const AFFECTED_ROWS_COLUMN: &str = "num_affected_rows";
 
-/// SEA result aliases are ambiguous, so row-count extraction also requires DML SQL.
-pub(crate) fn sql_is_dml(sql: &str) -> bool {
-    outer_statement_keyword(sql).is_some_and(is_dml_keyword)
+/// SEA result aliases are ambiguous, so row-count extraction also requires a
+/// statement form that can modify rows.
+pub(crate) fn sql_may_modify_rows(sql: &str) -> bool {
+    let mut cursor = SqlCursor::new(sql);
+    let Some(first) = cursor.next_keyword() else {
+        return false;
+    };
+    if first.eq_ignore_ascii_case("WITH") {
+        if cursor.skip_ctes().is_none() {
+            return false;
+        }
+        let Some(outer) = cursor.next_keyword() else {
+            return false;
+        };
+        return cursor.statement_may_modify_rows(outer);
+    }
+    cursor.statement_may_modify_rows(first)
 }
 
 fn is_dml_keyword(keyword: &str) -> bool {
     ["INSERT", "UPDATE", "DELETE", "MERGE"]
         .iter()
         .any(|candidate| keyword.eq_ignore_ascii_case(candidate))
-}
-
-fn outer_statement_keyword(sql: &str) -> Option<&str> {
-    let mut cursor = SqlCursor::new(sql);
-    let first = cursor.next_keyword()?;
-    if first.eq_ignore_ascii_case("FROM") {
-        return cursor.has_multi_insert_body().then_some("INSERT");
-    }
-    if !first.eq_ignore_ascii_case("WITH") {
-        return Some(first);
-    }
-    cursor.skip_ctes()?;
-    let outer = cursor.next_keyword()?;
-    if outer.eq_ignore_ascii_case("FROM") {
-        cursor.has_multi_insert_body().then_some("INSERT")
-    } else {
-        Some(outer)
-    }
 }
 
 struct SqlCursor<'a> {
@@ -215,6 +212,87 @@ impl<'a> SqlCursor<'a> {
                 _ => self.advance_char(),
             }
         }
+    }
+
+    fn statement_may_modify_rows(&mut self, keyword: &str) -> bool {
+        if is_dml_keyword(keyword) {
+            return true;
+        }
+        if keyword.eq_ignore_ascii_case("FROM") {
+            return self.has_multi_insert_body();
+        }
+        if keyword.eq_ignore_ascii_case("COPY") {
+            return self.consume_keyword("INTO");
+        }
+        if keyword.eq_ignore_ascii_case("CREATE") {
+            return self.is_create_table_as_select();
+        }
+        if keyword.eq_ignore_ascii_case("REPLACE") {
+            return self.consume_keyword("TABLE") && self.has_as_query();
+        }
+        if keyword.eq_ignore_ascii_case("EXECUTE") && self.consume_keyword("IMMEDIATE") {
+            return self.take_string_literal().is_some_and(sql_may_modify_rows);
+        }
+        false
+    }
+
+    fn is_create_table_as_select(&mut self) -> bool {
+        if self.consume_keyword("OR") && !self.consume_keyword("REPLACE") {
+            return false;
+        }
+        if !self.consume_keyword("TEMP") {
+            self.consume_keyword("TEMPORARY");
+        }
+        self.consume_keyword("TABLE") && self.has_as_query()
+    }
+
+    fn has_as_query(&mut self) -> bool {
+        while let Some(keyword) = self.next_top_level_keyword() {
+            if keyword.eq_ignore_ascii_case("AS") {
+                return self.next_top_level_keyword().is_some_and(|query| {
+                    ["SELECT", "TABLE", "VALUES", "WITH", "FROM"]
+                        .iter()
+                        .any(|candidate| query.eq_ignore_ascii_case(candidate))
+                });
+            }
+        }
+        false
+    }
+
+    fn take_string_literal(&mut self) -> Option<&'a str> {
+        self.skip_trivia();
+        if self.current_char().is_some_and(|c| matches!(c, 'R' | 'r')) {
+            let prefix = self.index;
+            self.advance_char();
+            if !matches!(self.current_char(), Some('\'' | '"')) {
+                self.index = prefix;
+                return None;
+            }
+        }
+        let quote = self.current_char()?;
+        if !matches!(quote, '\'' | '"') {
+            return None;
+        }
+        let raw = self.is_raw_string();
+        self.advance_char();
+        let start = self.index;
+        while let Some(character) = self.current_char() {
+            if !raw && character == '\\' {
+                self.advance_char();
+                self.advance_char();
+            } else if character == quote {
+                let end = self.index;
+                self.advance_char();
+                if !raw && self.current_char() == Some(quote) {
+                    self.advance_char();
+                } else {
+                    return Some(&self.sql[start..end]);
+                }
+            } else {
+                self.advance_char();
+            }
+        }
+        None
     }
 
     fn has_multi_insert_body(&mut self) -> bool {
@@ -439,7 +517,7 @@ mod tests {
     use std::sync::Arc;
 
     #[test]
-    fn classifies_direct_and_cte_dml() {
+    fn classifies_statements_that_may_modify_rows() {
         for sql in [
             "INSERT INTO t VALUES (1)",
             "-- comment\nUPDATE t SET value = 1",
@@ -463,8 +541,15 @@ mod tests {
             "FROM source INSERT ONCE INTO ONCE target SELECT * FROM source",
             "FROM insert INSERT INTO target SELECT * FROM insert",
             "FROM source AS insert INSERT INTO target SELECT * FROM source",
+            "COPY INTO target FROM '/Volumes/catalog/schema/volume'",
+            "CREATE TABLE target USING DELTA AS SELECT 1",
+            "CREATE OR REPLACE TABLE target AS SELECT 1",
+            "CREATE TEMPORARY TABLE target AS VALUES (1)",
+            "REPLACE TABLE target AS WITH source AS (SELECT 1) SELECT * FROM source",
+            "EXECUTE IMMEDIATE 'INSERT INTO target VALUES (1)'",
+            "EXECUTE IMMEDIATE R'UPDATE target SET value = 1'",
         ] {
-            assert!(sql_is_dml(sql), "expected DML: {sql}");
+            assert!(sql_may_modify_rows(sql), "expected modifying SQL: {sql}");
         }
     }
 
@@ -482,10 +567,16 @@ mod tests {
             "FROM insert SELECT *",
             "WITH source AS (SELECT 1) FROM source SELECT *",
             "EXPLAIN UPDATE t SET value = 1",
-            "CREATE TABLE t AS SELECT 1",
+            "CREATE TABLE t (value BIGINT)",
+            "CREATE VIEW v AS SELECT 1",
+            "EXECUTE IMMEDIATE 'SELECT 7 AS num_affected_rows'",
+            "EXECUTE IMMEDIATE sql_variable",
             "WITH source AS (SELECT 1",
         ] {
-            assert!(!sql_is_dml(sql), "expected non-DML: {sql}");
+            assert!(
+                !sql_may_modify_rows(sql),
+                "expected non-modifying SQL: {sql}"
+            );
         }
     }
 
