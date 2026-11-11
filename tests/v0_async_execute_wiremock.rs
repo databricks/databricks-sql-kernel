@@ -645,6 +645,14 @@ async fn re_submit_invalidates_prior_async_handle() {
 
     // Re-submit invalidates async_exec_x.
     let _async_exec_y = stmt.submit().await.expect("submit Y");
+    assert_eq!(
+        async_exec_x.try_num_modified_rows().unwrap_err().code,
+        ErrorCode::InvalidStatementHandle
+    );
+    assert_eq!(
+        reader.num_modified_rows().unwrap_err().code,
+        ErrorCode::InvalidStatementHandle
+    );
     let err = async_exec_x
         .cancel()
         .await
@@ -1602,6 +1610,10 @@ async fn owner_release_invalidates_readers() {
         .expect("reader stops polling after owner release");
         assert_eq!(
             result.err().unwrap().code,
+            ErrorCode::InvalidStatementHandle
+        );
+        assert_eq!(
+            reader.num_modified_rows().unwrap_err().code,
             ErrorCode::InvalidStatementHandle
         );
         for result in [
