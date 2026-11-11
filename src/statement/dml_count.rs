@@ -249,7 +249,12 @@ impl<'a> SqlCursor<'a> {
     fn has_as_query(&mut self) -> bool {
         while let Some(keyword) = self.next_top_level_keyword() {
             if keyword.eq_ignore_ascii_case("AS") {
-                return self.next_top_level_keyword().is_some_and(|query| {
+                self.skip_trivia();
+                while self.current_char() == Some('(') {
+                    self.advance_char();
+                    self.skip_trivia();
+                }
+                return self.next_keyword().is_some_and(|query| {
                     ["SELECT", "TABLE", "VALUES", "WITH", "FROM"]
                         .iter()
                         .any(|candidate| query.eq_ignore_ascii_case(candidate))
@@ -543,9 +548,11 @@ mod tests {
             "FROM source AS insert INSERT INTO target SELECT * FROM source",
             "COPY INTO target FROM '/Volumes/catalog/schema/volume'",
             "CREATE TABLE target USING DELTA AS SELECT 1",
+            "CREATE TABLE target AS (SELECT 1)",
             "CREATE OR REPLACE TABLE target AS SELECT 1",
             "CREATE TEMPORARY TABLE target AS VALUES (1)",
             "REPLACE TABLE target AS WITH source AS (SELECT 1) SELECT * FROM source",
+            "REPLACE TABLE target AS (SELECT 1)",
             "EXECUTE IMMEDIATE 'INSERT INTO target VALUES (1)'",
             "EXECUTE IMMEDIATE R'UPDATE target SET value = 1'",
         ] {
