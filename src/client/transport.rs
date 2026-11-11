@@ -390,9 +390,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// Fetch one inline-Arrow chunk by `chunk_index` (+ server-side
     /// `row_offset`).
     ///
-    /// Used by the inline-Arrow streaming path that lights up when
-    /// `ResultConfig.cloudfetch_enabled == false`. The
-    /// server-side response for this path carries Arrow IPC bytes inline
+    /// Used for paged inline results. The response carries Arrow IPC bytes inline
     /// in `attachment` rather than emitting `external_links`.
     ///
     /// Per the bounded SEA API contract for OSS drivers:
