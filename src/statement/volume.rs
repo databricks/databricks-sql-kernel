@@ -232,8 +232,16 @@ async fn transfer(
     }
     if operation == "GET" {
         let destination = local.as_ref().unwrap();
-        let temporary =
-            tempfile::NamedTempFile::new_in(destination.parent().unwrap()).map_err(file_error)?;
+        let parent = destination.parent().ok_or_else(|| {
+            Error::invalid_argument().message("Download destination must be a file")
+        })?;
+        let mut builder = tempfile::Builder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            builder.permissions(std::fs::Permissions::from_mode(0o666));
+        }
+        let temporary = builder.tempfile_in(parent).map_err(file_error)?;
         let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(file_error)?);
         let mut body = response.bytes_stream();
         while let Some(bytes) = body.next().await {
@@ -242,6 +250,14 @@ async fn transfer(
         }
         file.flush().await.map_err(file_error)?;
         drop(file);
+        match std::fs::metadata(destination) {
+            Ok(metadata) => temporary
+                .as_file()
+                .set_permissions(metadata.permissions())
+                .map_err(file_error)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(file_error(error)),
+        }
         temporary
             .persist(destination)
             .map_err(|error| file_error(error.error))?;
@@ -259,7 +275,10 @@ fn transport_error(error: reqwest::Error) -> Error {
     } else {
         "File transfer request failed"
     };
-    Error::new(ErrorCode::NetworkError, message)
+    Error::new(ErrorCode::NetworkError, message).with_cause(Error::new(
+        ErrorCode::NetworkError,
+        format!("{:?}", error.without_url()),
+    ))
 }
 
 async fn send_transfer(
@@ -411,6 +430,62 @@ mod tests {
         let request = server.received_requests().await.unwrap().remove(0);
         assert!(!request.headers.contains_key("authorization"));
         assert_eq!(request.headers["x-file-header"], "value");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_preserves_file_permissions_and_rejects_root() {
+        use std::os::unix::fs::PermissionsExt;
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"contents"))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let destination = dir.path().join("download");
+        let control = dir.path().join("control");
+        std::fs::write(&control, b"").unwrap();
+        let roots = vec![dir.path().to_str().unwrap().into()];
+        for existing in [false, true] {
+            if existing {
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o640))
+                    .unwrap();
+            }
+            transfer(
+                &client(),
+                "GET",
+                &server.uri(),
+                &HashMap::new(),
+                destination.to_str(),
+                &roots,
+            )
+            .await
+            .unwrap();
+            let expected = if existing {
+                0o640
+            } else {
+                std::fs::metadata(&control).unwrap().permissions().mode() & 0o777
+            };
+            assert_eq!(
+                std::fs::metadata(&destination)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                expected
+            );
+        }
+        let error = transfer(
+            &client(),
+            "GET",
+            &server.uri(),
+            &HashMap::new(),
+            Some("/"),
+            &["/".into()],
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]
@@ -605,6 +680,22 @@ mod tests {
             );
             server.await.unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn transport_cause_omits_signed_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = reqwest::Client::new()
+            .get(format!("http://{address}/file?signature=secret"))
+            .send()
+            .await
+            .unwrap_err();
+        let error = transport_error(error);
+        assert!(error.cause.is_some());
+        assert!(!format!("{error:?}").contains("signature"));
+        assert!(!format!("{error:?}").contains("secret"));
     }
 
     #[tokio::test]

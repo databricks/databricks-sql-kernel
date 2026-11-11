@@ -225,7 +225,8 @@ pub struct StatementSpec {
 
     /// Local paths permitted for SQL file transfers. `None` leaves transfer
     /// instructions available to a caller that handles them itself. An empty list
-    /// enables REMOVE while denying local file access.
+    /// enables REMOVE while denying local file access. Transfers use the storage
+    /// retry overall deadline, which defaults to 15 minutes.
     pub staging_allowed_local_paths: Option<Vec<String>>,
 
     /// Preserve the instruction row after a successful transfer for APIs
