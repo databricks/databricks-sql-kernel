@@ -1716,7 +1716,7 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
         Err(error) => error,
     };
-    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert_eq!(error.code, ErrorCode::Internal);
     assert!(
         error.to_string().contains("CloudFetch is disabled"),
         "{error}"
@@ -1727,6 +1727,38 @@ async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloa
         wait_for_close_delete(&server, "stmt-cf-off", 1, Duration::from_secs(2)).await,
         1,
     );
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_preserves_unsupported_server_error() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let mut body: serde_json::Value = serde_json::from_str(&failed_body(
+        "stmt-unsupported-inline",
+        "[CONFIG_NOT_AVAILABLE] Configuration can_cloud_download is not available",
+        "42K0I",
+    ))
+    .unwrap();
+    body["status"]["error"]["error_code"] = json!("CONFIG_NOT_AVAILABLE");
+    mount_execute(&server, body.to_string()).await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut statement = session.statement();
+    statement.spec().sql("SELECT 1");
+    let error = match statement.execute().await {
+        Ok(_) => panic!("unsupported inline delivery must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::SqlError);
+    assert_eq!(error.sql_state.as_deref(), Some("42K0I"));
+    assert!(error.message.contains("CONFIG_NOT_AVAILABLE"), "{error}");
+    assert!(error.message.contains("can_cloud_download"), "{error}");
+    statement.close().await.expect("close statement");
+    session.close().await.expect("close session");
 }
 
 #[tokio::test]

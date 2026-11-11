@@ -1092,6 +1092,7 @@ pub struct ResultConfig {
     ///
     /// Set to `false` for applications without direct access to cloud storage.
     /// This connection-level setting requests paged inline Arrow results.
+    /// Servers without this capability may reject session creation or the first statement.
     pub cloudfetch_enabled: bool,
 
     /// Number of presigned URLs to prefetch ahead of the consumer.
