@@ -429,7 +429,6 @@ impl SeaRestTransport {
     }
 
     /// Fetch statement status for callers that expose the status directly.
-    ///
     async fn get_statement_status(
         &self,
         statement_id: &str,

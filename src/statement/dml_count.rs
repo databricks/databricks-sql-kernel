@@ -26,7 +26,8 @@
 //! | UPDATE    | `num_affected_rows`                                                      |
 //! | DELETE    | `num_affected_rows`                                                      |
 //! | MERGE     | `num_affected_rows`, `num_updated_rows`, `num_deleted_rows`, `num_inserted_rows` |
-//! | COPY INTO, CTAS, RTAS | `num_affected_rows`, `num_inserted_rows`                     |
+//! | COPY INTO | `num_affected_rows`, `num_inserted_rows`, `num_skipped_corrupt_files`    |
+//! | CTAS, RTAS | `num_affected_rows`, `num_inserted_rows`                                |
 //!
 //! `num_affected_rows` is the total, matching Thrift's `numModifiedRows`.
 //! Reading it here lets the kernel's `num_modified_rows()` accessor reach
@@ -44,11 +45,12 @@ use arrow_array::Array;
 use arrow_schema::DataType;
 
 /// The exact set of column names a SEA DML count result is built from.
-const DML_COUNT_COLUMNS: [&str; 4] = [
+const DML_COUNT_COLUMNS: [&str; 5] = [
     "num_affected_rows",
     "num_inserted_rows",
     "num_updated_rows",
     "num_deleted_rows",
+    "num_skipped_corrupt_files",
 ];
 
 /// The total-affected column whose value maps to `num_modified_rows`.
@@ -639,6 +641,27 @@ mod tests {
         // INSERT → [num_affected_rows, num_inserted_rows].
         let mut s = count_stream(&[("num_affected_rows", &[3]), ("num_inserted_rows", &[3])]).await;
         assert_eq!(read_dml_affected_rows(&mut s).await.unwrap(), Some(3));
+    }
+
+    #[tokio::test]
+    async fn copy_into_shape_returns_affected_rows() {
+        let manifest: ResultManifest = serde_json::from_str(
+            r#"{"format":"ARROW_STREAM","schema":{"column_count":3,"columns":[
+                {"name":"num_affected_rows","type_name":"LONG","type_text":"BIGINT","position":0},
+                {"name":"num_inserted_rows","type_name":"LONG","type_text":"BIGINT","position":1},
+                {"name":"num_skipped_corrupt_files","type_name":"INT","type_text":"INT","position":2}]},
+                "total_row_count":1}"#,
+        )
+        .unwrap();
+        assert!(manifest_is_dml_count(&manifest));
+
+        let mut stream = count_stream(&[
+            ("num_affected_rows", &[2]),
+            ("num_inserted_rows", &[2]),
+            ("num_skipped_corrupt_files", &[0]),
+        ])
+        .await;
+        assert_eq!(read_dml_affected_rows(&mut stream).await.unwrap(), Some(2));
     }
 
     #[tokio::test]
