@@ -1356,20 +1356,20 @@ async fn async_fetch_result_caches_failed_terminal_status() {
 }
 
 #[tokio::test]
-async fn async_fetch_result_caches_terminal_status_when_reader_creation_fails() {
+async fn async_fetch_result_caches_terminal_status_when_reader_factory_rejects_response() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     mount_close_any_statement(&server).await;
 
-    mount_submit(&server, pending_body("stmt-fetch-invalid-arrow")).await;
+    mount_submit(&server, pending_body("stmt-fetch-invalid-reader")).await;
     let batch = int64_batch("value", vec![1]);
     let mut response: serde_json::Value =
-        serde_json::from_str(&succeeded_inline_body("stmt-fetch-invalid-arrow", &batch)).unwrap();
-    response["result"]["attachment"] = json!(STANDARD.encode(b"not an Arrow stream"));
+        serde_json::from_str(&succeeded_inline_body("stmt-fetch-invalid-reader", &batch)).unwrap();
+    response["manifest"]["total_chunk_count"] = json!(2);
     mount_status_sequence(
         &server,
-        "stmt-fetch-invalid-arrow",
+        "stmt-fetch-invalid-reader",
         vec![response.to_string()],
     )
     .await;
@@ -1382,10 +1382,12 @@ async fn async_fetch_result_caches_terminal_status_when_reader_creation_fails() 
         .await
         .expect("submit");
 
-    assert!(
-        async_exec.fetch_result().await.is_err(),
-        "fetch_result with invalid Arrow data should error"
-    );
+    let error = match async_exec.fetch_result().await {
+        Ok(_) => panic!("reader factory must reject missing continuation metadata"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert!(error.message.contains("missing per-chunk next_chunk_index"));
 
     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     let status = async_exec.status().await.expect("status");

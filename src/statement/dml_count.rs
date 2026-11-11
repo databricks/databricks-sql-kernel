@@ -226,7 +226,7 @@ impl<'a> SqlCursor<'a> {
                 if self.consume_keyword("WITH")
                     && (!self.consume_keyword("SCHEMA") || !self.consume_keyword("EVOLUTION"))
                 {
-                    return false;
+                    continue;
                 }
                 if self.consume_keyword("OVERWRITE") {
                     return true;
@@ -236,7 +236,6 @@ impl<'a> SqlCursor<'a> {
                     self.consume_keyword("ONCE");
                     return true;
                 }
-                return false;
             }
         }
         false
@@ -462,6 +461,8 @@ mod tests {
             "WITH source AS (SELECT 1) FROM source INSERT INTO target SELECT * FROM source",
             "FROM source INSERT WITH SCHEMA EVOLUTION OVERWRITE target SELECT * FROM source",
             "FROM source INSERT ONCE INTO ONCE target SELECT * FROM source",
+            "FROM insert INSERT INTO target SELECT * FROM insert",
+            "FROM source AS insert INSERT INTO target SELECT * FROM source",
         ] {
             assert!(sql_is_dml(sql), "expected DML: {sql}");
         }
