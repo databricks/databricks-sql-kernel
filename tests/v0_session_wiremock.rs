@@ -422,9 +422,7 @@ async fn create_session_with_cloudfetch_disabled_requests_inline_results() {
     assert_eq!(body["session_confs"]["TIMEZONE"], "UTC");
 
     assert_eq!(
-        create_session_body(&server)
-            .await
-            .pointer("/session_confs/can_cloud_download"),
+        body.pointer("/session_confs/can_cloud_download"),
         Some(&serde_json::json!("false")),
     );
 }
