@@ -256,11 +256,13 @@ impl<'a> SqlCursor<'a> {
                     self.advance_char();
                     self.skip_trivia();
                 }
-                return self.next_keyword().is_some_and(|query| {
+                if self.next_keyword().is_some_and(|query| {
                     ["SELECT", "TABLE", "VALUES", "WITH", "FROM"]
                         .iter()
                         .any(|candidate| query.eq_ignore_ascii_case(candidate))
-                });
+                }) {
+                    return true;
+                }
             }
         }
         false
@@ -550,6 +552,7 @@ mod tests {
             "FROM source AS insert INSERT INTO target SELECT * FROM source",
             "COPY INTO target FROM '/Volumes/catalog/schema/volume'",
             "CREATE TABLE target USING DELTA AS SELECT 1",
+            "CREATE TABLE target STORED AS PARQUET AS SELECT 1",
             "CREATE TABLE target AS (SELECT 1)",
             "CREATE OR REPLACE TABLE target AS SELECT 1",
             "CREATE TEMPORARY TABLE target AS VALUES (1)",

@@ -30,6 +30,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Fixed
 
+- Affected-row inference now uses the submitted statement type, so ordinary
+  query results with columns such as `num_affected_rows` remain query rows.
+  Count result schemas for DML, COPY INTO, CTAS/RTAS, and literal EXECUTE
+  IMMEDIATE writes continue to populate `num_modified_rows`.
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
 
 ---
