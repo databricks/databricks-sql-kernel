@@ -162,6 +162,8 @@ an incompletely consumed reader triggers best-effort server cleanup.
 Set `adbc.databricks.cloudfetch.enabled` to `false` to fetch results through
 the SQL connection when the application cannot access cloud storage directly.
 Large results are read in pages.
+The warehouse must support paged inline delivery; otherwise session creation
+or the first statement returns the server's configuration error.
 
 ## ADBC behavior
 
