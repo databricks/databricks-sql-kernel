@@ -455,7 +455,11 @@ async fn send_transfer(
             .request(method.clone(), url.clone())
             .timeout(remaining);
         for (name, value) in headers {
-            request = request.header(name, value);
+            if method != Method::PUT
+                || !name.eq_ignore_ascii_case(reqwest::header::CONTENT_LENGTH.as_str())
+            {
+                request = request.header(name, value);
+            }
         }
         if method == Method::PUT {
             let local = local
@@ -881,6 +885,53 @@ mod tests {
             assert_eq!(error.code, ErrorCode::Internal);
             assert!(error.os_error.is_some());
         }
+    }
+
+    #[tokio::test]
+    async fn upload_uses_one_content_length() {
+        // HTTP test servers can normalize duplicate framing headers before inspection.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut headers = Vec::new();
+            while !headers.ends_with(b"\r\n\r\n") {
+                headers.push(socket.read_u8().await.unwrap());
+            }
+            let mut body = [0; 6];
+            socket.read_exact(&mut body).await.unwrap();
+            assert_eq!(&body, b"upload");
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .unwrap();
+            String::from_utf8(headers).unwrap()
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("input");
+        tokio::fs::write(&local, b"upload").await.unwrap();
+        transfer(
+            &client(),
+            "PUT",
+            &format!("http://{address}/file"),
+            &HashMap::from([
+                ("cOnTeNt-LeNgTh".into(), "6".into()),
+                ("x-file-header".into(), "value".into()),
+            ]),
+            local.to_str(),
+            &[dir.path().to_str().unwrap().into()],
+        )
+        .await
+        .unwrap();
+        let headers = server.await.unwrap().to_ascii_lowercase();
+        assert_eq!(
+            headers
+                .lines()
+                .filter(|line| line.starts_with("content-length:"))
+                .collect::<Vec<_>>(),
+            ["content-length: 6"]
+        );
+        assert!(headers.lines().any(|line| line == "x-file-header: value"));
     }
 
     #[tokio::test]
