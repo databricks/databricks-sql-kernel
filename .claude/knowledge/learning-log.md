@@ -414,6 +414,12 @@ author, follow-up, and review runs.
 - **Context:** In PR #430, a unit test gated on `#[cfg(feature = "tls-rustls")]` (it checks `rustls::Error` nested inside `io::Error`) was never compiled or run in CI. The default `cargo test` job builds with `tls-native`, and the new rustls CI step's test filter was too narrow to include it. The fix widened the filter to `--lib client::`.
   **Rule:** Whenever you add a test behind a non-default cargo feature (e.g. `tls-rustls`), confirm that some CI job builds with that feature and that its test filter actually matches the new test path. Otherwise the test silently never runs.
 
+### 2026-11-12: learnings since 2026-11-11T07:20:49Z
+- **Context:** PR #432 added `num_modified_rows` getters on `ExecutedAsyncStatement`/`AsyncStatementReader` (Rust + PyO3). The first version of the mocked regression test only checked a zero count on success and `None` on failure. The reviewer pointed out that a zero would also pass if the getter just returned a hard-coded default whenever the field was present, so a `(False, 3)` case was added.
+  **Rule:** When testing that a numeric field is passed through (row counts, offsets, sizes), assert a distinctive non-zero value as well as zero/absent. A zero/default-only assertion cannot catch a getter that ignores the server value.
+- **Context:** PR #432. The reviewer noticed that the new async `num_modified_rows` getters raise `InvalidStatementHandle` after owner close, parent re-submit, or owner release, while `statement_id` is cached and can still be read after close. The author kept this on purpose instead of snapshotting the count, and confirmed the Python connector copies the count to `cursor.rowcount` before closing. `try_num_modified_rows` checks `check_read_validity()` both before and after reading the cached status.
+  **Rule:** Async statement metadata getters (other than the cached `statement_id`) must check read validity and raise `InvalidStatementHandle` after close, re-submit, or owner release. Callers/connectors must read metadata such as `num_modified_rows` before closing the handle. New getters should check validity both before and after the read, and the wiremock/PyO3 tests should cover the invalidation cases.
+
 ---
 *Add new entries above this line (oldest→newest). The retrospective inserts each
 new entry just above this footer.*
