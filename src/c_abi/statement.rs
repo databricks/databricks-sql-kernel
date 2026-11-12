@@ -1314,8 +1314,8 @@ mod tests {
             for (json, retained, expected) in [
                 (c"[]".as_ptr(), true, Some(vec![])),
                 (std::ptr::null(), false, None),
-                (c"[\"/tmp\"]".as_ptr(), false, Some(vec!["/tmp".to_owned()])),
-                (c"null".as_ptr(), true, None),
+                (c"null".as_ptr(), false, None),
+                (c"[\"/tmp\"]".as_ptr(), true, Some(vec!["/tmp".to_owned()])),
             ] {
                 assert_eq!(
                     kernel_statement_set_staging_allowed_local_paths(statement, json, retained),
@@ -1332,7 +1332,10 @@ mod tests {
                     KernelStatusCode::InvalidArgument
                 );
                 let spec = statement_mut(statement).unwrap().spec();
-                assert!(spec.staging_allowed_local_paths.is_none());
+                assert_eq!(
+                    spec.staging_allowed_local_paths,
+                    Some(vec!["/tmp".to_owned()])
+                );
                 assert!(spec.retain_volume_operation_result);
             }
             assert_eq!(kernel_statement_close(statement), KernelStatusCode::Success);

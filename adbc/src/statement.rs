@@ -1517,9 +1517,9 @@ mod tests {
             OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
         assert_eq!(statement.get_option_string(option.clone()).unwrap(), "null");
         for (value, expected) in [
-            (r#"["/tmp/files"]"#, Some(vec!["/tmp/files".to_owned()])),
             ("[]", Some(vec![])),
             ("null", None),
+            (r#"["/tmp/files"]"#, Some(vec!["/tmp/files".to_owned()])),
         ] {
             statement.set_option(option.clone(), value.into()).unwrap();
             assert_eq!(
@@ -1542,9 +1542,12 @@ mod tests {
                 .unwrap()
                 .spec()
                 .staging_allowed_local_paths,
-            None
+            Some(vec!["/tmp/files".to_owned()])
         );
-        assert_eq!(statement.get_option_string(option).unwrap(), "null");
+        assert_eq!(
+            statement.get_option_string(option).unwrap(),
+            r#"["/tmp/files"]"#
+        );
     }
 
     fn batch(rows: usize) -> RecordBatch {

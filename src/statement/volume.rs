@@ -351,6 +351,7 @@ async fn transfer(
                 );
             }
             Ok(_) => {
+                // Preserve the OS error for directory destinations.
                 tokio::fs::OpenOptions::new()
                     .write(true)
                     .open(destination)
