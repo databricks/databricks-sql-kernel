@@ -344,6 +344,13 @@ async fn send_transfer(
         if method == Method::PUT {
             let local = local
                 .ok_or_else(|| Error::invalid_argument().message("Missing local upload path"))?;
+            if !tokio::fs::metadata(local)
+                .await
+                .map_err(file_error)?
+                .is_file()
+            {
+                return Err(Error::invalid_argument().message("Local upload path must be a file"));
+            }
             // Each retry reopens the file so a streaming upload starts at byte zero.
             let file = tokio::fs::File::open(local).await.map_err(file_error)?;
             let metadata = file.metadata().await.map_err(file_error)?;
@@ -622,6 +629,49 @@ mod tests {
         )
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn rejects_fifo_before_opening_upload() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let fifo = directory.path().join("input");
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .unwrap()
+            .success());
+        let local = fifo.clone();
+        let root = directory.path().to_str().unwrap().to_owned();
+        let url = format!("{}/file", server.uri());
+        let mut upload = tokio::spawn(async move {
+            transfer(
+                &client(),
+                "PUT",
+                &url,
+                &HashMap::new(),
+                local.to_str(),
+                &[root],
+            )
+            .await
+        });
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(1), &mut upload).await;
+        if outcome.is_err() {
+            // Unblock a regressed open so the runtime can shut down after the assertion.
+            let _peer = std::fs::OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(&fifo)
+                .unwrap();
+            let _ = upload.await;
+            panic!("upload blocked while opening a FIFO");
+        }
+        assert_eq!(
+            outcome.unwrap().unwrap().unwrap_err().code,
+            ErrorCode::InvalidArgument
+        );
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

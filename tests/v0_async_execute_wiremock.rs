@@ -2397,6 +2397,16 @@ async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
                 assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
                 assert_eq!(error.query_id.as_deref(), Some("transfer"));
                 assert!(!destination.exists());
+                assert_eq!(
+                    wait_for_close_delete(
+                        &server,
+                        "transfer",
+                        1,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await,
+                    1,
+                );
             } else {
                 let mut executed = result.unwrap();
                 assert!(executed
