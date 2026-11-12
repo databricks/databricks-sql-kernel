@@ -25,10 +25,28 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
 use tokio_util::io::ReaderStream;
 
-pub(crate) type VolumeCompletion = Mutex<Option<Result<()>>>;
+pub(crate) struct VolumeCompletion {
+    result: Mutex<Option<Result<()>>>,
+    cancelled: watch::Sender<bool>,
+}
+
+impl Default for VolumeCompletion {
+    fn default() -> Self {
+        Self {
+            result: Mutex::new(None),
+            cancelled: watch::channel(false).0,
+        }
+    }
+}
+
+impl VolumeCompletion {
+    pub(super) fn cancel(&self) {
+        self.cancelled.send_replace(true);
+    }
+}
 
 #[derive(Clone, Default)]
 pub(crate) struct VolumeOptions {
@@ -89,30 +107,35 @@ pub(crate) async fn complete(
             return Err(Error::invalid_state().message("Expected one file transfer instruction"));
         }
         {
-            let mut completed = completion.lock().await;
+            let mut completed = completion.result.lock().await;
             if completed.is_none() {
                 // Cancellation must leave a terminal result instead of replaying an upload.
                 *completed = Some(Err(Error::new(
                     ErrorCode::Cancelled,
                     "File transfer interrupted; re-execute the SQL to retry",
                 )));
-                *completed = Some(
-                    transfer(
-                        client,
-                        &operation,
-                        &url,
-                        &headers,
-                        local_file.as_deref(),
-                        paths,
-                    )
-                    .await
-                    .map_err(|mut error| {
-                        if let Some(os_error) = error.os_error.as_mut() {
-                            os_error.filename = local_file.clone();
-                        }
-                        error
-                    }),
+                let mut cancelled = completion.cancelled.subscribe();
+                let transfer = transfer(
+                    client,
+                    &operation,
+                    &url,
+                    &headers,
+                    local_file.as_deref(),
+                    paths,
                 );
+                let result = tokio::select! {
+                    biased;
+                    _ = cancelled.wait_for(|cancelled| *cancelled) => {
+                        Err(Error::cancelled().message("File transfer cancelled"))
+                    }
+                    result = transfer => result,
+                };
+                *completed = Some(result.map_err(|mut error| {
+                    if let Some(os_error) = error.os_error.as_mut() {
+                        os_error.filename = local_file.clone();
+                    }
+                    error
+                }));
             }
             completed.as_ref().unwrap().clone()?;
         }

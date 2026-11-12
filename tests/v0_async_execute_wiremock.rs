@@ -2422,3 +2422,111 @@ async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
         }
     }
 }
+
+#[tokio::test]
+async fn async_cancel_interrupts_shared_file_transfer() {
+    use arrow_array::StringArray;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for operation in ["PUT", "GET"] {
+        for detached in [false, true] {
+            let server = MockServer::start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            mount_close_any_statement(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements/transfer/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started, received) = tokio::sync::oneshot::channel();
+            let storage = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                }
+                if operation == "GET" {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial").await.unwrap();
+                } else {
+                    socket.read_u8().await.unwrap();
+                }
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let local = directory.path().join("file");
+            let original = vec![b'a'; 8 * 1024 * 1024];
+            std::fs::write(&local, &original).unwrap();
+            let batch = RecordBatch::try_from_iter(vec![
+                (
+                    "operation",
+                    Arc::new(StringArray::from(vec![operation])) as arrow_array::ArrayRef,
+                ),
+                (
+                    "url",
+                    Arc::new(StringArray::from(vec![format!("http://{address}/file")])),
+                ),
+                ("headers", Arc::new(StringArray::from(vec!["{}"]))),
+                (
+                    "local",
+                    Arc::new(StringArray::from(vec![local.to_str().unwrap()])),
+                ),
+            ])
+            .unwrap();
+            let mut body: serde_json::Value =
+                serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
+            body["manifest"]["is_volume_operation"] = json!(true);
+            mount_submit(&server, pending_body("transfer")).await;
+            mount_status_once(&server, "transfer", body.to_string()).await;
+            let session = open_session(&server).await;
+            let mut statement = session.statement();
+            let sql = if operation == "PUT" {
+                format!(
+                    "PUT '{}' INTO '/Volumes/c/s/v/file' OVERWRITE",
+                    local.display()
+                )
+            } else {
+                format!("GET '/Volumes/c/s/v/file' TO '{}'", local.display())
+            };
+            statement.spec().sql(sql);
+            statement.spec().staging_allowed_local_paths =
+                Some(vec![directory.path().to_str().unwrap().into()]);
+            let owner = statement.submit().await.unwrap();
+            let first = owner.reader().unwrap();
+            let second = owner.reader().unwrap();
+            let first = tokio::spawn(async move { first.fetch_result().await });
+            tokio::time::timeout(Duration::from_secs(5), received)
+                .await
+                .unwrap()
+                .unwrap();
+            let second = tokio::spawn(async move { second.fetch_result().await });
+            if detached {
+                owner.canceller().cancel().await.unwrap();
+            } else {
+                ExecutedStatementHandle::cancel(&owner).await.unwrap();
+            }
+            let results = tokio::time::timeout(Duration::from_secs(2), async {
+                (first.await.unwrap(), second.await.unwrap())
+            })
+            .await
+            .expect("async cancellation did not stop the transfer");
+            for result in [results.0, results.1] {
+                let error = result.err().expect("cancelled transfer must fail");
+                assert_eq!(error.code, ErrorCode::Cancelled);
+                assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+                assert_eq!(error.query_id.as_deref(), Some("transfer"));
+            }
+            if operation == "GET" {
+                assert_eq!(std::fs::read(&local).unwrap(), original);
+            }
+            storage.abort();
+            owner.close().await.unwrap();
+            session.close().await.unwrap();
+        }
+    }
+}

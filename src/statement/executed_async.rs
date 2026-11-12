@@ -1054,6 +1054,7 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
                      submitted it",
                 ));
             }
+            self.volume_completion.cancel();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1139,6 +1140,7 @@ impl ExecutedAsyncStatement {
             session: Arc::clone(&self.session),
             statement_id: self.statement_id.clone(),
             valid: self.valid.clone(),
+            volume_completion: Arc::clone(&self.volume_completion),
             // Inherit ownership: a canceller derived from an attached
             // (read-only) handle must not cancel the owner's statement
             // either — otherwise the footgun just moves to the detached
@@ -1150,19 +1152,19 @@ impl ExecutedAsyncStatement {
 
 /// Detached canceller for an in-flight async statement.
 ///
-/// Holds only the shared session handle, the statement id, and the
-/// shared [`ValidityFlag`] — **not** the [`ExecutedAsyncStatement`]
-/// itself — so a binding can fire a server-side cancel while the handle
+/// Holds the shared session, statement id, transfer completion, and
+/// [`ValidityFlag`] so a binding can cancel while the handle
 /// is borrowed elsewhere (e.g. parked inside a long-running
 /// [`ExecutedAsyncStatement::await_result`] that a binding-side lock is
 /// held across). Produced by [`ExecutedAsyncStatement::canceller`].
 ///
-/// Cheap to [`Clone`] (one `Arc` bump plus a `String` / flag clone).
+/// Cheap to [`Clone`].
 #[derive(Clone)]
 pub struct AsyncStatementCanceller {
     session: Arc<SessionInner>,
     statement_id: String,
     valid: ValidityFlag,
+    volume_completion: Arc<super::volume::VolumeCompletion>,
     /// Inherited from the producing handle — `false` for a canceller
     /// derived from an attached (read-only) handle, which must not
     /// cancel a statement it doesn't own. See
@@ -1171,7 +1173,7 @@ pub struct AsyncStatementCanceller {
 }
 
 impl AsyncStatementCanceller {
-    /// Server-side cancel via `cancel_statement(statement_id)`.
+    /// Interrupt its local transfer and send `cancel_statement(statement_id)`.
     ///
     /// Short-circuits to `InvalidStatementHandle` (no wire round-trip)
     /// if the parent handle was invalidated (re-execute / parent
@@ -1191,6 +1193,7 @@ impl AsyncStatementCanceller {
                      is owned by whoever submitted it",
                 ));
             }
+            self.volume_completion.cancel();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
