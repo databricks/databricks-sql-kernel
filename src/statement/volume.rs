@@ -298,7 +298,14 @@ async fn transfer(
         let builder = {
             use std::os::unix::fs::PermissionsExt;
             let mut builder = builder;
-            builder.permissions(std::fs::Permissions::from_mode(0o666));
+            let permissions = match std::fs::metadata(destination) {
+                Ok(metadata) => metadata.permissions(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    std::fs::Permissions::from_mode(0o666)
+                }
+                Err(error) => return Err(file_error(error)),
+            };
+            builder.permissions(permissions);
             builder
         };
         let temporary = builder.tempfile_in(parent).map_err(file_error)?;
@@ -563,6 +570,65 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.http_status, Some(307));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn download_temporary_file_preserves_private_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::time::Duration;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\npriv")
+                .await
+                .unwrap();
+            wait.await.unwrap();
+            socket.write_all(b"ate\n").await.unwrap();
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let destination = directory.path().join("download");
+        std::fs::write(&destination, b"original").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let http = client();
+        let url = format!("http://{address}/file");
+        let headers = HashMap::new();
+        let roots = vec![directory.path().to_str().unwrap().into()];
+        let inspect = async {
+            let permissions = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    for entry in std::fs::read_dir(directory.path()).unwrap() {
+                        let entry = entry.unwrap();
+                        if entry.path() != destination && entry.metadata().unwrap().len() > 0 {
+                            return entry.metadata().unwrap().permissions().mode() & 0o777;
+                        }
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await;
+            let original = std::fs::read(&destination).unwrap();
+            resume.send(()).unwrap();
+            (permissions.unwrap(), original)
+        };
+        let (result, (permissions, original)) = tokio::join!(
+            transfer(&http, "GET", &url, &headers, destination.to_str(), &roots),
+            inspect
+        );
+        result.unwrap();
+        server.await.unwrap();
+        assert_eq!(permissions, 0o600);
+        assert_eq!(original, b"original");
+        assert_eq!(std::fs::read(&destination).unwrap(), b"private\n");
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
     }
 
     #[cfg(unix)]

@@ -1090,6 +1090,7 @@ fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
     let mut tls = HttpTlsConfig::from_public(&config.tls);
     if config.connection.host.starts_with("http://") {
+        // Explicit HTTP sessions opt into loopback storage for local integrations.
         tls.enabled = Some(false);
     }
     HttpClientConfig {
