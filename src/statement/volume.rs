@@ -24,7 +24,7 @@ use futures::StreamExt;
 use reqwest::Method;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::OnceCell;
 use tokio_util::io::ReaderStream;
 
@@ -107,10 +107,14 @@ pub(crate) async fn complete(
         Ok(result)
     }
     .await
-    .map_err(|e: Error| {
-        e.with_error_code("FILE_TRANSFER_ERROR")
-            .with_sql_state("HY000")
-            .with_query_id(&statement_id)
+    .map_err(|mut e: Error| {
+        if e.error_code.is_none() {
+            e = e.with_error_code("FILE_TRANSFER_ERROR");
+        }
+        if e.sql_state.is_none() {
+            e = e.with_sql_state("HY000");
+        }
+        e.with_query_id(&statement_id)
     })
 }
 
@@ -340,15 +344,17 @@ async fn send_transfer(
         if method == Method::PUT {
             let local = local
                 .ok_or_else(|| Error::invalid_argument().message("Missing local upload path"))?;
-            let metadata = tokio::fs::metadata(local).await.map_err(file_error)?;
+            // Each retry reopens the file so a streaming upload starts at byte zero.
+            let file = tokio::fs::File::open(local).await.map_err(file_error)?;
+            let metadata = file.metadata().await.map_err(file_error)?;
             if !metadata.is_file() {
                 return Err(Error::invalid_argument().message("Local upload path must be a file"));
             }
-            // Each retry reopens the file so a streaming upload starts at byte zero.
-            let file = tokio::fs::File::open(local).await.map_err(file_error)?;
             request = request
                 .header(reqwest::header::CONTENT_LENGTH, metadata.len())
-                .body(reqwest::Body::wrap_stream(ReaderStream::new(file)));
+                .body(reqwest::Body::wrap_stream(ReaderStream::new(
+                    file.take(metadata.len()),
+                )));
         }
         // Presigned storage requests must omit workspace credentials and custom headers.
         let response = request.send().await;
@@ -676,6 +682,42 @@ mod tests {
         assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
         assert_eq!(error.query_id.as_deref(), Some("statement"));
         assert_eq!(error.sql_state.as_deref(), Some("HY000"));
+    }
+
+    #[tokio::test]
+    async fn instruction_read_failure_keeps_existing_error_context() {
+        struct FailedReader;
+        #[async_trait::async_trait]
+        impl crate::reader::ResultReader for FailedReader {
+            async fn schema(&self) -> Result<arrow_schema::SchemaRef> {
+                Err(
+                    Error::new(ErrorCode::NetworkError, "Instruction read failed")
+                        .with_error_code("INSTRUCTION_READ_FAILED")
+                        .with_sql_state("08S01"),
+                )
+            }
+            async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+                unreachable!()
+            }
+        }
+        let batch = instruction("GET", "https://storage.example/file", "/download");
+        let mut execution = result(batch, true);
+        execution.reader = Box::new(FailedReader);
+        let error = complete(
+            &client(),
+            execution,
+            &VolumeOptions {
+                paths: Some(vec![]),
+                retain_result: false,
+            },
+            &OnceCell::new(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.error_code.as_deref(), Some("INSTRUCTION_READ_FAILED"));
+        assert_eq!(error.sql_state.as_deref(), Some("08S01"));
+        assert_eq!(error.query_id.as_deref(), Some("statement"));
     }
 
     #[tokio::test]
