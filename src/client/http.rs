@@ -384,6 +384,7 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 pub struct DatabricksHttpClient {
     client: Client,
     volume_client: OnceLock<Result<Client>>,
+    pub(crate) allow_loopback_plaintext_storage: bool,
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
@@ -501,6 +502,7 @@ impl DatabricksHttpClient {
         Ok(Self {
             client,
             volume_client: OnceLock::new(),
+            allow_loopback_plaintext_storage: false,
             config,
             auth_provider: OnceLock::new(),
             retry_configs,

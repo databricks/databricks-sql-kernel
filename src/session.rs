@@ -368,11 +368,14 @@ impl Session {
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
-        let http_client = Arc::new(
-            DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
+        let mut http_client = DatabricksHttpClient::new(http_client_config, retry_configs)
+            .map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
-            })?,
-        );
+            })?;
+        // Explicit HTTP sessions allow loopback storage for local integrations.
+        http_client.allow_loopback_plaintext_storage =
+            reqwest::Url::parse(&host).is_ok_and(|url| url.scheme() == "http");
+        let http_client = Arc::new(http_client);
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
@@ -1088,11 +1091,6 @@ fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
 /// / `skip_hostname_verification` and is projected onto the internal
 /// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
-    let mut tls = HttpTlsConfig::from_public(&config.tls);
-    if config.connection.host.starts_with("http://") {
-        // Explicit HTTP sessions opt into loopback storage for local integrations.
-        tls.enabled = Some(false);
-    }
     HttpClientConfig {
         sea_response_compression_enabled: config.http.sea_response_compression_enabled,
         connect_timeout: Duration::from_secs(30),
@@ -1101,7 +1099,7 @@ fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> H
         read_timeout: config.http.request_timeout,
         max_connections_per_host: config.http.pool_max_idle_per_host,
         proxy: build_proxy_config(config.proxy.as_ref()),
-        tls,
+        tls: HttpTlsConfig::from_public(&config.tls),
         org_id,
         custom_headers: config.http.custom_headers.clone(),
         ..HttpClientConfig::default()

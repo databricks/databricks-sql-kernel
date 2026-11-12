@@ -231,7 +231,8 @@ async fn transfer(
     local_file: Option<&str>,
     paths: &[String],
 ) -> Result<()> {
-    let method = match operation {
+    let operation = operation.to_ascii_uppercase();
+    let method = match operation.as_str() {
         "PUT" => Method::PUT,
         "GET" => Method::GET,
         "REMOVE" => Method::DELETE,
@@ -246,7 +247,7 @@ async fn transfer(
                 .is_ok_and(|ip| ip.is_loopback())
     });
     if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http" && loopback && client.config().tls.enabled == Some(false))
+        && !(parsed.scheme() == "http" && loopback && client.allow_loopback_plaintext_storage)
     {
         return Err(Error::invalid_state().message("Invalid file transfer URL scheme"));
     }
@@ -440,9 +441,10 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn client() -> DatabricksHttpClient {
-        let mut config = HttpClientConfig::default();
-        config.tls.enabled = Some(false);
-        DatabricksHttpClient::with_default_retry(config).unwrap()
+        let mut client =
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap();
+        client.allow_loopback_plaintext_storage = true;
+        client
     }
 
     fn instruction(operation: &str, url: &str, local: &str) -> RecordBatch {
@@ -491,7 +493,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("download");
         let batch = instruction(
-            "GET",
+            "gEt",
             &format!("{}/file", server.uri()),
             local.to_str().unwrap(),
         );
@@ -737,7 +739,7 @@ mod tests {
         let http = client();
         transfer(
             &http,
-            "PUT",
+            "pUt",
             &format!("{}/file", server.uri()),
             &HashMap::new(),
             local.to_str(),
@@ -747,7 +749,7 @@ mod tests {
         .unwrap();
         transfer(
             &http,
-            "REMOVE",
+            "remove",
             &format!("{}/file", server.uri()),
             &HashMap::new(),
             None,
@@ -1015,21 +1017,21 @@ mod tests {
                     std::future::pending::<()>().await;
                 }
             });
-            let mut config = HttpClientConfig {
+            let config = HttpClientConfig {
                 read_timeout: Duration::from_millis(10),
                 ..Default::default()
             };
-            config.tls.enabled = Some(false);
             let retry = RetryConfig {
                 overall_timeout: Duration::from_millis(budget),
                 max_retries: 0,
                 ..Default::default()
             };
-            let http = DatabricksHttpClient::new(
+            let mut http = DatabricksHttpClient::new(
                 config,
                 HashMap::from([(RequestCategory::CloudFetch, retry)]),
             )
             .unwrap();
+            http.allow_loopback_plaintext_storage = true;
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("download");
             if existing {
