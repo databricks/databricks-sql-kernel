@@ -651,7 +651,7 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
     KernelStatusCode::Success
 }
 
-/// Fire a server-side cancel of the statement this canceller was created for.
+/// Interrupt its local file transfer and send a server-side statement cancel.
 /// Idempotent and safe to call concurrently with `kernel_statement_execute` on
 /// the originating statement.
 ///
@@ -697,7 +697,7 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
         let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
             return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
         };
-        // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
+        // Clone the canceller so the blocking cancel RPC owns its
         // session and id-slot handles rather than borrowing through this box.
         let canceller = handle.canceller.clone();
         match block_on_ffi(move || Box::pin(async move { canceller.cancel().await })) {

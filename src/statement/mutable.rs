@@ -54,6 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
+use crate::client::transport::ExecuteResult;
 use crate::client::{DirectOutcome, ExecutionTimeout};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -69,6 +70,7 @@ use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use tokio::sync::watch;
 use tracing::Instrument;
 
 /// Outcome of [`Statement::execute_direct`] — the Thrift/JDBC directResults
@@ -245,6 +247,7 @@ pub struct Statement {
     /// new `execute()` / `submit()` so a canceller never targets a
     /// stale prior statement.
     inflight_id: InflightId,
+    volume_cancellation: watch::Sender<Option<String>>,
 }
 
 impl Statement {
@@ -258,6 +261,7 @@ impl Statement {
             last_valid: None,
             last_closed: None,
             inflight_id: Arc::new(Mutex::new(None)),
+            volume_cancellation: watch::channel(None).0,
         }
     }
 
@@ -274,7 +278,7 @@ impl Statement {
     /// once the server issues the statement id mid-execute, the
     /// canceller's [`cancel`](StatementCanceller::cancel) reaches it.
     ///
-    /// Cheap to clone (two `Arc` bumps). If `cancel()` fires before the
+    /// Cheap to clone. If `cancel()` fires before the
     /// id is observed (query still in the initial submit round-trip) it
     /// is a no-op; the per-call drop guard still covers the
     /// future-dropped case.
@@ -282,6 +286,7 @@ impl Statement {
         StatementCanceller {
             session: Arc::clone(&self.session),
             inflight_id: Arc::clone(&self.inflight_id),
+            volume_cancellation: self.volume_cancellation.clone(),
         }
     }
 
@@ -409,14 +414,7 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
-            let result = match super::volume::complete(
-                &self.session.http_client,
-                result,
-                &super::volume::VolumeOptions::from(&self.spec),
-                &super::volume::VolumeCompletion::default(),
-            )
-            .await
-            {
+            let result = match self.complete_volume(result).await {
                 Ok(result) => result,
                 Err(error) => {
                     self.invalidate_prior().await;
@@ -660,14 +658,7 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    let result = match super::volume::complete(
-                        &self.session.http_client,
-                        result,
-                        &super::volume::VolumeOptions::from(&self.spec),
-                        &super::volume::VolumeCompletion::default(),
-                    )
-                    .await
-                    {
+                    let result = match self.complete_volume(result).await {
                         Ok(result) => result,
                         Err(error) => {
                             self.invalidate_prior().await;
@@ -779,6 +770,35 @@ impl Statement {
         wait_timeout_secs: Option<&str>,
     ) -> Result<(String, ExecuteParams)> {
         build_execute_params(&self.spec, wait_timeout_secs)
+    }
+
+    async fn complete_volume(&self, result: ExecuteResult) -> Result<ExecuteResult> {
+        let is_transfer = self.spec.staging_allowed_local_paths.is_some()
+            && result
+                .manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.is_volume_operation);
+        let statement_id = result.statement_id.clone();
+        let options = super::volume::VolumeOptions::from(&self.spec);
+        let completion = super::volume::VolumeCompletion::default();
+        let complete =
+            super::volume::complete(&self.session.http_client, result, &options, &completion);
+        if !is_transfer {
+            return complete.await;
+        }
+        // The SQL statement can finish before its local transfer starts.
+        let mut cancellation = self.volume_cancellation.subscribe();
+        tokio::select! {
+            biased;
+            _ = cancellation.wait_for(|id| id.as_ref() == Some(&statement_id)) => {
+                Err(Error::cancelled()
+                    .message("File transfer cancelled")
+                    .with_error_code("FILE_TRANSFER_ERROR")
+                    .with_sql_state("HY000")
+                    .with_query_id(&statement_id))
+            }
+            result = complete => result,
+        }
     }
 
     /// Clear the shared in-flight-id slot at the very start of a new
@@ -950,16 +970,17 @@ impl Drop for MidExecuteCancelGuard {
 /// is blocked. The sync-execute analogue of
 /// [`AsyncStatementCanceller`](crate::statement::executed_async::AsyncStatementCanceller).
 ///
-/// Cheap to [`Clone`] (two `Arc` bumps).
+/// Cheap to [`Clone`].
 #[derive(Clone)]
 pub struct StatementCanceller {
     session: Arc<SessionInner>,
     inflight_id: InflightId,
+    volume_cancellation: watch::Sender<Option<String>>,
 }
 
 impl StatementCanceller {
-    /// Server-side cancel of the in-flight statement via
-    /// `cancel_statement(statement_id)`.
+    /// Interrupt a local file transfer and send the in-flight statement's
+    /// server-side cancel via `cancel_statement(statement_id)`.
     ///
     /// Returns `Ok(true)` if a cancel RPC was POSTed for the currently
     /// observed statement id, and `Ok(false)` if it was a no-op because no
@@ -980,9 +1001,14 @@ impl StatementCanceller {
     /// Idempotent against a server already in a terminal state (the
     /// kernel's `cancel_statement` is a no-op there). Safe to call
     /// concurrently with the `execute()` it targets — the two share
-    /// only the id slot (behind a `Mutex`), no mutable statement state.
+    /// only the id slot and transfer-cancellation notification, no mutable
+    /// statement state.
     pub async fn cancel(&self) -> Result<bool> {
-        let id = self.inflight_id.lock().ok().and_then(|g| g.clone());
+        let id = self.inflight_id.lock().ok().and_then(|slot| {
+            let id = slot.clone()?;
+            self.volume_cancellation.send_replace(Some(id.clone()));
+            Some(id)
+        });
         async {
             // Log both outcomes at the decision point so a host debugging a
             // cancel can tell "raced ahead of the id" (no-op) from "wired to
