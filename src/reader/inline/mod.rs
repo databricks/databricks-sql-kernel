@@ -30,9 +30,8 @@
 //!   case. The server returns one chunk at a time via
 //!   `GET /result/chunks/{idx}?row_offset=N`; the kernel maintains a
 //!   bounded rolling window of pre-decoded chunks ahead of the
-//!   consumer. Used when CloudFetch is disabled (the execute request
-//!   was sent with SEA `disposition = INLINE`) and the result is
-//!   large enough that the server paginates it.
+//!   consumer. Used when the result is large enough that the server
+//!   paginates inline delivery.
 
 mod provider;
 mod streaming;

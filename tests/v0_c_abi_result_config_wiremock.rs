@@ -15,15 +15,8 @@
 //! C-ABI wiremock tests for the client-side result-config surface
 //! (`kernel_session_config_set_client_conf`).
 //!
-//! These prove the client-side knobs actually reach the wire / kernel
-//! behaviour through the C ABI — closing the gap where the C ABI
-//! previously could not reach `ResultConfig` at all (only the legacy
-//! `cloudfetch_max_chunks_in_memory` magic string). The headline check:
-//! opening a session with `cloudfetch_enabled = false` via
-//! `set_client_conf` makes every `ExecuteStatement` carry SEA
-//! `disposition = INLINE` (see #196 for why that, not a
-//! `can_cloud_download` session conf, is the correct mechanism), while the
-//! default carries `INLINE_OR_EXTERNAL_LINKS`.
+//! Verifies result configuration through the C ABI, including paged
+//! inline delivery when cloud-storage downloads are disabled.
 
 use std::ffi::CString;
 
@@ -176,6 +169,22 @@ fn recorded_execute_disposition(cloudfetch_enabled: Option<bool>) -> String {
     }
 
     let recorded = rt.block_on(async { server.received_requests().await.unwrap() });
+    let create = recorded
+        .iter()
+        .find(|request| request.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions")
+        .expect("a CreateSession request was made");
+    let create_body: serde_json::Value = serde_json::from_slice(&create.body).unwrap();
+    let expected = if cloudfetch_enabled == Some(false) {
+        Some("false")
+    } else {
+        None
+    };
+    assert_eq!(
+        create_body
+            .pointer("/session_confs/can_cloud_download")
+            .and_then(|value| value.as_str()),
+        expected,
+    );
     let exec = recorded
         .iter()
         .find(|r| r.url.path() == "/api/2.0/sql/statements" && r.method.as_str() == "POST")
@@ -219,13 +228,11 @@ fn recorded_create_session_geospatial_conf(enabled: bool) -> Option<String> {
 }
 
 #[test]
-fn c_abi_client_conf_cloudfetch_disabled_sends_inline_disposition() {
-    // The headline: a C-ABI host that disables CloudFetch via
-    // set_client_conf("cloudfetch_enabled","false") gets SEA
-    // `disposition = INLINE` on the wire — proving the client-conf channel
-    // reaches the execute path (previously unreachable from the C ABI).
-    // Mirrors the Rust-crate coverage in tests/v0_execute_wiremock.rs.
-    assert_eq!(recorded_execute_disposition(Some(false)), "INLINE");
+fn c_abi_client_conf_cloudfetch_disabled_supports_paged_arrow_results() {
+    assert_eq!(
+        recorded_execute_disposition(Some(false)),
+        "INLINE_OR_EXTERNAL_LINKS"
+    );
 }
 
 #[test]

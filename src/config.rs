@@ -1090,30 +1090,9 @@ pub struct ResultConfig {
     /// Whether to opt into CloudFetch (cloud-storage-backed download of
     /// large result sets via presigned URLs). Default: `true`.
     ///
-    /// Setting this to `false` mirrors JDBC's `EnableQueryResultDownload=0`
-    /// behaviour. It is a **connection-level** setting: read once at
-    /// [`Session::open`](crate::Session::open) and applied to every
-    /// statement by selecting the SEA `disposition` on each
-    /// `ExecuteStatement` (`false` → `INLINE`, so SEA serves **all**
-    /// result sizes via the inline-Arrow path regardless of size). This
-    /// matches how the JDBC and Thrift reference drivers control
-    /// cloud-fetch (per request), and is deliberately **not** expressed
-    /// as a session conf — SEA has no `CAN_CLOUD_DOWNLOAD` conf and
-    /// rejects one at ExecuteStatement with `CONFIG_NOT_AVAILABLE`
-    /// (issue #196). Users who need inline-only behaviour (e.g.
-    /// workspaces without cloud-storage egress) should set this to
-    /// `false`.
-    ///
-    /// Disabling CloudFetch routes results to the inline-Arrow
-    /// path. The kernel today supports the **single-attachment**
-    /// inline path; the multi-chunk inline path is on the SEA
-    /// inline-Arrow rollout (DD1) and is tracked as a follow-up
-    /// (`InlineArrowProvider::new` consumes one attachment, and
-    /// `src/reader/mod.rs` returns `Error::not_implemented` for
-    /// inline responses that carry a `next_chunk_internal_link`).
-    /// Once multi-chunk lands, this path will not match
-    /// CloudFetch's concurrent chunk-download pipeline
-    /// (`cloudfetch_max_chunks_in_memory`).
+    /// Set to `false` for applications without direct access to cloud storage.
+    /// This connection-level setting requests paged inline Arrow results.
+    /// Servers without this capability may reject session creation or the first statement.
     pub cloudfetch_enabled: bool,
 
     /// Number of presigned URLs to prefetch ahead of the consumer.
@@ -1125,8 +1104,7 @@ pub struct ResultConfig {
 
     /// Maximum number of decompressed Arrow chunks the inline-Arrow
     /// streaming reader holds in memory at once. Analogue of
-    /// [`Self::cloudfetch_max_chunks_in_memory`] for the inline path
-    /// (used when [`Self::cloudfetch_enabled`] is `false`).
+    /// [`Self::cloudfetch_max_chunks_in_memory`] for paged inline results.
     ///
     /// The inline path is sequential per the SEA contract — one
     /// `GetResultData` call at a time — so this knob bounds the
@@ -1565,19 +1543,9 @@ pub struct SessionConfig {
     /// Thrift `configuration`. Typed sub-structs above translate
     /// the *client-side* knobs; this map carries everything else.
     ///
-    /// The kernel passes user-supplied entries through unchanged. The
-    /// kernel does not synthesise any entries here from typed
-    /// client-side knobs.
-    ///
-    /// In particular, [`ResultConfig::cloudfetch_enabled`] is **not**
-    /// expressed as a session conf: SEA has no `CAN_CLOUD_DOWNLOAD`
-    /// conf (it is accepted at CreateSession but rejected at the first
-    /// ExecuteStatement with `CONFIG_NOT_AVAILABLE`, issue #196).
-    /// CloudFetch-disable is instead applied per-statement via the SEA
-    /// `disposition` field, matching the JDBC / Thrift reference
-    /// drivers. A caller-supplied `can_cloud_download` is still forwarded
-    /// unchanged because the kernel does not validate server-bound
-    /// `session_conf` keys.
+    /// User-supplied entries are passed through, except that disabling
+    /// CloudFetch in [`ResultConfig`] takes precedence over its corresponding
+    /// session setting.
     ///
     /// **Boolean-valued conf keys** should use the exact strings
     /// `"true"` / `"false"`. SEA accepts these literally; other forms

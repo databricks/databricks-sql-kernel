@@ -199,6 +199,11 @@ impl ResultReaderFactory {
             // Priority 1: CloudFetch (external_links present)
             if let Some(ref external_links) = result.external_links {
                 if !external_links.is_empty() {
+                    if !self.config.enabled {
+                        return Err(Error::data_loss().message(
+                            "CloudFetch is disabled, but the server returned cloud-storage result links",
+                        ));
+                    }
                     // `total_chunk_count` is forwarded purely as a
                     // transition-period guard. The link fetcher uses
                     // it only when the server hasn't yet rolled out
