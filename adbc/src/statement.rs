@@ -596,6 +596,12 @@ impl Statement {
 
     fn get_other_string(&self, key: &str) -> Result<String> {
         match key {
+            "adbc.databricks.statement.staging_allowed_local_paths" => {
+                serde_json::to_string(&self.inner()?.spec_ref().staging_allowed_local_paths)
+                    .map_err(|_| {
+                        adbc_error("Cannot serialize allowed local paths", Status::Internal)
+                    })
+            }
             ENABLE_DIRECT_RESULTS_OPTION => Ok(self.enable_direct_results.to_string()),
             IS_METADATA_COMMAND_OPTION => Ok(self.metadata_options.enabled.to_string()),
             METADATA_CATALOG_OPTION => metadata_string_option(
@@ -1509,6 +1515,7 @@ mod tests {
         let mut statement = connection.new_statement().unwrap();
         let option =
             OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
+        assert_eq!(statement.get_option_string(option.clone()).unwrap(), "null");
         for (value, expected) in [
             (r#"["/tmp/files"]"#, Some(vec!["/tmp/files".to_owned()])),
             ("[]", Some(vec![])),
@@ -1523,8 +1530,11 @@ mod tests {
                     .staging_allowed_local_paths,
                 expected
             );
+            assert_eq!(statement.get_option_string(option.clone()).unwrap(), value);
         }
-        let error = statement.set_option(option, "{}".into()).unwrap_err();
+        let error = statement
+            .set_option(option.clone(), "{}".into())
+            .unwrap_err();
         assert_eq!(error.status, Status::InvalidArguments);
         assert_eq!(
             statement
@@ -1534,6 +1544,7 @@ mod tests {
                 .staging_allowed_local_paths,
             None
         );
+        assert_eq!(statement.get_option_string(option).unwrap(), "null");
     }
 
     fn batch(rows: usize) -> RecordBatch {
