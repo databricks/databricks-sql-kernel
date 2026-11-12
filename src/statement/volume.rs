@@ -335,11 +335,8 @@ async fn transfer(
     };
     if operation == "GET" {
         let destination = local.as_ref().unwrap();
-        if destination.parent().is_none() {
-            return Err(Error::invalid_argument().message("Download destination must be a file"));
-        }
         match tokio::fs::metadata(destination).await {
-            Ok(metadata) if !metadata.is_file() => {
+            Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
                 return Err(
                     Error::invalid_argument().message("Download destination must be a file")
                 );
@@ -881,7 +878,8 @@ mod tests {
             )
             .await
             .unwrap_err();
-            assert_eq!(error.code, ErrorCode::InvalidArgument);
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(error.os_error.is_some());
         }
     }
 
