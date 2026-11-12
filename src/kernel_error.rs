@@ -197,6 +197,10 @@ pub struct Error {
     /// the string `error_code` themselves.
     pub vendor_code: Option<i32>,
 
+    /// Original local OS error code for language-native filesystem errors.
+    /// Uses errno on Unix and the Windows system error code on Windows.
+    pub os_error_code: Option<i32>,
+
     /// HTTP status for transport-layer errors.
     pub http_status: Option<u16>,
 
@@ -262,6 +266,7 @@ impl Error {
             sql_state: None,
             error_code: None,
             vendor_code: None,
+            os_error_code: None,
             http_status: None,
             retryable: false,
             query_id: None,

@@ -185,7 +185,7 @@ fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
 
 fn file_error(error: std::io::Error) -> Error {
     let permission_denied = error.kind() == std::io::ErrorKind::PermissionDenied;
-    let error = Error::new(
+    let mut mapped = Error::new(
         match error.kind() {
             std::io::ErrorKind::NotFound => ErrorCode::NotFound,
             std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
@@ -196,10 +196,11 @@ fn file_error(error: std::io::Error) -> Error {
         },
         format!("File transfer failed: {error}"),
     );
+    mapped.os_error_code = error.raw_os_error();
     if permission_denied {
-        error.with_error_code("FILE_TRANSFER_PERMISSION_ERROR")
+        mapped.with_error_code("FILE_TRANSFER_PERMISSION_ERROR")
     } else {
-        error
+        mapped
     }
 }
 
@@ -639,10 +640,15 @@ mod tests {
             let error = file_error(std::io::Error::from(kind));
             assert_eq!(error.code, code);
             assert!(!error.retryable);
+            assert_eq!(error.os_error_code, None);
             assert_eq!(
                 error.error_code.as_deref(),
                 (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
             );
+        }
+        for raw in [1, 2, 5, 13] {
+            let error = file_error(std::io::Error::from_raw_os_error(raw));
+            assert_eq!(error.os_error_code, Some(raw));
         }
     }
 

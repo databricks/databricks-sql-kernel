@@ -70,12 +70,14 @@ fn attach_attrs(
     display_message: Option<&str>,
     diagnostic_info: Option<&str>,
     error_details_json: Option<&str>,
+    os_error_code: Option<i32>,
 ) -> PyResult<()> {
     bound.setattr("code", code)?;
     bound.setattr("message", message)?;
     bound.setattr("sql_state", sql_state)?;
     bound.setattr("error_code", error_code)?;
     bound.setattr("vendor_code", vendor_code)?;
+    bound.setattr("os_error_code", os_error_code)?;
     bound.setattr("http_status", http_status)?;
     bound.setattr("retryable", retryable)?;
     bound.setattr("query_id", query_id)?;
@@ -138,6 +140,7 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.display_message.as_deref(),
         err.diagnostic_info.as_deref(),
         err.error_details_json.as_deref(),
+        err.os_error_code,
     ) {
         // Attribute attachment is best-effort. If something goes wrong
         // (extremely unlikely for plain string/int setattrs — but
@@ -182,9 +185,34 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
             None,
             None,
             None,
+            None,
         ) {
             return setattr_err;
         }
         py_err
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_os_error_code_crosses_python_boundary() {
+        Python::initialize();
+        Python::attach(|py| {
+            for raw in [None, Some(1), Some(2), Some(5), Some(13)] {
+                let mut error = KError::new(ErrorCode::NotFound, "missing file");
+                error.os_error_code = raw;
+                let mapped = to_py_err(py, error);
+                let actual: Option<i32> = mapped
+                    .value(py)
+                    .getattr("os_error_code")
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(actual, raw);
+            }
+        });
+    }
 }
