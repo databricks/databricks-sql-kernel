@@ -68,9 +68,16 @@ impl Statement {
 
     /// Configured transfers consume instruction rows.
     /// ``None`` restores caller-managed transfers.
-    fn set_staging_allowed_local_paths(&mut self, paths: Option<Vec<String>>) -> PyResult<()> {
+    /// ``input_stream_token`` prevents a stream sentinel from being opened as a file.
+    #[pyo3(signature = (paths=None, *, input_stream_token=None))]
+    fn set_staging_allowed_local_paths(
+        &mut self,
+        paths: Option<Vec<String>>,
+        input_stream_token: Option<String>,
+    ) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
         inner.stmt.spec().staging_allowed_local_paths = paths;
+        inner.stmt.spec().staging_stream_token = input_stream_token;
         Ok(())
     }
 

@@ -51,6 +51,7 @@ impl VolumeCompletion {
 #[derive(Clone, Default)]
 pub(crate) struct VolumeOptions {
     paths: Option<Vec<String>>,
+    stream_token: Option<String>,
     retain_result: bool,
 }
 
@@ -58,6 +59,7 @@ impl From<&StatementSpec> for VolumeOptions {
     fn from(spec: &StatementSpec) -> Self {
         Self {
             paths: spec.staging_allowed_local_paths.clone(),
+            stream_token: spec.staging_stream_token.clone(),
             retain_result: spec.retain_volume_operation_result,
         }
     }
@@ -105,6 +107,14 @@ pub(crate) async fn complete(
         };
         if next_instruction_batch(&mut stream).await?.is_some() {
             return Err(Error::invalid_state().message("Expected one file transfer instruction"));
+        }
+        if operation.eq_ignore_ascii_case("PUT")
+            && options.stream_token.is_some()
+            && local_file == options.stream_token
+        {
+            return Err(Error::invalid_argument()
+                .message("Streaming PUT is not supported by the kernel backend.")
+                .with_error_code("FILE_TRANSFER_UNSUPPORTED_STREAM"));
         }
         {
             let mut completed = completion.result.lock().await;
@@ -285,11 +295,10 @@ fn allowed_path(local_file: Option<&str>, paths: &[String]) -> Result<PathBuf> {
     let resolved = resolved_path(Path::new(file));
     let policy_path = match &resolved {
         Ok(file) => file.clone(),
-        Err(error) if error.code == ErrorCode::NotFound => {
-            // Missing components may classify a denial, but must never authorize file access.
+        Err(_) => {
+            // Unresolved components may classify a denial, but must never authorize file access.
             missing_path_for_policy(Path::new(file))?
         }
-        Err(error) => return Err(error.clone()),
     };
     for base in paths {
         let Ok(base) = resolved_path(Path::new(base)) else {
@@ -581,6 +590,7 @@ mod tests {
         let options = VolumeOptions {
             paths: Some(vec![dir.path().to_str().unwrap().into()]),
             retain_result: true,
+            ..Default::default()
         };
         let completion = VolumeCompletion::default();
         let http = client();
@@ -608,6 +618,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decoded_stream_token_is_not_opened_as_a_file() {
+        let server = MockServer::start().await;
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("stream-token");
+        std::fs::write(&local, b"disk bytes").unwrap();
+        let token = local.to_str().unwrap().to_owned();
+        let batch = instruction("PUT", &server.uri(), &token);
+        let error = complete(
+            &client(),
+            result(batch, true),
+            &VolumeOptions {
+                paths: Some(vec![directory.path().to_str().unwrap().into()]),
+                stream_token: Some(token),
+                ..Default::default()
+            },
+            &VolumeCompletion::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("FILE_TRANSFER_UNSUPPORTED_STREAM")
+        );
+        assert_eq!(error.query_id.as_deref(), Some("statement"));
+        assert!(server.received_requests().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn cancelled_reader_does_not_replay_upload() {
         use std::time::Duration;
 
@@ -624,6 +663,7 @@ mod tests {
         let options = VolumeOptions {
             paths: Some(vec![directory.path().to_str().unwrap().into()]),
             retain_result: false,
+            ..Default::default()
         };
         let completion = VolumeCompletion::default();
         let http = client();
@@ -697,6 +737,7 @@ mod tests {
         let options = VolumeOptions {
             paths: Some(vec![dir.path().to_str().unwrap().into()]),
             retain_result: false,
+            ..Default::default()
         };
         for operation in ["PUT", "GET"] {
             let batch = instruction(operation, &server.uri(), local.to_str().unwrap());
@@ -1119,14 +1160,35 @@ mod tests {
             let error = allowed_path(path.to_str(), &paths).unwrap_err();
             assert_eq!(error.code, expected);
         }
+        for base in [&allowed, &directory.path().join("outside")] {
+            std::fs::create_dir_all(base).unwrap();
+            std::fs::write(base.join("file"), b"file").unwrap();
+            let error = allowed_path(base.join("file/child").to_str(), &paths).unwrap_err();
+            if base == &allowed {
+                assert!(error.os_error.is_some());
+            } else {
+                assert_eq!(error.code, ErrorCode::PermissionDenied);
+                assert!(error.os_error.is_none());
+            }
+        }
         #[cfg(unix)]
         {
             let outside = directory.path().join("outside");
-            std::fs::create_dir(&outside).unwrap();
             std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
             let error =
                 allowed_path(allowed.join("link/missing/file").to_str(), &paths).unwrap_err();
             assert_eq!(error.code, ErrorCode::PermissionDenied);
+            for base in [&allowed, &outside] {
+                let path = base.join("loop");
+                std::os::unix::fs::symlink(&path, &path).unwrap();
+                let error = allowed_path(path.to_str(), &paths).unwrap_err();
+                if base == &allowed {
+                    assert!(error.os_error.is_some());
+                } else {
+                    assert_eq!(error.code, ErrorCode::PermissionDenied);
+                    assert!(error.os_error.is_none());
+                }
+            }
         }
     }
 
@@ -1156,6 +1218,7 @@ mod tests {
             &VolumeOptions {
                 paths: Some(vec![]),
                 retain_result: false,
+                ..Default::default()
             },
             &VolumeCompletion::default(),
         )
@@ -1181,6 +1244,7 @@ mod tests {
             &VolumeOptions {
                 paths: Some(vec![]),
                 retain_result: false,
+                ..Default::default()
             },
             &VolumeCompletion::default(),
         )
@@ -1218,6 +1282,7 @@ mod tests {
             &VolumeOptions {
                 paths: Some(vec![]),
                 retain_result: false,
+                ..Default::default()
             },
             &VolumeCompletion::default(),
         )
@@ -1238,6 +1303,7 @@ mod tests {
                 VolumeOptions {
                     paths: Some(vec![]),
                     retain_result: false,
+                    ..Default::default()
                 },
             ),
             (true, VolumeOptions::default()),
@@ -1337,6 +1403,7 @@ mod tests {
                 &VolumeOptions {
                     paths: Some(vec![dir.path().to_str().unwrap().into()]),
                     retain_result: false,
+                    ..Default::default()
                 },
                 &VolumeCompletion::default(),
             )

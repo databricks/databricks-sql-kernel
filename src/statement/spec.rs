@@ -234,6 +234,9 @@ pub struct StatementSpec {
     /// directory components cannot be modified by untrusted users during transfer.
     pub staging_allowed_local_paths: Option<Vec<String>>,
 
+    /// A connector's stream sentinel must never be opened as a local file.
+    pub staging_stream_token: Option<String>,
+
     /// Preserve the instruction row after a successful transfer for APIs
     /// whose existing result contract includes that row.
     pub retain_volume_operation_result: bool,
