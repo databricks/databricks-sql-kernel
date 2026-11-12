@@ -66,7 +66,8 @@ impl Statement {
         Ok(())
     }
 
-    /// Set permitted local paths; ``None`` restores caller-managed transfers.
+    /// Configured transfers consume instruction rows.
+    /// ``None`` restores caller-managed transfers.
     fn set_staging_allowed_local_paths(&mut self, paths: Option<Vec<String>>) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");
         inner.stmt.spec().staging_allowed_local_paths = paths;
