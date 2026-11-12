@@ -1261,18 +1261,20 @@ mod tests {
         let allowed = dir.path().join("allowed");
         std::fs::create_dir(&allowed).unwrap();
         let outside = dir.path().join("outside");
-        let error = transfer(
-            &client(),
-            "GET",
-            "http://127.0.0.1:1/file",
-            &HashMap::new(),
-            outside.to_str(),
-            &[allowed.to_str().unwrap().into()],
-        )
-        .await
-        .unwrap_err();
-        assert_eq!(error.code, ErrorCode::PermissionDenied);
-        assert!(!outside.exists());
+        for operation in ["PUT", "GET"] {
+            let error = transfer(
+                &client(),
+                operation,
+                "http://127.0.0.1:1/file",
+                &HashMap::new(),
+                outside.to_str(),
+                &[allowed.to_str().unwrap().into()],
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert!(!outside.exists());
+        }
     }
 
     #[tokio::test]

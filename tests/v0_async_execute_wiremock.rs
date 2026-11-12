@@ -2424,13 +2424,14 @@ async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
 }
 
 #[tokio::test]
-async fn async_cancel_interrupts_shared_file_transfer() {
+async fn cancellation_interrupts_file_transfers() {
     use arrow_array::StringArray;
+    use databricks_sql_kernel::DirectStatement;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     for operation in ["PUT", "GET"] {
-        for detached in [false, true] {
+        for mode in ["sync", "direct", "async-owner", "async-detached"] {
             let server = MockServer::start().await;
             mount_create_session(&server).await;
             mount_delete_session(&server).await;
@@ -2481,8 +2482,12 @@ async fn async_cancel_interrupts_shared_file_transfer() {
             let mut body: serde_json::Value =
                 serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
             body["manifest"]["is_volume_operation"] = json!(true);
-            mount_submit(&server, pending_body("transfer")).await;
-            mount_status_once(&server, "transfer", body.to_string()).await;
+            if mode == "sync" || mode == "direct" {
+                mount_submit(&server, body.to_string()).await;
+            } else {
+                mount_submit(&server, pending_body("transfer")).await;
+                mount_status_once(&server, "transfer", body.to_string()).await;
+            }
             let session = open_session(&server).await;
             let mut statement = session.statement();
             let sql = if operation == "PUT" {
@@ -2496,27 +2501,57 @@ async fn async_cancel_interrupts_shared_file_transfer() {
             statement.spec().sql(sql);
             statement.spec().staging_allowed_local_paths =
                 Some(vec![directory.path().to_str().unwrap().into()]);
-            let owner = statement.submit().await.unwrap();
-            let first = owner.reader().unwrap();
-            let second = owner.reader().unwrap();
-            let first = tokio::spawn(async move { first.fetch_result().await });
-            tokio::time::timeout(Duration::from_secs(5), received)
-                .await
-                .unwrap()
-                .unwrap();
-            let second = tokio::spawn(async move { second.fetch_result().await });
-            if detached {
-                owner.canceller().cancel().await.unwrap();
+            let errors = if mode == "sync" || mode == "direct" {
+                let canceller = statement.canceller();
+                let transfer = tokio::spawn(async move {
+                    if mode == "direct" {
+                        match statement.execute_direct().await {
+                            Ok(DirectStatement::Completed(executed)) => Ok(executed),
+                            Ok(DirectStatement::Running(_)) => panic!("expected inline completion"),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        statement.execute().await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                canceller.cancel().await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), transfer)
+                    .await
+                    .expect("sync/direct cancellation did not stop the transfer")
+                    .unwrap();
+                vec![result.err().expect("cancelled transfer must fail")]
             } else {
-                ExecutedStatementHandle::cancel(&owner).await.unwrap();
-            }
-            let results = tokio::time::timeout(Duration::from_secs(2), async {
-                (first.await.unwrap(), second.await.unwrap())
-            })
-            .await
-            .expect("async cancellation did not stop the transfer");
-            for result in [results.0, results.1] {
-                let error = result.err().expect("cancelled transfer must fail");
+                let owner = statement.submit().await.unwrap();
+                let first = owner.reader().unwrap();
+                let second = owner.reader().unwrap();
+                let first = tokio::spawn(async move { first.fetch_result().await });
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let second = tokio::spawn(async move { second.fetch_result().await });
+                if mode == "async-detached" {
+                    owner.canceller().cancel().await.unwrap();
+                } else {
+                    ExecutedStatementHandle::cancel(&owner).await.unwrap();
+                }
+                let results = tokio::time::timeout(Duration::from_secs(2), async {
+                    (first.await.unwrap(), second.await.unwrap())
+                })
+                .await
+                .expect("async cancellation did not stop the transfer");
+                let errors = vec![
+                    results.0.err().expect("cancelled transfer must fail"),
+                    results.1.err().expect("cancelled transfer must fail"),
+                ];
+                owner.close().await.unwrap();
+                errors
+            };
+            for error in errors {
                 assert_eq!(error.code, ErrorCode::Cancelled);
                 assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
                 assert_eq!(error.query_id.as_deref(), Some("transfer"));
@@ -2525,7 +2560,6 @@ async fn async_cancel_interrupts_shared_file_transfer() {
                 assert_eq!(std::fs::read(&local).unwrap(), original);
             }
             storage.abort();
-            owner.close().await.unwrap();
             session.close().await.unwrap();
         }
     }
