@@ -1180,8 +1180,8 @@ impl AsyncStatementCanceller {
     /// `Statement` drop). Idempotent against a server already in a
     /// terminal state — the kernel's `cancel_statement` is a no-op
     /// there. Byte-for-byte the same operation as
-    /// [`ExecutedAsyncStatement::cancel`]; the two share no mutable
-    /// state, so this can run concurrently with an in-flight
+    /// [`ExecutedAsyncStatement::cancel`]; no exclusive borrow of the
+    /// executed handle is required, so this can run concurrently with an in-flight
     /// `await_result` on the same statement.
     pub async fn cancel(&self) -> Result<()> {
         async {

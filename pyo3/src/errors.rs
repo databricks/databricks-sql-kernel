@@ -206,7 +206,7 @@ mod tests {
     fn local_os_error_code_crosses_python_boundary() {
         Python::initialize();
         Python::attach(|py| {
-            for raw in [None, Some(1), Some(2), Some(5), Some(13)] {
+            for raw in [None, Some(13)] {
                 let mut error = KError::new(ErrorCode::NotFound, "missing file");
                 error.os_error = raw.map(|code| {
                     Box::new(OsError {

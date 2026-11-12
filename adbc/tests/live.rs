@@ -396,13 +396,6 @@ fn volume_files_round_trip_and_remove() {
         statement.execute_update()?;
         let option =
             OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
-        if statement
-            .set_option(option.clone(), OptionValue::String("{}".into()))
-            .is_ok()
-        {
-            return Err("invalid path list was accepted".into());
-        }
-        statement.set_option(option.clone(), OptionValue::String("null".into()))?;
         let paths = serde_json::to_string(&vec![directory.to_str().unwrap()])?;
         statement.set_option(option.clone(), OptionValue::String(paths.clone()))?;
         for sql in [

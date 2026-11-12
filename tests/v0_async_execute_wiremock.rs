@@ -141,6 +141,27 @@ fn succeeded_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
     .to_string()
 }
 
+fn file_transfer_body(operation: &str, url: &str, local: &std::path::Path) -> String {
+    use arrow_array::StringArray;
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "operation",
+            Arc::new(StringArray::from(vec![operation])) as arrow_array::ArrayRef,
+        ),
+        ("url", Arc::new(StringArray::from(vec![url]))),
+        ("headers", Arc::new(StringArray::from(vec!["{}"]))),
+        (
+            "local",
+            Arc::new(StringArray::from(vec![local.to_str().unwrap()])),
+        ),
+    ])
+    .unwrap();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
+    body["manifest"]["is_volume_operation"] = json!(true);
+    body.to_string()
+}
+
 fn pending_body(statement_id: &str) -> String {
     json!({
         "statement_id": statement_id,
@@ -2277,7 +2298,6 @@ async fn await_result_succeeded_status_still_closes_statement() {
 
 #[tokio::test]
 async fn file_transfer_completion_is_shared_by_independent_readers() {
-    use arrow_array::StringArray;
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
@@ -2290,30 +2310,13 @@ async fn file_transfer_completion_is_shared_by_independent_readers() {
         .await;
     let dir = tempfile::tempdir().unwrap();
     let destination = dir.path().join("download");
-    let batch = RecordBatch::try_from_iter(vec![
-        (
-            "operation",
-            Arc::new(StringArray::from(vec!["GET"])) as arrow_array::ArrayRef,
-        ),
-        (
-            "url",
-            Arc::new(StringArray::from(vec![format!(
-                "{}/storage/file",
-                server.uri()
-            )])),
-        ),
-        ("headers", Arc::new(StringArray::from(vec!["{}"]))),
-        (
-            "local",
-            Arc::new(StringArray::from(vec![destination.to_str().unwrap()])),
-        ),
-    ])
-    .unwrap();
-    let mut body: serde_json::Value =
-        serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
-    body["manifest"]["is_volume_operation"] = json!(true);
+    let body = file_transfer_body(
+        "GET",
+        &format!("{}/storage/file", server.uri()),
+        &destination,
+    );
     mount_submit(&server, pending_body("transfer")).await;
-    mount_status_once(&server, "transfer", body.to_string()).await;
+    mount_status_once(&server, "transfer", body).await;
     let session = open_session(&server).await;
     let mut statement = session.statement();
     statement
@@ -2334,7 +2337,6 @@ async fn file_transfer_completion_is_shared_by_independent_readers() {
 
 #[tokio::test]
 async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
-    use arrow_array::StringArray;
     use databricks_sql_kernel::DirectStatement;
     for direct in [false, true] {
         for denied in [false, true] {
@@ -2350,29 +2352,12 @@ async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
                 .await;
             let directory = tempfile::tempdir().unwrap();
             let destination = directory.path().join("download");
-            let batch = RecordBatch::try_from_iter(vec![
-                (
-                    "operation",
-                    Arc::new(StringArray::from(vec!["GET"])) as arrow_array::ArrayRef,
-                ),
-                (
-                    "url",
-                    Arc::new(StringArray::from(vec![format!(
-                        "{}/storage/file",
-                        server.uri()
-                    )])),
-                ),
-                ("headers", Arc::new(StringArray::from(vec!["{}"]))),
-                (
-                    "local",
-                    Arc::new(StringArray::from(vec![destination.to_str().unwrap()])),
-                ),
-            ])
-            .unwrap();
-            let mut body: serde_json::Value =
-                serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
-            body["manifest"]["is_volume_operation"] = json!(true);
-            mount_submit(&server, body.to_string()).await;
+            let body = file_transfer_body(
+                "GET",
+                &format!("{}/storage/file", server.uri()),
+                &destination,
+            );
+            mount_submit(&server, body).await;
             let session = open_session(&server).await;
             let mut statement = session.statement();
             statement
@@ -2425,7 +2410,6 @@ async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
 
 #[tokio::test]
 async fn cancellation_interrupts_file_transfers() {
-    use arrow_array::StringArray;
     use databricks_sql_kernel::DirectStatement;
     use std::time::Duration;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -2463,30 +2447,12 @@ async fn cancellation_interrupts_file_transfers() {
             let local = directory.path().join("file");
             let original = vec![b'a'; 8 * 1024 * 1024];
             std::fs::write(&local, &original).unwrap();
-            let batch = RecordBatch::try_from_iter(vec![
-                (
-                    "operation",
-                    Arc::new(StringArray::from(vec![operation])) as arrow_array::ArrayRef,
-                ),
-                (
-                    "url",
-                    Arc::new(StringArray::from(vec![format!("http://{address}/file")])),
-                ),
-                ("headers", Arc::new(StringArray::from(vec!["{}"]))),
-                (
-                    "local",
-                    Arc::new(StringArray::from(vec![local.to_str().unwrap()])),
-                ),
-            ])
-            .unwrap();
-            let mut body: serde_json::Value =
-                serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
-            body["manifest"]["is_volume_operation"] = json!(true);
+            let body = file_transfer_body(operation, &format!("http://{address}/file"), &local);
             if mode == "sync" || mode == "direct" {
-                mount_submit(&server, body.to_string()).await;
+                mount_submit(&server, body).await;
             } else {
                 mount_submit(&server, pending_body("transfer")).await;
-                mount_status_once(&server, "transfer", body.to_string()).await;
+                mount_status_once(&server, "transfer", body).await;
             }
             let session = open_session(&server).await;
             let mut statement = session.statement();

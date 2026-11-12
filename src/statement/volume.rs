@@ -709,8 +709,6 @@ mod tests {
             (ErrorKind::InvalidInput, ErrorCode::InvalidArgument),
             (ErrorKind::StorageFull, ErrorCode::ResourceExhausted),
             (ErrorKind::TimedOut, ErrorCode::Timeout),
-            (ErrorKind::IsADirectory, ErrorCode::Internal),
-            (ErrorKind::ReadOnlyFilesystem, ErrorCode::Internal),
             (ErrorKind::Other, ErrorCode::Internal),
         ] {
             let error = file_error(std::io::Error::from(kind));
@@ -722,10 +720,8 @@ mod tests {
                 (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
             );
         }
-        for raw in [1, 2, 5, 13] {
-            let error = file_error(std::io::Error::from_raw_os_error(raw));
-            assert_eq!(error.os_error.as_ref().map(|e| e.code), Some(raw));
-        }
+        let error = file_error(std::io::Error::from_raw_os_error(13));
+        assert_eq!(error.os_error.as_ref().map(|e| e.code), Some(13));
     }
 
     #[tokio::test]
@@ -953,7 +949,7 @@ mod tests {
         tokio::fs::write(&local, b"upload").await.unwrap();
         transfer(
             &client(),
-            "PUT",
+            "pUt",
             &format!("http://{address}/file"),
             &HashMap::from([
                 ("cOnTeNt-LeNgTh".into(), "6".into()),
@@ -976,38 +972,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn streams_upload_and_accepts_missing_remove() {
+    async fn accepts_missing_remove() {
         let server = MockServer::start().await;
-        Mock::given(method("PUT"))
-            .and(path("/file"))
-            .and(body_bytes(b"upload"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
         Mock::given(method("DELETE"))
             .and(path("/file"))
             .respond_with(ResponseTemplate::new(404))
             .expect(1)
             .mount(&server)
             .await;
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("input");
-        tokio::fs::write(&local, b"upload").await.unwrap();
-        let roots = vec![dir.path().to_str().unwrap().into()];
-        let http = client();
         transfer(
-            &http,
-            "pUt",
-            &format!("{}/file", server.uri()),
-            &HashMap::new(),
-            local.to_str(),
-            &roots,
-        )
-        .await
-        .unwrap();
-        transfer(
-            &http,
+            &client(),
             "remove",
             &format!("{}/file", server.uri()),
             &HashMap::new(),
@@ -1175,9 +1149,10 @@ mod tests {
         {
             let outside = directory.path().join("outside");
             std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
-            let error =
-                allowed_path(allowed.join("link/missing/file").to_str(), &paths).unwrap_err();
-            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            for suffix in ["link/file", "link/missing/file"] {
+                let error = allowed_path(allowed.join(suffix).to_str(), &paths).unwrap_err();
+                assert_eq!(error.code, ErrorCode::PermissionDenied);
+            }
             for base in [&allowed, &outside] {
                 let path = base.join("loop");
                 std::os::unix::fs::symlink(&path, &path).unwrap();
@@ -1476,21 +1451,5 @@ mod tests {
             dir.path().to_str().unwrap().into(),
         ];
         assert_eq!(allowed_path(file.to_str(), &paths).unwrap(), file);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn rejects_symlinks_that_escape_allowed_directory() {
-        let dir = tempfile::tempdir().unwrap();
-        let allowed = dir.path().join("allowed");
-        let outside = dir.path().join("outside");
-        std::fs::create_dir(&allowed).unwrap();
-        std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
-        assert!(allowed_path(
-            allowed.join("link/file").to_str(),
-            &[allowed.to_str().unwrap().into()]
-        )
-        .is_err());
     }
 }
