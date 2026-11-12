@@ -123,7 +123,12 @@ pub(crate) async fn complete(
             e = e.with_error_code("FILE_TRANSFER_ERROR");
         }
         if e.sql_state.is_none() {
-            e = e.with_sql_state("HY000");
+            let state = if e.code == ErrorCode::Timeout {
+                "HYT00"
+            } else {
+                "HY000"
+            };
+            e = e.with_sql_state(state);
         }
         e.with_query_id(&statement_id)
     })
@@ -215,17 +220,48 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     }
 }
 
+fn missing_path_for_policy(path: &Path) -> Result<PathBuf> {
+    let absolute = std::path::absolute(path).map_err(file_error)?;
+    for ancestor in absolute.ancestors().skip(1) {
+        if let Ok(mut resolved) = ancestor.canonicalize() {
+            let suffix = absolute.strip_prefix(ancestor).unwrap();
+            for component in suffix.components() {
+                match component {
+                    std::path::Component::ParentDir => {
+                        resolved.pop();
+                    }
+                    std::path::Component::CurDir => {}
+                    component => resolved.push(component.as_os_str()),
+                }
+            }
+            return Ok(resolved);
+        }
+    }
+    Err(Error::new(
+        ErrorCode::PermissionDenied,
+        "Cannot resolve local file path",
+    ))
+}
+
 fn allowed_path(local_file: Option<&str>, paths: &[String]) -> Result<PathBuf> {
     let file = local_file.filter(|s| !s.is_empty()).ok_or_else(|| {
         Error::invalid_argument().message("Local file path is required for PUT and GET")
     })?;
-    let file = resolved_path(Path::new(file))?;
+    let resolved = resolved_path(Path::new(file));
+    let policy_path = match &resolved {
+        Ok(file) => file.clone(),
+        Err(error) if error.code == ErrorCode::NotFound => {
+            // Missing components may classify a denial, but must never authorize file access.
+            missing_path_for_policy(Path::new(file))?
+        }
+        Err(error) => return Err(error.clone()),
+    };
     for base in paths {
         let Ok(base) = resolved_path(Path::new(base)) else {
             continue;
         };
-        if file.starts_with(base) {
-            return Ok(file);
+        if policy_path.starts_with(base) {
+            return resolved;
         }
     }
     Err(Error::new(
@@ -968,6 +1004,75 @@ mod tests {
         server.abort();
         assert!(outcome.is_err());
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn missing_parent_preserves_policy_denial() {
+        let directory = tempfile::tempdir().unwrap();
+        let allowed = directory.path().join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        let paths = [allowed.to_str().unwrap().to_owned()];
+        for (path, expected) in [
+            (allowed.join("missing/file"), ErrorCode::NotFound),
+            (
+                directory.path().join("outside/missing/file"),
+                ErrorCode::PermissionDenied,
+            ),
+            (
+                allowed.join("missing/../../outside/file"),
+                ErrorCode::PermissionDenied,
+            ),
+        ] {
+            let error = allowed_path(path.to_str(), &paths).unwrap_err();
+            assert_eq!(error.code, expected);
+        }
+        #[cfg(unix)]
+        {
+            let outside = directory.path().join("outside");
+            std::fs::create_dir(&outside).unwrap();
+            std::os::unix::fs::symlink(&outside, allowed.join("link")).unwrap();
+            let error =
+                allowed_path(allowed.join("link/missing/file").to_str(), &paths).unwrap_err();
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_deadline_keeps_timeout_state_and_transfer_context() {
+        use crate::client::retry::{RequestCategory, RetryConfig};
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let retry = RetryConfig {
+            overall_timeout: std::time::Duration::ZERO,
+            ..Default::default()
+        };
+        let mut http = DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            HashMap::from([(RequestCategory::CloudFetch, retry)]),
+        )
+        .unwrap();
+        http.allow_loopback_plaintext_storage = true;
+        let batch = instruction("REMOVE", &server.uri(), "");
+        let error = complete(
+            &http,
+            result(batch, true),
+            &VolumeOptions {
+                paths: Some(vec![]),
+                retain_result: false,
+            },
+            &VolumeCompletion::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::Timeout);
+        assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+        assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+        assert_eq!(error.query_id.as_deref(), Some("statement"));
     }
 
     #[tokio::test]
