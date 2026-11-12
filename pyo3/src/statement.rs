@@ -69,6 +69,7 @@ impl Statement {
     /// Configured transfers consume instruction rows.
     /// ``None`` restores caller-managed transfers.
     /// ``input_stream_token`` prevents a stream sentinel from being opened as a file.
+    /// Each call replaces both settings; omitting ``input_stream_token`` clears it.
     #[pyo3(signature = (paths=None, *, input_stream_token=None))]
     fn set_staging_allowed_local_paths(
         &mut self,
