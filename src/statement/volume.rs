@@ -364,7 +364,8 @@ async fn transfer(
             builder
         };
         let temporary = builder.tempfile_in(parent).map_err(file_error)?;
-        let mut file = tokio::fs::File::from_std(temporary.reopen().map_err(file_error)?);
+        let mut file =
+            tokio::fs::File::from_std(temporary.as_file().try_clone().map_err(file_error)?);
         let mut body = response.bytes_stream();
         while let Some(bytes) = body.next().await {
             let bytes = bytes.map_err(transport_error)?;
@@ -787,7 +788,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .respond_with(ResponseTemplate::new(200).set_body_bytes(b"contents"))
-            .expect(2)
+            .expect(3)
             .mount(&server)
             .await;
         let dir = tempfile::tempdir().unwrap();
@@ -795,9 +796,9 @@ mod tests {
         let control = dir.path().join("control");
         std::fs::write(&control, b"").unwrap();
         let roots = vec![dir.path().to_str().unwrap().into()];
-        for existing in [false, true] {
-            if existing {
-                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o640))
+        for existing in [None, Some(0o640), Some(0o200)] {
+            if let Some(mode) = existing {
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))
                     .unwrap();
             }
             transfer(
@@ -810,11 +811,9 @@ mod tests {
             )
             .await
             .unwrap();
-            let expected = if existing {
-                0o640
-            } else {
+            let expected = existing.unwrap_or_else(|| {
                 std::fs::metadata(&control).unwrap().permissions().mode() & 0o777
-            };
+            });
             assert_eq!(
                 std::fs::metadata(&destination)
                     .unwrap()
