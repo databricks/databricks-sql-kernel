@@ -228,7 +228,8 @@ pub struct StatementSpec {
     /// enables REMOVE while denying local file access. Transfers use the storage
     /// retry overall deadline, which defaults to 15 minutes.
     /// Completion, including a failure after retries, is final and shared by all
-    /// readers of an execution. Re-execute the SQL to start a new transfer attempt.
+    /// readers of an execution. Cancellation during transfer is terminal;
+    /// re-execute the SQL to start a new transfer attempt.
     /// Interrupted GET bodies are not retried. Allow only trusted roots whose
     /// directory components cannot be modified by untrusted users during transfer.
     pub staging_allowed_local_paths: Option<Vec<String>>,

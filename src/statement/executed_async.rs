@@ -222,7 +222,7 @@ pub struct ExecutedAsyncStatement {
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
     pub(crate) volume_options: super::volume::VolumeOptions,
-    volume_completion: Arc<tokio::sync::OnceCell<Result<()>>>,
+    volume_completion: Arc<super::volume::VolumeCompletion>,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -334,7 +334,7 @@ impl ExecutedAsyncStatement {
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             volume_options: super::volume::VolumeOptions::default(),
-            volume_completion: Arc::new(tokio::sync::OnceCell::new()),
+            volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
@@ -395,7 +395,7 @@ impl ExecutedAsyncStatement {
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             volume_options: super::volume::VolumeOptions::default(),
-            volume_completion: Arc::new(tokio::sync::OnceCell::new()),
+            volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,

@@ -413,7 +413,7 @@ impl Statement {
                 &self.session.http_client,
                 result,
                 &super::volume::VolumeOptions::from(&self.spec),
-                &tokio::sync::OnceCell::new(),
+                &super::volume::VolumeCompletion::default(),
             )
             .await
             {
@@ -664,7 +664,7 @@ impl Statement {
                         &self.session.http_client,
                         result,
                         &super::volume::VolumeOptions::from(&self.spec),
-                        &tokio::sync::OnceCell::new(),
+                        &super::volume::VolumeCompletion::default(),
                     )
                     .await
                     {

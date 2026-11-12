@@ -25,8 +25,10 @@ use reqwest::Method;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::OnceCell;
+use tokio::sync::Mutex;
 use tokio_util::io::ReaderStream;
+
+pub(crate) type VolumeCompletion = Mutex<Option<Result<()>>>;
 
 #[derive(Clone, Default)]
 pub(crate) struct VolumeOptions {
@@ -47,7 +49,7 @@ pub(crate) async fn complete(
     client: &DatabricksHttpClient,
     mut result: ExecuteResult,
     options: &VolumeOptions,
-    completion: &OnceCell<Result<()>>,
+    completion: &VolumeCompletion,
 ) -> Result<ExecuteResult> {
     let Some(paths) = &options.paths else {
         return Ok(result);
@@ -86,19 +88,28 @@ pub(crate) async fn complete(
         if next_instruction_batch(&mut stream).await?.is_some() {
             return Err(Error::invalid_state().message("Expected one file transfer instruction"));
         }
-        completion
-            .get_or_init(|| {
-                transfer(
-                    client,
-                    &operation,
-                    &url,
-                    &headers,
-                    local_file.as_deref(),
-                    paths,
-                )
-            })
-            .await
-            .clone()?;
+        {
+            let mut completed = completion.lock().await;
+            if completed.is_none() {
+                // Cancellation must leave a terminal result instead of replaying an upload.
+                *completed = Some(Err(Error::new(
+                    ErrorCode::Cancelled,
+                    "File transfer interrupted; re-execute the SQL to retry",
+                )));
+                *completed = Some(
+                    transfer(
+                        client,
+                        &operation,
+                        &url,
+                        &headers,
+                        local_file.as_deref(),
+                        paths,
+                    )
+                    .await,
+                );
+            }
+            completed.as_ref().unwrap().clone()?;
+        }
         result.reader = if options.retain_result {
             Box::new(InMemoryReader::new(schema, vec![batch]))
         } else {
@@ -241,6 +252,10 @@ async fn transfer(
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| Error::invalid_state().message("Invalid file transfer URL"))?;
     let loopback = parsed.host_str().is_some_and(|host| {
+        let host = host
+            .strip_prefix('[')
+            .and_then(|host| host.strip_suffix(']'))
+            .unwrap_or(host);
         host == "localhost"
             || host
                 .parse::<std::net::IpAddr>()
@@ -501,7 +516,7 @@ mod tests {
             paths: Some(vec![dir.path().to_str().unwrap().into()]),
             retain_result: true,
         };
-        let completion = OnceCell::new();
+        let completion = VolumeCompletion::default();
         let http = client();
         for _ in 0..2 {
             let mut execution = result(batch.clone(), true);
@@ -524,6 +539,80 @@ mod tests {
         let request = server.received_requests().await.unwrap().remove(0);
         assert!(!request.headers.contains_key("authorization"));
         assert_eq!(request.headers["x-file-header"], "value");
+    }
+
+    #[tokio::test]
+    async fn cancelled_reader_does_not_replay_upload() {
+        use std::time::Duration;
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("upload");
+        std::fs::write(&source, b"upload").unwrap();
+        let batch = instruction("PUT", &server.uri(), source.to_str().unwrap());
+        let options = VolumeOptions {
+            paths: Some(vec![directory.path().to_str().unwrap().into()]),
+            retain_result: false,
+        };
+        let completion = VolumeCompletion::default();
+        let http = client();
+        let mut in_flight = Box::pin(complete(
+            &http,
+            result(batch.clone(), true),
+            &options,
+            &completion,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::select! {
+                    _ = &mut in_flight => panic!("upload completed before cancellation"),
+                    _ = tokio::time::sleep(Duration::from_millis(5)) => {}
+                }
+            }
+        })
+        .await
+        .unwrap();
+        drop(in_flight);
+        let error = tokio::time::timeout(
+            Duration::from_millis(500),
+            complete(&http, result(batch, true), &options, &completion),
+        )
+        .await
+        .unwrap()
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::Cancelled);
+        assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+        assert_eq!(error.query_id.as_deref(), Some("statement"));
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body, b"upload");
+    }
+
+    #[tokio::test]
+    async fn explicit_plaintext_opt_in_accepts_ipv6_loopback() {
+        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
+        let server = MockServer::builder().listener(listener).start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(404))
+            .expect(1)
+            .mount(&server)
+            .await;
+        transfer(
+            &client(),
+            "REMOVE",
+            &server.uri(),
+            &HashMap::new(),
+            None,
+            &[],
+        )
+        .await
+        .unwrap();
     }
 
     #[test]
@@ -895,7 +984,7 @@ mod tests {
                 paths: Some(vec![]),
                 retain_result: false,
             },
-            &OnceCell::new(),
+            &VolumeCompletion::default(),
         )
         .await
         .err()
@@ -932,7 +1021,7 @@ mod tests {
                 paths: Some(vec![]),
                 retain_result: false,
             },
-            &OnceCell::new(),
+            &VolumeCompletion::default(),
         )
         .await
         .err()
@@ -959,7 +1048,7 @@ mod tests {
                 &client(),
                 result(batch.clone(), marker),
                 &options,
-                &OnceCell::new(),
+                &VolumeCompletion::default(),
             )
             .await
             .unwrap();
