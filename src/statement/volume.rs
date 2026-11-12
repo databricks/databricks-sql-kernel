@@ -15,7 +15,7 @@
 use crate::client::retry::{calculate_backoff, RequestType, RetryStrategy};
 use crate::client::transport::ExecuteResult;
 use crate::client::DatabricksHttpClient;
-use crate::kernel_error::{Error, ErrorCode, Result};
+use crate::kernel_error::{Error, ErrorCode, OsError, Result};
 use crate::reader::{EmptyReader, InMemoryReader};
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::statement::StatementSpec;
@@ -105,7 +105,13 @@ pub(crate) async fn complete(
                         local_file.as_deref(),
                         paths,
                     )
-                    .await,
+                    .await
+                    .map_err(|mut error| {
+                        if let Some(os_error) = error.os_error.as_mut() {
+                            os_error.filename = local_file.clone();
+                        }
+                        error
+                    }),
                 );
             }
             completed.as_ref().unwrap().clone()?;
@@ -196,7 +202,12 @@ fn file_error(error: std::io::Error) -> Error {
         },
         format!("File transfer failed: {error}"),
     );
-    mapped.os_error_code = error.raw_os_error();
+    mapped.os_error = error.raw_os_error().map(|code| {
+        Box::new(OsError {
+            code,
+            filename: None,
+        })
+    });
     if permission_denied {
         mapped.with_error_code("FILE_TRANSFER_PERMISSION_ERROR")
     } else {
@@ -640,7 +651,7 @@ mod tests {
             let error = file_error(std::io::Error::from(kind));
             assert_eq!(error.code, code);
             assert!(!error.retryable);
-            assert_eq!(error.os_error_code, None);
+            assert!(error.os_error.is_none());
             assert_eq!(
                 error.error_code.as_deref(),
                 (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
@@ -648,8 +659,38 @@ mod tests {
         }
         for raw in [1, 2, 5, 13] {
             let error = file_error(std::io::Error::from_raw_os_error(raw));
-            assert_eq!(error.os_error_code, Some(raw));
+            assert_eq!(error.os_error.as_ref().map(|e| e.code), Some(raw));
         }
+    }
+
+    #[tokio::test]
+    async fn local_os_errors_keep_requested_filename() {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("absent-parent/file");
+        let expected_code = std::fs::File::open(&local).unwrap_err().raw_os_error();
+        let options = VolumeOptions {
+            paths: Some(vec![dir.path().to_str().unwrap().into()]),
+            retain_result: false,
+        };
+        for operation in ["PUT", "GET"] {
+            let batch = instruction(operation, &server.uri(), local.to_str().unwrap());
+            let error = complete(
+                &client(),
+                result(batch, true),
+                &options,
+                &VolumeCompletion::default(),
+            )
+            .await
+            .err()
+            .unwrap();
+            assert_eq!(error.code, ErrorCode::NotFound);
+            let os_error = error.os_error.as_ref().unwrap();
+            assert_eq!(Some(os_error.code), expected_code);
+            assert_eq!(os_error.filename.as_deref(), local.to_str());
+            assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[tokio::test]

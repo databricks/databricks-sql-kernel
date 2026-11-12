@@ -71,6 +71,7 @@ fn attach_attrs(
     diagnostic_info: Option<&str>,
     error_details_json: Option<&str>,
     os_error_code: Option<i32>,
+    os_error_filename: Option<&str>,
 ) -> PyResult<()> {
     bound.setattr("code", code)?;
     bound.setattr("message", message)?;
@@ -78,6 +79,7 @@ fn attach_attrs(
     bound.setattr("error_code", error_code)?;
     bound.setattr("vendor_code", vendor_code)?;
     bound.setattr("os_error_code", os_error_code)?;
+    bound.setattr("os_error_filename", os_error_filename)?;
     bound.setattr("http_status", http_status)?;
     bound.setattr("retryable", retryable)?;
     bound.setattr("query_id", query_id)?;
@@ -140,7 +142,8 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         err.display_message.as_deref(),
         err.diagnostic_info.as_deref(),
         err.error_details_json.as_deref(),
-        err.os_error_code,
+        err.os_error.as_ref().map(|e| e.code),
+        err.os_error.as_ref().and_then(|e| e.filename.as_deref()),
     ) {
         // Attribute attachment is best-effort. If something goes wrong
         // (extremely unlikely for plain string/int setattrs — but
@@ -186,6 +189,7 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
             None,
             None,
             None,
+            None,
         ) {
             return setattr_err;
         }
@@ -196,6 +200,7 @@ pub(crate) fn closed_err(handle_name: &str) -> PyErr {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use databricks_sql_kernel::kernel_error::OsError;
 
     #[test]
     fn local_os_error_code_crosses_python_boundary() {
@@ -203,7 +208,12 @@ mod tests {
         Python::attach(|py| {
             for raw in [None, Some(1), Some(2), Some(5), Some(13)] {
                 let mut error = KError::new(ErrorCode::NotFound, "missing file");
-                error.os_error_code = raw;
+                error.os_error = raw.map(|code| {
+                    Box::new(OsError {
+                        code,
+                        filename: Some("local-file.bin".to_owned()),
+                    })
+                });
                 let mapped = to_py_err(py, error);
                 let actual: Option<i32> = mapped
                     .value(py)
@@ -212,6 +222,13 @@ mod tests {
                     .extract()
                     .unwrap();
                 assert_eq!(actual, raw);
+                let filename: Option<String> = mapped
+                    .value(py)
+                    .getattr("os_error_filename")
+                    .unwrap()
+                    .extract()
+                    .unwrap();
+                assert_eq!(filename.as_deref(), raw.map(|_| "local-file.bin"));
             }
         });
     }

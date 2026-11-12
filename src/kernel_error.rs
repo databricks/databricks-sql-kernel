@@ -158,6 +158,15 @@ impl ErrorCode {
     }
 }
 
+/// Local OS failure details for language-native filesystem exceptions.
+#[derive(Debug, Clone)]
+pub struct OsError {
+    /// Uses errno on Unix and the Windows system error code on Windows.
+    pub code: i32,
+    /// Requested local path for a file-transfer OS error.
+    pub filename: Option<String>,
+}
+
 /// Typed kernel error.
 ///
 /// `cause` chains preserve the underlying provenance — a `SqlError`
@@ -197,9 +206,8 @@ pub struct Error {
     /// the string `error_code` themselves.
     pub vendor_code: Option<i32>,
 
-    /// Original local OS error code for language-native filesystem errors.
-    /// Uses errno on Unix and the Windows system error code on Windows.
-    pub os_error_code: Option<i32>,
+    /// Local OS failure details, boxed to keep other errors small.
+    pub os_error: Option<Box<OsError>>,
 
     /// HTTP status for transport-layer errors.
     pub http_status: Option<u16>,
@@ -266,7 +274,7 @@ impl Error {
             sql_state: None,
             error_code: None,
             vendor_code: None,
-            os_error_code: None,
+            os_error: None,
             http_status: None,
             retryable: false,
             query_id: None,
