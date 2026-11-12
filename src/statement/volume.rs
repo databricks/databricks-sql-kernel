@@ -376,6 +376,11 @@ async fn transfer(
 }
 
 fn transport_error(error: reqwest::Error) -> Error {
+    let code = if error.is_timeout() {
+        ErrorCode::Timeout
+    } else {
+        ErrorCode::NetworkError
+    };
     let message = if error.is_timeout() {
         "File transfer timed out"
     } else if error.is_connect() {
@@ -385,10 +390,7 @@ fn transport_error(error: reqwest::Error) -> Error {
     } else {
         "File transfer request failed"
     };
-    Error::new(ErrorCode::NetworkError, message).with_cause(Error::new(
-        ErrorCode::NetworkError,
-        format!("{:?}", error.without_url()),
-    ))
+    Error::new(code, message).with_cause(Error::new(code, format!("{:?}", error.without_url())))
 }
 
 async fn send_transfer(
@@ -1204,20 +1206,30 @@ mod tests {
             if existing {
                 std::fs::write(&file, b"original").unwrap();
             }
-            let result = transfer(
-                &http,
+            let batch = instruction(
                 "GET",
                 &format!("http://{address}/file"),
-                &HashMap::new(),
-                file.to_str(),
-                &[dir.path().to_str().unwrap().into()],
+                file.to_str().unwrap(),
+            );
+            let result = complete(
+                &http,
+                result(batch, true),
+                &VolumeOptions {
+                    paths: Some(vec![dir.path().to_str().unwrap().into()]),
+                    retain_result: false,
+                },
+                &VolumeCompletion::default(),
             )
             .await;
             assert_eq!(result.is_ok(), succeeds);
             if succeeds {
                 assert_eq!(std::fs::read(&file).unwrap(), b"data");
             } else {
-                assert_eq!(result.unwrap_err().code, ErrorCode::NetworkError);
+                let error = result.err().unwrap();
+                assert_eq!(error.code, ErrorCode::Timeout);
+                assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+                assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+                assert_eq!(error.query_id.as_deref(), Some("statement"));
                 if existing {
                     assert_eq!(std::fs::read(&file).unwrap(), b"original");
                 } else {
