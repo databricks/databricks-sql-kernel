@@ -192,7 +192,7 @@ fn file_error(error: std::io::Error) -> Error {
             std::io::ErrorKind::InvalidInput => ErrorCode::InvalidArgument,
             std::io::ErrorKind::TimedOut => ErrorCode::Timeout,
             std::io::ErrorKind::StorageFull => ErrorCode::ResourceExhausted,
-            _ => ErrorCode::Unavailable,
+            _ => ErrorCode::Internal,
         },
         format!("File transfer failed: {error}"),
     );
@@ -630,10 +630,13 @@ mod tests {
             (ErrorKind::InvalidInput, ErrorCode::InvalidArgument),
             (ErrorKind::StorageFull, ErrorCode::ResourceExhausted),
             (ErrorKind::TimedOut, ErrorCode::Timeout),
-            (ErrorKind::Other, ErrorCode::Unavailable),
+            (ErrorKind::IsADirectory, ErrorCode::Internal),
+            (ErrorKind::ReadOnlyFilesystem, ErrorCode::Internal),
+            (ErrorKind::Other, ErrorCode::Internal),
         ] {
             let error = file_error(std::io::Error::from(kind));
             assert_eq!(error.code, code);
+            assert!(!error.retryable);
             assert_eq!(
                 error.error_code.as_deref(),
                 (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
