@@ -372,9 +372,9 @@ impl Session {
             .map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?;
-        // Explicit HTTP sessions allow loopback storage for local integrations.
-        http_client.allow_loopback_plaintext_storage =
-            reqwest::Url::parse(&host).is_ok_and(|url| url.scheme() == "http");
+        // Local HTTP sessions allow loopback storage for local integrations.
+        http_client.allow_loopback_plaintext_storage = reqwest::Url::parse(&host)
+            .is_ok_and(|url| crate::client::http::is_loopback_http_url(&url));
         let http_client = Arc::new(http_client);
 
         // 2. Auth provider — async because OAuth flows hit the OIDC

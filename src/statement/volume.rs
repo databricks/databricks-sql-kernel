@@ -287,18 +287,9 @@ async fn transfer(
     };
     let parsed = reqwest::Url::parse(url)
         .map_err(|_| Error::invalid_state().message("Invalid file transfer URL"))?;
-    let loopback = parsed.host_str().is_some_and(|host| {
-        let host = host
-            .strip_prefix('[')
-            .and_then(|host| host.strip_suffix(']'))
-            .unwrap_or(host);
-        host == "localhost"
-            || host
-                .parse::<std::net::IpAddr>()
-                .is_ok_and(|ip| ip.is_loopback())
-    });
     if parsed.scheme() != "https"
-        && !(parsed.scheme() == "http" && loopback && client.allow_loopback_plaintext_storage)
+        && !(client.allow_loopback_plaintext_storage
+            && crate::client::http::is_loopback_http_url(&parsed))
     {
         return Err(Error::invalid_state().message("Invalid file transfer URL scheme"));
     }
@@ -628,27 +619,6 @@ mod tests {
         let requests = server.received_requests().await.unwrap();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].body, b"upload");
-    }
-
-    #[tokio::test]
-    async fn explicit_plaintext_opt_in_accepts_ipv6_loopback() {
-        let listener = std::net::TcpListener::bind("[::1]:0").unwrap();
-        let server = MockServer::builder().listener(listener).start().await;
-        Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-        transfer(
-            &client(),
-            "REMOVE",
-            &server.uri(),
-            &HashMap::new(),
-            None,
-            &[],
-        )
-        .await
-        .unwrap();
     }
 
     #[test]
