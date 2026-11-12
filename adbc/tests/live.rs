@@ -370,7 +370,7 @@ fn metadata_statement_catalog_underscore_escaping_is_configurable() {
 #[test]
 #[ignore = "requires a writable Unity Catalog catalog and live warehouse"]
 fn volume_files_round_trip_and_remove() {
-    let catalog = env::var("DATABRICKS_VOLUME_TEST_CATALOG").unwrap_or_else(|_| "main".into());
+    let catalog = required_env("DATABRICKS_VOLUME_TEST_CATALOG");
     let unique = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()

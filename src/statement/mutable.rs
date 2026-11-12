@@ -240,6 +240,7 @@ pub struct Statement {
     /// skip the `CloseStatement` round-trip entirely when the server
     /// side is already gone.
     last_closed: Option<Arc<AtomicBool>>,
+    last_volume_completion: Option<Arc<super::volume::VolumeCompletion>>,
     /// Server statement id of the in-flight (or most recent) execution,
     /// shared with any [`StatementCanceller`] handed out via
     /// [`Statement::canceller`]. Populated mid-execute as soon as the
@@ -260,6 +261,7 @@ impl Statement {
             last_statement_id: None,
             last_valid: None,
             last_closed: None,
+            last_volume_completion: None,
             inflight_id: Arc::new(Mutex::new(None)),
             volume_cancellation: watch::channel(None).0,
         }
@@ -563,6 +565,7 @@ impl Statement {
                 timeout,
             );
             executed.volume_options = super::volume::VolumeOptions::from(&self.spec);
+            self.last_volume_completion = Some(Arc::clone(&executed.volume_completion));
             Ok(executed)
         }
         .instrument(span)
@@ -698,6 +701,7 @@ impl Statement {
                         ExecutionTimeout::Default,
                     );
                     executed.volume_options = super::volume::VolumeOptions::from(&self.spec);
+                    self.last_volume_completion = Some(Arc::clone(&executed.volume_completion));
                     Ok(DirectStatement::Running(executed))
                 }
             }
@@ -854,6 +858,9 @@ impl Statement {
     async fn invalidate_prior(&mut self) {
         if let Some(valid) = self.last_valid.take() {
             valid.invalidate();
+        }
+        if let Some(completion) = self.last_volume_completion.take() {
+            completion.cancel();
         }
         // If the shared `closed` flag is already set, the server side
         // is gone (server auto-closed on the inline-result fast path,
@@ -1048,6 +1055,9 @@ impl Drop for Statement {
         // Statement).
         if let Some(valid) = self.last_valid.take() {
             valid.invalidate();
+        }
+        if let Some(completion) = self.last_volume_completion.take() {
+            completion.cancel();
         }
         // `last_statement_id` is left as-is. By construction it is
         // only set immediately before `ExecutedStatement::new`

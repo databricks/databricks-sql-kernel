@@ -24,6 +24,7 @@ use futures::StreamExt;
 use reqwest::Method;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{watch, Mutex};
 use tokio_util::io::ReaderStream;
@@ -125,7 +126,10 @@ pub(crate) async fn complete(
                     "File transfer interrupted; re-execute the SQL to retry",
                 )));
                 let mut cancelled = completion.cancelled.subscribe();
+                let log = TransferLog::new(&statement_id, &operation);
+                let started = Instant::now();
                 let transfer = transfer(
+                    &statement_id,
                     client,
                     &operation,
                     &url,
@@ -140,6 +144,7 @@ pub(crate) async fn complete(
                     }
                     result = transfer => result,
                 };
+                log.finish("total", started, result.as_ref().err());
                 *completed = Some(result.map_err(|mut error| {
                     if let Some(os_error) = error.os_error.as_mut() {
                         os_error.filename = local_file.clone();
@@ -314,7 +319,65 @@ fn allowed_path(local_file: Option<&str>, paths: &[String]) -> Result<PathBuf> {
     ))
 }
 
+struct TransferLog<'a> {
+    statement_id: &'a str,
+    operation: &'static str,
+}
+
+impl<'a> TransferLog<'a> {
+    fn new(statement_id: &'a str, operation: &str) -> Self {
+        Self {
+            statement_id,
+            operation: if operation.eq_ignore_ascii_case("PUT") {
+                "PUT"
+            } else if operation.eq_ignore_ascii_case("GET") {
+                "GET"
+            } else if operation.eq_ignore_ascii_case("REMOVE") {
+                "REMOVE"
+            } else {
+                "UNKNOWN"
+            },
+        }
+    }
+
+    fn start(&self, phase: &'static str) -> Instant {
+        crate::klog::debug!(
+            statement_id = self.statement_id,
+            operation = self.operation,
+            phase,
+            outcome = "start",
+            reason = "none",
+            elapsed_ms = 0,
+            "Volume transfer"
+        );
+        Instant::now()
+    }
+
+    fn finish(&self, phase: &'static str, started: Instant, error: Option<&Error>) {
+        let (outcome, reason) = match error.map(|error| error.code) {
+            None => ("success", "none"),
+            Some(ErrorCode::Cancelled) => ("cancelled", "cancelled"),
+            Some(ErrorCode::Timeout) => ("error", "timeout"),
+            Some(ErrorCode::PermissionDenied) => ("error", "permission_denied"),
+            Some(ErrorCode::NotFound) => ("error", "not_found"),
+            Some(ErrorCode::InvalidArgument) => ("error", "invalid_argument"),
+            Some(ErrorCode::NetworkError) => ("error", "transport_error"),
+            Some(_) => ("error", "transfer_error"),
+        };
+        crate::klog::debug!(
+            statement_id = self.statement_id,
+            operation = self.operation,
+            phase,
+            outcome,
+            reason,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "Volume transfer"
+        );
+    }
+}
+
 async fn transfer(
+    statement_id: &str,
     client: &DatabricksHttpClient,
     operation: &str,
     url: &str,
@@ -322,8 +385,9 @@ async fn transfer(
     local_file: Option<&str>,
     paths: &[String],
 ) -> Result<()> {
-    let operation = operation.to_ascii_uppercase();
-    let method = match operation.as_str() {
+    let log = TransferLog::new(statement_id, operation);
+    let operation = log.operation;
+    let method = match operation {
         "PUT" => Method::PUT,
         "GET" => Method::GET,
         "REMOVE" => Method::DELETE,
@@ -340,29 +404,36 @@ async fn transfer(
     let local = if operation == "REMOVE" {
         None
     } else {
-        Some(allowed_path(local_file, paths)?)
+        let local_file = local_file.map(str::to_owned);
+        let paths = paths.to_vec();
+        let started = log.start("preflight");
+        let local = tokio::task::spawn_blocking(move || {
+            let destination = allowed_path(local_file.as_deref(), &paths)?;
+            if operation == "GET" {
+                match std::fs::metadata(&destination) {
+                    Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
+                        return Err(Error::invalid_argument()
+                            .message("Download destination must be a file"));
+                    }
+                    Ok(_) => {
+                        // Preserve the OS error for directory destinations.
+                        std::fs::OpenOptions::new()
+                            .write(true)
+                            .open(&destination)
+                            .map_err(file_error)?;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(file_error(error)),
+                }
+            }
+            Ok(destination)
+        })
+        .await
+        .unwrap_or_else(|_| Err(Error::internal().message("File transfer preflight failed")));
+        log.finish("preflight", started, local.as_ref().err());
+        Some(local?)
     };
-    if operation == "GET" {
-        let destination = local.as_ref().unwrap();
-        match tokio::fs::metadata(destination).await {
-            Ok(metadata) if !metadata.is_file() && !metadata.is_dir() => {
-                return Err(
-                    Error::invalid_argument().message("Download destination must be a file")
-                );
-            }
-            Ok(_) => {
-                // Preserve the OS error for directory destinations.
-                tokio::fs::OpenOptions::new()
-                    .write(true)
-                    .open(destination)
-                    .await
-                    .map_err(file_error)?;
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(file_error(error)),
-        }
-    }
-    let response = send_transfer(client, method, parsed, headers, local.as_deref()).await?;
+    let response = send_transfer(client, method, parsed, headers, local.as_deref(), &log).await?;
     if !response.status().is_success()
         && !(operation == "REMOVE" && response.status().as_u16() == 404)
     {
@@ -378,42 +449,64 @@ async fn transfer(
         let parent = destination.parent().ok_or_else(|| {
             Error::invalid_argument().message("Download destination must be a file")
         })?;
-        let builder = tempfile::Builder::new();
-        #[cfg(unix)]
-        let builder = {
-            use std::os::unix::fs::PermissionsExt;
-            let mut builder = builder;
-            let permissions = match std::fs::metadata(destination) {
-                Ok(metadata) => metadata.permissions(),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    std::fs::Permissions::from_mode(0o666)
-                }
-                Err(error) => return Err(file_error(error)),
+        let started = log.start("temp_create");
+        let temporary = (|| {
+            let builder = tempfile::Builder::new();
+            #[cfg(unix)]
+            let builder = {
+                use std::os::unix::fs::PermissionsExt;
+                let mut builder = builder;
+                let permissions = match std::fs::metadata(destination) {
+                    Ok(metadata) => metadata.permissions(),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        std::fs::Permissions::from_mode(0o666)
+                    }
+                    Err(error) => return Err(file_error(error)),
+                };
+                builder.permissions(permissions);
+                builder
             };
-            builder.permissions(permissions);
-            builder
-        };
-        let temporary = builder.tempfile_in(parent).map_err(file_error)?;
-        let mut file =
-            tokio::fs::File::from_std(temporary.as_file().try_clone().map_err(file_error)?);
-        let mut body = response.bytes_stream();
-        while let Some(bytes) = body.next().await {
-            let bytes = bytes.map_err(transport_error)?;
-            file.write_all(&bytes).await.map_err(file_error)?;
+            let temporary = builder.tempfile_in(parent).map_err(file_error)?;
+            let file =
+                tokio::fs::File::from_std(temporary.as_file().try_clone().map_err(file_error)?);
+            Ok((temporary, file))
+        })();
+        log.finish("temp_create", started, temporary.as_ref().err());
+        let (temporary, mut file) = temporary?;
+        let started = log.start("body_write");
+        let body = async {
+            let mut body = response.bytes_stream();
+            while let Some(bytes) = body.next().await {
+                let bytes = bytes.map_err(transport_error)?;
+                file.write_all(&bytes).await.map_err(file_error)?;
+            }
+            Ok(())
         }
-        file.flush().await.map_err(file_error)?;
+        .await;
+        log.finish("body_write", started, body.as_ref().err());
+        body?;
+        let started = log.start("body_flush");
+        let flushed = file.flush().await.map_err(file_error);
+        log.finish("body_flush", started, flushed.as_ref().err());
+        flushed?;
         drop(file);
-        match std::fs::metadata(destination) {
-            Ok(metadata) => temporary
-                .as_file()
-                .set_permissions(metadata.permissions())
-                .map_err(file_error)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(file_error(error)),
-        }
-        temporary
-            .persist(destination)
-            .map_err(|error| file_error(error.error))?;
+        let started = log.start("commit");
+        let committed = (|| {
+            match std::fs::metadata(destination) {
+                Ok(metadata) => temporary
+                    .as_file()
+                    .set_permissions(metadata.permissions())
+                    .map_err(file_error)?,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(file_error(error)),
+            }
+            temporary
+                .persist(destination)
+                .map_err(|error| file_error(error.error))?;
+            Ok(())
+        })();
+        log.finish("commit", started, committed.as_ref().err());
+        committed?;
     }
     Ok(())
 }
@@ -433,7 +526,62 @@ fn transport_error(error: reqwest::Error) -> Error {
     } else {
         "File transfer request failed"
     };
-    Error::new(code, message).with_cause(Error::new(code, format!("{:?}", error.without_url())))
+    let message = format!("{message}: {}", transport_reason(&error));
+    Error::new(code, message.clone()).with_cause(Error::new(code, message))
+}
+
+fn transport_reason(error: &reqwest::Error) -> &'static str {
+    let mut io_reason = None;
+    let mut http_reason = None;
+    for source in crate::client::error_chain(error).take(8) {
+        if let Some(error) = source.downcast_ref::<std::io::Error>() {
+            io_reason = io_reason.or(match error.kind() {
+                std::io::ErrorKind::UnexpectedEof => Some("unexpected_eof"),
+                std::io::ErrorKind::ConnectionRefused => Some("connection_refused"),
+                std::io::ErrorKind::ConnectionReset => Some("connection_reset"),
+                std::io::ErrorKind::ConnectionAborted => Some("connection_aborted"),
+                std::io::ErrorKind::NotConnected => Some("not_connected"),
+                std::io::ErrorKind::BrokenPipe => Some("broken_pipe"),
+                std::io::ErrorKind::TimedOut => Some("timeout"),
+                std::io::ErrorKind::PermissionDenied => Some("permission_denied"),
+                _ => None,
+            });
+        }
+        if let Some(source) = source.downcast_ref::<hyper::Error>() {
+            http_reason = http_reason.or(if source.is_incomplete_message() {
+                Some(if error.is_body() || error.is_decode() {
+                    "unexpected_eof"
+                } else {
+                    "incomplete_response"
+                })
+            } else if source.is_closed() {
+                Some("connection_closed")
+            } else if source.is_parse() {
+                Some("invalid_response")
+            } else if source.is_canceled() {
+                Some("cancelled")
+            } else if source.is_timeout() {
+                Some("timeout")
+            } else if source.is_body_write_aborted() {
+                Some("body_write_aborted")
+            } else {
+                None
+            });
+        }
+    }
+    io_reason.or(http_reason).unwrap_or(if error.is_timeout() {
+        "timeout"
+    } else if error.is_connect() {
+        "connection_failed"
+    } else if error.is_body() {
+        "body_error"
+    } else if error.is_decode() {
+        "decode_error"
+    } else if error.is_builder() {
+        "invalid_request"
+    } else {
+        "request_failed"
+    })
 }
 
 async fn send_transfer(
@@ -442,8 +590,9 @@ async fn send_transfer(
     url: reqwest::Url,
     headers: &HashMap<String, String>,
     local: Option<&Path>,
+    log: &TransferLog<'_>,
 ) -> Result<reqwest::Response> {
-    let config = client.storage_retry_config();
+    let config = client.volume_retry_config();
     let request_type = if method == Method::PUT {
         RequestType::VolumeUpload
     } else {
@@ -451,6 +600,17 @@ async fn send_transfer(
     };
     let strategy = RetryStrategy::for_request(request_type, &config);
     let started = std::time::Instant::now();
+    let attempt_limit = u64::from(config.max_retries) + 1;
+    crate::klog::debug!(
+        statement_id = log.statement_id,
+        operation = log.operation,
+        phase = "retry_policy",
+        outcome = "resolved",
+        reason = "none",
+        attempt_limit,
+        budget_ms = config.overall_timeout.as_millis() as u64,
+        "Volume transfer"
+    );
     for attempt in 0..=config.max_retries {
         let remaining = config.overall_timeout.saturating_sub(started.elapsed());
         if remaining.is_zero() {
@@ -474,19 +634,30 @@ async fn send_transfer(
         if method == Method::PUT {
             let local = local
                 .ok_or_else(|| Error::invalid_argument().message("Missing local upload path"))?;
-            if !tokio::fs::metadata(local)
-                .await
-                .map_err(file_error)?
-                .is_file()
-            {
-                return Err(Error::invalid_argument().message("Local upload path must be a file"));
+            let opened_at = log.start("upload_open");
+            let opened = async {
+                if !tokio::fs::metadata(local)
+                    .await
+                    .map_err(file_error)?
+                    .is_file()
+                {
+                    return Err(
+                        Error::invalid_argument().message("Local upload path must be a file")
+                    );
+                }
+                // Each retry reopens the file so a streaming upload starts at byte zero.
+                let file = tokio::fs::File::open(local).await.map_err(file_error)?;
+                let metadata = file.metadata().await.map_err(file_error)?;
+                if !metadata.is_file() {
+                    return Err(
+                        Error::invalid_argument().message("Local upload path must be a file")
+                    );
+                }
+                Ok((file, metadata))
             }
-            // Each retry reopens the file so a streaming upload starts at byte zero.
-            let file = tokio::fs::File::open(local).await.map_err(file_error)?;
-            let metadata = file.metadata().await.map_err(file_error)?;
-            if !metadata.is_file() {
-                return Err(Error::invalid_argument().message("Local upload path must be a file"));
-            }
+            .await;
+            log.finish("upload_open", opened_at, opened.as_ref().err());
+            let (file, metadata) = opened?;
             request = request
                 .header(reqwest::header::CONTENT_LENGTH, metadata.len())
                 .body(reqwest::Body::wrap_stream(ReaderStream::new(
@@ -494,7 +665,35 @@ async fn send_transfer(
                 )));
         }
         // Presigned storage requests must omit workspace credentials and custom headers.
+        let attempt_started = Instant::now();
+        crate::klog::debug!(
+            statement_id = log.statement_id,
+            operation = log.operation,
+            phase = "attempt",
+            outcome = "start",
+            reason = "none",
+            attempt = u64::from(attempt) + 1,
+            attempt_limit,
+            remaining_ms = remaining.as_millis() as u64,
+            "Volume transfer"
+        );
         let response = request.send().await;
+        crate::klog::debug!(
+            statement_id = log.statement_id,
+            operation = log.operation,
+            phase = "attempt",
+            outcome = if response.is_ok() { "headers" } else { "error" },
+            reason = response
+                .as_ref()
+                .err()
+                .map(transport_reason)
+                .unwrap_or("none"),
+            attempt = u64::from(attempt) + 1,
+            attempt_limit,
+            http_status = response.as_ref().ok().map(|r| r.status().as_u16()),
+            elapsed_ms = attempt_started.elapsed().as_millis() as u64,
+            "Volume transfer"
+        );
         let (retryable, retry_after) = match &response {
             Ok(response) => (
                 strategy.is_retryable_status(
@@ -510,11 +709,40 @@ async fn send_transfer(
             ),
             Err(error) => (strategy.is_retryable_error(error), None),
         };
-        if !retryable || attempt == config.max_retries {
-            return response.map_err(transport_error);
-        }
-        let delay = calculate_backoff(&config, attempt, retry_after);
-        if started.elapsed().saturating_add(delay) >= config.overall_timeout {
+        let delay = if retryable && attempt < config.max_retries {
+            calculate_backoff(&config, attempt, retry_after)
+        } else {
+            std::time::Duration::ZERO
+        };
+        let reason = if !retryable {
+            "not_retryable"
+        } else if attempt == config.max_retries {
+            "attempt_limit"
+        } else if started.elapsed().saturating_add(delay) >= config.overall_timeout {
+            "budget_exhausted"
+        } else {
+            "retryable"
+        };
+        crate::klog::debug!(
+            statement_id = log.statement_id,
+            operation = log.operation,
+            phase = "retry",
+            outcome = if reason == "retryable" {
+                "scheduled"
+            } else {
+                "stop"
+            },
+            reason,
+            attempt = u64::from(attempt) + 1,
+            attempt_limit,
+            remaining_ms = config
+                .overall_timeout
+                .saturating_sub(started.elapsed())
+                .as_millis() as u64,
+            backoff_ms = delay.as_millis() as u64,
+            "Volume transfer"
+        );
+        if reason != "retryable" {
             return response.map_err(transport_error);
         }
         tokio::time::sleep(delay).await;
@@ -572,50 +800,59 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn completes_transfer_once_and_preserves_requested_result() {
-        let server = MockServer::start().await;
-        Mock::given(method("GET"))
-            .and(path("/file"))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"file contents"))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let dir = tempfile::tempdir().unwrap();
-        let local = dir.path().join("download");
-        let batch = instruction(
-            "gEt",
-            &format!("{}/file", server.uri()),
-            local.to_str().unwrap(),
-        );
-        let options = VolumeOptions {
-            paths: Some(vec![dir.path().to_str().unwrap().into()]),
-            retain_result: true,
-            ..Default::default()
-        };
-        let completion = VolumeCompletion::default();
-        let http = client();
-        for _ in 0..2 {
-            let mut execution = result(batch.clone(), true);
-            execution.reader = Box::new(InMemoryReader::new(
-                batch.schema(),
-                vec![
-                    RecordBatch::new_empty(batch.schema()),
-                    batch.clone(),
-                    RecordBatch::new_empty(batch.schema()),
-                ],
-            ));
-            let completed = complete(&http, execution, &options, &completion)
-                .await
-                .unwrap();
-            let mut reader = ResultStream::from_reader(completed.reader).await.unwrap();
-            assert!(reader.next_batch().await.unwrap().is_some());
-            assert!(reader.next_batch().await.unwrap().is_none());
-        }
-        assert_eq!(tokio::fs::read(local).await.unwrap(), b"file contents");
-        let request = server.received_requests().await.unwrap().remove(0);
-        assert!(!request.headers.contains_key("authorization"));
-        assert_eq!(request.headers["x-file-header"], "value");
+    #[test]
+    fn completes_transfer_once_and_preserves_requested_result() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        tokio::task::LocalSet::new().block_on(&runtime, async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/file"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"file contents"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let dir = tempfile::tempdir().unwrap();
+            let local = dir.path().join("download");
+            std::fs::write(&local, b"stale bytes").unwrap();
+            let batch = instruction(
+                "gEt",
+                &format!("{}/file", server.uri()),
+                local.to_str().unwrap(),
+            );
+            let options = VolumeOptions {
+                paths: Some(vec![dir.path().to_str().unwrap().into()]),
+                retain_result: true,
+                ..Default::default()
+            };
+            let completion = VolumeCompletion::default();
+            let http = client();
+            for _ in 0..2 {
+                let mut execution = result(batch.clone(), true);
+                execution.reader = Box::new(InMemoryReader::new(
+                    batch.schema(),
+                    vec![
+                        RecordBatch::new_empty(batch.schema()),
+                        batch.clone(),
+                        RecordBatch::new_empty(batch.schema()),
+                    ],
+                ));
+                let completed = complete(&http, execution, &options, &completion)
+                    .await
+                    .unwrap();
+                let mut reader = ResultStream::from_reader(completed.reader).await.unwrap();
+                assert!(reader.next_batch().await.unwrap().is_some());
+                assert!(reader.next_batch().await.unwrap().is_none());
+            }
+            assert_eq!(tokio::fs::read(&local).await.unwrap(), b"file contents");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            let request = server.received_requests().await.unwrap().remove(0);
+            assert!(!request.headers.contains_key("authorization"));
+            assert_eq!(request.headers["x-file-header"], "value");
+        });
     }
 
     #[tokio::test]
@@ -774,13 +1011,29 @@ mod tests {
             .await;
         let url = format!("{}/redirect", server.uri());
         let strict = DatabricksHttpClient::with_default_retry(HttpClientConfig::default()).unwrap();
-        let error = transfer(&strict, "REMOVE", &url, &HashMap::new(), None, &[])
-            .await
-            .unwrap_err();
+        let error = transfer(
+            "statement",
+            &strict,
+            "REMOVE",
+            &url,
+            &HashMap::new(),
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert!(error.message.contains("URL scheme"));
-        let error = transfer(&client(), "REMOVE", &url, &HashMap::new(), None, &[])
-            .await
-            .unwrap_err();
+        let error = transfer(
+            "statement",
+            &client(),
+            "REMOVE",
+            &url,
+            &HashMap::new(),
+            None,
+            &[],
+        )
+        .await
+        .unwrap_err();
         assert_eq!(error.http_status, Some(307));
     }
 
@@ -832,7 +1085,15 @@ mod tests {
             (permissions.unwrap(), original)
         };
         let (result, (permissions, original)) = tokio::join!(
-            transfer(&http, "GET", &url, &headers, destination.to_str(), &roots),
+            transfer(
+                "statement",
+                &http,
+                "GET",
+                &url,
+                &headers,
+                destination.to_str(),
+                &roots
+            ),
             inspect
         );
         result.unwrap();
@@ -864,6 +1125,7 @@ mod tests {
                     .unwrap();
             }
             transfer(
+                "statement",
                 &client(),
                 "GET",
                 &server.uri(),
@@ -893,6 +1155,7 @@ mod tests {
             .is_err()
         {
             let error = transfer(
+                "statement",
                 &client(),
                 "GET",
                 &server.uri(),
@@ -911,6 +1174,7 @@ mod tests {
         }
         for destination in [Path::new("/"), dir.path()] {
             let error = transfer(
+                "statement",
                 &client(),
                 "GET",
                 &server.uri(),
@@ -949,6 +1213,7 @@ mod tests {
         let local = dir.path().join("input");
         tokio::fs::write(&local, b"upload").await.unwrap();
         transfer(
+            "statement",
             &client(),
             "pUt",
             &format!("http://{address}/file"),
@@ -982,6 +1247,7 @@ mod tests {
             .mount(&server)
             .await;
         transfer(
+            "statement",
             &client(),
             "remove",
             &format!("{}/file", server.uri()),
@@ -1009,6 +1275,7 @@ mod tests {
         let url = format!("{}/file", server.uri());
         let mut upload = tokio::spawn(async move {
             transfer(
+                "statement",
                 &client(),
                 "PUT",
                 &url,
@@ -1060,6 +1327,7 @@ mod tests {
         let file = dir.path().join("input");
         std::fs::write(&file, b"upload").unwrap();
         transfer(
+            "statement",
             &client(),
             "PUT",
             &format!("{}/file", server.uri()),
@@ -1102,6 +1370,7 @@ mod tests {
         let local = directory.path().join("input");
         std::fs::write(&local, b"upload").unwrap();
         let outcome = transfer(
+            "statement",
             &client(),
             "PUT",
             &url,
@@ -1111,7 +1380,9 @@ mod tests {
         )
         .await;
         server.abort();
-        assert!(outcome.is_err());
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code, ErrorCode::NetworkError);
+        assert!(error.message.contains("incomplete_response"), "{error:?}");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
@@ -1183,7 +1454,7 @@ mod tests {
         };
         let mut http = DatabricksHttpClient::new(
             HttpClientConfig::default(),
-            HashMap::from([(RequestCategory::CloudFetch, retry)]),
+            HashMap::from([(RequestCategory::Sea, retry)]),
         )
         .unwrap();
         http.allow_loopback_plaintext_storage = true;
@@ -1305,6 +1576,7 @@ mod tests {
         let outside = dir.path().join("outside");
         for operation in ["PUT", "GET"] {
             let error = transfer(
+                "statement",
                 &client(),
                 operation,
                 "http://127.0.0.1:1/file",
@@ -1357,11 +1629,9 @@ mod tests {
                 max_retries: 0,
                 ..Default::default()
             };
-            let mut http = DatabricksHttpClient::new(
-                config,
-                HashMap::from([(RequestCategory::CloudFetch, retry)]),
-            )
-            .unwrap();
+            let mut http =
+                DatabricksHttpClient::new(config, HashMap::from([(RequestCategory::Sea, retry)]))
+                    .unwrap();
             http.allow_loopback_plaintext_storage = true;
             let dir = tempfile::tempdir().unwrap();
             let file = dir.path().join("download");
@@ -1413,6 +1683,9 @@ mod tests {
 
     #[tokio::test]
     async fn transport_cause_omits_signed_url() {
+        use std::io::Write;
+        use tracing::instrument::WithSubscriber;
+
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         drop(listener);
@@ -1423,13 +1696,84 @@ mod tests {
             .unwrap_err();
         let error = transport_error(error);
         assert!(error.cause.is_some());
+        assert!(error.message.contains("connection_refused"), "{error:?}");
         assert!(!format!("{error:?}").contains("signature"));
         assert!(!format!("{error:?}").contains("secret"));
+
+        struct Capture(Arc<std::sync::Mutex<Vec<u8>>>);
+        impl Write for Capture {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let writer = captured.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter("databricks::sql::kernel=debug")
+            .without_time()
+            .with_ansi(false)
+            .with_writer(move || Capture(writer.clone()))
+            .finish();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "http://{}/remote-sentinel?signature=secret-sentinel",
+            listener.local_addr().unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(b"\r\n\r\n") {
+                request.push(socket.read_u8().await.unwrap());
+            }
+            socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nX-Sentinel: header-sentinel\r\nConnection: close\r\n\r\npart").await.unwrap();
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("local-path-sentinel");
+        std::fs::write(&local, b"original").unwrap();
+        let error = transfer(
+            "statement",
+            &client(),
+            "GET",
+            &url,
+            &HashMap::from([("x-file-header".into(), "header-sentinel".into())]),
+            local.to_str(),
+            &[dir.path().to_str().unwrap().into()],
+        )
+        .with_subscriber(subscriber)
+        .await
+        .unwrap_err();
+        server.await.unwrap();
+        assert_eq!(error.code, ErrorCode::NetworkError);
+        assert!(error.message.contains("unexpected_eof"), "{error:?}");
+        assert_eq!(std::fs::read(local).unwrap(), b"original");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        let logs = String::from_utf8(captured.lock().unwrap().clone()).unwrap();
+        assert!(logs.contains("Volume transfer"));
+        assert!(
+            logs.contains("body_write") && logs.contains("error"),
+            "{logs}"
+        );
+        let diagnostics = format!("{error:?}\n{logs}");
+        for sentinel in [
+            "signature",
+            "secret-sentinel",
+            "remote-sentinel",
+            "header-sentinel",
+            "local-path-sentinel",
+            &url,
+        ] {
+            assert!(!diagnostics.contains(sentinel), "{diagnostics}");
+        }
     }
 
     #[tokio::test]
     async fn rejects_plaintext_storage_host() {
         let error = transfer(
+            "statement",
             &client(),
             "REMOVE",
             "http://storage.example/file?signature=secret",

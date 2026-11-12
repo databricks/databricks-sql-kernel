@@ -60,6 +60,7 @@ arrow-ipc = "59"
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+hyper = { version = "1", default-features = false }
 native-tls = { version = "0.2", optional = true }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 # Enforce TLS dependency minimums for consumers with their own lockfiles.

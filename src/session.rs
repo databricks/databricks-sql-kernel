@@ -1755,6 +1755,12 @@ mod retry_config_tests {
             Duration::from_secs(600),
             "Sea overall_timeout"
         );
+        let client = DatabricksHttpClient::new(HttpClientConfig::default(), configs).unwrap();
+        let volume = client.volume_retry_config();
+        assert_eq!(volume.min_wait, Duration::from_secs(3));
+        assert_eq!(volume.max_wait, Duration::from_secs(90));
+        assert_eq!(volume.max_retries, 7);
+        assert_eq!(volume.overall_timeout, Duration::from_secs(600));
     }
 
     #[test]

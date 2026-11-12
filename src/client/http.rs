@@ -763,9 +763,11 @@ impl DatabricksHttpClient {
         Ok(self.volume_client.get_or_init(|| client))
     }
 
-    pub(crate) fn storage_retry_config(&self) -> RetryConfig {
+    pub(crate) fn volume_retry_config(&self) -> RetryConfig {
+        // Session resolves the normalized global policy into Sea without an override.
+        // CloudFetch has its own outer retry loop and a separate inner policy.
         self.retry_configs
-            .get(&RequestCategory::CloudFetch)
+            .get(&RequestCategory::Sea)
             .cloned()
             .unwrap_or_default()
     }

@@ -36,7 +36,7 @@ pub mod retry;
 pub mod sea;
 pub(crate) mod transport;
 
-fn error_chain<'a>(
+pub(crate) fn error_chain<'a>(
     error: &'a (dyn std::error::Error + 'static),
 ) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
     std::iter::successors(Some(error), |error| {

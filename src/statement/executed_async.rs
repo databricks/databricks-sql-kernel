@@ -222,7 +222,7 @@ pub struct ExecutedAsyncStatement {
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
     pub(crate) volume_options: super::volume::VolumeOptions,
-    volume_completion: Arc<super::volume::VolumeCompletion>,
+    pub(super) volume_completion: Arc<super::volume::VolumeCompletion>,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -280,7 +280,7 @@ impl ExecutedAsyncStatement {
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
-        self.owner_released.store(true, Ordering::Release);
+        self.release_owner();
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
             self.session
                 .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
@@ -434,6 +434,13 @@ impl ExecutedAsyncStatement {
                 .with_query_id(&self.statement_id));
         }
         Ok(())
+    }
+
+    fn release_owner(&self) {
+        if self.owning {
+            self.owner_released.store(true, Ordering::Release);
+            self.volume_completion.cancel();
+        }
     }
 
     fn check_read_validity(&self) -> Result<()> {
@@ -887,7 +894,9 @@ impl ExecutedAsyncStatement {
                     &self.volume_options,
                     &self.volume_completion,
                 )
-                .await?;
+                .await;
+                self.check_read_validity()?;
+                let result = result?;
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
@@ -1084,9 +1093,7 @@ impl ExecutedAsyncStatement {
     }
 
     async fn close_server_statement(&self) -> Result<()> {
-        if self.owning {
-            self.owner_released.store(true, Ordering::Release);
-        }
+        self.release_owner();
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
         //
@@ -1211,9 +1218,7 @@ impl AsyncStatementCanceller {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
-        if self.owning {
-            self.owner_released.store(true, Ordering::Release);
-        }
+        self.release_owner();
         // Ensure submit-and-drop / status-only async statements still
         // emit one terminal telemetry event. Once a result stream has
         // been returned, that stream owns success finalization so it can

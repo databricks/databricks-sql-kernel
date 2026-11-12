@@ -665,6 +665,7 @@ dependencies = [
  "geo-traits",
  "hex",
  "hmac 0.13.0",
+ "hyper",
  "jsonwebtoken",
  "lz4_flex",
  "moka",

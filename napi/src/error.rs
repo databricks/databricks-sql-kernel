@@ -143,6 +143,12 @@ pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
     if let Some(qid) = e.query_id {
         obj.insert("queryId".to_owned(), Value::from(qid));
     }
+    if let Some(os_error) = e.os_error {
+        obj.insert("osErrorCode".to_owned(), Value::from(os_error.code));
+        if let Some(filename) = os_error.filename {
+            obj.insert("osErrorFilename".to_owned(), Value::from(filename));
+        }
+    }
     // Thrift-parity extended status fields: surfaced on the napi
     // envelope so a JS caller's catch-block sees the same fields the
     // Thrift driver's `TGetOperationStatusResp` exposes. Only
@@ -195,6 +201,7 @@ fn error_code_str(code: ErrorCode) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use databricks_sql_kernel::kernel_error::OsError;
 
     #[test]
     fn envelope_carries_sentinel_and_code() {
@@ -333,6 +340,10 @@ mod tests {
         e.http_status = Some(503);
         e.retryable = true;
         e.query_id = Some("01eedeadbeefdeadbeefdeadbeefdead".to_string());
+        e.os_error = Some(Box::new(OsError {
+            code: 13,
+            filename: Some("requested/local-file".to_string()),
+        }));
         // Thrift-parity extension fields: populated too so the
         // superset relation is exercised in the same fixture.
         e.display_message = Some("Statement failed at operator Scan".to_string());
@@ -388,6 +399,8 @@ mod tests {
                 "envelope is missing the Thrift-parity key `{k}`. payload: {payload}"
             );
         }
+        assert_eq!(obj["osErrorCode"], 13);
+        assert_eq!(obj["osErrorFilename"], "requested/local-file");
 
         // Intentionally-omitted fields must NOT leak into the wire
         // shape (the module doc and the kernel `Error` struct both
@@ -404,12 +417,12 @@ mod tests {
 
         // No surprise keys: the wire shape stays the documented set.
         // Exact-size check (not subset) catches accidental additions.
-        let expected_total = pyo3_parity_keys.len() + thrift_parity_keys.len();
+        let expected_total = pyo3_parity_keys.len() + thrift_parity_keys.len() + 2;
         assert_eq!(
             obj.len(),
             expected_total,
             "envelope has unexpected extra keys. expected pyo3 parity \
-             {pyo3_parity_keys:?} + thrift parity {thrift_parity_keys:?}, \
+             {pyo3_parity_keys:?} + thrift parity {thrift_parity_keys:?} + OS details, \
              got: {:?}",
             obj.keys().collect::<Vec<_>>()
         );
@@ -482,6 +495,8 @@ mod tests {
             "httpStatus",
             "retryable",
             "queryId",
+            "osErrorCode",
+            "osErrorFilename",
             // Thrift-parity extension fields also follow the
             // omit-when-None convention.
             "displayMessage",
@@ -496,6 +511,17 @@ mod tests {
         }
         assert!(obj.contains_key("code"));
         assert!(obj.contains_key("message"));
+
+        let mut e = KernelError::invalid_argument().message("hi");
+        e.os_error = Some(Box::new(OsError {
+            code: -2,
+            filename: None,
+        }));
+        let napi_err = napi_err_from_kernel(e);
+        let payload = &napi_err.reason.to_string()[ERROR_SENTINEL.len()..];
+        let v: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(v["osErrorCode"], -2);
+        assert!(!v.as_object().unwrap().contains_key("osErrorFilename"));
     }
 
     #[test]
