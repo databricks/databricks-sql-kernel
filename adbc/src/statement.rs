@@ -1474,6 +1474,68 @@ mod tests {
     use arrow_array::{BinaryArray, Int64Array, LargeBinaryArray, StringArray};
     use arrow_schema::{DataType, Field};
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn volume_paths_option_sets_clears_and_rejects_invalid_values() {
+        use adbc_core::options::OptionDatabase;
+        use adbc_core::{Connection as _, Database as _, Driver as _, Optionable as _};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session", "warehouse_id": "test_wh"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let database = crate::Driver
+            .new_database_with_opts([
+                (OptionDatabase::Uri, server.uri().into()),
+                (
+                    OptionDatabase::Other(crate::config::HTTP_PATH.into()),
+                    "/sql/1.0/warehouses/test_wh".into(),
+                ),
+                (
+                    OptionDatabase::Other(crate::config::ACCESS_TOKEN.into()),
+                    "token".into(),
+                ),
+            ])
+            .unwrap();
+        let mut connection = database.new_connection().unwrap();
+        let mut statement = connection.new_statement().unwrap();
+        let option =
+            OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
+        for (value, expected) in [
+            (r#"["/tmp/files"]"#, Some(vec!["/tmp/files".to_owned()])),
+            ("[]", Some(vec![])),
+            ("null", None),
+        ] {
+            statement.set_option(option.clone(), value.into()).unwrap();
+            assert_eq!(
+                statement
+                    .inner()
+                    .unwrap()
+                    .spec()
+                    .staging_allowed_local_paths,
+                expected
+            );
+        }
+        let error = statement.set_option(option, "{}".into()).unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(
+            statement
+                .inner()
+                .unwrap()
+                .spec()
+                .staging_allowed_local_paths,
+            None
+        );
+    }
+
     fn batch(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),

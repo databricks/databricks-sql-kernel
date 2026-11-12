@@ -46,6 +46,7 @@ pub enum RequestType {
     TelemetryExport,
     // CloudFetch
     CloudFetchDownload,
+    VolumeUpload,
     // Auth
     AuthTokenRequest,
     AuthDiscovery,
@@ -83,7 +84,7 @@ impl RequestType {
 
             Self::TelemetryExport => RequestCategory::Telemetry,
 
-            Self::CloudFetchDownload => RequestCategory::CloudFetch,
+            Self::CloudFetchDownload | Self::VolumeUpload => RequestCategory::CloudFetch,
 
             Self::AuthTokenRequest | Self::AuthDiscovery => RequestCategory::Auth,
         }
@@ -92,7 +93,7 @@ impl RequestType {
     /// Returns the idempotency classification for strategy selection.
     pub fn idempotency(self) -> RequestIdempotency {
         match self {
-            Self::ExecuteStatement => RequestIdempotency::NonIdempotent,
+            Self::ExecuteStatement | Self::VolumeUpload => RequestIdempotency::NonIdempotent,
             _ => RequestIdempotency::Idempotent,
         }
     }
@@ -821,10 +822,17 @@ mod tests {
 
     #[test]
     fn test_request_type_idempotency_mapping() {
-        // Only ExecuteStatement is non-idempotent
         assert_eq!(
             RequestType::ExecuteStatement.idempotency(),
             RequestIdempotency::NonIdempotent
+        );
+        assert_eq!(
+            RequestType::VolumeUpload.idempotency(),
+            RequestIdempotency::NonIdempotent
+        );
+        assert_eq!(
+            RequestType::VolumeUpload.category(),
+            RequestCategory::CloudFetch
         );
 
         // Everything else is idempotent

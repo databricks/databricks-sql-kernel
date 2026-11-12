@@ -129,7 +129,12 @@ async fn next_instruction_batch(stream: &mut ResultStream) -> Result<Option<Reco
 }
 
 fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
-    let invalid = || Error::invalid_state().message("Invalid file transfer headers");
+    let invalid = || {
+        Error::invalid_state().message(format!(
+            "Invalid file transfer headers: {:?}",
+            batch.column(2).data_type()
+        ))
+    };
     let column = batch.column(2);
     if column.is_null(0) {
         return Ok(HashMap::new());
@@ -163,7 +168,8 @@ fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
 }
 
 fn file_error(error: std::io::Error) -> Error {
-    Error::new(
+    let permission_denied = error.kind() == std::io::ErrorKind::PermissionDenied;
+    let error = Error::new(
         match error.kind() {
             std::io::ErrorKind::NotFound => ErrorCode::NotFound,
             std::io::ErrorKind::PermissionDenied => ErrorCode::PermissionDenied,
@@ -173,7 +179,12 @@ fn file_error(error: std::io::Error) -> Error {
             _ => ErrorCode::Unavailable,
         },
         format!("File transfer failed: {error}"),
-    )
+    );
+    if permission_denied {
+        error.with_error_code("FILE_TRANSFER_PERMISSION_ERROR")
+    } else {
+        error
+    }
 }
 
 fn resolved_path(path: &Path) -> Result<PathBuf> {
@@ -244,12 +255,27 @@ async fn transfer(
     } else {
         Some(allowed_path(local_file, paths)?)
     };
-    if operation == "GET"
-        && local
-            .as_ref()
-            .is_some_and(|path| path.parent().is_none() || path.is_dir())
-    {
-        return Err(Error::invalid_argument().message("Download destination must be a file"));
+    if operation == "GET" {
+        let destination = local.as_ref().unwrap();
+        if destination.parent().is_none() {
+            return Err(Error::invalid_argument().message("Download destination must be a file"));
+        }
+        match tokio::fs::metadata(destination).await {
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(
+                    Error::invalid_argument().message("Download destination must be a file")
+                );
+            }
+            Ok(_) => {
+                tokio::fs::OpenOptions::new()
+                    .write(true)
+                    .open(destination)
+                    .await
+                    .map_err(file_error)?;
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(file_error(error)),
+        }
     }
     let response = send_transfer(client, method, parsed, headers, local.as_deref()).await?;
     if !response.status().is_success()
@@ -323,7 +349,12 @@ async fn send_transfer(
     local: Option<&Path>,
 ) -> Result<reqwest::Response> {
     let config = client.storage_retry_config();
-    let strategy = RetryStrategy::for_request(RequestType::CloudFetchDownload, &config);
+    let request_type = if method == Method::PUT {
+        RequestType::VolumeUpload
+    } else {
+        RequestType::CloudFetchDownload
+    };
+    let strategy = RetryStrategy::for_request(request_type, &config);
     let started = std::time::Instant::now();
     for attempt in 0..=config.max_retries {
         let remaining = config.overall_timeout.saturating_sub(started.elapsed());
@@ -497,7 +528,12 @@ mod tests {
             (ErrorKind::TimedOut, ErrorCode::Timeout),
             (ErrorKind::Other, ErrorCode::Unavailable),
         ] {
-            assert_eq!(file_error(std::io::Error::from(kind)).code, code);
+            let error = file_error(std::io::Error::from(kind));
+            assert_eq!(error.code, code);
+            assert_eq!(
+                error.error_code.as_deref(),
+                (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
+            );
         }
     }
 
@@ -572,6 +608,30 @@ mod tests {
                     & 0o777,
                 expected
             );
+        }
+        std::fs::write(&destination, b"protected").unwrap();
+        std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o440)).unwrap();
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)
+            .is_err()
+        {
+            let error = transfer(
+                &client(),
+                "GET",
+                &server.uri(),
+                &HashMap::new(),
+                destination.to_str(),
+                &roots,
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(error.code, ErrorCode::PermissionDenied);
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("FILE_TRANSFER_PERMISSION_ERROR")
+            );
+            assert_eq!(std::fs::read(&destination).unwrap(), b"protected");
         }
         for destination in [Path::new("/"), dir.path()] {
             let error = transfer(
@@ -689,6 +749,7 @@ mod tests {
                 } else {
                     200
                 })
+                .insert_header("Retry-After", "0")
             })
             .expect(2)
             .mount(&server)
@@ -707,6 +768,49 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn does_not_retry_upload_after_response_is_lost() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/file", listener.local_addr().unwrap());
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let observed = Arc::clone(&attempts);
+        let server = tokio::spawn(async move {
+            for attempt in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut received = Vec::new();
+                while !received.ends_with(b"\r\n\r\nupload") {
+                    let mut buffer = [0u8; 1024];
+                    let count = socket.read(&mut buffer).await.unwrap();
+                    assert_ne!(count, 0);
+                    received.extend_from_slice(&buffer[..count]);
+                }
+                observed.fetch_add(1, Ordering::SeqCst);
+                if attempt == 1 {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let directory = tempfile::tempdir().unwrap();
+        let local = directory.path().join("input");
+        std::fs::write(&local, b"upload").unwrap();
+        let outcome = transfer(
+            &client(),
+            "PUT",
+            &url,
+            &HashMap::new(),
+            local.to_str(),
+            &[directory.path().to_str().unwrap().into()],
+        )
+        .await;
+        server.abort();
+        assert!(outcome.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
