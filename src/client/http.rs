@@ -397,7 +397,7 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 #[derive(Debug)]
 pub struct DatabricksHttpClient {
     client: Client,
-    volume_client: OnceLock<Result<Client>>,
+    volume_client: OnceLock<Client>,
     pub(crate) allow_loopback_plaintext_storage: bool,
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
@@ -756,12 +756,11 @@ impl DatabricksHttpClient {
 
     pub(crate) fn volume_client(&self) -> Result<&Client> {
         // Transfer instructions authorize one URL; redirects must not forward their headers.
-        self.volume_client
-            .get_or_init(|| {
-                Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())
-            })
-            .as_ref()
-            .map_err(Clone::clone)
+        if let Some(client) = self.volume_client.get() {
+            return Ok(client);
+        }
+        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        Ok(self.volume_client.get_or_init(|| client))
     }
 
     pub(crate) fn storage_retry_config(&self) -> RetryConfig {
@@ -1614,6 +1613,22 @@ lGrv15pBcePj
         config.tls.trusted_certificate_path = Some(tmp.path().to_string_lossy().to_string());
         let client = DatabricksHttpClient::new(config, default_retry_configs());
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn volume_client_recovers_after_certificate_file_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("ca.pem");
+        std::fs::write(&certificate, TEST_CA_CERT_PEM).unwrap();
+        let mut config = HttpClientConfig::default();
+        config.tls.trusted_certificate_path = Some(certificate.to_string_lossy().into_owned());
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+
+        std::fs::remove_file(&certificate).unwrap();
+        assert!(client.volume_client().is_err());
+        std::fs::write(&certificate, TEST_CA_CERT_PEM).unwrap();
+        let initialized = client.volume_client().unwrap();
+        assert!(std::ptr::eq(initialized, client.volume_client().unwrap()));
     }
 
     #[test]
