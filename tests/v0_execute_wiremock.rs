@@ -1764,6 +1764,58 @@ async fn cloudfetch_disabled_surfaces_other_create_session_errors() {
 }
 
 #[tokio::test]
+async fn cloudfetch_disabled_fallback_failure_reports_both_errors() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .and(body_string_contains("can_cloud_download"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "Invalid session params: [INVALID_CONF_VALUE] The value 'false' in the \
+                        config \"can_cloud_download\" is invalid. SQLSTATE: 22022",
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error_code": "PERMISSION_DENIED",
+            "message": "not allowed",
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let error = match Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .open()
+        .await
+    {
+        Ok(_) => panic!("a failed fallback CreateSession must surface"),
+        Err(error) => error,
+    };
+    assert_eq!(error.http_status, Some(403));
+    assert!(error.message.contains("not allowed"), "{error}");
+    assert!(
+        error.message.contains("retried without can_cloud_download"),
+        "{error}"
+    );
+    assert!(error.message.contains("INVALID_CONF_VALUE"), "{error}");
+}
+
+#[tokio::test]
 async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloading() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;

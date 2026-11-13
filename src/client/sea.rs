@@ -1068,13 +1068,13 @@ impl SeaRestTransport {
 }
 
 /// Whether a CreateSession error is the server rejecting the `can_cloud_download`
-/// session conf (e.g. Reyden: `[INVALID_CONF_VALUE] ... "can_cloud_download"`).
+/// session conf itself (Reyden: `[INVALID_CONF_VALUE] The value 'false' in the
+/// config "can_cloud_download" is invalid`), not merely mentioning it.
 fn rejects_can_cloud_download(error: &Error) -> bool {
+    let message = error.message.to_ascii_lowercase();
     error.http_status == Some(400)
-        && error
-            .message
-            .to_ascii_lowercase()
-            .contains("can_cloud_download")
+        && message.contains("invalid_conf_value")
+        && message.contains("config \"can_cloud_download\"")
 }
 
 /// Convert a parsed `GetChunksResponse` into the kernel-facing
@@ -1199,10 +1199,23 @@ impl Transport for SeaRestTransport {
                     "warehouse rejected can_cloud_download; using INLINE results for this session"
                 );
                 session_config.retain(|key, _| !key.eq_ignore_ascii_case("can_cloud_download"));
-                self.inline_disposition.store(true, Ordering::Relaxed);
-                self.http_client
+                match self
+                    .http_client
                     .execute(build_request(session_config)?, RequestType::CreateSession)
-                    .await?
+                    .await
+                {
+                    Ok(response) => {
+                        self.inline_disposition.store(true, Ordering::Relaxed);
+                        response
+                    }
+                    Err(mut retry_error) => {
+                        retry_error.message = format!(
+                            "{} (CreateSession retried without can_cloud_download after: {})",
+                            retry_error.message, e.message
+                        );
+                        return Err(retry_error);
+                    }
+                }
             }
             Err(e) => return Err(e),
         };
@@ -2485,7 +2498,7 @@ mod tests {
         assert!(rejects_can_cloud_download(&rejection(400, reyden)));
         assert!(rejects_can_cloud_download(&rejection(
             400,
-            "CAN_CLOUD_DOWNLOAD is not supported"
+            r#"[invalid_conf_value] The value 'false' in the config "CAN_CLOUD_DOWNLOAD" is invalid."#
         )));
         for status in [401, 403, 404, 429, 500, 503] {
             assert!(
@@ -2493,10 +2506,17 @@ mod tests {
                 "HTTP {status} must not trigger the INLINE fallback"
             );
         }
-        assert!(!rejects_can_cloud_download(&rejection(
-            400,
-            "[INVALID_CONF_VALUE] TIMEZONE is invalid"
-        )));
+        for other in [
+            r#"[INVALID_CONF_VALUE] The value 'x' in the config "TIMEZONE" is invalid."#,
+            // Mentions the setting, but another conf is the one rejected.
+            r#"[INVALID_CONF_VALUE] The value 'x' in the config "TIMEZONE" is invalid. Params: can_cloud_download=false"#,
+            "can_cloud_download is not supported",
+        ] {
+            assert!(
+                !rejects_can_cloud_download(&rejection(400, other)),
+                "{other}"
+            );
+        }
         let mut no_status = Error::invalid_argument().message(reyden);
         no_status.http_status = None;
         assert!(!rejects_can_cloud_download(&no_status));
