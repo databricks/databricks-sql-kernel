@@ -86,9 +86,16 @@ impl SharedCredentials {
                 return discovery.clone();
             }
         }
+        let Ok(runtime) = RuntimeHandle::try_current() else {
+            // An error for this caller rather than a panic; nothing is stored.
+            return futures::future::ready(Err(Error::invalid_state()
+                .message("OAuth M2M discovery must run inside a tokio runtime")))
+            .boxed()
+            .shared();
+        };
         let host = host.to_owned();
         let http_client = Arc::clone(http_client);
-        let task = tokio::spawn(async move {
+        let task = runtime.spawn(async move {
             let endpoints = OidcEndpoints::discover(&host, &http_client).await?;
             Ok((endpoints.token_endpoint, endpoints.authorization_endpoint))
         });
@@ -1212,6 +1219,29 @@ mod tests {
             3,
             "a failed discovery held by a live entry is retried"
         );
+    }
+
+    #[test]
+    fn discovery_outside_a_runtime_is_an_error_not_a_panic() {
+        let shared = shared_credentials(CredentialsKey {
+            host: "https://example.invalid".to_string(),
+            client_id: "no-runtime".to_string(),
+            secret_sha256: [0; 32],
+            scopes: vec![],
+            token_endpoint_override: None,
+            transport: [0; 32],
+        });
+        let client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                .expect("Failed to create HTTP client"),
+        );
+        let err = shared
+            .endpoints("https://example.invalid", &client)
+            .now_or_never()
+            .expect("ready without a runtime")
+            .unwrap_err();
+        assert!(err.message.contains("tokio runtime"), "{err:?}");
+        assert!(shared.discovery.lock().unwrap().is_none(), "nothing stored");
     }
 
     /// Sessions in the Python binding each own a runtime: an opener that
