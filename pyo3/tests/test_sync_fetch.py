@@ -23,6 +23,7 @@ import os
 import signal
 import threading
 import time
+import types
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import databricks_sql_kernel as k
@@ -164,8 +165,15 @@ def test_worker_thread_fetch_closes_statement_once(server_kwargs, rows):
 
 
 @pytest.mark.skipif(not hasattr(signal, "SIGINT") or os.name == "nt", reason="POSIX signals")
-def test_main_thread_execute_stays_interruptible():
+@pytest.mark.parametrize("greenlet_ident", [False, True], ids=["plain", "greenlet-ident"])
+def test_main_thread_execute_stays_interruptible(monkeypatch, greenlet_ident):
     assert threading.current_thread() is threading.main_thread()
+    if greenlet_ident:
+        # Under gevent/eventlet, get_ident() is a greenlet id that matches no
+        # thread's ident; only the OS-level native id still identifies main.
+        main = threading.main_thread()
+        fake = types.SimpleNamespace(ident=object(), native_id=main.native_id)
+        monkeypatch.setattr(threading, "main_thread", lambda: fake)
     with _server(execute_delay_s=5.0) as (port, _):
         session = _session(port)
         stmt = session.statement()

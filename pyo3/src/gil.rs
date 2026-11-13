@@ -29,16 +29,27 @@ use tokio::runtime::Runtime;
 static THREADING: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 
 /// Whether the calling thread is Python's main thread, the only one that
-/// runs signal handlers. Errs towards `true` so a lookup failure keeps
-/// signal checks on.
+/// runs signal handlers. Errs towards `true` (a wrong `true` only keeps
+/// signal checks on).
+///
+/// Either id may match: `threading` refreshes the main thread's `ident`
+/// after `fork()` but not its `native_id`, while greenlet libraries
+/// (gevent, eventlet) patch `get_ident` but not the OS-level `native_id`.
 pub(crate) fn on_main_thread(py: Python<'_>) -> bool {
     let check = || -> PyResult<bool> {
         let threading = THREADING
             .get_or_try_init(py, || py.import("threading").map(Bound::unbind))?
             .bind(py);
-        let current = threading.call_method0("get_ident")?;
-        let main = threading.call_method0("main_thread")?.getattr("ident")?;
-        current.eq(main)
+        let main = threading.call_method0("main_thread")?;
+        if threading
+            .call_method0("get_ident")?
+            .eq(main.getattr("ident")?)?
+        {
+            return Ok(true);
+        }
+        threading
+            .call_method0("get_native_id")?
+            .eq(main.getattr("native_id")?)
     };
     check().unwrap_or(true)
 }
