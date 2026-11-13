@@ -947,6 +947,7 @@ impl StreamingCloudFetchProvider {
         // A presigned URL cloud storage refused (401/403/404). The next attempt
         // refreshes the link even though it has not expired.
         let mut rejected_url: Option<String> = None;
+        let mut refused_before = false;
 
         loop {
             if ctx.cancel_token.is_cancelled() {
@@ -1139,15 +1140,19 @@ impl StreamingCloudFetchProvider {
                     }
                     // Storage refused the presigned URL itself (an expired or
                     // invalid signature; GCS answers 404 for an expired one), so
-                    // retrying it cannot succeed. Refresh the link instead, without
-                    // sleeping: the failure was charged above.
+                    // retrying it cannot succeed: refresh the link instead. The
+                    // first refusal refreshes at once; if a refreshed URL is refused
+                    // too, fall through to the backoff below before refreshing again.
                     if let Some(status @ (401 | 403 | 404)) = e.http_status {
                         debug!(
                             "Chunk {} download got HTTP {}; refreshing the link before retry",
                             chunk_index, status,
                         );
                         rejected_url = Some(link.url.clone());
-                        continue;
+                        if !refused_before {
+                            refused_before = true;
+                            continue;
+                        }
                     }
                     // Stale-snapshot detection. Two ways a download
                     // can fail against a URL that became stale while
@@ -2142,6 +2147,102 @@ mod tests {
             fetcher.refresh_calls.load(AtomicOrdering::SeqCst),
             expected_refreshes,
             "HTTP {status}: link refreshes",
+        );
+    }
+
+    #[tokio::test]
+    async fn repeatedly_refused_url_backs_off_before_refreshing_again() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+
+        // Storage refuses every URL, including refreshed ones.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        #[derive(Debug)]
+        struct NewUrlFetcher {
+            base: String,
+            refresh_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for NewUrlFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!()
+            }
+
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!()
+            }
+
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                let n = self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+                Ok(vec![CloudFetchLink {
+                    url: format!("{}/chunk-0-{n}.arrow", self.base),
+                    ..create_test_link(0)
+                }])
+            }
+        }
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let fetcher = Arc::new(NewUrlFetcher {
+            base: server.uri(),
+            refresh_calls: AtomicUsize::new(0),
+        });
+        let chunks = Arc::new(DashMap::new());
+        let original = CloudFetchLink {
+            url: format!("{}/chunk-0-0.arrow", server.uri()),
+            ..create_test_link(0)
+        };
+        chunks.insert(0, entry_with_state(original, ChunkState::Downloading));
+        let ctx = DownloadCtx {
+            downloader: Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            )),
+            link_fetcher: fetcher.clone(),
+            chunks,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            cancel_token: CancellationToken::new(),
+            statement_id: None,
+            metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+            max_retries: 3,
+            retry_delay: RETRY_DELAY,
+            download_timeout: std::time::Duration::ZERO,
+        };
+
+        let started = std::time::Instant::now();
+        let error = StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx)
+            .await
+            .expect_err("a URL storage always refuses must fail");
+        assert_eq!(error.http_status, Some(403));
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        assert_eq!(fetcher.refresh_calls.load(AtomicOrdering::SeqCst), 2);
+        // The first refusal refreshes at once; the refused refreshed URL waits one backoff.
+        assert!(
+            started.elapsed() >= RETRY_DELAY,
+            "expected one backoff, took {:?}",
+            started.elapsed()
         );
     }
 
