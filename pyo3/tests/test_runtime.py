@@ -55,12 +55,15 @@ def _server():
             requests.append((self.command, self.path))
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             payload = json.dumps(body).encode()
-            self.send_response(200)
-            self.send_header("Content-Length", str(len(payload)))
-            for name, value in headers:
-                self.send_header(name, value)
-            self.end_headers()
-            self.wfile.write(payload)
+            try:
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(payload)))
+                for name, value in headers:
+                    self.send_header(name, value)
+                self.end_headers()
+                self.wfile.write(payload)
+            except (BrokenPipeError, ConnectionResetError):
+                pass  # The client went away (e.g. a pooled connection was dropped).
 
         def do_POST(self):
             if self.path == SESSIONS:

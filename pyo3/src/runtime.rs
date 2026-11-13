@@ -16,12 +16,24 @@
 
 use pyo3::prelude::*;
 use std::ops::Deref;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::runtime::{Builder, Runtime};
 
+type Slot = Option<(u32, Arc<KernelRuntime>)>;
+
 /// The process-wide runtime, tagged with the pid that built it.
-static SHARED: Mutex<Option<(u32, Arc<KernelRuntime>)>> = Mutex::new(None);
+static SHARED: Mutex<Slot> = Mutex::new(None);
+
+fn lock_slot() -> MutexGuard<'static, Slot> {
+    SHARED.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn installed(slot: &Slot, pid: u32) -> Option<Arc<KernelRuntime>> {
+    slot.as_ref()
+        .filter(|(owner, _)| *owner == pid)
+        .map(|(_, runtime)| runtime.clone())
+}
 
 /// Runtime shared by every `Session` in the process.
 ///
@@ -33,24 +45,30 @@ static SHARED: Mutex<Option<(u32, Arc<KernelRuntime>)>> = Mutex::new(None);
 /// Worker threads don't survive `fork()`, so a child process builds its
 /// own runtime. The parent's is leaked rather than dropped, because
 /// dropping it would wait on threads that don't exist in the child.
+///
+/// The lock is never held while building: a `fork()` taken while it is
+/// held would leave it locked forever in the child.
 pub(crate) fn shared() -> std::io::Result<Arc<KernelRuntime>> {
     let pid = std::process::id();
-    let mut slot = SHARED.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((owner, runtime)) = slot.as_ref() {
-        if *owner == pid {
-            return Ok(runtime.clone());
-        }
+    if let Some(runtime) = installed(&lock_slot(), pid) {
+        return Ok(runtime);
     }
-    let runtime = Arc::new(KernelRuntime::new(
+    let built = Arc::new(KernelRuntime::new(
         Builder::new_multi_thread()
             .enable_all()
             .thread_name("dbx-sql-kernel")
             .build()?,
     ));
-    if let Some((_, inherited)) = slot.replace((pid, runtime.clone())) {
+    let mut slot = lock_slot();
+    // Another thread may have installed one meanwhile; ours, still idle,
+    // is dropped after the lock is released.
+    if let Some(runtime) = installed(&slot, pid) {
+        return Ok(runtime);
+    }
+    if let Some((_, inherited)) = slot.replace((pid, built.clone())) {
         std::mem::forget(inherited);
     }
-    Ok(runtime)
+    Ok(built)
 }
 
 /// Upper bound on how long an explicit `close()` waits for the runtime to
