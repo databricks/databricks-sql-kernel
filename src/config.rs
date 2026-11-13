@@ -1387,7 +1387,9 @@ pub struct TelemetryConfig {
     /// Maximum number of HTTP retries for telemetry export.
     pub max_retries: u32,
 
-    /// Fixed retry delay between telemetry export attempts.
+    /// Minimum delay between telemetry export attempts. The delay doubles per
+    /// attempt and a server `Retry-After` is honored; both are capped by
+    /// `close_flush_timeout`, which also bounds the total retry time.
     pub retry_delay: Duration,
 
     /// Maximum time an explicit session close should wait for the final

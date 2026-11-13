@@ -1208,11 +1208,20 @@ fn build_retry_configs_for_session(
             ..Default::default()
         },
     );
+    // Telemetry exports run in the background, so a rate-limited export can
+    // wait out the server's Retry-After (or a doubling backoff) instead of
+    // retrying inside the throttle window and dropping the batch. The
+    // overall budget still bounds the total wait at close_flush_timeout.
     overrides.insert(
         RequestCategory::Telemetry,
         RetryConfigOverrides {
             min_wait: Some(config.telemetry.retry_delay),
-            max_wait: Some(config.telemetry.retry_delay),
+            max_wait: Some(
+                config
+                    .telemetry
+                    .close_flush_timeout
+                    .max(config.telemetry.retry_delay),
+            ),
             overall_timeout: Some(config.telemetry.close_flush_timeout),
             max_retries: Some(config.telemetry.max_retries),
             ..Default::default()
@@ -1835,9 +1844,27 @@ mod retry_config_tests {
         let telemetry = &configs[&RequestCategory::Telemetry];
 
         assert_eq!(telemetry.min_wait, Duration::from_millis(50));
-        assert_eq!(telemetry.max_wait, Duration::from_millis(50));
+        assert_eq!(telemetry.max_wait, Duration::from_secs(7));
         assert_eq!(telemetry.max_retries, 2);
         assert_eq!(telemetry.overall_timeout, Duration::from_secs(7));
+    }
+
+    #[test]
+    fn telemetry_retry_honors_retry_after_within_flush_budget() {
+        let configs =
+            build_retry_configs_for_session(&config_with_telemetry(TelemetryConfig::default()));
+        let telemetry = &configs[&RequestCategory::Telemetry];
+
+        // A throttled export waits out Retry-After (plus 5-25% jitter)
+        // instead of the 100 ms retry floor.
+        let wait = crate::client::retry::calculate_backoff(telemetry, 1, Some("1"));
+        assert!(wait >= Duration::from_secs(1), "{wait:?}");
+        assert!(wait <= Duration::from_millis(1250), "{wait:?}");
+
+        // Without Retry-After the floor doubles per attempt.
+        let wait = crate::client::retry::calculate_backoff(telemetry, 1, None);
+        assert!(wait >= Duration::from_millis(200), "{wait:?}");
+        assert!(wait <= Duration::from_millis(300), "{wait:?}");
     }
 
     #[test]

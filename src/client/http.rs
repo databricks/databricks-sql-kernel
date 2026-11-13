@@ -36,6 +36,18 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+/// Log a retry. Telemetry export is fail-open background work, so its
+/// retries (e.g. a throttled `/telemetry-ext`) log at debug, not warn.
+macro_rules! retry_log {
+    ($request_type:expr, $($arg:tt)*) => {
+        if $request_type.category() == RequestCategory::Telemetry {
+            debug!($($arg)*)
+        } else {
+            warn!($($arg)*)
+        }
+    };
+}
+
 /// Build an `Error` for a transport-level non-2xx HTTP response, parsing
 /// the SEA error envelope out of the response body when present.
 ///
@@ -988,7 +1000,8 @@ impl DatabricksHttpClient {
                             ));
                         }
 
-                        warn!(
+                        retry_log!(
+                            request_type,
                             "{:?}: HTTP {} (attempt {}/{}), waiting {:.1}s before retry",
                             request_type,
                             status.as_u16(),
@@ -1040,7 +1053,8 @@ impl DatabricksHttpClient {
                             )));
                         }
 
-                        warn!(
+                        retry_log!(
+                            request_type,
                             "{:?}: error (attempt {}/{}): {}, waiting {:.1}s before retry",
                             request_type,
                             attempts,
