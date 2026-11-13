@@ -250,6 +250,14 @@ impl TokenStore {
                 refreshing: self.refreshing.clone(),
             };
 
+            // Another caller may have refreshed between this caller's read and
+            // the CAS. The store serves every session with these credentials,
+            // so a second token request here would be one for all of them.
+            let current = self.token.read().ok().and_then(|t| t.clone());
+            if let Some(t) = current.filter(|t| !t.is_expired()) {
+                return Ok(t);
+            }
+
             // We won the race: perform the refresh
             let result = refresh_fn();
             *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
@@ -372,12 +380,13 @@ impl TokenStore {
 /// causes: dropped or panicked (`Cancelled`) or a transport failure, with no
 /// response from the server. A server's answer (a 429 or 401, or a 5xx after
 /// retries) carries its HTTP status and is shared with waiters as is.
+///
+/// A real outage (DNS failure, connection refused) is also a `NetworkError`;
+/// waiters then see it after one more retry ladder (one waiter runs it, the
+/// rest wait on that), never more. `Timeout` is excluded: a closing runtime
+/// doesn't produce it, and a hung endpoint makes for the longest ladder.
 fn cut_short(e: &Error) -> bool {
-    e.http_status.is_none()
-        && matches!(
-            e.code,
-            ErrorCode::Cancelled | ErrorCode::NetworkError | ErrorCode::Timeout
-        )
+    e.http_status.is_none() && matches!(e.code, ErrorCode::Cancelled | ErrorCode::NetworkError)
 }
 
 /// Internal enum representing the token's current state.
@@ -673,6 +682,50 @@ mod tests {
         let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
         let err = wait_on_failed_refresh_with(expired, http_429()).unwrap_err();
         assert_eq!(err.http_status, Some(429), "{err:?}");
+    }
+
+    #[test]
+    fn test_store_waiters_get_a_timeout_as_is() {
+        // A hung endpoint isn't retried by the waiters too.
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        let error = Error::timeout().message("overall timeout");
+        let err = wait_on_failed_refresh_with(expired, error).unwrap_err();
+        assert_eq!(err.code, ErrorCode::Timeout, "{err:?}");
+    }
+
+    #[test]
+    fn test_store_waiter_retries_a_network_error_only_once() {
+        let store = Arc::new(TokenStore::new());
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        *store.token.write().unwrap() = Some(expired);
+        store.refreshing.store(true, Ordering::SeqCst);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (s, c) = (store.clone(), calls.clone());
+        let waiter = std::thread::spawn(move || {
+            s.get_or_refresh(move || {
+                c.fetch_add(1, Ordering::SeqCst);
+                Err(Error::network_error().message("connection refused"))
+            })
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        *store.last_error.lock().unwrap() = Some(Error::network_error().message("down"));
+        store.refreshing.store(false, Ordering::SeqCst);
+        let err = waiter.join().unwrap().unwrap_err();
+        assert_eq!(err.code, ErrorCode::NetworkError, "{err:?}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn test_store_caller_reaching_the_cas_after_a_refresh_uses_its_token() {
+        // This caller saw the token expired, but another refresh finished
+        // before it won the CAS: no second token request.
+        let store = TokenStore::new();
+        *store.token.write().unwrap() = Some(create_token_with_ttl(3600));
+        let token = store
+            .blocking_refresh(|| unreachable!("the store already holds a fresh token"))
+            .expect("token");
+        assert_eq!(token.access_token, "token-3600");
+        assert!(!store.refreshing.load(Ordering::SeqCst));
     }
 
     #[tokio::test(flavor = "multi_thread")]
