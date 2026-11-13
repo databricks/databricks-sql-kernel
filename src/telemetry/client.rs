@@ -228,9 +228,10 @@ impl TelemetryClient {
                 *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default();
                 true
             }
+            // Re-queue first, so whoever sees the throttle also sees the batch.
             Err(TelemetryExportError::Throttled(_)) if requeue_if_throttled => {
-                self.back_off();
                 self.requeue(batch);
+                self.back_off();
                 false
             }
             Err(_) => false,
