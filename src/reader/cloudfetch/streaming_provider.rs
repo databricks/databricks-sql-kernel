@@ -3244,6 +3244,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_waiter_does_not_take_a_rejected_link_as_fresh() {
+        // Chunk 0's link has not expired, but storage rejected its URL. Another
+        // task holds the refresh claim and finishes without touching chunk 0, so
+        // the waiter must still issue its own refresh instead of skipping it.
+        let rejected = create_test_link(0);
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(
+            0,
+            entry_with_state(rejected.clone(), ChunkState::Downloading),
+        );
+        let mock = RefreshCountingMock::new(1);
+        let coordinator = Arc::new(RefreshCoordinator::default());
+        coordinator.in_progress.store(true, Ordering::Release);
+
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+        let (task_chunks, task_coordinator) = (Arc::clone(&chunks), Arc::clone(&coordinator));
+        let rejected_url = rejected.url.clone();
+        let waiter = tokio::spawn(async move {
+            StreamingCloudFetchProvider::refresh_links_batch_replacing(
+                0,
+                Some(&rejected_url),
+                &fetcher,
+                &task_chunks,
+                &task_coordinator,
+                &CancellationToken::new(),
+                None,
+            )
+            .await
+        });
+        // On the single-threaded test runtime this sleep lets the waiter park on `done`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the waiter must wait for the other refresh"
+        );
+        coordinator.in_progress.store(false, Ordering::Release);
+        coordinator.done.notify_waiters();
+
+        waiter.await.unwrap().unwrap();
+        assert_eq!(mock.refresh_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_ne!(
+            chunks.get(&0).unwrap().link.as_ref().unwrap().url,
+            rejected.url,
+            "the rejected URL must be replaced"
+        );
+    }
+
+    #[tokio::test]
     async fn refresh_batch_disjoint_window_loser_retries_claim() {
         // Loser-of-claim disjoint-window gap (round-3 follow-up):
         // when Task A wins the CAS and refreshes a window that
