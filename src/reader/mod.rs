@@ -1975,9 +1975,9 @@ mod tests {
         ) -> Result<crate::client::DirectOutcome> {
             unreachable!()
         }
-        async fn fetch_completed_result(
+        async fn completed_result(
             &self,
-            _: &str,
+            _: ExecuteResponse,
             _: crate::client::SessionAttribution,
         ) -> Result<Option<ExecuteResult>> {
             unreachable!()

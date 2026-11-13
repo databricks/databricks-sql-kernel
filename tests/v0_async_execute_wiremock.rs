@@ -484,6 +484,18 @@ async fn await_result_polls_until_succeeded() {
             .value(0),
         42
     );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-poll"
+            })
+            .count(),
+        2,
+        "materialisation must use the final poll response"
+    );
 }
 
 #[tokio::test]
@@ -1243,7 +1255,7 @@ async fn async_status_call_refreshes_cached_status() {
 
     // A status() poll returns SUCCEEDED with extended fields. The
     // status() call itself must overwrite the cached snapshot.
-    let batch = int64_batch("n", vec![1]);
+    let batch = int64_batch("n", vec![11, 22]);
     mount_status_sequence(
         &server,
         "stmt-async-refresh",
@@ -1252,8 +1264,8 @@ async fn async_status_call_refreshes_cached_status() {
             &batch,
             Some(99),
             Some("Refreshed via status()"),
-            None,
-            None,
+            Some("operator=Update"),
+            Some(r#"{"detail":"refreshed"}"#),
         )],
     )
     .await;
@@ -1282,6 +1294,62 @@ async fn async_status_call_refreshes_cached_status() {
     assert_eq!(
         async_exec.display_message().as_deref(),
         Some("Refreshed via status()")
+    );
+    assert_eq!(
+        async_exec.diagnostic_info().as_deref(),
+        Some("operator=Update")
+    );
+    assert_eq!(
+        async_exec.error_details_json().as_deref(),
+        Some(r#"{"detail":"refreshed"}"#)
+    );
+
+    let mut stream = async_exec.await_result().await.expect("await_result");
+    let schema = stream.schema();
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(schema.field(0).name(), "n");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        schema.field(0).is_nullable(),
+        batch.schema().field(0).is_nullable()
+    );
+    let batches = drain(&mut stream).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .values()
+            .as_ref(),
+        &[11_i64, 22]
+    );
+    assert_eq!(async_exec.num_modified_rows(), Some(99));
+    assert_eq!(
+        async_exec.display_message().as_deref(),
+        Some("Refreshed via status()")
+    );
+    assert_eq!(
+        async_exec.diagnostic_info().as_deref(),
+        Some("operator=Update")
+    );
+    assert_eq!(
+        async_exec.error_details_json().as_deref(),
+        Some(r#"{"detail":"refreshed"}"#)
+    );
+    let status_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "GET"
+                && request.url.path() == "/api/2.0/sql/statements/stmt-async-refresh"
+        })
+        .count();
+    assert_eq!(
+        status_requests, 1,
+        "owner await must consume its observed response"
     );
 
     async_exec.close().await.expect("close");
@@ -1481,7 +1549,7 @@ async fn async_readers_preserve_session_routes() {
         Mock::given(method("GET"))
             .and(path(format!("{session_prefix}/statements/stmt-result")))
             .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(7)
+            .expect(4)
             .mount(&server)
             .await;
         let chunk_mock = Mock::given(method("GET")).and(path(format!(
@@ -1807,7 +1875,7 @@ async fn attached_statement_inline_reads_use_standard_urls() {
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/stmt-attach"))
             .respond_with(ResponseTemplate::new(200).set_body_json(status))
-            .expect(3)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2165,8 +2233,8 @@ async fn await_result_closed_status_skips_close_statement() {
 
     let batch = int64_batch("n", vec![7]);
     mount_submit(&server, pending_body("stmt-async-closed")).await;
-    // await_result polls RUNNING → CLOSED (with inline results). The final
-    // CLOSED body is also served to materialise_result's own status GET.
+    // await_result polls RUNNING → CLOSED with inline results. An independent
+    // reader can still fetch the same CLOSED result.
     mount_status_sequence(
         &server,
         "stmt-async-closed",
@@ -2231,16 +2299,23 @@ async fn await_result_succeeded_status_still_closes_statement() {
     mount_delete_session(&server).await;
 
     let batch = int64_batch("n", vec![7]);
-    mount_submit(&server, pending_body("stmt-async-succ")).await;
-    mount_status_sequence(
-        &server,
-        "stmt-async-succ",
-        vec![
-            running_body("stmt-async-succ"),
-            succeeded_inline_body("stmt-async-succ", &batch),
-        ],
-    )
-    .await;
+    let submit = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("stmt-async-succ")))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-async-succ"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_body("stmt-async-succ", &batch)),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_status_not_found(&server, "stmt-async-succ").await;
 
     // Scoped expectation: exactly one DELETE on the statement endpoint.
     let _close = Mock::given(method("DELETE"))
@@ -2255,10 +2330,18 @@ async fn await_result_succeeded_status_still_closes_statement() {
         let mut stmt = session.statement();
         stmt.spec().sql("SELECT 7 AS n");
         let async_exec = stmt.submit().await.expect("submit");
-        let mut stream = async_exec.await_result().await.expect("await_result");
-        let _ = drain(&mut stream).await;
+        assert!(matches!(
+            async_exec.status().await.unwrap(),
+            StatementStatus::Succeeded
+        ));
         async_exec.close().await.expect("close");
-        // async_exec drops here — the close guard must fire the DELETE.
+        let error = async_exec
+            .await_result()
+            .await
+            .err()
+            .expect("fresh status after close");
+        assert_eq!(error.code, ErrorCode::NotFound);
+        // Drop must not repeat the explicit close.
     }
 
     let closes = wait_for_close_delete(
@@ -2273,4 +2356,80 @@ async fn await_result_succeeded_status_still_closes_statement() {
         "SUCCEEDED status must trigger exactly one CloseStatement"
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-async-succ"
+            })
+            .count(),
+        2
+    );
+    drop(submit);
+
+    // A status reply arriving after owner release must not backfill reusable rows.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&started);
+    let late_body = succeeded_inline_body("stmt-late-status", &batch);
+    mount_submit(&server, pending_body("stmt-late-status")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-late-status"))
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_string(late_body.clone())
+                .set_delay(std::time::Duration::from_secs(1))
+        })
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_status_not_found(&server, "stmt-late-status").await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-late-status"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut late_statement = session.statement();
+    late_statement.spec().sql("SELECT 7 AS n");
+    let late = late_statement.submit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let status = late.status();
+        tokio::pin!(status);
+        tokio::select! {
+            result = &mut status => panic!("status completed before request notification: {result:?}"),
+            _ = started.notified() => {}
+        }
+        ExecutedStatementHandle::close(&late).await.unwrap();
+        assert!(futures::poll!(&mut status).is_pending(), "status must complete after close returns");
+        assert!(matches!(status.await.unwrap(), StatementStatus::Succeeded));
+        let error = late.await_result().await.err().expect("late reply must not survive close");
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }).await.expect("bounded late status reply");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-late-status"
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "DELETE"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-late-status"
+            })
+            .count(),
+        1
+    );
 }
