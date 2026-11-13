@@ -171,8 +171,13 @@ impl TelemetryClient {
         self.flush_bounded().await;
         // The final flush stops at its first failed post; say what it left.
         let abandoned = self.drain_pending(usize::MAX).len();
-        if abandoned > 0 {
-            tracing::debug!(abandoned, "telemetry client closed with undelivered events");
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        if abandoned > 0 || dropped > 0 {
+            tracing::debug!(
+                abandoned,
+                dropped,
+                "telemetry client closed with undelivered events"
+            );
         }
         self.state.store(STATE_CLOSED, Ordering::Release);
     }
@@ -196,12 +201,16 @@ impl TelemetryClient {
     }
 
     /// Session-release and close flush. Sends everything queued without
-    /// waiting out a backoff. While the client stays in use a throttled batch
-    /// is kept; once it is closing, it is dropped as before.
+    /// waiting out a backoff. While the client stays in use and is throttled,
+    /// the queue is left for the background flush after the backoff; once it
+    /// is closing, one attempt is made and a throttled batch is dropped.
     async fn flush_once_wait(self: &Arc<Self>) {
         let _guard = self.flush_lock.lock().await;
-        let requeue_if_throttled = self.state.load(Ordering::Acquire) == STATE_ACTIVE;
-        while self.export_once(requeue_if_throttled).await {}
+        let active = self.state.load(Ordering::Acquire) == STATE_ACTIVE;
+        if active && self.throttled() {
+            return;
+        }
+        while self.export_once(active).await {}
     }
 
     /// Export the oldest queued events in one request. Returns whether a
@@ -530,16 +539,38 @@ mod tests {
         client.enqueue(sample_log("one"));
         wait_until(|| client.throttled()).await;
 
-        // The flush run when a host's last session closes ignores the backoff,
-        // but the client stays in use, so a throttled batch is kept.
+        // The flush run when a host's last session closes doesn't post into an
+        // active throttle; the client stays in use, so the batch stays queued
+        // for the background flush and the backoff is not extended.
         client.flush_bounded().await;
 
-        assert_eq!(exporter.ids(), [vec!["one"], vec!["one"]]);
+        assert_eq!(exporter.ids(), [vec!["one"]]);
         assert_eq!(client.pending.lock().unwrap().len(), 1);
         assert_eq!(
             client.throttle.lock().unwrap().backoff,
-            INITIAL_THROTTLE_BACKOFF * 2
+            INITIAL_THROTTLE_BACKOFF
         );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn session_release_flush_requeues_when_it_gets_throttled() {
+        let exporter = ThrottlingExporter::new(1);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 100,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+        client.enqueue(sample_log("one"));
+
+        client.flush_bounded().await;
+
+        assert_eq!(exporter.ids(), [vec!["one"]]);
+        assert_eq!(client.pending.lock().unwrap().len(), 1);
+        assert!(client.throttled());
         client.close().await;
     }
 
