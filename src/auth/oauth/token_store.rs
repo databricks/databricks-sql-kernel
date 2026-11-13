@@ -50,6 +50,32 @@ impl Drop for RefreshGuard {
     }
 }
 
+/// A claimed background refresh. Tokio drops a blocking closure unrun when its
+/// runtime is shutting down; dropping this unfinished records a failed
+/// background refresh, so waiters refresh themselves instead of spinning.
+struct BackgroundRefresh {
+    last_error: Arc<Mutex<Option<(Error, bool)>>>,
+    finished: bool,
+    // Declared last: clears the flag after `drop` has recorded the error.
+    _guard: RefreshGuard,
+}
+
+impl BackgroundRefresh {
+    fn finish(mut self, error: Option<Error>) {
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = error.map(|e| (e, true));
+        self.finished = true;
+    }
+}
+
+impl Drop for BackgroundRefresh {
+    fn drop(&mut self) {
+        if !self.finished {
+            let error = Error::cancelled().message("background token refresh did not finish");
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some((error, true));
+        }
+    }
+}
+
 /// Thread-safe token container with refresh state machine.
 ///
 /// The `TokenStore` manages the lifecycle of an OAuth token, coordinating
@@ -273,30 +299,29 @@ impl TokenStore {
         {
             // Clone Arc pointers to move into the task
             let token = self.token.clone();
-            let refreshing = self.refreshing.clone();
-            let last_error = self.last_error.clone();
+            // Built before the spawn so that a closure tokio never runs, or a
+            // refresh_fn that panics, still clears `refreshing`.
+            let refresh = BackgroundRefresh {
+                last_error: self.last_error.clone(),
+                finished: false,
+                _guard: RefreshGuard {
+                    refreshing: self.refreshing.clone(),
+                },
+            };
 
             // Spawn on tokio's blocking thread pool (reuses threads, cheaper than std::thread::spawn)
             tokio::task::spawn_blocking(move || {
-                // Guard ensures refreshing is reset even if refresh_fn panics
-                let _guard = RefreshGuard {
-                    refreshing: refreshing.clone(),
-                };
-
-                let result = refresh_fn();
                 // Not returned to anyone here, but a blocking caller that lost
                 // the race to this refresh waits on it and reads the outcome.
-                *last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                    result.as_ref().err().map(|e| (e.clone(), true));
-
-                // Store the new token if successful
-                if let Ok(new_token) = result {
-                    if let Ok(mut token_guard) = token.write() {
-                        *token_guard = Some(new_token);
+                match refresh_fn() {
+                    Ok(new_token) => {
+                        if let Ok(mut token_guard) = token.write() {
+                            *token_guard = Some(new_token);
+                        }
+                        refresh.finish(None);
                     }
+                    Err(e) => refresh.finish(Some(e)),
                 }
-
-                // _guard drops here, resetting refreshing to false
             });
         }
         // If another task is already refreshing, do nothing
@@ -619,6 +644,57 @@ mod tests {
         }
         let recorded = store.last_error.lock().unwrap().clone();
         assert!(matches!(recorded, Some((_, true))), "{recorded:?}");
+    }
+
+    #[test]
+    fn test_store_background_refresh_dropped_by_a_shut_down_runtime_clears_the_flag() {
+        // Each Python session owns its runtime, so the session that started
+        // the refresh may already be gone; tokio then drops the closure unrun.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .unwrap();
+        let handle = runtime.handle().clone();
+        runtime.shutdown_background();
+        let store = TokenStore::new();
+        let stale = create_token_with_expiry(Utc::now() + Duration::seconds(600), 1200);
+        *store.token.write().unwrap() = Some(stale);
+        {
+            let _entered = handle.enter();
+            store
+                .get_or_refresh(|| unreachable!("the runtime has shut down"))
+                .expect("stale token is returned");
+        }
+        assert!(!store.refreshing.load(Ordering::SeqCst), "flag left set");
+        let recorded = store.last_error.lock().unwrap().clone();
+        assert!(matches!(recorded, Some((_, true))), "{recorded:?}");
+    }
+
+    #[test]
+    fn test_store_waiter_refreshes_itself_when_a_background_refresh_never_finishes() {
+        let store = Arc::new(TokenStore::new());
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        *store.token.write().unwrap() = Some(expired);
+        store.refreshing.store(true, Ordering::SeqCst);
+        let refresh = BackgroundRefresh {
+            last_error: store.last_error.clone(),
+            finished: false,
+            _guard: RefreshGuard {
+                refreshing: store.refreshing.clone(),
+            },
+        };
+        let (tx, rx) = std::sync::mpsc::channel();
+        let s = store.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(s.get_or_refresh(|| Ok(create_token_with_ttl(3600))));
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drop(refresh);
+        let token = rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("waiter returned")
+            .expect("own refresh");
+        assert_eq!(token.access_token, "token-3600");
     }
 
     #[test]
