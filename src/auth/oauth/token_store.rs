@@ -121,6 +121,10 @@ pub(crate) struct TokenStore {
     /// Error from the last refresh if it failed, handed to the callers that
     /// waited on it.
     last_error: Arc<Mutex<Option<Error>>>,
+    /// Callers that entered `wait_for_refresh`, so tests release a refresh
+    /// only once a waiter is waiting on it.
+    #[cfg(test)]
+    waiters: std::sync::atomic::AtomicUsize,
 }
 
 impl TokenStore {
@@ -130,6 +134,8 @@ impl TokenStore {
             token: Arc::new(RwLock::new(None)),
             refreshing: Arc::new(AtomicBool::new(false)),
             last_error: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            waiters: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -349,6 +355,8 @@ impl TokenStore {
     /// Also returns whether the refresh it waited on failed without the
     /// server's answer (see [`cut_short`]).
     fn wait_for_refresh(&self) -> (Result<OAuthToken>, bool) {
+        #[cfg(test)]
+        self.waiters.fetch_add(1, Ordering::SeqCst);
         // Poll until the refresh completes, sleeping to avoid busy-waiting
         while self.refreshing.load(Ordering::SeqCst) {
             std::thread::sleep(std::time::Duration::from_millis(1));
@@ -613,6 +621,18 @@ mod tests {
         assert!(err_msg.contains("network error"));
     }
 
+    /// Blocks until `n` callers are in `wait_for_refresh`.
+    fn wait_for_waiters(store: &TokenStore, n: usize) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while store.waiters.load(Ordering::SeqCst) < n {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "no caller started waiting"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
     /// A caller waits on a refresh that is already running (`refreshing` set
     /// by hand) and then fails with `error`. The waiter's own refresh returns
     /// a fresh token.
@@ -623,7 +643,7 @@ mod tests {
         let s = store.clone();
         let waiter =
             std::thread::spawn(move || s.get_or_refresh(|| Ok(create_token_with_ttl(3600))));
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        wait_for_waiters(&store, 1);
         *store.last_error.lock().unwrap() = Some(error);
         store.refreshing.store(false, Ordering::SeqCst);
         waiter.join().unwrap()
@@ -733,7 +753,7 @@ mod tests {
                 Err(Error::network_error().message("connection refused"))
             })
         });
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        wait_for_waiters(&store, 1);
         *store.last_error.lock().unwrap() = Some(Error::network_error().message("down"));
         store.refreshing.store(false, Ordering::SeqCst);
         let err = waiter.join().unwrap().unwrap_err();
@@ -811,7 +831,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = tx.send(s.get_or_refresh(|| Ok(create_token_with_ttl(3600))));
         });
-        std::thread::sleep(std::time::Duration::from_millis(20));
+        wait_for_waiters(&store, 1);
         drop(refresh);
         let token = rx
             .recv_timeout(std::time::Duration::from_secs(10))
