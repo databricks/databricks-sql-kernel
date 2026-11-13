@@ -15,6 +15,7 @@
 use super::exporter::{export_batch, TelemetryExportError, TelemetryExporter};
 use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -32,12 +33,13 @@ const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_secs(1);
 #[cfg(test)]
 const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_THROTTLE_BACKOFF: Duration = Duration::from_secs(30);
-/// Events kept while throttled (at least one batch); past this the oldest are
-/// dropped. Sized for several seconds of backoff at ~1k events/s (~14 MB).
+/// Most events queued (at least one batch); past this the oldest are dropped.
+/// Only reached while throttled. Sized for several seconds of backoff at ~1k
+/// events/s (~14 MB).
 #[cfg(not(test))]
 const MAX_PENDING_EVENTS: usize = 10_000;
 #[cfg(test)]
-const MAX_PENDING_EVENTS: usize = 20;
+const MAX_PENDING_EVENTS: usize = 200;
 /// Most events per POST (at least one batch), so a backlog left by throttling
 /// goes out in bounded requests (~1.4 MB) rather than one large one.
 #[cfg(not(test))]
@@ -50,8 +52,10 @@ pub(super) struct TelemetryClient {
     batch_size: usize,
     flush_interval: Duration,
     close_flush_timeout: Duration,
-    pending: Mutex<Vec<TelemetryFrontendLog>>,
+    pending: Mutex<VecDeque<TelemetryFrontendLog>>,
     queue_count: AtomicUsize,
+    /// Events dropped because the queue was full, not yet logged.
+    dropped: AtomicUsize,
     flush_lock: tokio::sync::Mutex<()>,
     throttle: Mutex<Throttle>,
     state: AtomicU8,
@@ -63,6 +67,22 @@ pub(super) struct TelemetryClient {
 struct Throttle {
     until: Option<Instant>,
     backoff: Duration,
+}
+
+/// A drained batch whose export is in flight; still non-empty when dropped
+/// (export throttled or cancelled), it goes back to the queue.
+struct InFlight<'a> {
+    client: &'a TelemetryClient,
+    batch: Vec<TelemetryFrontendLog>,
+    requeue_on_drop: bool,
+}
+
+impl Drop for InFlight<'_> {
+    fn drop(&mut self) {
+        if self.requeue_on_drop && !self.batch.is_empty() {
+            self.client.requeue(std::mem::take(&mut self.batch));
+        }
+    }
 }
 
 impl TelemetryClient {
@@ -86,8 +106,9 @@ impl TelemetryClient {
             batch_size: config.batch_size,
             flush_interval: config.flush_interval,
             close_flush_timeout: config.close_flush_timeout,
-            pending: Mutex::new(Vec::new()),
+            pending: Mutex::new(VecDeque::new()),
             queue_count: AtomicUsize::new(0),
+            dropped: AtomicUsize::new(0),
             flush_lock: tokio::sync::Mutex::new(()),
             throttle: Mutex::new(Throttle::default()),
             state: AtomicU8::new(STATE_ACTIVE),
@@ -105,8 +126,14 @@ impl TelemetryClient {
 
         let count = {
             let mut pending = self.pending.lock().expect("poisoned telemetry queue");
-            pending.push(log);
-            self.queue_count.fetch_add(1, Ordering::AcqRel) + 1
+            if pending.len() >= self.pending_cap() {
+                pending.pop_front();
+                self.dropped.fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.queue_count.fetch_add(1, Ordering::AcqRel);
+            }
+            pending.push_back(log);
+            pending.len()
         };
 
         if count >= self.batch_size && !self.throttled() {
@@ -158,6 +185,11 @@ impl TelemetryClient {
             timer.abort();
         }
         self.flush_bounded().await;
+        // The final flush stops at its first failed post; say what it left.
+        let abandoned = self.drain_pending(usize::MAX).len();
+        if abandoned > 0 {
+            tracing::debug!(abandoned, "telemetry client closed with undelivered events");
+        }
         self.state.store(STATE_CLOSED, Ordering::Release);
     }
 
@@ -189,25 +221,46 @@ impl TelemetryClient {
     }
 
     /// Export the oldest queued events in one request. Returns whether a
-    /// non-empty batch was delivered.
+    /// non-empty batch was delivered. With `requeue_if_throttled`, a throttled
+    /// batch, or one whose export is cancelled (flush timeout), is re-queued.
     async fn export_once(&self, requeue_if_throttled: bool) -> bool {
-        let batch = self.drain_pending(MAX_EVENTS_PER_EXPORT.max(self.batch_size));
-        if batch.is_empty() {
+        let mut in_flight = InFlight {
+            client: self,
+            batch: self.drain_pending(MAX_EVENTS_PER_EXPORT.max(self.batch_size)),
+            requeue_on_drop: requeue_if_throttled,
+        };
+        if in_flight.batch.is_empty() {
             return false;
         }
 
-        match export_batch(Arc::clone(&self.exporter), &batch).await {
+        let result = export_batch(Arc::clone(&self.exporter), &in_flight.batch).await;
+        let dropped = self.dropped.swap(0, Ordering::Relaxed);
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "telemetry backlog full while throttled; dropped oldest events"
+            );
+        }
+        match result {
             Ok(()) => {
+                in_flight.batch.clear();
                 *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default();
                 true
             }
+            // `in_flight` puts the batch back when it drops.
             Err(TelemetryExportError::Throttled(_)) if requeue_if_throttled => {
                 self.back_off();
-                self.requeue(batch);
                 false
             }
-            Err(_) => false,
+            Err(_) => {
+                in_flight.batch.clear();
+                false
+            }
         }
+    }
+
+    fn pending_cap(&self) -> usize {
+        MAX_PENDING_EVENTS.max(self.batch_size)
     }
 
     fn throttled(&self) -> bool {
@@ -225,21 +278,18 @@ impl TelemetryClient {
         throttle.until = Some(Instant::now() + throttle.backoff);
     }
 
-    /// Put a throttled batch back ahead of events queued since it was drained.
-    fn requeue(&self, mut batch: Vec<TelemetryFrontendLog>) {
+    /// Put a batch back ahead of events queued since it was drained.
+    fn requeue(&self, batch: Vec<TelemetryFrontendLog>) {
         let mut pending = self.pending.lock().expect("poisoned telemetry queue");
-        batch.append(&mut pending);
-        let cap = MAX_PENDING_EVENTS.max(self.batch_size);
-        let excess = batch.len().saturating_sub(cap);
-        if excess > 0 {
-            batch.drain(..excess);
-            tracing::debug!(
-                dropped = excess,
-                "telemetry backlog full while throttled; dropping oldest events"
-            );
+        for log in batch.into_iter().rev() {
+            pending.push_front(log);
         }
-        self.queue_count.store(batch.len(), Ordering::Release);
-        *pending = batch;
+        let excess = pending.len().saturating_sub(self.pending_cap());
+        if excess > 0 {
+            pending.drain(..excess);
+            self.dropped.fetch_add(excess, Ordering::Relaxed);
+        }
+        self.queue_count.store(pending.len(), Ordering::Release);
     }
 
     fn drain_pending(&self, limit: usize) -> Vec<TelemetryFrontendLog> {
@@ -523,7 +573,7 @@ mod tests {
             .map(|i| sample_log(&format!("e{i}")))
             .collect::<Vec<_>>();
         client.queue_count.store(backlog.len(), Ordering::Release);
-        *client.pending.lock().unwrap() = backlog;
+        *client.pending.lock().unwrap() = backlog.into();
 
         client.flush_bounded().await;
 
@@ -548,7 +598,7 @@ mod tests {
             .map(|i| sample_log(&format!("e{i}")))
             .collect::<Vec<_>>();
         client.queue_count.store(backlog.len(), Ordering::Release);
-        *client.pending.lock().unwrap() = backlog;
+        *client.pending.lock().unwrap() = backlog.into();
 
         client.enqueue(sample_log("e119"));
         wait_until(|| exporter.ids().len() == 3).await;
@@ -557,6 +607,110 @@ mod tests {
         assert_eq!(sizes, [MAX_EVENTS_PER_EXPORT, MAX_EVENTS_PER_EXPORT, 20]);
         assert!(client.pending.lock().unwrap().is_empty());
         client.close().await;
+    }
+
+    #[tokio::test]
+    async fn enqueue_caps_backlog_while_throttled() {
+        let exporter = ThrottlingExporter::new(usize::MAX);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+
+        client.enqueue(sample_log("first"));
+        wait_until(|| client.throttled()).await;
+        for i in 0..MAX_PENDING_EVENTS + 10 {
+            client.enqueue(sample_log(&format!("e{i}")));
+        }
+
+        {
+            let pending = client.pending.lock().unwrap();
+            assert_eq!(pending.len(), MAX_PENDING_EVENTS);
+            assert_eq!(pending[0].frontend_log_event_id, "e10");
+            assert_eq!(
+                pending[MAX_PENDING_EVENTS - 1].frontend_log_event_id,
+                format!("e{}", MAX_PENDING_EVENTS + 9)
+            );
+        }
+        assert_eq!(
+            client.queue_count.load(Ordering::Acquire),
+            MAX_PENDING_EVENTS
+        );
+        assert_eq!(client.dropped.load(Ordering::Relaxed), 11);
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_stops_at_first_failed_post_and_clears_the_rest() {
+        let exporter = ThrottlingExporter::new(usize::MAX);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 2,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+        let backlog = (0..120)
+            .map(|i| sample_log(&format!("e{i}")))
+            .collect::<VecDeque<_>>();
+        client.queue_count.store(backlog.len(), Ordering::Release);
+        *client.pending.lock().unwrap() = backlog;
+
+        client.close().await;
+
+        assert_eq!(exporter.ids().len(), 1);
+        assert_eq!(exporter.ids()[0].len(), MAX_EVENTS_PER_EXPORT);
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert_eq!(client.queue_count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn timed_out_session_release_flush_keeps_in_flight_batch() {
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 100,
+            flush_interval: Duration::from_secs(60),
+            close_flush_timeout: Duration::from_millis(50),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(HangingExporter))
+            .expect("telemetry runtime should start");
+        client.enqueue(sample_log("one"));
+        client.enqueue(sample_log("two"));
+
+        client.flush_bounded().await;
+
+        let pending = client.pending.lock().unwrap();
+        let ids = pending
+            .iter()
+            .map(|log| log.frontend_log_event_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, ["one", "two"]);
+    }
+
+    /// Never completes an export.
+    struct HangingExporter;
+
+    impl TelemetryExporter for HangingExporter {
+        fn export<'a>(
+            &'a self,
+            _request: TelemetryRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = super::super::exporter::TelemetryExportResult>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(std::future::pending::<
+                super::super::exporter::TelemetryExportResult,
+            >())
+        }
     }
 
     #[tokio::test]
@@ -571,12 +725,20 @@ mod tests {
             .expect("telemetry runtime should start");
         *client.pending.lock().unwrap() = (0..5).map(|i| sample_log(&format!("new{i}"))).collect();
 
-        client.requeue((0..18).map(|i| sample_log(&format!("old{i}"))).collect());
+        client.requeue(
+            (0..MAX_PENDING_EVENTS - 2)
+                .map(|i| sample_log(&format!("old{i}")))
+                .collect(),
+        );
 
         let pending = client.pending.lock().unwrap();
         assert_eq!(pending.len(), MAX_PENDING_EVENTS);
         assert_eq!(pending[0].frontend_log_event_id, "old3");
-        assert_eq!(pending[19].frontend_log_event_id, "new4");
+        assert_eq!(
+            pending[MAX_PENDING_EVENTS - 1].frontend_log_event_id,
+            "new4"
+        );
+        assert_eq!(client.dropped.load(Ordering::Relaxed), 3);
         assert_eq!(client.queue_count.load(Ordering::Acquire), pending.len());
     }
 
