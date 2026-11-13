@@ -735,7 +735,9 @@ impl DatabricksHttpClient {
     /// Digest of everything that decides how this client reaches a server
     /// and how long it tries: TLS, proxy, timeouts, headers and the auth
     /// retry policy. Auth results are shared only between clients with the
-    /// same fingerprint.
+    /// same fingerprint. A CA given as `trusted_certificate_path` (internal
+    /// only) is hashed by path, not by the file's contents; the public surface
+    /// passes CA bytes, which are hashed.
     pub(crate) fn transport_fingerprint(&self) -> [u8; 32] {
         use sha2::{Digest, Sha256};
         fn bytes(h: &mut Sha256, b: Option<&[u8]>) {
