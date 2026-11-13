@@ -33,7 +33,7 @@ use crate::auth::oauth::token_store::TokenStore;
 use crate::auth::AuthProvider;
 use crate::client::http::DatabricksHttpClient;
 use crate::client::retry::{is_non_retryable_status, RequestType};
-use crate::kernel_error::{Error, Result};
+use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::util::runtime::block_on_in_runtime;
 use futures::future::{BoxFuture, FutureExt, Shared};
 use oauth2::basic::BasicClient;
@@ -71,6 +71,11 @@ impl SharedCredentials {
     /// The discovery to await: the one in flight or done, or a new one if the
     /// last attempt failed. Callers that join an attempt get its result, error
     /// included, instead of each retrying it in turn.
+    ///
+    /// The request runs as a task on the caller's runtime and only its result
+    /// is shared: joiners may be sessions with their own runtimes, so they
+    /// must not drive a request bound to another runtime. If that runtime
+    /// shuts down first, joiners get `Cancelled` (see [`Self::endpoints`]).
     fn discovery(&self, host: &str, http_client: &Arc<DatabricksHttpClient>) -> Discovery {
         let mut slot = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(discovery) = slot.as_ref() {
@@ -80,14 +85,32 @@ impl SharedCredentials {
         }
         let host = host.to_owned();
         let http_client = Arc::clone(http_client);
-        let discovery = async move {
+        let task = tokio::spawn(async move {
             let endpoints = OidcEndpoints::discover(&host, &http_client).await?;
             Ok((endpoints.token_endpoint, endpoints.authorization_endpoint))
+        });
+        let discovery = async move {
+            task.await.unwrap_or_else(|e| {
+                Err(Error::cancelled().message(format!("OIDC discovery did not finish: {e}")))
+            })
         }
         .boxed()
         .shared();
         *slot = Some(discovery.clone());
         discovery
+    }
+
+    /// Discovered endpoints. An attempt cancelled with the session that
+    /// started it is not this caller's failure, so it is retried once.
+    async fn endpoints(
+        &self,
+        host: &str,
+        http_client: &Arc<DatabricksHttpClient>,
+    ) -> Result<(String, String)> {
+        match self.discovery(host, http_client).await {
+            Err(e) if e.code == ErrorCode::Cancelled => self.discovery(host, http_client).await,
+            result => result,
+        }
     }
 }
 
@@ -328,7 +351,7 @@ impl ClientCredentialsProvider {
         });
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
-            None => shared.discovery(host, &http_client).await?,
+            None => shared.endpoints(host, &http_client).await?,
         };
 
         Ok(Self {
@@ -623,7 +646,6 @@ mod tests {
     use super::*;
     use crate::client::http::HttpClientConfig;
     use crate::client::retry::{build_retry_configs, RetryConfig};
-    use crate::kernel_error::ErrorCode;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::time::Duration;
@@ -1177,6 +1199,110 @@ mod tests {
             2,
             "a failed discovery is retried by the next open"
         );
+    }
+
+    /// Sessions in the Python binding each own a runtime: an opener that
+    /// joins a discovery started on a runtime that then shuts down must still
+    /// open, not hang or fail on the abandoned request.
+    #[test]
+    fn discovery_outlives_the_runtime_that_started_it() {
+        let runtime = || {
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .enable_all()
+                .build()
+                .unwrap()
+        };
+        let (first, second) = (runtime(), runtime());
+        let server = second.block_on(MockServer::start());
+        let uri = server.uri();
+        let body = serde_json::json!({
+            "authorization_endpoint": format!("{uri}/oidc/v1/authorize"),
+            "token_endpoint": format!("{uri}/oidc/v1/token"),
+        });
+        second.block_on(async {
+            Mock::given(method("GET"))
+                .and(path("/oidc/.well-known/oauth-authorization-server"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(body.clone())
+                        .set_delay(Duration::from_secs(2)),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path("/oidc/.well-known/oauth-authorization-server"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(body))
+                .mount(&server)
+                .await;
+        });
+
+        // Held here so the second open joins the first one's attempt.
+        let shared = shared_credentials(CredentialsKey {
+            host: uri.clone(),
+            client_id: "client".to_string(),
+            secret_sha256: [0; 32],
+            scopes: vec![],
+            token_endpoint_override: None,
+            transport: [0; 32],
+        });
+        let client = || {
+            Arc::new(
+                DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                    .expect("Failed to create HTTP client"),
+            )
+        };
+        let (s, u, c) = (Arc::clone(&shared), uri.clone(), client());
+        first.spawn(async move {
+            let _ = s.endpoints(&u, &c).await;
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        first.shutdown_background();
+
+        let joined = second.block_on(async {
+            tokio::time::timeout(Duration::from_secs(5), shared.endpoints(&uri, &client())).await
+        });
+        let endpoints = joined
+            .expect("hung on the abandoned discovery")
+            .expect("failed on the abandoned discovery");
+        assert_eq!(endpoints.0, format!("{uri}/oidc/v1/token"));
+    }
+
+    /// Azure SP data tokens go through the token-endpoint override (no
+    /// discovery), and share the same way.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn providers_with_a_token_endpoint_override_share_one_token() {
+        let mock_server = MockServer::start().await;
+        let token = Mock::given(method("POST"))
+            .and(path("/oauth2/v2.0/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_token_response_body()))
+            .mount_as_scoped(&mock_server)
+            .await;
+        let token_url = format!("{}/oauth2/v2.0/token", mock_server.uri());
+        let mut providers = Vec::new();
+        for _ in 0..4 {
+            let http_client = Arc::new(
+                DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                    .expect("Failed to create HTTP client"),
+            );
+            providers.push(Arc::new(
+                ClientCredentialsProvider::new_with_full_config(
+                    "https://adb-1.azuredatabricks.net",
+                    "client",
+                    "secret",
+                    http_client,
+                    vec!["scope/.default".to_string()],
+                    Some(token_url.clone()),
+                )
+                .await
+                .expect("Failed to create provider"),
+            ));
+        }
+        for p in &providers {
+            auth_header(p).await;
+        }
+        assert_eq!(token.received_requests().await.len(), 1);
     }
 
     async fn shared_test_provider(

@@ -23,10 +23,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
 - All HTTP clients in a process share one DNS lookup per host at a time and
   reuse a successful answer for 30 s, so many sessions opening at once no
   longer send one identical lookup each.
-- OAuth M2M sessions in one process that use the same host, client id, secret
-  and scopes share one OIDC discovery and one access token while any of them is
-  open, so opening many sessions at once sends one token request instead of one
-  per session.
+- OAuth M2M and Azure service-principal sessions in one process that use the
+  same host, client id, secret, scopes and HTTP transport settings share one
+  OIDC discovery and one access token while any of them is open, so opening
+  many sessions at once sends one token request instead of one per session.
+  (The Azure management token is still fetched per session.)
 
 ### Updated
 
