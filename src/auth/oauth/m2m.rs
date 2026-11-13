@@ -76,6 +76,9 @@ impl SharedCredentials {
     /// is shared: joiners may be sessions with their own runtimes, so they
     /// must not drive a request bound to another runtime. If that runtime
     /// shuts down first, joiners get `Cancelled` (see [`Self::endpoints`]).
+    /// The starter's runtime has to keep running its tasks: a multi-thread
+    /// runtime does (every binding uses one), but a `current_thread` runtime
+    /// that stays alive and is no longer driven would leave joiners waiting.
     fn discovery(&self, host: &str, http_client: &Arc<DatabricksHttpClient>) -> Discovery {
         let mut slot = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(discovery) = slot.as_ref() {

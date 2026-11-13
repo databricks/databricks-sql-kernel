@@ -284,7 +284,13 @@ impl TokenStore {
             match (result, current) {
                 // Like its waiters, keep a token the server still accepts
                 // (inside the expiry buffer) rather than fail on it.
-                (Err(_), Some(t)) if t.expires_at > chrono::Utc::now() => Ok(t),
+                (Err(e), Some(t)) if t.expires_at > chrono::Utc::now() => {
+                    crate::klog::warn!(
+                        "OAuth token refresh failed, using the cached token until it expires: {}",
+                        e
+                    );
+                    Ok(t)
+                }
                 (result, _) => result,
             }
         } else {
