@@ -95,7 +95,28 @@ fn closed_err(what: &str) -> napi::Error {
 
 /// An `AsyncResultHandle`'s stream, shared with its parent `AsyncStatement`
 /// so the parent's `close()` can release it.
-type ResultSlot = Mutex<Option<ResultStream>>;
+struct ResultSlot {
+    stream: Mutex<Option<ResultStream>>,
+    /// Set by the parent's `close()`. A fetch holding `stream` at that moment
+    /// drops it on return, so `close()` never waits for a fetch.
+    closed: AtomicBool,
+}
+
+impl ResultSlot {
+    fn new(stream: ResultStream) -> Self {
+        Self {
+            stream: Mutex::new(Some(stream)),
+            closed: AtomicBool::new(false),
+        }
+    }
+
+    fn release(&self) {
+        self.closed.store(true, Ordering::Release);
+        if let Ok(mut stream) = self.stream.try_lock() {
+            stream.take();
+        }
+    }
+}
 
 /// Inner state for the JS-visible `AsyncStatement` wrapper. Same
 /// shape rationale as `StatementInner` in `statement.rs`: we hold
@@ -328,7 +349,7 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
-            let slot = Arc::new(Mutex::new(Some(stream)));
+            let slot = Arc::new(ResultSlot::new(stream));
             // Registered while `inner` is still held, so a `close()` queued
             // behind this call always sees the slot.
             results
@@ -414,7 +435,7 @@ impl AsyncStatement {
             let slots =
                 std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
             for slot in slots.iter().filter_map(Weak::upgrade) {
-                slot.lock().await.take();
+                slot.release();
             }
             outcome
         })
@@ -466,6 +487,34 @@ pub struct AsyncResultHandle {
     statement_id: String,
 }
 
+/// Pull one batch from `stream` and encode it as an Arrow IPC payload.
+async fn next_ipc_batch(
+    stream: &mut ResultStream,
+    schema: &SchemaRef,
+) -> napi::Result<Option<ArrowBatch>> {
+    let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
+    let Some(batch) = maybe_batch else {
+        return Ok(None);
+    };
+    let record_batch = match batch {
+        ResultBatch::Arrow(rb) => rb,
+        _ => {
+            return Err(napi_err_from_kernel(
+                KernelError::invalid_argument().message(format!(
+                    "non-Arrow ResultBatch variant from kernel — \
+                     databricks-sea-native v{} cannot decode this batch \
+                     shape, upgrade the binding",
+                    env!("CARGO_PKG_VERSION"),
+                )),
+            ));
+        }
+    };
+    let bytes = encode_ipc_stream(schema, Some(record_batch))?;
+    Ok(Some(ArrowBatch {
+        ipc_bytes: bytes.into(),
+    }))
+}
+
 #[napi]
 impl AsyncResultHandle {
     /// Server-issued statement id. Cached at construction; readable
@@ -487,31 +536,21 @@ impl AsyncResultHandle {
         let inner = Arc::clone(&self.inner);
         let schema = self.schema.clone();
         guarded(async move {
-            let mut guard = inner.lock().await;
-            let stream = guard
-                .as_mut()
-                .ok_or_else(|| closed_err("AsyncResultHandle"))?;
-            let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
-            let Some(batch) = maybe_batch else {
-                return Ok(None);
-            };
-            let record_batch = match batch {
-                ResultBatch::Arrow(rb) => rb,
-                _ => {
-                    return Err(napi_err_from_kernel(
-                        KernelError::invalid_argument().message(format!(
-                            "non-Arrow ResultBatch variant from kernel — \
-                             databricks-sea-native v{} cannot decode this batch \
-                             shape, upgrade the binding",
-                            env!("CARGO_PKG_VERSION"),
-                        )),
-                    ));
+            let outcome = {
+                let mut guard = inner.stream.lock().await;
+                if inner.closed.load(Ordering::Acquire) {
+                    guard.take();
+                }
+                match guard.as_mut() {
+                    Some(stream) => next_ipc_batch(stream, &schema).await,
+                    None => Err(closed_err("AsyncResultHandle")),
                 }
             };
-            let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
-            Ok(Some(ArrowBatch {
-                ipc_bytes: bytes.into(),
-            }))
+            // The parent may have closed while this fetch held the stream.
+            if inner.closed.load(Ordering::Acquire) {
+                inner.release();
+            }
+            outcome
         })
         .await
     }
@@ -728,5 +767,31 @@ mod tests {
     #[tokio::test]
     async fn close_releases_session_held_by_result_handles() {
         next_session_gets_its_own_telemetry_client(true).await;
+    }
+
+    #[tokio::test]
+    async fn close_does_not_wait_for_an_in_flight_fetch() {
+        let server = lease_server().await;
+        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let statement = connection
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = statement.await_result().await.expect("await result");
+        // Hold the stream the way an in-flight `fetchNextBatch()` does.
+        let in_flight = result.inner.stream.lock().await;
+        tokio::time::timeout(Duration::from_secs(5), statement.close())
+            .await
+            .expect("close must not wait for an in-flight fetch")
+            .expect("close statement");
+        drop(in_flight);
+        let err = result
+            .fetch_next_batch()
+            .await
+            .err()
+            .expect("fetching after the parent closed must fail");
+        assert!(err.reason.contains("AsyncResultHandle already closed"));
+        assert!(result.inner.stream.lock().await.is_none());
+        connection.close().await.expect("close session");
     }
 }
