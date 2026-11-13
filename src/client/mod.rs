@@ -31,6 +31,7 @@
 //! [`transport`]: self::transport
 //! [`sea`]: self::sea
 
+pub(crate) mod dns;
 pub mod http;
 pub mod retry;
 pub mod sea;
