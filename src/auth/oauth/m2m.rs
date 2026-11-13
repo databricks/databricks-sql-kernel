@@ -40,8 +40,47 @@ use oauth2::{
     AuthUrl, ClientId, ClientSecret, HttpRequest, HttpResponse, RequestTokenError, Scope,
     TokenResponse, TokenUrl,
 };
-use std::sync::Arc;
+use sha2::{Digest, Sha256};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::runtime::Handle as RuntimeHandle;
+use tokio::sync::OnceCell;
+
+/// OIDC endpoints and token store shared by every live provider in the
+/// process that uses the same credentials, so N sessions opening at once
+/// run one discovery and one token exchange instead of N of each.
+#[derive(Debug, Default)]
+struct SharedCredentials {
+    endpoints: OnceCell<(String, String)>,
+    token_store: Arc<TokenStore>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CredentialsKey {
+    host: String,
+    client_id: String,
+    secret_sha256: [u8; 32],
+    scopes: Vec<String>,
+    token_endpoint_override: Option<String>,
+}
+
+/// Entries are weak: a token is shared only while a provider using it is
+/// alive, so it is not kept in memory after the last session closes.
+fn shared_credentials(key: CredentialsKey) -> Arc<SharedCredentials> {
+    static REGISTRY: OnceLock<Mutex<HashMap<CredentialsKey, Weak<SharedCredentials>>>> =
+        OnceLock::new();
+    let mut registry = REGISTRY
+        .get_or_init(Default::default)
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if let Some(shared) = registry.get(&key).and_then(Weak::upgrade) {
+        return shared;
+    }
+    registry.retain(|_, weak| weak.strong_count() > 0);
+    let shared = Arc::new(SharedCredentials::default());
+    registry.insert(key, Arc::downgrade(&shared));
+    shared
+}
 
 /// OAuth provider for M2M (Machine-to-Machine) authentication.
 ///
@@ -90,8 +129,11 @@ pub struct ClientCredentialsProvider {
     /// Discovered OIDC endpoints
     token_endpoint: String,
     auth_endpoint: String,
-    /// Thread-safe token store managing the token lifecycle
-    token_store: TokenStore,
+    /// Thread-safe token store managing the token lifecycle; shared with
+    /// other live providers that use the same credentials.
+    token_store: Arc<TokenStore>,
+    /// Keeps the process-wide entry alive while this provider is.
+    _shared: Option<Arc<SharedCredentials>>,
     /// HTTP client for token endpoint requests
     http_client: Arc<DatabricksHttpClient>,
     /// OAuth scopes to request (typically "all-apis"). Empty when `resource`
@@ -215,12 +257,23 @@ impl ClientCredentialsProvider {
         // would needlessly depend on it being reachable and describing the
         // right issuer. Reuse the token endpoint as the (unused) auth URL
         // placeholder so the `oauth2` client still constructs.
+        let shared = shared_credentials(CredentialsKey {
+            host: host.to_string(),
+            client_id: client_id.to_string(),
+            secret_sha256: Sha256::digest(client_secret.as_bytes()).into(),
+            scopes: scopes.clone(),
+            token_endpoint_override: token_endpoint_override.clone(),
+        });
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
-            None => {
-                let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-                (endpoints.token_endpoint, endpoints.authorization_endpoint)
-            }
+            None => shared
+                .endpoints
+                .get_or_try_init(|| async {
+                    let endpoints = OidcEndpoints::discover(host, &http_client).await?;
+                    Ok::<_, Error>((endpoints.token_endpoint, endpoints.authorization_endpoint))
+                })
+                .await?
+                .clone(),
         };
 
         Ok(Self {
@@ -228,7 +281,8 @@ impl ClientCredentialsProvider {
             client_secret: client_secret.to_string(),
             token_endpoint,
             auth_endpoint,
-            token_store: TokenStore::new(),
+            token_store: Arc::clone(&shared.token_store),
+            _shared: Some(shared),
             http_client,
             scopes,
             resource: None,
@@ -263,7 +317,8 @@ impl ClientCredentialsProvider {
             client_secret: client_secret.to_string(),
             auth_endpoint: token_endpoint.clone(),
             token_endpoint,
-            token_store: TokenStore::new(),
+            token_store: Arc::new(TokenStore::new()),
+            _shared: None,
             http_client,
             scopes: Vec::new(),
             resource: Some(resource),
@@ -898,6 +953,65 @@ mod tests {
 
         // Verify mock expectations (only 1 token fetch)
         // This is verified by the .expect(1) on the Mock
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn live_providers_with_the_same_credentials_share_discovery_and_token() {
+        let mock_server = MockServer::start().await;
+        let token_endpoint = mock_oidc_discovery(&mock_server);
+        let discovery = Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": format!("{}/oidc/v1/authorize", mock_server.uri()),
+                "token_endpoint": token_endpoint,
+            })))
+            .mount_as_scoped(&mock_server)
+            .await;
+        let token = Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_token_response_body()))
+            .mount_as_scoped(&mock_server)
+            .await;
+
+        let new_provider = |secret: &'static str| {
+            let uri = mock_server.uri();
+            async move {
+                let http_client = Arc::new(
+                    DatabricksHttpClient::with_default_retry(HttpClientConfig::default())
+                        .expect("Failed to create HTTP client"),
+                );
+                Arc::new(
+                    ClientCredentialsProvider::new(&uri, "shared-client", secret, http_client)
+                        .await
+                        .expect("Failed to create provider"),
+                )
+            }
+        };
+        let auth = |p: Arc<ClientCredentialsProvider>| async move {
+            tokio::task::spawn_blocking(move || p.get_auth_header().expect("auth header"))
+                .await
+                .unwrap()
+        };
+
+        let providers: Vec<_> = futures::future::join_all((0..8).map(|_| new_provider("s1"))).await;
+        for p in &providers {
+            assert_eq!(auth(Arc::clone(p)).await, "Bearer test-access-token-m2m");
+        }
+        assert_eq!(discovery.received_requests().await.len(), 1);
+        assert_eq!(token.received_requests().await.len(), 1);
+
+        let other_secret = new_provider("s2").await;
+        auth(Arc::clone(&other_secret)).await;
+        assert_eq!(token.received_requests().await.len(), 2, "keyed by secret");
+
+        drop(providers);
+        let after_close = new_provider("s1").await;
+        auth(after_close).await;
+        assert_eq!(
+            token.received_requests().await.len(),
+            3,
+            "not retained once no provider uses it"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
