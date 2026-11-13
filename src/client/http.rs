@@ -522,7 +522,8 @@ impl DatabricksHttpClient {
             .timeout(config.read_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)
-            .redirect(redirect);
+            .redirect(redirect)
+            .dns_resolver(crate::client::dns::CachingResolver::shared());
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {

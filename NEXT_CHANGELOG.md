@@ -20,6 +20,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- All HTTP clients in a process share one DNS lookup per host at a time and
+  reuse a successful answer for 30 s, so many sessions opening at once no
+  longer send one identical lookup each.
 
 ### Updated
 
