@@ -20,10 +20,11 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
-- OAuth M2M sessions in one process that use the same host, client id, secret
-  and scopes share one OIDC discovery and one access token while any of them is
-  open, so opening many sessions at once sends one token request instead of one
-  per session.
+- OAuth M2M and Azure service-principal sessions in one process that use the
+  same host, client id, secret, scopes and HTTP transport settings share one
+  OIDC discovery and one access token while any of them is open, so opening
+  many sessions at once sends one token request instead of one per session.
+  (The Azure management token is still fetched per session.)
 
 ### Updated
 
