@@ -70,6 +70,8 @@ pub(crate) struct TransportConfig {
     /// When false, session creation requests paged inline results without
     /// cloud-storage downloads. The value is fixed for the session lifetime.
     pub cloudfetch_enabled: bool,
+    /// Mirrors [`crate::config::ResultConfig::realtime_inline_small_results`].
+    pub realtime_inline_small_results: bool,
 }
 
 impl Default for TransportConfig {
@@ -79,6 +81,7 @@ impl Default for TransportConfig {
             poll_interval: Duration::from_millis(500),
             // Mirror `ResultConfig::default().cloudfetch_enabled`.
             cloudfetch_enabled: true,
+            realtime_inline_small_results: true,
         }
     }
 }

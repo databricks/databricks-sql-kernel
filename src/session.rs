@@ -392,6 +392,7 @@ impl Session {
         let defaults = config.defaults.clone().unwrap_or_default();
         let transport_config = TransportConfig {
             cloudfetch_enabled: config.result.cloudfetch_enabled,
+            realtime_inline_small_results: config.result.realtime_inline_small_results,
             ..TransportConfig::default()
         };
         let sea = Arc::new(SeaRestTransport::new(

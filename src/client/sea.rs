@@ -31,8 +31,8 @@ use crate::telemetry::ExecutionResultFormat;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::{
     CompressionCodec, CreateSessionRequest, CreateSessionResponse, ExecuteParams,
-    ExecuteStatementRequest, GetChunksResponse, SessionExecutionMode, SessionVersion,
-    StatementExecutionResponse, StatementState,
+    ExecuteStatementRequest, GetChunksResponse, ResultManifest, SessionExecutionMode,
+    SessionVersion, StatementExecutionResponse, StatementState,
 };
 use async_trait::async_trait;
 use reqwest::Method;
@@ -96,6 +96,64 @@ impl MetadataOperation {
 struct ExecutionRequest {
     request_type: RequestType,
     metadata_operation: Option<MetadataOperation>,
+    /// Request `INLINE` instead of `INLINE_OR_EXTERNAL_LINKS`.
+    inline: bool,
+}
+
+/// Largest result (uncompressed `total_byte_count`) that lets a SQL text use
+/// `INLINE` on its next execution: far below the server's 25 MiB inline limit.
+const SMALL_RESULT_BYTES: i64 = 4 * 1024 * 1024;
+/// Bound on remembered SQL texts per session; the set is cleared when full.
+const SMALL_RESULT_MEMO_CAP: usize = 1024;
+/// How long a small result keeps a SQL text on `INLINE`.
+const SMALL_RESULT_TTL: std::time::Duration = std::time::Duration::from_secs(600);
+const INLINE_BYTE_LIMIT_MESSAGE: &str = "Inline byte limit exceeded";
+const INLINE_TRUNCATED_MESSAGE: &str = "Server truncated the INLINE result";
+
+/// Whether `sql` starts with a verb that only reads (after comments, whitespace
+/// and opening parentheses). Re-running such a statement is side-effect free.
+fn is_read_only_query(sql: &str) -> bool {
+    let mut rest = sql;
+    loop {
+        rest = rest.trim_start_matches(|c: char| c.is_whitespace() || c == '(');
+        if let Some(after) = rest.strip_prefix("--") {
+            rest = after.split_once('\n').map_or("", |(_, tail)| tail);
+        } else if let Some(after) = rest.strip_prefix("/*") {
+            rest = after.split_once("*/").map_or("", |(_, tail)| tail);
+        } else {
+            break;
+        }
+    }
+    let verb: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    matches!(
+        verb.as_str(),
+        "SELECT" | "WITH" | "VALUES" | "TABLE" | "FROM" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
+    )
+}
+
+fn sql_key(sql: &str) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    sql.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// `INLINE` result over the server's limit: either rejected outright, or (on
+/// servers without the rejection) returned with `manifest.truncated`.
+fn is_inline_overflow(error: &Error) -> bool {
+    error.message.contains(INLINE_TRUNCATED_MESSAGE)
+        || (error.error_code.as_deref() == Some("BAD_REQUEST")
+            && error.message.contains(INLINE_BYTE_LIMIT_MESSAGE))
+}
+
+/// A truncated manifest that the caller's `row_limit` does not explain.
+fn inline_result_truncated(manifest: &ResultManifest, row_limit: Option<i64>) -> bool {
+    manifest.truncated
+        && !row_limit.is_some_and(|limit| manifest.total_row_count.is_some_and(|n| n >= limit))
 }
 
 /// Internal terminal-outcome for a single SEA statement response.
@@ -184,6 +242,10 @@ pub(crate) struct SeaRestTransport {
     /// `can_cloud_download` session conf (Reyden does): the session then
     /// requests `INLINE` results instead of paged inline results.
     inline_disposition: AtomicBool,
+    /// SQL texts (hashed) whose last result was small. On a realtime session,
+    /// these run with `INLINE`, which avoids the server persisting every hybrid
+    /// result to cloud storage while it holds the result stream open.
+    small_results: std::sync::Mutex<HashMap<u64, std::time::Instant>>,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
@@ -227,6 +289,7 @@ impl SeaRestTransport {
             session_route: OnceLock::new(),
             session_version: AtomicI64::new(NO_SESSION_VERSION),
             inline_disposition: AtomicBool::new(false),
+            small_results: std::sync::Mutex::new(HashMap::new()),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
         }
@@ -270,6 +333,48 @@ impl SeaRestTransport {
             SessionAttribution::Current => self.base_url(),
             SessionAttribution::Detached => {
                 format!("{}/api/2.0/sql", self.host.trim_end_matches('/'))
+            }
+        }
+    }
+
+    fn adaptive_inline_enabled(&self) -> bool {
+        self.config.cloudfetch_enabled
+            && self.config.realtime_inline_small_results
+            && matches!(
+                self.session_route.get(),
+                Some(SessionRoute::Realtime { .. })
+            )
+    }
+
+    /// Whether a user statement should request `INLINE`: realtime session,
+    /// read-only verb, and a small result for the same SQL text recently.
+    fn prefers_inline(&self, sql: &str) -> bool {
+        self.adaptive_inline_enabled()
+            && is_read_only_query(sql)
+            && self.small_results.lock().is_ok_and(|memo| {
+                memo.get(&sql_key(sql))
+                    .is_some_and(|seen| seen.elapsed() < SMALL_RESULT_TTL)
+            })
+    }
+
+    fn remember_result_size(&self, sql: &str, result: &ExecuteResult) {
+        if !self.adaptive_inline_enabled() {
+            return;
+        }
+        let small = result.telemetry_result_format != ExecutionResultFormat::ExternalLinks
+            && result
+                .manifest
+                .as_ref()
+                .and_then(|m| m.total_byte_count)
+                .is_some_and(|bytes| bytes <= SMALL_RESULT_BYTES);
+        if let Ok(mut memo) = self.small_results.lock() {
+            if small {
+                if memo.len() >= SMALL_RESULT_MEMO_CAP {
+                    memo.clear();
+                }
+                memo.insert(sql_key(sql), std::time::Instant::now());
+            } else {
+                memo.remove(&sql_key(sql));
             }
         }
     }
@@ -660,6 +765,7 @@ impl SeaRestTransport {
         params: &ExecuteParams,
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
+        inline: bool,
     ) -> Result<ExecuteResponse> {
         let url = format!("{}/statements", self.base_url());
 
@@ -677,7 +783,7 @@ impl SeaRestTransport {
             session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
-            disposition: if self.inline_disposition.load(Ordering::Relaxed) {
+            disposition: if inline || self.inline_disposition.load(Ordering::Relaxed) {
                 "INLINE"
             } else {
                 "INLINE_OR_EXTERNAL_LINKS"
@@ -816,6 +922,7 @@ impl SeaRestTransport {
                 params,
                 request.request_type,
                 request.metadata_operation,
+                request.inline,
             )
             .await
             .map_err(|error| TerminalExecutionFailure {
@@ -908,6 +1015,30 @@ impl SeaRestTransport {
         metadata_operation: Option<MetadataOperation>,
         timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
+        self.execute_and_read_with(
+            session_id,
+            sql,
+            params,
+            request_type,
+            metadata_operation,
+            timeout,
+            false,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_and_read_with(
+        &self,
+        session_id: &str,
+        sql: &str,
+        params: &ExecuteParams,
+        request_type: RequestType,
+        metadata_operation: Option<MetadataOperation>,
+        timeout: ExecutionTimeout,
+        inline: bool,
+    ) -> Result<ExecuteResult> {
+        let inline = inline || self.inline_disposition.load(Ordering::Relaxed);
         // After call_execute_api succeeds, the SEA statement is open
         // on the server. Any subsequent failure before we hand back
         // an ExecuteResult (which wraps it in an ExecutedStatement
@@ -935,6 +1066,7 @@ impl SeaRestTransport {
             ExecutionRequest {
                 request_type,
                 metadata_operation,
+                inline,
             },
             timeout,
             &status_request_in_flight,
@@ -1008,6 +1140,20 @@ impl SeaRestTransport {
                 return Err(error);
             }
         };
+        if inline
+            && response
+                .manifest
+                .as_ref()
+                .is_some_and(|m| inline_result_truncated(m, params.row_limit))
+        {
+            self.close_orphaned_statement(&statement_id, "inline_truncated")
+                .await;
+            return Err(Error::data_loss()
+                .message(format!(
+                    "{INLINE_TRUNCATED_MESSAGE}; enable CloudFetch to fetch the full result"
+                ))
+                .with_query_id(&statement_id));
+        }
         // Preserve the old sync behavior: a terminal GetStatementStatus response
         // is DML-enriched before the result reader is handed off. It now happens
         // after terminal mapping, keeping this result work out of the execution
@@ -1300,15 +1446,40 @@ impl Transport for SeaRestTransport {
         params: &ExecuteParams,
         timeout: ExecutionTimeout,
     ) -> Result<ExecuteResult> {
-        self.execute_and_read(
-            session_id,
-            sql,
-            params,
-            RequestType::ExecuteStatement,
-            None,
-            timeout,
-        )
-        .await
+        let inline = self.prefers_inline(sql);
+        let mut result = self
+            .execute_and_read_with(
+                session_id,
+                sql,
+                params,
+                RequestType::ExecuteStatement,
+                None,
+                timeout,
+                inline,
+            )
+            .await;
+        if inline && result.as_ref().is_err_and(is_inline_overflow) {
+            // The result outgrew INLINE. The statement is read-only, so run it
+            // again with links; it will not use INLINE again until small.
+            debug!("INLINE result exceeded the inline limit; re-running with external links");
+            if let Ok(mut memo) = self.small_results.lock() {
+                memo.remove(&sql_key(sql));
+            }
+            result = self
+                .execute_and_read(
+                    session_id,
+                    sql,
+                    params,
+                    RequestType::ExecuteStatement,
+                    None,
+                    timeout,
+                )
+                .await;
+        }
+        if let Ok(result) = &result {
+            self.remember_result_size(sql, result);
+        }
+        result
     }
 
     async fn submit_statement(
@@ -1335,6 +1506,7 @@ impl Transport for SeaRestTransport {
             &params,
             RequestType::ExecuteStatement,
             None,
+            false,
         )
         .await
     }
@@ -1357,7 +1529,14 @@ impl Transport for SeaRestTransport {
         // internal poll loop: a query that outlasts the inline wait
         // comes back `Running` for the caller to poll/cancel.
         let response = self
-            .call_execute_api(session_id, sql, params, RequestType::ExecuteStatement, None)
+            .call_execute_api(
+                session_id,
+                sql,
+                params,
+                RequestType::ExecuteStatement,
+                None,
+                false,
+            )
             .await?;
         let statement_id = response.statement_id.clone();
 
@@ -2122,6 +2301,7 @@ mod tests {
                 ExecutionRequest {
                     request_type: RequestType::ExecuteStatement,
                     metadata_operation: None,
+                    inline: false,
                 },
                 ExecutionTimeout::Unlimited,
                 &AtomicBool::new(false),
@@ -2500,6 +2680,32 @@ mod tests {
         let mut no_status = Error::invalid_argument().message(reyden);
         no_status.http_status = None;
         assert!(!rejects_can_cloud_download(&no_status));
+    }
+
+    #[test]
+    fn read_only_query_detection_skips_comments_and_parentheses() {
+        for sql in [
+            "SELECT 1",
+            "  select 1",
+            "-- note\nWITH t AS (SELECT 1) SELECT * FROM t",
+            "/* hint */ (VALUES (1))",
+            "SHOW TABLES",
+            "describe t",
+            "EXPLAIN SELECT 1",
+        ] {
+            assert!(is_read_only_query(sql), "{sql:?}");
+        }
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "CALL p()",
+            "MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE",
+            "-- SELECT\nDELETE FROM t",
+            "/* unterminated SELECT",
+            "",
+            "SELECTED",
+        ] {
+            assert!(!is_read_only_query(sql), "{sql:?}");
+        }
     }
 
     #[test]
