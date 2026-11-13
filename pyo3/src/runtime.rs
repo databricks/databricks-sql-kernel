@@ -46,8 +46,11 @@ fn installed(slot: &Slot, pid: u32) -> Option<Arc<KernelRuntime>> {
 /// own runtime. The parent's is leaked rather than dropped, because
 /// dropping it would wait on threads that don't exist in the child.
 ///
-/// The lock is never held while building: a `fork()` taken while it is
-/// held would leave it locked forever in the child.
+/// A `fork()` taken while the slot lock is held would leave it locked in the
+/// child. The lock is not held while building, and the only caller,
+/// `Session.__new__`, holds the GIL across each short critical section, so a
+/// fork from Python (`os.fork()` runs with the GIL held) can't observe it
+/// locked. Native code that forks without the GIL could.
 pub(crate) fn shared() -> std::io::Result<Arc<KernelRuntime>> {
     let pid = std::process::id();
     if let Some(runtime) = installed(&lock_slot(), pid) {
@@ -80,10 +83,14 @@ const CLOSE_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
 ///
 /// A plain `Runtime` drop blocks until every worker exits, but a worker
 /// forwarding a log record through `pyo3_log` waits for the GIL, so
-/// dropping it with the GIL held deadlocks. Explicit `close()` calls go
-/// through [`release`](Self::release), which waits with the GIL released.
-/// `Drop` — reached when Python frees a handle — uses `shutdown_background`,
-/// so workers may still run briefly after it returns.
+/// dropping it with the GIL held deadlocks. [`release`](Self::release)
+/// shuts a standalone runtime down with the GIL released; `Drop` uses
+/// `shutdown_background`, so workers may still run briefly after it returns.
+///
+/// Sessions use the [`shared`] runtime, which neither ever stops. Work a
+/// closed session queued (fire-and-forget CloseStatement / DeleteSession,
+/// telemetry, log records) can still run after its `close()` returns; the
+/// logging bridge drops records once interpreter exit begins.
 ///
 /// Handle structs must declare their kernel object before this field:
 /// fields drop in order, and kernel `Drop` impls queue cleanup on it.
@@ -95,9 +102,9 @@ impl KernelRuntime {
     }
 
     /// Release a handle at the end of an explicit `close()`. If it was the
-    /// last one, shut down and wait for the workers with the GIL released,
-    /// so none is still logging into Python after `close()` returns. The
-    /// [`shared`] runtime is never the last one.
+    /// last one, shut down and wait for the workers with the GIL released.
+    /// The [`shared`] runtime is never the last one, so for sessions this
+    /// only drops the handle.
     pub(crate) fn release(runtime: Arc<Self>, py: Python<'_>) {
         if let Ok(mut runtime) = Arc::try_unwrap(runtime) {
             if let Some(runtime) = runtime.0.take() {
