@@ -2508,6 +2508,22 @@ mod tests {
         ))
     }
 
+    /// Download tasks decode chunks, so the reader over this provider reports
+    /// a ready `try_next_batch` as a cheap buffer hand-off.
+    #[tokio::test]
+    async fn cloudfetch_reader_try_next_batch_is_cheap() {
+        use crate::reader::ResultReader;
+
+        let fetcher: Arc<dyn ChunkLinkFetcher> = Arc::new(MockLinkFetcher::new(1));
+        let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+            fetcher,
+            unused_downloader(),
+            Arc::new(DashMap::new()),
+            true,
+        );
+        assert!(crate::reader::CloudFetchResultReader::new(provider).try_next_batch_is_cheap());
+    }
+
     /// `try_next_batch` must return `Pending` (without blocking) while the
     /// head chunk is not yet `Downloaded`, then `Ready` once it flips, and
     /// finally `End` after the last chunk is consumed. This exercises the

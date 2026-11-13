@@ -917,6 +917,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_reader_try_next_batch_is_cheap() {
+        use crate::reader::ResultReader;
+
+        let (initial_bytes, c0, c1, c2) = three_chunk_fixture();
+        let source: Arc<dyn InlineChunkSource> = MockSource::new(vec![c1, c2]);
+        let provider = InlineStreamingProvider::new(
+            source,
+            "stmt-1",
+            &initial_bytes,
+            c0.chunk_index,
+            c0.row_offset,
+            c0.row_count,
+            c0.next_chunk_index,
+            CompressionCodec::None,
+            1,
+            None,
+            tokio::runtime::Handle::current(),
+        )
+        .unwrap();
+        // The prefetch task decodes chunks, so a ready read only takes one.
+        assert!(crate::reader::InlineStreamingReader::new(provider).try_next_batch_is_cheap());
+    }
+
+    #[tokio::test]
     async fn prefetch_task_exits_when_consumer_drops() {
         // P0 #2 regression guard. The prefetch task must not keep
         // RPC-ing after the consumer has dropped the provider.

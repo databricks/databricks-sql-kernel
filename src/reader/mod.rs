@@ -2260,6 +2260,70 @@ mod tests {
         }
     }
 
+    fn inline_response(batch: &RecordBatch) -> ExecuteResponse {
+        let mut bytes = Vec::new();
+        let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+        writer.write(batch).unwrap();
+        writer.finish().unwrap();
+        drop(writer);
+        ExecuteResponse {
+            statement_id: "stmt-1".to_string(),
+            status: ok_status(),
+            manifest: Some(minimal_manifest(Some(1))),
+            result: Some(ExecuteResultData {
+                next_chunk_internal_link: None,
+                external_links: None,
+                inline_arrow_data: Some(bytes),
+                inline_chunk_index: Some(0),
+                inline_row_offset: Some(0),
+                inline_row_count: Some(batch.num_rows() as i64),
+                inline_next_chunk_index: None,
+            }),
+        }
+    }
+
+    /// Bindings read ready batches without giving up a host lock only when
+    /// this holds, so pin it for the readers the factory builds, including
+    /// through `ResultStream`.
+    #[tokio::test]
+    async fn factory_readers_report_cheap_try_next_batch() {
+        let factory = factory_for_control_flow_test();
+        let ints = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)])),
+            vec![Arc::new(arrow_array::Int64Array::from(vec![1, 2]))],
+        )
+        .unwrap();
+        let reader = factory
+            .create_reader(
+                "stmt-1",
+                &inline_response(&ints),
+                SessionAttribution::Current,
+            )
+            .await
+            .unwrap();
+        assert!(reader.try_next_batch_is_cheap());
+        let stream = crate::result_stream::ResultStream::from_reader(reader)
+            .await
+            .unwrap();
+        assert!(stream.try_next_batch_is_cheap());
+
+        // An untyped NULL column is rewritten per batch on the reading thread.
+        let nulls = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new("n", DataType::Null, true)])),
+            vec![Arc::new(arrow_array::NullArray::new(2))],
+        )
+        .unwrap();
+        let reader = factory
+            .create_reader(
+                "stmt-1",
+                &inline_response(&nulls),
+                SessionAttribution::Current,
+            )
+            .await
+            .unwrap();
+        assert!(!reader.try_next_batch_is_cheap());
+    }
+
     /// B-3: initial execute response must be strict about
     /// `row_count` when `next_chunk_index.is_some()`. Defaulting
     /// to 0 would silently corrupt the next-fetch row_offset.
