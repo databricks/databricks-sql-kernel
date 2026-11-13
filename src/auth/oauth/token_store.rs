@@ -301,13 +301,16 @@ impl TokenStore {
                 .context(format!("read lock error: {}", e))
         })?;
 
-        token.clone().ok_or_else(|| {
-            let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
-            last_error.clone().unwrap_or_else(|| {
-                Error::invalid_state()
-                    .message("token refresh failed: no token available after refresh")
-            })
-        })
+        // Like the caller that ran it, waiters on a failed refresh get its
+        // error instead of the missing or expired token it failed to replace.
+        let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+        match (token.as_ref(), last_error.as_ref()) {
+            (Some(t), Some(e)) if t.is_expired() => Err(e.clone()),
+            (Some(t), _) => Ok(t.clone()),
+            (None, Some(e)) => Err(e.clone()),
+            (None, None) => Err(Error::invalid_state()
+                .message("token refresh failed: no token available after refresh")),
+        }
     }
 }
 
@@ -528,6 +531,27 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("network error"));
+    }
+
+    #[test]
+    fn test_store_waiters_on_an_expired_token_get_the_failed_refresh_error() {
+        let store = Arc::new(TokenStore::new());
+        *store.token.write().unwrap() = Some(create_token_with_ttl(30)); // EXPIRED
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.get_or_refresh(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Err(Error::resource_exhausted().message("HTTP 429"))
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            let err = h.join().unwrap().unwrap_err();
+            assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
+        }
     }
 
     #[test]
