@@ -1267,7 +1267,22 @@ mod tests {
         first.spawn(async move {
             let _ = s.endpoints(&u, &c).await;
         });
-        std::thread::sleep(Duration::from_millis(200));
+        // Shut down only once the first open's attempt is in the slot and
+        // unresolved, so the second open has to join it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !shared
+            .discovery
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|d| d.peek().is_none())
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first open never started its discovery"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
         first.shutdown_background();
 
         let joined = second.block_on(async {
