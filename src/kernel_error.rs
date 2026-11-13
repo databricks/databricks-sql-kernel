@@ -165,6 +165,8 @@ pub struct OsError {
     pub code: i32,
     /// Requested local path for a file-transfer OS error.
     pub filename: Option<String>,
+    /// Logical filesystem operation when the failing API identifies it.
+    pub operation: Option<&'static str>,
 }
 
 /// Typed kernel error.

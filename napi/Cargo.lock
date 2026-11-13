@@ -661,6 +661,7 @@ dependencies = [
  "chrono",
  "databricks-sql-kernel",
  "futures",
+ "libloading",
  "napi",
  "napi-build",
  "napi-derive",

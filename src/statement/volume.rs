@@ -227,7 +227,7 @@ fn instruction_headers(batch: &RecordBatch) -> Result<HashMap<String, String>> {
     }
 }
 
-fn file_error(error: std::io::Error) -> Error {
+fn file_error(operation: Option<&'static str>, error: std::io::Error) -> Error {
     let permission_denied = error.kind() == std::io::ErrorKind::PermissionDenied;
     let mut mapped = Error::new(
         match error.kind() {
@@ -244,6 +244,7 @@ fn file_error(error: std::io::Error) -> Error {
         Box::new(OsError {
             code,
             filename: None,
+            operation,
         })
     });
     if permission_denied {
@@ -257,21 +258,24 @@ fn resolved_path(path: &Path) -> Result<PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let absolute = std::path::absolute(path).map_err(file_error)?;
+            let absolute = std::path::absolute(path).map_err(|error| file_error(None, error))?;
             let parent = absolute
                 .parent()
                 .ok_or_else(|| Error::invalid_argument().message("Invalid local file path"))?;
             let name = absolute
                 .file_name()
                 .ok_or_else(|| Error::invalid_argument().message("Invalid local file path"))?;
-            Ok(parent.canonicalize().map_err(file_error)?.join(name))
+            Ok(parent
+                .canonicalize()
+                .map_err(|error| file_error(Some("realpath"), error))?
+                .join(name))
         }
-        Err(error) => Err(file_error(error)),
+        Err(error) => Err(file_error(Some("realpath"), error)),
     }
 }
 
 fn missing_path_for_policy(path: &Path) -> Result<PathBuf> {
-    let absolute = std::path::absolute(path).map_err(file_error)?;
+    let absolute = std::path::absolute(path).map_err(|error| file_error(None, error))?;
     for ancestor in absolute.ancestors().skip(1) {
         if let Ok(mut resolved) = ancestor.canonicalize() {
             let suffix = absolute.strip_prefix(ancestor).unwrap();
@@ -420,10 +424,10 @@ async fn transfer(
                         std::fs::OpenOptions::new()
                             .write(true)
                             .open(&destination)
-                            .map_err(file_error)?;
+                            .map_err(|error| file_error(Some("open"), error))?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(file_error(error)),
+                    Err(error) => return Err(file_error(Some("stat"), error)),
                 }
             }
             Ok(destination)
@@ -461,14 +465,20 @@ async fn transfer(
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                         std::fs::Permissions::from_mode(0o666)
                     }
-                    Err(error) => return Err(file_error(error)),
+                    Err(error) => return Err(file_error(Some("stat"), error)),
                 };
                 builder.permissions(permissions);
                 builder
             };
-            let temporary = builder.tempfile_in(parent).map_err(file_error)?;
-            let file =
-                tokio::fs::File::from_std(temporary.as_file().try_clone().map_err(file_error)?);
+            let temporary = builder
+                .tempfile_in(parent)
+                .map_err(|error| file_error(Some("open"), error))?;
+            let file = tokio::fs::File::from_std(
+                temporary
+                    .as_file()
+                    .try_clone()
+                    .map_err(|error| file_error(None, error))?,
+            );
             Ok((temporary, file))
         })();
         log.finish("temp_create", started, temporary.as_ref().err());
@@ -478,7 +488,9 @@ async fn transfer(
             let mut body = response.bytes_stream();
             while let Some(bytes) = body.next().await {
                 let bytes = bytes.map_err(transport_error)?;
-                file.write_all(&bytes).await.map_err(file_error)?;
+                file.write_all(&bytes)
+                    .await
+                    .map_err(|error| file_error(Some("write"), error))?;
             }
             Ok(())
         }
@@ -486,7 +498,10 @@ async fn transfer(
         log.finish("body_write", started, body.as_ref().err());
         body?;
         let started = log.start("body_flush");
-        let flushed = file.flush().await.map_err(file_error);
+        let flushed = file
+            .flush()
+            .await
+            .map_err(|error| file_error(Some("write"), error));
         log.finish("body_flush", started, flushed.as_ref().err());
         flushed?;
         drop(file);
@@ -496,13 +511,15 @@ async fn transfer(
                 Ok(metadata) => temporary
                     .as_file()
                     .set_permissions(metadata.permissions())
-                    .map_err(file_error)?,
+                    .map_err(|error| file_error(Some("fchmod"), error))?,
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(file_error(error)),
+                Err(error) => return Err(file_error(Some("stat"), error)),
             }
+            // Windows persist can fail before replacement without identifying the operation.
+            let operation = cfg!(unix).then_some("rename");
             temporary
                 .persist(destination)
-                .map_err(|error| file_error(error.error))?;
+                .map_err(|error| file_error(operation, error.error))?;
             Ok(())
         })();
         log.finish("commit", started, committed.as_ref().err());
@@ -638,7 +655,7 @@ async fn send_transfer(
             let opened = async {
                 if !tokio::fs::metadata(local)
                     .await
-                    .map_err(file_error)?
+                    .map_err(|error| file_error(Some("stat"), error))?
                     .is_file()
                 {
                     return Err(
@@ -646,8 +663,13 @@ async fn send_transfer(
                     );
                 }
                 // Each retry reopens the file so a streaming upload starts at byte zero.
-                let file = tokio::fs::File::open(local).await.map_err(file_error)?;
-                let metadata = file.metadata().await.map_err(file_error)?;
+                let file = tokio::fs::File::open(local)
+                    .await
+                    .map_err(|error| file_error(Some("open"), error))?;
+                let metadata = file
+                    .metadata()
+                    .await
+                    .map_err(|error| file_error(Some("fstat"), error))?;
                 if !metadata.is_file() {
                     return Err(
                         Error::invalid_argument().message("Local upload path must be a file")
@@ -949,7 +971,7 @@ mod tests {
             (ErrorKind::TimedOut, ErrorCode::Timeout),
             (ErrorKind::Other, ErrorCode::Internal),
         ] {
-            let error = file_error(std::io::Error::from(kind));
+            let error = file_error(Some("stat"), std::io::Error::from(kind));
             assert_eq!(error.code, code);
             assert!(!error.retryable);
             assert!(error.os_error.is_none());
@@ -958,8 +980,10 @@ mod tests {
                 (kind == ErrorKind::PermissionDenied).then_some("FILE_TRANSFER_PERMISSION_ERROR")
             );
         }
-        let error = file_error(std::io::Error::from_raw_os_error(13));
-        assert_eq!(error.os_error.as_ref().map(|e| e.code), Some(13));
+        let error = file_error(None, std::io::Error::from_raw_os_error(13));
+        let os_error = error.os_error.as_ref().unwrap();
+        assert_eq!(os_error.code, 13);
+        assert_eq!(os_error.operation, None);
     }
 
     #[tokio::test]
@@ -988,8 +1012,27 @@ mod tests {
             let os_error = error.os_error.as_ref().unwrap();
             assert_eq!(Some(os_error.code), expected_code);
             assert_eq!(os_error.filename.as_deref(), local.to_str());
+            assert_eq!(os_error.operation, Some("realpath"));
             assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
         }
+        let missing_leaf = dir.path().join("missing");
+        let expected_code = std::fs::metadata(&missing_leaf).unwrap_err().raw_os_error();
+        let batch = instruction("PUT", &server.uri(), missing_leaf.to_str().unwrap());
+        let error = complete(
+            &client(),
+            result(batch, true),
+            &options,
+            &VolumeCompletion::default(),
+        )
+        .await
+        .err()
+        .unwrap();
+        assert_eq!(error.code, ErrorCode::NotFound);
+        let os_error = error.os_error.as_ref().unwrap();
+        assert_eq!(Some(os_error.code), expected_code);
+        assert_eq!(os_error.filename.as_deref(), missing_leaf.to_str());
+        assert_eq!(os_error.operation, Some("stat"));
+        assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
         assert!(server.received_requests().await.unwrap().is_empty());
     }
 

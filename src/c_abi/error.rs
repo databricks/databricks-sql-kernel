@@ -247,6 +247,7 @@ mod tests {
         error.os_error = Some(Box::new(crate::kernel_error::OsError {
             code: 2,
             filename: Some("local-file".into()),
+            operation: None,
         }));
         store_error(error.clone());
         clear_error();
@@ -277,6 +278,7 @@ mod tests {
         error.os_error = Some(Box::new(crate::kernel_error::OsError {
             code: 2,
             filename: Some("requested/local-file".into()),
+            operation: None,
         }));
         store_error(error.clone());
         let mut code = -1;

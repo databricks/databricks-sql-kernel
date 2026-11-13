@@ -212,6 +212,7 @@ mod tests {
                     Box::new(OsError {
                         code,
                         filename: Some("local-file.bin".to_owned()),
+                        operation: None,
                     })
                 });
                 let mapped = to_py_err(py, error);
