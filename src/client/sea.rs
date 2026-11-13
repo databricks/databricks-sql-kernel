@@ -2477,6 +2477,32 @@ mod tests {
     }
 
     #[test]
+    fn rejects_can_cloud_download_requires_http_400_and_names_the_setting() {
+        let rejection = |status: u16, message: &str| {
+            Error::from_http_status(status).message(format!("HTTP {status}: {message}"))
+        };
+        let reyden = r#"[INVALID_CONF_VALUE] The value 'false' in the config "can_cloud_download" is invalid."#;
+        assert!(rejects_can_cloud_download(&rejection(400, reyden)));
+        assert!(rejects_can_cloud_download(&rejection(
+            400,
+            "CAN_CLOUD_DOWNLOAD is not supported"
+        )));
+        for status in [401, 403, 404, 429, 500, 503] {
+            assert!(
+                !rejects_can_cloud_download(&rejection(status, reyden)),
+                "HTTP {status} must not trigger the INLINE fallback"
+            );
+        }
+        assert!(!rejects_can_cloud_download(&rejection(
+            400,
+            "[INVALID_CONF_VALUE] TIMEZONE is invalid"
+        )));
+        let mut no_status = Error::invalid_argument().message(reyden);
+        no_status.http_status = None;
+        assert!(!rejects_can_cloud_download(&no_status));
+    }
+
+    #[test]
     fn test_list_table_types() {
         let client = create_test_client();
         let types = client.list_table_types();
