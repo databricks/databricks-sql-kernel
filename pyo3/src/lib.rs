@@ -36,6 +36,7 @@ mod auth;
 mod errors;
 mod executed_async;
 mod fetch;
+mod gil;
 mod logging;
 mod metadata;
 mod params;

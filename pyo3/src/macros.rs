@@ -61,6 +61,10 @@ macro_rules! run_kernel {
 /// mid-execute cancel guard, so the server-side statement is cancelled
 /// too, not just abandoned.
 ///
+/// Only Python's main thread runs signal handlers, so on any other thread
+/// the future runs in one GIL-released slice: re-acquiring the GIL every
+/// tick there costs a GIL hand-off and checks nothing.
+///
 /// `$runtime` must be a `&tokio::runtime::Runtime` (so the future can
 /// be driven across slices). Expands to a `PyResult<T>` (the future's
 /// `Ok` value), mapping kernel `Error`s via `to_py_err` and surfacing
@@ -73,7 +77,13 @@ macro_rules! run_kernel_interruptible {
         // 100ms balances interrupt latency against per-tick overhead.
         const TICK: ::std::time::Duration = ::std::time::Duration::from_millis(100);
         let mut fut = ::std::boxed::Box::pin($future);
+        let interruptible = $crate::gil::on_main_thread(py);
         loop {
+            if !interruptible {
+                break py
+                    .detach(|| runtime.block_on(&mut fut))
+                    .map_err(|e| $crate::errors::to_py_err(py, e));
+            }
             let step = py.detach(|| {
                 runtime.block_on(async {
                     match ::tokio::time::timeout(TICK, &mut fut).await {

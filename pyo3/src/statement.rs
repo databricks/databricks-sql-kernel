@@ -27,8 +27,8 @@ use crate::runtime::KernelRuntime;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
-    Error as KError, ExecutedStatement as KExecutedStatement, ExecutedStatementHandle,
-    Statement as KStatement, StatementCanceller as KStatementCanceller,
+    Error as KError, ExecutedStatement as KExecutedStatement, ExecutedStatementHandle, ResultBatch,
+    Statement as KStatement, StatementCanceller as KStatementCanceller, TryNextBatch,
 };
 use pyo3::prelude::*;
 use std::collections::HashMap;
@@ -349,10 +349,30 @@ impl ExecutedStatement {
             return Ok(None);
         }
         let runtime = inner.runtime.clone();
-        // `next_batch_exec` drives the ExecutedStatement so the kernel's
-        // auto-close-on-drain fires the server CloseStatement once the
-        // stream is exhausted (after all lazy CloudFetch link fetches).
-        let batch = run_sync_kernel!(py, fetch::next_batch_exec(&runtime, &mut inner.exec))?;
+        // Inline results and already-downloaded CloudFetch chunks are in
+        // memory: take them without a GIL hand-off. Both paths drive the
+        // ExecutedStatement, so auto-close-on-drain still fires the server
+        // CloseStatement once the stream is exhausted.
+        let ready = {
+            let _context = runtime.enter();
+            match inner.exec.try_next_batch().map_err(|e| to_py_err(py, e))? {
+                TryNextBatch::Ready(ResultBatch::Arrow(rb)) => Some(Some(rb.clone())),
+                // Same error as the blocking path; falling back would skip it.
+                TryNextBatch::Ready(_) => {
+                    return Err(to_py_err(
+                        py,
+                        KError::invalid_argument()
+                            .message("kernel returned a non-Arrow ResultBatch variant"),
+                    ))
+                }
+                TryNextBatch::End => Some(None),
+                _ => None,
+            }
+        };
+        let batch = match ready {
+            Some(batch) => batch,
+            None => run_sync_kernel!(py, fetch::next_batch_exec(&runtime, &mut inner.exec))?,
+        };
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
@@ -397,7 +417,13 @@ impl ExecutedStatement {
             return Ok(());
         };
         let runtime = inner.runtime.clone();
-        let res = run_kernel!(py, runtime, KExecutedStatement::close(&mut inner.exec));
+        let res = if inner.exhausted {
+            // Drain already fired CloseStatement, so this does no I/O.
+            crate::gil::run_ready_first(py, &runtime, KExecutedStatement::close(&mut inner.exec))
+                .map_err(|e| to_py_err(py, e))
+        } else {
+            run_kernel!(py, runtime, KExecutedStatement::close(&mut inner.exec))
+        };
         // Drop the kernel handle regardless of close() outcome — the
         // kernel's Drop impl runs fire-and-forget cleanup if close()
         // failed mid-flight.

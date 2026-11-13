@@ -14,6 +14,12 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ### Added
 
 ### Changed
+- `ExecutedStatement.fetch_next_batch()` returns batches that are already
+  in memory without releasing the GIL, `close()` after the stream is
+  drained no longer releases it either, and `Statement.execute()` on a
+  thread other than the main thread no longer re-acquires it every
+  100 ms to check for signals that only the main thread can receive.
+  This cuts GIL hand-offs per query when many threads share the GIL.
 
 ### Updated
 
