@@ -25,9 +25,11 @@
 //! unanswered after [`HEDGE`] is no longer joined: the next caller starts a
 //! fresh one, so one dropped query can't hold every new connection.
 //!
-//! The answer is not invalidated when connecting to it fails, so after a
-//! host moves to new addresses, new connections in this process may try the
-//! old ones for up to [`TTL`] (the JVM's default caches the same way).
+//! [`TTL`] is fixed: `getaddrinfo` doesn't report the record's own DNS TTL,
+//! so that is ignored. The answer is also not invalidated when connecting to
+//! it fails, so after a host moves to new addresses, new connections in this
+//! process may try the old ones for up to [`TTL`] (the JVM's default caches
+//! the same way).
 
 use std::collections::HashMap;
 use std::io;
