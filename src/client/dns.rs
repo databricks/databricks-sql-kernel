@@ -26,11 +26,12 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
-use tokio::sync::OnceCell;
+use tokio::sync::watch;
 
 /// How long a successful answer is reused. Matches the JVM's default
 /// positive-lookup TTL, so the JDBC driver's behaviour is the reference.
@@ -40,11 +41,15 @@ const MAX_HOSTS: usize = 256;
 
 type Lookup = Arc<dyn Fn(&str) -> io::Result<Vec<SocketAddr>> + Send + Sync>;
 type Answer = (Result<Arc<[SocketAddr]>, Arc<io::Error>>, Instant);
+/// `None` while the lookup thread runs; the thread publishes the answer.
+type Entry = watch::Receiver<Option<Answer>>;
 
 pub(crate) struct CachingResolver {
-    entries: Mutex<HashMap<String, Arc<OnceCell<Answer>>>>,
+    entries: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
     lookup: Lookup,
+    /// Rotates the first address handed out, as round-robin DNS would.
+    next: AtomicUsize,
 }
 
 impl CachingResolver {
@@ -61,75 +66,108 @@ impl CachingResolver {
             entries: Mutex::new(HashMap::new()),
             ttl,
             lookup,
+            next: AtomicUsize::new(0),
         }
     }
 
     /// The lookup to join for `host`: the one in flight, a fresh cached
     /// answer, or a new lookup when the last one expired or failed.
-    fn entry(&self, host: &str) -> Arc<OnceCell<Answer>> {
+    fn entry(&self, host: &str) -> Entry {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = |cell: &OnceCell<Answer>| match cell.get() {
-            None => true,
-            Some((Ok(_), at)) => at.elapsed() < self.ttl,
-            Some((Err(_), _)) => false,
+        let usable = |entry: &Entry| {
+            let in_flight = match &*entry.borrow() {
+                None => true,
+                Some((Ok(_), at)) => return at.elapsed() < self.ttl,
+                Some((Err(_), _)) => return false,
+            };
+            // An unanswered entry whose thread is gone will never be answered.
+            in_flight && entry.has_changed().is_ok()
         };
-        if let Some(cell) = entries.get(host) {
-            if usable(cell) {
-                return Arc::clone(cell);
+        if let Some(entry) = entries.get(host) {
+            if usable(entry) {
+                return entry.clone();
             }
         }
         if entries.len() >= MAX_HOSTS {
-            entries.retain(|_, cell| usable(cell));
+            entries.retain(|_, entry| usable(entry));
             if entries.len() >= MAX_HOSTS {
                 entries.clear();
             }
         }
-        let cell = Arc::new(OnceCell::new());
-        entries.insert(host.to_owned(), Arc::clone(&cell));
-        cell
+        let entry = self.start_lookup(host);
+        entries.insert(host.to_owned(), entry.clone());
+        entry
+    }
+
+    /// Run the blocking lookup on its own thread, which publishes the answer
+    /// itself: waiters from other sessions depend on it, so it must not be
+    /// abandoned when the caller that started it is cancelled or its runtime
+    /// shuts down.
+    fn start_lookup(&self, host: &str) -> Entry {
+        let (tx, rx) = watch::channel(None);
+        let tx = Arc::new(tx);
+        let thread_tx = Arc::clone(&tx);
+        let lookup = Arc::clone(&self.lookup);
+        let host = host.to_owned();
+        let spawned = std::thread::Builder::new()
+            .name("dbx-sql-kernel-dns".to_owned())
+            .spawn(move || {
+                let result = lookup(&host).and_then(|addrs| {
+                    if addrs.is_empty() {
+                        Err(io::Error::new(
+                            io::ErrorKind::NotFound,
+                            "DNS lookup returned no addresses",
+                        ))
+                    } else {
+                        Ok(addrs)
+                    }
+                });
+                thread_tx.send_replace(Some((
+                    result.map(Arc::from).map_err(Arc::new),
+                    Instant::now(),
+                )));
+            });
+        if let Err(e) = spawned {
+            tx.send_replace(Some((Err(Arc::new(e)), Instant::now())));
+        }
+        rx
     }
 }
 
 impl Resolve for CachingResolver {
     fn resolve(&self, name: Name) -> Resolving {
-        let host = name.as_str().to_owned();
-        let cell = self.entry(&host);
-        let lookup = Arc::clone(&self.lookup);
+        let mut entry = self.entry(name.as_str());
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
         Box::pin(async move {
-            let (answer, _) = cell.get_or_init(|| run_lookup(lookup, host)).await;
-            match answer {
-                Ok(addrs) => {
-                    let addrs = Arc::clone(addrs);
-                    Ok(Box::new((0..addrs.len()).map(move |i| addrs[i])) as Addrs)
-                }
-                Err(e) => Err(io::Error::new(e.kind(), e.to_string()).into()),
+            let result = match entry.wait_for(Option::is_some).await {
+                Ok(answer) => answer.as_ref().map(|(result, _)| result.clone()),
+                Err(_) => None,
+            };
+            match result {
+                Some(Ok(addrs)) => Ok(Box::new(rotated(addrs, start)) as Addrs),
+                Some(Err(e)) => Err(io::Error::new(e.kind(), e.to_string()).into()),
+                None => Err(io::Error::other("DNS lookup thread exited").into()),
             }
         })
     }
 }
 
-/// Run the blocking lookup on its own thread, not the caller's blocking
-/// pool: other sessions wait on this answer, so it must not be cancelled
-/// when the session that started it shuts its runtime down.
-async fn run_lookup(lookup: Lookup, host: String) -> Answer {
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    let spawned = std::thread::Builder::new()
-        .name("dbx-sql-kernel-dns".to_owned())
-        .spawn(move || {
-            let _ = tx.send(lookup(&host));
-        });
-    let result = match spawned {
-        Err(e) => Err(e),
-        Ok(_) => match rx.await {
-            Ok(Ok(addrs)) if addrs.is_empty() => Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                "DNS lookup returned no addresses",
-            )),
-            Ok(result) => result,
-            Err(_) => Err(io::Error::other("DNS lookup thread exited")),
-        },
-    };
-    (result.map(Arc::from).map_err(Arc::new), Instant::now())
+/// `addrs` starting at a different address per call. Only the leading run
+/// of one address family rotates, so the family the connector tries first
+/// (happy eyeballs) stays the resolver's choice.
+fn rotated(addrs: Arc<[SocketAddr]>, start: usize) -> impl Iterator<Item = SocketAddr> + Send {
+    let lead = addrs
+        .iter()
+        .take_while(|a| a.is_ipv4() == addrs[0].is_ipv4())
+        .count();
+    let offset = start % lead.max(1);
+    (0..addrs.len()).map(move |i| {
+        if i < lead {
+            addrs[(i + offset) % lead]
+        } else {
+            addrs[i]
+        }
+    })
 }
 
 fn system_lookup(host: &str) -> io::Result<Vec<SocketAddr>> {
@@ -249,6 +287,37 @@ mod tests {
             .build()
             .unwrap();
         assert!(second.block_on(resolve(&r, "example.com")).is_ok());
-        assert!(calls.load(Ordering::SeqCst) <= 2);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn lookup_survives_a_cancelled_caller() {
+        let (lookup, calls) = counting(Duration::from_millis(100), false);
+        let r = Arc::new(CachingResolver::new(TTL, lookup));
+        let timed_out =
+            tokio::time::timeout(Duration::from_millis(10), resolve(&r, "example.com")).await;
+        assert!(timed_out.is_err(), "first caller is cancelled mid-lookup");
+        resolve(&r, "example.com").await.unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn each_call_starts_at_the_next_address_of_the_leading_family() {
+        let lookup: Lookup = Arc::new(|_| {
+            Ok(["10.0.0.1:0", "10.0.0.2:0", "10.0.0.3:0", "[::1]:0"]
+                .iter()
+                .map(|a| a.parse().unwrap())
+                .collect())
+        });
+        let r = Arc::new(CachingResolver::new(TTL, lookup));
+        let mut firsts = std::collections::HashSet::new();
+        for _ in 0..3 {
+            let addrs = resolve(&r, "example.com").await.unwrap();
+            assert_eq!(addrs.len(), 4);
+            assert!(addrs[..3].iter().all(SocketAddr::is_ipv4));
+            assert_eq!(addrs[3], "[::1]:0".parse().unwrap());
+            firsts.insert(addrs[0]);
+        }
+        assert_eq!(firsts.len(), 3);
     }
 }
