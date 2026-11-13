@@ -92,9 +92,9 @@ pub(crate) struct TokenStore {
     /// Flag indicating whether a refresh is currently in progress.
     /// This prevents concurrent refresh attempts.
     refreshing: Arc<AtomicBool>,
-    /// Error from the last failed blocking refresh, handed to the callers
-    /// that waited on it.
-    last_error: Mutex<Option<Error>>,
+    /// Error from the last refresh (blocking or background) if it failed,
+    /// handed to the callers that waited on it.
+    last_error: Arc<Mutex<Option<Error>>>,
 }
 
 impl TokenStore {
@@ -103,7 +103,7 @@ impl TokenStore {
         Self {
             token: Arc::new(RwLock::new(None)),
             refreshing: Arc::new(AtomicBool::new(false)),
-            last_error: Mutex::new(None),
+            last_error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -260,6 +260,7 @@ impl TokenStore {
             // Clone Arc pointers to move into the task
             let token = self.token.clone();
             let refreshing = self.refreshing.clone();
+            let last_error = self.last_error.clone();
 
             // Spawn on tokio's blocking thread pool (reuses threads, cheaper than std::thread::spawn)
             tokio::task::spawn_blocking(move || {
@@ -269,8 +270,12 @@ impl TokenStore {
                 };
 
                 let result = refresh_fn();
+                // Not returned to anyone here, but a blocking caller that lost
+                // the race to this refresh waits on it and reads the outcome.
+                *last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                    result.as_ref().err().cloned();
 
-                // Store the new token if successful (ignore errors in background)
+                // Store the new token if successful
                 if let Ok(new_token) = result {
                     if let Ok(mut token_guard) = token.write() {
                         *token_guard = Some(new_token);
@@ -552,6 +557,30 @@ mod tests {
             let err = h.join().unwrap().unwrap_err();
             assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_store_blocking_caller_gets_a_failed_background_refresh_error() {
+        let store = Arc::new(TokenStore::new());
+        let stale = create_token_with_expiry(Utc::now() + Duration::seconds(600), 1200);
+        *store.token.write().unwrap() = Some(stale);
+        // STALE: starts a background refresh that fails.
+        store
+            .get_or_refresh(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Err(Error::resource_exhausted().message("HTTP 429"))
+            })
+            .expect("stale token is returned");
+        // The token reaches the expiry buffer while that refresh still runs.
+        *store.token.write().unwrap() = Some(create_token_with_ttl(30));
+        let s = store.clone();
+        let err = tokio::task::spawn_blocking(move || {
+            s.get_or_refresh(|| unreachable!("the background refresh holds the flag"))
+        })
+        .await
+        .unwrap()
+        .unwrap_err();
+        assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
     }
 
     #[test]
