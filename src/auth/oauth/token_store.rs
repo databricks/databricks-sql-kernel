@@ -306,11 +306,12 @@ impl TokenStore {
                 .context(format!("read lock error: {}", e))
         })?;
 
-        // Like the caller that ran it, waiters on a failed refresh get its
-        // error instead of the missing or expired token it failed to replace.
+        // After a failed refresh, waiters keep a token the server still
+        // accepts (inside the expiry buffer) and get the refresh's error only
+        // when there is none, rather than a token past its expiry.
         let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
         match (token.as_ref(), last_error.as_ref()) {
-            (Some(t), Some(e)) if t.is_expired() => Err(e.clone()),
+            (Some(t), Some(e)) if t.expires_at <= chrono::Utc::now() => Err(e.clone()),
             (Some(t), _) => Ok(t.clone()),
             (None, Some(e)) => Err(e.clone()),
             (None, None) => Err(Error::invalid_state()
@@ -538,25 +539,34 @@ mod tests {
         assert!(err_msg.contains("network error"));
     }
 
+    /// A caller waits on a refresh that is already running (`refreshing` set
+    /// by hand) and then fails with HTTP 429.
+    fn wait_on_failed_refresh(token: OAuthToken) -> Result<OAuthToken> {
+        let store = Arc::new(TokenStore::new());
+        *store.token.write().unwrap() = Some(token);
+        store.refreshing.store(true, Ordering::SeqCst);
+        let s = store.clone();
+        let waiter = std::thread::spawn(move || {
+            s.get_or_refresh(|| unreachable!("another caller holds the refresh"))
+        });
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        *store.last_error.lock().unwrap() = Some(Error::resource_exhausted().message("HTTP 429"));
+        store.refreshing.store(false, Ordering::SeqCst);
+        waiter.join().unwrap()
+    }
+
+    #[test]
+    fn test_store_waiters_keep_a_still_valid_token_when_the_refresh_fails() {
+        // 30 s left: inside the 40 s expiry buffer, still accepted by the server.
+        let token = wait_on_failed_refresh(create_token_with_ttl(30)).expect("cached token");
+        assert_eq!(token.access_token, "token-30");
+    }
+
     #[test]
     fn test_store_waiters_on_an_expired_token_get_the_failed_refresh_error() {
-        let store = Arc::new(TokenStore::new());
-        *store.token.write().unwrap() = Some(create_token_with_ttl(30)); // EXPIRED
-        let handles: Vec<_> = (0..8)
-            .map(|_| {
-                let store = store.clone();
-                std::thread::spawn(move || {
-                    store.get_or_refresh(|| {
-                        std::thread::sleep(std::time::Duration::from_millis(50));
-                        Err(Error::resource_exhausted().message("HTTP 429"))
-                    })
-                })
-            })
-            .collect();
-        for h in handles {
-            let err = h.join().unwrap().unwrap_err();
-            assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
-        }
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        let err = wait_on_failed_refresh(expired).unwrap_err();
+        assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -571,8 +581,11 @@ mod tests {
                 Err(Error::resource_exhausted().message("HTTP 429"))
             })
             .expect("stale token is returned");
-        // The token reaches the expiry buffer while that refresh still runs.
-        *store.token.write().unwrap() = Some(create_token_with_ttl(30));
+        // The token expires while that refresh still runs.
+        *store.token.write().unwrap() = Some(create_token_with_expiry(
+            Utc::now() - Duration::seconds(5),
+            1200,
+        ));
         let s = store.clone();
         let err = tokio::task::spawn_blocking(move || {
             s.get_or_refresh(|| unreachable!("the background refresh holds the flag"))
