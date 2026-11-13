@@ -35,6 +35,7 @@ use crate::client::http::DatabricksHttpClient;
 use crate::client::retry::{is_non_retryable_status, RequestType};
 use crate::kernel_error::{Error, Result};
 use crate::util::runtime::block_on_in_runtime;
+use futures::future::{BoxFuture, FutureExt, Shared};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, ClientId, ClientSecret, HttpRequest, HttpResponse, RequestTokenError, Scope,
@@ -42,18 +43,52 @@ use oauth2::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::fmt;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use tokio::runtime::Handle as RuntimeHandle;
-use tokio::sync::OnceCell;
+
+/// `(token_endpoint, authorization_endpoint)` from one OIDC discovery.
+type Discovery = Shared<BoxFuture<'static, Result<(String, String)>>>;
 
 /// OIDC endpoints and token store shared by every live provider in the
 /// process that uses the same credentials, so N sessions opening at once
 /// run one discovery and one token exchange instead of N of each.
-#[derive(Debug)]
 struct SharedCredentials {
     key: CredentialsKey,
-    endpoints: OnceCell<(String, String)>,
+    discovery: Mutex<Option<Discovery>>,
     token_store: Arc<TokenStore>,
+}
+
+impl fmt::Debug for SharedCredentials {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SharedCredentials")
+            .field("key", &self.key)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SharedCredentials {
+    /// The discovery to await: the one in flight or done, or a new one if the
+    /// last attempt failed. Callers that join an attempt get its result, error
+    /// included, instead of each retrying it in turn.
+    fn discovery(&self, host: &str, http_client: &Arc<DatabricksHttpClient>) -> Discovery {
+        let mut slot = self.discovery.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(discovery) = slot.as_ref() {
+            if !matches!(discovery.peek(), Some(Err(_))) {
+                return discovery.clone();
+            }
+        }
+        let host = host.to_owned();
+        let http_client = Arc::clone(http_client);
+        let discovery = async move {
+            let endpoints = OidcEndpoints::discover(&host, &http_client).await?;
+            Ok((endpoints.token_endpoint, endpoints.authorization_endpoint))
+        }
+        .boxed()
+        .shared();
+        *slot = Some(discovery.clone());
+        discovery
+    }
 }
 
 /// Identifies credentials without holding the secret itself.
@@ -82,7 +117,7 @@ fn shared_credentials(key: CredentialsKey) -> Arc<SharedCredentials> {
     }
     let shared = Arc::new(SharedCredentials {
         key: key.clone(),
-        endpoints: OnceCell::new(),
+        discovery: Mutex::new(None),
         token_store: Arc::new(TokenStore::new()),
     });
     registry.insert(key, Arc::downgrade(&shared));
@@ -289,14 +324,7 @@ impl ClientCredentialsProvider {
         });
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
-            None => shared
-                .endpoints
-                .get_or_try_init(|| async {
-                    let endpoints = OidcEndpoints::discover(host, &http_client).await?;
-                    Ok::<_, Error>((endpoints.token_endpoint, endpoints.authorization_endpoint))
-                })
-                .await?
-                .clone(),
+            None => shared.discovery(host, &http_client).await?,
         };
 
         Ok(Self {
@@ -1059,6 +1087,57 @@ mod tests {
         assert_eq!(token_mocks[0].received_requests().await.len(), 4);
         assert_eq!(token_mocks[1].received_requests().await.len(), 2);
         assert_eq!(registered(&a), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_opens_share_a_failed_discovery() {
+        let mock_server = MockServer::start().await;
+        let discovery = Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(
+                ResponseTemplate::new(500)
+                    .set_body_string("Internal server error")
+                    .set_delay(Duration::from_millis(300)),
+            )
+            .mount_as_scoped(&mock_server)
+            .await;
+        let uri = mock_server.uri();
+        let client = || {
+            let retry = RetryConfig {
+                max_retries: 0,
+                ..RetryConfig::default()
+            };
+            Arc::new(
+                DatabricksHttpClient::new(
+                    HttpClientConfig::default(),
+                    build_retry_configs(&retry, &HashMap::new()),
+                )
+                .expect("Failed to create HTTP client"),
+            )
+        };
+        // Clients first, so every open is in flight before discovery answers.
+        let clients: Vec<_> = (0..8).map(|_| client()).collect();
+        let results = futures::future::join_all(
+            clients
+                .into_iter()
+                .map(|c| ClientCredentialsProvider::new(&uri, "client", "secret", c)),
+        )
+        .await;
+        for result in results {
+            assert!(format!("{:?}", result.unwrap_err()).contains("500"));
+        }
+        assert_eq!(discovery.received_requests().await.len(), 1);
+
+        assert!(
+            ClientCredentialsProvider::new(&uri, "client", "secret", client())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            discovery.received_requests().await.len(),
+            2,
+            "a failed discovery is retried by the next open"
+        );
     }
 
     async fn shared_test_provider(
