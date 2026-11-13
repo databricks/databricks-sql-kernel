@@ -1681,6 +1681,259 @@ async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
     );
 }
 
+const RT_STATEMENTS: &str = "/api/2.0/sql/warehouses/test_wh/sessions/rt-sess/statements";
+
+/// A realtime (Reyden) session: the CreateSession response carries the
+/// realtime header and statements go to the warehouse-session route.
+async fn open_realtime_session(server: &MockServer) -> Session {
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-databricks-rt-session", "true")
+                .set_body_json(
+                    json!({"session_id": "rt-sess", "session_version": {"version_id": 1}}),
+                ),
+        )
+        .mount(server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(server)
+        .await;
+    open_session_with_result(server, ResultConfig::default()).await
+}
+
+async fn recorded_execute_dispositions(server: &MockServer) -> Vec<String> {
+    server
+        .received_requests()
+        .await
+        .expect("wiremock received_requests must be available")
+        .iter()
+        .filter(|r| r.method.as_str() == "POST" && r.url.path().ends_with("/statements"))
+        .map(|r| {
+            let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+            body["disposition"].as_str().unwrap().to_string()
+        })
+        .collect()
+}
+
+async fn run_and_drain(session: &Session, sql: &str) -> databricks_sql_kernel::Result<usize> {
+    let mut stmt = session.statement();
+    stmt.spec().sql(sql);
+    let mut exec = stmt.execute().await?;
+    let rows = drain(exec.result_stream_mut())
+        .await
+        .iter()
+        .map(|b| b.num_rows())
+        .sum();
+    exec.close().await?;
+    Ok(rows)
+}
+
+#[tokio::test]
+async fn realtime_repeat_select_with_small_result_uses_inline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_body("stmt-1", &int64_batch("n", vec![7]))),
+        )
+        .mount(&server)
+        .await;
+    let session = open_realtime_session(&server).await;
+    for sql in [
+        "SELECT 7 AS n",
+        "SELECT 7 AS n",
+        " -- comment\n(SELECT 8 AS n)",
+        " -- comment\n(SELECT 8 AS n)",
+        "INSERT INTO t VALUES (1)",
+        "INSERT INTO t VALUES (1)",
+    ] {
+        assert_eq!(run_and_drain(&session, sql).await.expect(sql), 1);
+    }
+    assert_eq!(
+        recorded_execute_dispositions(&server).await,
+        [
+            "INLINE_OR_EXTERNAL_LINKS",
+            "INLINE",
+            "INLINE_OR_EXTERNAL_LINKS",
+            "INLINE",
+            "INLINE_OR_EXTERNAL_LINKS",
+            "INLINE_OR_EXTERNAL_LINKS",
+        ]
+    );
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn realtime_inline_overflow_reruns_with_external_links() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    let mut overflow: serde_json::Value = serde_json::from_str(&failed_body(
+        "stmt-inline",
+        "Inline byte limit exceeded",
+        "42000",
+    ))
+    .unwrap();
+    overflow["status"]["error"]["error_code"] = json!("BAD_REQUEST");
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .and(body_string_contains(r#""disposition":"INLINE""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(overflow))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_body("stmt-1", &int64_batch("n", vec![7]))),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let session = open_realtime_session(&server).await;
+    assert_eq!(run_and_drain(&session, "SELECT 7 AS n").await.unwrap(), 1);
+    assert_eq!(
+        run_and_drain(&session, "SELECT 7 AS n")
+            .await
+            .expect("re-run must succeed"),
+        1
+    );
+    assert_eq!(
+        recorded_execute_dispositions(&server).await,
+        [
+            "INLINE_OR_EXTERNAL_LINKS",
+            "INLINE",
+            "INLINE_OR_EXTERNAL_LINKS"
+        ]
+    );
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn realtime_truncated_inline_result_reruns_with_external_links() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    let mut truncated: serde_json::Value = serde_json::from_str(&succeeded_inline_body(
+        "stmt-inline",
+        &int64_batch("n", vec![7]),
+    ))
+    .unwrap();
+    truncated["manifest"]["truncated"] = json!(true);
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .and(body_string_contains(r#""disposition":"INLINE""#))
+        .respond_with(ResponseTemplate::new(200).set_body_json(truncated))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(succeeded_inline_body(
+                "stmt-1",
+                &int64_batch("n", vec![7, 8]),
+            )),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    let session = open_realtime_session(&server).await;
+    assert_eq!(run_and_drain(&session, "SELECT n FROM t").await.unwrap(), 2);
+    assert_eq!(run_and_drain(&session, "SELECT n FROM t").await.unwrap(), 2);
+    assert_eq!(
+        recorded_execute_dispositions(&server).await,
+        [
+            "INLINE_OR_EXTERNAL_LINKS",
+            "INLINE",
+            "INLINE_OR_EXTERNAL_LINKS"
+        ]
+    );
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn realtime_inline_small_results_can_be_disabled_through_session_conf() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("x-databricks-rt-session", "true")
+                .set_body_json(
+                    json!({"session_id": "rt-sess", "session_version": {"version_id": 1}}),
+                ),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(RT_STATEMENTS))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_body("stmt-1", &int64_batch("n", vec![7]))),
+        )
+        .mount(&server)
+        .await;
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .session_conf(std::collections::HashMap::from([(
+            "realtime_inline_small_results".into(),
+            "false".into(),
+        )]))
+        .open()
+        .await
+        .expect("session open");
+    run_and_drain(&session, "SELECT 7 AS n").await.unwrap();
+    run_and_drain(&session, "SELECT 7 AS n").await.unwrap();
+    assert_eq!(
+        recorded_execute_dispositions(&server).await,
+        ["INLINE_OR_EXTERNAL_LINKS", "INLINE_OR_EXTERNAL_LINKS"]
+    );
+    let create = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|r| r.url.path() == "/api/2.0/sql/warehouses/test_wh/sessions")
+        .unwrap();
+    assert!(!String::from_utf8_lossy(&create.body).contains("realtime_inline_small_results"));
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn standard_route_never_uses_inline() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_execute(
+        &server,
+        succeeded_inline_body("stmt-1", &int64_batch("n", vec![7])),
+    )
+    .await;
+    let session = open_session_with_result(&server, ResultConfig::default()).await;
+    run_and_drain(&session, "SELECT 7 AS n").await.unwrap();
+    run_and_drain(&session, "SELECT 7 AS n").await.unwrap();
+    assert_eq!(
+        recorded_execute_dispositions(&server).await,
+        ["INLINE_OR_EXTERNAL_LINKS", "INLINE_OR_EXTERNAL_LINKS"]
+    );
+    session.close().await.expect("close session");
+}
+
 #[tokio::test]
 async fn cloudfetch_disabled_falls_back_to_inline_when_warehouse_rejects_can_cloud_download() {
     use wiremock::matchers::body_string_contains;

@@ -1151,6 +1151,14 @@ pub struct ResultConfig {
     ///
     /// Default `false`.
     pub intervals_as_string: bool,
+
+    /// On Lakehouse Real-Time sessions, run a read-only statement with the
+    /// `INLINE` result disposition once its SQL text has returned a small
+    /// result. The hybrid disposition makes the server persist every result to
+    /// cloud storage, which costs throughput and causes failures at high
+    /// concurrency. A result that outgrows the inline limit is detected and the
+    /// statement runs again with the hybrid disposition. Default `true`.
+    pub realtime_inline_small_results: bool,
 }
 
 impl Default for ResultConfig {
@@ -1162,6 +1170,7 @@ impl Default for ResultConfig {
             inline_max_chunks_in_memory: 4,
             complex_types_as_json: false,
             intervals_as_string: false,
+            realtime_inline_small_results: true,
         }
     }
 }
@@ -1193,6 +1202,7 @@ pub(crate) enum ClientConfKey {
     InlineMaxChunksInMemory,
     ComplexTypesAsJson,
     IntervalsAsString,
+    RealtimeInlineSmallResults,
 }
 
 impl ClientConfKey {
@@ -1205,6 +1215,7 @@ impl ClientConfKey {
         Self::InlineMaxChunksInMemory,
         Self::ComplexTypesAsJson,
         Self::IntervalsAsString,
+        Self::RealtimeInlineSmallResults,
     ];
 
     /// The canonical wire spelling of this key.
@@ -1216,6 +1227,7 @@ impl ClientConfKey {
             Self::InlineMaxChunksInMemory => "inline_max_chunks_in_memory",
             Self::ComplexTypesAsJson => "complex_types_as_json",
             Self::IntervalsAsString => "intervals_as_string",
+            Self::RealtimeInlineSmallResults => "realtime_inline_small_results",
         }
     }
 
@@ -1323,6 +1335,9 @@ impl ResultConfig {
             }
             ClientConfKey::IntervalsAsString => {
                 self.intervals_as_string = parse_bool(value)?;
+            }
+            ClientConfKey::RealtimeInlineSmallResults => {
+                self.realtime_inline_small_results = parse_bool(value)?;
             }
         }
         Ok(())
