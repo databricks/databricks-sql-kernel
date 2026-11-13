@@ -16,6 +16,7 @@ use super::exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExpo
 use super::models::TelemetryRequest;
 use crate::client::retry::RequestType;
 use crate::client::DatabricksHttpClient;
+use crate::kernel_error::Error as KernelError;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Body, Method, Request, Url};
 use std::future::Future;
@@ -70,8 +71,15 @@ impl TelemetryExporter for DatabricksTelemetryExporter {
                 .execute(request, RequestType::TelemetryExport)
                 .await
                 .map(|_| ())
-                .map_err(|e| TelemetryExportError::Export(e.to_string()))
+                .map_err(export_error)
         })
+    }
+}
+
+fn export_error(error: KernelError) -> TelemetryExportError {
+    match error.http_status {
+        Some(429 | 503) => TelemetryExportError::Throttled(error.to_string()),
+        _ => TelemetryExportError::Export(error.to_string()),
     }
 }
 
@@ -116,6 +124,26 @@ mod tests {
             endpoint_url("http://localhost:8080", TelemetryEndpoint::Unauthenticated),
             "http://localhost:8080/telemetry-unauth"
         );
+    }
+
+    #[test]
+    fn rate_limit_statuses_classify_as_throttled() {
+        for status in [429, 503] {
+            assert!(matches!(
+                export_error(KernelError::from_http_status(status)),
+                TelemetryExportError::Throttled(_)
+            ));
+        }
+        for status in [400, 500] {
+            assert!(matches!(
+                export_error(KernelError::from_http_status(status)),
+                TelemetryExportError::Export(_)
+            ));
+        }
+        assert!(matches!(
+            export_error(KernelError::network_error()),
+            TelemetryExportError::Export(_)
+        ));
     }
 
     #[test]

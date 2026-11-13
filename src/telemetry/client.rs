@@ -12,28 +12,51 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use super::exporter::{export_batch, TelemetryExporter};
+use super::exporter::{export_batch, TelemetryExportError, TelemetryExporter};
 use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
 
 const STATE_ACTIVE: u8 = 0;
 const STATE_CLOSING: u8 = 1;
 const STATE_CLOSED: u8 = 2;
 
+// After a throttled background export, background flushes pause for this
+// long, doubling per consecutive throttled export up to the cap. The endpoint
+// sends `Retry-After: 1` when it throttles.
+#[cfg(not(test))]
+const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_secs(1);
+#[cfg(test)]
+const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_millis(200);
+const MAX_THROTTLE_BACKOFF: Duration = Duration::from_secs(30);
+/// Events kept while throttled (at least one batch); past this the oldest are
+/// dropped. Sized for several seconds of backoff at ~1k events/s (~14 MB).
+#[cfg(not(test))]
+const MAX_PENDING_EVENTS: usize = 10_000;
+#[cfg(test)]
+const MAX_PENDING_EVENTS: usize = 20;
+
 pub(super) struct TelemetryClient {
     exporter: Arc<dyn TelemetryExporter>,
     batch_size: usize,
-    flush_interval: std::time::Duration,
-    close_flush_timeout: std::time::Duration,
+    flush_interval: Duration,
+    close_flush_timeout: Duration,
     pending: Mutex<Vec<TelemetryFrontendLog>>,
     queue_count: AtomicUsize,
     flush_lock: tokio::sync::Mutex<()>,
+    throttle: Mutex<Throttle>,
     state: AtomicU8,
     timer: Mutex<Option<tokio::task::JoinHandle<()>>>,
     runtime_handle: Handle,
+}
+
+#[derive(Default)]
+struct Throttle {
+    until: Option<Instant>,
+    backoff: Duration,
 }
 
 impl TelemetryClient {
@@ -60,6 +83,7 @@ impl TelemetryClient {
             pending: Mutex::new(Vec::new()),
             queue_count: AtomicUsize::new(0),
             flush_lock: tokio::sync::Mutex::new(()),
+            throttle: Mutex::new(Throttle::default()),
             state: AtomicU8::new(STATE_ACTIVE),
             timer: Mutex::new(None),
             runtime_handle,
@@ -79,7 +103,7 @@ impl TelemetryClient {
             self.queue_count.fetch_add(1, Ordering::AcqRel) + 1
         };
 
-        if count >= self.batch_size {
+        if count >= self.batch_size && !self.throttled() {
             let client = Arc::clone(self);
             self.runtime_handle.spawn(async move {
                 client.flush_once_if_idle().await;
@@ -131,25 +155,73 @@ impl TelemetryClient {
         self.state.store(STATE_CLOSED, Ordering::Release);
     }
 
+    /// Background (batch-size or timer) flush. Skipped while throttled; a
+    /// throttled batch goes back to the queue for a later flush.
     async fn flush_once_if_idle(self: Arc<Self>) {
+        if self.throttled() {
+            return;
+        }
         let Ok(_guard) = self.flush_lock.try_lock() else {
             return;
         };
-        self.export_pending().await;
+        self.export_pending(true).await;
     }
 
+    /// Close-time flush: one export attempt regardless of throttling, so close
+    /// never waits out a backoff.
     async fn flush_once_wait(self: &Arc<Self>) {
         let _guard = self.flush_lock.lock().await;
-        self.export_pending().await;
+        self.export_pending(false).await;
     }
 
-    async fn export_pending(&self) {
+    async fn export_pending(&self, requeue_if_throttled: bool) {
         let batch = self.drain_pending();
         if batch.is_empty() {
             return;
         }
 
-        export_batch(Arc::clone(&self.exporter), batch).await;
+        match export_batch(Arc::clone(&self.exporter), &batch).await {
+            Ok(()) => {
+                *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default()
+            }
+            Err(TelemetryExportError::Throttled(_)) if requeue_if_throttled => {
+                self.back_off();
+                self.requeue(batch);
+            }
+            Err(_) => {}
+        }
+    }
+
+    fn throttled(&self) -> bool {
+        let throttle = self.throttle.lock().expect("poisoned telemetry throttle");
+        throttle.until.is_some_and(|until| Instant::now() < until)
+    }
+
+    fn back_off(&self) {
+        let mut throttle = self.throttle.lock().expect("poisoned telemetry throttle");
+        throttle.backoff = if throttle.backoff.is_zero() {
+            INITIAL_THROTTLE_BACKOFF
+        } else {
+            (throttle.backoff * 2).min(MAX_THROTTLE_BACKOFF)
+        };
+        throttle.until = Some(Instant::now() + throttle.backoff);
+    }
+
+    /// Put a throttled batch back ahead of events queued since it was drained.
+    fn requeue(&self, mut batch: Vec<TelemetryFrontendLog>) {
+        let mut pending = self.pending.lock().expect("poisoned telemetry queue");
+        batch.append(&mut pending);
+        let cap = MAX_PENDING_EVENTS.max(self.batch_size);
+        let excess = batch.len().saturating_sub(cap);
+        if excess > 0 {
+            batch.drain(..excess);
+            tracing::debug!(
+                dropped = excess,
+                "telemetry backlog full while throttled; dropping oldest events"
+            );
+        }
+        self.queue_count.store(batch.len(), Ordering::Release);
+        *pending = batch;
     }
 
     fn drain_pending(&self) -> Vec<TelemetryFrontendLog> {
@@ -336,6 +408,166 @@ mod tests {
         let requests = exporter.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].proto_logs.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn throttled_background_export_is_retried_after_backoff() {
+        let exporter = ThrottlingExporter::new(1);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 2,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+
+        client.enqueue(sample_log("one"));
+        client.enqueue(sample_log("two"));
+        wait_until(|| client.throttled()).await;
+
+        // A full batch inside the backoff does not trigger another export.
+        client.enqueue(sample_log("three"));
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert_eq!(exporter.ids().len(), 1);
+
+        tokio::time::sleep(INITIAL_THROTTLE_BACKOFF).await;
+        client.enqueue(sample_log("four"));
+        wait_until(|| exporter.ids().len() == 2).await;
+
+        assert_eq!(exporter.ids()[1], ["one", "two", "three", "four"]);
+        assert!(!client.throttled());
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn close_flush_ignores_backoff_and_does_not_requeue() {
+        let exporter = ThrottlingExporter::new(usize::MAX);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+
+        client.enqueue(sample_log("one"));
+        wait_until(|| client.throttled()).await;
+        client.enqueue(sample_log("two"));
+        assert!(client.throttled());
+
+        client.close().await;
+
+        assert_eq!(exporter.ids(), [vec!["one"], vec!["one", "two"]]);
+        assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn requeue_keeps_oldest_first_and_caps_backlog() {
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 2,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(ThrottlingExporter::new(0)))
+            .expect("telemetry runtime should start");
+        *client.pending.lock().unwrap() = (0..5).map(|i| sample_log(&format!("new{i}"))).collect();
+
+        client.requeue((0..18).map(|i| sample_log(&format!("old{i}"))).collect());
+
+        let pending = client.pending.lock().unwrap();
+        assert_eq!(pending.len(), MAX_PENDING_EVENTS);
+        assert_eq!(pending[0].frontend_log_event_id, "old3");
+        assert_eq!(pending[19].frontend_log_event_id, "new4");
+        assert_eq!(client.queue_count.load(Ordering::Acquire), pending.len());
+    }
+
+    #[tokio::test]
+    async fn backoff_doubles_up_to_cap() {
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(ThrottlingExporter::new(0)))
+            .expect("telemetry runtime should start");
+
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            client.back_off();
+            seen.push(client.throttle.lock().unwrap().backoff);
+        }
+
+        assert_eq!(seen[0], INITIAL_THROTTLE_BACKOFF);
+        assert_eq!(seen[1], INITIAL_THROTTLE_BACKOFF * 2);
+        assert_eq!(*seen.last().unwrap(), MAX_THROTTLE_BACKOFF);
+    }
+
+    /// Throttles the first `throttled` exports, then accepts; records the
+    /// event ids of every export attempt.
+    #[derive(Clone)]
+    struct ThrottlingExporter {
+        throttled: usize,
+        attempts: Arc<Mutex<Vec<Vec<String>>>>,
+    }
+
+    impl ThrottlingExporter {
+        fn new(throttled: usize) -> Self {
+            Self {
+                throttled,
+                attempts: Arc::default(),
+            }
+        }
+
+        fn ids(&self) -> Vec<Vec<String>> {
+            self.attempts.lock().unwrap().clone()
+        }
+    }
+
+    impl TelemetryExporter for ThrottlingExporter {
+        fn export<'a>(
+            &'a self,
+            request: TelemetryRequest,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = super::super::exporter::TelemetryExportResult>
+                    + Send
+                    + 'a,
+            >,
+        > {
+            Box::pin(async move {
+                let ids = request
+                    .proto_logs
+                    .iter()
+                    .map(|log| {
+                        serde_json::from_str::<serde_json::Value>(log).unwrap()
+                            ["frontend_log_event_id"]
+                            .as_str()
+                            .unwrap()
+                            .to_string()
+                    })
+                    .collect();
+                let mut attempts = self.attempts.lock().unwrap();
+                attempts.push(ids);
+                if attempts.len() <= self.throttled {
+                    Err(TelemetryExportError::Throttled("HTTP 429".to_string()))
+                } else {
+                    Ok(())
+                }
+            })
+        }
+    }
+
+    async fn wait_until(mut condition: impl FnMut() -> bool) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !condition() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("condition should become true");
     }
 
     fn sample_log(id: &str) -> TelemetryFrontendLog {
