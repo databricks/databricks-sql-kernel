@@ -26,6 +26,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
+- A CloudFetch download that cloud storage rejects with 401, 403 or 404 (an expired or invalid presigned URL) now refreshes the chunk's link before retrying, instead of retrying the same URL. The retry still counts against the download attempt budget.
 
 ---
 *Note: When making changes, please add your change under the appropriate

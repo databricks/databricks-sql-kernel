@@ -944,6 +944,10 @@ impl StreamingCloudFetchProvider {
         let deadline = (!ctx.download_timeout.is_zero())
             .then(|| std::time::Instant::now() + ctx.download_timeout);
 
+        // A presigned URL cloud storage refused (401/403/404). The next attempt
+        // refreshes the link even though it has not expired.
+        let mut rejected_url: Option<String> = None;
+
         loop {
             if ctx.cancel_token.is_cancelled() {
                 return Err(Error::invalid_state().message("Download cancelled"));
@@ -974,7 +978,12 @@ impl StreamingCloudFetchProvider {
                 let stored_link = ctx.chunks.get(&chunk_index).and_then(|e| e.link.clone());
 
                 match stored_link {
-                    Some(link) if !link.is_expired() => link,
+                    Some(link)
+                        if !link.is_expired()
+                            && rejected_url.as_deref() != Some(link.url.as_str()) =>
+                    {
+                        link
+                    }
                     _ => {
                         debug!(
                             "Link for chunk {} missing or expired; \
@@ -988,8 +997,9 @@ impl StreamingCloudFetchProvider {
                         // keeps the deadline genuinely end-to-end across
                         // the link-refresh step, matching the loop-level
                         // comment above.
-                        let refresh = Self::refresh_links_batch(
+                        let refresh = Self::refresh_links_batch_replacing(
                             chunk_index,
+                            rejected_url.as_deref(),
                             &ctx.link_fetcher,
                             &ctx.chunks,
                             &ctx.refresh_coordinator,
@@ -1020,6 +1030,9 @@ impl StreamingCloudFetchProvider {
                                 ))
                                 .with_cause(e)
                         })?;
+                        // Download whatever URL the refresh produced; a
+                        // repeat rejection is charged to the attempt budget.
+                        rejected_url = None;
                         // After a successful refresh, the link
                         // MUST exist and be fresh — `refresh_links_batch`
                         // returns Err otherwise (missing chunk in
@@ -1123,6 +1136,18 @@ impl StreamingCloudFetchProvider {
                     attempts += 1;
                     if attempts >= ctx.max_retries {
                         return Err(e);
+                    }
+                    // Storage refused the presigned URL itself (an expired or
+                    // invalid signature; GCS answers 404 for an expired one), so
+                    // retrying it cannot succeed. Refresh the link instead, without
+                    // sleeping: the failure was charged above.
+                    if let Some(status @ (401 | 403 | 404)) = e.http_status {
+                        debug!(
+                            "Chunk {} download got HTTP {}; refreshing the link before retry",
+                            chunk_index, status,
+                        );
+                        rejected_url = Some(link.url.clone());
+                        continue;
                     }
                     // Stale-snapshot detection. Two ways a download
                     // can fail against a URL that became stale while
@@ -1288,6 +1313,34 @@ impl StreamingCloudFetchProvider {
         cancel_token: &CancellationToken,
         statement_id: Option<&str>,
     ) -> Result<()> {
+        Self::refresh_links_batch_replacing(
+            start_chunk_index,
+            None,
+            link_fetcher,
+            chunks,
+            coordinator,
+            cancel_token,
+            statement_id,
+        )
+        .await
+    }
+
+    /// [`Self::refresh_links_batch`], where `rejected_url` (when set) is a
+    /// presigned URL cloud storage refused: a cached link with that URL needs
+    /// a refresh even though it has not expired.
+    async fn refresh_links_batch_replacing(
+        start_chunk_index: i64,
+        rejected_url: Option<&str>,
+        link_fetcher: &Arc<dyn ChunkLinkFetcher>,
+        chunks: &Arc<DashMap<i64, ChunkEntry>>,
+        coordinator: &Arc<RefreshCoordinator>,
+        cancel_token: &CancellationToken,
+        statement_id: Option<&str>,
+    ) -> Result<()> {
+        // A cached link is usable unless it expired or storage rejected its URL.
+        let is_usable = |link: &crate::types::CloudFetchLink| {
+            !link.is_expired() && rejected_url != Some(link.url.as_str())
+        };
         // Display helper: `"<unknown>"` is loud enough for ops
         // to notice missing statement_id in log filters.
         let sid = statement_id.unwrap_or("<unknown>");
@@ -1361,7 +1414,7 @@ impl StreamingCloudFetchProvider {
                     let url_changed = pre_attempt_url
                         .as_ref()
                         .is_some_and(|prev| *prev != link.url);
-                    if url_changed || !link.is_expired() {
+                    if url_changed || is_usable(link) {
                         debug!(
                             statement_id = %sid,
                             "Concurrent refresh delivered a {} link for chunk {}; \
@@ -1411,7 +1464,7 @@ impl StreamingCloudFetchProvider {
                 let url_changed = pre_attempt_url
                     .as_ref()
                     .is_some_and(|prev| *prev != link.url);
-                if url_changed || !link.is_expired() {
+                if url_changed || is_usable(link) {
                     debug!(
                         statement_id = %sid,
                         "Batched refresh for chunk {} skipped after claim — \
@@ -1952,6 +2005,143 @@ mod tests {
             server.received_requests().await.unwrap().len(),
             MAX_DOWNLOAD_ATTEMPTS as usize,
             "in-flight link expiry must not bypass the download attempt budget",
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_presigned_url_is_refreshed_before_retry() {
+        for status in [401, 403, 404] {
+            assert_download_recovers(status, true).await;
+        }
+        // Other 4xx statuses keep the same-URL retry.
+        assert_download_recovers(400, false).await;
+    }
+
+    async fn assert_download_recovers(status: u16, expect_refresh: bool) {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_array::Int32Array;
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .unwrap();
+        let mut ipc_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // The original URL fails once; a refreshed URL is served by a second path.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/chunk-0-old.arrow"))
+            .respond_with(ResponseTemplate::new(status))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        for chunk_path in ["/chunk-0-old.arrow", "/chunk-0-new.arrow"] {
+            Mock::given(method("GET"))
+                .and(path(chunk_path))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc_bytes.clone()))
+                .mount(&server)
+                .await;
+        }
+
+        #[derive(Debug)]
+        struct RefreshingFetcher {
+            fresh_url: String,
+            refresh_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for RefreshingFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!()
+            }
+
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!()
+            }
+
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(vec![CloudFetchLink {
+                    url: self.fresh_url.clone(),
+                    ..create_test_link(0)
+                }])
+            }
+        }
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let fetcher = Arc::new(RefreshingFetcher {
+            fresh_url: format!("{}/chunk-0-new.arrow", server.uri()),
+            refresh_calls: AtomicUsize::new(0),
+        });
+        let chunks = Arc::new(DashMap::new());
+        let original = CloudFetchLink {
+            url: format!("{}/chunk-0-old.arrow", server.uri()),
+            ..create_test_link(0)
+        };
+        chunks.insert(0, entry_with_state(original, ChunkState::Downloading));
+        let ctx = DownloadCtx {
+            downloader: Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            )),
+            link_fetcher: fetcher.clone(),
+            chunks,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            cancel_token: CancellationToken::new(),
+            statement_id: None,
+            metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+            max_retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            download_timeout: std::time::Duration::ZERO,
+        };
+
+        let batches = StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx)
+            .await
+            .unwrap_or_else(|e| panic!("HTTP {status}: one failed download must recover: {e}"));
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 3);
+
+        let paths: Vec<String> = server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|r| r.url.path().to_string())
+            .collect();
+        let (expected_paths, expected_refreshes) = if expect_refresh {
+            (vec!["/chunk-0-old.arrow", "/chunk-0-new.arrow"], 1)
+        } else {
+            (vec!["/chunk-0-old.arrow", "/chunk-0-old.arrow"], 0)
+        };
+        assert_eq!(paths, expected_paths, "HTTP {status}: downloaded URLs");
+        assert_eq!(
+            fetcher.refresh_calls.load(AtomicOrdering::SeqCst),
+            expected_refreshes,
+            "HTTP {status}: link refreshes",
         );
     }
 
