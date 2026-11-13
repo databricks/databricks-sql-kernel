@@ -221,6 +221,8 @@ pub struct ExecutedAsyncStatement {
     /// don't `.await` and the poll loop releases the lock before
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
+    /// Take-once ownership avoids retaining raw payloads after reader construction.
+    pending_result: std::sync::Mutex<Option<ExecuteResponse>>,
     pub(crate) volume_options: super::volume::VolumeOptions,
     pub(super) volume_completion: Arc<super::volume::VolumeCompletion>,
     statement_telemetry: StatementTelemetry,
@@ -333,6 +335,7 @@ impl ExecutedAsyncStatement {
             owning: true,
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            pending_result: std::sync::Mutex::new(None),
             volume_options: super::volume::VolumeOptions::default(),
             volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry,
@@ -394,6 +397,7 @@ impl ExecutedAsyncStatement {
             owning: false,
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            pending_result: std::sync::Mutex::new(None),
             volume_options: super::volume::VolumeOptions::default(),
             volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry: StatementTelemetry::noop(),
@@ -439,6 +443,7 @@ impl ExecutedAsyncStatement {
     fn release_owner(&self) {
         if self.owning {
             self.owner_released.store(true, Ordering::Release);
+            self.clear_pending_result();
             self.volume_completion.cancel();
         }
     }
@@ -528,18 +533,45 @@ impl ExecutedAsyncStatement {
             .and_then(|s| s.error_details_json.clone())
     }
 
-    /// Internal helper — overwrite the cached `StatementStatus` with
-    /// a fresh poll's response. Called by `status()` /
-    /// `await_result()` after every successful
-    /// `statement_status` RPC. Lock poisoning is intentionally
-    /// swallowed: a poisoned lock here would only happen if a panic
+    /// Publish observed metadata together with an optional response for reuse.
+    /// Lock poisoning is intentionally swallowed: a poisoned lock here
+    /// would only happen if a panic
     /// landed mid-write, and the recovery path is to keep the prior
     /// status visible (worse: a fresh poll's status lost; better:
     /// the handle's accessor surface keeps working).
-    fn record_latest_status(&self, fresh: crate::types::sea::StatementStatus) {
+    fn record_latest_status(
+        &self,
+        fresh: crate::types::sea::StatementStatus,
+        response: Option<ExecuteResponse>,
+    ) {
+        // Payload before metadata keeps concurrent publications from mixing observations.
+        let pending = self.pending_result.lock().ok();
         if let Ok(mut guard) = self.latest_status.lock() {
             *guard = fresh;
         }
+        if let Some(mut pending) = pending {
+            *pending = response.filter(|response| {
+                matches!(
+                    response.status.state,
+                    StatementState::Succeeded | StatementState::Closed
+                ) && !self.owner_released.load(Ordering::Acquire)
+            });
+        }
+    }
+
+    fn clear_pending_result(&self) {
+        if let Ok(mut pending) = self.pending_result.lock() {
+            *pending = None;
+        }
+    }
+
+    fn take_pending_result(&self) -> Option<ExecuteResponse> {
+        let mut pending = self.pending_result.lock().ok()?;
+        if self.owner_released.load(Ordering::Acquire) {
+            *pending = None;
+            return None;
+        }
+        pending.take()
     }
 
     fn cancelled_error(&self, status: &crate::types::sea::StatementStatus) -> Error {
@@ -581,6 +613,7 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.check_read_validity()?;
+            self.clear_pending_result();
             // The client deadline governs only the pre-terminal window
             // ("initial submit through observed terminal status"). Once
             // this handle has observed a terminal state, `status()`
@@ -622,10 +655,6 @@ impl ExecutedAsyncStatement {
             self.check_read_validity()?;
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
-            // Cache the wire status so the extended-field accessors
-            // reflect what THIS handle has observed (instead of the
-            // stale initial-submit snapshot).
-            self.record_latest_status(response.status.clone());
             // Latch the terminal observation so subsequent `status()`
             // calls stop enforcing the client deadline against this
             // already-finished statement.
@@ -639,6 +668,7 @@ impl ExecutedAsyncStatement {
                     .client_deadline
                     .is_some_and(|deadline| std::time::Instant::now() >= deadline)
             {
+                self.record_latest_status(response.status.clone(), None);
                 return Err(self.expire_client_query_timeout());
             }
             match &status {
@@ -654,11 +684,13 @@ impl ExecutedAsyncStatement {
                 | StatementStatus::Succeeded
                 | StatementStatus::Closed => {}
             }
+            self.record_latest_status(response.status.clone(), Some(response));
             Ok(status)
         }
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -685,6 +717,9 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.check_read_validity()?;
+            if let Some(response) = self.take_pending_result() {
+                return self.materialise_result(response).await;
+            }
 
             let cfg = self.session.transport().poll_config();
             let start = std::time::Instant::now();
@@ -767,7 +802,7 @@ impl ExecutedAsyncStatement {
                 // Cache the wire status so the extended-field
                 // accessors reflect THIS poll's observation — not the
                 // initial-submit snapshot that's now stale by minutes.
-                self.record_latest_status(response.status.clone());
+                self.record_latest_status(response.status.clone(), None);
                 // Latch the terminal observation so a later `status()`
                 // call stops enforcing the client deadline against this
                 // already-finished statement.
@@ -779,7 +814,7 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        return self.materialise_result().await;
+                        return self.materialise_result(response).await;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
@@ -836,6 +871,7 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -849,8 +885,28 @@ impl ExecutedAsyncStatement {
     /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        let result = self.materialise_result().instrument(span).await;
+        let result = async {
+            self.check_read_validity()?;
+            let response = match self.take_pending_result() {
+                Some(response) => response,
+                None => {
+                    self.clear_pending_result();
+                    let response = self
+                        .session
+                        .transport()
+                        .statement_status(&self.statement_id, self.session_attribution)
+                        .await?;
+                    self.check_read_validity()?;
+                    self.clear_pending_result();
+                    response
+                }
+            };
+            self.materialise_result(response).await
+        }
+        .instrument(span)
+        .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -861,12 +917,17 @@ impl ExecutedAsyncStatement {
     /// statement is still running. The error includes the observed
     /// status so callers don't have to re-query, and points at the
     /// actionable follow-up.
-    async fn materialise_result(&self) -> Result<ResultStream> {
+    async fn materialise_result(&self, response: ExecuteResponse) -> Result<ResultStream> {
         self.check_read_validity()?;
+        let observed = match response.status.state {
+            StatementState::Pending => "Pending",
+            StatementState::Running => "Running",
+            _ => "non-terminal",
+        };
         let result = self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id, self.session_attribution)
+            .completed_result(response, self.session_attribution)
             .await?;
         self.check_read_validity()?;
         match result {
@@ -917,32 +978,12 @@ impl ExecutedAsyncStatement {
                     .store(true, Ordering::Release);
                 Ok(stream)
             }
-            None => {
-                // Re-read the status so the error message names the
-                // observed state (Pending vs Running). Best-effort —
-                // if the status call itself fails, fall back to the
-                // generic non-terminal message.
-                let observed = match self
-                    .session
-                    .transport()
-                    .statement_status(&self.statement_id, self.session_attribution)
-                    .await
-                {
-                    Ok(r) => match r.status.state {
-                        crate::types::sea::StatementState::Pending => "Pending",
-                        crate::types::sea::StatementState::Running => "Running",
-                        _ => "non-terminal",
-                    },
-                    Err(_) => "non-terminal",
-                };
-                self.check_read_validity()?;
-                Err(Error::invalid_state().message(format!(
-                    "Statement {} is not terminal yet (status: {}); call await_result() to \
+            None => Err(Error::invalid_state().message(format!(
+                "Statement {} is not terminal yet (status: {}); call await_result() to \
                      block until done, or poll status() and re-call fetch_result() once it \
                      reports Succeeded / Closed",
-                    self.statement_id, observed
-                )))
-            }
+                self.statement_id, observed
+            ))),
         }
     }
 }

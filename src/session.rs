@@ -3060,8 +3060,8 @@ mod is_open_tests {
         );
         assert_eq!(
             detail["n_operation_status_calls"].as_i64(),
-            Some(2),
-            "only owning status and await polls contribute to execution telemetry"
+            Some(1),
+            "only the owning status request contributes; await consumes its response"
         );
         assert!(
             detail["operation_status_latency_millis"]
