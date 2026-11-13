@@ -48,6 +48,72 @@ async fn live_session() -> Session {
         .expect("Session::open against live workspace")
 }
 
+#[tokio::test]
+#[ignore]
+async fn cloudfetch_disabled_drains_large_results() {
+    use arrow_array::{Int64Array, StringArray};
+    use sha2::{Digest, Sha256};
+
+    let host = env_var("DATABRICKS_HOST").expect("DATABRICKS_HOST required");
+    let path = env_var("DATABRICKS_HTTP_PATH").expect("DATABRICKS_HTTP_PATH required");
+    let token = env_var("DATABRICKS_TOKEN").expect("DATABRICKS_TOKEN required");
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = Session::builder()
+        .http_path(host, path)
+        .auth(AuthConfig::Pat {
+            token,
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .open()
+        .await
+        .expect("open session with CloudFetch disabled");
+    let mut statement = session.statement();
+    statement
+        .spec()
+        .sql("SELECT id, sha2(CAST(id AS STRING), 512) AS payload FROM range(250000) ORDER BY id");
+    let mut executed = statement.execute().await.expect("execute large query");
+    let mut rows = 0_i64;
+    let mut payload_bytes = 0;
+    let mut digest = Sha256::new();
+    while let Some(batch) = executed
+        .result_stream_mut()
+        .next_batch()
+        .await
+        .expect("next batch")
+    {
+        let ResultBatch::Arrow(batch) = batch else {
+            panic!("expected Arrow batch");
+        };
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .unwrap();
+        let payloads = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        for row in 0..batch.num_rows() {
+            assert_eq!(ids.value(row), rows);
+            let payload = payloads.value(row);
+            payload_bytes += payload.len();
+            digest.update(format!("{rows}\t{payload}\n").as_bytes());
+            rows += 1;
+        }
+    }
+    assert_eq!(rows, 250_000);
+    assert_eq!(payload_bytes, 32_000_000);
+    assert_eq!(
+        hex::encode(digest.finalize()),
+        "a25ada4c6c476b53e97eb6e8a945e9ce4c14cc432c7ad672dc6fb607d660c86a",
+    );
+    executed.close().await.expect("close statement");
+    session.close().await.expect("close session");
+}
+
 /// Open a live session authenticated via the JWT private-key M2M flow
 /// (`AuthConfig::OAuthM2MPrivateKey`).
 ///

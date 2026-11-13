@@ -345,10 +345,6 @@ async fn open_session_with_result_cfg(
         .await
 }
 
-/// Assert that the recorded CreateSession request carries no
-/// `can_cloud_download`-shaped key under any casing. Shared by the tests
-/// below which prove the typed CloudFetch toggle does not synthesize this
-/// session conf.
 async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
     let recorded = server
         .received_requests()
@@ -367,9 +363,7 @@ async fn assert_no_can_cloud_download_on_create(server: &MockServer) {
         for key in obj.keys() {
             assert!(
                 !key.eq_ignore_ascii_case("can_cloud_download"),
-                "CreateSession must not carry a can_cloud_download session conf \
-                 (SEA rejects it at ExecuteStatement, issue #196); found key={key:?} \
-                 value={:?}",
+                "unexpected session setting: key={key:?} value={:?}",
                 obj.get(key),
             );
         }
@@ -392,15 +386,7 @@ async fn create_session_body(server: &MockServer) -> serde_json::Value {
 }
 
 #[tokio::test]
-async fn create_session_with_cloudfetch_disabled_omits_can_cloud_download() {
-    // Regression test for issue #196. Disabling CloudFetch
-    // (`cloudfetch_enabled = false`) must NOT synthesise a
-    // `can_cloud_download` session conf on CreateSession — SEA has no
-    // such conf and rejects it at the first ExecuteStatement with
-    // CONFIG_NOT_AVAILABLE, making the session unusable. The disable is
-    // instead applied per-statement via the SEA `disposition` (covered in
-    // the execute-path wiremock tests). Here we only assert the session
-    // opens and the poisoned conf never reaches the wire.
+async fn create_session_with_cloudfetch_disabled_requests_inline_results() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
@@ -414,12 +400,31 @@ async fn create_session_with_cloudfetch_disabled_omits_can_cloud_download() {
 
     let mut result = ResultConfig::default();
     result.cloudfetch_enabled = false;
-    let session = open_session_with_result_cfg(&server, result)
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .session_conf(std::collections::HashMap::from([
+            ("Can_Cloud_Download".into(), "true".into()),
+            ("TIMEZONE".into(), "UTC".into()),
+        ]))
+        .open()
         .await
         .expect("session open with cloudfetch_enabled=false");
     assert_eq!(session.session_id(), "sess-cf-off");
+    let body = create_session_body(&server).await;
+    assert!(body["session_confs"].get("Can_Cloud_Download").is_none());
+    assert_eq!(body["session_confs"]["TIMEZONE"], "UTC");
 
-    assert_no_can_cloud_download_on_create(&server).await;
+    assert_eq!(
+        body.pointer("/session_confs/can_cloud_download"),
+        Some(&serde_json::json!("false")),
+    );
 }
 
 #[tokio::test]
@@ -608,9 +613,6 @@ async fn typed_geospatial_config_does_not_reinterpret_raw_session_conf() {
 
 #[tokio::test]
 async fn create_session_with_cloudfetch_enabled_omits_can_cloud_download() {
-    // The default (cloudfetch_enabled=true) path must also never send a
-    // `can_cloud_download` session conf — the kernel synthesises nothing
-    // here on either branch now.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
