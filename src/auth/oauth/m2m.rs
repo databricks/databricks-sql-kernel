@@ -99,6 +99,9 @@ struct CredentialsKey {
     secret_sha256: [u8; 32],
     scopes: Vec<String>,
     token_endpoint_override: Option<String>,
+    /// Sessions with different TLS, proxy or retry settings never share:
+    /// a result fetched through one transport must not stand in for another.
+    transport: [u8; 32],
 }
 
 type Registry = Mutex<HashMap<CredentialsKey, Weak<SharedCredentials>>>;
@@ -321,6 +324,7 @@ impl ClientCredentialsProvider {
             secret_sha256: Sha256::digest(client_secret.as_bytes()).into(),
             scopes: key_scopes,
             token_endpoint_override: token_endpoint_override.clone(),
+            transport: http_client.transport_fingerprint(),
         });
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
             Some(token_endpoint) => (token_endpoint.clone(), token_endpoint),
@@ -1087,6 +1091,41 @@ mod tests {
         assert_eq!(token_mocks[0].received_requests().await.len(), 4);
         assert_eq!(token_mocks[1].received_requests().await.len(), 2);
         assert_eq!(registered(&a), 4);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn providers_with_different_transports_never_share() {
+        let mock_server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/oidc/.well-known/oauth-authorization-server"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_endpoint": format!("{}/oidc/v1/authorize", mock_server.uri()),
+                "token_endpoint": format!("{}/oidc/v1/token", mock_server.uri()),
+            })))
+            .mount(&mock_server)
+            .await;
+        let token = Mock::given(method("POST"))
+            .and(path("/oidc/v1/token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(mock_token_response_body()))
+            .mount_as_scoped(&mock_server)
+            .await;
+        let uri = mock_server.uri();
+        let strict = shared_test_provider(&uri, "client", "secret", &["all-apis"]).await;
+        let mut relaxed_config = HttpClientConfig::default();
+        relaxed_config.tls.allow_self_signed = Some(true);
+        let relaxed_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(relaxed_config)
+                .expect("Failed to create HTTP client"),
+        );
+        let relaxed = Arc::new(
+            ClientCredentialsProvider::new(&uri, "client", "secret", relaxed_client)
+                .await
+                .expect("Failed to create provider"),
+        );
+        auth_header(&strict).await;
+        auth_header(&relaxed).await;
+        assert_eq!(token.received_requests().await.len(), 2);
+        assert_eq!(registered(&uri), 2);
     }
 
     #[tokio::test(flavor = "multi_thread")]

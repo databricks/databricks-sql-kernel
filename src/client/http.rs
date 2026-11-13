@@ -732,6 +732,73 @@ impl DatabricksHttpClient {
         &self.config
     }
 
+    /// Digest of everything that decides how this client reaches a server
+    /// and how long it tries: TLS, proxy, timeouts, headers and the auth
+    /// retry policy. Auth results are shared only between clients with the
+    /// same fingerprint.
+    pub(crate) fn transport_fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        fn bytes(h: &mut Sha256, b: Option<&[u8]>) {
+            match b {
+                None => h.update([0]),
+                Some(b) => {
+                    h.update([1]);
+                    h.update((b.len() as u64).to_le_bytes());
+                    h.update(b);
+                }
+            }
+        }
+        fn flag(h: &mut Sha256, v: Option<bool>) {
+            h.update([v.map_or(2, u8::from)]);
+        }
+        let c = &self.config;
+        let mut h = Sha256::new();
+        flag(&mut h, c.tls.enabled);
+        flag(&mut h, c.tls.allow_self_signed);
+        flag(&mut h, c.tls.allow_hostname_mismatch);
+        bytes(
+            &mut h,
+            c.tls.trusted_certificate_path.as_deref().map(str::as_bytes),
+        );
+        bytes(&mut h, c.tls.trusted_certificate_pem.as_deref());
+        bytes(&mut h, c.tls.client_cert_pem.as_deref());
+        bytes(&mut h, c.tls.client_key_pem.as_deref());
+        for v in [
+            &c.proxy.url,
+            &c.proxy.username,
+            &c.proxy.password,
+            &c.proxy.bypass_hosts,
+            &c.org_id,
+        ] {
+            bytes(&mut h, v.as_deref().map(str::as_bytes));
+        }
+        bytes(&mut h, Some(c.user_agent.as_bytes()));
+        for (name, value) in &c.custom_headers {
+            bytes(&mut h, Some(name.as_bytes()));
+            bytes(&mut h, Some(value.as_bytes()));
+        }
+        h.update(c.connect_timeout.as_nanos().to_le_bytes());
+        h.update(c.read_timeout.as_nanos().to_le_bytes());
+        if let Some(retry) = self.retry_configs.get(&RequestCategory::Auth) {
+            h.update(retry.min_wait.as_nanos().to_le_bytes());
+            h.update(retry.max_wait.as_nanos().to_le_bytes());
+            h.update(retry.overall_timeout.as_nanos().to_le_bytes());
+            h.update(retry.max_retries.to_le_bytes());
+            let mut codes: Vec<u16> = retry
+                .override_retryable_codes
+                .iter()
+                .flatten()
+                .copied()
+                .collect();
+            codes.sort_unstable();
+            h.update([u8::from(retry.override_retryable_codes.is_some())]);
+            for code in codes {
+                h.update(code.to_le_bytes());
+            }
+        }
+        h.finalize().into()
+    }
+
     /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
