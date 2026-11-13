@@ -69,6 +69,10 @@ impl ResultReader for MockReader {
             crate::reader::TryNextBatch::Ready(batch)
         })
     }
+
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
+    }
 }
 
 /// A reader that returns an error on `next_batch()`.

@@ -716,9 +716,11 @@ pub trait ResultReader: Send + Sync {
         Err(Error::invalid_state().message("reader does not support non-blocking batch reads"))
     }
 
-    /// Whether producing a batch rewrites column values on the reading
-    /// thread (per-row work), so a ready `try_next_batch` is not cheap.
-    fn rewrites_batches(&self) -> bool {
+    /// Whether `try_next_batch` is supported and a ready batch is a buffer
+    /// hand-off, with no per-row work on the calling thread. Defaults to
+    /// `false`, so callers keep using `next_batch` for readers that don't
+    /// opt in.
+    fn try_next_batch_is_cheap(&self) -> bool {
         false
     }
 
@@ -797,6 +799,11 @@ impl ResultReader for CloudFetchResultReader {
         self.provider.try_next_batch()
     }
 
+    // Download tasks decode chunks; a ready read only takes a buffered batch.
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
+    }
+
     fn metrics(&self) -> Option<ResultReaderMetrics> {
         self.provider.metrics()
     }
@@ -833,6 +840,11 @@ impl ResultReader for InlineArrowReader {
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         Ok(TryNextBatch::from_option(self.provider.next_batch()?))
     }
+
+    // The attachment is decoded when the provider is built.
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
+    }
 }
 
 /// Reader for multi-chunk inline-Arrow streaming.
@@ -868,6 +880,11 @@ impl ResultReader for InlineStreamingReader {
 
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         self.provider.try_next_batch()
+    }
+
+    // The prefetch task decodes chunks; a ready read only takes one.
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
     }
 }
 
@@ -908,6 +925,10 @@ impl ResultReader for InMemoryReader {
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         Ok(TryNextBatch::from_option(self.batches.next()))
     }
+
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
+    }
 }
 
 /// Empty reader for queries with no results.
@@ -937,6 +958,10 @@ impl ResultReader for EmptyReader {
 
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         Ok(TryNextBatch::End)
+    }
+
+    fn try_next_batch_is_cheap(&self) -> bool {
+        true
     }
 }
 

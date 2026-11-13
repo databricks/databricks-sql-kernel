@@ -303,8 +303,8 @@ impl ResultReader for ResultPostProcessor {
         next.map_ready(|batch| self.process_batch(batch))
     }
 
-    fn rewrites_batches(&self) -> bool {
-        self.rewrites
+    fn try_next_batch_is_cheap(&self) -> bool {
+        !self.rewrites && self.inner.try_next_batch_is_cheap()
     }
 
     fn metrics(&self) -> Option<ResultReaderMetrics> {
@@ -554,10 +554,22 @@ mod tests {
             .unwrap();
         // No transform should have been installed.
         assert!(pp.transform.is_none());
-        assert!(!pp.rewrites_batches());
+        assert!(pp.try_next_batch_is_cheap());
         let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.schema().field(0).metadata().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn cheap_try_next_batch_requires_the_inner_reader_to_opt_in() {
+        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
+        let inner: Box<dyn ResultReader + Send> =
+            Box::new(crate::reader::test_utils::ErrorReader { schema });
+        let pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
+            .await
+            .unwrap();
+        assert!(pp.transform.is_none());
+        assert!(!pp.try_next_batch_is_cheap());
     }
 
     #[tokio::test]
@@ -577,7 +589,7 @@ mod tests {
                 .unwrap();
         assert!(pp.transform.is_some());
         // Re-projecting onto the augmented schema reuses the arrays.
-        assert!(!pp.rewrites_batches());
+        assert!(pp.try_next_batch_is_cheap());
 
         let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(
@@ -677,7 +689,8 @@ mod tests {
         let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
             .await
             .unwrap();
-        assert!(pp.rewrites_batches());
+        // Rewriting the column is per-row work on the reading thread.
+        assert!(!pp.try_next_batch_is_cheap());
 
         // Both the advertised schema and the yielded batch report Utf8 for
         // the untyped-NULL column, identical to the CAST(NULL AS STRING)

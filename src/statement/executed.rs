@@ -151,9 +151,9 @@ impl ExecutedStatement {
         Ok(None)
     }
 
-    /// See [`ResultStream::rewrites_batches`].
-    pub fn rewrites_batches(&self) -> bool {
-        self.result_stream.rewrites_batches()
+    /// See [`ResultStream::try_next_batch_is_cheap`].
+    pub fn try_next_batch_is_cheap(&self) -> bool {
+        self.result_stream.try_next_batch_is_cheap()
     }
 
     /// Non-blocking counterpart to [`Self::next_batch`]. It preserves the same

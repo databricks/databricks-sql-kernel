@@ -350,10 +350,10 @@ impl ExecutedStatement {
         }
         let runtime = inner.runtime.clone();
         // Inline results and already-downloaded CloudFetch chunks are in
-        // memory: take them without a GIL hand-off, unless reading one still
-        // rewrites column values. Both paths drive the ExecutedStatement, so
+        // memory: take them without a GIL hand-off when reading one is only a
+        // buffer hand-off. Both paths drive the ExecutedStatement, so
         // auto-close-on-drain still fires CloseStatement once exhausted.
-        let ready = if inner.exec.rewrites_batches() {
+        let ready = if !inner.exec.try_next_batch_is_cheap() {
             None
         } else {
             let _context = runtime.enter();
