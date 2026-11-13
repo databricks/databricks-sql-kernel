@@ -987,9 +987,13 @@ impl StreamingCloudFetchProvider {
                     }
                     _ => {
                         debug!(
-                            "Link for chunk {} missing or expired; \
-                             triggering batched refresh",
-                            chunk_index
+                            "Link for chunk {} {}; triggering batched refresh",
+                            chunk_index,
+                            if rejected_url.is_some() {
+                                "rejected by storage"
+                            } else {
+                                "missing or expired"
+                            }
                         );
                         // Bound the refresh RPC by the remaining chunk
                         // budget so a stalled refresh can't overshoot the
@@ -2159,7 +2163,8 @@ mod tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+        // Long enough that the < 2 × delay bound leaves a wide margin for the round-trips.
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_secs(1);
 
         // Storage refuses every URL, including refreshed ones.
         let server = MockServer::start().await;
