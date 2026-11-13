@@ -51,10 +51,10 @@ impl Drop for RefreshGuard {
 }
 
 /// A claimed background refresh. Tokio drops a blocking closure unrun when its
-/// runtime is shutting down; dropping this unfinished records a failed
-/// background refresh, so waiters refresh themselves instead of spinning.
+/// runtime is shutting down; dropping this unfinished records a refresh that
+/// got no answer, so waiters refresh themselves instead of spinning.
 struct BackgroundRefresh {
-    last_error: Arc<Mutex<Option<(Error, bool)>>>,
+    last_error: Arc<Mutex<Option<Error>>>,
     finished: bool,
     // Declared last: clears the flag after `drop` has recorded the error.
     _guard: RefreshGuard,
@@ -62,7 +62,7 @@ struct BackgroundRefresh {
 
 impl BackgroundRefresh {
     fn finish(mut self, error: Option<Error>) {
-        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = error.map(|e| (e, true));
+        *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = error;
         self.finished = true;
     }
 }
@@ -71,7 +71,7 @@ impl Drop for BackgroundRefresh {
     fn drop(&mut self) {
         if !self.finished {
             let error = Error::cancelled().message("background token refresh did not finish");
-            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some((error, true));
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = Some(error);
         }
     }
 }
@@ -119,8 +119,8 @@ pub(crate) struct TokenStore {
     /// This prevents concurrent refresh attempts.
     refreshing: Arc<AtomicBool>,
     /// Error from the last refresh if it failed, handed to the callers that
-    /// waited on it, and whether it was a background refresh.
-    last_error: Arc<Mutex<Option<(Error, bool)>>>,
+    /// waited on it.
+    last_error: Arc<Mutex<Option<Error>>>,
 }
 
 impl TokenStore {
@@ -253,7 +253,7 @@ impl TokenStore {
             // We won the race: perform the refresh
             let result = refresh_fn();
             *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
-                result.as_ref().err().map(|e| (e.clone(), false));
+                result.as_ref().err().cloned();
 
             // Store the new token if successful
             if let Ok(ref new_token) = result {
@@ -272,9 +272,10 @@ impl TokenStore {
             // Another thread is already refreshing: wait for it to complete
             let (result, cut_short) = self.wait_for_refresh();
             if result.is_err() && cut_short && retry {
-                // A background refresh runs on the runtime of the session that
-                // started it and fails if that session closes meanwhile. That
-                // failure isn't this caller's, so it refreshes once itself.
+                // A refresh, blocking or background, runs on the runtime of
+                // the session that started it and fails if that session
+                // closes meanwhile. That failure isn't this caller's, so it
+                // refreshes once itself.
                 return self.blocking_refresh_inner(refresh_fn, false);
             }
             result
@@ -332,8 +333,8 @@ impl TokenStore {
     /// This method is called by threads that lost the race to refresh an EXPIRED token.
     /// It polls until the `refreshing` flag is cleared, sleeping briefly between checks
     /// to avoid burning CPU.
-    /// Also returns whether the refresh it waited on was a background one that
-    /// failed without the server's answer (see [`cut_short`]).
+    /// Also returns whether the refresh it waited on failed without the
+    /// server's answer (see [`cut_short`]).
     fn wait_for_refresh(&self) -> (Result<OAuthToken>, bool) {
         // Poll until the refresh completes, sleeping to avoid busy-waiting
         while self.refreshing.load(Ordering::SeqCst) {
@@ -355,17 +356,15 @@ impl TokenStore {
         // accepts (inside the expiry buffer) and get the refresh's error only
         // when there is none, rather than a token past its expiry.
         let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
-        let cut_short_background = last_error
-            .as_ref()
-            .is_some_and(|(e, background)| *background && cut_short(e));
+        let failed_without_answer = last_error.as_ref().is_some_and(cut_short);
         let result = match (token.as_ref(), last_error.as_ref()) {
-            (Some(t), Some((e, _))) if t.expires_at <= chrono::Utc::now() => Err(e.clone()),
+            (Some(t), Some(e)) if t.expires_at <= chrono::Utc::now() => Err(e.clone()),
             (Some(t), _) => Ok(t.clone()),
-            (None, Some((e, _))) => Err(e.clone()),
+            (None, Some(e)) => Err(e.clone()),
             (None, None) => Err(Error::invalid_state()
                 .message("token refresh failed: no token available after refresh")),
         };
-        (result, cut_short_background)
+        (result, failed_without_answer)
     }
 }
 
@@ -601,13 +600,9 @@ mod tests {
     }
 
     /// A caller waits on a refresh that is already running (`refreshing` set
-    /// by hand) and then fails with `error`; `background` says which kind of
-    /// refresh it was. The waiter's own refresh returns a fresh token.
-    fn wait_on_failed_refresh_with(
-        token: OAuthToken,
-        error: Error,
-        background: bool,
-    ) -> Result<OAuthToken> {
+    /// by hand) and then fails with `error`. The waiter's own refresh returns
+    /// a fresh token.
+    fn wait_on_failed_refresh_with(token: OAuthToken, error: Error) -> Result<OAuthToken> {
         let store = Arc::new(TokenStore::new());
         *store.token.write().unwrap() = Some(token);
         store.refreshing.store(true, Ordering::SeqCst);
@@ -615,7 +610,7 @@ mod tests {
         let waiter =
             std::thread::spawn(move || s.get_or_refresh(|| Ok(create_token_with_ttl(3600))));
         std::thread::sleep(std::time::Duration::from_millis(20));
-        *store.last_error.lock().unwrap() = Some((error, background));
+        *store.last_error.lock().unwrap() = Some(error);
         store.refreshing.store(false, Ordering::SeqCst);
         waiter.join().unwrap()
     }
@@ -625,7 +620,7 @@ mod tests {
     }
 
     fn wait_on_failed_refresh(token: OAuthToken) -> Result<OAuthToken> {
-        wait_on_failed_refresh_with(token, http_429(), false)
+        wait_on_failed_refresh_with(token, http_429())
     }
 
     #[test]
@@ -643,25 +638,45 @@ mod tests {
     }
 
     #[test]
-    fn test_store_waiter_refreshes_itself_after_a_background_refresh_cut_short() {
-        // A background refresh may fail only because the session that ran it
-        // closed; the waiter refreshes with its own function instead.
+    fn test_store_waiter_refreshes_itself_after_a_refresh_cut_short() {
+        // A refresh may fail only because the session that ran it closed; the
+        // waiter refreshes with its own function instead.
         let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
         let error = Error::network_error().message("runtime shut down");
-        let token = wait_on_failed_refresh_with(expired, error, true).expect("own refresh");
+        let token = wait_on_failed_refresh_with(expired, error).expect("own refresh");
         assert_eq!(token.access_token, "token-3600");
     }
 
     #[test]
-    fn test_store_waiters_get_the_servers_answer_to_a_background_refresh() {
+    fn test_store_waiter_refreshes_itself_after_a_blocking_refresh_cut_short() {
+        let store = Arc::new(TokenStore::new());
+        let s = store.clone();
+        let closing = std::thread::spawn(move || {
+            s.get_or_refresh(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                Err(Error::network_error().message("runtime shut down"))
+            })
+        });
+        while !store.refreshing.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let token = store
+            .get_or_refresh(|| Ok(create_token_with_ttl(3600)))
+            .expect("own refresh");
+        assert_eq!(token.access_token, "token-3600");
+        assert!(closing.join().unwrap().is_err());
+    }
+
+    #[test]
+    fn test_store_waiters_get_the_servers_answer() {
         // A 429 after the retry ladder isn't retried again by every waiter.
         let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
-        let err = wait_on_failed_refresh_with(expired, http_429(), true).unwrap_err();
+        let err = wait_on_failed_refresh_with(expired, http_429()).unwrap_err();
         assert_eq!(err.http_status, Some(429), "{err:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn test_store_background_refresh_failure_is_recorded_as_background() {
+    async fn test_store_background_refresh_failure_is_recorded() {
         let store = TokenStore::new();
         let stale = create_token_with_expiry(Utc::now() + Duration::seconds(600), 1200);
         *store.token.write().unwrap() = Some(stale);
@@ -672,7 +687,7 @@ mod tests {
             tokio::time::sleep(std::time::Duration::from_millis(1)).await;
         }
         let recorded = store.last_error.lock().unwrap().clone();
-        assert!(matches!(recorded, Some((_, true))), "{recorded:?}");
+        assert!(recorded.is_some_and(|e| e.code == ErrorCode::ResourceExhausted));
     }
 
     #[test]
@@ -696,7 +711,7 @@ mod tests {
         }
         assert!(!store.refreshing.load(Ordering::SeqCst), "flag left set");
         let recorded = store.last_error.lock().unwrap().clone();
-        assert!(matches!(recorded, Some((_, true))), "{recorded:?}");
+        assert!(recorded.is_some_and(|e| e.code == ErrorCode::Cancelled));
     }
 
     #[test]
