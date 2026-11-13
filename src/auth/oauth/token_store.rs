@@ -34,7 +34,7 @@
 //! concurrent callers. This is coordinated via an `AtomicBool` flag.
 
 use crate::auth::oauth::token::OAuthToken;
-use crate::kernel_error::{Error, Result};
+use crate::kernel_error::{Error, ErrorCode, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -270,8 +270,8 @@ impl TokenStore {
             result
         } else {
             // Another thread is already refreshing: wait for it to complete
-            let (result, background_failure) = self.wait_for_refresh();
-            if result.is_err() && background_failure && retry {
+            let (result, cut_short) = self.wait_for_refresh();
+            if result.is_err() && cut_short && retry {
                 // A background refresh runs on the runtime of the session that
                 // started it and fails if that session closes meanwhile. That
                 // failure isn't this caller's, so it refreshes once itself.
@@ -332,7 +332,8 @@ impl TokenStore {
     /// This method is called by threads that lost the race to refresh an EXPIRED token.
     /// It polls until the `refreshing` flag is cleared, sleeping briefly between checks
     /// to avoid burning CPU.
-    /// Also returns whether the refresh it waited on was a failed background one.
+    /// Also returns whether the refresh it waited on was a background one that
+    /// failed without the server's answer (see [`cut_short`]).
     fn wait_for_refresh(&self) -> (Result<OAuthToken>, bool) {
         // Poll until the refresh completes, sleeping to avoid busy-waiting
         while self.refreshing.load(Ordering::SeqCst) {
@@ -354,9 +355,9 @@ impl TokenStore {
         // accepts (inside the expiry buffer) and get the refresh's error only
         // when there is none, rather than a token past its expiry.
         let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
-        let background = last_error
+        let cut_short_background = last_error
             .as_ref()
-            .is_some_and(|(_, background)| *background);
+            .is_some_and(|(e, background)| *background && cut_short(e));
         let result = match (token.as_ref(), last_error.as_ref()) {
             (Some(t), Some((e, _))) if t.expires_at <= chrono::Utc::now() => Err(e.clone()),
             (Some(t), _) => Ok(t.clone()),
@@ -364,8 +365,20 @@ impl TokenStore {
             (None, None) => Err(Error::invalid_state()
                 .message("token refresh failed: no token available after refresh")),
         };
-        (result, background)
+        (result, cut_short_background)
     }
+}
+
+/// Whether a refresh failed in a way its session's runtime shutting down
+/// causes: dropped or panicked (`Cancelled`) or a transport failure, with no
+/// response from the server. A server's answer (a 429 or 401, or a 5xx after
+/// retries) carries its HTTP status and is shared with waiters as is.
+fn cut_short(e: &Error) -> bool {
+    e.http_status.is_none()
+        && matches!(
+            e.code,
+            ErrorCode::Cancelled | ErrorCode::NetworkError | ErrorCode::Timeout
+        )
 }
 
 /// Internal enum representing the token's current state.
@@ -588,9 +601,13 @@ mod tests {
     }
 
     /// A caller waits on a refresh that is already running (`refreshing` set
-    /// by hand) and then fails with HTTP 429; `background` says which kind of
+    /// by hand) and then fails with `error`; `background` says which kind of
     /// refresh it was. The waiter's own refresh returns a fresh token.
-    fn wait_on_failed_refresh_of(token: OAuthToken, background: bool) -> Result<OAuthToken> {
+    fn wait_on_failed_refresh_with(
+        token: OAuthToken,
+        error: Error,
+        background: bool,
+    ) -> Result<OAuthToken> {
         let store = Arc::new(TokenStore::new());
         *store.token.write().unwrap() = Some(token);
         store.refreshing.store(true, Ordering::SeqCst);
@@ -598,14 +615,17 @@ mod tests {
         let waiter =
             std::thread::spawn(move || s.get_or_refresh(|| Ok(create_token_with_ttl(3600))));
         std::thread::sleep(std::time::Duration::from_millis(20));
-        let error = Error::resource_exhausted().message("HTTP 429");
         *store.last_error.lock().unwrap() = Some((error, background));
         store.refreshing.store(false, Ordering::SeqCst);
         waiter.join().unwrap()
     }
 
+    fn http_429() -> Error {
+        Error::from_http_status(429).message("HTTP 429")
+    }
+
     fn wait_on_failed_refresh(token: OAuthToken) -> Result<OAuthToken> {
-        wait_on_failed_refresh_of(token, false)
+        wait_on_failed_refresh_with(token, http_429(), false)
     }
 
     #[test]
@@ -623,12 +643,21 @@ mod tests {
     }
 
     #[test]
-    fn test_store_waiter_refreshes_itself_after_a_failed_background_refresh() {
+    fn test_store_waiter_refreshes_itself_after_a_background_refresh_cut_short() {
         // A background refresh may fail only because the session that ran it
         // closed; the waiter refreshes with its own function instead.
         let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
-        let token = wait_on_failed_refresh_of(expired, true).expect("own refresh");
+        let error = Error::network_error().message("runtime shut down");
+        let token = wait_on_failed_refresh_with(expired, error, true).expect("own refresh");
         assert_eq!(token.access_token, "token-3600");
+    }
+
+    #[test]
+    fn test_store_waiters_get_the_servers_answer_to_a_background_refresh() {
+        // A 429 after the retry ladder isn't retried again by every waiter.
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        let err = wait_on_failed_refresh_with(expired, http_429(), true).unwrap_err();
+        assert_eq!(err.http_status, Some(429), "{err:?}");
     }
 
     #[tokio::test(flavor = "multi_thread")]
