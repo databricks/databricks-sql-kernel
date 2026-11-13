@@ -1,0 +1,462 @@
+name: Temporary Node OS error validation
+
+on:
+  push:
+    branches: [aakash-saravanan_data/validation/volume-terminal-response-node-os-public-source]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  windows-pair:
+    if: github.repository == 'databricks/databricks-sql-kernel'
+    environment: azure-prod
+    runs-on:
+      group: databricks-protected-runner-group
+      labels: [windows-server-latest]
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      REVIEWED_KERNEL_SHA: 7c98f1c993c8950bbcf4fc60da368b3fa5c3a57b
+      REVIEWED_NODE_SHA: 5014ad7a90414af6d76acadf58d2fcfe76e0eaad
+    steps:
+      - name: Initialize owned receipt directory
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $runRoot = "$env:RUNNER_TEMP/node-os-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT"
+          if (Test-Path -LiteralPath $runRoot) { throw 'Owned run directory already exists' }
+          New-Item -ItemType Directory -Path "$runRoot/receipts" | Out-Null
+          '{"stage":"source","ok":false}' | Set-Content "$runRoot/receipts/outcome.json"
+          @("NODE_OS_RUN_ROOT=$runRoot", "CARGO_HOME=$runRoot/cargo", "RUSTUP_HOME=$runRoot/rustup",
+            "CARGO_TARGET_DIR=$runRoot/target", "NPM_CONFIG_CACHE=$runRoot/npm-cache",
+            "NPM_CONFIG_USERCONFIG=$runRoot/npmrc") | Add-Content $env:GITHUB_ENV
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          ref: ${{ github.sha }}
+          path: kernel
+          fetch-depth: 2
+          persist-credentials: false
+
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22.23.4
+          architecture: x64
+
+      - name: Verify H and its exact two-file association with Kprime
+        env:
+          EXECUTED_WORKFLOW_SHA: ${{ github.workflow_sha }}
+        run: |
+          @'
+          const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto');
+          const { execFileSync } = require('node:child_process'), assert = require('node:assert/strict');
+          const root = process.env.NODE_OS_RUN_ROOT, kernel = path.join(process.env.GITHUB_WORKSPACE, 'kernel');
+          const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          const git = (...args) => execFileSync('git', ['-C', kernel, ...args], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim();
+          const out = { ok: false };
+          let check = 'source-event';
+          try {
+            const event = JSON.parse(fs.readFileSync(process.env.GITHUB_EVENT_PATH, 'utf8'));
+            const branch = 'refs/heads/aakash-saravanan_data/validation/volume-terminal-response-node-os-public-source';
+            check = 'source-full-shas';
+            for (const key of ['REVIEWED_KERNEL_SHA', 'REVIEWED_NODE_SHA', 'GITHUB_SHA', 'EXECUTED_WORKFLOW_SHA']) assert(/^[0-9a-f]{40}$/.test(process.env[key]));
+            check = 'source-push-event';
+            assert.equal(process.env.GITHUB_EVENT_NAME, 'push');
+            check = 'source-branch';
+            assert.equal(process.env.GITHUB_REF, branch);
+            check = 'source-repository';
+            assert.equal(process.env.GITHUB_REPOSITORY, 'databricks/databricks-sql-kernel');
+            check = 'source-private';
+            assert.equal(event.repository.private, true);
+            check = 'source-event-head';
+            assert.equal(event.after, process.env.GITHUB_SHA);
+            check = 'source-workflow-ref';
+            assert.equal(process.env.GITHUB_WORKFLOW_REF, `databricks/databricks-sql-kernel/.github/workflows/node-os-errors-validation.yml@${branch}`);
+            check = 'source-workflow-sha';
+            assert.equal(process.env.EXECUTED_WORKFLOW_SHA, process.env.GITHUB_SHA);
+            check = 'source-checkout-sha';
+            assert.equal(git('rev-parse', 'HEAD'), process.env.GITHUB_SHA);
+            check = 'source-single-parent';
+            const parents = git('rev-list', '--parents', '-n', '1', 'HEAD').split(' ');
+            assert.deepEqual(parents, [process.env.GITHUB_SHA, process.env.REVIEWED_KERNEL_SHA]);
+            const files = ['.github/scripts/node-os-errors-pair.cjs', '.github/workflows/node-os-errors-validation.yml'];
+            check = 'source-two-added-files';
+            assert.deepEqual(git('diff-tree', '--no-commit-id', '--name-status', '-r', parents[1], parents[0]).split('\n').sort(), files.map(file => `A\t${file}`));
+            check = 'source-file-modes-and-bytes';
+            for (const file of files) {
+              assert(git('ls-tree', 'HEAD', '--', file).startsWith('100644 blob '));
+              assert(fs.readFileSync(path.join(kernel, file)).equals(execFileSync('git', ['-C', kernel, 'show', `HEAD:${file}`])));
+            }
+            check = 'source-clean-tree';
+            assert.equal(git('status', '--porcelain'), '');
+            check = 'source-receipt-hashes';
+            Object.assign(out, { ok: true, H: parents[0], Kprime: parents[1], N: process.env.REVIEWED_NODE_SHA,
+              buildCheckout: 'H', productInputs: 'identical-to-Kprime-by-two-file-diff',
+              workflowSha256: hash(path.join(kernel, files[1])), helperSha256: hash(path.join(kernel, files[0])) });
+          } catch { out.failure = { check, exitCode: 1 }; process.exitCode = 1; }
+          fs.writeFileSync(path.join(root, 'receipts', 'source.json'), JSON.stringify(out, null, 2));
+          '@ | node
+          if ($LASTEXITCODE -ne 0) { throw 'Source identity gate failed; no candidate was loaded' }
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        env:
+          GIT_CONFIG_COUNT: '1'
+          GIT_CONFIG_KEY_0: core.autocrlf
+          GIT_CONFIG_VALUE_0: 'false'
+        with:
+          repository: databricks/databricks-sql-nodejs
+          ref: ${{ env.REVIEWED_NODE_SHA }}
+          path: node-source
+          persist-credentials: false
+
+      - name: Verify public Node N pins Kprime
+        run: |
+          @'
+          const fs = require('node:fs'), path = require('node:path'), assert = require('node:assert/strict');
+          const { execFileSync } = require('node:child_process');
+          const source = path.join(process.env.GITHUB_WORKSPACE, 'node-source');
+          const file = path.join(process.env.NODE_OS_RUN_ROOT, 'receipts', 'source.json');
+          const receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+          let check = 'node-source-receipt';
+          try {
+            assert(receipt.ok);
+            check = 'node-checkout-sha';
+            assert.equal(execFileSync('git', ['-C', source, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim(), receipt.N);
+            check = 'node-kernel-pin';
+            assert.equal(fs.readFileSync(path.join(source, 'KERNEL_REV'), 'utf8').trim(), receipt.Kprime);
+            receipt.nodePinVerified = true;
+          } catch { receipt.ok = false; receipt.failure = { check, exitCode: 1 }; process.exitCode = 1; }
+          fs.writeFileSync(file, JSON.stringify(receipt, null, 2));
+          '@ | node
+          if ($LASTEXITCODE -ne 0) { throw 'Node pin gate failed' }
+
+      - uses: ./kernel/.github/actions/setup-jfrog
+
+      - uses: actions-rust-lang/setup-rust-toolchain@166cdcfd11aee3cb47222f9ddb555ce30ddb9659 # v1.17.0
+        with:
+          toolchain: stable
+          target: x86_64-pc-windows-msvc
+          cache: false
+          rustflags: ''
+
+      - uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1
+        with:
+          arch: x64
+
+      - name: Prepare owned registry configuration and disposable Node inputs
+        run: |
+          $ErrorActionPreference = 'Stop'
+          '{"stage":"dependencies","ok":false}' | Set-Content "$env:NODE_OS_RUN_ROOT/receipts/outcome.json"
+          $command = 'owned-registry-config'; $commandExit = 1
+          try {
+            New-Item -ItemType Directory -Force -Path $env:CARGO_HOME | Out-Null
+          @'
+          [source.crates-io]
+          replace-with = "jfrog"
+          [source.jfrog]
+          registry = "sparse+https://databricks.jfrog.io/artifactory/api/cargo/db-cargo-remote/index/"
+          [registries.jfrog]
+          index = "sparse+https://databricks.jfrog.io/artifactory/api/cargo/db-cargo-remote/index/"
+          credential-provider = ["cargo:token"]
+          '@ | Set-Content "$env:CARGO_HOME/config.toml"
+            "[registries.jfrog]`ntoken = `"Bearer $env:JFROG_ACCESS_TOKEN`"" | Set-Content "$env:CARGO_HOME/credentials.toml"
+            "registry=https://databricks.jfrog.io/artifactory/api/npm/db-npm/`n//databricks.jfrog.io/artifactory/api/npm/db-npm/:_authToken=$env:JFROG_ACCESS_TOKEN`nalways-auth=true" | Set-Content $env:NPM_CONFIG_USERCONFIG
+            $command = 'disposable-node-inputs'; $commandExit = 1
+          @'
+          const fs = require('node:fs'), path = require('node:path'), { execFileSync } = require('node:child_process');
+          const source = path.join(process.env.GITHUB_WORKSPACE, 'node-source'), root = process.env.NODE_OS_RUN_ROOT;
+          try {
+            for (const file of execFileSync('git', ['-C', source, 'ls-files', '-z'], { encoding: 'utf8' }).split('\0').filter(Boolean)) {
+              const destination = path.join(root, 'node', file);
+              fs.mkdirSync(path.dirname(destination), { recursive: true });
+              fs.copyFileSync(path.join(source, file), destination);
+            }
+            fs.mkdirSync(path.join(root, 'baseline'));
+            fs.writeFileSync(path.join(root, 'baseline', 'package.json'), JSON.stringify({ private: true, dependencies: { '@databricks/sql': '3.0.0' } }));
+          } catch {
+            fs.writeFileSync(path.join(root, 'receipts/dependencies.json'), JSON.stringify({ ok: false, failure: { check: 'disposable-node-inputs', exitCode: 1 } }));
+            process.exitCode = 1;
+          }
+          '@ | node
+            $commandExit = $LASTEXITCODE
+            if ($commandExit -ne 0) { throw 'Disposable input preparation failed' }
+            $command = 'npm-baseline-lock'; $commandExit = 1
+            Push-Location "$env:NODE_OS_RUN_ROOT/baseline"
+            try {
+              & npm.cmd install --package-lock-only --ignore-scripts --omit=optional --no-audit --no-fund *> "$env:NODE_OS_RUN_ROOT/npm-lock.log"
+              $commandExit = $LASTEXITCODE
+              if ($commandExit -ne 0) { throw 'Baseline lock resolution failed' }
+            } finally { Pop-Location }
+            $command = 'adapt-disposable-locks'; $commandExit = 1
+          @'
+          const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto'), assert = require('node:assert/strict');
+          const root = process.env.NODE_OS_RUN_ROOT, hash = bytes => crypto.createHash('sha256').update(bytes).digest('hex');
+          const receipt = { ok: false, inputs: {} };
+          let check = 'disposable-lock-inputs';
+          try {
+            for (const name of ['node', 'baseline']) {
+              check = `${name}-lock-read`;
+              const file = path.join(root, name, 'package-lock.json'), original = fs.readFileSync(file);
+              const lock = JSON.parse(original), originalGraph = structuredClone(lock);
+              const graph = value => Object.fromEntries(Object.entries(value.packages).map(([key, item]) => [key, { version: item.version, integrity: item.integrity }]));
+              check = `${name}-lock-proxy-url`;
+              for (const item of Object.values(lock.packages)) if (item.resolved) {
+                item.resolved = item.resolved.replace(/^https:\/\/(registry\.npmjs\.org|npm-proxy\.dev\.databricks\.com)(?=\/)/,
+                  'https://databricks.jfrog.io/artifactory/api/npm/db-npm');
+                assert(item.resolved.startsWith('https://databricks.jfrog.io/artifactory/api/npm/db-npm/'));
+              }
+              check = `${name}-lock-versions-integrities`;
+              assert.deepEqual(graph(lock), graph(originalGraph));
+              const adapted = Buffer.from(JSON.stringify(lock, null, 2) + '\n');
+              fs.writeFileSync(file, adapted);
+              receipt.inputs[name] = { originalLockSha256: hash(original), adaptedLockSha256: hash(adapted), versionsAndIntegritiesUnchanged: true };
+              if (name === 'baseline') {
+                check = 'baseline-version-integrity';
+                const pkg = lock.packages['node_modules/@databricks/sql'];
+                assert.equal(pkg.version, '3.0.0');
+                assert(typeof pkg.integrity === 'string' && pkg.integrity.startsWith('sha512-'));
+                receipt.baseline = { version: pkg.version, integrity: pkg.integrity, dependencies: graph(lock) };
+              }
+            }
+            receipt.ok = true;
+          } catch { receipt.failure = { check, exitCode: 1 }; process.exitCode = 1; }
+          fs.writeFileSync(path.join(root, 'receipts', 'dependencies.json'), JSON.stringify(receipt, null, 2));
+          '@ | node
+            $commandExit = $LASTEXITCODE
+            if ($commandExit -ne 0) { throw 'Disposable lock adaptation failed' }
+            foreach ($package in @('node', 'baseline')) {
+              $command = if ($package -eq 'node') { 'npm-ci-node' } else { 'npm-ci-baseline' }
+              $commandExit = 1
+              Push-Location "$env:NODE_OS_RUN_ROOT/$package"
+              try {
+                & npm.cmd ci --ignore-scripts --include=dev --omit=optional --no-audit --no-fund *> "$env:NODE_OS_RUN_ROOT/npm-$package.log"
+                $commandExit = $LASTEXITCODE
+                if ($commandExit -ne 0) { throw 'Dependency installation failed; raw output is excluded from receipts' }
+              } finally { Pop-Location }
+            }
+          } catch {
+          @'
+          const fs = require('node:fs'), path = require('node:path');
+          const root = process.env.NODE_OS_RUN_ROOT, file = path.join(root, 'receipts/dependencies.json');
+          let receipt = { ok: false };
+          try {
+            if (fs.existsSync(file)) receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const logs = { 'npm-baseline-lock': 'npm-lock.log', 'npm-ci-node': 'npm-node.log', 'npm-ci-baseline': 'npm-baseline.log' };
+            const command = process.argv[2];
+            if (!['owned-registry-config', 'disposable-node-inputs', 'adapt-disposable-locks', ...Object.keys(logs)].includes(command)) throw 0;
+            const exitCode = Number(process.argv[3]);
+            receipt.ok = false;
+            receipt.failure = { ...receipt.failure, command, exitCode: Number.isInteger(exitCode) && exitCode !== 0 ? exitCode : 1 };
+            if (logs[command]) {
+              const log = path.join(root, logs[command]);
+              const match = fs.existsSync(log) && fs.readFileSync(log, 'utf8').match(/^npm (?:error|ERR!) code (E[A-Z0-9_]{1,39})\r?$/m);
+              if (match) receipt.failure.npmCode = match[1];
+            }
+          } catch { receipt.ok = false; receipt.diagnosticsIncomplete = true; }
+          fs.writeFileSync(file, JSON.stringify(receipt, null, 2));
+          '@ | node - $command $commandExit
+            throw 'Dependency preparation failed; inspect sanitized receipts'
+          }
+
+      - name: Build H standalone rustls napi and actual Node dist
+        run: |
+          $ErrorActionPreference = 'Stop'
+          '{"stage":"build","ok":false}' | Set-Content "$env:NODE_OS_RUN_ROOT/receipts/outcome.json"
+          $command = 'cargo-metadata'; $commandExit = 1
+          try {
+            Push-Location kernel/napi
+            try {
+              & cargo metadata --locked --format-version 1 --filter-platform x86_64-pc-windows-msvc 1> "$env:NODE_OS_RUN_ROOT/metadata.json" 2> "$env:NODE_OS_RUN_ROOT/cargo-metadata.log"
+              $commandExit = $LASTEXITCODE
+              if ($commandExit -ne 0) { throw 'Cargo metadata failed' }
+              $command = 'cargo-build'; $commandExit = 1
+              & cargo build --locked --release --target x86_64-pc-windows-msvc --message-format=json 1> "$env:NODE_OS_RUN_ROOT/cargo-artifacts.jsonl" 2> "$env:NODE_OS_RUN_ROOT/cargo-build.log"
+              $commandExit = $LASTEXITCODE
+              if ($commandExit -ne 0) { throw 'Release napi build failed' }
+            } finally { Pop-Location }
+            $command = 'copy-native-addon'; $commandExit = 1
+            New-Item -ItemType Directory -Path "$env:NODE_OS_RUN_ROOT/native" | Out-Null
+            Copy-Item "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/release/databricks_sql_kernel_napi.dll" "$env:NODE_OS_RUN_ROOT/native/volume.node"
+            $command = 'node-update-version'; $commandExit = 1
+            Push-Location "$env:NODE_OS_RUN_ROOT/node"
+            try {
+              & node bin/update-version.js *> "$env:NODE_OS_RUN_ROOT/version.log"
+              $commandExit = $LASTEXITCODE
+              if ($commandExit -ne 0) { throw 'Normal version generation failed' }
+              $command = 'tsc-build'; $commandExit = 1
+              & node node_modules/typescript/bin/tsc --project tsconfig.build.json --pretty false *> "$env:NODE_OS_RUN_ROOT/tsc.log"
+              $commandExit = $LASTEXITCODE
+              if ($commandExit -ne 0) { throw 'Normal build-tsconfig compilation failed' }
+            } finally { Pop-Location }
+            $command = 'build-provenance'; $commandExit = 1
+          @'
+          const fs = require('node:fs'), path = require('node:path'), crypto = require('node:crypto'), assert = require('node:assert/strict');
+          const { execFileSync } = require('node:child_process');
+          const root = process.env.NODE_OS_RUN_ROOT, kernel = path.join(process.env.GITHUB_WORKSPACE, 'kernel');
+          const source = path.join(process.env.GITHUB_WORKSPACE, 'node-source'), node = path.join(root, 'node');
+          const hash = file => crypto.createHash('sha256').update(fs.readFileSync(file)).digest('hex');
+          const receipt = { ok: false };
+          let check = 'build-runtime';
+          try {
+            assert.equal(process.version, 'v22.23.4'); assert.equal(process.arch, 'x64'); assert.equal(process.platform, 'win32');
+            check = 'build-profile-env';
+            assert(!Object.keys(process.env).some(key => key.toUpperCase().startsWith('CARGO_PROFILE_RELEASE_')));
+            check = 'build-rust-flags';
+            for (const key of ['RUSTFLAGS', 'CARGO_ENCODED_RUSTFLAGS', 'RUSTC_WRAPPER', 'RUSTC_WORKSPACE_WRAPPER']) assert(!process.env[key]);
+            check = 'build-metadata';
+            const metadata = JSON.parse(fs.readFileSync(path.join(root, 'metadata.json'), 'utf8'));
+            const features = name => {
+              const pkg = metadata.packages.find(pkg => pkg.name === name);
+              return metadata.resolve.nodes.find(node => node.id === pkg.id).features;
+            };
+            check = 'build-rustls';
+            assert(features('databricks-sql-kernel').includes('tls-rustls'));
+            check = 'build-native-tls-absent';
+            assert(!features('databricks-sql-kernel').includes('tls-native'));
+            check = 'build-dyn-symbols-absent';
+            assert(!features('databricks-sql-kernel-napi').includes('dyn-symbols'));
+            check = 'build-release-manifest';
+            const manifest = fs.readFileSync(path.join(kernel, 'napi', 'Cargo.toml'), 'utf8');
+            const profile = manifest.split('[profile.release]')[1].split(/\n\[/)[0];
+            assert(/^lto\s*=\s*true\s*$/m.test(profile) && /^codegen-units\s*=\s*1\s*$/m.test(profile));
+            assert(/^strip\s*=\s*"debuginfo"\s*$/m.test(profile) && !/^panic\s*=/m.test(profile));
+            check = 'build-release-artifact';
+            const artifact = fs.readFileSync(path.join(root, 'cargo-artifacts.jsonl'), 'utf8').trim().split('\n').map(line => JSON.parse(line))
+              .find(item => item.reason === 'compiler-artifact' && item.target.name === 'databricks_sql_kernel_napi' && item.filenames.some(file => file.endsWith('.dll')));
+            assert(artifact && artifact.profile.opt_level === '3' && !artifact.features.includes('dyn-symbols'));
+            const dll = path.join(process.env.CARGO_TARGET_DIR, 'x86_64-pc-windows-msvc', 'release', 'databricks_sql_kernel_napi.dll');
+            const addon = path.join(root, 'native', 'volume.node');
+            check = 'build-addon-bytes';
+            assert(fs.readFileSync(dll).equals(fs.readFileSync(addon)));
+            check = 'build-addon-hash';
+            assert.equal(hash(dll), hash(addon));
+            check = 'build-router-hash';
+            assert.equal(hash(path.join(node, 'native/kernel/index.js')), hash(path.join(source, 'native/kernel/index.js')));
+            check = 'build-napi-lock';
+            const lock = 'napi/Cargo.lock';
+            assert.equal(hash(path.join(kernel, lock)), crypto.createHash('sha256').update(execFileSync('git', ['-C', kernel, 'show', `HEAD:${lock}`])).digest('hex'));
+            check = 'build-receipt-fields';
+            Object.assign(receipt, { ok: true, buildCheckout: JSON.parse(fs.readFileSync(path.join(root, 'receipts/source.json'))).H,
+              command: 'cargo build --locked --release --target x86_64-pc-windows-msvc --message-format=json',
+              napiLockSha256: hash(path.join(kernel, lock)), napiManifestSha256: hash(path.join(kernel, 'napi/Cargo.toml')),
+              kernelFeatures: features('databricks-sql-kernel'), napiFeatures: artifact.features, cargoProfile: artifact.profile,
+              profile: { lto: true, codegenUnits: 1, strip: 'debuginfo', panic: 'unwind-default' },
+              rustc: execFileSync('rustc', ['--version'], { encoding: 'utf8' }).trim(), cargo: execFileSync('cargo', ['--version'], { encoding: 'utf8' }).trim(),
+              nodeVersion: process.version, nodeExecutableSha256: hash(process.execPath), dllSha256: hash(dll), addonSha256: hash(addon),
+              generatorSha256: hash(path.join(node, 'bin/update-version.js')), generatorInputSha256: hash(path.join(node, 'package.json')),
+              versionOutputSha256: hash(path.join(node, 'lib/version.ts')), buildTsconfigSha256: hash(path.join(node, 'tsconfig.build.json')),
+              compiledEntrySha256: hash(path.join(node, 'dist/index.js')), unchangedRouterSha256: hash(path.join(node, 'native/kernel/index.js')) });
+          } catch { receipt.failure = { check, exitCode: 1 }; process.exitCode = 1; }
+          fs.writeFileSync(path.join(root, 'receipts/build.json'), JSON.stringify(receipt, null, 2));
+          '@ | node
+            $commandExit = $LASTEXITCODE
+            if ($commandExit -ne 0) { throw 'Build provenance gate failed' }
+          } catch {
+          @'
+          const fs = require('node:fs'), path = require('node:path'), { execFileSync } = require('node:child_process');
+          const root = process.env.NODE_OS_RUN_ROOT, file = path.join(root, 'receipts/build.json');
+          const kernel = path.join(process.env.GITHUB_WORKSPACE, 'kernel'), node = path.join(root, 'node');
+          let receipt = { ok: false };
+          try {
+            if (fs.existsSync(file)) receipt = JSON.parse(fs.readFileSync(file, 'utf8'));
+            const command = process.argv[2], exitCode = Number(process.argv[3]);
+            if (!['cargo-metadata', 'cargo-build', 'copy-native-addon', 'node-update-version', 'tsc-build', 'build-provenance'].includes(command)) throw 0;
+            receipt.ok = false;
+            receipt.failure = { ...receipt.failure, command, exitCode: Number.isInteger(exitCode) && exitCode !== 0 ? exitCode : 1 };
+            const tracked = directory => new Set(execFileSync('git', ['-C', directory, 'ls-files', '-z'],
+              { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).split('\0'));
+            const source = (directory, cwd, files, name) => {
+              if (typeof name !== 'string') return;
+              const relative = path.relative(directory, path.resolve(cwd, name)).split(path.sep).join('/');
+              if (/^[A-Za-z0-9_./-]{1,240}$/.test(relative) && !relative.split('/').includes('..') && files.has(relative)) return relative;
+            };
+            const position = value => Number.isInteger(value) && value > 0 && value <= 10000000;
+            if (command === 'cargo-build') {
+              const files = tracked(kernel), cwd = path.join(kernel, 'napi');
+              const metadata = JSON.parse(fs.readFileSync(path.join(root, 'metadata.json'), 'utf8'));
+              const packages = new Set(metadata.packages.filter(pkg => source(kernel, cwd, files, pkg.manifest_path)).map(pkg => pkg.id));
+              receipt.cargoErrors = [];
+              for (const line of fs.readFileSync(path.join(root, 'cargo-artifacts.jsonl'), 'utf8').split('\n').filter(Boolean)) {
+                const item = JSON.parse(line), message = item.message;
+                if (item.reason !== 'compiler-message' || !packages.has(item.package_id) || message?.level !== 'error') continue;
+                const spans = (message.spans || []).map(span => ({ file: source(kernel, cwd, files, span.file_name),
+                  lineStart: span.line_start, lineEnd: span.line_end, columnStart: span.column_start, columnEnd: span.column_end }))
+                  .filter(span => span.file && [span.lineStart, span.lineEnd, span.columnStart, span.columnEnd].every(position)).slice(0, 5);
+                if (spans.length) receipt.cargoErrors.push({ code: /^E[0-9]{4}$/.test(message.code?.code) ? message.code.code : undefined, spans });
+                if (receipt.cargoErrors.length === 20) break;
+              }
+            } else if (command === 'tsc-build') {
+              const files = tracked(path.join(process.env.GITHUB_WORKSPACE, 'node-source'));
+              receipt.typescriptErrors = [];
+              for (const line of fs.readFileSync(path.join(root, 'tsc.log'), 'utf8').split('\n')) {
+                const match = line.match(/^(.+?)\(([0-9]{1,8}),([0-9]{1,8})\): error (TS[0-9]{3,5}):/);
+                if (match) {
+                  const file = source(node, node, files, match[1]), row = Number(match[2]), column = Number(match[3]);
+                  if (file && position(row) && position(column)) receipt.typescriptErrors.push({ code: match[4], file, line: row, column });
+                } else {
+                  const global = line.match(/^error (TS[0-9]{3,5}):/);
+                  if (global) receipt.typescriptErrors.push({ code: global[1] });
+                }
+                if (receipt.typescriptErrors.length === 30) break;
+              }
+            }
+          } catch { receipt.ok = false; receipt.diagnosticsIncomplete = true; }
+          fs.writeFileSync(file, JSON.stringify(receipt, null, 2));
+          '@ | node - $command $commandExit
+            throw 'Build failed; inspect sanitized receipts'
+          }
+
+      - name: Run the fixed live Thrift and native pair
+        env:
+          E2E_HOST: ${{ secrets.DATABRICKS_HOST }}
+          E2E_PATH: ${{ secrets.DATABRICKS_HTTP_PATH }}
+          E2E_ACCESS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          E2E_CATALOG: peco
+          E2E_SCHEMA: default
+          E2E_VOLUME: e2etests
+        run: |
+          '{"stage":"live-pair","ok":false}' | Set-Content "$env:NODE_OS_RUN_ROOT/receipts/outcome.json"
+          & node kernel/.github/scripts/node-os-errors-pair.cjs *> "$env:NODE_OS_RUN_ROOT/pair-output.log"
+          if ($LASTEXITCODE -ne 0) { throw 'Live pair did not pass; inspect only the sanitized receipts' }
+          '{"stage":"live-pair","ok":true}' | Set-Content "$env:NODE_OS_RUN_ROOT/receipts/outcome.json"
+
+      - name: Remove owned build inputs and preserve receipt cleanup outcome
+        if: always()
+        env:
+          VALIDATION_JOB_STATUS: ${{ job.status }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          if ($env:NODE_OS_RUN_ROOT -ne "$env:RUNNER_TEMP/node-os-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT") { throw 'Cleanup ownership mismatch' }
+          if (Test-Path -LiteralPath "$env:NODE_OS_RUN_ROOT/receipts/outcome.json") {
+            $outcome = Get-Content -Raw "$env:NODE_OS_RUN_ROOT/receipts/outcome.json" | ConvertFrom-Json -AsHashtable
+            $outcome.jobStatus = $env:VALIDATION_JOB_STATUS
+            $outcome.cleanup = 'removed-owned-inputs'
+            try {
+              Get-ChildItem -LiteralPath $env:NODE_OS_RUN_ROOT -Force | Where-Object Name -ne 'receipts' | Remove-Item -Recurse -Force
+            } catch { $outcome.cleanup = 'failed'; $outcome.ok = $false }
+            $outcome | ConvertTo-Json | Set-Content "$env:NODE_OS_RUN_ROOT/receipts/outcome.json"
+            if ($outcome.cleanup -eq 'failed') { throw 'Owned input cleanup failed' }
+          }
+
+      - name: Upload private allowlisted receipts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: node-os-errors-${{ github.run_id }}-${{ github.run_attempt }}
+          retention-days: 1
+          if-no-files-found: error
+          path: |
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/outcome.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/source.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/dependencies.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/build.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/pair.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/thrift.json
+            ${{ env.NODE_OS_RUN_ROOT }}/receipts/native.json
