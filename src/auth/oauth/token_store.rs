@@ -254,8 +254,8 @@ impl TokenStore {
             // the CAS. The store serves every session with these credentials,
             // so a second token request here would be one for all of them.
             let current = self.token.read().ok().and_then(|t| t.clone());
-            if let Some(t) = current.filter(|t| !t.is_expired()) {
-                return Ok(t);
+            if let Some(t) = current.as_ref().filter(|t| !t.is_expired()) {
+                return Ok(t.clone());
             }
 
             // We won the race: perform the refresh
@@ -275,7 +275,12 @@ impl TokenStore {
 
             // _guard drops here, resetting refreshing to false
 
-            result
+            match (result, current) {
+                // Like its waiters, keep a token the server still accepts
+                // (inside the expiry buffer) rather than fail on it.
+                (Err(_), Some(t)) if t.expires_at > chrono::Utc::now() => Ok(t),
+                (result, _) => result,
+            }
         } else {
             // Another thread is already refreshing: wait for it to complete
             let (result, cut_short) = self.wait_for_refresh();
@@ -637,6 +642,27 @@ mod tests {
         // 30 s left: inside the 40 s expiry buffer, still accepted by the server.
         let token = wait_on_failed_refresh(create_token_with_ttl(30)).expect("cached token");
         assert_eq!(token.access_token, "token-30");
+    }
+
+    #[test]
+    fn test_store_refresher_keeps_a_still_valid_token_when_its_refresh_fails() {
+        let store = TokenStore::new();
+        // 30 s left: inside the 40 s expiry buffer, still accepted by the server.
+        *store.token.write().unwrap() = Some(create_token_with_ttl(30));
+        let token = store
+            .get_or_refresh(|| Err(http_429()))
+            .expect("cached token");
+        assert_eq!(token.access_token, "token-30");
+        assert!(
+            store.last_error.lock().unwrap().is_some(),
+            "kept for waiters"
+        );
+
+        // Past its expiry, the refresh's error is returned.
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        *store.token.write().unwrap() = Some(expired);
+        let err = store.get_or_refresh(|| Err(http_429())).unwrap_err();
+        assert_eq!(err.http_status, Some(429), "{err:?}");
     }
 
     #[test]
