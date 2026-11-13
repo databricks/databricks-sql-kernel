@@ -38,6 +38,12 @@ const MAX_THROTTLE_BACKOFF: Duration = Duration::from_secs(30);
 const MAX_PENDING_EVENTS: usize = 10_000;
 #[cfg(test)]
 const MAX_PENDING_EVENTS: usize = 20;
+/// Most events per POST (at least one batch), so a backlog left by throttling
+/// goes out in bounded requests (~1.4 MB) rather than one large one.
+#[cfg(not(test))]
+const MAX_EVENTS_PER_EXPORT: usize = 1_000;
+#[cfg(test)]
+const MAX_EVENTS_PER_EXPORT: usize = 50;
 
 pub(super) struct TelemetryClient {
     exporter: Arc<dyn TelemetryExporter>,
@@ -164,31 +170,43 @@ impl TelemetryClient {
         let Ok(_guard) = self.flush_lock.try_lock() else {
             return;
         };
-        self.export_pending(true).await;
+        // Keep going while a backlog left by throttling still fills a batch.
+        loop {
+            let delivered = self.export_once(true).await;
+            if !delivered || self.queue_count.load(Ordering::Acquire) < self.batch_size {
+                break;
+            }
+        }
     }
 
-    /// Close-time flush: one export attempt regardless of throttling, so close
-    /// never waits out a backoff.
+    /// Session-release and close flush. Sends everything queued without
+    /// waiting out a backoff. While the client stays in use a throttled batch
+    /// is kept; once it is closing, it is dropped as before.
     async fn flush_once_wait(self: &Arc<Self>) {
         let _guard = self.flush_lock.lock().await;
-        self.export_pending(false).await;
+        let requeue_if_throttled = self.state.load(Ordering::Acquire) == STATE_ACTIVE;
+        while self.export_once(requeue_if_throttled).await {}
     }
 
-    async fn export_pending(&self, requeue_if_throttled: bool) {
-        let batch = self.drain_pending();
+    /// Export the oldest queued events in one request. Returns whether a
+    /// non-empty batch was delivered.
+    async fn export_once(&self, requeue_if_throttled: bool) -> bool {
+        let batch = self.drain_pending(MAX_EVENTS_PER_EXPORT.max(self.batch_size));
         if batch.is_empty() {
-            return;
+            return false;
         }
 
         match export_batch(Arc::clone(&self.exporter), &batch).await {
             Ok(()) => {
-                *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default()
+                *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default();
+                true
             }
             Err(TelemetryExportError::Throttled(_)) if requeue_if_throttled => {
                 self.back_off();
                 self.requeue(batch);
+                false
             }
-            Err(_) => {}
+            Err(_) => false,
         }
     }
 
@@ -224,13 +242,12 @@ impl TelemetryClient {
         *pending = batch;
     }
 
-    fn drain_pending(&self) -> Vec<TelemetryFrontendLog> {
-        let drained = self
-            .pending
-            .lock()
-            .expect("poisoned telemetry queue")
-            .drain(..)
-            .collect::<Vec<_>>();
+    fn drain_pending(&self, limit: usize) -> Vec<TelemetryFrontendLog> {
+        let drained = {
+            let mut pending = self.pending.lock().expect("poisoned telemetry queue");
+            let n = pending.len().min(limit);
+            pending.drain(..n).collect::<Vec<_>>()
+        };
         self.queue_count.fetch_sub(drained.len(), Ordering::AcqRel);
         drained
     }
@@ -461,6 +478,85 @@ mod tests {
 
         assert_eq!(exporter.ids(), [vec!["one"], vec!["one", "two"]]);
         assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_release_flush_keeps_throttled_batch() {
+        let exporter = ThrottlingExporter::new(usize::MAX);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+
+        client.enqueue(sample_log("one"));
+        wait_until(|| client.throttled()).await;
+
+        // The flush run when a host's last session closes ignores the backoff,
+        // but the client stays in use, so a throttled batch is kept.
+        client.flush_bounded().await;
+
+        assert_eq!(exporter.ids(), [vec!["one"], vec!["one"]]);
+        assert_eq!(client.pending.lock().unwrap().len(), 1);
+        assert_eq!(
+            client.throttle.lock().unwrap().backoff,
+            INITIAL_THROTTLE_BACKOFF * 2
+        );
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn flush_sends_backlog_in_bounded_posts() {
+        let exporter = ThrottlingExporter::new(0);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 2,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+        let backlog = (0..120)
+            .map(|i| sample_log(&format!("e{i}")))
+            .collect::<Vec<_>>();
+        client.queue_count.store(backlog.len(), Ordering::Release);
+        *client.pending.lock().unwrap() = backlog;
+
+        client.flush_bounded().await;
+
+        let sizes = exporter.ids().iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, [MAX_EVENTS_PER_EXPORT, MAX_EVENTS_PER_EXPORT, 20]);
+        assert_eq!(exporter.ids()[0][0], "e0");
+        client.close().await;
+    }
+
+    #[tokio::test]
+    async fn background_flush_drains_backlog_in_bounded_posts() {
+        let exporter = ThrottlingExporter::new(0);
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 2,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let client = TelemetryClient::new(&config, Arc::new(exporter.clone()))
+            .expect("telemetry runtime should start");
+        let backlog = (0..119)
+            .map(|i| sample_log(&format!("e{i}")))
+            .collect::<Vec<_>>();
+        client.queue_count.store(backlog.len(), Ordering::Release);
+        *client.pending.lock().unwrap() = backlog;
+
+        client.enqueue(sample_log("e119"));
+        wait_until(|| exporter.ids().len() == 3).await;
+
+        let sizes = exporter.ids().iter().map(Vec::len).collect::<Vec<_>>();
+        assert_eq!(sizes, [MAX_EVENTS_PER_EXPORT, MAX_EVENTS_PER_EXPORT, 20]);
+        assert!(client.pending.lock().unwrap().is_empty());
+        client.close().await;
     }
 
     #[tokio::test]
