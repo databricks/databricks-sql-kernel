@@ -600,7 +600,175 @@ pub(crate) fn statement_closed_err() -> napi::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow_array::{RecordBatch, StringArray};
+    use arrow_ipc::reader::StreamReader;
     use arrow_schema::{DataType, Field, Schema};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use databricks_sql_kernel::{AuthConfig, Session};
+    use serde_json::json;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    async fn volume_session() -> (MockServer, Session) {
+        let server = MockServer::start().await;
+        let names = ["operation", "presignedUrl", "headers", "localFile"];
+        let schema = Arc::new(Schema::new(
+            names
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .to_vec(),
+        ));
+        let values = [
+            "REMOVE".to_owned(),
+            format!("{}/object", server.uri()),
+            "{}".into(),
+            "".into(),
+        ];
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            values
+                .iter()
+                .map(|value| Arc::new(StringArray::from(vec![value.as_str()])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let response = json!({
+            "statement_id":"volume", "status":{"state":"CLOSED"},
+            "manifest":{"format":"ARROW_STREAM", "is_volume_operation":true, "total_row_count":1, "total_chunk_count":1,
+                "schema":{"column_count":4,"columns":names.iter().enumerate().map(|(i,name)| json!({"name":name,"type_name":"STRING","type_text":"STRING","position":i})).collect::<Vec<_>>()}},
+            "result":{"chunk_index":0,"row_offset":0,"row_count":1,"attachment":STANDARD.encode(crate::result::encode_ipc_stream(&schema, Some(&batch)).unwrap())}
+        });
+        for verb in ["POST", "GET"] {
+            Mock::given(method(verb))
+                .and(path(if verb == "POST" {
+                    "/api/2.0/sql/statements"
+                } else {
+                    "/api/2.0/sql/statements/volume"
+                }))
+                .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/wh/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({"session_id":"session"})))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let session = Session::builder()
+            .http_path(server.uri(), "/sql/1.0/warehouses/wh")
+            .auth(AuthConfig::Pat {
+                token: "test-token".into(),
+                identity_federation_client_id: None,
+            })
+            .open()
+            .await
+            .unwrap();
+        (server, session)
+    }
+
+    #[tokio::test]
+    async fn sync_and_async_volume_completion_preserves_instruction_ipc() {
+        for asynchronous in [false, true] {
+            let (server, session) = volume_session().await;
+            Mock::given(method("DELETE"))
+                .and(path("/object"))
+                .respond_with(ResponseTemplate::new(200))
+                .with_priority(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            let mut parent = session.statement();
+            parent.spec().sql("operation");
+            let batch = if asynchronous {
+                let executed = parent.submit().await.unwrap();
+                let owner =
+                    crate::async_statement::AsyncStatement::from_executed_async(parent, executed);
+                let result = owner.await_result().await.unwrap();
+                assert!(result.is_volume_operation());
+                assert_eq!(
+                    result
+                        .complete_volume_operation(vec![], None)
+                        .await
+                        .unwrap(),
+                    "completed"
+                );
+                let batch = result.fetch_next_batch().await.unwrap().unwrap();
+                owner.close().await.unwrap();
+                batch
+            } else {
+                let executed = parent.execute().await.unwrap();
+                let result = Statement::from_executed(parent, executed);
+                assert!(result.is_volume_operation());
+                assert_eq!(
+                    result
+                        .complete_volume_operation(vec![], None)
+                        .await
+                        .unwrap(),
+                    "completed"
+                );
+                let batch = result.fetch_next_batch().await.unwrap().unwrap();
+                result.close().await.unwrap();
+                batch
+            };
+            let decoded =
+                StreamReader::try_new(std::io::Cursor::new(batch.ipc_bytes.as_ref()), None)
+                    .unwrap()
+                    .next()
+                    .unwrap()
+                    .unwrap();
+            assert_eq!(
+                decoded
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap()
+                    .value(0),
+                "REMOVE"
+            );
+            session.close().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn close_interrupts_volume_completion_before_waiting_for_its_lock() {
+        let (server, session) = volume_session().await;
+        Mock::given(method("DELETE"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+            .with_priority(1)
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut parent = session.statement();
+        parent.spec().sql("operation");
+        let executed = parent.execute().await.unwrap();
+        let result = Statement::from_executed(parent, executed);
+        let completion = result.complete_volume_operation(vec![], None);
+        tokio::pin!(completion);
+        tokio::select! {
+            finished = &mut completion => panic!("completion finished before close: {finished:?}"),
+            _ = async {
+                while !server.received_requests().await.unwrap().iter().any(|request| request.url.path() == "/object") {
+                    tokio::task::yield_now().await;
+                }
+            } => {}
+        }
+        let (closed, completed) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(result.close(), &mut completion)
+        })
+        .await
+        .expect("close must signal before waiting for the completion lock");
+        closed.unwrap();
+        assert!(completed
+            .unwrap_err()
+            .reason
+            .contains(r#""code":"Cancelled""#));
+        session.close().await.unwrap();
+    }
 
     fn make_schema() -> Arc<Schema> {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))

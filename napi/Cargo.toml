@@ -129,6 +129,7 @@ serde_json = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
+base64 = "0.22"
 wiremock = "0.6"
 
 [build-dependencies]

@@ -29,6 +29,15 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn response(server: &MockServer, marked: bool, local: &str) -> serde_json::Value {
+    response_with_batches(server, marked, local, 1)
+}
+
+fn response_with_batches(
+    server: &MockServer,
+    marked: bool,
+    local: &str,
+    count: usize,
+) -> serde_json::Value {
     let names = ["operation", "presignedUrl", "headers", "localFile"];
     let schema = Arc::new(Schema::new(
         names
@@ -53,7 +62,9 @@ fn response(server: &MockServer, marked: bool, local: &str) -> serde_json::Value
     let mut ipc = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut ipc, &batch.schema()).unwrap();
-        writer.write(&batch).unwrap();
+        for _ in 0..count {
+            writer.write(&batch).unwrap();
+        }
         writer.finish().unwrap();
     }
     json!({
@@ -61,10 +72,48 @@ fn response(server: &MockServer, marked: bool, local: &str) -> serde_json::Value
         "manifest": {
             "format": "ARROW_STREAM", "is_volume_operation": marked,
             "schema": {"column_count":4,"columns": names.iter().enumerate().map(|(i,name)| json!({"name":name,"type_name":"STRING","type_text":"STRING","position":i})).collect::<Vec<_>>()},
-            "total_row_count":1,"total_chunk_count":1
+            "total_row_count":count,"total_chunk_count":1
         },
-        "result": {"chunk_index":0,"row_offset":0,"row_count":1,"attachment":STANDARD.encode(&ipc)}
+        "result": {"chunk_index":0,"row_offset":0,"row_count":count,"attachment":STANDARD.encode(&ipc)}
     })
+}
+
+#[tokio::test]
+async fn multiple_instruction_batches_fail_before_any_storage_request() {
+    let server = MockServer::start().await;
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("download");
+    std::fs::write(&dest, b"original").unwrap();
+    let session = session(
+        &server,
+        response_with_batches(&server, true, dest.to_str().unwrap(), 2),
+    )
+    .await;
+    Mock::given(method("GET"))
+        .and(path("/object"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"replacement"))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut statement = session.statement();
+    statement.spec().sql("operation");
+    let mut executed = statement.execute().await.unwrap();
+    let options = VolumeOptions {
+        allowed_paths: vec![dir.path().to_owned()],
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let error = executed
+            .result_stream_mut()
+            .complete_volume_operation(&options, None)
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidArgument);
+        assert_eq!(error.message, "Expected one Volume instruction row");
+    }
+    assert_eq!(std::fs::read(&dest).unwrap(), b"original");
+    executed.close().await.unwrap();
+    session.close().await.unwrap();
 }
 
 async fn session(server: &MockServer, body: serde_json::Value) -> Session {

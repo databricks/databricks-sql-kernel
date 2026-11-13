@@ -1530,8 +1530,171 @@ fn parse_client_timeout_option(key: &str, value: OptionValue) -> Option<Result<O
 #[cfg(test)]
 mod tests {
     use super::*;
+    use adbc_core::{Optionable as _, Statement as _};
     use arrow_array::{BinaryArray, Int64Array, LargeBinaryArray, StringArray};
+    use arrow_ipc::writer::StreamWriter;
     use arrow_schema::{DataType, Field};
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    #[test]
+    fn volume_option_controls_completion_on_all_execution_paths_and_preserves_rows() {
+        let runtime = RuntimeHandle::create().unwrap();
+        let server = runtime.block_on_safe(MockServer::start());
+        let names = ["operation", "presignedUrl", "headers", "localFile"];
+        let schema = Arc::new(Schema::new(
+            names
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .to_vec(),
+        ));
+        let values = [
+            "REMOVE".to_owned(),
+            format!("{}/object", server.uri()),
+            "{}".into(),
+            "".into(),
+        ];
+        let instruction = RecordBatch::try_new(
+            schema.clone(),
+            values
+                .iter()
+                .map(|value| Arc::new(StringArray::from(vec![value.as_str()])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let mut ipc = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc, &schema).unwrap();
+            writer.write(&instruction).unwrap();
+            writer.finish().unwrap();
+        }
+        let response = json!({
+            "statement_id":"volume", "status":{"state":"CLOSED"},
+            "manifest":{"format":"ARROW_STREAM", "is_volume_operation":true, "total_row_count":1,"total_chunk_count":1,
+                "schema":{"column_count":4,"columns":names.iter().enumerate().map(|(i,name)| json!({"name":name,"type_name":"STRING","type_text":"STRING","position":i})).collect::<Vec<_>>()}},
+            "result":{"chunk_index":0,"row_offset":0,"row_count":1,"attachment":STANDARD.encode(&ipc)}
+        });
+        runtime.block_on_safe(async {
+            for verb in ["POST", "GET"] {
+                Mock::given(method(verb))
+                    .and(path(if verb == "POST" {
+                        "/api/2.0/sql/statements"
+                    } else {
+                        "/api/2.0/sql/statements/volume"
+                    }))
+                    .respond_with(ResponseTemplate::new(200).set_body_json(response.clone()))
+                    .mount(&server)
+                    .await;
+            }
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/warehouses/wh/sessions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"session_id":"session"})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .and(path("/object"))
+                .respond_with(ResponseTemplate::new(200))
+                .with_priority(1)
+                .expect(7)
+                .mount(&server)
+                .await;
+        });
+        let session = runtime
+            .block_on_safe(
+                kernel::Session::builder()
+                    .http_path(server.uri(), "/sql/1.0/warehouses/wh")
+                    .auth(kernel::AuthConfig::Pat {
+                        token: "test-token".into(),
+                        identity_federation_client_id: None,
+                    })
+                    .open(),
+            )
+            .unwrap();
+        let mut transfers = 0;
+        for mode in ["raw", "sync", "async", "await", "fetch", "bound", "update"] {
+            let mut statement = Statement::new(
+                session.statement(),
+                session.metadata(),
+                Arc::clone(&runtime),
+                Arc::new(CancellationRegistry::default()),
+                false,
+            );
+            statement.set_sql_query("operation ?, ?").unwrap();
+            let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
+            assert_eq!(
+                statement.get_option_string(key.clone()).unwrap_err().status,
+                Status::NotFound
+            );
+            for value in [OptionValue::Int(1), OptionValue::String("[1]".into())] {
+                assert_eq!(
+                    statement.set_option(key.clone(), value).unwrap_err().status,
+                    Status::InvalidArguments
+                );
+            }
+            if mode != "raw" {
+                statement.set_option(key.clone(), "[]".into()).unwrap();
+                assert_eq!(statement.get_option_string(key).unwrap(), "[]");
+            }
+            if mode == "async" {
+                statement
+                    .set_option(
+                        OptionStatement::Other(ENABLE_DIRECT_RESULTS_OPTION.into()),
+                        "false".into(),
+                    )
+                    .unwrap();
+            }
+            if mode == "bound" {
+                statement.bind(batch(2)).unwrap();
+            }
+            let reader = match mode {
+                "await" => statement.submit().unwrap().await_result().unwrap(),
+                "fetch" => statement.submit().unwrap().fetch_result().unwrap(),
+                "update" => {
+                    assert_eq!(statement.execute_update().unwrap(), None);
+                    transfers += 1;
+                    continue;
+                }
+                _ => statement.execute().unwrap(),
+            };
+            let batches = reader.collect::<std::result::Result<Vec<_>, _>>().unwrap();
+            assert_eq!(batches.len(), if mode == "bound" { 2 } else { 1 }, "{mode}");
+            for batch in batches {
+                assert_eq!(
+                    batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .unwrap()
+                        .value(0),
+                    "REMOVE"
+                );
+            }
+            transfers += match mode {
+                "raw" => 0,
+                "bound" => 2,
+                _ => 1,
+            };
+            assert_eq!(
+                runtime
+                    .block_on_safe(server.received_requests())
+                    .unwrap()
+                    .iter()
+                    .filter(|request| request.url.path() == "/object")
+                    .count(),
+                transfers,
+                "{mode}"
+            );
+        }
+        assert_eq!(transfers, 7);
+        runtime.block_on_safe(session.close()).unwrap();
+    }
 
     fn batch(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![
