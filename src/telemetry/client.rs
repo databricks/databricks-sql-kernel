@@ -69,22 +69,6 @@ struct Throttle {
     backoff: Duration,
 }
 
-/// A drained batch whose export is in flight; still non-empty when dropped
-/// (export throttled or cancelled), it goes back to the queue.
-struct InFlight<'a> {
-    client: &'a TelemetryClient,
-    batch: Vec<TelemetryFrontendLog>,
-    requeue_on_drop: bool,
-}
-
-impl Drop for InFlight<'_> {
-    fn drop(&mut self) {
-        if self.requeue_on_drop && !self.batch.is_empty() {
-            self.client.requeue(std::mem::take(&mut self.batch));
-        }
-    }
-}
-
 impl TelemetryClient {
     pub(super) fn new(
         config: &TelemetryConfig,
@@ -221,19 +205,17 @@ impl TelemetryClient {
     }
 
     /// Export the oldest queued events in one request. Returns whether a
-    /// non-empty batch was delivered. With `requeue_if_throttled`, a throttled
-    /// batch, or one whose export is cancelled (flush timeout), is re-queued.
+    /// non-empty batch was delivered. With `requeue_if_throttled`, a batch the
+    /// endpoint rejected with 429/503 is re-queued. Any other failure, or a
+    /// cancelled export (flush timeout), drops it, since the server may
+    /// already have accepted it.
     async fn export_once(&self, requeue_if_throttled: bool) -> bool {
-        let mut in_flight = InFlight {
-            client: self,
-            batch: self.drain_pending(MAX_EVENTS_PER_EXPORT.max(self.batch_size)),
-            requeue_on_drop: requeue_if_throttled,
-        };
-        if in_flight.batch.is_empty() {
+        let batch = self.drain_pending(MAX_EVENTS_PER_EXPORT.max(self.batch_size));
+        if batch.is_empty() {
             return false;
         }
 
-        let result = export_batch(Arc::clone(&self.exporter), &in_flight.batch).await;
+        let result = export_batch(Arc::clone(&self.exporter), &batch).await;
         let dropped = self.dropped.swap(0, Ordering::Relaxed);
         if dropped > 0 {
             tracing::debug!(
@@ -243,19 +225,15 @@ impl TelemetryClient {
         }
         match result {
             Ok(()) => {
-                in_flight.batch.clear();
                 *self.throttle.lock().expect("poisoned telemetry throttle") = Throttle::default();
                 true
             }
-            // `in_flight` puts the batch back when it drops.
             Err(TelemetryExportError::Throttled(_)) if requeue_if_throttled => {
                 self.back_off();
+                self.requeue(batch);
                 false
             }
-            Err(_) => {
-                in_flight.batch.clear();
-                false
-            }
+            Err(_) => false,
         }
     }
 
@@ -278,9 +256,17 @@ impl TelemetryClient {
         throttle.until = Some(Instant::now() + throttle.backoff);
     }
 
-    /// Put a batch back ahead of events queued since it was drained.
+    /// Put a batch back ahead of events queued since it was drained. Once the
+    /// client is closing nothing would send it, so it is dropped instead.
     fn requeue(&self, batch: Vec<TelemetryFrontendLog>) {
         let mut pending = self.pending.lock().expect("poisoned telemetry queue");
+        if self.state.load(Ordering::Acquire) != STATE_ACTIVE {
+            tracing::debug!(
+                abandoned = batch.len(),
+                "telemetry client closed during a throttled export; dropping its events"
+            );
+            return;
+        }
         for log in batch.into_iter().rev() {
             pending.push_front(log);
         }
@@ -293,12 +279,10 @@ impl TelemetryClient {
     }
 
     fn drain_pending(&self, limit: usize) -> Vec<TelemetryFrontendLog> {
-        let drained = {
-            let mut pending = self.pending.lock().expect("poisoned telemetry queue");
-            let n = pending.len().min(limit);
-            pending.drain(..n).collect::<Vec<_>>()
-        };
-        self.queue_count.fetch_sub(drained.len(), Ordering::AcqRel);
+        let mut pending = self.pending.lock().expect("poisoned telemetry queue");
+        let n = pending.len().min(limit);
+        let drained = pending.drain(..n).collect::<Vec<_>>();
+        self.queue_count.store(pending.len(), Ordering::Release);
         drained
     }
 
@@ -670,7 +654,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn timed_out_session_release_flush_keeps_in_flight_batch() {
+    async fn timed_out_flush_does_not_requeue_in_flight_batch() {
         let config = TelemetryConfig {
             enabled: Some(true),
             batch_size: 100,
@@ -678,25 +662,62 @@ mod tests {
             close_flush_timeout: Duration::from_millis(50),
             ..TelemetryConfig::default()
         };
-        let client = TelemetryClient::new(&config, Arc::new(HangingExporter))
-            .expect("telemetry runtime should start");
+        let client = TelemetryClient::new(
+            &config,
+            Arc::new(SlowThrottlingExporter::new(Duration::from_secs(3600))),
+        )
+        .expect("telemetry runtime should start");
         client.enqueue(sample_log("one"));
         client.enqueue(sample_log("two"));
 
+        // The server may already have accepted a batch whose response came
+        // too late, so a cancelled export is not sent again.
         client.flush_bounded().await;
 
-        let pending = client.pending.lock().unwrap();
-        let ids = pending
-            .iter()
-            .map(|log| log.frontend_log_event_id.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, ["one", "two"]);
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert_eq!(client.queue_count.load(Ordering::Acquire), 0);
     }
 
-    /// Never completes an export.
-    struct HangingExporter;
+    #[tokio::test]
+    async fn throttled_export_finishing_after_close_is_dropped() {
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            close_flush_timeout: Duration::from_millis(20),
+            ..TelemetryConfig::default()
+        };
+        let exporter = Arc::new(SlowThrottlingExporter::new(Duration::from_millis(200)));
+        let client = TelemetryClient::new(&config, exporter.clone())
+            .expect("telemetry runtime should start");
+        client.enqueue(sample_log("one"));
+        wait_until(|| exporter.calls.load(Ordering::Acquire) == 1).await;
 
-    impl TelemetryExporter for HangingExporter {
+        // close() gives up waiting for the in-flight background export.
+        client.close().await;
+        assert_eq!(client.state.load(Ordering::Acquire), STATE_CLOSED);
+        wait_until(|| client.flush_lock.try_lock().is_ok()).await;
+
+        assert!(client.pending.lock().unwrap().is_empty());
+        assert_eq!(client.queue_count.load(Ordering::Acquire), 0);
+    }
+
+    /// Answers every export with a throttle after `delay`.
+    struct SlowThrottlingExporter {
+        delay: Duration,
+        calls: AtomicUsize,
+    }
+
+    impl SlowThrottlingExporter {
+        fn new(delay: Duration) -> Self {
+            Self {
+                delay,
+                calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl TelemetryExporter for SlowThrottlingExporter {
         fn export<'a>(
             &'a self,
             _request: TelemetryRequest,
@@ -707,9 +728,11 @@ mod tests {
                     + 'a,
             >,
         > {
-            Box::pin(std::future::pending::<
-                super::super::exporter::TelemetryExportResult,
-            >())
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::AcqRel);
+                tokio::time::sleep(self.delay).await;
+                Err(TelemetryExportError::Throttled("HTTP 429".to_string()))
+            })
         }
     }
 
