@@ -26,6 +26,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
+- CloseStatement and CancelStatement read their response body, so the HTTP connection is reused instead of a new TCP/TLS connection being opened for the next request.
 
 ---
 *Note: When making changes, please add your change under the appropriate
