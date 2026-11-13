@@ -36,7 +36,7 @@
 use crate::auth::oauth::token::OAuthToken;
 use crate::kernel_error::{Error, Result};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 /// RAII guard that resets the `refreshing` flag on drop.
 /// Ensures the flag is cleared even if the refresh function panics.
@@ -92,6 +92,9 @@ pub(crate) struct TokenStore {
     /// Flag indicating whether a refresh is currently in progress.
     /// This prevents concurrent refresh attempts.
     refreshing: Arc<AtomicBool>,
+    /// Error from the last failed blocking refresh, handed to the callers
+    /// that waited on it.
+    last_error: Mutex<Option<Error>>,
 }
 
 impl TokenStore {
@@ -100,6 +103,7 @@ impl TokenStore {
         Self {
             token: Arc::new(RwLock::new(None)),
             refreshing: Arc::new(AtomicBool::new(false)),
+            last_error: Mutex::new(None),
         }
     }
 
@@ -215,6 +219,8 @@ impl TokenStore {
 
             // We won the race: perform the refresh
             let result = refresh_fn();
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                result.as_ref().err().cloned();
 
             // Store the new token if successful
             if let Ok(ref new_token) = result {
@@ -296,7 +302,11 @@ impl TokenStore {
         })?;
 
         token.clone().ok_or_else(|| {
-            Error::invalid_state().message("token refresh failed: no token available after refresh")
+            let last_error = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
+            last_error.clone().unwrap_or_else(|| {
+                Error::invalid_state()
+                    .message("token refresh failed: no token available after refresh")
+            })
         })
     }
 }
@@ -518,5 +528,25 @@ mod tests {
         assert!(result.is_err());
         let err_msg = format!("{:?}", result.unwrap_err());
         assert!(err_msg.contains("network error"));
+    }
+
+    #[test]
+    fn test_store_waiters_get_the_failed_refresh_error() {
+        let store = Arc::new(TokenStore::new());
+        let handles: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                std::thread::spawn(move || {
+                    store.get_or_refresh(|| {
+                        std::thread::sleep(std::time::Duration::from_millis(50));
+                        Err(Error::resource_exhausted().message("HTTP 429"))
+                    })
+                })
+            })
+            .collect();
+        for h in handles {
+            let err = h.join().unwrap().unwrap_err();
+            assert!(format!("{err:?}").contains("HTTP 429"), "{err:?}");
+        }
     }
 }
