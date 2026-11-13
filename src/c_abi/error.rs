@@ -12,12 +12,11 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Thread-local last-error storage and the `kernel_get_last_error` C
-//! entry point.
+//! Thread-local last-error storage and read-only C error getters.
 //!
 //! Pattern borrowed from the legacy `src/adbc/ffi/error.rs`: every C
-//! function clears the buffer at entry and writes to it on error;
-//! callers fetch detail with `kernel_get_last_error`.
+//! function except the error getters clears the buffer at entry and
+//! writes to it on error; the getters leave the buffer intact.
 
 use super::KernelStatusCode;
 use crate::kernel_error::Error;
@@ -27,9 +26,9 @@ use std::ffi::{c_char, CString};
 /// Mirror of `crate::kernel_error::Error` in `repr(C)` form.
 ///
 /// String fields are owned by the kernel's thread-local buffer; the
-/// caller copies them out before the next FFI call on this thread
-/// clears the buffer. Pointers are nullable for fields the underlying
-/// `Error` left as `None`.
+/// caller copies them out before an FFI call on this thread clears or
+/// replaces the buffer. Error getters leave it intact. Pointers are nullable
+/// for fields the underlying `Error` left as `None`.
 #[repr(C)]
 pub struct KernelError {
     /// Discriminant matches `KernelStatusCode` (cast-equal). Use
@@ -50,7 +49,7 @@ pub struct KernelError {
 /// Owned backing store for the thread-local last error.
 ///
 /// Holds the `CString`s alive so the `*const c_char` pointers handed
-/// back through [`KernelError`] stay valid until the next FFI call on
+/// back through the error getters stay valid until an FFI call on
 /// this thread clears or overwrites the buffer. `code == None` means
 /// "no error recorded since the last clear".
 #[derive(Default)]
@@ -62,13 +61,14 @@ struct LastError {
     http_status: u16,
     retryable: bool,
     query_id: Option<CString>,
+    os_error: Option<(i32, Option<CString>)>,
 }
 
 thread_local! {
     /// Per-thread last-error slot. The C ABI is call-response on a
     /// single thread: a function clears this on entry, populates it on
     /// failure, and the caller reads it via `kernel_get_last_error`
-    /// before making the next FFI call on the same thread.
+    /// before making a call that clears or replaces it on the same thread.
     static LAST_ERROR: RefCell<LastError> = RefCell::new(LastError::default());
 }
 
@@ -95,13 +95,12 @@ pub(crate) fn to_cstring_lossy(s: &str) -> CString {
 /// Returns `false` if no error has been recorded since the last
 /// [`clear_error`] (or thread start), leaving `*out` untouched. On
 /// `true`, `*out` is fully populated; its `*const c_char` fields point
-/// into this thread's last-error buffer and are valid until the next
-/// `kernel_*` call on this thread.
+/// into this thread's last-error buffer and are valid until a call clears
+/// or replaces it. Both error getters leave the buffer intact.
 ///
 /// # Safety
 /// `out` must be a valid, writable pointer to a `KernelError`. The
-/// pointer fields it returns are valid until the next FFI call on
-/// this thread.
+/// pointer fields it returns borrow this thread's last-error buffer.
 #[no_mangle]
 pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
     if out.is_null() {
@@ -125,6 +124,39 @@ pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
                 retryable: last.retryable,
                 query_id: as_ptr(&last.query_id),
             },
+        );
+        true
+    })
+}
+
+/// Fetch optional raw OS details without clearing this thread's last error.
+///
+/// Returns `false` without writing outputs if either pointer is null or
+/// OS details are absent. On `true`, the filename pointer is null when
+/// absent; otherwise it borrows the buffer until a call clears or replaces
+/// it. Both error getters can be called repeatedly in either order.
+///
+/// # Safety
+/// Non-null outputs must be valid, writable pointers to their respective
+/// types. Copy the filename before a call clears or replaces the buffer.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_get_last_error_os(
+    code_out: *mut i32,
+    filename_out: *mut *const c_char,
+) -> bool {
+    if code_out.is_null() || filename_out.is_null() {
+        return false;
+    }
+    LAST_ERROR.with(|cell| {
+        let last = cell.borrow();
+        let Some((code, filename)) = &last.os_error else {
+            return false;
+        };
+        // SAFETY: both outputs are non-null and writable per the contract.
+        std::ptr::write(code_out, *code);
+        std::ptr::write(
+            filename_out,
+            filename.as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
         );
         true
     })
@@ -158,13 +190,16 @@ pub(crate) fn store_error(err: Error) {
             http_status: err.http_status.unwrap_or(0),
             retryable: err.retryable,
             query_id: err.query_id.as_deref().map(to_cstring_lossy),
+            os_error: err
+                .os_error
+                .map(|os| (os.code, os.filename.as_deref().map(to_cstring_lossy))),
         };
     });
 }
 
 /// Crate-internal: clear the thread-local last-error buffer. Called at
-/// the entry of every FFI function (via [`crate::c_abi::block_on_ffi`] or
-/// directly) so a previous call's stale error can't leak into a
+/// the entry of FFI functions other than the error getters (via
+/// [`crate::c_abi::block_on_ffi`] or directly) so stale errors can't leak into a
 /// subsequent one that succeeds.
 pub(crate) fn clear_error() {
     LAST_ERROR.with(|cell| *cell.borrow_mut() = LastError::default());
@@ -208,19 +243,51 @@ mod tests {
 
     #[test]
     fn no_error_after_clear() {
+        let mut error = Error::internal().message("local failure");
+        error.os_error = Some(Box::new(crate::kernel_error::OsError {
+            code: 2,
+            filename: Some("local-file".into()),
+        }));
+        store_error(error.clone());
         clear_error();
         with_last_error(|e| assert!(e.is_none()));
+        let mut code = -1;
+        let untouched = c"untouched".as_ptr();
+        let mut filename = untouched;
+        assert!(!unsafe { kernel_get_last_error_os(&mut code, &mut filename) });
+        assert_eq!(code, -1);
+        assert_eq!(filename, untouched);
+
+        store_error(error);
+        store_error(Error::from_http_status(404).message("remote failure"));
+        assert!(!unsafe { kernel_get_last_error_os(&mut code, &mut filename) });
+        assert_eq!(code, -1);
+        assert_eq!(filename, untouched);
+        with_last_error(|e| assert_eq!(e.unwrap().http_status, 404));
+        clear_error();
     }
 
     #[test]
     fn store_then_fetch_roundtrips_core_fields() {
-        store_error(
-            Error::sql_error()
-                .message("boom")
-                .with_sql_state("42601")
-                .with_http_status(400)
-                .with_query_id("q-123"),
-        );
+        let mut error = Error::sql_error()
+            .message("boom")
+            .with_sql_state("42601")
+            .with_http_status(400)
+            .with_query_id("q-123");
+        error.os_error = Some(Box::new(crate::kernel_error::OsError {
+            code: 2,
+            filename: Some("requested/local-file".into()),
+        }));
+        store_error(error.clone());
+        let mut code = -1;
+        let mut filename = std::ptr::null();
+        assert!(unsafe { kernel_get_last_error_os(&mut code, &mut filename) });
+        assert_eq!(code, 2);
+        let path = filename;
+        assert!(!unsafe { kernel_get_last_error_os(std::ptr::null_mut(), &mut filename) });
+        assert!(!unsafe { kernel_get_last_error_os(&mut code, std::ptr::null_mut()) });
+        assert_eq!(code, 2);
+        assert_eq!(filename, path);
         with_last_error(|e| {
             let e = e.expect("error present");
             assert_eq!(e.code, KernelStatusCode::SqlError as i32);
@@ -238,7 +305,28 @@ mod tests {
                 .to_str()
                 .unwrap();
             assert_eq!(qid, "q-123");
+            for _ in 0..2 {
+                assert!(unsafe { kernel_get_last_error_os(&mut code, &mut filename) });
+                assert_eq!(code, 2);
+                assert_eq!(filename, path);
+                assert_eq!(
+                    unsafe { std::ffi::CStr::from_ptr(path) }.to_str().unwrap(),
+                    "requested/local-file"
+                );
+                with_last_error(|again| {
+                    let again = again.unwrap();
+                    assert_eq!(again.code, e.code);
+                    assert_eq!(again.message, e.message);
+                    assert_eq!(again.sql_state, e.sql_state);
+                    assert_eq!(again.query_id, e.query_id);
+                });
+            }
         });
+        error.os_error.as_mut().unwrap().filename = None;
+        store_error(error);
+        assert!(unsafe { kernel_get_last_error_os(&mut code, &mut filename) });
+        assert_eq!(code, 2);
+        assert!(filename.is_null());
         clear_error();
     }
 
