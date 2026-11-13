@@ -1189,15 +1189,25 @@ mod tests {
         }
         assert_eq!(discovery.received_requests().await.len(), 1);
 
-        assert!(
-            ClientCredentialsProvider::new(&uri, "client", "secret", client())
-                .await
-                .is_err()
-        );
+        // An entry that stays alive across the failure, as one does while
+        // other sessions with the same credentials are open, replaces the
+        // failed attempt instead of handing it out again.
+        let shared = shared_credentials(CredentialsKey {
+            host: uri.clone(),
+            client_id: "held".to_string(),
+            secret_sha256: [0; 32],
+            scopes: vec![],
+            token_endpoint_override: None,
+            transport: [0; 32],
+        });
+        let c = client();
+        assert!(shared.endpoints(&uri, &c).await.is_err());
+        assert_eq!(discovery.received_requests().await.len(), 2);
+        assert!(shared.endpoints(&uri, &c).await.is_err());
         assert_eq!(
             discovery.received_requests().await.len(),
-            2,
-            "a failed discovery is retried by the next open"
+            3,
+            "a failed discovery held by a live entry is retried"
         );
     }
 
