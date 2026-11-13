@@ -66,6 +66,29 @@ and security vulnerabilities should be reported according to
 [SECURITY.md](SECURITY.md). For other project questions, contact
 [eng-oss-sql-driver@databricks.com](mailto:eng-oss-sql-driver@databricks.com).
 
+## Volume file operations
+
+`ResultStream::complete_volume_operation` completes server-marked SQL PUT, GET,
+and REMOVE instructions. Pass `VolumeOptions` with the local roots authorized for
+PUT and GET. Completion preserves the instruction rows; callers that want the raw
+result can omit completion. The PyO3 `ExecutedStatement` and `ResultStream`
+classes expose `is_volume_operation` and `complete_volume_operation`.
+
+A PUT instruction with `localFile == "__input_stream__"` returns
+`NeedsInputStream` until owned input bytes are supplied. An empty byte buffer is a
+valid upload. Other statements do not request or consume input bytes.
+
+Local paths must satisfy both the lexical allowed-root check and a resolved-target
+check. Symlinks within the configured roots are permitted, including links between
+two authorized roots. Symlinks that resolve outside all authorized roots are
+rejected. This is stricter than the lexical-only checks in existing Python and
+Node.js Thrift transfer paths. An allowed root's symlink alias does not authorize
+additional lexical paths.
+
+GET replaces the destination only after a complete download. Transfer failures
+and cancellation before publication preserve the destination's existing bytes.
+Repeated completion on the same execution reuses its outcome, including errors.
+
 ## License
 
 Apache 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).

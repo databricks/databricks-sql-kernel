@@ -127,6 +127,7 @@ pub mod metadata_v0;
 pub mod result_stream;
 pub mod session;
 pub(crate) mod util;
+mod volume;
 
 // Custom C ABI for ODBC / Go consumers (lives in the core crate; see
 // `c_abi` module docs for why it is not a separate crate like pyo3 / napi).
@@ -138,7 +139,7 @@ pub use config::{
     LoggingConfig, ProxyConfig, ResultConfig, SessionConfig, TelemetryConfig, TlsConfig,
     TokenCacheConfig, TransportMode,
 };
-pub use kernel_error::{Error, ErrorCode, Result};
+pub use kernel_error::{Error, ErrorCode, LocalFileError, Result};
 /// The `tracing` target string stamped on every kernel log event.
 /// Binding crates (pyo3, napi) reference this constant directly so the
 /// logger name they expose to users can never drift from what the
@@ -157,6 +158,7 @@ pub use statement::params_codec::parse_typed_value;
 pub use statement::spec::{ResultFormat, StatementSpec, TypedValue};
 pub use statement::{MAX_CLIENT_QUERY_TIMEOUT, MAX_CLIENT_QUERY_TIMEOUT_MS};
 pub use telemetry::DriverSystemConfiguration;
+pub use volume::{VolumeCompletion, VolumeOptions};
 
 // === Compile-time guarantees on auto-traits ===
 //

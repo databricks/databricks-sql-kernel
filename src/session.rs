@@ -97,6 +97,8 @@ pub(crate) struct SessionInner {
     /// behind the trait object; future variants slot in via
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
+    storage_client: reqwest::Client,
+    volume_states: std::sync::Mutex<Option<Vec<std::sync::Weak<crate::volume::VolumeState>>>>,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -158,6 +160,34 @@ pub(crate) struct SessionInner {
 }
 
 impl SessionInner {
+    pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
+        let state = crate::volume::VolumeState::new();
+        let mut states = self.volume_states.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(states) = states.as_mut() {
+            states.retain(|state| state.strong_count() != 0);
+            states.push(Arc::downgrade(&state));
+        } else {
+            state.cancel();
+        }
+        state
+    }
+
+    fn cancel_volume_operations(&self) {
+        let states = self
+            .volume_states
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+            .unwrap_or_default();
+        for state in states.into_iter().filter_map(|state| state.upgrade()) {
+            state.cancel();
+        }
+    }
+
+    pub(crate) fn storage_client(&self) -> reqwest::Client {
+        self.storage_client.clone()
+    }
+
     /// Crate-internal accessor for the session's transport. Used by
     /// `Metadata` (and PR 4's `Statement`) to drive RPCs without
     /// reaching into private fields.
@@ -226,6 +256,7 @@ impl SessionInner {
     /// explicit close genuinely *initiates* the delete rather than
     /// deferring it to an idle-timeout.
     pub(crate) fn initiate_delete(&self) {
+        self.cancel_volume_operations();
         if self
             .closed
             .compare_exchange(
@@ -452,7 +483,7 @@ impl Session {
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
-            http_client,
+            http_client.clone(),
             session_info.session_id.clone(),
         ));
         telemetry
@@ -472,6 +503,8 @@ impl Session {
         Ok(Session {
             inner: Arc::new(SessionInner {
                 transport,
+                storage_client: http_client.inner().clone(),
+                volume_states: std::sync::Mutex::new(Some(Vec::new())),
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,
@@ -778,6 +811,7 @@ impl Session {
     ///   race): flag stays false, [`Drop`] picks up the slack.
     /// - On `Ok`: flag flips, [`Drop`] is a no-op.
     pub async fn close(self) -> Result<()> {
+        self.inner.cancel_volume_operations();
         // Bail early if a concurrent caller already finished a
         // successful close — no point hitting the wire twice.
         if self.inner.closed.load(std::sync::atomic::Ordering::Acquire) {

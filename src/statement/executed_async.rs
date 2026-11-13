@@ -172,6 +172,7 @@ impl StatementStatus {
 
 /// Async-consumption executed handle.
 pub struct ExecutedAsyncStatement {
+    volume: Option<Arc<crate::volume::VolumeState>>,
     session: Arc<SessionInner>,
     statement_id: String,
     /// Shared with the parent `Statement`; flipped on re-execute or
@@ -280,6 +281,9 @@ impl ExecutedAsyncStatement {
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
+        if let Some(volume) = &self.volume {
+            volume.cancel();
+        }
         self.owner_released.store(true, Ordering::Release);
         self.clear_pending_result();
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
@@ -313,6 +317,7 @@ impl ExecutedAsyncStatement {
     /// deadline and the transport's default `poll_timeout` ceiling;
     /// `Default` keeps the `poll_timeout` ceiling with no client
     /// deadline.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         session: Arc<SessionInner>,
         statement_id: String,
@@ -321,6 +326,7 @@ impl ExecutedAsyncStatement {
         initial_status: crate::types::sea::StatementStatus,
         statement_telemetry: StatementTelemetry,
         timeout: ExecutionTimeout,
+        volume: Arc<crate::volume::VolumeState>,
     ) -> Self {
         let (client_deadline, poll_timeout_disabled) = deadline_policy(timeout);
         let initial_terminal = initial_status.state.is_terminal();
@@ -330,6 +336,7 @@ impl ExecutedAsyncStatement {
             valid,
             closed,
             owner_released: Arc::new(AtomicBool::new(false)),
+            volume: Some(volume),
             // The submitting handle owns the statement lifecycle.
             owning: true,
             session_attribution: SessionAttribution::Current,
@@ -391,6 +398,7 @@ impl ExecutedAsyncStatement {
             valid,
             closed: Arc::new(AtomicBool::new(true)),
             owner_released,
+            volume: None,
             owning: false,
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
@@ -413,16 +421,16 @@ impl ExecutedAsyncStatement {
             .lock()
             .map_err(|error| Error::internal().message(format!("Statement status lock: {error}")))?
             .clone();
-        Ok(AsyncStatementReader {
-            inner: Self::new_read_only(
-                Arc::clone(&self.session),
-                self.statement_id.clone(),
-                self.valid.clone(),
-                Arc::clone(&self.owner_released),
-                self.session_attribution,
-                status,
-            ),
-        })
+        let mut inner = Self::new_read_only(
+            Arc::clone(&self.session),
+            self.statement_id.clone(),
+            self.valid.clone(),
+            Arc::clone(&self.owner_released),
+            self.session_attribution,
+            status,
+        );
+        inner.volume = self.volume.clone();
+        Ok(AsyncStatementReader { inner })
     }
 
     fn check_owner_available(&self) -> Result<()> {
@@ -940,7 +948,14 @@ impl ExecutedAsyncStatement {
                 if result.status.state == crate::types::sea::StatementState::Closed {
                     self.closed.store(true, Ordering::Release);
                 }
+                let marked = result
+                    .manifest
+                    .as_ref()
+                    .is_some_and(|m| m.is_volume_operation);
                 let mut stream = ResultStream::from_reader(result.reader).await?;
+                if let Some(volume) = &self.volume {
+                    stream.attach_volume(marked, Arc::clone(volume), self.session.storage_client());
+                }
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
@@ -1086,6 +1101,9 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
                      submitted it",
                 ));
             }
+            if let Some(volume) = &self.volume {
+                volume.cancel();
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1116,6 +1134,9 @@ impl ExecutedAsyncStatement {
 
     async fn close_server_statement(&self) -> Result<()> {
         if self.owning {
+            if let Some(volume) = &self.volume {
+                volume.cancel();
+            }
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
         }
@@ -1176,6 +1197,7 @@ impl ExecutedAsyncStatement {
             // either — otherwise the footgun just moves to the detached
             // canceller.
             owning: self.owning,
+            volume: self.volume.clone(),
         }
     }
 }
@@ -1192,6 +1214,7 @@ impl ExecutedAsyncStatement {
 /// Cheap to [`Clone`] (one `Arc` bump plus a `String` / flag clone).
 #[derive(Clone)]
 pub struct AsyncStatementCanceller {
+    volume: Option<Arc<crate::volume::VolumeState>>,
     session: Arc<SessionInner>,
     statement_id: String,
     valid: ValidityFlag,
@@ -1223,6 +1246,9 @@ impl AsyncStatementCanceller {
                      is owned by whoever submitted it",
                 ));
             }
+            if let Some(volume) = &self.volume {
+                volume.cancel();
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1241,6 +1267,9 @@ impl AsyncStatementCanceller {
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
         if self.owning {
+            if let Some(volume) = &self.volume {
+                volume.cancel();
+            }
             self.owner_released.store(true, Ordering::Release);
             self.clear_pending_result();
         }

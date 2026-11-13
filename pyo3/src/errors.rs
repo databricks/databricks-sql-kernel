@@ -154,6 +154,15 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         chained.set_cause(py, Some(setattr_err));
         return chained;
     }
+    let local = err.local_error.as_ref();
+    if let Err(error) = (|| -> PyResult<()> {
+        bound.setattr("local_os_error", local.and_then(|e| e.raw_os_error))?;
+        bound.setattr("local_error_kind", local.map(|e| e.kind.as_str()))?;
+        bound.setattr("local_path", local.map(|e| e.path.as_str()))?;
+        Ok(())
+    })() {
+        return error;
+    }
     py_err
 }
 

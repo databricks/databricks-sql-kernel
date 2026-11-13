@@ -13,6 +13,10 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `ExecutedStatement` and `ResultStream` expose `is_volume_operation` and
+  `complete_volume_operation` for explicit Volume transfers, including owned-byte
+  stream uploads. Filesystem errors retain their OS code, kind and requested path.
+
 ### Changed
 
 ### Updated

@@ -105,7 +105,8 @@ moka = { version = "0.12.16", features = ["future"] }
 
 # Async utilities
 futures = "0.3"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
+tempfile = "3"
 async-trait = "0.1"
 
 # Error handling
@@ -162,7 +163,6 @@ pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }           
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 wiremock = "0.6"
-tempfile = "3"
 log = "0.4"
 # Generate JWT test keys in-process to avoid PEM fixtures and an external
 # `openssl` dependency. `ring` already backs runtime JWT signing.

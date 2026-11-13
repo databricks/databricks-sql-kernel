@@ -56,6 +56,35 @@ impl ResultStream {
 
 #[pymethods]
 impl ResultStream {
+    #[getter]
+    fn is_volume_operation(&self) -> PyResult<bool> {
+        let inner = alive!(self, "ResultStream");
+        Ok(inner.stream.is_volume_operation())
+    }
+
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success=false, input_bytes=None))]
+    fn complete_volume_operation(
+        &mut self,
+        py: Python<'_>,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: bool,
+        input_bytes: Option<Vec<u8>>,
+    ) -> PyResult<&'static str> {
+        let inner = alive_mut!(self, "ResultStream");
+        let runtime = inner.runtime.clone();
+        let options = databricks_sql_kernel::VolumeOptions {
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        };
+        let stream = &mut inner.stream;
+        let outcome = run_kernel_interruptible!(
+            py,
+            &runtime,
+            stream.complete_volume_operation(&options, input_bytes)
+        )?;
+        Ok(outcome.as_str())
+    }
+
     /// Result schema as a `pyarrow.Schema`. Available even after `close()`.
     fn arrow_schema<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         self.schema.as_ref().to_pyarrow(py)

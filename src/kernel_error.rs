@@ -248,6 +248,17 @@ pub struct Error {
 
     /// Underlying cause. Boxed to keep the struct stack-friendly.
     pub cause: Option<Box<Error>>,
+
+    /// Original local filesystem failure, for host-language OS error mapping.
+    pub local_error: Option<Box<LocalFileError>>,
+}
+
+/// Local filesystem error details retained across language boundaries.
+#[derive(Debug, Clone)]
+pub struct LocalFileError {
+    pub raw_os_error: Option<i32>,
+    pub kind: String,
+    pub path: String,
 }
 
 impl Error {
@@ -270,6 +281,7 @@ impl Error {
             diagnostic_info: None,
             error_details_json: None,
             cause: None,
+            local_error: None,
         }
     }
 

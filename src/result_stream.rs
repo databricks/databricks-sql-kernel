@@ -493,6 +493,7 @@ pub struct ResultStream {
     close_guard: Option<StatementCloseGuard>,
 
     telemetry: Option<ResultStreamTelemetry>,
+    volume: Option<(Arc<crate::volume::VolumeState>, reqwest::Client)>,
 }
 
 struct ResultStreamTelemetry {
@@ -608,6 +609,7 @@ impl ResultStream {
             exhausted: false,
             close_guard: None,
             telemetry: None,
+            volume: None,
         })
     }
 
@@ -636,6 +638,54 @@ impl ResultStream {
             });
         }
         Ok(stream)
+    }
+
+    pub(crate) fn attach_volume(
+        &mut self,
+        marked: bool,
+        state: Arc<crate::volume::VolumeState>,
+        client: reqwest::Client,
+    ) {
+        if marked {
+            self.volume = Some((state, client));
+        }
+    }
+
+    /// Whether this execution has server-authorized Volume completion.
+    pub fn is_volume_operation(&self) -> bool {
+        self.volume.is_some()
+    }
+
+    /// Complete a marked instruction without consuming its result row.
+    ///
+    /// Ordinary results and read-only attachments have no transfer authority.
+    /// `NeedsInputStream` requests owned bytes for the server's stream sentinel;
+    /// supplying an empty buffer is a valid upload.
+    pub async fn complete_volume_operation(
+        &mut self,
+        options: &crate::volume::VolumeOptions,
+        input_bytes: Option<Vec<u8>>,
+    ) -> Result<crate::volume::VolumeCompletion> {
+        let Some((state, client)) = self.volume.clone() else {
+            return Ok(crate::volume::VolumeCompletion::NotVolume);
+        };
+        if let Some(result) = state.cached() {
+            return result;
+        }
+        let batch = self
+            .peek_first_batch()
+            .await
+            .map_err(|error| state.fail(error))?
+            .ok_or_else(|| {
+                state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
+            })?;
+        state.complete(batch, &client, options, input_bytes).await
+    }
+
+    pub(crate) fn cancel_volume(&self) {
+        if let Some((state, _)) = &self.volume {
+            state.cancel();
+        }
     }
 
     pub(crate) fn attach_telemetry(&mut self, telemetry: StatementTelemetry) {
@@ -887,6 +937,7 @@ impl ResultStream {
     /// `Drop` performs the same cleanup (including the metadata guard's
     /// close) if `close` was never called explicitly.
     pub fn close(self) {
+        self.cancel_volume();
         // Drops `self` (and the wrapped reader / current batch / any
         // metadata close-guard). Background tasks owned by the reader
         // stop on `Drop`.

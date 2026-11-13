@@ -322,6 +322,35 @@ impl ExecutedStatement {
 #[pymethods]
 impl ExecutedStatement {
     #[getter]
+    fn is_volume_operation(&self) -> PyResult<bool> {
+        let inner = alive!(self, "ExecutedStatement");
+        Ok(inner.exec.result_stream().is_volume_operation())
+    }
+
+    #[pyo3(signature = (allowed_paths, remove_not_found_is_success=false, input_bytes=None))]
+    fn complete_volume_operation(
+        &mut self,
+        py: Python<'_>,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: bool,
+        input_bytes: Option<Vec<u8>>,
+    ) -> PyResult<&'static str> {
+        let inner = alive_mut!(self, "ExecutedStatement");
+        let runtime = inner.runtime.clone();
+        let options = databricks_sql_kernel::VolumeOptions {
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        };
+        let stream = inner.exec.result_stream_mut();
+        let outcome = run_kernel_interruptible!(
+            py,
+            &runtime,
+            stream.complete_volume_operation(&options, input_bytes)
+        )?;
+        Ok(outcome.as_str())
+    }
+
+    #[getter]
     fn statement_id(&self) -> &str {
         &self.statement_id
     }
