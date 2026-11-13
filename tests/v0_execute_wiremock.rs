@@ -2017,6 +2017,58 @@ async fn cloudfetch_disabled_surfaces_other_create_session_errors() {
 }
 
 #[tokio::test]
+async fn cloudfetch_disabled_inline_fallback_rejects_truncated_result() {
+    use wiremock::matchers::body_string_contains;
+    // With CloudFetch off there is nothing to re-run with, so a server-truncated
+    // INLINE result must fail instead of returning partial rows.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .and(body_string_contains("can_cloud_download"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "Invalid session params: [INVALID_CONF_VALUE] The value 'false' in the \
+                        config \"can_cloud_download\" is invalid. SQLSTATE: 22022",
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
+        )
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let mut truncated: serde_json::Value = serde_json::from_str(&succeeded_inline_body(
+        "stmt-truncated",
+        &int64_batch("n", vec![7]),
+    ))
+    .unwrap();
+    truncated["manifest"]["truncated"] = json!(true);
+    mount_execute(&server, truncated.to_string()).await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT n FROM t");
+    let error = match stmt.execute().await {
+        Ok(_) => panic!("a truncated INLINE result must not be returned"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert!(error.message.contains("truncated"), "{error}");
+    assert_eq!(recorded_execute_dispositions(&server).await, ["INLINE"]);
+    stmt.close().await.expect("close statement");
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
 async fn cloudfetch_disabled_fallback_failure_reports_both_errors() {
     use wiremock::matchers::body_string_contains;
     let server = MockServer::start().await;

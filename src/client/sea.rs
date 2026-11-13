@@ -112,6 +112,8 @@ const INLINE_TRUNCATED_MESSAGE: &str = "Server truncated the INLINE result";
 
 /// Whether `sql` starts with a verb that only reads (after comments, whitespace
 /// and opening parentheses). Re-running such a statement is side-effect free.
+/// `WITH` and `FROM` can introduce DML (`WITH c AS (...) INSERT ...`, Hive
+/// multi-insert), so they count only when no DML keyword appears anywhere.
 fn is_read_only_query(sql: &str) -> bool {
     let mut rest = sql;
     loop {
@@ -129,10 +131,17 @@ fn is_read_only_query(sql: &str) -> bool {
         .take_while(|c| c.is_ascii_alphabetic())
         .collect::<String>()
         .to_ascii_uppercase();
-    matches!(
-        verb.as_str(),
-        "SELECT" | "WITH" | "VALUES" | "TABLE" | "FROM" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN"
-    )
+    match verb.as_str() {
+        "SELECT" | "VALUES" | "TABLE" | "SHOW" | "DESCRIBE" | "DESC" | "EXPLAIN" => true,
+        "WITH" | "FROM" => !sql
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .any(|word| {
+                ["INSERT", "MERGE", "UPDATE", "DELETE"]
+                    .iter()
+                    .any(|dml| word.eq_ignore_ascii_case(dml))
+            }),
+        _ => false,
+    }
 }
 
 fn sql_key(sql: &str) -> u64 {
@@ -2712,6 +2721,7 @@ mod tests {
             "SHOW TABLES",
             "describe t",
             "EXPLAIN SELECT 1",
+            "FROM t SELECT a, updated_at",
         ] {
             assert!(is_read_only_query(sql), "{sql:?}");
         }
@@ -2720,6 +2730,9 @@ mod tests {
             "CALL p()",
             "MERGE INTO t USING s ON true WHEN MATCHED THEN DELETE",
             "-- SELECT\nDELETE FROM t",
+            "WITH t AS (SELECT 1) INSERT INTO x SELECT * FROM t",
+            "with t as (select 1) merge into x using t on true when matched then update set *",
+            "FROM src INSERT INTO t1 SELECT a INSERT INTO t2 SELECT b",
             "/* unterminated SELECT",
             "",
             "SELECTED",
