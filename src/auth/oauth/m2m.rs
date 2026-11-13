@@ -277,11 +277,14 @@ impl ClientCredentialsProvider {
         // would needlessly depend on it being reachable and describing the
         // right issuer. Reuse the token endpoint as the (unused) auth URL
         // placeholder so the `oauth2` client still constructs.
+        let mut key_scopes = scopes.clone();
+        key_scopes.sort_unstable();
+        key_scopes.dedup();
         let shared = shared_credentials(CredentialsKey {
             host: host.to_string(),
             client_id: client_id.to_string(),
             secret_sha256: Sha256::digest(client_secret.as_bytes()).into(),
-            scopes: scopes.clone(),
+            scopes: key_scopes,
             token_endpoint_override: token_endpoint_override.clone(),
         });
         let (token_endpoint, auth_endpoint) = match token_endpoint_override {
@@ -1046,12 +1049,15 @@ mod tests {
             shared_test_provider(&a, "other-client", "secret", &["all-apis"]).await,
             shared_test_provider(&a, "client", "secret", &["sql"]).await,
             shared_test_provider(&b, "client", "secret", &["all-apis"]).await,
+            // Scope order doesn't matter.
+            shared_test_provider(&b, "client", "secret", &["sql", "all-apis"]).await,
+            shared_test_provider(&b, "client", "secret", &["all-apis", "sql"]).await,
         ];
         for p in &providers {
             auth_header(p).await;
         }
         assert_eq!(token_mocks[0].received_requests().await.len(), 4);
-        assert_eq!(token_mocks[1].received_requests().await.len(), 1);
+        assert_eq!(token_mocks[1].received_requests().await.len(), 2);
         assert_eq!(registered(&a), 4);
     }
 
