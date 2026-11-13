@@ -52,9 +52,14 @@
 //! rather than queue behind it. The `Arc<Mutex<Option<…>>>` shape is
 //! otherwise the same as `Connection`/`Statement` so Drop's
 //! fire-and-forget cleanup behaves consistently.
+//!
+//! `close()` also releases the canceller and the result streams of the
+//! `AsyncResultHandle`s it produced. Both hold the kernel session, and with
+//! it the host's shared telemetry client, so leaving them to JS GC kept that
+//! client (and its configuration) alive after every session had closed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError, Weak};
 use tokio::sync::Mutex;
 
 use arrow_schema::SchemaRef;
@@ -87,6 +92,10 @@ fn closed_err(what: &str) -> napi::Error {
 // route encode failures through the same kernel error envelope.
 
 // ───────────────────────── AsyncStatement ─────────────────────────
+
+/// An `AsyncResultHandle`'s stream, shared with its parent `AsyncStatement`
+/// so the parent's `close()` can release it.
+type ResultSlot = Mutex<Option<ResultStream>>;
 
 /// Inner state for the JS-visible `AsyncStatement` wrapper. Same
 /// shape rationale as `StatementInner` in `statement.rs`: we hold
@@ -130,8 +139,13 @@ pub struct AsyncStatement {
     /// construction and held **outside** `inner` so `cancel()` can fire
     /// a server-side cancel without contending for the mutex an
     /// in-flight `awaitResult()` holds. See the struct-level
-    /// concurrency note.
-    canceller: AsyncStatementCanceller,
+    /// concurrency note. A std mutex (never held across an `.await`) so
+    /// `close()` can drop it; `None` once closed.
+    canceller: Arc<std::sync::Mutex<Option<AsyncStatementCanceller>>>,
+    /// Result slots of the `AsyncResultHandle`s returned by
+    /// `awaitResult()`, emptied by `close()`. Weak so a handle JS has
+    /// already dropped is not kept alive here.
+    results: Arc<std::sync::Mutex<Vec<Weak<ResultSlot>>>>,
     /// Lock-free mirror of "has `close()` taken `inner`". Set by
     /// `close()`; read by the lock-free `cancel()` so a cancel after an
     /// explicit close still surfaces `InvalidStatementHandle` without
@@ -164,7 +178,8 @@ impl AsyncStatement {
                 _parent: parent,
                 executed_async,
             }))),
-            canceller,
+            canceller: Arc::new(std::sync::Mutex::new(Some(canceller))),
+            results: Arc::new(std::sync::Mutex::new(Vec::new())),
             closed: Arc::new(AtomicBool::new(false)),
             statement_id,
         }
@@ -294,6 +309,7 @@ impl AsyncStatement {
     #[napi]
     pub async fn await_result(&self) -> napi::Result<AsyncResultHandle> {
         let inner = Arc::clone(&self.inner);
+        let results = Arc::clone(&self.results);
         guarded(async move {
             // Acquire and HOLD the lock across the kernel await:
             // dropping the guard while the long-running
@@ -312,8 +328,15 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
+            let slot = Arc::new(Mutex::new(Some(stream)));
+            // Registered while `inner` is still held, so a `close()` queued
+            // behind this call always sees the slot.
+            results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::downgrade(&slot));
             Ok(AsyncResultHandle {
-                inner: Arc::new(Mutex::new(Some(stream))),
+                inner: slot,
                 schema,
                 statement_id,
             })
@@ -342,7 +365,14 @@ impl AsyncStatement {
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_err("AsyncStatement"));
         }
-        let canceller = self.canceller.clone();
+        let canceller = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(canceller) = canceller else {
+            return Err(closed_err("AsyncStatement"));
+        };
         guarded(async move { canceller.cancel().await.map_err(napi_err_from_kernel) }).await
     }
 
@@ -356,6 +386,8 @@ impl AsyncStatement {
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
         let closed = Arc::clone(&self.closed);
+        let canceller = Arc::clone(&self.canceller);
+        let results = Arc::clone(&self.results);
         guarded(async move {
             let taken = {
                 let mut guard = inner.lock().await;
@@ -368,9 +400,23 @@ impl AsyncStatement {
             // lock-free `cancel()` short-circuits to InvalidStatementHandle
             // rather than firing a wire cancel on a closing statement.
             closed.store(true, Ordering::Release);
-            ExecutedAsyncStatement::close(&mut inner_state.executed_async)
+            let outcome = ExecutedAsyncStatement::close(&mut inner_state.executed_async)
                 .await
-                .map_err(napi_err_from_kernel)
+                .map_err(napi_err_from_kernel);
+            // Release everything that holds the session, even if the
+            // close RPC failed: JS may keep this object (and its result
+            // handles) reachable long after close.
+            drop(inner_state);
+            canceller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let slots =
+                std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
+            for slot in slots.iter().filter_map(Weak::upgrade) {
+                slot.lock().await.take();
+            }
+            outcome
         })
         .await
     }
@@ -413,10 +459,9 @@ impl Drop for AsyncStatement {
 /// post-close contract.
 #[napi]
 pub struct AsyncResultHandle {
-    /// `Option<ResultStream>` only so a future explicit-close path
-    /// can `.take()` consistently. Today the slot is filled at
-    /// construction and never emptied until Drop.
-    inner: Arc<Mutex<Option<ResultStream>>>,
+    /// Emptied when the parent `AsyncStatement` closes; fetching after
+    /// that returns `InvalidStatementHandle`.
+    inner: Arc<ResultSlot>,
     schema: SchemaRef,
     statement_id: String,
 }
@@ -493,6 +538,12 @@ impl AsyncResultHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::connection::Connection;
+    use databricks_sql_kernel::{AuthConfig, ConnectionConfig, Session, TelemetryConfig};
+    use serde_json::json;
+    use std::time::Duration;
+    use wiremock::matchers::{method, path, path_regex};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn closed_err_carries_invalid_statement_handle_envelope() {
@@ -518,5 +569,164 @@ mod tests {
     fn closed_err_status_collapses_to_invalid_arg() {
         let err = closed_err("AsyncResultHandle");
         assert_eq!(err.status, napi::Status::InvalidArg);
+    }
+
+    const FIRST_SESSION: &str = "sess-napi-lease-first";
+    const SECOND_SESSION: &str = "sess-napi-lease-second";
+    const STATEMENT: &str = "stmt-napi-lease";
+
+    async fn lease_server() -> MockServer {
+        let server = MockServer::start().await;
+        for session_id in [FIRST_SESSION, SECOND_SESSION] {
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({ "session_id": session_id })),
+                )
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/api/2\.0/sql/sessions/.+"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": STATEMENT,
+                "status": { "state": "PENDING" },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path(format!("/api/2.0/sql/statements/{STATEMENT}")))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "statement_id": STATEMENT,
+                "status": { "state": "SUCCEEDED" },
+                "manifest": {
+                    "format": "ARROW_STREAM",
+                    "schema": {
+                        "column_count": 1,
+                        "columns": [{
+                            "name": "n", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0,
+                        }],
+                    },
+                    "total_chunk_count": 0,
+                    "total_row_count": 0,
+                    "truncated": false,
+                },
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/api/2\.0/sql/statements/.+"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/telemetry-ext"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn telemetry_connection(
+        server: &MockServer,
+        batch_size: usize,
+        flush_interval: Duration,
+    ) -> Connection {
+        let mut telemetry = TelemetryConfig::default();
+        telemetry.set_enabled(true);
+        telemetry.batch_size = batch_size;
+        telemetry.flush_interval = flush_interval;
+        let session = Session::builder()
+            .connection(
+                ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh")
+                    .expect("valid HTTP path"),
+            )
+            .auth(AuthConfig::Pat {
+                token: "dapi_test_token".into(),
+                identity_federation_client_id: None,
+            })
+            .telemetry(telemetry)
+            .open()
+            .await
+            .expect("session opens against mock server");
+        let session_id = session.session_id().to_owned();
+        Connection {
+            inner: Arc::new(Mutex::new(Some(session))),
+            session_id,
+        }
+    }
+
+    async fn exports_for(server: &MockServer, session_id: &str) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap_or_default()
+            .iter()
+            .filter(|request| {
+                request.url.path() == "/telemetry-ext"
+                    && String::from_utf8_lossy(&request.body).contains(session_id)
+            })
+            .count()
+    }
+
+    /// The host's telemetry client must be released once its sessions and
+    /// their statements are closed, even while JS still references the closed
+    /// handles. Otherwise the next session on the host reuses it and ignores
+    /// its own telemetry settings.
+    async fn next_session_gets_its_own_telemetry_client(fetch_result: bool) {
+        let server = lease_server().await;
+        // Batch size 1: this client exports every event at once.
+        let first = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
+        let statement = first
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = if fetch_result {
+            Some(statement.await_result().await.expect("await result"))
+        } else {
+            None
+        };
+        statement.close().await.expect("close statement");
+        first.close().await.expect("close first session");
+
+        let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        // Inheriting the first client would export CREATE_SESSION right away.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            exports_for(&server, SECOND_SESSION).await,
+            0,
+            "second session reused the first session's telemetry client"
+        );
+        second.close().await.expect("close second session");
+        assert!(
+            exports_for(&server, SECOND_SESSION).await > 0,
+            "closing the last session must flush its events"
+        );
+        if let Some(result) = &result {
+            let err = result
+                .fetch_next_batch()
+                .await
+                .err()
+                .expect("fetching after the parent closed must fail");
+            assert!(err.reason.contains("AsyncResultHandle already closed"));
+        }
+        // Dropped only now, as JS GC would.
+        drop((statement, result));
+    }
+
+    #[tokio::test]
+    async fn close_releases_session_held_by_canceller() {
+        next_session_gets_its_own_telemetry_client(false).await;
+    }
+
+    #[tokio::test]
+    async fn close_releases_session_held_by_result_handles() {
+        next_session_gets_its_own_telemetry_client(true).await;
     }
 }
