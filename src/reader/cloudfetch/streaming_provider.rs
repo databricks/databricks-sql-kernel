@@ -2159,7 +2159,7 @@ mod tests {
         use wiremock::matchers::method;
         use wiremock::{Mock, MockServer, ResponseTemplate};
 
-        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(200);
+        const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
 
         // Storage refuses every URL, including refreshed ones.
         let server = MockServer::start().await;
@@ -2235,14 +2235,15 @@ mod tests {
         let error = StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx)
             .await
             .expect_err("a URL storage always refuses must fail");
+        let elapsed = started.elapsed();
         assert_eq!(error.http_status, Some(403));
         assert_eq!(server.received_requests().await.unwrap().len(), 3);
         assert_eq!(fetcher.refresh_calls.load(AtomicOrdering::SeqCst), 2);
-        // The first refusal refreshes at once; the refused refreshed URL waits one backoff.
+        // Exactly one backoff: the first refusal refreshes at once, and only the
+        // refused refreshed URL waits before the next refresh.
         assert!(
-            started.elapsed() >= RETRY_DELAY,
-            "expected one backoff, took {:?}",
-            started.elapsed()
+            elapsed >= RETRY_DELAY && elapsed < RETRY_DELAY * 2,
+            "expected exactly one backoff of {RETRY_DELAY:?}, took {elapsed:?}"
         );
     }
 
