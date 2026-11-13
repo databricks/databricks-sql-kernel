@@ -66,6 +66,22 @@ impl Statement {
         Ok(())
     }
 
+    /// Configured transfers consume instruction rows.
+    /// ``None`` restores caller-managed transfers.
+    /// ``input_stream_token`` prevents a stream sentinel from being opened as a file.
+    /// Each call replaces both settings; omitting ``input_stream_token`` clears it.
+    #[pyo3(signature = (paths=None, *, input_stream_token=None))]
+    fn set_staging_allowed_local_paths(
+        &mut self,
+        paths: Option<Vec<String>>,
+        input_stream_token: Option<String>,
+    ) -> PyResult<()> {
+        let inner = alive_mut!(self, "Statement");
+        inner.stmt.spec().staging_allowed_local_paths = paths;
+        inner.stmt.spec().staging_stream_token = input_stream_token;
+        Ok(())
+    }
+
     /// Set the server-side row cap for this statement. ``None`` clears it.
     fn set_row_limit(&mut self, row_limit: Option<i64>) -> PyResult<()> {
         let inner = alive_mut!(self, "Statement");

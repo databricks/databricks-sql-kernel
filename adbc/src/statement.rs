@@ -470,6 +470,18 @@ impl Statement {
             return Ok(());
         }
         match key {
+            "adbc.databricks.statement.staging_allowed_local_paths" => {
+                let paths =
+                    serde_json::from_str::<Option<Vec<String>>>(&expect_string(value, key)?)
+                        .map_err(|_| {
+                            adbc_error(
+                                "Expected a JSON array of allowed local paths or null",
+                                Status::InvalidArguments,
+                            )
+                        })?;
+                self.inner()?.spec().staging_allowed_local_paths = paths;
+                Ok(())
+            }
             ENABLE_DIRECT_RESULTS_OPTION => {
                 self.enable_direct_results = expect_bool_string(value, key)?;
                 Ok(())
@@ -584,6 +596,12 @@ impl Statement {
 
     fn get_other_string(&self, key: &str) -> Result<String> {
         match key {
+            "adbc.databricks.statement.staging_allowed_local_paths" => {
+                serde_json::to_string(&self.inner()?.spec_ref().staging_allowed_local_paths)
+                    .map_err(|_| {
+                        adbc_error("Cannot serialize allowed local paths", Status::Internal)
+                    })
+            }
             ENABLE_DIRECT_RESULTS_OPTION => Ok(self.enable_direct_results.to_string()),
             IS_METADATA_COMMAND_OPTION => Ok(self.metadata_options.enabled.to_string()),
             METADATA_CATALOG_OPTION => metadata_string_option(
@@ -1461,6 +1479,76 @@ mod tests {
     use super::*;
     use arrow_array::{BinaryArray, Int64Array, LargeBinaryArray, StringArray};
     use arrow_schema::{DataType, Field};
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn volume_paths_option_sets_clears_and_rejects_invalid_values() {
+        use adbc_core::options::OptionDatabase;
+        use adbc_core::{Connection as _, Database as _, Driver as _, Optionable as _};
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "session_id": "session", "warehouse_id": "test_wh"
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+            .mount(&server)
+            .await;
+        let database = crate::Driver
+            .new_database_with_opts([
+                (OptionDatabase::Uri, server.uri().into()),
+                (
+                    OptionDatabase::Other(crate::config::HTTP_PATH.into()),
+                    "/sql/1.0/warehouses/test_wh".into(),
+                ),
+                (
+                    OptionDatabase::Other(crate::config::ACCESS_TOKEN.into()),
+                    "token".into(),
+                ),
+            ])
+            .unwrap();
+        let mut connection = database.new_connection().unwrap();
+        let mut statement = connection.new_statement().unwrap();
+        let option =
+            OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
+        assert_eq!(statement.get_option_string(option.clone()).unwrap(), "null");
+        for (value, expected) in [
+            ("[]", Some(vec![])),
+            ("null", None),
+            (r#"["/tmp/files"]"#, Some(vec!["/tmp/files".to_owned()])),
+        ] {
+            statement.set_option(option.clone(), value.into()).unwrap();
+            assert_eq!(
+                statement
+                    .inner()
+                    .unwrap()
+                    .spec()
+                    .staging_allowed_local_paths,
+                expected
+            );
+            assert_eq!(statement.get_option_string(option.clone()).unwrap(), value);
+        }
+        let error = statement
+            .set_option(option.clone(), "{}".into())
+            .unwrap_err();
+        assert_eq!(error.status, Status::InvalidArguments);
+        assert_eq!(
+            statement
+                .inner()
+                .unwrap()
+                .spec()
+                .staging_allowed_local_paths,
+            Some(vec!["/tmp/files".to_owned()])
+        );
+        assert_eq!(
+            statement.get_option_string(option).unwrap(),
+            r#"["/tmp/files"]"#
+        );
+    }
 
     fn batch(rows: usize) -> RecordBatch {
         let schema = Arc::new(Schema::new(vec![

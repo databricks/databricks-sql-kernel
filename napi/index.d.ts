@@ -39,6 +39,11 @@
  */
 export interface ExecuteOptions {
   /**
+   * Configured transfers consume instruction rows.
+   * Omit to handle instructions in the caller; an empty list denies local file access.
+   */
+  stagingAllowedLocalPaths?: string[]
+  /**
    * Per-statement Spark conf overlay. Merged on top of the
    * session-level `sessionConf` at execute time; this map wins
    * on key collisions. Unknown keys are rejected by the server.

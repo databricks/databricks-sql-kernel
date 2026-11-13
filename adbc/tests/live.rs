@@ -366,3 +366,94 @@ fn metadata_statement_catalog_underscore_escaping_is_configurable() {
         assert_eq!(actual_catalogs, expected_catalogs);
     }
 }
+
+#[test]
+#[ignore = "requires a writable Unity Catalog catalog and live warehouse"]
+fn volume_files_round_trip_and_remove() {
+    let catalog = required_env("DATABRICKS_VOLUME_TEST_CATALOG");
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let schema = format!("volume_{unique}");
+    let namespace = format!("`{}`.`{schema}`", catalog.replace('`', "``"));
+    let directory = env::temp_dir().join(&schema);
+    fs::create_dir(&directory).unwrap();
+    let source = directory.join("input.bin");
+    let destination = directory.join("output.bin");
+    let payload: Vec<u8> = (0..=255).cycle().take(1_048_576).collect();
+    fs::write(&source, &payload).unwrap();
+    let remote = format!("/Volumes/{catalog}/{schema}/files/input.bin");
+    let literal = |value: &str| format!("'{}'", value.replace('\\', "\\\\").replace('\'', "\\'"));
+    let mut connection = live_connection();
+    let mut statement = connection.new_statement().unwrap();
+    statement
+        .set_sql_query(format!("CREATE SCHEMA {namespace}"))
+        .unwrap();
+    statement.execute_update().unwrap();
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        statement.set_sql_query(format!("CREATE VOLUME {namespace}.files"))?;
+        statement.execute_update()?;
+        let option =
+            OptionStatement::Other("adbc.databricks.statement.staging_allowed_local_paths".into());
+        let paths = serde_json::to_string(&vec![directory.to_str().unwrap()])?;
+        statement.set_option(option.clone(), OptionValue::String(paths.clone()))?;
+        for sql in [
+            format!(
+                "PUT {} INTO {} OVERWRITE",
+                literal(source.to_str().unwrap()),
+                literal(&remote)
+            ),
+            format!(
+                "GET {} TO {}",
+                literal(&remote),
+                literal(destination.to_str().unwrap())
+            ),
+        ] {
+            statement.set_sql_query(sql)?;
+            let batches = statement.execute()?.collect::<Result<Vec<_>, _>>()?;
+            if batches.iter().any(|batch| batch.num_rows() != 0) {
+                return Err("completed transfer retained instruction rows".into());
+            }
+        }
+        if fs::read(&destination)? != payload {
+            return Err("downloaded bytes differ".into());
+        }
+        fs::remove_file(&destination)?;
+        statement.set_option(option.clone(), OptionValue::String("null".into()))?;
+        statement.set_sql_query(format!(
+            "GET {} TO {}",
+            literal(&remote),
+            literal(destination.to_str().unwrap())
+        ))?;
+        let rows: usize = statement
+            .execute()?
+            .collect::<Result<Vec<_>, _>>()?
+            .iter()
+            .map(|batch| batch.num_rows())
+            .sum();
+        if rows != 1 || destination.exists() {
+            return Err("clearing the option did not restore raw instructions".into());
+        }
+        statement.set_option(option, OptionValue::String(paths))?;
+        for _ in 0..2 {
+            statement.set_sql_query(format!("REMOVE {}", literal(&remote)))?;
+            statement.execute_update()?;
+        }
+        statement.set_sql_query(format!(
+            "GET {} TO {}",
+            literal(&remote),
+            literal(destination.to_str().unwrap())
+        ))?;
+        if statement.execute().is_ok() {
+            return Err("download succeeded after removal".into());
+        }
+        Ok(())
+    })();
+    statement
+        .set_sql_query(format!("DROP SCHEMA {namespace} CASCADE"))
+        .unwrap();
+    statement.execute_update().unwrap();
+    fs::remove_dir_all(directory).unwrap();
+    result.unwrap();
+}

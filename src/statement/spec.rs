@@ -222,6 +222,35 @@ pub struct StatementSpec {
 
     /// Result wire format.
     pub result_format: ResultFormat,
+
+    /// Local paths permitted for SQL file transfers. `None` leaves transfer
+    /// instructions available to a caller that handles them itself. An empty list
+    /// enables REMOVE while denying local file access.
+    /// Completion, including a failure after retries, is final and shared by all
+    /// readers of an execution. Cancellation or release before destination
+    /// replacement begins is terminal; a replacement already in progress completes.
+    /// Re-execute the SQL to start a new transfer attempt.
+    ///
+    /// Storage HTTP attempts and the entire GET response body, including continuous
+    /// progress, share the session's [`crate::HttpConfig::overall_timeout`] budget
+    /// (default 900 seconds), also used by SQL HTTP retries. Lowering it caps storage
+    /// transfers too. This is separate from the SQL query timeout; the Thrift
+    /// transfer path has no equivalent wall-clock cap on a progressing body.
+    /// Cancellation and deadlines are cooperative, not hard limits on blocked
+    /// filesystem calls. Temporary-file creation, replacement and cleanup run
+    /// inline and can stall other work sharing the runtime; the Python binding
+    /// performs them on the caller's thread.
+    ///
+    /// Interrupted GET bodies are not retried. Allow only trusted roots whose
+    /// directory components cannot be modified by untrusted users during transfer.
+    pub staging_allowed_local_paths: Option<Vec<String>>,
+
+    /// A connector's stream sentinel must never be opened as a local file.
+    pub staging_stream_token: Option<String>,
+
+    /// Preserve the instruction row after a successful transfer for APIs
+    /// whose existing result contract includes that row.
+    pub retain_volume_operation_result: bool,
 }
 
 impl StatementSpec {

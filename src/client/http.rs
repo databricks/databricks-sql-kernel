@@ -36,6 +36,20 @@ use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 
+pub(crate) fn is_loopback_http_url(url: &reqwest::Url) -> bool {
+    url.scheme() == "http"
+        && url.host_str().is_some_and(|host| {
+            let host = host
+                .strip_prefix('[')
+                .and_then(|host| host.strip_suffix(']'))
+                .unwrap_or(host);
+            host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .is_ok_and(|ip| ip.is_loopback())
+        })
+}
+
 /// Build an `Error` for a transport-level non-2xx HTTP response, parsing
 /// the SEA error envelope out of the response body when present.
 ///
@@ -383,6 +397,8 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 #[derive(Debug)]
 pub struct DatabricksHttpClient {
     client: Client,
+    volume_client: OnceLock<Client>,
+    pub(crate) allow_loopback_plaintext_storage: bool,
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
@@ -499,6 +515,8 @@ impl DatabricksHttpClient {
 
         Ok(Self {
             client,
+            volume_client: OnceLock::new(),
+            allow_loopback_plaintext_storage: false,
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
@@ -734,6 +752,24 @@ impl DatabricksHttpClient {
     /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn volume_client(&self) -> Result<&Client> {
+        // Transfer instructions authorize one URL; redirects must not forward their headers.
+        if let Some(client) = self.volume_client.get() {
+            return Ok(client);
+        }
+        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        Ok(self.volume_client.get_or_init(|| client))
+    }
+
+    pub(crate) fn volume_retry_config(&self) -> RetryConfig {
+        // Session resolves the normalized global policy into Sea without an override.
+        // CloudFetch has its own outer retry loop and a separate inner policy.
+        self.retry_configs
+            .get(&RequestCategory::Sea)
+            .cloned()
+            .unwrap_or_default()
     }
 
     /// Get the authorization header value.
@@ -1080,6 +1116,27 @@ mod tests {
     use super::*;
     use crate::auth::PersonalAccessToken;
     use crate::client::retry::build_retry_configs;
+
+    #[test]
+    fn plaintext_storage_requires_a_loopback_http_url() {
+        for (url, allowed) in [
+            ("http://localhost:8080", true),
+            ("http://127.0.0.1:8080", true),
+            ("http://127.1.2.3:8080", true),
+            ("http://[::1]:8080", true),
+            ("https://localhost", false),
+            ("http://example.com", false),
+            ("http://localhost.example.com", false),
+            ("http://192.0.2.1", false),
+            ("http://[2001:db8::1]", false),
+        ] {
+            assert_eq!(
+                is_loopback_http_url(&reqwest::Url::parse(url).unwrap()),
+                allowed,
+                "{url}"
+            );
+        }
+    }
 
     fn default_retry_configs() -> HashMap<RequestCategory, RetryConfig> {
         build_retry_configs(&RetryConfig::default(), &HashMap::new())
@@ -1558,6 +1615,22 @@ lGrv15pBcePj
         config.tls.trusted_certificate_path = Some(tmp.path().to_string_lossy().to_string());
         let client = DatabricksHttpClient::new(config, default_retry_configs());
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn volume_client_recovers_after_certificate_file_is_restored() {
+        let directory = tempfile::tempdir().unwrap();
+        let certificate = directory.path().join("ca.pem");
+        std::fs::write(&certificate, TEST_CA_CERT_PEM).unwrap();
+        let mut config = HttpClientConfig::default();
+        config.tls.trusted_certificate_path = Some(certificate.to_string_lossy().into_owned());
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+
+        std::fs::remove_file(&certificate).unwrap();
+        assert!(client.volume_client().is_err());
+        std::fs::write(&certificate, TEST_CA_CERT_PEM).unwrap();
+        let initialized = client.volume_client().unwrap();
+        assert!(std::ptr::eq(initialized, client.volume_client().unwrap()));
     }
 
     #[test]

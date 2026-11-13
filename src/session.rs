@@ -97,6 +97,7 @@ pub(crate) struct SessionInner {
     /// behind the trait object; future variants slot in via
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
+    pub(crate) http_client: Arc<DatabricksHttpClient>,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -367,11 +368,14 @@ impl Session {
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
-        let http_client = Arc::new(
-            DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
+        let mut http_client = DatabricksHttpClient::new(http_client_config, retry_configs)
+            .map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
-            })?,
-        );
+            })?;
+        // Local HTTP sessions allow loopback storage for local integrations.
+        http_client.allow_loopback_plaintext_storage = reqwest::Url::parse(&host)
+            .is_ok_and(|url| crate::client::http::is_loopback_http_url(&url));
+        let http_client = Arc::new(http_client);
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
@@ -453,7 +457,7 @@ impl Session {
             &config.connection,
             &config.auth,
             config.driver_system_configuration.clone(),
-            http_client,
+            http_client.clone(),
             session_info.session_id.clone(),
         ));
         telemetry
@@ -473,6 +477,7 @@ impl Session {
         Ok(Session {
             inner: Arc::new(SessionInner {
                 transport,
+                http_client,
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,
@@ -1751,6 +1756,12 @@ mod retry_config_tests {
             Duration::from_secs(600),
             "Sea overall_timeout"
         );
+        let client = DatabricksHttpClient::new(HttpClientConfig::default(), configs).unwrap();
+        let volume = client.volume_retry_config();
+        assert_eq!(volume.min_wait, Duration::from_secs(3));
+        assert_eq!(volume.max_wait, Duration::from_secs(90));
+        assert_eq!(volume.max_retries, 7);
+        assert_eq!(volume.overall_timeout, Duration::from_secs(600));
     }
 
     #[test]
@@ -3049,8 +3060,8 @@ mod is_open_tests {
         );
         assert_eq!(
             detail["n_operation_status_calls"].as_i64(),
-            Some(2),
-            "only owning status and await polls contribute to execution telemetry"
+            Some(1),
+            "only the owning status request contributes; await consumes its response"
         );
         assert!(
             detail["operation_status_latency_millis"]

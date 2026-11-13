@@ -60,6 +60,7 @@ arrow-ipc = "59"
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
 reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+hyper = { version = "1", default-features = false }
 native-tls = { version = "0.2", optional = true }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 # Enforce TLS dependency minimums for consumers with their own lockfiles.
@@ -91,7 +92,7 @@ moka = { version = "0.12.16", features = ["future"] }
 
 # Async utilities
 futures = "0.3"
-tokio-util = "0.7"
+tokio-util = { version = "0.7", features = ["io"] }
 async-trait = "0.1"
 
 # Error handling
@@ -145,10 +146,11 @@ zeroize = "1.9"                                                                 
 jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] } # JWT signing (RS256/384/512, PS256/384/512, ES256/384); use_pem = PEM key loading (adds pem + simple_asn1, no TLS)
 pkcs8 = { version = "0.10", features = ["encryption", "pem", "std"] }            # PKCS#8 PEM parsing + PBES2 passphrase decryption
 
+tempfile = "3"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util"] }
 wiremock = "0.6"
-tempfile = "3"
 log = "0.4"
 # Generate JWT test keys in-process to avoid PEM fixtures and an external
 # `openssl` dependency. `ring` already backs runtime JWT signing.

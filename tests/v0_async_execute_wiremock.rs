@@ -141,6 +141,27 @@ fn succeeded_inline_body(statement_id: &str, batch: &RecordBatch) -> String {
     .to_string()
 }
 
+fn file_transfer_body(operation: &str, url: &str, local: &std::path::Path) -> String {
+    use arrow_array::StringArray;
+    let batch = RecordBatch::try_from_iter(vec![
+        (
+            "operation",
+            Arc::new(StringArray::from(vec![operation])) as arrow_array::ArrayRef,
+        ),
+        ("url", Arc::new(StringArray::from(vec![url]))),
+        ("headers", Arc::new(StringArray::from(vec!["{}"]))),
+        (
+            "local",
+            Arc::new(StringArray::from(vec![local.to_str().unwrap()])),
+        ),
+    ])
+    .unwrap();
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("transfer", &batch)).unwrap();
+    body["manifest"]["is_volume_operation"] = json!(true);
+    body.to_string()
+}
+
 fn pending_body(statement_id: &str) -> String {
     json!({
         "statement_id": statement_id,
@@ -483,6 +504,18 @@ async fn await_result_polls_until_succeeded() {
             .as_primitive::<arrow_array::types::Int64Type>()
             .value(0),
         42
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-poll"
+            })
+            .count(),
+        2,
+        "materialisation must use the final poll response"
     );
 }
 
@@ -1243,7 +1276,7 @@ async fn async_status_call_refreshes_cached_status() {
 
     // A status() poll returns SUCCEEDED with extended fields. The
     // status() call itself must overwrite the cached snapshot.
-    let batch = int64_batch("n", vec![1]);
+    let batch = int64_batch("n", vec![11, 22]);
     mount_status_sequence(
         &server,
         "stmt-async-refresh",
@@ -1252,8 +1285,8 @@ async fn async_status_call_refreshes_cached_status() {
             &batch,
             Some(99),
             Some("Refreshed via status()"),
-            None,
-            None,
+            Some("operator=Update"),
+            Some(r#"{"detail":"refreshed"}"#),
         )],
     )
     .await;
@@ -1282,6 +1315,62 @@ async fn async_status_call_refreshes_cached_status() {
     assert_eq!(
         async_exec.display_message().as_deref(),
         Some("Refreshed via status()")
+    );
+    assert_eq!(
+        async_exec.diagnostic_info().as_deref(),
+        Some("operator=Update")
+    );
+    assert_eq!(
+        async_exec.error_details_json().as_deref(),
+        Some(r#"{"detail":"refreshed"}"#)
+    );
+
+    let mut stream = async_exec.await_result().await.expect("await_result");
+    let schema = stream.schema();
+    assert_eq!(schema.fields().len(), 1);
+    assert_eq!(schema.field(0).name(), "n");
+    assert_eq!(schema.field(0).data_type(), &DataType::Int64);
+    assert_eq!(
+        schema.field(0).is_nullable(),
+        batch.schema().field(0).is_nullable()
+    );
+    let batches = drain(&mut stream).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].num_rows(), 2);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .values()
+            .as_ref(),
+        &[11_i64, 22]
+    );
+    assert_eq!(async_exec.num_modified_rows(), Some(99));
+    assert_eq!(
+        async_exec.display_message().as_deref(),
+        Some("Refreshed via status()")
+    );
+    assert_eq!(
+        async_exec.diagnostic_info().as_deref(),
+        Some("operator=Update")
+    );
+    assert_eq!(
+        async_exec.error_details_json().as_deref(),
+        Some(r#"{"detail":"refreshed"}"#)
+    );
+    let status_requests = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(|request| {
+            request.method.as_str() == "GET"
+                && request.url.path() == "/api/2.0/sql/statements/stmt-async-refresh"
+        })
+        .count();
+    assert_eq!(
+        status_requests, 1,
+        "owner await must consume its observed response"
     );
 
     async_exec.close().await.expect("close");
@@ -1481,7 +1570,7 @@ async fn async_readers_preserve_session_routes() {
         Mock::given(method("GET"))
             .and(path(format!("{session_prefix}/statements/stmt-result")))
             .respond_with(ResponseTemplate::new(200).set_body_json(&response))
-            .expect(7)
+            .expect(4)
             .mount(&server)
             .await;
         let chunk_mock = Mock::given(method("GET")).and(path(format!(
@@ -1807,7 +1896,7 @@ async fn attached_statement_inline_reads_use_standard_urls() {
         Mock::given(method("GET"))
             .and(path("/api/2.0/sql/statements/stmt-attach"))
             .respond_with(ResponseTemplate::new(200).set_body_json(status))
-            .expect(3)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("GET"))
@@ -2165,8 +2254,8 @@ async fn await_result_closed_status_skips_close_statement() {
 
     let batch = int64_batch("n", vec![7]);
     mount_submit(&server, pending_body("stmt-async-closed")).await;
-    // await_result polls RUNNING → CLOSED (with inline results). The final
-    // CLOSED body is also served to materialise_result's own status GET.
+    // await_result polls RUNNING → CLOSED with inline results. An independent
+    // reader can still fetch the same CLOSED result.
     mount_status_sequence(
         &server,
         "stmt-async-closed",
@@ -2220,27 +2309,32 @@ async fn await_result_closed_status_skips_close_statement() {
     // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
 
-/// Regression-guard for the async CLOSED-skip fix: a SUCCEEDED async
-/// result must STILL fire exactly one `CloseStatement` on close/drop —
-/// the server still owns the statement. Guards against over-correcting
-/// the CLOSED-skip into a server-statement leak.
+/// A Succeeded statement still receives exactly one CloseStatement on owner close,
+/// and close discards both a saved terminal response and a later status reply.
 #[tokio::test]
-async fn await_result_succeeded_status_still_closes_statement() {
+async fn owner_close_discards_cached_and_late_terminal_responses() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
 
     let batch = int64_batch("n", vec![7]);
-    mount_submit(&server, pending_body("stmt-async-succ")).await;
-    mount_status_sequence(
-        &server,
-        "stmt-async-succ",
-        vec![
-            running_body("stmt-async-succ"),
-            succeeded_inline_body("stmt-async-succ", &batch),
-        ],
-    )
-    .await;
+    let submit = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("stmt-async-succ")))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-async-succ"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(succeeded_inline_body("stmt-async-succ", &batch)),
+        )
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_status_not_found(&server, "stmt-async-succ").await;
 
     // Scoped expectation: exactly one DELETE on the statement endpoint.
     let _close = Mock::given(method("DELETE"))
@@ -2255,10 +2349,18 @@ async fn await_result_succeeded_status_still_closes_statement() {
         let mut stmt = session.statement();
         stmt.spec().sql("SELECT 7 AS n");
         let async_exec = stmt.submit().await.expect("submit");
-        let mut stream = async_exec.await_result().await.expect("await_result");
-        let _ = drain(&mut stream).await;
+        assert!(matches!(
+            async_exec.status().await.unwrap(),
+            StatementStatus::Succeeded
+        ));
         async_exec.close().await.expect("close");
-        // async_exec drops here — the close guard must fire the DELETE.
+        let error = async_exec
+            .await_result()
+            .await
+            .err()
+            .expect("fresh status after close");
+        assert_eq!(error.code, ErrorCode::NotFound);
+        // Drop must not repeat the explicit close.
     }
 
     let closes = wait_for_close_delete(
@@ -2273,4 +2375,626 @@ async fn await_result_succeeded_status_still_closes_statement() {
         "SUCCEEDED status must trigger exactly one CloseStatement"
     );
     // `_close` also verifies expect(1) when it drops at end of scope.
+    assert_eq!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-async-succ"
+            })
+            .count(),
+        2
+    );
+    drop(submit);
+
+    // A status reply arriving after owner release must not backfill reusable rows.
+    let started = Arc::new(tokio::sync::Notify::new());
+    let notify = Arc::clone(&started);
+    let late_body = succeeded_inline_body("stmt-late-status", &batch);
+    mount_submit(&server, pending_body("stmt-late-status")).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-late-status"))
+        .respond_with(move |_: &wiremock::Request| {
+            notify.notify_one();
+            ResponseTemplate::new(200)
+                .set_body_string(late_body.clone())
+                .set_delay(std::time::Duration::from_secs(1))
+        })
+        .up_to_n_times(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_status_not_found(&server, "stmt-late-status").await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-late-status"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut late_statement = session.statement();
+    late_statement.spec().sql("SELECT 7 AS n");
+    let late = late_statement.submit().await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        let status = late.status();
+        tokio::pin!(status);
+        tokio::select! {
+            result = &mut status => panic!("status completed before request notification: {result:?}"),
+            _ = started.notified() => {}
+        }
+        ExecutedStatementHandle::close(&late).await.unwrap();
+        assert!(futures::poll!(&mut status).is_pending(), "status must complete after close returns");
+        assert!(matches!(status.await.unwrap(), StatementStatus::Succeeded));
+        let error = late.await_result().await.err().expect("late reply must not survive close");
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }).await.expect("bounded late status reply");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "GET"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-late-status"
+            })
+            .count(),
+        2
+    );
+    assert_eq!(
+        requests
+            .iter()
+            .filter(|request| {
+                request.method.as_str() == "DELETE"
+                    && request.url.path() == "/api/2.0/sql/statements/stmt-late-status"
+            })
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn file_transfer_uses_session_retry_policy() {
+    use databricks_sql_kernel::HttpConfig;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::Duration;
+
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    Mock::given(method("GET"))
+        .and(path("/storage/file"))
+        .respond_with(move |_: &wiremock::Request| {
+            if count.fetch_add(1, Ordering::SeqCst) == 0 {
+                ResponseTemplate::new(503).insert_header("Retry-After", "0")
+            } else {
+                ResponseTemplate::new(200).set_body_bytes(b"fresh download")
+            }
+        })
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("download");
+    std::fs::write(&destination, b"stale bytes").unwrap();
+    mount_submit(
+        &server,
+        file_transfer_body(
+            "GET",
+            &format!("{}/storage/file", server.uri()),
+            &destination,
+        ),
+    )
+    .await;
+    let mut http = HttpConfig::default();
+    http.retry_min_wait = Duration::from_millis(1);
+    http.retry_max_wait = Duration::from_millis(1);
+    http.retry_max_retries = 1;
+    http.overall_timeout = Duration::from_secs(5);
+    let session = Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .http(http)
+        .open()
+        .await
+        .unwrap();
+    let mut statement = session.statement();
+    statement
+        .spec()
+        .sql("GET '/Volumes/c/s/v/file' TO '/tmp/download'");
+    statement.spec().staging_allowed_local_paths = Some(vec![dir.path().to_str().unwrap().into()]);
+    let result = statement.execute().await;
+    assert!(
+        result.is_ok(),
+        "storage requests={}: {:?}",
+        requests.load(Ordering::SeqCst),
+        result.as_ref().err()
+    );
+    let mut result = result.unwrap();
+    assert!(result
+        .result_stream_mut()
+        .next_batch()
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(requests.load(Ordering::SeqCst), 2);
+    assert_eq!(std::fs::read(destination).unwrap(), b"fresh download");
+    result.close().await.unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn file_transfer_completion_is_shared_by_independent_readers() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    Mock::given(method("GET"))
+        .and(path("/storage/file"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"download"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let dir = tempfile::tempdir().unwrap();
+    let destination = dir.path().join("download");
+    let body = file_transfer_body(
+        "GET",
+        &format!("{}/storage/file", server.uri()),
+        &destination,
+    );
+    mount_submit(&server, pending_body("transfer")).await;
+    mount_status_once(&server, "transfer", body).await;
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement
+        .spec()
+        .sql("GET '/Volumes/c/s/v/file' TO '/tmp/download'");
+    statement.spec().staging_allowed_local_paths = Some(vec![dir.path().to_str().unwrap().into()]);
+    let owner = statement.submit().await.unwrap();
+    let first = owner.reader().unwrap();
+    let second = owner.reader().unwrap();
+    let (first, second) = tokio::join!(first.fetch_result(), second.fetch_result());
+    for stream in [first, second] {
+        assert!(stream.unwrap().next_batch().await.unwrap().is_none());
+    }
+    assert_eq!(std::fs::read(destination).unwrap(), b"download");
+    owner.close().await.unwrap();
+    session.close().await.unwrap();
+}
+
+#[tokio::test]
+async fn owner_close_interrupts_download() {
+    release_during_download("owner-close").await;
+}
+
+#[tokio::test]
+async fn owner_drop_interrupts_download_after_server_close() {
+    release_during_download("owner-drop").await;
+}
+
+#[tokio::test]
+async fn parent_close_interrupts_direct_download() {
+    release_during_download("parent-close").await;
+}
+
+#[tokio::test]
+async fn parent_drop_interrupts_download() {
+    release_during_download("parent-drop").await;
+}
+
+#[tokio::test]
+async fn parent_reuse_interrupts_download_and_allows_next_transfer() {
+    release_during_download("parent-reuse").await;
+}
+
+#[tokio::test]
+async fn owner_deadline_interrupts_reader_download() {
+    release_during_download("owner-deadline").await;
+}
+
+#[tokio::test]
+async fn idle_reader_drop_preserves_download() {
+    release_during_download("reader-drop").await;
+}
+
+async fn release_during_download(mode: &str) {
+    use databricks_sql_kernel::DirectStatement;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/transfer/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(u64::from(mode == "owner-deadline"))
+        .mount(&server)
+        .await;
+    if mode == "owner-drop" {
+        Mock::given(method("DELETE"))
+            .and(path("/api/2.0/sql/statements/transfer"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (started, received) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let storage = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            headers.push(socket.read_u8().await.unwrap());
+        }
+        socket
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nnew-")
+            .await
+            .unwrap();
+        started.send(()).unwrap();
+        let _ = released.await;
+        let _ = socket.write_all(b"data").await;
+    });
+    let directory = tempfile::tempdir().unwrap();
+    let destination = directory.path().join("download");
+    std::fs::write(&destination, b"original").unwrap();
+    let mut body: serde_json::Value = serde_json::from_str(&file_transfer_body(
+        "GET",
+        &format!("http://{address}/file"),
+        &destination,
+    ))
+    .unwrap();
+    if mode == "owner-drop" {
+        body["status"]["state"] = json!("CLOSED");
+    }
+    mount_status_once(&server, "transfer", body.to_string()).await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(pending_body("transfer")))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement
+        .spec()
+        .sql("GET '/Volumes/c/s/v/file' TO 'download'");
+    statement.spec().staging_allowed_local_paths =
+        Some(vec![directory.path().to_str().unwrap().into()]);
+    let owner = if mode == "parent-close" {
+        match statement.execute_direct().await.unwrap() {
+            DirectStatement::Running(owner) => owner,
+            DirectStatement::Completed(_) => panic!("expected running statement"),
+        }
+    } else if mode == "owner-deadline" {
+        statement
+            .submit_with_timeout(Duration::from_secs(1))
+            .await
+            .unwrap()
+    } else {
+        statement.submit().await.unwrap()
+    };
+    let first = owner.reader().unwrap();
+    let sibling = owner.reader().unwrap();
+    let mut readers = tokio::task::JoinSet::new();
+    readers.spawn(async move { first.fetch_result().await.map(|_| ()) });
+    tokio::time::timeout(Duration::from_secs(5), received)
+        .await
+        .expect("download did not start")
+        .unwrap();
+    if mode == "owner-close" {
+        readers.spawn(async move { sibling.fetch_result().await.map(|_| ()) });
+        tokio::task::yield_now().await;
+    } else {
+        drop(sibling);
+    }
+    let mut owner = Some(owner);
+    let mut statement = Some(statement);
+    let mut next = None;
+    match mode {
+        "owner-close" => owner.as_mut().unwrap().close().await.unwrap(),
+        "owner-drop" => {
+            assert!(tokio::time::timeout(
+                Duration::from_millis(100),
+                owner.as_ref().unwrap().await_result(),
+            )
+            .await
+            .is_err());
+            drop(owner.take());
+        }
+        "parent-close" => statement.take().unwrap().close().await.unwrap(),
+        "parent-drop" => drop(statement.take()),
+        "parent-reuse" => {
+            mount_submit(&server, pending_body("next-transfer")).await;
+            let mut body: serde_json::Value = serde_json::from_str(&file_transfer_body(
+                "GET",
+                &format!("{}/storage/next", server.uri()),
+                &destination,
+            ))
+            .unwrap();
+            body["statement_id"] = json!("next-transfer");
+            mount_status_once(&server, "next-transfer", body.to_string()).await;
+            Mock::given(method("GET"))
+                .and(path("/storage/next"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"fresh"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            next = Some(statement.as_mut().unwrap().submit().await.unwrap());
+        }
+        "owner-deadline" => {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            let error = owner.as_ref().unwrap().status().await.unwrap_err();
+            assert_eq!(error.code, ErrorCode::Timeout);
+            assert_eq!(error.sql_state.as_deref(), Some("HYT00"));
+            assert_eq!(error.query_id.as_deref(), Some("transfer"));
+            assert!(!error.retryable);
+        }
+        "reader-drop" => {}
+        _ => panic!("unknown release mode: {mode}"),
+    }
+    assert_eq!(std::fs::read(&destination).unwrap(), b"original");
+    let mut outcomes = Vec::new();
+    let stopped = if mode == "reader-drop" {
+        false
+    } else {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(result) = readers.join_next().await {
+                outcomes.push(result.unwrap());
+            }
+        })
+        .await
+        .is_ok()
+    };
+    release.send(()).unwrap();
+    storage.await.unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while let Some(result) = readers.join_next().await {
+            outcomes.push(result.unwrap());
+        }
+    })
+    .await
+    .expect("reader did not finish after releasing storage");
+    let bytes = std::fs::read(&destination).unwrap();
+    if mode == "reader-drop" {
+        outcomes.pop().unwrap().unwrap();
+        assert_eq!(bytes, b"new-data");
+    } else {
+        for outcome in outcomes {
+            let error = outcome.unwrap_err();
+            assert_eq!(error.code, ErrorCode::InvalidStatementHandle, "{mode}");
+            assert!(error.error_code.is_none(), "{mode}: {error:?}");
+        }
+        assert!(
+            stopped,
+            "{mode}: reader waited for storage; final bytes: {bytes:?}"
+        );
+        assert_eq!(bytes, b"original", "{mode}");
+    }
+    assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    if let Some(next) = next {
+        next.fetch_result().await.unwrap();
+        assert_eq!(std::fs::read(&destination).unwrap(), b"fresh");
+        next.close().await.unwrap();
+    }
+    if mode == "owner-deadline" {
+        assert_eq!(
+            wait_for_close_delete(&server, "transfer", 1, Duration::from_secs(5)).await,
+            1
+        );
+    }
+    if let Some(owner) = owner {
+        owner.close().await.unwrap();
+    }
+    if let Some(statement) = statement {
+        statement.close().await.unwrap();
+    }
+    session.close().await.unwrap();
+    server.verify().await;
+}
+
+#[tokio::test]
+async fn sync_and_direct_transfers_complete_and_preserve_error_context() {
+    use databricks_sql_kernel::DirectStatement;
+    for direct in [false, true] {
+        for denied in [false, true] {
+            let server = MockServer::start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            mount_close_any_statement(&server).await;
+            Mock::given(method("GET"))
+                .and(path("/storage/file"))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"download"))
+                .expect(if denied { 0 } else { 1 })
+                .mount(&server)
+                .await;
+            let directory = tempfile::tempdir().unwrap();
+            let destination = directory.path().join("download");
+            let body = file_transfer_body(
+                "GET",
+                &format!("{}/storage/file", server.uri()),
+                &destination,
+            );
+            mount_submit(&server, body).await;
+            let session = open_session(&server).await;
+            let mut statement = session.statement();
+            statement
+                .spec()
+                .sql("GET '/Volumes/c/s/v/file' TO '/tmp/download'");
+            statement.spec().staging_allowed_local_paths = Some(if denied {
+                vec![]
+            } else {
+                vec![directory.path().to_str().unwrap().into()]
+            });
+            let result = if direct {
+                match statement.execute_direct().await {
+                    Ok(DirectStatement::Completed(executed)) => Ok(executed),
+                    Ok(DirectStatement::Running(_)) => panic!("expected inline completion"),
+                    Err(error) => Err(error),
+                }
+            } else {
+                statement.execute().await
+            };
+            if denied {
+                let error = result.err().expect("denied transfer");
+                assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+                assert_eq!(error.query_id.as_deref(), Some("transfer"));
+                assert!(!destination.exists());
+                assert_eq!(
+                    wait_for_close_delete(
+                        &server,
+                        "transfer",
+                        1,
+                        std::time::Duration::from_secs(1),
+                    )
+                    .await,
+                    1,
+                );
+            } else {
+                let mut executed = result.unwrap();
+                assert!(executed
+                    .result_stream_mut()
+                    .next_batch()
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(std::fs::read(&destination).unwrap(), b"download");
+                executed.close().await.unwrap();
+            }
+            session.close().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_file_transfers() {
+    use databricks_sql_kernel::DirectStatement;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    for operation in ["PUT", "GET"] {
+        for mode in ["sync", "direct", "async-owner", "async-detached"] {
+            let server = MockServer::start().await;
+            mount_create_session(&server).await;
+            mount_delete_session(&server).await;
+            mount_close_any_statement(&server).await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.0/sql/statements/transfer/cancel"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let (started, received) = tokio::sync::oneshot::channel();
+            let storage = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut headers = Vec::new();
+                while !headers.ends_with(b"\r\n\r\n") {
+                    headers.push(socket.read_u8().await.unwrap());
+                }
+                if operation == "GET" {
+                    socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\nConnection: close\r\n\r\npartial").await.unwrap();
+                } else {
+                    socket.read_u8().await.unwrap();
+                }
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            });
+            let directory = tempfile::tempdir().unwrap();
+            let local = directory.path().join("file");
+            let original = vec![b'a'; 8 * 1024 * 1024];
+            std::fs::write(&local, &original).unwrap();
+            let body = file_transfer_body(operation, &format!("http://{address}/file"), &local);
+            if mode == "sync" || mode == "direct" {
+                mount_submit(&server, body).await;
+            } else {
+                mount_submit(&server, pending_body("transfer")).await;
+                mount_status_once(&server, "transfer", body).await;
+            }
+            let session = open_session(&server).await;
+            let mut statement = session.statement();
+            let sql = if operation == "PUT" {
+                format!(
+                    "PUT '{}' INTO '/Volumes/c/s/v/file' OVERWRITE",
+                    local.display()
+                )
+            } else {
+                format!("GET '/Volumes/c/s/v/file' TO '{}'", local.display())
+            };
+            statement.spec().sql(sql);
+            statement.spec().staging_allowed_local_paths =
+                Some(vec![directory.path().to_str().unwrap().into()]);
+            let errors = if mode == "sync" || mode == "direct" {
+                let canceller = statement.canceller();
+                let transfer = tokio::spawn(async move {
+                    if mode == "direct" {
+                        match statement.execute_direct().await {
+                            Ok(DirectStatement::Completed(executed)) => Ok(executed),
+                            Ok(DirectStatement::Running(_)) => panic!("expected inline completion"),
+                            Err(error) => Err(error),
+                        }
+                    } else {
+                        statement.execute().await
+                    }
+                });
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                canceller.cancel().await.unwrap();
+                let result = tokio::time::timeout(Duration::from_secs(2), transfer)
+                    .await
+                    .expect("sync/direct cancellation did not stop the transfer")
+                    .unwrap();
+                vec![result.err().expect("cancelled transfer must fail")]
+            } else {
+                let owner = statement.submit().await.unwrap();
+                let first = owner.reader().unwrap();
+                let second = owner.reader().unwrap();
+                let first = tokio::spawn(async move { first.fetch_result().await });
+                tokio::time::timeout(Duration::from_secs(5), received)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let second = tokio::spawn(async move { second.fetch_result().await });
+                if mode == "async-detached" {
+                    owner.canceller().cancel().await.unwrap();
+                } else {
+                    ExecutedStatementHandle::cancel(&owner).await.unwrap();
+                }
+                let results = tokio::time::timeout(Duration::from_secs(2), async {
+                    (first.await.unwrap(), second.await.unwrap())
+                })
+                .await
+                .expect("async cancellation did not stop the transfer");
+                let errors = vec![
+                    results.0.err().expect("cancelled transfer must fail"),
+                    results.1.err().expect("cancelled transfer must fail"),
+                ];
+                owner.close().await.unwrap();
+                errors
+            };
+            for error in errors {
+                assert_eq!(error.code, ErrorCode::Cancelled);
+                assert_eq!(error.error_code.as_deref(), Some("FILE_TRANSFER_ERROR"));
+                assert_eq!(error.query_id.as_deref(), Some("transfer"));
+            }
+            if operation == "GET" {
+                assert_eq!(std::fs::read(&local).unwrap(), original);
+            }
+            storage.abort();
+            session.close().await.unwrap();
+        }
+    }
 }

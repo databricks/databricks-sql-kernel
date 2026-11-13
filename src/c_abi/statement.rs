@@ -159,6 +159,34 @@ pub enum KernelStatementStatusKind {
     Closed = 5,
 }
 
+/// Configure permitted local paths from a JSON array for SQL file transfers.
+/// `retain_result` keeps the instruction row readable after a successful transfer.
+///
+/// # Safety
+/// `stmt` must be live; non-null `paths_json` must be NUL-terminated UTF-8.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_statement_set_staging_allowed_local_paths(
+    stmt: *mut kernel_statement_t,
+    paths_json: *const c_char,
+    retain_result: bool,
+) -> KernelStatusCode {
+    with_statement(stmt, |stmt| {
+        let paths = if paths_json.is_null() {
+            None
+        } else {
+            let json = CStr::from_ptr(paths_json)
+                .to_str()
+                .map_err(|_| Error::invalid_argument().message("paths_json must be UTF-8"))?;
+            serde_json::from_str::<Option<Vec<String>>>(json).map_err(|_| {
+                Error::invalid_argument().message("paths_json must be an array of paths or null")
+            })?
+        };
+        stmt.spec().staging_allowed_local_paths = paths;
+        stmt.spec().retain_volume_operation_result = retain_result;
+        Ok(())
+    })
+}
+
 // ─── Crate-internal raw-handle helpers ───────────────────────────────────────
 
 /// Box a [`Statement`] and erase it to the opaque C handle type.
@@ -623,7 +651,7 @@ pub unsafe extern "C" fn kernel_statement_canceller_new(
     KernelStatusCode::Success
 }
 
-/// Fire a server-side cancel of the statement this canceller was created for.
+/// Interrupt its local file transfer and send a server-side statement cancel.
 /// Idempotent and safe to call concurrently with `kernel_statement_execute` on
 /// the originating statement.
 ///
@@ -669,7 +697,7 @@ pub unsafe extern "C" fn kernel_statement_canceller_cancel(
         let Some(handle) = (canceller as *mut CancellerHandle).as_ref() else {
             return store_invalid_arg("kernel_statement_canceller_cancel: handle must not be null");
         };
-        // Clone the canceller (two Arc bumps) so the blocking cancel RPC owns its
+        // Clone the canceller so the blocking cancel RPC owns its
         // session and id-slot handles rather than borrowing through this box.
         let canceller = handle.canceller.clone();
         match block_on_ffi(move || Box::pin(async move { canceller.cancel().await })) {
@@ -1242,6 +1270,78 @@ unsafe fn with_statement(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn staging_options_clear_consistently_and_reject_invalid_inputs() {
+        use crate::{AuthConfig, ConnectionConfig, Session};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let server = runtime.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_string(r#"{"session_id":"session","warehouse_id":"warehouse"}"#),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+                .mount(&server)
+                .await;
+            server
+        });
+        let session = runtime
+            .block_on(
+                Session::builder()
+                    .connection(
+                        ConnectionConfig::from_http_path(
+                            server.uri(),
+                            "/sql/1.0/warehouses/warehouse",
+                        )
+                        .unwrap(),
+                    )
+                    .auth(AuthConfig::Pat {
+                        token: "test".into(),
+                        identity_federation_client_id: None,
+                    })
+                    .open(),
+            )
+            .unwrap();
+        let statement = into_raw_statement(session.statement());
+        unsafe {
+            for (json, retained, expected) in [
+                (c"[]".as_ptr(), true, Some(vec![])),
+                (std::ptr::null(), false, None),
+                (c"null".as_ptr(), false, None),
+                (c"[\"/tmp\"]".as_ptr(), true, Some(vec!["/tmp".to_owned()])),
+            ] {
+                assert_eq!(
+                    kernel_statement_set_staging_allowed_local_paths(statement, json, retained),
+                    KernelStatusCode::Success
+                );
+                let spec = statement_mut(statement).unwrap().spec();
+                assert_eq!(spec.staging_allowed_local_paths, expected);
+                assert_eq!(spec.retain_volume_operation_result, retained);
+            }
+            let invalid_utf8 = [0xff_u8, 0];
+            for json in [c"{}".as_ptr(), invalid_utf8.as_ptr().cast()] {
+                assert_eq!(
+                    kernel_statement_set_staging_allowed_local_paths(statement, json, false),
+                    KernelStatusCode::InvalidArgument
+                );
+                let spec = statement_mut(statement).unwrap().spec();
+                assert_eq!(
+                    spec.staging_allowed_local_paths,
+                    Some(vec!["/tmp".to_owned()])
+                );
+                assert!(spec.retain_volume_operation_result);
+            }
+            assert_eq!(kernel_statement_close(statement), KernelStatusCode::Success);
+        }
+        runtime.block_on(session.close()).unwrap();
+    }
 
     // Null-pointer guards only: a bad handle yields InvalidArgument, never a
     // crash. The success + concurrent-cancel-during-execute paths are covered by

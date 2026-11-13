@@ -221,6 +221,10 @@ pub struct ExecutedAsyncStatement {
     /// don't `.await` and the poll loop releases the lock before
     /// every network round-trip.
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
+    /// Take-once ownership avoids retaining raw payloads after reader construction.
+    pending_result: std::sync::Mutex<Option<ExecuteResponse>>,
+    pub(crate) volume_options: super::volume::VolumeOptions,
+    pub(super) volume_completion: Arc<super::volume::VolumeCompletion>,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -278,7 +282,7 @@ impl ExecutedAsyncStatement {
     /// best-effort server cleanup when a deadline retained across
     /// caller-driven status polls expires.
     pub(crate) fn expire_client_query_timeout(&self) -> Error {
-        self.owner_released.store(true, Ordering::Release);
+        self.release_owner();
         if !self.client_timeout_expired.swap(true, Ordering::AcqRel) {
             self.session
                 .dispatch_timeout_cleanup(Some(self.statement_id.clone()));
@@ -331,6 +335,9 @@ impl ExecutedAsyncStatement {
             owning: true,
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            pending_result: std::sync::Mutex::new(None),
+            volume_options: super::volume::VolumeOptions::default(),
+            volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
@@ -390,6 +397,9 @@ impl ExecutedAsyncStatement {
             owning: false,
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
+            pending_result: std::sync::Mutex::new(None),
+            volume_options: super::volume::VolumeOptions::default(),
+            volume_completion: Arc::new(super::volume::VolumeCompletion::default()),
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,
@@ -408,16 +418,17 @@ impl ExecutedAsyncStatement {
             .lock()
             .map_err(|error| Error::internal().message(format!("Statement status lock: {error}")))?
             .clone();
-        Ok(AsyncStatementReader {
-            inner: Self::new_read_only(
-                Arc::clone(&self.session),
-                self.statement_id.clone(),
-                self.valid.clone(),
-                Arc::clone(&self.owner_released),
-                self.session_attribution,
-                status,
-            ),
-        })
+        let mut inner = Self::new_read_only(
+            Arc::clone(&self.session),
+            self.statement_id.clone(),
+            self.valid.clone(),
+            Arc::clone(&self.owner_released),
+            self.session_attribution,
+            status,
+        );
+        inner.volume_options = self.volume_options.clone();
+        inner.volume_completion = Arc::clone(&self.volume_completion);
+        Ok(AsyncStatementReader { inner })
     }
 
     fn check_owner_available(&self) -> Result<()> {
@@ -427,6 +438,14 @@ impl ExecutedAsyncStatement {
                 .with_query_id(&self.statement_id));
         }
         Ok(())
+    }
+
+    fn release_owner(&self) {
+        if self.owning {
+            self.owner_released.store(true, Ordering::Release);
+            self.clear_pending_result();
+            self.volume_completion.cancel();
+        }
     }
 
     fn check_read_validity(&self) -> Result<()> {
@@ -514,18 +533,45 @@ impl ExecutedAsyncStatement {
             .and_then(|s| s.error_details_json.clone())
     }
 
-    /// Internal helper — overwrite the cached `StatementStatus` with
-    /// a fresh poll's response. Called by `status()` /
-    /// `await_result()` after every successful
-    /// `statement_status` RPC. Lock poisoning is intentionally
-    /// swallowed: a poisoned lock here would only happen if a panic
+    /// Publish observed metadata together with an optional response for reuse.
+    /// Lock poisoning is intentionally swallowed: a poisoned lock here
+    /// would only happen if a panic
     /// landed mid-write, and the recovery path is to keep the prior
     /// status visible (worse: a fresh poll's status lost; better:
     /// the handle's accessor surface keeps working).
-    fn record_latest_status(&self, fresh: crate::types::sea::StatementStatus) {
+    fn record_latest_status(
+        &self,
+        fresh: crate::types::sea::StatementStatus,
+        response: Option<ExecuteResponse>,
+    ) {
+        // Payload before metadata keeps concurrent publications from mixing observations.
+        let pending = self.pending_result.lock().ok();
         if let Ok(mut guard) = self.latest_status.lock() {
             *guard = fresh;
         }
+        if let Some(mut pending) = pending {
+            *pending = response.filter(|response| {
+                matches!(
+                    response.status.state,
+                    StatementState::Succeeded | StatementState::Closed
+                ) && !self.owner_released.load(Ordering::Acquire)
+            });
+        }
+    }
+
+    fn clear_pending_result(&self) {
+        if let Ok(mut pending) = self.pending_result.lock() {
+            *pending = None;
+        }
+    }
+
+    fn take_pending_result(&self) -> Option<ExecuteResponse> {
+        let mut pending = self.pending_result.lock().ok()?;
+        if self.owner_released.load(Ordering::Acquire) {
+            *pending = None;
+            return None;
+        }
+        pending.take()
     }
 
     fn cancelled_error(&self, status: &crate::types::sea::StatementStatus) -> Error {
@@ -563,10 +609,16 @@ impl ExecutedAsyncStatement {
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`
     /// has already invalidated this handle.
+    ///
+    /// A successful terminal check keeps one complete response, including any
+    /// inline rows, on this handle for its next result read. Status-only callers
+    /// should close or drop owning handles when finished, and drop independent
+    /// readers or attached handles to release their saved payload.
     pub async fn status(&self) -> Result<StatementStatus> {
         let span = self.session.log_span().clone();
         let result = async {
             self.check_read_validity()?;
+            self.clear_pending_result();
             // The client deadline governs only the pre-terminal window
             // ("initial submit through observed terminal status"). Once
             // this handle has observed a terminal state, `status()`
@@ -608,10 +660,6 @@ impl ExecutedAsyncStatement {
             self.check_read_validity()?;
             self.statement_telemetry
                 .record_poll(status_started.elapsed());
-            // Cache the wire status so the extended-field accessors
-            // reflect what THIS handle has observed (instead of the
-            // stale initial-submit snapshot).
-            self.record_latest_status(response.status.clone());
             // Latch the terminal observation so subsequent `status()`
             // calls stop enforcing the client deadline against this
             // already-finished statement.
@@ -625,6 +673,7 @@ impl ExecutedAsyncStatement {
                     .client_deadline
                     .is_some_and(|deadline| std::time::Instant::now() >= deadline)
             {
+                self.record_latest_status(response.status.clone(), None);
                 return Err(self.expire_client_query_timeout());
             }
             match &status {
@@ -640,11 +689,13 @@ impl ExecutedAsyncStatement {
                 | StatementStatus::Succeeded
                 | StatementStatus::Closed => {}
             }
+            self.record_latest_status(response.status.clone(), Some(response));
             Ok(status)
         }
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -671,6 +722,9 @@ impl ExecutedAsyncStatement {
         let span = self.session.log_span().clone();
         let result = async {
             self.check_read_validity()?;
+            if let Some(response) = self.take_pending_result() {
+                return self.materialise_result(response).await;
+            }
 
             let cfg = self.session.transport().poll_config();
             let start = std::time::Instant::now();
@@ -753,7 +807,7 @@ impl ExecutedAsyncStatement {
                 // Cache the wire status so the extended-field
                 // accessors reflect THIS poll's observation — not the
                 // initial-submit snapshot that's now stale by minutes.
-                self.record_latest_status(response.status.clone());
+                self.record_latest_status(response.status.clone(), None);
                 // Latch the terminal observation so a later `status()`
                 // call stops enforcing the client deadline against this
                 // already-finished statement.
@@ -765,7 +819,7 @@ impl ExecutedAsyncStatement {
                         if let Some(g) = cancel_guard.take() {
                             g.defuse();
                         }
-                        return self.materialise_result().await;
+                        return self.materialise_result(response).await;
                     }
                     StatementStatus::Failed(e) => {
                         // Server already decided this is terminal — no
@@ -822,6 +876,7 @@ impl ExecutedAsyncStatement {
         .instrument(span)
         .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -835,8 +890,28 @@ impl ExecutedAsyncStatement {
     /// when the caller has already confirmed completion themselves.
     pub async fn fetch_result(&self) -> Result<ResultStream> {
         let span = self.session.log_span().clone();
-        let result = self.materialise_result().instrument(span).await;
+        let result = async {
+            self.check_read_validity()?;
+            let response = match self.take_pending_result() {
+                Some(response) => response,
+                None => {
+                    self.clear_pending_result();
+                    let response = self
+                        .session
+                        .transport()
+                        .statement_status(&self.statement_id, self.session_attribution)
+                        .await?;
+                    self.check_read_validity()?;
+                    self.clear_pending_result();
+                    response
+                }
+            };
+            self.materialise_result(response).await
+        }
+        .instrument(span)
+        .await;
         if let Err(error) = &result {
+            self.clear_pending_result();
             self.statement_telemetry.finalize(Some(error));
         }
         result
@@ -847,12 +922,17 @@ impl ExecutedAsyncStatement {
     /// statement is still running. The error includes the observed
     /// status so callers don't have to re-query, and points at the
     /// actionable follow-up.
-    async fn materialise_result(&self) -> Result<ResultStream> {
+    async fn materialise_result(&self, response: ExecuteResponse) -> Result<ResultStream> {
         self.check_read_validity()?;
+        let observed = match response.status.state {
+            StatementState::Pending => "Pending",
+            StatementState::Running => "Running",
+            _ => "non-terminal",
+        };
         let result = self
             .session
             .transport()
-            .fetch_completed_result(&self.statement_id, self.session_attribution)
+            .completed_result(response, self.session_attribution)
             .await?;
         self.check_read_validity()?;
         match result {
@@ -874,6 +954,15 @@ impl ExecutedAsyncStatement {
                 if result.status.state == crate::types::sea::StatementState::Closed {
                     self.closed.store(true, Ordering::Release);
                 }
+                let result = super::volume::complete(
+                    &self.session.http_client,
+                    result,
+                    &self.volume_options,
+                    &self.volume_completion,
+                )
+                .await;
+                self.check_read_validity()?;
+                let result = result?;
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
@@ -894,32 +983,12 @@ impl ExecutedAsyncStatement {
                     .store(true, Ordering::Release);
                 Ok(stream)
             }
-            None => {
-                // Re-read the status so the error message names the
-                // observed state (Pending vs Running). Best-effort —
-                // if the status call itself fails, fall back to the
-                // generic non-terminal message.
-                let observed = match self
-                    .session
-                    .transport()
-                    .statement_status(&self.statement_id, self.session_attribution)
-                    .await
-                {
-                    Ok(r) => match r.status.state {
-                        crate::types::sea::StatementState::Pending => "Pending",
-                        crate::types::sea::StatementState::Running => "Running",
-                        _ => "non-terminal",
-                    },
-                    Err(_) => "non-terminal",
-                };
-                self.check_read_validity()?;
-                Err(Error::invalid_state().message(format!(
-                    "Statement {} is not terminal yet (status: {}); call await_result() to \
+            None => Err(Error::invalid_state().message(format!(
+                "Statement {} is not terminal yet (status: {}); call await_result() to \
                      block until done, or poll status() and re-call fetch_result() once it \
                      reports Succeeded / Closed",
-                    self.statement_id, observed
-                )))
-            }
+                self.statement_id, observed
+            ))),
         }
     }
 }
@@ -1040,6 +1109,7 @@ impl ExecutedStatementHandle for ExecutedAsyncStatement {
                      submitted it",
                 ));
             }
+            self.volume_completion.cancel();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1069,9 +1139,7 @@ impl ExecutedAsyncStatement {
     }
 
     async fn close_server_statement(&self) -> Result<()> {
-        if self.owning {
-            self.owner_released.store(true, Ordering::Release);
-        }
+        self.release_owner();
         // Idempotent on success: a prior successful close sets
         // `closed=true` and subsequent calls short-circuit.
         //
@@ -1125,6 +1193,7 @@ impl ExecutedAsyncStatement {
             session: Arc::clone(&self.session),
             statement_id: self.statement_id.clone(),
             valid: self.valid.clone(),
+            volume_completion: Arc::clone(&self.volume_completion),
             // Inherit ownership: a canceller derived from an attached
             // (read-only) handle must not cancel the owner's statement
             // either — otherwise the footgun just moves to the detached
@@ -1136,19 +1205,19 @@ impl ExecutedAsyncStatement {
 
 /// Detached canceller for an in-flight async statement.
 ///
-/// Holds only the shared session handle, the statement id, and the
-/// shared [`ValidityFlag`] — **not** the [`ExecutedAsyncStatement`]
-/// itself — so a binding can fire a server-side cancel while the handle
+/// Holds the shared session, statement id, transfer completion, and
+/// [`ValidityFlag`] so a binding can cancel while the handle
 /// is borrowed elsewhere (e.g. parked inside a long-running
 /// [`ExecutedAsyncStatement::await_result`] that a binding-side lock is
 /// held across). Produced by [`ExecutedAsyncStatement::canceller`].
 ///
-/// Cheap to [`Clone`] (one `Arc` bump plus a `String` / flag clone).
+/// Cheap to [`Clone`].
 #[derive(Clone)]
 pub struct AsyncStatementCanceller {
     session: Arc<SessionInner>,
     statement_id: String,
     valid: ValidityFlag,
+    volume_completion: Arc<super::volume::VolumeCompletion>,
     /// Inherited from the producing handle — `false` for a canceller
     /// derived from an attached (read-only) handle, which must not
     /// cancel a statement it doesn't own. See
@@ -1157,15 +1226,15 @@ pub struct AsyncStatementCanceller {
 }
 
 impl AsyncStatementCanceller {
-    /// Server-side cancel via `cancel_statement(statement_id)`.
+    /// Interrupt its local transfer and send `cancel_statement(statement_id)`.
     ///
     /// Short-circuits to `InvalidStatementHandle` (no wire round-trip)
     /// if the parent handle was invalidated (re-execute / parent
     /// `Statement` drop). Idempotent against a server already in a
     /// terminal state — the kernel's `cancel_statement` is a no-op
     /// there. Byte-for-byte the same operation as
-    /// [`ExecutedAsyncStatement::cancel`]; the two share no mutable
-    /// state, so this can run concurrently with an in-flight
+    /// [`ExecutedAsyncStatement::cancel`]; no exclusive borrow of the
+    /// executed handle is required, so this can run concurrently with an in-flight
     /// `await_result` on the same statement.
     pub async fn cancel(&self) -> Result<()> {
         async {
@@ -1177,6 +1246,7 @@ impl AsyncStatementCanceller {
                      is owned by whoever submitted it",
                 ));
             }
+            self.volume_completion.cancel();
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)
@@ -1194,9 +1264,7 @@ impl AsyncStatementCanceller {
 
 impl Drop for ExecutedAsyncStatement {
     fn drop(&mut self) {
-        if self.owning {
-            self.owner_released.store(true, Ordering::Release);
-        }
+        self.release_owner();
         // Ensure submit-and-drop / status-only async statements still
         // emit one terminal telemetry event. Once a result stream has
         // been returned, that stream owns success finalization so it can

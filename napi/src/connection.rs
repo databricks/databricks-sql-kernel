@@ -102,6 +102,9 @@ pub struct ExecuteOptions {
     /// (SEA `row_limit`), independent of any SQL `LIMIT`. Maps to
     /// `StatementSpec.row_limit`. Omitted ⇒ no driver-imposed cap.
     pub row_limit: Option<i64>,
+    /// Configured transfers consume instruction rows.
+    /// Omit to handle instructions in the caller; an empty list denies local file access.
+    pub staging_allowed_local_paths: Option<Vec<String>>,
     /// Positional parameters, in 1-based wire order. Index `i` in this
     /// Vec corresponds to the `i+1`-th `?` placeholder in the SQL.
     /// Each entry is a `{ sqlType, value }` pair — `value` is the
@@ -193,6 +196,7 @@ fn build_statement(
     positional_params: Vec<TypedValue>,
     named_params: Vec<(String, TypedValue)>,
     raw_params: Vec<RawParameterInput>,
+    staging_allowed_local_paths: Option<Vec<String>>,
 ) -> napi::Result<databricks_sql_kernel::Statement> {
     // Positional/named mutual-exclusivity is enforced in the kernel's
     // `build_execute_params` (StatementSpec dispatch), so every binding
@@ -200,6 +204,7 @@ fn build_statement(
     // No napi-layer guard needed here.
     let mut stmt = session.statement();
     stmt.spec().sql(sql);
+    stmt.spec().staging_allowed_local_paths = staging_allowed_local_paths;
     // Set the explicit per-statement conf overlay first (only when non-empty)
     // so the kernel's `query_tags` merge can detect a dual definition against it.
     if let Some(conf) = statement_conf {
@@ -322,6 +327,9 @@ impl Connection {
         // `queryTags` + `statementConf["query_tags"]` definition.
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        let staging_allowed_local_paths = options
+            .as_mut()
+            .and_then(|o| o.staging_allowed_local_paths.take());
         guarded(async move {
             // Build the kernel `Statement` while holding the session lock,
             // then RELEASE the lock before `execute().await`. `Session::statement()`
@@ -345,6 +353,7 @@ impl Connection {
                     positional_params,
                     named_params,
                     raw_params,
+                    staging_allowed_local_paths,
                 )?
                 // session lock released here
             };
@@ -405,6 +414,9 @@ impl Connection {
             .unwrap_or_default();
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        let staging_allowed_local_paths = options
+            .as_mut()
+            .and_then(|o| o.staging_allowed_local_paths.take());
         guarded(async move {
             let mut stmt = {
                 let guard = inner.lock().await;
@@ -418,6 +430,7 @@ impl Connection {
                     positional_params,
                     named_params,
                     raw_params,
+                    staging_allowed_local_paths,
                 )?
             };
 
@@ -478,6 +491,9 @@ impl Connection {
             .unwrap_or_default();
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        let staging_allowed_local_paths = options
+            .as_mut()
+            .and_then(|o| o.staging_allowed_local_paths.take());
         guarded(async move {
             // Build the kernel `Statement` under the session lock, release
             // the lock, then hand the built statement to the
@@ -498,6 +514,7 @@ impl Connection {
                     positional_params,
                     named_params,
                     raw_params,
+                    staging_allowed_local_paths,
                 )?
                 // session lock released here
             };
@@ -553,6 +570,9 @@ impl Connection {
         // kernel `StatementSpec` owns the merge + serialisation.
         let statement_conf = options.as_mut().and_then(|o| o.statement_conf.take());
         let query_tags = options.as_mut().and_then(|o| o.query_tags.take());
+        let staging_allowed_local_paths = options
+            .as_mut()
+            .and_then(|o| o.staging_allowed_local_paths.take());
         guarded(async move {
             // Build the kernel `Statement` while holding the session lock,
             // then RELEASE the lock before `submit().await` — same shape as
@@ -576,6 +596,7 @@ impl Connection {
                     positional_params,
                     named_params,
                     raw_params,
+                    staging_allowed_local_paths,
                 )?
                 // session lock released here
             };
@@ -759,6 +780,7 @@ mod tests {
             vec![],
             vec![],
             vec![raw()],
+            None,
         )
         .expect("raw statement builds");
         let dispatched_err = raw_stmt
@@ -792,6 +814,7 @@ mod tests {
             vec![TypedValue::Int32(1)],
             vec![],
             vec![raw()],
+            None,
         )
         .expect("mixed statement builds before dispatch validation");
         let mixed_err = mixed_stmt

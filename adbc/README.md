@@ -128,6 +128,13 @@ It preserves `%` wildcards and existing `\_` escapes and does not alter schema,
 table, or column patterns. Set it to `false` for raw ADBC catalog-pattern
 semantics.
 
+`adbc.databricks.statement.staging_allowed_local_paths` accepts a JSON array
+of local paths, for example `["/tmp/transfers"]`, and enables SQL PUT, GET,
+and REMOVE file transfers. An empty array permits REMOVE and denies local
+file access. Successful transfers return no instruction rows. Without the
+option, results remain available to callers that handle transfers themselves.
+Set the option to JSON `null` to restore that mode on a reused statement.
+
 Statement options include positional or named parameter style, query tags,
 the portable `adbc.apache.statement.query_timeout_s` client deadline (with `0`
 meaning unlimited), a millisecond Databricks client-timeout alias, server
