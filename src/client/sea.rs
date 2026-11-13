@@ -2895,9 +2895,15 @@ mod tests {
             spawn_close_reply_server(Some(std::time::Duration::from_millis(20))).await;
 
         let transport = create_test_client_against(&format!("http://{addr}"));
+        // hyper returns an idle HTTP/1 connection to the pool from a spawned
+        // task; pause between calls so the next one can't race ahead of it.
+        let pause = || tokio::time::sleep(std::time::Duration::from_millis(10));
         transport.close_statement("statement-1").await.unwrap();
+        pause().await;
         transport.close_statement("statement-2").await.unwrap();
+        pause().await;
         transport.cancel_statement("statement-3").await.unwrap();
+        pause().await;
         transport.close_statement("statement-3").await.unwrap();
 
         assert_eq!(accepted.load(Ordering::SeqCst), 1);
