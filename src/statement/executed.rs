@@ -151,6 +151,11 @@ impl ExecutedStatement {
         Ok(None)
     }
 
+    /// See [`ResultStream::rewrites_batches`].
+    pub fn rewrites_batches(&self) -> bool {
+        self.result_stream.rewrites_batches()
+    }
+
     /// Non-blocking counterpart to [`Self::next_batch`]. It preserves the same
     /// drain-driven auto-close behavior when end-of-stream is observed.
     pub fn try_next_batch(&mut self) -> Result<crate::result_stream::TryNextBatch<'_>> {

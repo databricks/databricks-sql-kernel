@@ -92,6 +92,8 @@ pub(crate) struct ResultPostProcessor {
     inner: Box<dyn ResultReader + Send>,
     schema: SchemaRef,
     transform: Option<BatchTransform>,
+    /// `transform` rewrites column values (per-row work), not just the schema.
+    rewrites: bool,
 }
 
 type BatchTransform = Box<dyn Fn(&RecordBatch) -> Result<RecordBatch> + Send + Sync>;
@@ -278,6 +280,7 @@ impl ResultPostProcessor {
             inner,
             schema: output_schema,
             transform,
+            rewrites: has_rewrites,
         })
     }
 }
@@ -298,6 +301,10 @@ impl ResultReader for ResultPostProcessor {
     fn try_next_batch(&mut self) -> Result<TryNextBatch> {
         let next = self.inner.try_next_batch()?;
         next.map_ready(|batch| self.process_batch(batch))
+    }
+
+    fn rewrites_batches(&self) -> bool {
+        self.rewrites
     }
 
     fn metrics(&self) -> Option<ResultReaderMetrics> {
@@ -547,6 +554,7 @@ mod tests {
             .unwrap();
         // No transform should have been installed.
         assert!(pp.transform.is_none());
+        assert!(!pp.rewrites_batches());
         let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(out.num_rows(), 1);
         assert_eq!(out.schema().field(0).metadata().len(), 0);
@@ -568,6 +576,8 @@ mod tests {
                 .await
                 .unwrap();
         assert!(pp.transform.is_some());
+        // Re-projecting onto the augmented schema reuses the arrays.
+        assert!(!pp.rewrites_batches());
 
         let out = pp.next_batch().await.unwrap().unwrap();
         assert_eq!(
@@ -667,6 +677,7 @@ mod tests {
         let mut pp = ResultPostProcessor::new(inner, None, PostProcessOptions::default())
             .await
             .unwrap();
+        assert!(pp.rewrites_batches());
 
         // Both the advertised schema and the yielded batch report Utf8 for
         // the untyped-NULL column, identical to the CAST(NULL AS STRING)

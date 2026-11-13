@@ -350,10 +350,12 @@ impl ExecutedStatement {
         }
         let runtime = inner.runtime.clone();
         // Inline results and already-downloaded CloudFetch chunks are in
-        // memory: take them without a GIL hand-off. Both paths drive the
-        // ExecutedStatement, so auto-close-on-drain still fires the server
-        // CloseStatement once the stream is exhausted.
-        let ready = {
+        // memory: take them without a GIL hand-off, unless reading one still
+        // rewrites column values. Both paths drive the ExecutedStatement, so
+        // auto-close-on-drain still fires CloseStatement once exhausted.
+        let ready = if inner.exec.rewrites_batches() {
+            None
+        } else {
             let _context = runtime.enter();
             match inner.exec.try_next_batch().map_err(|e| to_py_err(py, e))? {
                 TryNextBatch::Ready(ResultBatch::Arrow(rb)) => Some(Some(rb.clone())),

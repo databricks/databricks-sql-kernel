@@ -13,6 +13,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - A native Rust ADBC 1.1 driver in `adbc/`, with an optional standard ADBC C
   ABI for driver-manager loading from other languages.
+- `ExecutedStatement::rewrites_batches()` and `ResultStream::rewrites_batches()`
+  report whether reading a ready batch still rewrites column values on the
+  calling thread, so bindings can tell when `try_next_batch` is not cheap.
 
 ### Changed
 

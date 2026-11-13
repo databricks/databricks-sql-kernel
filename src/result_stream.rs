@@ -748,6 +748,15 @@ impl ResultStream {
         }
     }
 
+    /// Whether a ready [`try_next_batch`](Self::try_next_batch) still rewrites
+    /// column values on the calling thread (e.g. geospatial, interval or JSON
+    /// stringification), so it costs per-row CPU rather than a buffer hand-off.
+    pub fn rewrites_batches(&self) -> bool {
+        self.reader
+            .as_ref()
+            .is_some_and(|reader| reader.rewrites_batches())
+    }
+
     /// Return the next batch if it is already available without waiting for
     /// network or background-prefetch progress.
     pub fn try_next_batch(&mut self) -> Result<TryNextBatch<'_>> {

@@ -716,6 +716,12 @@ pub trait ResultReader: Send + Sync {
         Err(Error::invalid_state().message("reader does not support non-blocking batch reads"))
     }
 
+    /// Whether producing a batch rewrites column values on the reading
+    /// thread (per-row work), so a ready `try_next_batch` is not cheap.
+    fn rewrites_batches(&self) -> bool {
+        false
+    }
+
     /// Optional reader-level metrics accumulated below `ResultStream`.
     ///
     /// CloudFetch overrides this to surface chunk download metrics into
