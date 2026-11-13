@@ -16,7 +16,7 @@ use super::exporter::{export_batch, TelemetryExportError, TelemetryExporter};
 use super::models::TelemetryFrontendLog;
 use crate::config::TelemetryConfig;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::runtime::{Handle, Runtime};
@@ -34,8 +34,8 @@ const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_secs(1);
 const INITIAL_THROTTLE_BACKOFF: Duration = Duration::from_millis(200);
 const MAX_THROTTLE_BACKOFF: Duration = Duration::from_secs(30);
 /// Most events queued (at least one batch); past this the oldest are dropped.
-/// Only reached while throttled. Sized for several seconds of backoff at ~1k
-/// events/s (~14 MB).
+/// Mainly reached while throttled (or behind a stuck export). Sized for
+/// several seconds of backoff at ~1k events/s (~14 MB).
 #[cfg(not(test))]
 const MAX_PENDING_EVENTS: usize = 10_000;
 #[cfg(test)]
@@ -56,6 +56,9 @@ pub(super) struct TelemetryClient {
     queue_count: AtomicUsize,
     /// Events dropped because the queue was full, not yet logged.
     dropped: AtomicUsize,
+    /// A background flush is running; it re-checks the queue before exiting,
+    /// so `enqueue` need not spawn another.
+    background_flushing: AtomicBool,
     flush_lock: tokio::sync::Mutex<()>,
     throttle: Mutex<Throttle>,
     state: AtomicU8,
@@ -67,6 +70,15 @@ pub(super) struct TelemetryClient {
 struct Throttle {
     until: Option<Instant>,
     backoff: Duration,
+}
+
+/// Clears the flag when dropped, including if the flush is cancelled.
+struct ClearOnDrop<'a>(&'a AtomicBool);
+
+impl Drop for ClearOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
 }
 
 impl TelemetryClient {
@@ -93,6 +105,7 @@ impl TelemetryClient {
             pending: Mutex::new(VecDeque::new()),
             queue_count: AtomicUsize::new(0),
             dropped: AtomicUsize::new(0),
+            background_flushing: AtomicBool::new(false),
             flush_lock: tokio::sync::Mutex::new(()),
             throttle: Mutex::new(Throttle::default()),
             state: AtomicU8::new(STATE_ACTIVE),
@@ -120,7 +133,10 @@ impl TelemetryClient {
             pending.len()
         };
 
-        if count >= self.batch_size && !self.throttled() {
+        if count >= self.batch_size
+            && !self.background_flushing.load(Ordering::Acquire)
+            && !self.throttled()
+        {
             let client = Arc::clone(self);
             self.runtime_handle.spawn(async move {
                 client.flush_once_if_idle().await;
@@ -191,6 +207,8 @@ impl TelemetryClient {
         let Ok(_guard) = self.flush_lock.try_lock() else {
             return;
         };
+        self.background_flushing.store(true, Ordering::Release);
+        let _flushing = ClearOnDrop(&self.background_flushing);
         // Keep going while a backlog left by throttling still fills a batch.
         loop {
             let delivered = self.export_once(true).await;
@@ -200,10 +218,11 @@ impl TelemetryClient {
         }
     }
 
-    /// Session-release and close flush. Sends everything queued without
-    /// waiting out a backoff. While the client stays in use and is throttled,
-    /// the queue is left for the background flush after the backoff; once it
-    /// is closing, one attempt is made and a throttled batch is dropped.
+    /// Session-release and close flush. Sends everything queued, in bounded
+    /// posts, without waiting out a backoff. While the client stays in use and
+    /// is throttled, the queue is left for the background flush after the
+    /// backoff. Once it is closing, it stops at the first failed post and a
+    /// throttled batch is dropped.
     async fn flush_once_wait(self: &Arc<Self>) {
         let _guard = self.flush_lock.lock().await;
         let active = self.state.load(Ordering::Acquire) == STATE_ACTIVE;
@@ -708,6 +727,27 @@ mod tests {
 
         assert!(client.pending.lock().unwrap().is_empty());
         assert_eq!(client.queue_count.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn background_flush_flag_covers_the_running_flush() {
+        let config = TelemetryConfig {
+            enabled: Some(true),
+            batch_size: 1,
+            flush_interval: Duration::from_secs(60),
+            ..TelemetryConfig::default()
+        };
+        let exporter = Arc::new(SlowThrottlingExporter::new(Duration::from_millis(100)));
+        let client = TelemetryClient::new(&config, exporter.clone())
+            .expect("telemetry runtime should start");
+
+        client.enqueue(sample_log("one"));
+        wait_until(|| exporter.calls.load(Ordering::Acquire) == 1).await;
+        // Enqueues while the flush runs don't start more background flushes.
+        assert!(client.background_flushing.load(Ordering::Acquire));
+        wait_until(|| !client.background_flushing.load(Ordering::Acquire)).await;
+        assert_eq!(exporter.calls.load(Ordering::Acquire), 1);
+        client.close().await;
     }
 
     #[tokio::test]
