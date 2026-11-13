@@ -188,7 +188,10 @@ impl VolumeState {
         let local_path = if instruction.operation == "REMOVE" {
             None
         } else if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
-            request = request.body(input_bytes.ok_or_else(|| invalid("Missing input stream"))?);
+            let bytes = input_bytes.ok_or_else(|| invalid("Missing input stream"))?;
+            request = request
+                .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                .body(bytes);
             None
         } else {
             let path = allowed_path(&instruction.local_file, &options.allowed_paths)?;
@@ -516,6 +519,7 @@ mod tests {
         Mock::given(method("PUT"))
             .and(path("/object"))
             .and(body_bytes(Vec::<u8>::new()))
+            .and(header("content-length", "0"))
             .and(header("x-storage-token", "server-token"))
             .respond_with(ResponseTemplate::new(200))
             .expect(1)
