@@ -259,10 +259,19 @@ impl TokenStore {
             // Another caller may have refreshed between this caller's read and
             // the CAS. The store serves every session with these credentials,
             // so a second token request here would be one for all of them.
+            // Each claim of the flag leaves its own outcome in `last_error`, so
+            // waiters never read an earlier refresh's error.
             let current = self.token.read().ok().and_then(|t| t.clone());
             if let Some(t) = current.as_ref().filter(|t| !t.is_expired()) {
+                *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 return Ok(t.clone());
             }
+
+            // Recorded first: if refresh_fn panics (its session's runtime
+            // shutting down mid-request), waiters see a refresh that got no
+            // answer and refresh themselves.
+            *self.last_error.lock().unwrap_or_else(|e| e.into_inner()) =
+                Some(Error::cancelled().message("token refresh did not finish"));
 
             // We won the race: perform the refresh
             let result = refresh_fn();
@@ -778,6 +787,41 @@ mod tests {
             .expect("token");
         assert_eq!(token.access_token, "token-3600");
         assert!(!store.refreshing.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_store_reusing_a_stored_token_clears_an_earlier_error() {
+        let store = TokenStore::new();
+        *store.token.write().unwrap() = Some(create_token_with_ttl(3600));
+        *store.last_error.lock().unwrap() = Some(http_429());
+        store
+            .blocking_refresh(|| unreachable!("the store already holds a fresh token"))
+            .expect("token");
+        assert!(store.last_error.lock().unwrap().is_none());
+    }
+
+    #[test]
+    fn test_store_waiter_refreshes_itself_when_the_refresher_panics() {
+        // A refresh_fn panics when its session's runtime shuts down
+        // mid-request; the waiter must not get the expired token as Ok.
+        let store = Arc::new(TokenStore::new());
+        let expired = create_token_with_expiry(Utc::now() - Duration::seconds(5), 1200);
+        *store.token.write().unwrap() = Some(expired);
+        let (s, s2) = (store.clone(), store.clone());
+        let refresher = std::thread::spawn(move || {
+            s.get_or_refresh(move || -> Result<OAuthToken> {
+                wait_for_waiters(&s2, 1);
+                panic!("runtime is being shutdown")
+            })
+        });
+        while !store.refreshing.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        let token = store
+            .get_or_refresh(|| Ok(create_token_with_ttl(7200)))
+            .expect("own refresh");
+        assert_eq!(token.access_token, "token-7200");
+        assert!(refresher.join().is_err(), "the refresher panicked");
     }
 
     #[tokio::test(flavor = "multi_thread")]
