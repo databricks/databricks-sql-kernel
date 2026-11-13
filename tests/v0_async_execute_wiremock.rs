@@ -2288,12 +2288,10 @@ async fn await_result_closed_status_skips_close_statement() {
     // `_no_close` also verifies expect(0) when it drops at end of scope.
 }
 
-/// Regression-guard for the async CLOSED-skip fix: a SUCCEEDED async
-/// result must STILL fire exactly one `CloseStatement` on close/drop —
-/// the server still owns the statement. Guards against over-correcting
-/// the CLOSED-skip into a server-statement leak.
+/// A Succeeded statement still receives exactly one CloseStatement on owner close,
+/// and close discards both a saved terminal response and a later status reply.
 #[tokio::test]
-async fn await_result_succeeded_status_still_closes_statement() {
+async fn owner_close_discards_cached_and_late_terminal_responses() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;

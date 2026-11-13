@@ -595,6 +595,11 @@ impl ExecutedAsyncStatement {
     /// GetStatementStatus RPC. Returns `Err(InvalidStatementHandle)`
     /// locally — without hitting the wire — if the parent `Statement`
     /// has already invalidated this handle.
+    ///
+    /// A successful terminal check keeps one complete response, including any
+    /// inline rows, on this handle for its next result read. Status-only callers
+    /// should close or drop owning handles when finished, and drop independent
+    /// readers or attached handles to release their saved payload.
     pub async fn status(&self) -> Result<StatementStatus> {
         let span = self.session.log_span().clone();
         let result = async {
