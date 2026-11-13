@@ -36,7 +36,7 @@ use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     Error as KernelError, ExecutedStatement, ExecutedStatementHandle, ResultBatch, ResultStream,
-    Statement as KernelStatement,
+    Statement as KernelStatement, StatementCanceller, VolumeOptions,
 };
 
 use crate::error::napi_err_from_kernel;
@@ -131,6 +131,8 @@ pub struct Statement {
     /// does not emit a statement id for SHOW/information_schema
     /// queries driven through `Metadata`).
     statement_id: String,
+    is_volume_operation: bool,
+    canceller: Option<StatementCanceller>,
     /// Set to `true` when `fetchNextBatch` observes the natural end of
     /// the stream (`None`). `cancel()` short-circuits to `Ok(())` when
     /// this is set, matching the JDBC `Statement.cancel()` no-op-after-
@@ -153,6 +155,8 @@ impl Statement {
     pub(crate) fn from_executed(parent: KernelStatement, executed: ExecutedStatement) -> Self {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
+        let is_volume_operation = executed.result_stream().is_volume_operation();
+        let canceller = Some(parent.canceller());
         Self {
             inner: Arc::new(Mutex::new(Some(AnyInner::Executed(Box::new(
                 StatementInner {
@@ -162,6 +166,8 @@ impl Statement {
             ))))),
             schema,
             statement_id,
+            is_volume_operation,
+            canceller,
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -182,6 +188,8 @@ impl Statement {
             inner: Arc::new(Mutex::new(Some(AnyInner::Metadata(stream)))),
             schema,
             statement_id: String::new(),
+            is_volume_operation: false,
+            canceller: None,
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -189,6 +197,38 @@ impl Statement {
 
 #[napi]
 impl Statement {
+    #[napi(getter)]
+    pub fn is_volume_operation(&self) -> bool {
+        self.is_volume_operation
+    }
+
+    /// Complete a server-marked file transfer while retaining its instruction rows.
+    #[napi]
+    pub async fn complete_volume_operation(
+        &self,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: Option<bool>,
+    ) -> napi::Result<String> {
+        let options = VolumeOptions {
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
+        };
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let mut guard = inner.lock().await;
+            let stream = match guard.as_mut().ok_or_else(statement_closed_err)? {
+                AnyInner::Executed(s) => s.executed.result_stream_mut(),
+                AnyInner::Metadata(stream) => stream,
+            };
+            stream
+                .complete_volume_operation(&options, None)
+                .await
+                .map(|status| status.as_str().to_owned())
+                .map_err(napi_err_from_kernel)
+        })
+        .await
+    }
+
     /// Server-issued statement id. Cached at construction; readable
     /// even after `close()` so JS-side log lines can correlate against
     /// kernel / server logs which key on the same id.
@@ -418,6 +458,9 @@ impl Statement {
     /// has been explicitly `close()`d.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
+        if let Some(canceller) = &self.canceller {
+            canceller.cancel_volume_operation();
+        }
         // Idempotent against natural completion.
         if self.finished.load(Ordering::Acquire) {
             return Ok(());
@@ -477,6 +520,9 @@ impl Statement {
     /// resource to release).
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        if let Some(canceller) = &self.canceller {
+            canceller.cancel_volume_operation();
+        }
         let inner = Arc::clone(&self.inner);
         guarded(async move {
             // Take the inner state out so `Drop` knows there's nothing
@@ -503,6 +549,9 @@ impl Statement {
 
 impl Drop for Statement {
     fn drop(&mut self) {
+        if let Some(canceller) = &self.canceller {
+            canceller.cancel_volume_operation();
+        }
         // Best-effort cleanup: schedule a drop of the kernel handle on
         // the captured tokio runtime. JS callers who need a
         // guaranteed `close_statement` round-trip must call `close()`
@@ -623,6 +672,8 @@ mod tests {
         let stmt = Statement {
             inner: Arc::new(Mutex::new(None)), // "already closed"
             schema: make_schema(),
+            is_volume_operation: false,
+            canceller: None,
             statement_id: "stmt-survives-close".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -638,6 +689,8 @@ mod tests {
         let stmt = Statement {
             inner: Arc::new(Mutex::new(None)),
             schema: schema.clone(),
+            is_volume_operation: false,
+            canceller: None,
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -657,6 +710,8 @@ mod tests {
         let stmt = Statement {
             inner: Arc::new(Mutex::new(None)),
             schema: make_schema(),
+            is_volume_operation: false,
+            canceller: None,
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -673,6 +728,8 @@ mod tests {
         let stmt = Statement {
             inner: Arc::new(Mutex::new(None)), // closed
             schema: make_schema(),
+            is_volume_operation: false,
+            canceller: None,
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(true)),
         };

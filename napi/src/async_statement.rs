@@ -60,7 +60,7 @@ use tokio::sync::Mutex;
 use arrow_schema::SchemaRef;
 use databricks_sql_kernel::{
     AsyncStatementCanceller, Error as KernelError, ExecutedAsyncStatement, ExecutedStatementHandle,
-    ResultBatch, ResultStream, Statement as KernelStatement,
+    ResultBatch, ResultStream, Statement as KernelStatement, VolumeOptions,
 };
 
 use crate::error::napi_err_from_kernel;
@@ -320,6 +320,7 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
+            let is_volume_operation = stream.is_volume_operation();
             let stream = Arc::new(Mutex::new(Some(stream)));
             // Registered while `inner` is held, so a queued `close()` sees it.
             results
@@ -330,6 +331,7 @@ impl AsyncStatement {
                 inner: stream,
                 schema,
                 statement_id,
+                is_volume_operation,
             })
         })
         .await
@@ -353,6 +355,7 @@ impl AsyncStatement {
     /// `InvalidStatementHandle`.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
+        self.canceller.cancel_volume_operation();
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_err("AsyncStatement"));
         }
@@ -379,6 +382,7 @@ impl AsyncStatement {
     /// unless a fetch was in progress when `close()` ran.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
+        self.canceller.cancel_volume_operation();
         let inner = Arc::clone(&self.inner);
         let closed = Arc::clone(&self.closed);
         let canceller = Arc::clone(&self.canceller);
@@ -420,6 +424,7 @@ impl AsyncStatement {
 
 impl Drop for AsyncStatement {
     fn drop(&mut self) {
+        self.canceller.cancel_volume_operation();
         // Best-effort cleanup — same shape as `Connection::Drop`.
         // JS callers needing a guaranteed close-with-error-surface
         // call `close()` explicitly.
@@ -459,10 +464,41 @@ pub struct AsyncResultHandle {
     inner: Arc<ResultSlot>,
     schema: SchemaRef,
     statement_id: String,
+    is_volume_operation: bool,
 }
 
 #[napi]
 impl AsyncResultHandle {
+    #[napi(getter)]
+    pub fn is_volume_operation(&self) -> bool {
+        self.is_volume_operation
+    }
+
+    /// Complete a server-marked file transfer while retaining its instruction rows.
+    #[napi]
+    pub async fn complete_volume_operation(
+        &self,
+        allowed_paths: Vec<String>,
+        remove_not_found_is_success: Option<bool>,
+    ) -> napi::Result<String> {
+        let options = VolumeOptions {
+            allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
+        };
+        let inner = Arc::clone(&self.inner);
+        guarded(async move {
+            let mut guard = inner.lock().await;
+            guard
+                .as_mut()
+                .ok_or_else(|| closed_err("AsyncResultHandle"))?
+                .complete_volume_operation(&options, None)
+                .await
+                .map(|status| status.as_str().to_owned())
+                .map_err(napi_err_from_kernel)
+        })
+        .await
+    }
+
     /// Server-issued statement id. Cached at construction; readable
     /// for log correlation. Matches the parent `AsyncStatement`'s
     /// `statementId`.

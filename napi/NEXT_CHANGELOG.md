@@ -14,6 +14,9 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Added
 
+- Explicit Volume completion and marker access on synchronous and asynchronous
+  result handles, with structured local filesystem error details.
+
 ### Changed
 
 ### Updated

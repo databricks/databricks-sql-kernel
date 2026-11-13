@@ -965,6 +965,14 @@ pub struct StatementCanceller {
 }
 
 impl StatementCanceller {
+    /// Cancel local Volume completion without waiting for a server request.
+    pub fn cancel_volume_operation(&self) {
+        self.volume
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .cancel();
+    }
+
     /// Server-side cancel of the in-flight statement via
     /// `cancel_statement(statement_id)`.
     ///

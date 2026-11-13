@@ -682,6 +682,10 @@ impl ResultStream {
         state.complete(batch, &client, options, input_bytes).await
     }
 
+    pub(crate) fn volume_state(&self) -> Option<Arc<crate::volume::VolumeState>> {
+        self.volume.as_ref().map(|(state, _)| Arc::clone(state))
+    }
+
     pub(crate) fn cancel_volume(&self) {
         if let Some((state, _)) = &self.volume {
             state.cancel();

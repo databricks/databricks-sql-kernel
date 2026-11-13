@@ -32,6 +32,7 @@ use crate::error::{adbc_error, map_kernel_error, option_not_found, unsupported};
 use crate::reader::{AsyncKernelReader, BoundRows, KernelReader, SequenceReader, SlicingReader};
 use crate::runtime::{RuntimeExt as _, RuntimeHandle};
 
+const STAGING_ALLOWED_PATHS_OPTION: &str = "adbc.databricks.statement.staging_allowed_local_paths";
 const PARAMETER_STYLE_OPTION: &str = "adbc.databricks.statement.parameter_style";
 const QUERY_TAGS_OPTION: &str = "adbc.databricks.statement.query_tags";
 const CLIENT_TIMEOUT_OPTION: &str = "adbc.databricks.statement.client_timeout_ms";
@@ -84,6 +85,7 @@ pub struct Statement {
     cancellation_notify: Arc<Notify>,
     connection_cancellation: Arc<CancellationRegistry>,
     metadata_options: MetadataCommandOptions,
+    volume_options: Option<kernel::VolumeOptions>,
 }
 
 #[derive(Debug, Default)]
@@ -161,11 +163,16 @@ impl SubmittedStatement<'_> {
             .executed
             .take()
             .ok_or_else(|| adbc_error("submitted statement was consumed", Status::InvalidState))?;
-        let stream = self
+        let mut stream = self
             .statement
             .runtime
             .block_on_safe(executed.await_result())
             .map_err(map_kernel_error)?;
+        complete_volume(
+            &self.statement.runtime,
+            &mut stream,
+            self.statement.volume_options.as_ref(),
+        )?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(AsyncKernelReader::new(
             Arc::clone(&self.statement.runtime),
             executed,
@@ -188,11 +195,16 @@ impl SubmittedStatement<'_> {
             .executed
             .take()
             .ok_or_else(|| adbc_error("submitted statement was consumed", Status::InvalidState))?;
-        let stream = self
+        let mut stream = self
             .statement
             .runtime
             .block_on_safe(executed.fetch_result())
             .map_err(map_kernel_error)?;
+        complete_volume(
+            &self.statement.runtime,
+            &mut stream,
+            self.statement.volume_options.as_ref(),
+        )?;
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(AsyncKernelReader::new(
             Arc::clone(&self.statement.runtime),
             executed,
@@ -234,6 +246,7 @@ pub struct StatementCancellationHandle {
 
 impl StatementCancellationHandle {
     pub fn cancel(&self) -> Result<()> {
+        self.canceller.cancel_volume_operation();
         if self.current_cancellation.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -335,6 +348,7 @@ impl Statement {
             canceller,
             runtime,
             binding: None,
+            volume_options: None,
             parameter_style: ParameterStyle::default(),
             prepared: false,
             client_timeout: None,
@@ -392,10 +406,17 @@ impl Statement {
             )),
         };
         self.blocking_execute.store(false, Ordering::Release);
-        match result {
-            Some(result) => result.map_err(map_kernel_error),
-            None => Err(adbc_error("operation was cancelled", Status::Cancelled)),
-        }
+        drop(inner);
+        let mut executed = match result {
+            Some(result) => result.map_err(map_kernel_error)?,
+            None => return Err(adbc_error("operation was cancelled", Status::Cancelled)),
+        };
+        complete_volume(
+            &self.runtime,
+            executed.result_stream_mut(),
+            self.volume_options.as_ref(),
+        )?;
+        Ok(executed)
     }
 
     fn execute_async_inner(
@@ -444,7 +465,9 @@ impl Statement {
             None => Err(adbc_error("operation was cancelled", Status::Cancelled)),
         };
         self.blocking_execute.store(false, Ordering::Release);
-        result
+        let (executed, mut stream) = result?;
+        complete_volume(&self.runtime, &mut stream, self.volume_options.as_ref())?;
+        Ok((executed, stream))
     }
 
     fn invalidate_results(&self) {
@@ -470,6 +493,20 @@ impl Statement {
             return Ok(());
         }
         match key {
+            STAGING_ALLOWED_PATHS_OPTION => {
+                let text = expect_string(value, key)?;
+                let roots: Vec<String> = serde_json::from_str(&text).map_err(|_| {
+                    adbc_error(
+                        format!("{key} expects a JSON array of strings"),
+                        Status::InvalidArguments,
+                    )
+                })?;
+                self.volume_options = Some(kernel::VolumeOptions {
+                    allowed_paths: roots.into_iter().map(Into::into).collect(),
+                    remove_not_found_is_success: false,
+                });
+                Ok(())
+            }
             ENABLE_DIRECT_RESULTS_OPTION => {
                 self.enable_direct_results = expect_bool_string(value, key)?;
                 Ok(())
@@ -584,6 +621,14 @@ impl Statement {
 
     fn get_other_string(&self, key: &str) -> Result<String> {
         match key {
+            STAGING_ALLOWED_PATHS_OPTION => self
+                .volume_options
+                .as_ref()
+                .map(|options| {
+                    serde_json::to_string(&options.allowed_paths)
+                        .expect("paths serialize as strings")
+                })
+                .ok_or_else(|| option_not_found("statement string", key)),
             ENABLE_DIRECT_RESULTS_OPTION => Ok(self.enable_direct_results.to_string()),
             IS_METADATA_COMMAND_OPTION => Ok(self.metadata_options.enabled.to_string()),
             METADATA_CATALOG_OPTION => metadata_string_option(
@@ -825,6 +870,7 @@ impl adbc_core::Statement for Statement {
             &row,
             self.parameter_style,
             self.client_timeout,
+            self.volume_options.as_ref(),
         )?;
         let expected_generation = self.generation.load(Ordering::Acquire);
         let reader: Box<dyn RecordBatchReader + Send> = Box::new(SequenceReader::new(
@@ -835,6 +881,7 @@ impl adbc_core::Statement for Statement {
             base_spec,
             self.parameter_style,
             self.client_timeout,
+            self.volume_options.clone(),
             rows,
             executed,
             connection_operation,
@@ -888,6 +935,7 @@ impl adbc_core::Statement for Statement {
                 &row,
                 self.parameter_style,
                 self.client_timeout,
+                self.volume_options.as_ref(),
             ) {
                 Ok(executed) => executed,
                 Err(mut error) => {
@@ -1123,6 +1171,7 @@ pub(crate) fn execute_bound_row(
     row: &RecordBatch,
     style: ParameterStyle,
     client_timeout: Option<Duration>,
+    volume_options: Option<&kernel::VolumeOptions>,
 ) -> Result<kernel::ExecutedStatement> {
     let parameters = convert_binding(row, style)?;
     let mut inner = inner
@@ -1164,11 +1213,33 @@ pub(crate) fn execute_bound_row(
             .spec()
             .param_raw(parameter.name, parameter.param_type, parameter.value);
     }
-    match client_timeout {
+    let mut executed = match client_timeout {
         Some(timeout) => runtime.block_on_safe(inner.execute_with_timeout(timeout)),
         None => runtime.block_on_safe(inner.execute()),
     }
-    .map_err(map_kernel_error)
+    .map_err(map_kernel_error)?;
+    drop(inner);
+    complete_volume(runtime, executed.result_stream_mut(), volume_options)?;
+    Ok(executed)
+}
+
+fn complete_volume(
+    runtime: &RuntimeHandle,
+    stream: &mut kernel::ResultStream,
+    options: Option<&kernel::VolumeOptions>,
+) -> Result<()> {
+    let Some(options) = options else {
+        return Ok(());
+    };
+    match runtime
+        .block_on_safe(stream.complete_volume_operation(options, None))
+        .map_err(map_kernel_error)?
+    {
+        kernel::VolumeCompletion::NeedsInputStream => {
+            Err(unsupported("Volume PUT with input streams"))
+        }
+        kernel::VolumeCompletion::Completed | kernel::VolumeCompletion::NotVolume => Ok(()),
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

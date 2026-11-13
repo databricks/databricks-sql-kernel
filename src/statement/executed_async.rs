@@ -1226,6 +1226,15 @@ pub struct AsyncStatementCanceller {
 }
 
 impl AsyncStatementCanceller {
+    /// Cancel local Volume completion without waiting for a server request.
+    pub fn cancel_volume_operation(&self) {
+        if self.owning {
+            if let Some(volume) = &self.volume {
+                volume.cancel();
+            }
+        }
+    }
+
     /// Server-side cancel via `cancel_statement(statement_id)`.
     ///
     /// Short-circuits to `InvalidStatementHandle` (no wire round-trip)

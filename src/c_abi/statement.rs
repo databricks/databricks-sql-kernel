@@ -1239,6 +1239,31 @@ unsafe fn with_statement(
     })
 }
 
+/// Read the server-authorized Volume marker before taking a result stream.
+/// # Safety
+/// `exec` must be live and `out` must be writable; no fetch may be in flight.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_executed_statement_is_volume_operation(
+    exec: *const kernel_executed_statement_t,
+    out: *mut bool,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        let Some(handle) = (exec as *const ExecutedHandle).as_ref() else {
+            return store_invalid_arg("Volume marker: null executed statement");
+        };
+        if out.is_null() {
+            return store_invalid_arg("Volume marker: null out pointer");
+        }
+        if !handle.exec.is_valid() {
+            return store_and_code(
+                Error::invalid_statement_handle().message("executed statement is invalid"),
+            );
+        }
+        std::ptr::write(out, handle.exec.result_stream().is_volume_operation());
+        KernelStatusCode::Success
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

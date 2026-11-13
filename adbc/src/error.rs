@@ -60,6 +60,20 @@ pub(crate) fn map_kernel_error(source: kernel::Error) -> Error {
     mapped.details = source
         .error_code
         .map(|code| vec![("databricks.error_code".to_string(), code.into_bytes())]);
+    if let Some(local) = source.local_error {
+        let details = mapped.details.get_or_insert_default();
+        details.push((
+            "databricks.local_error_kind".into(),
+            local.kind.into_bytes(),
+        ));
+        details.push(("databricks.local_path".into(), local.path.into_bytes()));
+        if let Some(errno) = local.raw_os_error {
+            details.push((
+                "databricks.local_os_error".into(),
+                errno.to_string().into_bytes(),
+            ));
+        }
+    }
     mapped
 }
 

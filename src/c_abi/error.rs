@@ -55,6 +55,9 @@ pub struct KernelError {
 /// "no error recorded since the last clear".
 #[derive(Default)]
 struct LastError {
+    local_os_error: i32,
+    local_kind: Option<CString>,
+    local_path: Option<CString>,
     code: Option<crate::kernel_error::ErrorCode>,
     message: Option<CString>,
     sql_state: Option<CString>,
@@ -130,6 +133,34 @@ pub unsafe extern "C" fn kernel_get_last_error(out: *mut KernelError) -> bool {
     })
 }
 
+/// Original local OS error number, or zero when unavailable. Does not clear the error.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_local_os_error() -> i32 {
+    LAST_ERROR.with(|last| last.borrow().local_os_error)
+}
+
+/// Borrowed local error kind, or null. Valid until the next error-clearing call.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_local_kind() -> *const c_char {
+    LAST_ERROR.with(|last| {
+        last.borrow()
+            .local_kind
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
+/// Borrowed requested local path, or null. Valid until the next error-clearing call.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_local_path() -> *const c_char {
+    LAST_ERROR.with(|last| {
+        last.borrow()
+            .local_path
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
 /// Crate-internal: write a typed kernel [`Error`] into the thread-local
 /// last-error buffer. Every FFI function that returns a non-`Success`
 /// status code calls this (via [`crate::c_abi::block_on_ffi`] or directly)
@@ -151,6 +182,13 @@ pub(crate) fn store_error(err: Error) {
             message.push_str(ec);
         }
         *last = LastError {
+            local_os_error: err
+                .local_error
+                .as_ref()
+                .and_then(|e| e.raw_os_error)
+                .unwrap_or(0),
+            local_kind: err.local_error.as_ref().map(|e| to_cstring_lossy(&e.kind)),
+            local_path: err.local_error.as_ref().map(|e| to_cstring_lossy(&e.path)),
             code: Some(err.code),
             message: Some(to_cstring_lossy(&message)),
             sql_state: err.sql_state.as_deref().map(to_cstring_lossy),
@@ -191,6 +229,35 @@ pub(crate) fn store_invalid_arg(msg: &str) -> KernelStatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn local_error_getters_preserve_error_until_clear() {
+        let mut error = Error::not_found().message("missing local file");
+        error.local_error = Some(Box::new(crate::kernel_error::LocalFileError {
+            raw_os_error: Some(2),
+            kind: "NotFound".into(),
+            path: "local-file".into(),
+        }));
+        store_error(error);
+        assert_eq!(kernel_get_last_error_local_os_error(), 2);
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_kind()) }
+                .to_str()
+                .unwrap(),
+            "NotFound"
+        );
+        assert_eq!(
+            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_path()) }
+                .to_str()
+                .unwrap(),
+            "local-file"
+        );
+        with_last_error(|error| assert!(error.is_some()));
+        clear_error();
+        assert_eq!(kernel_get_last_error_local_os_error(), 0);
+        assert!(kernel_get_last_error_local_kind().is_null());
+        assert!(kernel_get_last_error_local_path().is_null());
+    }
 
     /// Helper: read the thread-local error into a `KernelError` and run
     /// `f` with the borrowed C strings still alive.

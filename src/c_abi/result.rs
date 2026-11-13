@@ -86,6 +86,7 @@ pub struct kernel_result_stream_canceller_t {
 /// download — close the stream (and, for a sync-executed statement, the executed
 /// handle) to release those on their own completion.
 struct ResultStreamInner {
+    volume: Option<std::sync::Arc<crate::volume::VolumeState>>,
     /// Fired by a cloned [`ResultStreamCanceller`] to interrupt an in-flight
     /// `next_batch`. Once fired the stream is permanently aborted: `next_batch`
     /// returns `Cancelled` on every subsequent call rather than re-driving a
@@ -127,6 +128,7 @@ enum ResultStreamShape {
 /// reference to the stream's `&mut` state, so it is safe to `cancel()` from any
 /// thread concurrently with `next_batch`/`close` on the owning thread.
 struct ResultStreamCanceller {
+    volume: Option<std::sync::Arc<crate::volume::VolumeState>>,
     cancel: CancellationToken,
 }
 
@@ -139,6 +141,7 @@ pub(crate) fn into_raw_result_stream(
     stream: crate::result_stream::ResultStream,
 ) -> *mut kernel_result_stream_t {
     Box::into_raw(Box::new(ResultStreamInner {
+        volume: stream.volume_state(),
         cancel: CancellationToken::new(),
         shape: ResultStreamShape::Owned { schema, stream },
     })) as *mut kernel_result_stream_t
@@ -156,6 +159,7 @@ pub(crate) unsafe fn into_raw_executed_stream(
     valid: ValidityFlag,
 ) -> *mut kernel_result_stream_t {
     Box::into_raw(Box::new(ResultStreamInner {
+        volume: (*exec).result_stream().volume_state(),
         cancel: CancellationToken::new(),
         shape: ResultStreamShape::Executed { exec, valid },
     })) as *mut kernel_result_stream_t
@@ -531,7 +535,11 @@ pub unsafe extern "C" fn kernel_result_stream_close(
     if stream.is_null() {
         return store_invalid_arg("kernel_result_stream_close: stream must not be null");
     }
-    drop(Box::from_raw(stream as *mut ResultStreamInner));
+    let inner = Box::from_raw(stream as *mut ResultStreamInner);
+    if let Some(volume) = &inner.volume {
+        volume.cancel();
+    }
+    drop(inner);
     KernelStatusCode::Success
 }
 
@@ -584,6 +592,7 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_new(
         // is a `Sync` atomic). SAFETY: `stream` is a live box (non-null checked).
         let p = stream as *mut ResultStreamInner;
         let handle = ResultStreamCanceller {
+            volume: (*std::ptr::addr_of!((*p).volume)).clone(),
             cancel: (*std::ptr::addr_of!((*p).cancel)).clone(),
         };
         std::ptr::write(
@@ -618,6 +627,9 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_cancel(
                 "kernel_result_stream_canceller_cancel: handle must not be null",
             );
         };
+        if let Some(volume) = &handle.volume {
+            volume.cancel();
+        }
         handle.cancel.cancel();
         KernelStatusCode::Success
     })
@@ -643,6 +655,89 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_free(
         }
         drop(Box::from_raw(canceller as *mut ResultStreamCanceller));
         KernelStatusCode::Success
+    })
+}
+
+/// Read whether this stream has authority to complete a Volume instruction.
+/// # Safety
+/// `stream` must be live and `out` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_result_stream_is_volume_operation(
+    stream: *const kernel_result_stream_t,
+    out: *mut bool,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if stream.is_null() || out.is_null() {
+            return store_invalid_arg("Volume marker: null pointer");
+        }
+        let p = stream as *const ResultStreamInner;
+        std::ptr::write(out, (*std::ptr::addr_of!((*p).volume)).is_some());
+        KernelStatusCode::Success
+    })
+}
+
+/// Complete a marked instruction while preserving its result rows.
+/// `allowed_paths_json` is a JSON array of strings. Status is 0 (ordinary result),
+/// 1 (owned input bytes required) or 2 (completed). This API supplies no input bytes.
+/// # Safety
+/// `stream` must be live with exclusive fetch access, `allowed_paths_json` must
+/// be NUL-terminated UTF-8, and `out_status` must be writable.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_result_stream_complete_volume_operation(
+    stream: *mut kernel_result_stream_t,
+    allowed_paths_json: *const std::ffi::c_char,
+    remove_not_found_is_success: bool,
+    out_status: *mut i32,
+) -> KernelStatusCode {
+    catch_ffi(|| {
+        if stream.is_null() || allowed_paths_json.is_null() || out_status.is_null() {
+            return store_invalid_arg("Volume completion: null pointer");
+        }
+        let roots = match std::ffi::CStr::from_ptr(allowed_paths_json)
+            .to_str()
+            .ok()
+            .and_then(|text| serde_json::from_str::<Vec<String>>(text).ok())
+        {
+            Some(roots) => roots,
+            None => {
+                return store_invalid_arg("Volume allowed paths must be a JSON array of strings")
+            }
+        };
+        let options = crate::VolumeOptions {
+            allowed_paths: roots.into_iter().map(Into::into).collect(),
+            remove_not_found_is_success,
+        };
+        let p = stream as *mut ResultStreamInner;
+        let shape = &mut *std::ptr::addr_of_mut!((*p).shape);
+        let result = match shape {
+            ResultStreamShape::Owned { stream, .. } => {
+                block_on_ffi(|| stream.complete_volume_operation(&options, None))
+            }
+            ResultStreamShape::Executed { exec, valid } => {
+                let exec = match executed_ref(*exec, valid) {
+                    Ok(exec) => exec,
+                    Err(code) => return code,
+                };
+                block_on_ffi(|| {
+                    exec.result_stream_mut()
+                        .complete_volume_operation(&options, None)
+                })
+            }
+        };
+        match result {
+            Ok(status) => {
+                std::ptr::write(
+                    out_status,
+                    match status {
+                        crate::VolumeCompletion::NotVolume => 0,
+                        crate::VolumeCompletion::NeedsInputStream => 1,
+                        crate::VolumeCompletion::Completed => 2,
+                    },
+                );
+                KernelStatusCode::Success
+            }
+            Err(code) => code,
+        }
     })
 }
 
@@ -676,6 +771,97 @@ mod tests {
                 .unwrap()
         });
         into_raw_result_stream(schema, stream)
+    }
+
+    #[test]
+    fn volume_completion_keeps_raw_rows_and_observes_detached_cancel() {
+        use crate::reader::test_utils::MockReader;
+        use crate::result_stream::ResultStream;
+        use arrow_array::StringArray;
+        use std::ffi::CString;
+
+        let schema = Arc::new(Schema::new(
+            ["operation", "presignedUrl", "headers", "localFile"]
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .to_vec(),
+        ));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            ["REMOVE", "http://unused.invalid/object", "{}", ""]
+                .into_iter()
+                .map(|value| Arc::new(StringArray::from(vec![value])) as _)
+                .collect(),
+        )
+        .unwrap();
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        for marked in [false, true] {
+            let stream = rt.block_on(async {
+                let mut stream =
+                    ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
+                        .await
+                        .unwrap();
+                stream.attach_volume(
+                    marked,
+                    crate::volume::VolumeState::new(),
+                    reqwest::Client::new(),
+                );
+                into_raw_result_stream(schema.clone(), stream)
+            });
+            let mut is_volume = !marked;
+            assert_eq!(
+                unsafe { kernel_result_stream_is_volume_operation(stream, &mut is_volume) },
+                KernelStatusCode::Success
+            );
+            assert_eq!(is_volume, marked);
+            let roots = CString::new("[]").unwrap();
+            let mut status = -1;
+            if marked {
+                let mut canceller = std::ptr::null_mut();
+                assert_eq!(
+                    unsafe { kernel_result_stream_canceller_new(stream, &mut canceller) },
+                    KernelStatusCode::Success
+                );
+                assert_eq!(
+                    unsafe { kernel_result_stream_canceller_cancel(canceller) },
+                    KernelStatusCode::Success
+                );
+                for _ in 0..2 {
+                    assert_eq!(
+                        unsafe {
+                            kernel_result_stream_complete_volume_operation(
+                                stream,
+                                roots.as_ptr(),
+                                false,
+                                &mut status,
+                            )
+                        },
+                        KernelStatusCode::Cancelled
+                    );
+                }
+                unsafe { kernel_result_stream_canceller_free(canceller) };
+            } else {
+                assert_eq!(
+                    unsafe {
+                        kernel_result_stream_complete_volume_operation(
+                            stream,
+                            roots.as_ptr(),
+                            false,
+                            &mut status,
+                        )
+                    },
+                    KernelStatusCode::Success
+                );
+                assert_eq!(status, 0);
+                let mut array = FFI_ArrowArray::empty();
+                let mut schema = FFI_ArrowSchema::empty();
+                assert_eq!(
+                    unsafe { kernel_result_stream_next_batch(stream, &mut array, &mut schema) },
+                    KernelStatusCode::Success
+                );
+                assert!(!array.is_released());
+            }
+            unsafe { kernel_result_stream_close(stream) };
+        }
     }
 
     /// End-of-stream on an Owned stream returns `Success` with a
