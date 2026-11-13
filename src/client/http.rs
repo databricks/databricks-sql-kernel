@@ -750,47 +750,73 @@ impl DatabricksHttpClient {
         fn flag(h: &mut Sha256, v: Option<bool>) {
             h.update([v.map_or(2, u8::from)]);
         }
-        let c = &self.config;
+        // Exhaustive destructuring: a new field fails to compile here until
+        // someone decides whether it belongs in the fingerprint.
+        let HttpClientConfig {
+            // Neither changes what an auth request gets back: compression
+            // only applies to authenticated SEA requests, and the pool size
+            // only limits idle connections.
+            sea_response_compression_enabled: _,
+            max_connections_per_host: _,
+            connect_timeout,
+            read_timeout,
+            user_agent,
+            proxy,
+            tls,
+            org_id,
+            custom_headers,
+        } = &self.config;
+        let TlsConfig {
+            enabled,
+            allow_self_signed,
+            allow_hostname_mismatch,
+            trusted_certificate_path,
+            trusted_certificate_pem,
+            client_cert_pem,
+            client_key_pem,
+        } = tls;
+        let ProxyConfig {
+            url,
+            username,
+            password,
+            bypass_hosts,
+        } = proxy;
         let mut h = Sha256::new();
-        flag(&mut h, c.tls.enabled);
-        flag(&mut h, c.tls.allow_self_signed);
-        flag(&mut h, c.tls.allow_hostname_mismatch);
+        flag(&mut h, *enabled);
+        flag(&mut h, *allow_self_signed);
+        flag(&mut h, *allow_hostname_mismatch);
         bytes(
             &mut h,
-            c.tls.trusted_certificate_path.as_deref().map(str::as_bytes),
+            trusted_certificate_path.as_deref().map(str::as_bytes),
         );
-        bytes(&mut h, c.tls.trusted_certificate_pem.as_deref());
-        bytes(&mut h, c.tls.client_cert_pem.as_deref());
-        bytes(&mut h, c.tls.client_key_pem.as_deref());
-        for v in [
-            &c.proxy.url,
-            &c.proxy.username,
-            &c.proxy.password,
-            &c.proxy.bypass_hosts,
-            &c.org_id,
-        ] {
+        bytes(&mut h, trusted_certificate_pem.as_deref());
+        bytes(&mut h, client_cert_pem.as_deref());
+        bytes(&mut h, client_key_pem.as_deref());
+        for v in [url, username, password, bypass_hosts, org_id] {
             bytes(&mut h, v.as_deref().map(str::as_bytes));
         }
-        bytes(&mut h, Some(c.user_agent.as_bytes()));
-        for (name, value) in &c.custom_headers {
+        bytes(&mut h, Some(user_agent.as_bytes()));
+        for (name, value) in custom_headers {
             bytes(&mut h, Some(name.as_bytes()));
             bytes(&mut h, Some(value.as_bytes()));
         }
-        h.update(c.connect_timeout.as_nanos().to_le_bytes());
-        h.update(c.read_timeout.as_nanos().to_le_bytes());
-        if let Some(retry) = self.retry_configs.get(&RequestCategory::Auth) {
-            h.update(retry.min_wait.as_nanos().to_le_bytes());
-            h.update(retry.max_wait.as_nanos().to_le_bytes());
-            h.update(retry.overall_timeout.as_nanos().to_le_bytes());
-            h.update(retry.max_retries.to_le_bytes());
-            let mut codes: Vec<u16> = retry
-                .override_retryable_codes
-                .iter()
-                .flatten()
-                .copied()
-                .collect();
+        h.update(connect_timeout.as_nanos().to_le_bytes());
+        h.update(read_timeout.as_nanos().to_le_bytes());
+        if let Some(RetryConfig {
+            min_wait,
+            max_wait,
+            overall_timeout,
+            max_retries,
+            override_retryable_codes,
+        }) = self.retry_configs.get(&RequestCategory::Auth)
+        {
+            h.update(min_wait.as_nanos().to_le_bytes());
+            h.update(max_wait.as_nanos().to_le_bytes());
+            h.update(overall_timeout.as_nanos().to_le_bytes());
+            h.update(max_retries.to_le_bytes());
+            let mut codes: Vec<u16> = override_retryable_codes.iter().flatten().copied().collect();
             codes.sort_unstable();
-            h.update([u8::from(retry.override_retryable_codes.is_some())]);
+            h.update([u8::from(override_retryable_codes.is_some())]);
             for code in codes {
                 h.update(code.to_le_bytes());
             }
@@ -1169,6 +1195,45 @@ mod tests {
         let config = HttpClientConfig::default();
         let client = DatabricksHttpClient::new(config, default_retry_configs());
         assert!(client.is_ok());
+    }
+
+    #[tokio::test]
+    async fn transport_fingerprint_tracks_transport_settings() {
+        let fingerprint = |config: HttpClientConfig, retry: RetryConfig| {
+            DatabricksHttpClient::new(config, build_retry_configs(&retry, &HashMap::new()))
+                .unwrap()
+                .transport_fingerprint()
+        };
+        let base = fingerprint(HttpClientConfig::default(), RetryConfig::default());
+        assert_eq!(
+            base,
+            fingerprint(HttpClientConfig::default(), RetryConfig::default())
+        );
+
+        let mut proxied = HttpClientConfig::default();
+        proxied.proxy.url = Some("http://proxy.example.com:8080".to_string());
+        let mut with_header = HttpClientConfig::default();
+        with_header
+            .custom_headers
+            .push(("x-test".to_string(), "1".to_string()));
+        let fewer_retries = RetryConfig {
+            max_retries: 1,
+            ..RetryConfig::default()
+        };
+        for changed in [
+            fingerprint(proxied, RetryConfig::default()),
+            fingerprint(with_header, RetryConfig::default()),
+            fingerprint(HttpClientConfig::default(), fewer_retries),
+        ] {
+            assert_ne!(changed, base);
+        }
+
+        // The idle pool size doesn't change what an auth request returns.
+        let small_pool = HttpClientConfig {
+            max_connections_per_host: 7,
+            ..HttpClientConfig::default()
+        };
+        assert_eq!(fingerprint(small_pool, RetryConfig::default()), base);
     }
 
     #[tokio::test]
