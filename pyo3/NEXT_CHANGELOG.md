@@ -30,6 +30,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 - All sessions in a process share one tokio runtime instead of each
   starting its own worker per CPU, so many concurrent sessions use far
   fewer threads and less CPU per query.
+- `Statement.execute()` remembers per thread whether it runs on the main
+  thread (recomputed after `fork()`) instead of asking `threading` on every
+  call.
 
 ### Updated
 
