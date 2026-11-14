@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import datetime
 import json
 import random
@@ -235,15 +236,28 @@ def test_schema_keys_are_equal_for_equal_schemas():
     assert a.__eq__(object()) is NotImplemented
 
 
-@pytest.fixture
-def local_session():
-    """A session on a local server whose every statement returns one inline
-    attachment holding three 2-row batches (ids 0-5)."""
+@contextlib.contextmanager
+def _local_session(chunks):
+    """A session on a local server whose every statement returns `chunks`
+    inline: one list of `id` values per batch, one list of batches per chunk.
+    A `None` chunk is answered with 404."""
     schema = pa.schema([("id", pa.int64())])
-    buffer = pa.BufferOutputStream()
-    with pa.ipc.new_stream(buffer, schema) as writer:
-        for lo in (0, 2, 4):
-            writer.write_batch(pa.record_batch([pa.array([lo, lo + 1])], schema=schema))
+
+    def chunk(index):
+        buffer = pa.BufferOutputStream()
+        with pa.ipc.new_stream(buffer, schema) as writer:
+            for ids in chunks[index] or []:
+                writer.write_batch(pa.record_batch([pa.array(ids)], schema=schema))
+        body = {
+            "chunk_index": index,
+            "row_offset": sum(len(ids) for c in chunks[:index] for ids in c or []),
+            "row_count": sum(len(ids) for ids in chunks[index] or []),
+            "attachment": base64.b64encode(buffer.getvalue()).decode(),
+        }
+        if index + 1 < len(chunks):
+            body["next_chunk_index"] = index + 1
+        return body
+
     response = {
         "statement_id": "test-statement",
         "status": {"state": "SUCCEEDED"},
@@ -253,22 +267,17 @@ def local_session():
                 "column_count": 1,
                 "columns": [{"name": "id", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0}],
             },
-            "total_chunk_count": 1,
-            "total_row_count": 6,
+            "total_chunk_count": len(chunks),
+            "total_row_count": sum(len(ids) for c in chunks for ids in c or []),
         },
-        "result": {
-            "chunk_index": 0,
-            "row_offset": 0,
-            "row_count": 6,
-            "attachment": base64.b64encode(buffer.getvalue()).decode(),
-        },
+        "result": chunk(0),
     }
 
     class Handler(BaseHTTPRequestHandler):
-        def respond(self, body, realtime=False):
+        def respond(self, body, realtime=False, status=200):
             self.rfile.read(int(self.headers.get("Content-Length", 0)))
             payload = json.dumps(body).encode()
-            self.send_response(200)
+            self.send_response(status)
             self.send_header("Content-Length", str(len(payload)))
             if realtime:
                 self.send_header("x-databricks-rt-session", "true")
@@ -282,7 +291,14 @@ def local_session():
                 self.respond(response)
 
         def do_GET(self):
-            self.respond(response)
+            if "/result/chunks/" in self.path:
+                index = int(self.path.rsplit("/", 1)[1].split("?")[0])
+                if chunks[index] is None:
+                    self.respond({"error_code": "NOT_FOUND", "message": "gone"}, status=404)
+                else:
+                    self.respond(chunk(index))
+            else:
+                self.respond(response)
 
         def do_DELETE(self):
             self.respond({})
@@ -303,6 +319,24 @@ def local_session():
         finally:
             session.close()
             server.shutdown()
+
+
+@pytest.fixture
+def local_session():
+    """Every statement returns one inline chunk of three 2-row batches."""
+    with _local_session([[[0, 1], [2, 3], [4, 5]]]) as session:
+        yield session
+
+
+def test_a_failed_drain_keeps_the_batches_fetch_all_rows_read():
+    with _local_session([[[0, 1], [2, 3]], None]) as session:
+        for handle in _handles(session):
+            assert handle.fetch_all_rows(1) is None
+            with pytest.raises(k.KernelError):
+                handle.fetch_all_arrow()
+            first = handle.fetch_next_batch()
+            assert first is not None and first.column(0).to_pylist() == [0, 1]
+            handle.close()
 
 
 def _handles(session):

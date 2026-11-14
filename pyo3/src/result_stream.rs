@@ -138,15 +138,14 @@ impl ResultStream {
     /// Drain the full result and return a single `pyarrow.Table`.
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = alive_mut!(self, "ResultStream");
-        let mut batches: Vec<RecordBatch> = inner.pending.drain(..).collect();
+        let mut drained = Vec::new();
         if !inner.exhausted {
             let runtime = inner.runtime.clone();
-            batches.extend(run_sync_kernel!(
-                py,
-                fetch::drain(&runtime, &mut inner.stream)
-            )?);
+            drained = run_sync_kernel!(py, fetch::drain(&runtime, &mut inner.stream))?;
             inner.exhausted = true;
         }
+        // `pending` stays put if the drain fails, for the next fetch.
+        let batches: Vec<RecordBatch> = inner.pending.drain(..).chain(drained).collect();
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
 
