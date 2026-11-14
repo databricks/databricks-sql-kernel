@@ -182,17 +182,17 @@ impl<L: log::Log> log::Log for ExitGuard<L> {
 /// failed, or another global `log` logger is already set). Never panics:
 /// a logging helper must not be able to tear down the host process.
 pub(crate) fn init_logging(py: Python<'_>) -> bool {
-    if RESET_HANDLE.get().is_some() {
+    // Already installed, or a prior attempt failed — don't retry. Retry
+    // would re-run `Logger::install()`'s global-logger set, which is not
+    // free, on every Session construction.
+    if !matches!(*lock_state(), LogState::NotInstalled) {
         return false;
     }
-    // Read the levels before taking the install lock: the read runs Python
+    // Read the levels without holding the install lock: the read runs Python
     // code, during which another thread may take the GIL and then block on
     // that lock.
     let levels = PythonLevels::read(py);
     let mut state = lock_state();
-    // Already installed, or a prior attempt failed — don't retry. Retry
-    // would re-run `Logger::install()`'s global-logger set, which is not
-    // free, on every Session construction.
     if !matches!(*state, LogState::NotInstalled) {
         return false;
     }
@@ -431,8 +431,8 @@ fn level_filter_for_python_threshold(threshold: i64) -> log::LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        decide, level_filter_for_python_threshold, levels_unchanged, mark_interpreter_exiting,
-        ExitGuard, PythonLevels, KERNEL_TARGET,
+        decide, init_logging, level_filter_for_python_threshold, levels_unchanged, lock_state,
+        mark_interpreter_exiting, ExitGuard, LogState, PythonLevels, KERNEL_TARGET, NEXT_READ,
     };
     use log::{LevelFilter, Log};
     use pyo3::prelude::*;
@@ -486,6 +486,12 @@ mod tests {
             assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Info);
             assert!(levels_unchanged(py), "the probe works after dictConfig");
             run("child.disabled = False\nchild.setLevel(logging.NOTSET)");
+
+            // After a failed install, init_logging() returns without reading.
+            *lock_state() = LogState::Failed;
+            let reads = NEXT_READ.load(Ordering::Relaxed);
+            assert!(!init_logging(py));
+            assert_eq!(NEXT_READ.load(Ordering::Relaxed), reads);
         });
     }
 
