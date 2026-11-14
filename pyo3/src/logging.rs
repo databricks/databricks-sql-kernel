@@ -281,42 +281,57 @@ static APPLIED: Mutex<(u64, u64)> = Mutex::new((0, 0));
 /// Set `log::max_level` from `levels`, and clear `pyo3_log`'s cache if the
 /// levels changed or `reset` is set.
 ///
-/// Reads run Python code, so a read can be interrupted by a thread that
-/// changes a level and applies its own read. A read that started earlier
-/// than the last applied one is therefore not applied: the later read saw
-/// at least as recent a configuration. Nothing in here calls Python, so
-/// holding `APPLIED` can't deadlock with the GIL.
+/// Reads run Python code, so threads can interleave them with level
+/// changes. Applies are ordered by ticket: a read that started before the
+/// last applied one is not applied. It may still have seen a newer
+/// configuration than that one, and it already refilled the change probe,
+/// so the next `Session` is made to read again. Nothing in here calls
+/// Python, so holding `APPLIED` can't deadlock with the GIL.
 fn apply(levels: PythonLevels, reset: bool) {
     let Some(handle) = RESET_HANDLE.get() else {
         return;
     };
     let mut applied = APPLIED.lock().unwrap_or_else(|p| p.into_inner());
-    let (set_level, clear_cache) = decide(&mut applied, &levels, reset);
-    if let Some(level) = set_level {
+    let decision = decide(&mut applied, &levels, reset);
+    if let Some(level) = decision.set_level {
         log::set_max_level(level);
     }
-    if clear_cache {
+    if decision.clear_cache {
         handle.reset();
+    }
+    if decision.read_again {
+        LOGGERS_SEEN.store(usize::MAX, Ordering::Relaxed);
     }
 }
 
-/// What [`apply`] does for `levels`, given the `(ticket, fingerprint)` of
-/// the last applied read (updated in place): the max level to set, if
-/// any, and whether to clear `pyo3_log`'s cache.
-fn decide(
-    applied: &mut (u64, u64),
-    levels: &PythonLevels,
-    reset: bool,
-) -> (Option<log::LevelFilter>, bool) {
+/// What [`apply`] does with one read.
+#[derive(Debug, PartialEq)]
+struct Decision {
+    /// The max level to set, if any.
+    set_level: Option<log::LevelFilter>,
+    /// Whether to clear `pyo3_log`'s cache.
+    clear_cache: bool,
+    /// Whether the next `Session` must read the levels again.
+    read_again: bool,
+}
+
+/// [`apply`]'s decision for `levels`, given the `(ticket, fingerprint)` of
+/// the last applied read (updated in place).
+fn decide(applied: &mut (u64, u64), levels: &PythonLevels, reset: bool) -> Decision {
     let (applied_ticket, applied_fingerprint) = *applied;
     if levels.ticket <= applied_ticket {
-        return (None, reset);
+        return Decision {
+            set_level: None,
+            clear_cache: reset,
+            read_again: true,
+        };
     }
     *applied = (levels.ticket, levels.fingerprint);
-    (
-        Some(levels.max_level),
-        reset || levels.fingerprint != applied_fingerprint,
-    )
+    Decision {
+        set_level: Some(levels.max_level),
+        clear_cache: reset || levels.fingerprint != applied_fingerprint,
+        read_again: false,
+    }
 }
 
 /// The current `log::max_level`, for tests.
@@ -444,7 +459,8 @@ fn level_filter_for_python_threshold(threshold: i64) -> log::LevelFilter {
 mod tests {
     use super::{
         decide, init_logging, level_filter_for_python_threshold, levels_unchanged, lock_state,
-        mark_interpreter_exiting, ExitGuard, LogState, PythonLevels, KERNEL_TARGET, NEXT_READ,
+        mark_interpreter_exiting, Decision, ExitGuard, LogState, PythonLevels, KERNEL_TARGET,
+        LOGGERS_SEEN, NEXT_READ,
     };
     use log::{LevelFilter, Log};
     use pyo3::prelude::*;
@@ -512,6 +528,17 @@ mod tests {
             assert!(levels_unchanged(py), "the probe works after dictConfig");
             run("child.disabled = False\nchild.setLevel(logging.NOTSET)");
 
+            // A dropped read makes the next Session read again.
+            PythonLevels::read(py);
+            assert!(levels_unchanged(py));
+            LOGGERS_SEEN.store(usize::MAX, Ordering::Relaxed);
+            assert!(
+                !levels_unchanged(py),
+                "the read-again sentinel forces a read"
+            );
+            PythonLevels::read(py);
+            assert!(levels_unchanged(py));
+
             // After a failed install, init_logging() returns without reading.
             let previous = std::mem::replace(&mut *lock_state(), LogState::Failed);
             let reads = NEXT_READ.load(Ordering::Relaxed);
@@ -532,30 +559,42 @@ mod tests {
 
     #[test]
     fn apply_sets_newer_reads_and_resets_on_change() {
+        let applied_read = |clear_cache| Decision {
+            set_level: Some(LevelFilter::Debug),
+            clear_cache,
+            read_again: false,
+        };
         let mut applied = (0, 0);
         // First read: set the level; the fingerprint differs from the
         // initial state, so the cache is cleared too.
         assert_eq!(
             decide(&mut applied, &levels(1, 7), false),
-            (Some(LevelFilter::Debug), true)
+            applied_read(true)
         );
         assert_eq!(applied, (1, 7));
         // Same levels: set again, keep the cache.
         assert_eq!(
             decide(&mut applied, &levels(2, 7), false),
-            (Some(LevelFilter::Debug), false)
+            applied_read(false)
         );
         // reset_logging() always clears the cache.
         assert_eq!(
             decide(&mut applied, &levels(3, 7), true),
-            (Some(LevelFilter::Debug), true)
+            applied_read(true)
         );
-        // A read that started before the applied one is dropped...
+        // A read that started before the applied one is dropped, and since
+        // it may have seen a newer configuration, the next Session reads
+        // again...
         decide(&mut applied, &levels(5, 9), false);
-        assert_eq!(decide(&mut applied, &levels(4, 8), false), (None, false));
+        let dropped = |clear_cache| Decision {
+            set_level: None,
+            clear_cache,
+            read_again: true,
+        };
+        assert_eq!(decide(&mut applied, &levels(4, 8), false), dropped(false));
         assert_eq!(applied, (5, 9));
-        // ...but an overtaken reset_logging() still clears the cache.
-        assert_eq!(decide(&mut applied, &levels(4, 8), true), (None, true));
+        // ...and an overtaken reset_logging() still clears the cache.
+        assert_eq!(decide(&mut applied, &levels(4, 8), true), dropped(true));
     }
 
     #[test]
