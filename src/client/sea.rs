@@ -180,6 +180,10 @@ pub(crate) struct SeaRestTransport {
     config: TransportConfig,
     session_route: OnceLock<SessionRoute>,
     session_version: AtomicI64,
+    /// Set when CloudFetch is disabled and the warehouse rejected the
+    /// `can_cloud_download` session conf (Reyden does): the session then
+    /// requests `INLINE` results instead of paged inline results.
+    inline_disposition: AtomicBool,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
 }
@@ -222,6 +226,7 @@ impl SeaRestTransport {
             config,
             session_route: OnceLock::new(),
             session_version: AtomicI64::new(NO_SESSION_VERSION),
+            inline_disposition: AtomicBool::new(false),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
         }
@@ -672,7 +677,12 @@ impl SeaRestTransport {
             session_version: self.current_session_version(),
             catalog: params.catalog.clone(),
             schema: params.schema.clone(),
-            disposition: "INLINE_OR_EXTERNAL_LINKS".to_string(),
+            disposition: if self.inline_disposition.load(Ordering::Relaxed) {
+                "INLINE"
+            } else {
+                "INLINE_OR_EXTERNAL_LINKS"
+            }
+            .to_string(),
             format: "ARROW_STREAM".to_string(),
             wait_timeout: params.wait_timeout.clone(),
             on_wait_timeout: params.on_wait_timeout.clone(),
@@ -1057,6 +1067,16 @@ impl SeaRestTransport {
     }
 }
 
+/// Whether a CreateSession error is the server rejecting the `can_cloud_download`
+/// session conf itself (Reyden: `[INVALID_CONF_VALUE] The value 'false' in the
+/// config "can_cloud_download" is invalid`), not merely mentioning it.
+fn rejects_can_cloud_download(error: &Error) -> bool {
+    let message = error.message.to_ascii_lowercase();
+    error.http_status == Some(400)
+        && message.contains("invalid_conf_value")
+        && message.contains("config \"can_cloud_download\"")
+}
+
 /// Convert a parsed `GetChunksResponse` into the kernel-facing
 /// `ChunkLinkFetchResult`. Extracted from `get_result_chunks`
 /// so the continuation derivation (top-level vs per-link
@@ -1141,31 +1161,64 @@ impl Transport for SeaRestTransport {
             session_config.insert("can_cloud_download".to_string(), "false".to_string());
         }
 
-        let request_body = CreateSessionRequest {
-            warehouse_id: None,
-            catalog: catalog.map(|s| s.to_string()),
-            schema: schema.map(|s| s.to_string()),
-            session_confs: session_config,
-            execution_mode: SessionExecutionMode::Fast,
+        let build_request = |session_confs: HashMap<String, String>| {
+            let request_body = CreateSessionRequest {
+                warehouse_id: None,
+                catalog: catalog.map(|s| s.to_string()),
+                schema: schema.map(|s| s.to_string()),
+                session_confs,
+                execution_mode: SessionExecutionMode::Fast,
+            };
+            self.http_client
+                .inner()
+                .request(Method::POST, &url)
+                .header("Content-Type", "application/json")
+                .json(&request_body)
+                .build()
+                .map_err(|e| {
+                    Error::invalid_argument().message(format!("Failed to build request: {e}"))
+                })
         };
 
         debug!("Creating session at {}", url);
 
-        let request = self
+        let response = match self
             .http_client
-            .inner()
-            .request(Method::POST, &url)
-            .header("Content-Type", "application/json")
-            .json(&request_body)
-            .build()
-            .map_err(|e| {
-                Error::invalid_argument().message(format!("Failed to build request: {e}"))
-            })?;
-
-        let response = self
-            .http_client
-            .execute(request, RequestType::CreateSession)
-            .await?;
+            .execute(
+                build_request(session_config.clone())?,
+                RequestType::CreateSession,
+            )
+            .await
+        {
+            Ok(response) => response,
+            Err(e) if !self.config.cloudfetch_enabled && rejects_can_cloud_download(&e) => {
+                // Reyden rejects `can_cloud_download` but serves INLINE results
+                // (and fails statements over the inline byte limit).
+                warn!(
+                    error = %e,
+                    "warehouse rejected can_cloud_download; using INLINE results for this session"
+                );
+                session_config.retain(|key, _| !key.eq_ignore_ascii_case("can_cloud_download"));
+                match self
+                    .http_client
+                    .execute(build_request(session_config)?, RequestType::CreateSession)
+                    .await
+                {
+                    Ok(response) => {
+                        self.inline_disposition.store(true, Ordering::Relaxed);
+                        response
+                    }
+                    Err(mut retry_error) => {
+                        retry_error.message = format!(
+                            "{} (CreateSession retried without can_cloud_download after: {})",
+                            retry_error.message, e.message
+                        );
+                        return Err(retry_error);
+                    }
+                }
+            }
+            Err(e) => return Err(e),
+        };
         let realtime = response
             .headers()
             .get(REALTIME_SESSION_HEADER)
@@ -2434,6 +2487,39 @@ mod tests {
                 "codec {codec:?} should match CompressionCodec::None"
             );
         }
+    }
+
+    #[test]
+    fn rejects_can_cloud_download_requires_http_400_and_names_the_setting() {
+        let rejection = |status: u16, message: &str| {
+            Error::from_http_status(status).message(format!("HTTP {status}: {message}"))
+        };
+        let reyden = r#"[INVALID_CONF_VALUE] The value 'false' in the config "can_cloud_download" is invalid."#;
+        assert!(rejects_can_cloud_download(&rejection(400, reyden)));
+        assert!(rejects_can_cloud_download(&rejection(
+            400,
+            r#"[invalid_conf_value] The value 'false' in the config "CAN_CLOUD_DOWNLOAD" is invalid."#
+        )));
+        for status in [401, 403, 404, 429, 500, 503] {
+            assert!(
+                !rejects_can_cloud_download(&rejection(status, reyden)),
+                "HTTP {status} must not trigger the INLINE fallback"
+            );
+        }
+        for other in [
+            r#"[INVALID_CONF_VALUE] The value 'x' in the config "TIMEZONE" is invalid."#,
+            // Mentions the setting, but another conf is the one rejected.
+            r#"[INVALID_CONF_VALUE] The value 'x' in the config "TIMEZONE" is invalid. Params: can_cloud_download=false"#,
+            "can_cloud_download is not supported",
+        ] {
+            assert!(
+                !rejects_can_cloud_download(&rejection(400, other)),
+                "{other}"
+            );
+        }
+        let mut no_status = Error::invalid_argument().message(reyden);
+        no_status.http_status = None;
+        assert!(!rejects_can_cloud_download(&no_status));
     }
 
     #[test]

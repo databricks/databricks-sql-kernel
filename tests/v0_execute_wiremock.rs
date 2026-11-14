@@ -1682,6 +1682,140 @@ async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
 }
 
 #[tokio::test]
+async fn cloudfetch_disabled_falls_back_to_inline_when_warehouse_rejects_can_cloud_download() {
+    use wiremock::matchers::body_string_contains;
+    // Reyden rejects the paged-inline session conf at CreateSession; the
+    // session must still open and request INLINE results instead.
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .and(body_string_contains("can_cloud_download"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "Invalid session params: [INVALID_CONF_VALUE] The value 'false' in the \
+                        config \"can_cloud_download\" is invalid. SQLSTATE: 22022",
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"session_id":"sess-test","warehouse_id":"test_wh"}"#),
+        )
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    mount_execute(
+        &server,
+        succeeded_inline_body("stmt-inline", &int64_batch("n", vec![7])),
+    )
+    .await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let mut exec = stmt.execute().await.expect("inline execute");
+    let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    exec.close().await.expect("close");
+    assert_eq!(recorded_execute_disposition(&server).await, "INLINE");
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_surfaces_other_create_session_errors() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "Invalid session params: [INVALID_CONF_VALUE] TIMEZONE is invalid.",
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let error = match Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .open()
+        .await
+    {
+        Ok(_) => panic!("unrelated CreateSession rejection must surface"),
+        Err(error) => error,
+    };
+    assert_eq!(error.http_status, Some(400));
+    assert!(error.message.contains("TIMEZONE"), "{error}");
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_fallback_failure_reports_both_errors() {
+    use wiremock::matchers::body_string_contains;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .and(body_string_contains("can_cloud_download"))
+        .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+            "error_code": "INVALID_PARAMETER_VALUE",
+            "message": "Invalid session params: [INVALID_CONF_VALUE] The value 'false' in the \
+                        config \"can_cloud_download\" is invalid. SQLSTATE: 22022",
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/warehouses/test_wh/sessions"))
+        .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+            "error_code": "PERMISSION_DENIED",
+            "message": "not allowed",
+        })))
+        .with_priority(2)
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let error = match Session::builder()
+        .connection(
+            ConnectionConfig::from_http_path(server.uri(), "/sql/1.0/warehouses/test_wh").unwrap(),
+        )
+        .auth(AuthConfig::Pat {
+            token: "dapi_test_token".into(),
+            identity_federation_client_id: None,
+        })
+        .result(result)
+        .open()
+        .await
+    {
+        Ok(_) => panic!("a failed fallback CreateSession must surface"),
+        Err(error) => error,
+    };
+    assert_eq!(error.http_status, Some(403));
+    assert!(error.message.contains("not allowed"), "{error}");
+    assert!(
+        error.message.contains("retried without can_cloud_download"),
+        "{error}"
+    );
+    assert!(error.message.contains("INVALID_CONF_VALUE"), "{error}");
+}
+
+#[tokio::test]
 async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloading() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
