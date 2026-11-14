@@ -1077,6 +1077,19 @@ fn rejects_can_cloud_download(error: &Error) -> bool {
         && message.contains("config \"can_cloud_download\"")
 }
 
+/// How long a close/cancel waits for its (`{}`) reply body before giving up.
+const DISCARD_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Read a response body we don't need to its end. Over HTTP/1.1 hyper can only
+/// return a connection to the pool once the body has been read, so dropping
+/// the (`{}`) body of a close/cancel reply would make the next request open a
+/// new TCP/TLS connection. The call already succeeded, so a read error is
+/// ignored, and a stalled body is dropped after [`DISCARD_BODY_TIMEOUT`]
+/// (losing only the connection) rather than delaying the caller.
+async fn discard_body(response: reqwest::Response) {
+    let _ = tokio::time::timeout(DISCARD_BODY_TIMEOUT, response.bytes()).await;
+}
+
 /// Convert a parsed `GetChunksResponse` into the kernel-facing
 /// `ChunkLinkFetchResult`. Extracted from `get_result_chunks`
 /// so the continuation derivation (top-level vs per-link
@@ -1643,9 +1656,11 @@ impl Transport for SeaRestTransport {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
             })?;
 
-        self.http_client
+        let response = self
+            .http_client
             .execute(request, RequestType::CancelStatement)
             .await?;
+        discard_body(response).await;
 
         debug!("Canceled statement: {}", statement_id);
 
@@ -1674,17 +1689,20 @@ impl Transport for SeaRestTransport {
         // already applied the SEA retry policy, so callers see only the
         // post-retry result; the `Drop` fire-and-forget fallback close still
         // runs on the kernel side if the explicit close errored.
-        if let Err(e) = self
+        match self
             .http_client
             .execute(request, RequestType::CloseStatement)
             .await
         {
-            crate::klog::warn!(
-                statement_id = %statement_id,
-                error = %e,
-                "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"
-            );
-            return Err(e);
+            Ok(response) => discard_body(response).await,
+            Err(e) => {
+                crate::klog::warn!(
+                    statement_id = %statement_id,
+                    error = %e,
+                    "close_statement failed after HTTP retries; surfacing to caller (Drop fallback close will run)"
+                );
+                return Err(e);
+            }
         }
 
         debug!("Closed statement: {}", statement_id);
@@ -2901,6 +2919,98 @@ mod tests {
         assert!(requests
             .iter()
             .all(|request| request.headers.get(REALTIME_SESSION_HEADER).is_none()));
+    }
+
+    /// Serves every request with chunked `{}` headers, then sends the body after
+    /// `body_delay` (never, if `None`). Returns the address and an accepted-
+    /// connection counter.
+    async fn spawn_close_reply_server(
+        body_delay: Option<std::time::Duration>,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted_by_server = Arc::clone(&accepted);
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    return;
+                };
+                accepted_by_server.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 1024];
+                    loop {
+                        // These requests carry no body: a request ends at the blank line.
+                        while !buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                            match socket.read(&mut chunk).await {
+                                Ok(0) | Err(_) => return,
+                                Ok(n) => buf.extend_from_slice(&chunk[..n]),
+                            }
+                        }
+                        let end = buf.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+                        buf.drain(..end);
+                        let head = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\n\
+                                     transfer-encoding: chunked\r\n\r\n";
+                        if socket.write_all(head).await.is_err() || socket.flush().await.is_err() {
+                            return;
+                        }
+                        let Some(delay) = body_delay else {
+                            // Stall: hold the connection open without a body.
+                            let _ = socket.read(&mut chunk).await;
+                            return;
+                        };
+                        tokio::time::sleep(delay).await;
+                        if socket.write_all(b"2\r\n{}\r\n0\r\n\r\n").await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, accepted)
+    }
+
+    /// Close and cancel replies are `{}` sent chunked, and a server may flush
+    /// the body after the headers. Their connections must still be reused.
+    #[tokio::test]
+    async fn close_and_cancel_reuse_the_connection() {
+        let (addr, accepted) =
+            spawn_close_reply_server(Some(std::time::Duration::from_millis(20))).await;
+
+        let transport = create_test_client_against(&format!("http://{addr}"));
+        // hyper returns an idle HTTP/1 connection to the pool from a spawned
+        // task; pause between calls so the next one can't race ahead of it.
+        let pause = || tokio::time::sleep(std::time::Duration::from_millis(10));
+        transport.close_statement("statement-1").await.unwrap();
+        pause().await;
+        transport.close_statement("statement-2").await.unwrap();
+        pause().await;
+        transport.cancel_statement("statement-3").await.unwrap();
+        pause().await;
+        transport.close_statement("statement-3").await.unwrap();
+
+        assert_eq!(accepted.load(Ordering::SeqCst), 1);
+    }
+
+    /// A body that never arrives must not hold up a close/cancel that already
+    /// succeeded beyond the short drain bound.
+    #[tokio::test]
+    async fn close_and_cancel_do_not_wait_for_a_stalled_body() {
+        let (addr, _) = spawn_close_reply_server(None).await;
+
+        let transport = create_test_client_against(&format!("http://{addr}"));
+        let started = std::time::Instant::now();
+        transport.close_statement("statement-1").await.unwrap();
+        transport.cancel_statement("statement-2").await.unwrap();
+
+        assert!(
+            started.elapsed() < 2 * DISCARD_BODY_TIMEOUT + std::time::Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]

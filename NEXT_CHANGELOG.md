@@ -43,6 +43,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
 - With CloudFetch disabled, sessions open again on warehouses that reject the `can_cloud_download` session setting (Lakehouse Real-Time). Those sessions request `INLINE` results, as 1.4.0 did, so results over the 25 MiB inline limit fail.
+- CloseStatement and CancelStatement read their response body, so the HTTP connection is reused instead of a new TCP/TLS connection being opened for the next request.
 
 ---
 *Note: When making changes, please add your change under the appropriate
