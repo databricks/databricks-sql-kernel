@@ -360,14 +360,36 @@ async fn owner_reader_and_repeated_materialization_share_one_completion() {
 }
 
 #[tokio::test]
-async fn cancellation_and_session_close_interrupt_transfer_after_sql_closed() {
-    for close_session in [false, true] {
+async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_sql_closed() {
+    for (instruction_page, close_session) in
+        [(false, false), (false, true), (true, false), (true, true)]
+    {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("download");
         std::fs::write(&dest, b"old").unwrap();
-        let mut session =
-            Some(session(&server, response(&server, true, dest.to_str().unwrap())).await);
+        let mut body = response(&server, true, dest.to_str().unwrap());
+        let held_path = if instruction_page {
+            body["manifest"]["total_chunk_count"] = json!(2);
+            body["result"]["next_chunk_index"] = json!(1);
+            let mut next = response_with_batches(&server, true, dest.to_str().unwrap(), "GET", 0)
+                ["result"]
+                .clone();
+            next["chunk_index"] = json!(1);
+            Mock::given(method("GET"))
+                .and(path("/api/2.0/sql/statements/volume-stmt/result/chunks/1"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_delay(Duration::from_secs(3))
+                        .set_body_json(next),
+                )
+                .mount(&server)
+                .await;
+            "/api/2.0/sql/statements/volume-stmt/result/chunks/1"
+        } else {
+            "/object"
+        };
+        let mut session = Some(session(&server, body).await);
         Mock::given(method("GET"))
             .and(path("/object"))
             .respond_with(
@@ -375,6 +397,7 @@ async fn cancellation_and_session_close_interrupt_transfer_after_sql_closed() {
                     .set_delay(Duration::from_secs(3))
                     .set_body_bytes(b"new"),
             )
+            .expect(if instruction_page { 0 } else { 1 })
             .mount(&server)
             .await;
         let mut stmt = session.as_ref().unwrap().statement();
@@ -395,7 +418,7 @@ async fn cancellation_and_session_close_interrupt_transfer_after_sql_closed() {
                     .await
                     .unwrap()
                     .iter()
-                    .any(|req| req.url.path() == "/object")
+                    .any(|req| req.url.path() == held_path)
                 {
                     break;
                 }
@@ -413,6 +436,24 @@ async fn cancellation_and_session_close_interrupt_transfer_after_sql_closed() {
         .await
         .unwrap();
         assert_eq!(result.unwrap_err().code, ErrorCode::Cancelled);
+        assert_eq!(
+            exec.result_stream_mut()
+                .complete_volume_operation(&options, None)
+                .await
+                .unwrap_err()
+                .code,
+            ErrorCode::Cancelled
+        );
+        assert_eq!(
+            server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .filter(|req| req.url.path() == held_path)
+                .count(),
+            1
+        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"old");
         if let Some(session) = session {
             session.close().await.unwrap();

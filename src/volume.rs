@@ -18,11 +18,12 @@ use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStr
 use crate::kernel_error::{Error, LocalFileError, Result};
 use crate::result_stream::ResultBatch;
 use arrow_array::{Array, LargeStringArray, MapArray, StringArray, StringViewArray};
+use futures::TryStreamExt;
 use reqwest::{header::HeaderMap, Client, Method};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::{oneshot, Notify};
 use tokio_util::io::ReaderStream;
 
 /// Local file authorization and driver-specific storage response policy.
@@ -62,7 +63,7 @@ enum CommitState {
 #[derive(Default)]
 pub(crate) struct VolumeState {
     retry: RetryConfig,
-    download_read_timeout: Option<std::time::Duration>,
+    read_timeout: Option<std::time::Duration>,
     serial: tokio::sync::Mutex<()>,
     commit: Mutex<CommitState>,
     changed: Notify,
@@ -73,13 +74,10 @@ fn cancelled() -> Error {
 }
 
 impl VolumeState {
-    pub(crate) fn new(
-        retry: RetryConfig,
-        download_read_timeout: Option<std::time::Duration>,
-    ) -> Arc<Self> {
+    pub(crate) fn new(retry: RetryConfig, read_timeout: Option<std::time::Duration>) -> Arc<Self> {
         Arc::new(Self {
             retry,
-            download_read_timeout,
+            read_timeout,
             ..Self::default()
         })
     }
@@ -113,14 +111,14 @@ impl VolumeState {
         }
     }
 
-    async fn cancellation(&self) {
+    pub(crate) async fn cancellation(&self) -> Error {
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
             if matches!(self.cached(), Some(Err(error)) if error.code == crate::ErrorCode::Cancelled)
             {
-                return;
+                return cancelled();
             }
             notified.await;
         }
@@ -186,16 +184,10 @@ impl VolumeState {
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<VolumeCompletion> {
-        let input_request =
+        let input =
             if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
                 let bytes = input_bytes.ok_or_else(|| invalid("Missing input stream"))?;
-                Some(
-                    client
-                        .put(&instruction.url)
-                        .headers(instruction.headers.clone())
-                        .header(reqwest::header::CONTENT_LENGTH, bytes.len())
-                        .body(bytes),
-                )
+                Some(Arc::<[u8]>::from(bytes))
             } else {
                 None
             };
@@ -208,7 +200,7 @@ impl VolumeState {
                     &instruction,
                     client,
                     options,
-                    input_request.as_ref(),
+                    input.as_ref(),
                     &mut retry_after,
                 )
                 .await
@@ -234,7 +226,7 @@ impl VolumeState {
         instruction: &Instruction,
         client: &Client,
         options: &VolumeOptions,
-        input_request: Option<&reqwest::RequestBuilder>,
+        input: Option<&Arc<[u8]>>,
         retry_after: &mut Option<String>,
     ) -> Result<VolumeCompletion> {
         let method = match instruction.operation.as_str() {
@@ -243,14 +235,23 @@ impl VolumeState {
             "REMOVE" => Method::DELETE,
             _ => return Err(invalid("Unsupported Volume operation")),
         };
-        let mut request = match input_request {
-            Some(request) => request
-                .try_clone()
-                .ok_or_else(|| invalid("Input bytes cannot be replayed"))?,
-            None => client
-                .request(method, &instruction.url)
-                .headers(instruction.headers.clone()),
-        };
+        let mut request = client
+            .request(method, &instruction.url)
+            .headers(instruction.headers.clone());
+        let upload_error = Arc::new(Mutex::new(None));
+        let (uploaded, upload_complete) = oneshot::channel();
+        let mut uploaded = Some(uploaded);
+        if let Some(bytes) = input {
+            request = request
+                .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                .body(upload_body(
+                    std::io::Cursor::new(Arc::clone(bytes)),
+                    bytes.len() as u64,
+                    instruction.local_file.clone(),
+                    uploaded.take().unwrap(),
+                    Arc::clone(&upload_error),
+                ));
+        }
         let local_path = if instruction.operation == "REMOVE"
             || (instruction.operation == "PUT" && instruction.local_file == "__input_stream__")
         {
@@ -258,15 +259,27 @@ impl VolumeState {
         } else {
             let path = allowed_path(&instruction.local_file, &options.allowed_paths)?;
             if instruction.operation == "PUT" {
-                let file = std::fs::File::open(&path)
+                let mut file = std::fs::File::open(&path)
                     .map_err(|e| local_error(e, &instruction.local_file))?;
-                let size = file
+                let metadata = file
                     .metadata()
-                    .map_err(|e| local_error(e, &instruction.local_file))?
-                    .len();
-                request = request.header(reqwest::header::CONTENT_LENGTH, size).body(
-                    reqwest::Body::wrap_stream(ReaderStream::new(tokio::fs::File::from_std(file))),
-                );
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                if metadata.is_dir() {
+                    // Reading the opened directory retains the platform's filesystem cause.
+                    let error = std::io::Read::read(&mut file, &mut [0])
+                        .err()
+                        .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
+                    return Err(local_error(error, &instruction.local_file));
+                }
+                request = request
+                    .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+                    .body(upload_body(
+                        tokio::fs::File::from_std(file),
+                        metadata.len(),
+                        instruction.local_file.clone(),
+                        uploaded.take().unwrap(),
+                        Arc::clone(&upload_error),
+                    ));
             }
             Some(path)
         };
@@ -311,15 +324,11 @@ impl VolumeState {
             None
         };
 
-        let read_timeout = if instruction.operation == "GET" {
-            self.download_read_timeout
-        } else {
-            None
-        };
-        let mut response = storage_read(read_timeout, async {
-            request.send().await.map_err(storage_error)
-        })
-        .await?;
+        if let Some(uploaded) = uploaded {
+            let _ = uploaded.send(());
+        }
+        let mut response =
+            storage_send(request, self.read_timeout, upload_complete, upload_error).await?;
         let status = response.status();
         if !status.is_success()
             && !(instruction.operation == "REMOVE"
@@ -339,7 +348,7 @@ impl VolumeState {
                     status.as_u16()
                 )));
         }
-        while let Some(bytes) = storage_read(read_timeout, async {
+        while let Some(bytes) = storage_read(self.read_timeout, async {
             response.chunk().await.map_err(response_body_error)
         })
         .await?
@@ -369,8 +378,61 @@ impl VolumeState {
     }
 }
 
+fn upload_body(
+    reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
+    mut remaining: u64,
+    path: String,
+    uploaded: oneshot::Sender<()>,
+    error: Arc<Mutex<Option<Error>>>,
+) -> reqwest::Body {
+    let mut uploaded = Some(uploaded);
+    if remaining == 0 {
+        let _ = uploaded.take().unwrap().send(());
+    }
+    reqwest::Body::wrap_stream(
+        ReaderStream::new(reader)
+            .inspect_ok(move |bytes| {
+                remaining = remaining.saturating_sub(bytes.len() as u64);
+                if remaining == 0 {
+                    if let Some(uploaded) = uploaded.take() {
+                        let _ = uploaded.send(());
+                    }
+                }
+            })
+            .map_err(move |cause| {
+                *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
+                std::io::Error::other("Volume upload source could not be read")
+            }),
+    )
+}
+
 fn invalid(message: &str) -> Error {
     Error::invalid_argument().message(message)
+}
+
+async fn storage_send(
+    request: reqwest::RequestBuilder,
+    timeout: Option<std::time::Duration>,
+    upload_complete: oneshot::Receiver<()>,
+    upload_error: Arc<Mutex<Option<Error>>>,
+) -> Result<reqwest::Response> {
+    let send = request.send();
+    tokio::pin!(send);
+    // Response inactivity starts after the upload, without a total transfer deadline.
+    let response = tokio::select! {
+        result = &mut send => result.map_err(storage_error),
+        _ = upload_complete => storage_read(timeout, async {
+            send.await.map_err(storage_error)
+        }).await,
+    };
+    if let Some(error) = upload_error
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+    {
+        return Err(error);
+    }
+    response
 }
 
 async fn storage_read<T>(
@@ -384,7 +446,7 @@ async fn storage_read<T>(
                 Err(Error::network_error()
                     .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
                     .with_retryable(true)
-                    .message("Volume storage download read timed out"))
+                    .message("Volume storage read timed out"))
             }),
         None => read.await,
     }
@@ -651,16 +713,45 @@ mod tests {
     #[tokio::test]
     async fn local_upload_read_errors_wrapped_as_request_errors_are_not_retried() {
         let server = MockServer::start().await;
-        let body = reqwest::Body::wrap_stream(futures::stream::iter([Err::<Vec<u8>, _>(
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        )]));
-        let error = Client::new()
-            .put(server.uri())
-            .body(body)
-            .send()
-            .await
-            .unwrap_err();
-        assert!(!storage_error(error).retryable);
+        struct FailedRead(Option<std::io::Error>);
+        impl tokio::io::AsyncRead for FailedRead {
+            fn poll_read(
+                mut self: std::pin::Pin<&mut Self>,
+                _: &mut std::task::Context<'_>,
+                _: &mut tokio::io::ReadBuf<'_>,
+            ) -> std::task::Poll<std::io::Result<()>> {
+                std::task::Poll::Ready(Err(self.0.take().unwrap()))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("missing");
+        let cause = std::fs::File::open(&source).unwrap_err();
+        let os_code = cause.raw_os_error();
+        let captured = Arc::new(Mutex::new(None));
+        let (uploaded, complete) = oneshot::channel();
+        let body = upload_body(
+            FailedRead(Some(cause)),
+            1,
+            source.to_str().unwrap().into(),
+            uploaded,
+            Arc::clone(&captured),
+        );
+        let error = storage_send(
+            Client::new()
+                .put(format!("{}/object?secret=hidden", server.uri()))
+                .body(body),
+            None,
+            complete,
+            captured,
+        )
+        .await
+        .unwrap_err();
+        assert!(!error.retryable);
+        assert_eq!(error.code, crate::ErrorCode::Internal);
+        let local = error.local_error.unwrap();
+        assert_eq!(local.raw_os_error, os_code);
+        assert_eq!(local.path, source.to_str().unwrap());
+        assert!(!error.message.contains("hidden"));
     }
 
     #[tokio::test]
@@ -1035,15 +1126,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_inactivity_bounds_headers_and_body_without_publishing() {
+    async fn response_inactivity_bounds_headers_and_body_without_publishing() {
         use tokio::io::AsyncReadExt;
-        for headers_sent in [false, true] {
+        for (operation, headers_sent) in [
+            ("GET", false),
+            ("GET", true),
+            ("PUT", false),
+            ("REMOVE", false),
+        ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let peer = tokio::spawn(async move {
                 let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = [0; 2048];
-                assert!(socket.read(&mut request).await.unwrap() > 0);
+                let mut request = Vec::new();
+                let mut byte = [0];
+                while !request.ends_with(b"\r\n\r\n") {
+                    socket.read_exact(&mut byte).await.unwrap();
+                    request.push(byte[0]);
+                }
+                let size = String::from_utf8(request)
+                    .unwrap()
+                    .lines()
+                    .find_map(|line| {
+                        line.to_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|size| size.trim().parse::<usize>().unwrap())
+                    })
+                    .unwrap_or(0);
+                socket.read_exact(&mut vec![0; size]).await.unwrap();
                 if headers_sent {
                     socket
                         .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
@@ -1062,7 +1172,7 @@ mod tests {
             let error = tokio::time::timeout(
                 Duration::from_secs(2),
                 state.complete(
-                    &instruction("GET", &url, &dest),
+                    &instruction(operation, &url, &dest),
                     &Client::new(),
                     &options(dir.path()),
                     None,
@@ -1084,7 +1194,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn download_inactivity_resets_on_progress_and_does_not_limit_put() {
+    async fn response_inactivity_resets_on_progress_and_allows_progressing_uploads() {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1122,23 +1232,32 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(body_bytes(b"xxxxx"))
-            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .respond_with(ResponseTemplate::new(200))
             .expect(1)
             .mount(&server)
             .await;
-        let state = VolumeState::new(
-            transfer_state(0).retry.clone(),
+        let (mut writer, reader) = tokio::io::duplex(1);
+        let producer = tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                writer.write_all(b"x").await.unwrap();
+            }
+        });
+        let (uploaded, complete) = oneshot::channel();
+        let error = Arc::new(Mutex::new(None));
+        let body = upload_body(reader, 5, "input".into(), uploaded, Arc::clone(&error));
+        storage_send(
+            Client::new()
+                .put(server.uri())
+                .header(reqwest::header::CONTENT_LENGTH, 5)
+                .body(body),
             Some(Duration::from_millis(150)),
-        );
-        state
-            .complete(
-                &instruction("PUT", &server.uri(), &dest),
-                &Client::new(),
-                &options(dir.path()),
-                None,
-            )
-            .await
-            .unwrap();
+            complete,
+            error,
+        )
+        .await
+        .unwrap();
+        producer.await.unwrap();
     }
 
     #[tokio::test]
@@ -1228,17 +1347,46 @@ mod tests {
     #[tokio::test]
     async fn local_errors_retain_os_code_and_requested_filename() {
         let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("missing");
-        let batch = instruction("PUT", "http://127.0.0.1:1?secret=hidden", &source);
-        let error = transfer_state(0)
-            .complete(&batch, &Client::new(), &options(dir.path()), None)
-            .await
-            .unwrap_err();
-        let local = error.local_error.unwrap();
-        assert_eq!(local.kind, "NotFound");
-        assert!(local.raw_os_error.is_some());
-        assert_eq!(local.path, source.to_str().unwrap());
-        assert!(!error.message.contains("hidden"));
+        let server = MockServer::start().await;
+        for (source, kind) in [
+            (dir.path().join("missing"), "NotFound"),
+            (
+                dir.path().to_owned(),
+                if cfg!(windows) {
+                    "PermissionDenied"
+                } else {
+                    "IsADirectory"
+                },
+            ),
+        ] {
+            let batch = instruction(
+                "PUT",
+                &format!("{}/object?secret=hidden", server.uri()),
+                &source,
+            );
+            let state = transfer_state(1);
+            let error = state
+                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .await
+                .unwrap_err();
+            let local = error.local_error.as_ref().unwrap();
+            assert_eq!(local.kind, kind);
+            assert!(local.raw_os_error.is_some());
+            assert_eq!(local.path, source.to_str().unwrap());
+            assert!(!error.message.contains("hidden"));
+            assert_eq!(
+                state
+                    .complete(&batch, &Client::new(), &options(dir.path()), None)
+                    .await
+                    .unwrap_err()
+                    .local_error
+                    .as_ref()
+                    .unwrap()
+                    .raw_os_error,
+                local.raw_os_error
+            );
+        }
+        assert!(server.received_requests().await.unwrap().is_empty());
     }
 
     #[test]

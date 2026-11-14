@@ -207,7 +207,7 @@ fn build_http_config(
     http.sea_response_compression_enabled = sea_response_compression_enabled;
     if let Some(timeout) = request_timeout {
         http.request_timeout = timeout;
-        http.storage_download_read_timeout = Some(timeout);
+        http.storage_read_timeout = Some(timeout);
     }
     if let Some(max) = max_connections {
         http.pool_max_idle_per_host = max;
@@ -323,8 +323,8 @@ impl Session {
     /// 30-second connection timeout also applies, so connection establishment
     /// is bounded by the shorter limit. Unset or `0` keeps the kernel default
     /// (120 seconds).
-    /// For Volume GET, a positive configured value instead bounds inactivity
-    /// while waiting for response headers or the next body chunk.
+    /// For Volume transfers, a positive configured value bounds response
+    /// inactivity after upload and between body chunks, without a total deadline.
     ///
     /// `max_connections` sets the maximum idle connections retained per host.
     /// Unset keeps the kernel default (100); zero is rejected.
@@ -873,7 +873,7 @@ mod send_sync_tests {
             .expect("positive request timeout should build an HTTP config");
         assert_eq!(http.request_timeout, std::time::Duration::from_millis(500));
         assert_eq!(
-            http.storage_download_read_timeout,
+            http.storage_read_timeout,
             Some(std::time::Duration::from_millis(500))
         );
         assert_eq!(http.retry_min_wait, default.retry_min_wait);

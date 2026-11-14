@@ -757,9 +757,9 @@ pub struct HttpConfig {
     /// applies, so connection establishment is bounded by the shorter limit.
     pub request_timeout: Duration,
 
-    /// Inactivity limit for Volume GET response headers and each body read.
+    /// Inactivity limit for Volume response headers after upload and each body read.
     /// Separate from the SQL request deadline so progressing transfers can finish.
-    pub storage_download_read_timeout: Option<Duration>,
+    pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.
     /// Retrying stops once cumulative elapsed time exceeds this.
@@ -840,7 +840,7 @@ impl Default for HttpConfig {
         Self {
             sea_response_compression_enabled: false,
             request_timeout: Duration::from_secs(120),
-            storage_download_read_timeout: None,
+            storage_read_timeout: None,
             overall_timeout: Duration::from_secs(900),
             pool_max_idle_per_host: 100,
             // Mirror `RetryConfig::default()` so a stock `HttpConfig`

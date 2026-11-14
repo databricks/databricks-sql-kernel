@@ -164,7 +164,7 @@ impl SessionInner {
     pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
         let state = crate::volume::VolumeState::new(
             self.storage_retry.clone(),
-            self.config.http.storage_download_read_timeout,
+            self.config.http.storage_read_timeout,
         );
         let mut states = self.volume_states.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(states) = states.as_mut() {

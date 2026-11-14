@@ -672,36 +672,42 @@ impl ResultStream {
         if let Some(result) = state.cached() {
             return result;
         }
-        let batch = self
-            .peek_first_batch()
-            .await
-            .map_err(|error| state.fail(error))?
-            .ok_or_else(|| {
-                state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
-            })?;
-        let ResultBatch::Arrow(batch) = batch;
-        let batch = ResultBatch::Arrow(batch.clone());
-        // The first batch stays buffered for callers; later batches must not
-        // authorize a partial transfer of a multi-row instruction result.
-        while !self.exhausted {
-            match self
-                .reader
-                .as_mut()
-                .expect("Volume completion retains its reader")
-                .next_batch()
-                .await
-                .map_err(|error| state.fail(error))?
-            {
-                Some(batch) if batch.num_rows() != 0 => {
-                    return Err(state.fail(
-                        Error::invalid_argument().message("Expected one Volume instruction row"),
-                    ));
+        tokio::select! {
+            biased;
+            error = state.cancellation() => Err(error),
+            result = async {
+                let batch = self
+                    .peek_first_batch()
+                    .await
+                    .map_err(|error| state.fail(error))?
+                    .ok_or_else(|| {
+                        state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
+                    })?;
+                let ResultBatch::Arrow(batch) = batch;
+                let batch = ResultBatch::Arrow(batch.clone());
+                // The first batch stays buffered for callers; later batches must not
+                // authorize a partial transfer of a multi-row instruction result.
+                while !self.exhausted {
+                    match self
+                        .reader
+                        .as_mut()
+                        .expect("Volume completion retains its reader")
+                        .next_batch()
+                        .await
+                        .map_err(|error| state.fail(error))?
+                    {
+                        Some(batch) if batch.num_rows() != 0 => {
+                            return Err(state.fail(
+                                Error::invalid_argument().message("Expected one Volume instruction row"),
+                            ));
+                        }
+                        Some(_) => {}
+                        None => self.exhausted = true,
+                    }
                 }
-                Some(_) => {}
-                None => self.exhausted = true,
-            }
+                state.complete(&batch, &client, options, input_bytes).await
+            } => result,
         }
-        state.complete(&batch, &client, options, input_bytes).await
     }
 
     pub(crate) fn volume_state(&self) -> Option<Arc<crate::volume::VolumeState>> {
