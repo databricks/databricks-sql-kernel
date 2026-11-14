@@ -145,6 +145,15 @@ impl CachingResolver {
         entry
     }
 
+    /// Whether `host` has a cached successful answer (tests only).
+    #[cfg(test)]
+    pub(crate) fn has_answer(&self, host: &str) -> bool {
+        let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        entries
+            .get(host)
+            .is_some_and(|slot| matches!(&*slot.entry.borrow(), Some((Ok(_), _))))
+    }
+
     /// Run the lookup off the caller's runtime on a thread that publishes the
     /// answer itself: waiters from other sessions depend on it, so it must not
     /// be abandoned when the caller that started it is cancelled or its
@@ -152,12 +161,12 @@ impl CachingResolver {
     fn start_lookup(&self, host: &str) -> Entry {
         let (tx, rx) = watch::channel(None);
         let lookup = Arc::clone(&self.lookup);
-        let hedge = self.hedge;
+        let (hedge, deadline) = (self.hedge, self.stuck_after);
         let host = host.to_owned();
         let spawned = std::thread::Builder::new()
             .name("dbx-sql-kernel-dns".to_owned())
             .spawn(move || {
-                let result = first_answer(&lookup, &host, hedge);
+                let result = first_answer(&lookup, &host, hedge, deadline);
                 tx.send_replace(Some((
                     result.map(Arc::from).map_err(Arc::new),
                     Instant::now(),
@@ -179,8 +188,15 @@ impl CachingResolver {
 /// `hedge` while none has succeeded, and at once when one fails: a fast
 /// failure (`EAI_AGAIN` from an overloaded stub) must not fail every waiter
 /// while another attempt may still succeed. The last error is returned only
-/// once every attempt has failed.
-fn first_answer(lookup: &Lookup, host: &str, hedge: Duration) -> io::Result<Vec<SocketAddr>> {
+/// once every attempt has failed, and `TimedOut` if none has answered by
+/// `deadline`, so a resolver that hangs still settles the lookup.
+fn first_answer(
+    lookup: &Lookup,
+    host: &str,
+    hedge: Duration,
+    deadline: Duration,
+) -> io::Result<Vec<SocketAddr>> {
+    let started = Instant::now();
     let (done_tx, done_rx) = std::sync::mpsc::channel();
     let (mut attempts, mut running) = (0, 0);
     let mut last_error = None;
@@ -210,7 +226,13 @@ fn first_answer(lookup: &Lookup, host: &str, hedge: Duration) -> io::Result<Vec<
             }
             return Err(last_error.unwrap_or_else(|| io::Error::other("DNS lookup failed")));
         }
-        match done_rx.recv_timeout(hedge) {
+        let Some(left) = deadline.checked_sub(started.elapsed()) else {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!("DNS lookup for {host} timed out after {deadline:?}"),
+            ));
+        };
+        match done_rx.recv_timeout(hedge.min(left)) {
             Ok(Ok(addrs)) if !addrs.is_empty() => return Ok(addrs),
             Ok(result) => {
                 running -= 1;
@@ -560,6 +582,21 @@ mod tests {
         }
         // A slow scheduler may let another hedge start before the answer arrives.
         assert!((2..=MAX_ATTEMPTS).contains(&calls.load(Ordering::SeqCst)));
+        release(&stall);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_whose_attempts_all_hang_times_out() {
+        let (lookup, calls, stall) = stalling(usize::MAX);
+        let mut r = CachingResolver::new(TTL, Duration::from_millis(10), lookup);
+        r.stuck_after = Duration::from_millis(100);
+        let r = Arc::new(r);
+        let err = tokio::time::timeout(Duration::from_secs(10), resolve(&r, "example.com"))
+            .await
+            .expect("the lookup never settled")
+            .unwrap_err();
+        assert!(err.contains("timed out"), "{err}");
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_ATTEMPTS);
         release(&stall);
     }
 
