@@ -24,7 +24,8 @@
 //! after [`HEDGE`], or whose attempt failed, gets another attempt, up to
 //! [`MAX_ATTEMPTS`]. The first successful answer reaches every caller waiting
 //! on it, so one dropped query doesn't hold the whole burst for glibc's retry.
-//! An error reaches them only when every attempt failed, and is not cached.
+//! An error reaches them only when every attempt failed, and is reused for
+//! [`NEGATIVE_TTL`].
 //!
 //! [`TTL`] is fixed: `getaddrinfo` doesn't report the record's own DNS TTL,
 //! so that is ignored. The answer is also not invalidated when connecting to
@@ -51,9 +52,13 @@ const HEDGE: Duration = Duration::from_secs(1);
 /// Attempts per lookup, started [`HEDGE`] apart while none has succeeded
 /// (or at once when one fails).
 const MAX_ATTEMPTS: usize = 3;
-/// An unanswered lookup older than this is replaced. A lookup's own threads
-/// always answer well before; this covers an entry inherited across `fork()`,
-/// whose threads don't exist in the child.
+/// How long a failed lookup is reused, so retries from every session against
+/// a host that doesn't resolve make one lookup, not one each (the JVM's
+/// default negative TTL is 10 s).
+const NEGATIVE_TTL: Duration = Duration::from_secs(2);
+/// An unanswered lookup older than this is replaced; a backstop for a lookup
+/// that never returns. (One inherited across `fork()` is replaced at once, see
+/// [`Slot::pid`].)
 const STUCK_AFTER: Duration = Duration::from_secs(60);
 /// Bound on distinct cached hosts (workspace + CloudFetch storage hosts).
 const MAX_HOSTS: usize = 256;
@@ -63,10 +68,20 @@ type Answer = (Result<Arc<[SocketAddr]>, Arc<io::Error>>, Instant);
 /// `None` while the lookup thread runs; the thread publishes the answer.
 type Entry = watch::Receiver<Option<Answer>>;
 
+/// A host's latest lookup.
+struct Slot {
+    entry: Entry,
+    started: Instant,
+    /// The process that started it. A child after `fork()` has the entry but
+    /// not the lookup threads that would answer it.
+    pid: u32,
+}
+
 pub(crate) struct CachingResolver {
-    /// Each host's latest lookup and when it started.
-    entries: Mutex<HashMap<String, (Entry, Instant)>>,
+    entries: Mutex<HashMap<String, Slot>>,
     ttl: Duration,
+    negative_ttl: Duration,
+    stuck_after: Duration,
     hedge: Duration,
     lookup: Lookup,
     /// Rotates the first address handed out, as round-robin DNS would.
@@ -86,25 +101,32 @@ impl CachingResolver {
         Self {
             entries: Mutex::new(HashMap::new()),
             ttl,
+            negative_ttl: NEGATIVE_TTL,
+            stuck_after: STUCK_AFTER,
             hedge,
             lookup,
             next: AtomicUsize::new(0),
         }
     }
 
-    /// The lookup to join for `host`: one in flight, a fresh cached answer, or
-    /// a new lookup when the last one expired or failed.
+    /// The lookup to join for `host`: one in flight, a recent answer, or a new
+    /// lookup when the last one expired.
     fn entry(&self, host: &str) -> Entry {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = |(entry, started): &(Entry, Instant)| match &*entry.borrow() {
-            // An unanswered entry whose thread is gone will never be answered.
-            None => entry.has_changed().is_ok() && started.elapsed() < STUCK_AFTER,
+        let usable = |slot: &Slot| match &*slot.entry.borrow() {
+            // An unanswered entry is joined only while something can still
+            // answer it.
+            None => {
+                slot.entry.has_changed().is_ok()
+                    && slot.pid == std::process::id()
+                    && slot.started.elapsed() < self.stuck_after
+            }
             Some((Ok(_), at)) => at.elapsed() < self.ttl,
-            Some((Err(_), _)) => false,
+            Some((Err(_), at)) => at.elapsed() < self.negative_ttl,
         };
         if let Some(current) = entries.get(host) {
             if usable(current) {
-                return current.0.clone();
+                return current.entry.clone();
             }
         }
         if entries.len() >= MAX_HOSTS {
@@ -114,7 +136,12 @@ impl CachingResolver {
             }
         }
         let entry = self.start_lookup(host);
-        entries.insert(host.to_owned(), (entry.clone(), Instant::now()));
+        let slot = Slot {
+            entry: entry.clone(),
+            started: Instant::now(),
+            pid: std::process::id(),
+        };
+        entries.insert(host.to_owned(), slot);
         entry
     }
 
@@ -308,9 +335,11 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn failures_reach_current_waiters_but_are_not_cached() {
+    async fn failures_reach_current_waiters_and_are_reused_briefly() {
         let (lookup, calls) = counting(Duration::from_millis(50), true);
-        let r = Arc::new(CachingResolver::new(TTL, HEDGE, lookup));
+        let mut r = CachingResolver::new(TTL, HEDGE, lookup);
+        r.negative_ttl = Duration::from_millis(200);
+        let r = Arc::new(r);
         let tasks: Vec<_> = (0..16)
             .map(|_| {
                 let r = Arc::clone(&r);
@@ -328,8 +357,15 @@ mod tests {
         assert!(resolve(&r, "example.com").await.is_err());
         assert_eq!(
             calls.load(Ordering::SeqCst),
+            MAX_ATTEMPTS,
+            "a recent failure is reused"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(resolve(&r, "example.com").await.is_err());
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
             2 * MAX_ATTEMPTS,
-            "a failure is retried by the next caller"
+            "an expired failure is looked up again"
         );
     }
 
@@ -363,27 +399,53 @@ mod tests {
         assert!((2..=MAX_ATTEMPTS).contains(&calls.load(Ordering::SeqCst)));
     }
 
-    #[tokio::test]
-    async fn an_unanswered_entry_past_its_deadline_is_replaced() {
-        // After fork() the child keeps an in-flight entry whose lookup
-        // threads (and their senders' owners) don't exist there.
-        let (lookup, calls) = counting(Duration::ZERO, false);
-        let r = Arc::new(CachingResolver::new(TTL, HEDGE, lookup));
+    /// An unanswered entry nothing will answer: its sender is kept alive, as
+    /// in a child after `fork()`, where the lookup threads don't exist.
+    fn insert_orphan(
+        r: &CachingResolver,
+        started: Instant,
+        pid: u32,
+    ) -> watch::Sender<Option<Answer>> {
         let (orphan_tx, orphan_rx) = watch::channel(None);
-        let long_ago = Instant::now()
-            .checked_sub(STUCK_AFTER + Duration::from_secs(1))
-            .expect("monotonic clock far enough from its origin");
+        let slot = Slot {
+            entry: orphan_rx,
+            started,
+            pid,
+        };
         r.entries
             .lock()
             .unwrap()
-            .insert("example.com".to_owned(), (orphan_rx, long_ago));
-        let addrs = tokio::time::timeout(Duration::from_secs(10), resolve(&r, "example.com"))
+            .insert("example.com".to_owned(), slot);
+        orphan_tx
+    }
+
+    async fn resolves_with_one_new_lookup(r: &Arc<CachingResolver>, calls: &AtomicUsize) {
+        let addrs = tokio::time::timeout(Duration::from_secs(10), resolve(r, "example.com"))
             .await
             .expect("waited on the orphaned entry")
             .unwrap();
         assert_eq!(addrs, vec!["10.0.0.1:0".parse().unwrap()]);
         assert_eq!(calls.load(Ordering::SeqCst), 1);
-        drop(orphan_tx);
+    }
+
+    #[tokio::test]
+    async fn an_entry_from_another_process_is_replaced_at_once() {
+        let (lookup, calls) = counting(Duration::ZERO, false);
+        let r = Arc::new(CachingResolver::new(TTL, HEDGE, lookup));
+        let parent = std::process::id().wrapping_add(1);
+        let _orphan = insert_orphan(&r, Instant::now(), parent);
+        resolves_with_one_new_lookup(&r, &calls).await;
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_entry_past_its_deadline_is_replaced() {
+        let (lookup, calls) = counting(Duration::ZERO, false);
+        let mut r = CachingResolver::new(TTL, HEDGE, lookup);
+        r.stuck_after = Duration::from_millis(20);
+        let r = Arc::new(r);
+        let _orphan = insert_orphan(&r, Instant::now(), std::process::id());
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        resolves_with_one_new_lookup(&r, &calls).await;
     }
 
     #[tokio::test]
