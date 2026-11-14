@@ -20,6 +20,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- When an execute response already holds the whole result inline, `execute()`
+  closes the server statement right away instead of when the caller finishes
+  reading it, and `cancel()` on a closed statement no longer sends a request.
 
 ### Updated
 

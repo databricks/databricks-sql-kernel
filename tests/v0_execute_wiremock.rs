@@ -2819,6 +2819,114 @@ async fn try_next_batch_drain_auto_closes_statement() {
     // `_close` also verifies expect(1) when it drops at end of scope.
 }
 
+/// A `SUCCEEDED` response that already holds the whole result is closed by
+/// `execute()` itself, before anything is read; reading, closing, cancelling
+/// and dropping the handle afterwards send no second close and no cancel.
+#[tokio::test]
+async fn execute_closes_complete_inline_result_before_it_is_read() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-early", &batch)).await;
+    let _close = Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-early"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount_as_scoped(&server)
+        .await;
+    let _no_cancel = Mock::given(method("POST"))
+        .and(path("/api/2.0/sql/statements/stmt-early/cancel"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(0)
+        .mount_as_scoped(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    {
+        let mut stmt = session.statement();
+        stmt.spec().sql("SELECT 1 AS n");
+        let mut exec = stmt.execute().await.expect("execute");
+
+        let closes = wait_for_close_delete(
+            &server,
+            "stmt-early",
+            1,
+            std::time::Duration::from_millis(2000),
+        )
+        .await;
+        assert_eq!(closes, 1, "execute must close a complete inline result");
+
+        let batches = drain(exec.result_stream_mut()).await;
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        exec.cancel().await.expect("cancel of a closed statement");
+        exec.close().await.expect("close");
+    }
+
+    // Give a wrongly spawned second close or cancel time to reach the wire.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let closes = wait_for_close_delete(
+        &server,
+        "stmt-early",
+        1,
+        std::time::Duration::from_millis(100),
+    )
+    .await;
+    assert_eq!(closes, 1, "the statement must be closed exactly once");
+}
+
+/// `close()` on a complete inline result that was not read waits for the
+/// close `execute()` started, like any explicit close; after the stream is
+/// drained, `close()` returns without waiting for it.
+#[tokio::test]
+async fn close_waits_for_the_early_close_only_before_the_stream_is_drained() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-slow-close", &batch)).await;
+    let close_delay = Duration::from_millis(400);
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-slow-close"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string("{}")
+                .set_delay(close_delay),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+
+    let exec = stmt.execute().await.expect("execute");
+    let started = Instant::now();
+    exec.close().await.expect("close");
+    assert!(
+        started.elapsed() >= close_delay / 2,
+        "close() before draining must wait for the CloseStatement reply"
+    );
+    drop(exec);
+
+    let mut exec = stmt.execute().await.expect("re-execute");
+    // Drain through the handle, as the bindings do, so end-of-stream is seen.
+    while exec.next_batch().await.expect("next_batch").is_some() {}
+    let started = Instant::now();
+    exec.close().await.expect("close after drain");
+    assert!(
+        started.elapsed() < close_delay / 2,
+        "close() after draining must not wait for the CloseStatement reply"
+    );
+    drop(exec);
+    drop(stmt);
+    // Let the second close reach the server before `expect(2)` is verified.
+    tokio::time::sleep(close_delay + Duration::from_millis(200)).await;
+    session.close().await.expect("session close");
+}
+
 // ─── Client query timeout ───────────────────────────────────────────
 
 #[tokio::test]

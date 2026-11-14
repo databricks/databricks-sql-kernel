@@ -2020,6 +2020,12 @@ async fn primary_keys_rejects_invalid_current_namespace_and_closes_lookup() {
             1,
             "invalid namespace must not issue SHOW KEYS"
         );
+        // A lookup that read to the end closes its statement fire-and-forget.
+        assert_eq!(
+            wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
+            1,
+            "namespace case {index}: the lookup statement must be closed"
+        );
         session.close().await.unwrap();
         server.verify().await;
     }

@@ -129,6 +129,10 @@ pub(crate) struct ExecuteResult {
     /// `display_message` / etc. without a second GetStatementStatus
     /// round-trip.
     pub status: StatementStatus,
+    /// The `Succeeded` response carried the whole result inline (one chunk,
+    /// nothing left to fetch), so the server statement can be closed before
+    /// the result is read.
+    pub result_complete: bool,
 }
 
 impl std::fmt::Debug for ExecuteResult {
@@ -140,6 +144,7 @@ impl std::fmt::Debug for ExecuteResult {
             .field("telemetry_result_format", &self.telemetry_result_format)
             .field("telemetry_is_compressed", &self.telemetry_is_compressed)
             .field("status", &self.status)
+            .field("result_complete", &self.result_complete)
             .finish()
     }
 }

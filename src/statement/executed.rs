@@ -29,7 +29,6 @@
 //! separately.
 
 use crate::kernel_error::Result;
-use crate::klog::warn;
 use crate::result_stream::{ResultBatch, ResultStream, SchemaRef};
 use crate::session::SessionInner;
 use crate::statement::handle::ExecutedStatementHandle;
@@ -37,7 +36,8 @@ use crate::statement::validity::ValidityFlag;
 use crate::types::sea::StatementStatus as SeaStatementStatus;
 use async_trait::async_trait;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use tokio::task::JoinHandle;
 use tracing::Instrument;
 
 /// Sync-consumption executed handle.
@@ -59,6 +59,10 @@ pub struct ExecutedStatement {
     /// skip its fire-and-forget cleanup so an explicit close
     /// doesn't trigger a redundant background spawn.
     closed: Arc<AtomicBool>,
+    /// The CloseStatement `execute()` started for a result it already held
+    /// in full. An explicit `close()` before the stream is drained waits for
+    /// it, as it would for its own close; draining or dropping lets it run on.
+    early_close: Mutex<Option<JoinHandle<Result<()>>>>,
 }
 
 impl ExecutedStatement {
@@ -85,7 +89,22 @@ impl ExecutedStatement {
             result_stream,
             closed,
             status,
+            early_close: Mutex::new(None),
         }
+    }
+
+    /// Record the CloseStatement `execute()` started (the `closed` flag is
+    /// already set).
+    pub(crate) fn with_early_close(self, task: JoinHandle<Result<()>>) -> Self {
+        *self.early_close.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        self
+    }
+
+    fn take_early_close(&self) -> Option<JoinHandle<Result<()>>> {
+        self.early_close
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Result schema. Available without iterating any batches; mirrors
@@ -204,8 +223,17 @@ impl ExecutedStatement {
         // so the only cost of the race is one redundant RPC — far
         // better than dropping the retry contract.
         async {
-            if self.closed.load(Ordering::Acquire) {
-                return Ok(());
+            match self.take_early_close() {
+                // execute() already sent the close: wait for it, and send it
+                // again if it failed.
+                Some(task) => {
+                    if matches!(task.await, Ok(Ok(()))) {
+                        return Ok(());
+                    }
+                    self.closed.store(false, Ordering::Release);
+                }
+                None if self.closed.load(Ordering::Acquire) => return Ok(()),
+                None => {}
             }
             self.session
                 .transport()
@@ -221,24 +249,17 @@ impl ExecutedStatement {
     /// Spawn a fire-and-forget `CloseStatement` unless the statement is
     /// already closed (`closed` flag). Shared by [`Self::next_batch`]'s
     /// auto-close-on-drain and `Drop`. The `swap` makes whichever fires
-    /// first win; the other observes `closed=true` and skips.
+    /// first win; the other observes `closed=true` and skips. A close that
+    /// `execute()` started is left to finish on its own.
     fn spawn_close_if_open(&self) {
+        drop(self.take_early_close());
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
-        let transport = Arc::clone(self.session.transport());
-        let runtime = self.session.runtime_handle().clone();
-        let stmt_id = self.statement_id.clone();
-        runtime.spawn(async move {
-            if let Err(e) = transport.close_statement(&stmt_id).await {
-                warn!(
-                    statement_id = %stmt_id,
-                    error = %e,
-                    "fire-and-forget close_statement failed; \
-                     server-side resource reclaimed when the session closes"
-                );
-            }
-        });
+        drop(
+            self.session
+                .spawn_close_statement(self.statement_id.clone()),
+        );
     }
 
     /// Rows modified by the statement (UPDATE / INSERT / DELETE /
@@ -354,6 +375,10 @@ impl ExecutedStatementHandle for ExecutedStatement {
         // `ExecutedStatementHandle` trait bound.
         async {
             self.valid.check()?;
+            // A closed statement has finished: there is nothing to cancel.
+            if self.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)

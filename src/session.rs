@@ -200,6 +200,28 @@ impl SessionInner {
         &self.runtime_handle
     }
 
+    /// `CloseStatement` for `statement_id` as a task on the session runtime.
+    /// A failure is logged; the server reclaims the statement when the session
+    /// closes. Dropping the handle leaves the close running.
+    pub(crate) fn spawn_close_statement(
+        &self,
+        statement_id: String,
+    ) -> tokio::task::JoinHandle<Result<()>> {
+        let transport = Arc::clone(&self.transport);
+        self.runtime_handle.spawn(async move {
+            let result = transport.close_statement(&statement_id).await;
+            if let Err(e) = &result {
+                crate::klog::warn!(
+                    statement_id = %statement_id,
+                    error = %e,
+                    "fire-and-forget close_statement failed; \
+                     server-side resource reclaimed when the session closes"
+                );
+            }
+            result
+        })
+    }
+
     pub(crate) fn dispatch_timeout_cleanup(&self, statement_id: Option<String>) {
         self.timeout_cleanup.dispatch(
             &self.runtime_handle,

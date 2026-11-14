@@ -396,15 +396,18 @@ impl Statement {
             guard.defuse();
 
             let valid = ValidityFlag::new();
-            // Only `Closed` triggers the short-circuit. `Succeeded` means
-            // the server still owns the statement and we must issue
-            // CloseStatement. `Failed` / `Canceled` are terminal but still
-            // server-side-tracked — also fall through to the standard close
-            // path. See `prepare_for_dispatch` for why omitting
-            // `wait_timeout` typically yields `Closed` on the inline-result
-            // fast path.
+            // `Closed`: the server already cleaned up, no CloseStatement.
+            // `Succeeded`: the server still owns the statement and we must
+            // issue CloseStatement. When the response already holds the whole
+            // result, nothing more is read from the statement, so close it
+            // now, from this call (which the bindings run without the GIL),
+            // rather than when the caller finishes reading.
             let already_closed = result.status.state == StatementState::Closed;
-            let closed = Arc::new(AtomicBool::new(already_closed));
+            let early_close = (!already_closed && result.result_complete).then(|| {
+                self.session
+                    .spawn_close_statement(result.statement_id.clone())
+            });
+            let closed = Arc::new(AtomicBool::new(already_closed || early_close.is_some()));
             self.last_statement_id = Some(result.statement_id.clone());
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
@@ -429,7 +432,10 @@ impl Statement {
                 closed,
                 status,
             );
-            Ok(executed)
+            Ok(match early_close {
+                Some(task) => executed.with_early_close(task),
+                None => executed,
+            })
         }
         .instrument(span)
         .await;

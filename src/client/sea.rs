@@ -182,6 +182,9 @@ pub(crate) struct SeaRestTransport {
     session_version: AtomicI64,
     reader_factory: OnceLock<ResultReaderFactory>,
     runtime_handle: OnceLock<RuntimeHandle>,
+    /// `{base_url}/statements`, parsed once the session route is known, so
+    /// per-statement requests don't format and re-parse the URL.
+    statements_url: OnceLock<reqwest::Url>,
 }
 
 impl std::fmt::Debug for SeaRestTransport {
@@ -224,7 +227,33 @@ impl SeaRestTransport {
             session_version: AtomicI64::new(NO_SESSION_VERSION),
             reader_factory: OnceLock::new(),
             runtime_handle: OnceLock::new(),
+            statements_url: OnceLock::new(),
         }
+    }
+
+    /// `{base_url}/statements` followed by `segments` (e.g. a statement id).
+    fn statements_url(&self, segments: &[&str]) -> Result<reqwest::Url> {
+        let parse = || {
+            reqwest::Url::parse(&format!("{}/statements", self.base_url())).map_err(|e| {
+                Error::invalid_argument().message(format!("Failed to build request URL: {e}"))
+            })
+        };
+        // The base URL is fixed once the session route is set; before that
+        // (session creation) it is parsed per call.
+        let mut url = match (self.session_route.get(), self.statements_url.get()) {
+            (Some(_), Some(url)) => url.clone(),
+            (Some(_), None) => {
+                let url = parse()?;
+                self.statements_url.get_or_init(|| url).clone()
+            }
+            (None, _) => parse()?,
+        };
+        if !segments.is_empty() {
+            url.path_segments_mut()
+                .map_err(|()| Error::invalid_argument().message("statement URL cannot be a base"))?
+                .extend(segments);
+        }
+        Ok(url)
     }
 
     /// Set the reader factory and runtime handle. Must be called once after wrapping in `Arc`.
@@ -656,7 +685,7 @@ impl SeaRestTransport {
         request_type: RequestType,
         metadata_operation: Option<MetadataOperation>,
     ) -> Result<ExecuteResponse> {
-        let url = format!("{}/statements", self.base_url());
+        let url = self.statements_url(&[])?;
 
         let (warehouse_id, session_id) = match self.session_route.get() {
             Some(SessionRoute::Standard { .. }) | None => (
@@ -687,7 +716,7 @@ impl SeaRestTransport {
         let mut builder = self
             .http_client
             .inner()
-            .request(Method::POST, &url)
+            .request(Method::POST, url)
             .header("Content-Type", "application/json");
 
         // Signal that a metadata query may be served fully synchronously, so
@@ -874,6 +903,7 @@ impl SeaRestTransport {
         // GetStatementStatus round-trip.
         let telemetry_result_format = Self::telemetry_result_format(&response);
         let telemetry_is_compressed = Self::telemetry_is_compressed(&response);
+        let result_complete = Self::result_is_complete_inline(&response);
         Ok(ExecuteResult {
             statement_id: response.statement_id,
             reader,
@@ -881,7 +911,28 @@ impl SeaRestTransport {
             telemetry_result_format,
             telemetry_is_compressed,
             status: response.status,
+            result_complete,
         })
+    }
+
+    /// Whether a `Succeeded` response carries its whole result inline: an
+    /// attachment, no next chunk or links, and at most one chunk in total.
+    fn result_is_complete_inline(response: &ExecuteResponse) -> bool {
+        if response.status.state != StatementState::Succeeded {
+            return false;
+        }
+        let Some(result) = response.result.as_ref() else {
+            return false;
+        };
+        result.inline_arrow_data.is_some()
+            && result.inline_next_chunk_index.is_none()
+            && result.next_chunk_internal_link.is_none()
+            && result.external_links.as_ref().is_none_or(Vec::is_empty)
+            && response
+                .manifest
+                .as_ref()
+                .and_then(|m| m.total_chunk_count)
+                .is_none_or(|n| n <= 1)
     }
 
     /// Execute a SQL statement end-to-end: raw execution → result materialisation.
@@ -1067,7 +1118,13 @@ const DISCARD_BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_mill
 /// ignored, and a stalled body is dropped after [`DISCARD_BODY_TIMEOUT`]
 /// (losing only the connection) rather than delaying the caller.
 async fn discard_body(response: reqwest::Response) {
-    let _ = tokio::time::timeout(DISCARD_BODY_TIMEOUT, response.bytes()).await;
+    let mut body = std::pin::pin!(response.bytes());
+    // The reply is a few bytes that usually arrive with the headers: take it
+    // without arming a timer.
+    if futures::poll!(body.as_mut()).is_ready() {
+        return;
+    }
+    let _ = tokio::time::timeout(DISCARD_BODY_TIMEOUT, body).await;
 }
 
 /// Convert a parsed `GetChunksResponse` into the kernel-facing
@@ -1369,6 +1426,7 @@ impl Transport for SeaRestTransport {
                     telemetry_result_format,
                     telemetry_is_compressed,
                     status: r.status,
+                    result_complete: false,
                 }))
             }
             // Still running after the inline wait → hand back a running handle;
@@ -1406,6 +1464,7 @@ impl Transport for SeaRestTransport {
                     telemetry_result_format,
                     telemetry_is_compressed,
                     status: r.status,
+                    result_complete: false,
                 }))
             }
             StatementOutcome::NotReady(_) => Ok(None),
@@ -1590,14 +1649,14 @@ impl Transport for SeaRestTransport {
     }
 
     async fn cancel_statement(&self, statement_id: &str) -> Result<()> {
-        let url = format!("{}/statements/{}/cancel", self.base_url(), statement_id);
+        let url = self.statements_url(&[statement_id, "cancel"])?;
 
         debug!("Canceling statement at {}", url);
 
         let request = self
             .http_client
             .inner()
-            .request(Method::POST, &url)
+            .request(Method::POST, url)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -1615,14 +1674,14 @@ impl Transport for SeaRestTransport {
     }
 
     async fn close_statement(&self, statement_id: &str) -> Result<()> {
-        let url = format!("{}/statements/{}", self.base_url(), statement_id);
+        let url = self.statements_url(&[statement_id])?;
 
         debug!("Closing statement at {}", url);
 
         let request = self
             .http_client
             .inner()
-            .request(Method::DELETE, &url)
+            .request(Method::DELETE, url)
             .build()
             .map_err(|e| {
                 Error::invalid_argument().message(format!("Failed to build request: {e}"))
@@ -2364,6 +2423,136 @@ mod tests {
             TransportConfig::default(),
         );
         assert_eq!(client.base_url(), "https://test.databricks.com/api/2.0/sql");
+    }
+
+    #[test]
+    fn statements_url_matches_the_formatted_url_before_and_after_the_route_is_set() {
+        let retry_configs = build_retry_configs(&RetryConfig::default(), &HashMap::new());
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(HttpClientConfig::default(), retry_configs).unwrap(),
+        );
+        let client = SeaRestTransport::new(
+            http_client,
+            "https://test.databricks.com/",
+            "warehouse-123",
+            TransportConfig::default(),
+        );
+        let base = "https://test.databricks.com/api/2.0/sql/statements";
+        assert_eq!(client.statements_url(&[]).unwrap().as_str(), base);
+        assert_eq!(
+            client.statements_url(&["s-1"]).unwrap().as_str(),
+            format!("{base}/s-1")
+        );
+
+        let session_url = "https://test.databricks.com/api/2.0/sql/warehouses/w/sessions/abc";
+        client
+            .session_route
+            .set(SessionRoute::Realtime {
+                session_url: session_url.to_string(),
+            })
+            .unwrap();
+        for _ in 0..2 {
+            // The second round reads the cached URL.
+            assert_eq!(
+                client.statements_url(&[]).unwrap().as_str(),
+                format!("{session_url}/statements")
+            );
+            assert_eq!(
+                client.statements_url(&["s-2", "cancel"]).unwrap().as_str(),
+                format!("{session_url}/statements/s-2/cancel")
+            );
+        }
+    }
+
+    #[test]
+    fn result_is_complete_inline_only_for_a_single_inline_chunk() {
+        use crate::types::sea::{ResultManifest, ResultSchema, StatementState, StatementStatus};
+        let response =
+            |state: StatementState, chunks: Option<i64>, data: ExecuteResultData| ExecuteResponse {
+                statement_id: "s".to_string(),
+                status: StatementStatus {
+                    state,
+                    error: None,
+                    sql_state: None,
+                    session_version: None,
+                    num_modified_rows: None,
+                    display_message: None,
+                    diagnostic_info: None,
+                    error_details_json: None,
+                },
+                manifest: Some(ResultManifest {
+                    format: "ARROW_STREAM".to_string(),
+                    schema: ResultSchema {
+                        column_count: 0,
+                        columns: vec![],
+                    },
+                    arrow_schema: None,
+                    total_chunk_count: chunks,
+                    total_row_count: None,
+                    total_byte_count: None,
+                    truncated: false,
+                    chunks: None,
+                    result_compression: None,
+                    is_native_metadata_result: None,
+                }),
+                result: Some(data),
+            };
+        let inline = || ExecuteResultData {
+            next_chunk_internal_link: None,
+            external_links: None,
+            inline_arrow_data: Some(vec![1, 2, 3]),
+            inline_chunk_index: Some(0),
+            inline_row_offset: Some(0),
+            inline_row_count: Some(1),
+            inline_next_chunk_index: None,
+        };
+        let complete = |r: &ExecuteResponse| SeaRestTransport::result_is_complete_inline(r);
+
+        assert!(complete(&response(
+            StatementState::Succeeded,
+            Some(1),
+            inline()
+        )));
+        assert!(complete(&response(
+            StatementState::Succeeded,
+            None,
+            inline()
+        )));
+        // Already closed by the server, or more chunks / links to fetch.
+        assert!(!complete(&response(
+            StatementState::Closed,
+            Some(1),
+            inline()
+        )));
+        assert!(!complete(&response(
+            StatementState::Succeeded,
+            Some(2),
+            inline()
+        )));
+        let mut paged = inline();
+        paged.inline_next_chunk_index = Some(1);
+        assert!(!complete(&response(
+            StatementState::Succeeded,
+            Some(1),
+            paged
+        )));
+        let mut linked = inline();
+        linked.next_chunk_internal_link = Some("/next".to_string());
+        assert!(!complete(&response(
+            StatementState::Succeeded,
+            Some(1),
+            linked
+        )));
+        let mut no_data = inline();
+        no_data.inline_arrow_data = None;
+        assert!(!complete(&response(
+            StatementState::Succeeded,
+            Some(1),
+            no_data
+        )));
+        let mut no_result = response(StatementState::Succeeded, Some(1), inline());
+        no_result.result = None;
+        assert!(!complete(&no_result));
     }
 
     #[test]
