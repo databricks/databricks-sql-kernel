@@ -40,6 +40,7 @@ mod logging;
 mod metadata;
 mod params;
 mod result_stream;
+mod rows;
 mod runtime;
 mod session;
 mod statement;
@@ -87,8 +88,10 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<executed_async::AsyncStatementReader>()?;
     m.add_class::<metadata::Metadata>()?;
     m.add_class::<result_stream::ResultStream>()?;
+    m.add_class::<rows::SchemaKey>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(rows::rows_from_arrow, m)?)?;
 
     // Install the log bridge at module import so *any* consumer of the
     // bare wheel (the connector, integration tests, custom embedders)

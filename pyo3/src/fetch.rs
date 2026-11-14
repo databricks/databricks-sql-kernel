@@ -25,6 +25,7 @@ use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{Error, ExecutedStatement, Result, ResultBatch, ResultStream};
 use pyo3::prelude::*;
+use std::collections::VecDeque;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
 
@@ -102,6 +103,60 @@ pub(crate) fn drain_exec(
             }
         }
         Ok(out)
+    })
+}
+
+/// Pull batches into `pending` until it holds more than `max_rows` rows or
+/// the stream ends. Returns whether the stream ended.
+pub(crate) fn fill(
+    runtime: &Runtime,
+    stream: &mut ResultStream,
+    pending: &mut VecDeque<RecordBatch>,
+    max_rows: usize,
+) -> Result<bool> {
+    runtime.block_on(async {
+        let mut rows: usize = pending.iter().map(RecordBatch::num_rows).sum();
+        while rows <= max_rows {
+            match stream.next_batch().await? {
+                Some(ResultBatch::Arrow(rb)) => {
+                    rows += rb.num_rows();
+                    pending.push_back(rb.clone());
+                }
+                Some(_) => {
+                    return Err(Error::invalid_argument()
+                        .message("kernel returned a non-Arrow ResultBatch variant"));
+                }
+                None => return Ok(true),
+            }
+        }
+        Ok(false)
+    })
+}
+
+/// Like [`fill`], but drives the `ExecutedStatement` so auto-close-on-drain
+/// fires once the stream is exhausted.
+pub(crate) fn fill_exec(
+    runtime: &Runtime,
+    exec: &mut ExecutedStatement,
+    pending: &mut VecDeque<RecordBatch>,
+    max_rows: usize,
+) -> Result<bool> {
+    runtime.block_on(async {
+        let mut rows: usize = pending.iter().map(RecordBatch::num_rows).sum();
+        while rows <= max_rows {
+            match exec.next_batch().await? {
+                Some(ResultBatch::Arrow(rb)) => {
+                    rows += rb.num_rows();
+                    pending.push_back(rb.clone());
+                }
+                Some(_) => {
+                    return Err(Error::invalid_argument()
+                        .message("kernel returned a non-Arrow ResultBatch variant"));
+                }
+                None => return Ok(true),
+            }
+        }
+        Ok(false)
     })
 }
 
