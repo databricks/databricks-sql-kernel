@@ -90,9 +90,10 @@ impl ResultStream {
     fn fetch_all_rows<'py>(
         &mut self,
         py: Python<'py>,
-        max_rows: usize,
+        max_rows: i64,
         nan_ok: bool,
     ) -> PyResult<Option<Bound<'py, PyList>>> {
+        let max_rows = rows::max_rows(py, max_rows)?;
         let inner = alive_mut!(self, "ResultStream");
         if !self.rows_supported {
             return Ok(None);
@@ -139,14 +140,15 @@ impl ResultStream {
     /// Drain the full result and return a single `pyarrow.Table`.
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = alive_mut!(self, "ResultStream");
-        let mut drained = Vec::new();
         if !inner.exhausted {
             let runtime = inner.runtime.clone();
-            drained = run_sync_kernel!(py, fetch::drain(&runtime, &mut inner.stream))?;
-            inner.exhausted = true;
+            // Read through `pending`, so a failed read loses no batch.
+            inner.exhausted = run_sync_kernel!(
+                py,
+                fetch::fill(&runtime, &mut inner.stream, &mut inner.pending, usize::MAX)
+            )?;
         }
-        // `pending` stays put if the drain fails, for the next fetch.
-        let batches: Vec<RecordBatch> = inner.pending.drain(..).chain(drained).collect();
+        let batches: Vec<RecordBatch> = inner.pending.drain(..).collect();
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
 

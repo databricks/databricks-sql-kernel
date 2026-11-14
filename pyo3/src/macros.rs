@@ -119,7 +119,7 @@ macro_rules! run_kernel_block {
     }};
 }
 
-/// Run a synchronous helper (e.g. `fetch::next_batch` / `fetch::drain`,
+/// Run a synchronous helper (e.g. `fetch::next_batch` / `fetch::fill`,
 /// which `block_on` internally) with the GIL released, mapping kernel
 /// errors into `KernelError`.
 ///
