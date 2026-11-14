@@ -374,7 +374,8 @@ impl ExecutedStatement {
         if !self.rows_supported {
             return Ok(None);
         }
-        if !inner.exhausted {
+        // No GIL hand-off when an earlier call already read more than fits.
+        if !inner.exhausted && rows::pending_rows(&inner.pending) <= max_rows {
             let runtime = inner.runtime.clone();
             inner.exhausted = run_sync_kernel!(
                 py,

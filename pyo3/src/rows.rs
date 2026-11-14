@@ -101,6 +101,10 @@ pub(crate) fn schema_is_supported(schema: &Schema) -> bool {
     schema.fields().iter().all(|f| is_supported(f.data_type()))
 }
 
+pub(crate) fn pending_rows(pending: &VecDeque<RecordBatch>) -> usize {
+    pending.iter().map(RecordBatch::num_rows).sum()
+}
+
 /// The rows in `pending` if the stream `ended` with at most `max_rows` of
 /// them and they convert, clearing `pending`; otherwise `None`, leaving
 /// `pending` for the Arrow fetches.
@@ -112,7 +116,7 @@ pub(crate) fn take_rows<'py>(
     max_rows: usize,
     nan_ok: bool,
 ) -> PyResult<Option<Bound<'py, PyList>>> {
-    if !ended || pending.iter().map(RecordBatch::num_rows).sum::<usize>() > max_rows {
+    if !ended || pending_rows(pending) > max_rows {
         return Ok(None);
     }
     let rows = rows_to_py(py, schema, pending.make_contiguous(), nan_ok)?;
