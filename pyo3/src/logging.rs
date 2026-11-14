@@ -94,24 +94,23 @@ use databricks_sql_kernel::KERNEL_LOG_TARGET as KERNEL_TARGET;
 /// customer can isolate boundary logs from core kernel logs by name.
 pub(crate) const PYO3_LOG_TARGET: &str = "databricks::sql::kernel::pyo3";
 
-/// One-time install state. Tristate (rather than `Option<ResetHandle>`)
-/// so a *failed* install is sticky: we don't retry `Logger::install()`
-/// — which re-walks construction + the global-logger set — on every
-/// subsequent `init_logging` call.
+/// One-time install state. Tristate so a *failed* install is sticky: we
+/// don't retry `Logger::install()` — which re-walks construction + the
+/// global-logger set — on every subsequent `init_logging` call. The
+/// installed bridge's reset handle is kept in [`RESET_HANDLE`].
 enum LogState {
     /// No install attempted yet.
     NotInstalled,
-    /// Installed; handle retained for [`reset_logging`].
-    Installed(ResetHandle),
+    /// Installed.
+    Installed,
     /// Install was attempted and failed (or `Logger` construction
     /// failed). Sticky — we won't try again this process.
     Failed,
 }
 
-/// Holds the install state so [`reset_logging`] can reach the
-/// `ResetHandle` and repeated `init_logging` calls stay cheap. `Mutex`
-/// poisoning is handled (`into_inner`) rather than `unwrap`-panicked —
-/// a logging helper must never take down the process.
+/// Holds the install state so repeated `init_logging` calls stay cheap.
+/// `Mutex` poisoning is handled (`into_inner`) rather than
+/// `unwrap`-panicked — a logging helper must never take down the process.
 static LOG_STATE: OnceLock<Mutex<LogState>> = OnceLock::new();
 
 /// Lock the state, recovering the guard if a previous holder panicked
@@ -183,6 +182,13 @@ impl<L: log::Log> log::Log for ExitGuard<L> {
 /// failed, or another global `log` logger is already set). Never panics:
 /// a logging helper must not be able to tear down the host process.
 pub(crate) fn init_logging(py: Python<'_>) -> bool {
+    if RESET_HANDLE.get().is_some() {
+        return false;
+    }
+    // Read the levels before taking the install lock: the read runs Python
+    // code, during which another thread may take the GIL and then block on
+    // that lock.
+    let levels = PythonLevels::read(py);
     let mut state = lock_state();
     // Already installed, or a prior attempt failed — don't retry. Retry
     // would re-run `Logger::install()`'s global-logger set, which is not
@@ -220,12 +226,11 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
     let handle = logger.reset_handle();
     match log::set_boxed_logger(Box::new(ExitGuard(logger))) {
         Ok(()) => {
-            let levels = PythonLevels::read(py);
-            log::set_max_level(levels.max_level);
-            LEVELS_FINGERPRINT.store(levels.fingerprint, Ordering::Relaxed);
+            let _ = RESET_HANDLE.set(handle);
+            apply(levels, false);
             // Best effort: without the hook, records still flow until exit.
             let _ = register_exit_hook(py);
-            *state = LogState::Installed(handle);
+            *state = LogState::Installed;
             true
         }
         Err(_) => {
@@ -246,14 +251,8 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
 /// first kernel log) takes effect. No-op if logging was never installed.
 /// Never panics.
 pub(crate) fn reset_logging(py: Python<'_>) {
-    if !is_installed() {
-        return;
-    }
-    let levels = PythonLevels::read(py);
-    log::set_max_level(levels.max_level);
-    LEVELS_FINGERPRINT.store(levels.fingerprint, Ordering::Relaxed);
-    if let LogState::Installed(handle) = &*lock_state() {
-        handle.reset();
+    if RESET_HANDLE.get().is_some() {
+        apply(PythonLevels::read(py), true);
     }
 }
 
@@ -261,29 +260,71 @@ pub(crate) fn reset_logging(py: Python<'_>) {
 /// is created, so levels a customer sets before connecting apply without
 /// [`reset_logging`]. If any logger's level changed since the last read,
 /// `pyo3_log`'s cache is cleared too: a logger it cached at the old level
-/// would otherwise keep dropping newly enabled records. No-op if logging
-/// was never installed.
+/// would otherwise keep dropping newly enabled records. When no level
+/// changed, this costs one attribute read. No-op if logging was never
+/// installed.
 pub(crate) fn refresh_max_level(py: Python<'_>) {
-    if !is_installed() {
+    if RESET_HANDLE.get().is_some() && !levels_unchanged(py) {
+        apply(PythonLevels::read(py), false);
+    }
+}
+
+/// `pyo3_log`'s reset handle, set once the bridge is installed.
+static RESET_HANDLE: OnceLock<ResetHandle> = OnceLock::new();
+
+/// Orders level reads: each takes a ticket before it reads.
+static NEXT_READ: AtomicU64 = AtomicU64::new(0);
+
+/// The ticket and fingerprint of the last applied read.
+static APPLIED: Mutex<(u64, u64)> = Mutex::new((0, 0));
+
+/// Set `log::max_level` from `levels`, and clear `pyo3_log`'s cache if the
+/// levels changed or `reset` is set.
+///
+/// Reads run Python code, so a read can be interrupted by a thread that
+/// changes a level and applies its own read. A read that started earlier
+/// than the last applied one is therefore not applied: the later read saw
+/// at least as recent a configuration. Nothing in here calls Python, so
+/// holding `APPLIED` can't deadlock with the GIL.
+fn apply(levels: PythonLevels, reset: bool) {
+    let Some(handle) = RESET_HANDLE.get() else {
         return;
+    };
+    let mut applied = APPLIED.lock().unwrap_or_else(|p| p.into_inner());
+    let (applied_ticket, applied_fingerprint) = *applied;
+    let mut changed = false;
+    if levels.ticket > applied_ticket {
+        changed = levels.fingerprint != applied_fingerprint;
+        *applied = (levels.ticket, levels.fingerprint);
+        log::set_max_level(levels.max_level);
     }
-    let levels = PythonLevels::read(py);
-    if LEVELS_FINGERPRINT.swap(levels.fingerprint, Ordering::Relaxed) != levels.fingerprint {
-        if let LogState::Installed(handle) = &*lock_state() {
-            handle.reset();
-        }
+    if reset || changed {
+        handle.reset();
     }
-    log::set_max_level(levels.max_level);
 }
 
-fn is_installed() -> bool {
-    matches!(*lock_state(), LogState::Installed(_))
-}
+/// Name of a logger used only to detect level changes; see
+/// [`levels_unchanged`].
+const LEVELS_PROBE: &str = "databricks.sql.kernel._levels_probe";
 
-/// Fingerprint of the Python logger levels last applied to `log::max_level`.
-static LEVELS_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+/// Whether no Python logger level changed since the last read.
+///
+/// `logging` clears every logger's `_cache` on `setLevel()` and
+/// `logging.disable()`. [`PythonLevels::read`] fills the probe logger's
+/// cache before it reads, so a still-filled cache means nothing changed.
+/// Errs towards `false` (do the full read).
+fn levels_unchanged(py: Python<'_>) -> bool {
+    let check = || -> PyResult<bool> {
+        let probe = py
+            .import("logging")?
+            .call_method1("getLogger", (LEVELS_PROBE,))?;
+        Ok(probe.getattr("_cache")?.len()? > 0)
+    };
+    check().unwrap_or(false)
+}
 
 struct PythonLevels {
+    ticket: u64,
     /// The most verbose `log` level any Python logger currently accepts.
     max_level: log::LevelFilter,
     /// Changes whenever a logger is added or its effective level changes.
@@ -298,8 +339,14 @@ impl PythonLevels {
     /// loggers can't be read, falls back to `Trace` (forward everything to
     /// `pyo3_log`, the previous behaviour).
     fn read(py: Python<'_>) -> Self {
+        let ticket = NEXT_READ.fetch_add(1, Ordering::Relaxed) + 1;
         let read = || -> PyResult<Self> {
             let logging = py.import("logging")?;
+            // Fill the probe's cache first, so a level changed during the read
+            // empties it again and the next refresh reads anew.
+            logging
+                .call_method1("getLogger", (LEVELS_PROBE,))?
+                .call_method1("isEnabledFor", (50,))?;
             let root = logging.getattr("root")?;
             let manager = root.getattr("manager")?;
             let logger_type = logging.getattr("Logger")?;
@@ -323,11 +370,13 @@ impl PythonLevels {
             let disabled_up_to: i64 = manager.getattr("disable")?.extract()?;
             disabled_up_to.hash(&mut hasher);
             Ok(Self {
+                ticket,
                 max_level: level_filter_for_python_threshold(lowest.max(disabled_up_to + 1)),
                 fingerprint: hasher.finish(),
             })
         };
         read().unwrap_or(Self {
+            ticket,
             max_level: log::LevelFilter::Trace,
             fingerprint: 0,
         })
@@ -351,10 +400,54 @@ fn level_filter_for_python_threshold(threshold: i64) -> log::LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        level_filter_for_python_threshold, mark_interpreter_exiting, ExitGuard, KERNEL_TARGET,
+        level_filter_for_python_threshold, levels_unchanged, mark_interpreter_exiting, ExitGuard,
+        PythonLevels, KERNEL_TARGET,
     };
     use log::{LevelFilter, Log};
+    use pyo3::prelude::*;
+    use pyo3::types::PyDict;
+    use std::ffi::CString;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    // One test, since Python's logging configuration is process-wide.
+    #[test]
+    fn reads_python_levels_and_detects_changes() {
+        Python::initialize();
+        Python::attach(|py| {
+            let globals = PyDict::new(py);
+            let run = |code: &str| {
+                py.run(&CString::new(code).unwrap(), Some(&globals), None)
+                    .unwrap()
+            };
+            run("import logging\nlogging.root.setLevel(logging.WARNING)\nchild = logging.getLogger('kernel_logging_test.child')");
+
+            let levels = PythonLevels::read(py);
+            assert_eq!(levels.max_level, LevelFilter::Warn);
+            assert!(levels_unchanged(py), "nothing changed since the read");
+            let tickets = levels.ticket;
+
+            run("child.setLevel(logging.DEBUG)");
+            assert!(!levels_unchanged(py), "setLevel must be detected");
+            let levels = PythonLevels::read(py);
+            assert_eq!(levels.max_level, LevelFilter::Debug);
+            assert!(levels.ticket > tickets, "each read takes a later ticket");
+            assert!(levels_unchanged(py));
+
+            run("logging.disable(logging.CRITICAL)");
+            assert!(!levels_unchanged(py), "logging.disable must be detected");
+            assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Off);
+
+            run("logging.disable(logging.NOTSET)\nchild.setLevel(logging.NOTSET)\nlogging.root.setLevel(logging.NOTSET)");
+            assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Trace);
+
+            // A new logger with no level of its own changes nothing.
+            run("logging.root.setLevel(logging.WARNING)");
+            let before = PythonLevels::read(py).max_level;
+            run("logging.getLogger('kernel_logging_test.other')");
+            assert!(levels_unchanged(py));
+            assert_eq!(PythonLevels::read(py).max_level, before);
+        });
+    }
 
     #[test]
     fn python_thresholds_map_to_the_levels_pyo3_log_forwards() {
