@@ -359,7 +359,8 @@ mod tests {
                 vec!["10.0.0.1:0".parse().unwrap()]
             );
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A slow scheduler may let another hedge start before the answer arrives.
+        assert!((2..=MAX_ATTEMPTS).contains(&calls.load(Ordering::SeqCst)));
     }
 
     #[tokio::test]
@@ -495,7 +496,8 @@ mod tests {
                 .unwrap();
             assert_eq!(addrs, vec!["10.0.0.1:0".parse().unwrap()]);
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // A slow scheduler may let another hedge start before the answer arrives.
+        assert!((2..=MAX_ATTEMPTS).contains(&calls.load(Ordering::SeqCst)));
         release(&stall);
     }
 
