@@ -62,6 +62,7 @@ enum CommitState {
 #[derive(Default)]
 pub(crate) struct VolumeState {
     retry: RetryConfig,
+    download_read_timeout: Option<std::time::Duration>,
     serial: tokio::sync::Mutex<()>,
     commit: Mutex<CommitState>,
     changed: Notify,
@@ -72,9 +73,13 @@ fn cancelled() -> Error {
 }
 
 impl VolumeState {
-    pub(crate) fn new(retry: RetryConfig) -> Arc<Self> {
+    pub(crate) fn new(
+        retry: RetryConfig,
+        download_read_timeout: Option<std::time::Duration>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             retry,
+            download_read_timeout,
             ..Self::default()
         })
     }
@@ -306,7 +311,15 @@ impl VolumeState {
             None
         };
 
-        let mut response = request.send().await.map_err(storage_error)?;
+        let read_timeout = if instruction.operation == "GET" {
+            self.download_read_timeout
+        } else {
+            None
+        };
+        let mut response = storage_read(read_timeout, async {
+            request.send().await.map_err(storage_error)
+        })
+        .await?;
         let status = response.status();
         if !status.is_success()
             && !(instruction.operation == "REMOVE"
@@ -326,7 +339,11 @@ impl VolumeState {
                     status.as_u16()
                 )));
         }
-        while let Some(bytes) = response.chunk().await.map_err(response_body_error)? {
+        while let Some(bytes) = storage_read(read_timeout, async {
+            response.chunk().await.map_err(response_body_error)
+        })
+        .await?
+        {
             if let Some((_, writer)) = destination.as_mut() {
                 writer
                     .write_all(&bytes)
@@ -356,6 +373,23 @@ fn invalid(message: &str) -> Error {
     Error::invalid_argument().message(message)
 }
 
+async fn storage_read<T>(
+    timeout: Option<std::time::Duration>,
+    read: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, read)
+            .await
+            .unwrap_or_else(|_| {
+                Err(Error::network_error()
+                    .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
+                    .with_retryable(true)
+                    .message("Volume storage download read timed out"))
+            }),
+        None => read.await,
+    }
+}
+
 fn storage_error(error: reqwest::Error) -> Error {
     // A file reader's failure is wrapped in a request error by the HTTP stack.
     let source_body_failed = std::iter::successors(
@@ -371,6 +405,7 @@ fn storage_error(error: reqwest::Error) -> Error {
         && RetryStrategy::for_request(RequestType::CloudFetchDownload, &RetryConfig::default())
             .is_retryable_error(&error);
     Error::network_error()
+        .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
         .with_retryable(retryable)
         .message(format!(
             "Volume storage request failed: {}",
@@ -602,12 +637,15 @@ mod tests {
     }
 
     fn transfer_state(max_retries: u32) -> Arc<VolumeState> {
-        VolumeState::new(RetryConfig {
-            max_retries,
-            min_wait: Duration::ZERO,
-            max_wait: Duration::ZERO,
-            ..Default::default()
-        })
+        VolumeState::new(
+            RetryConfig {
+                max_retries,
+                min_wait: Duration::ZERO,
+                max_wait: Duration::ZERO,
+                ..Default::default()
+            },
+            None,
+        )
     }
 
     #[tokio::test]
@@ -722,13 +760,16 @@ mod tests {
                 .expect(requests)
                 .mount(&server)
                 .await;
-            let state = VolumeState::new(RetryConfig {
-                max_retries: retries,
-                overall_timeout: budget,
-                min_wait: Duration::ZERO,
-                max_wait: Duration::ZERO,
-                ..Default::default()
-            });
+            let state = VolumeState::new(
+                RetryConfig {
+                    max_retries: retries,
+                    overall_timeout: budget,
+                    min_wait: Duration::ZERO,
+                    max_wait: Duration::ZERO,
+                    ..Default::default()
+                },
+                None,
+            );
             let batch = instruction(
                 "REMOVE",
                 &format!("{}?secret=hidden", server.uri()),
@@ -758,11 +799,14 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        let state = VolumeState::new(RetryConfig {
-            min_wait: Duration::from_secs(30),
-            max_wait: Duration::from_secs(30),
-            ..Default::default()
-        });
+        let state = VolumeState::new(
+            RetryConfig {
+                min_wait: Duration::from_secs(30),
+                max_wait: Duration::from_secs(30),
+                ..Default::default()
+            },
+            None,
+        );
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
         let client = Client::new();
         let options = VolumeOptions::default();
@@ -988,6 +1032,113 @@ mod tests {
             assert_eq!(std::fs::read(&dest).unwrap(), b"old");
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+    }
+
+    #[tokio::test]
+    async fn download_inactivity_bounds_headers_and_body_without_publishing() {
+        use tokio::io::AsyncReadExt;
+        for headers_sent in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 2048];
+                assert!(socket.read(&mut request).await.unwrap() > 0);
+                if headers_sent {
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
+                        .await
+                        .unwrap();
+                }
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("download");
+            std::fs::write(&dest, b"old").unwrap();
+            let state = VolumeState::new(
+                transfer_state(0).retry.clone(),
+                Some(Duration::from_millis(150)),
+            );
+            let error = tokio::time::timeout(
+                Duration::from_secs(2),
+                state.complete(
+                    &instruction("GET", &url, &dest),
+                    &Client::new(),
+                    &options(dir.path()),
+                    None,
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap_err();
+            assert_eq!(error.code, crate::ErrorCode::NetworkError);
+            assert_eq!(
+                error.error_code.as_deref(),
+                Some("VOLUME_STORAGE_NETWORK_ERROR")
+            );
+            assert!(error.message.contains("read timed out"));
+            assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            peer.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn download_inactivity_resets_on_progress_and_does_not_limit_put() {
+        use tokio::io::AsyncReadExt;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let peer = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0; 2048];
+            assert!(socket.read(&mut request).await.unwrap() > 0);
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\n")
+                .await
+                .unwrap();
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                socket.write_all(b"x").await.unwrap();
+            }
+        });
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download");
+        let state = VolumeState::new(
+            transfer_state(0).retry.clone(),
+            Some(Duration::from_millis(150)),
+        );
+        state
+            .complete(
+                &instruction("GET", &url, &dest),
+                &Client::new(),
+                &options(dir.path()),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&dest).unwrap(), b"xxxxx");
+        peer.await.unwrap();
+
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(body_bytes(b"xxxxx"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = VolumeState::new(
+            transfer_state(0).retry.clone(),
+            Some(Duration::from_millis(150)),
+        );
+        state
+            .complete(
+                &instruction("PUT", &server.uri(), &dest),
+                &Client::new(),
+                &options(dir.path()),
+                None,
+            )
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

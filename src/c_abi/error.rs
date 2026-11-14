@@ -65,6 +65,7 @@ struct LastError {
     http_status: u16,
     retryable: bool,
     query_id: Option<CString>,
+    error_code: Option<CString>,
 }
 
 thread_local! {
@@ -139,6 +140,17 @@ pub extern "C" fn kernel_get_last_error_local_os_error() -> i32 {
     LAST_ERROR.with(|last| last.borrow().local_os_error)
 }
 
+/// Borrowed structured error identifier, or null. Valid until the next error-clearing call.
+#[no_mangle]
+pub extern "C" fn kernel_get_last_error_code() -> *const c_char {
+    LAST_ERROR.with(|last| {
+        last.borrow()
+            .error_code
+            .as_ref()
+            .map_or(std::ptr::null(), |s| s.as_ptr())
+    })
+}
+
 /// Borrowed local error kind, or null. Valid until the next error-clearing call.
 #[no_mangle]
 pub extern "C" fn kernel_get_last_error_local_kind() -> *const c_char {
@@ -196,6 +208,7 @@ pub(crate) fn store_error(err: Error) {
             http_status: err.http_status.unwrap_or(0),
             retryable: err.retryable,
             query_id: err.query_id.as_deref().map(to_cstring_lossy),
+            error_code: err.error_code.as_deref().map(to_cstring_lossy),
         };
     });
 }
@@ -323,8 +336,15 @@ mod tests {
                 .unwrap();
             assert!(msg.contains("statement gone"));
             assert!(msg.contains("STATEMENT_NOT_FOUND"));
+            assert_eq!(
+                unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_code()) }
+                    .to_str()
+                    .unwrap(),
+                "STATEMENT_NOT_FOUND"
+            );
         });
         clear_error();
+        assert!(kernel_get_last_error_code().is_null());
     }
 
     #[test]
