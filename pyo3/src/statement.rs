@@ -362,7 +362,8 @@ impl ExecutedStatement {
     /// are at most `max_rows` of them and every column has a type converted
     /// here; otherwise `None`, and the next Arrow fetch returns the batches
     /// this call pulled. Values are what pyarrow's `to_pylist()` returns.
-    /// NaN floats return `None` unless `nan_ok`.
+    /// NaN floats return `None` unless `nan_ok`. Only a time-zone-aware
+    /// timestamp column uses pyarrow, for its `string_to_tzinfo`.
     #[pyo3(signature = (max_rows, nan_ok = false))]
     fn fetch_all_rows<'py>(
         &mut self,

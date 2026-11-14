@@ -340,13 +340,15 @@ def test_a_failed_drain_keeps_the_batches_fetch_all_rows_read():
 
 
 def _handles(session):
-    """An ExecutedStatement and a ResultStream for the local statement."""
-    stmt = session.statement()
-    stmt.set_sql("SELECT id FROM range(6)")
-    yield stmt.execute()
-    stmt = session.statement()
-    stmt.set_sql("SELECT id FROM range(6)")
-    yield stmt.submit().await_result()
+    """An ExecutedStatement and a ResultStream for the local statement; each
+    Statement is closed once the caller moves on to the next handle."""
+    for submit in (False, True):
+        stmt = session.statement()
+        stmt.set_sql("SELECT id FROM range(6)")
+        try:
+            yield stmt.submit().await_result() if submit else stmt.execute()
+        finally:
+            stmt.close()
 
 
 def _ids(handle):
