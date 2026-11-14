@@ -328,15 +328,27 @@ def local_session():
         yield session
 
 
-def test_a_failed_drain_keeps_the_batches_fetch_all_rows_read():
+def test_a_failed_drain_keeps_every_batch_it_read():
     with _local_session([[[0, 1], [2, 3]], None]) as session:
         for handle in _handles(session):
             assert handle.fetch_all_rows(1) is None
             with pytest.raises(k.KernelError):
                 handle.fetch_all_arrow()
-            first = handle.fetch_next_batch()
-            assert first is not None and first.column(0).to_pylist() == [0, 1]
+            # Queued by fetch_all_rows, then read by the failed drain.
+            for ids in ([0, 1], [2, 3]):
+                assert handle.fetch_next_batch().column(0).to_pylist() == ids
+            with pytest.raises(k.KernelError):
+                handle.fetch_next_batch()
             handle.close()
+
+
+def test_negative_max_rows_is_a_kernel_error(local_session):
+    for handle in _handles(local_session):
+        with pytest.raises(k.KernelError) as error:
+            handle.fetch_all_rows(-1)
+        assert error.value.code == "InvalidArgument"
+        assert handle.fetch_all_rows(0) is None
+        handle.close()
 
 
 def _handles(session):

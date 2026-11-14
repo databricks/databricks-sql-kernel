@@ -101,6 +101,17 @@ pub(crate) fn schema_is_supported(schema: &Schema) -> bool {
     schema.fields().iter().all(|f| is_supported(f.data_type()))
 }
 
+/// `fetch_all_rows`'s `max_rows`, rejecting negatives as `KernelError`
+/// (a `usize` parameter would raise `OverflowError` instead).
+pub(crate) fn max_rows(py: Python<'_>, max_rows: i64) -> PyResult<usize> {
+    usize::try_from(max_rows).map_err(|_| {
+        crate::errors::to_py_err(
+            py,
+            databricks_sql_kernel::Error::invalid_argument().message("max_rows must be >= 0"),
+        )
+    })
+}
+
 pub(crate) fn pending_rows(pending: &VecDeque<RecordBatch>) -> usize {
     pending.iter().map(RecordBatch::num_rows).sum()
 }
