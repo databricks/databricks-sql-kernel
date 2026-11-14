@@ -686,24 +686,22 @@ impl SeaChunkLinkFetcher {
             return;
         }
 
-        // Try to claim prefetch (compare_exchange returns Ok if we won)
-        if self
-            .prefetch_in_progress
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_err()
-        {
-            // Another prefetch is already in progress
-            return;
-        }
-
-        let consumer_pos = self.current_consumer_index.load(Ordering::Acquire);
+        let consumer_pos = self.current_consumer_index.load(Ordering::SeqCst);
         let server_fetch_idx = self.next_server_fetch_index.load(Ordering::Acquire);
         let target_index = consumer_pos + self.link_prefetch_window;
 
         // Check if we need to prefetch
         if server_fetch_idx > target_index {
-            // We're already ahead of the window, release the flag
-            self.prefetch_in_progress.store(false, Ordering::Release);
+            return;
+        }
+
+        // Try to claim prefetch (compare_exchange returns Ok if we won)
+        if self
+            .prefetch_in_progress
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            // Another prefetch is already in progress
             return;
         }
 
@@ -717,6 +715,12 @@ impl SeaChunkLinkFetcher {
         self.runtime_handle.spawn(async move {
             fetcher.run_prefetch_loop().await;
         });
+    }
+
+    fn release_caught_up_prefetch(self: &Arc<Self>) {
+        // Sequential ordering keeps retiring workers from losing scheduling notifications.
+        self.prefetch_in_progress.store(false, Ordering::SeqCst);
+        self.maybe_trigger_prefetch();
     }
 
     /// Background prefetch loop - fetches links until caught up with window.
@@ -741,7 +745,9 @@ impl SeaChunkLinkFetcher {
                     "Prefetch loop: caught up (server_fetch={} > target={}), stopping",
                     server_fetch_idx, target_index
                 );
-                break;
+                drop(_page);
+                self.release_caught_up_prefetch();
+                return;
             }
 
             // Fetch next batch
@@ -841,7 +847,7 @@ impl SeaChunkLinkFetcher {
         }
 
         // Release prefetch flag
-        self.prefetch_in_progress.store(false, Ordering::Release);
+        self.prefetch_in_progress.store(false, Ordering::SeqCst);
     }
 }
 
@@ -881,7 +887,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
     fn note_scheduled(&self, chunk_index: i64) {
         self.inner
             .current_consumer_index
-            .fetch_max(chunk_index, Ordering::Release);
+            .fetch_max(chunk_index, Ordering::SeqCst);
         self.inner.maybe_trigger_prefetch();
     }
 
@@ -1473,37 +1479,52 @@ mod tests {
 
     #[tokio::test]
     async fn scheduled_cached_links_advance_bounded_prefetch() {
-        let pages: Vec<_> = (0..8).map(|i| vec![create_test_link(i)]).collect();
-        let initial: Vec<_> = (0..4).map(create_test_link).collect();
-        let fetcher = SeaChunkLinkFetcher::new(
-            Arc::new(MockDatabricksClient::new(pages)),
-            "test-statement",
-            &initial,
-            Some(8),
-            2,
-            tokio::runtime::Handle::current(),
-            SessionAttribution::Current,
-        );
-        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
-        assert!(!handle.inner.has_link(4));
+        for coalesced in [false, true] {
+            let pages: Vec<_> = (0..8).map(|i| vec![create_test_link(i)]).collect();
+            let initial: Vec<_> = (0..4).map(create_test_link).collect();
+            let client = Arc::new(MockDatabricksClient::new(pages));
+            let fetcher = SeaChunkLinkFetcher::new(
+                Arc::clone(&client) as Arc<dyn Transport>,
+                "test-statement",
+                &initial,
+                Some(8),
+                2,
+                tokio::runtime::Handle::current(),
+                SessionAttribution::Current,
+            );
+            let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+            assert!(!handle.inner.has_link(4));
 
-        handle.note_scheduled(2);
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            while handle.inner.prefetch_in_progress.load(Ordering::Acquire) {
-                tokio::task::yield_now().await;
+            if coalesced {
+                handle
+                    .inner
+                    .prefetch_in_progress
+                    .store(true, Ordering::SeqCst);
             }
-        })
-        .await
-        .expect("scheduling cached chunk 2 must prefetch the next page");
+            handle.note_scheduled(2);
+            if coalesced {
+                assert!(client.calls.lock().unwrap().is_empty());
+                handle.inner.release_caught_up_prefetch();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while handle.inner.prefetch_in_progress.load(Ordering::Acquire) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("scheduling cached chunk 2 must prefetch the next page");
 
-        assert!(handle.inner.has_link(3));
-        assert!(handle.inner.has_link(4));
-        assert!(!handle.inner.has_link(5));
-        handle.note_scheduled(1);
-        assert_eq!(
-            handle.inner.current_consumer_index.load(Ordering::Acquire),
-            2
-        );
+            assert!(handle.inner.has_link(3));
+            assert!(handle.inner.has_link(4));
+            assert!(!handle.inner.has_link(5));
+            assert_eq!(*client.calls.lock().unwrap(), vec![4]);
+            handle.note_scheduled(1);
+            assert_eq!(
+                handle.inner.current_consumer_index.load(Ordering::Acquire),
+                2
+            );
+            assert!(!handle.inner.prefetch_in_progress.load(Ordering::Acquire));
+        }
     }
 
     #[tokio::test]
