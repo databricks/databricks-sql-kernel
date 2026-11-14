@@ -49,11 +49,21 @@ def _restore_levels():
     k.reset_logging()
 
 
+def _lowest_level() -> int:
+    """The most verbose effective level of any logger in this process."""
+    loggers = [logging.root] + [
+        lg
+        for lg in logging.root.manager.loggerDict.values()
+        if isinstance(lg, logging.Logger)
+    ]
+    return min(lg.getEffectiveLevel() for lg in loggers)
+
+
 def test_debug_set_after_import_reaches_python(caplog):
     # The bridge was installed at import, before this level was set.
     with caplog.at_level(logging.DEBUG, logger=KERNEL_LOGGER):
         _reject_session()
-        assert k._log_max_level() == "DEBUG"
+        assert k._log_max_level() == ("TRACE" if _lowest_level() <= 5 else "DEBUG")
     (record,) = _breadcrumbs(caplog)
     assert record.name == "databricks.sql.kernel.pyo3"
     assert record.levelno == logging.DEBUG
@@ -62,6 +72,8 @@ def test_debug_set_after_import_reaches_python(caplog):
 def test_records_below_the_level_are_dropped_before_python(caplog):
     with caplog.at_level(logging.WARNING, logger=KERNEL_LOGGER):
         k.reset_logging()
+        if _lowest_level() < logging.WARNING:
+            pytest.skip("another logger in this process is below WARNING")
         # Below WARNING nothing is forwarded, so DEBUG records are dropped
         # by `log`'s own level check instead of reaching pyo3_log.
         assert k._log_max_level() == "WARN"
