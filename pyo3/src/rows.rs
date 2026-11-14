@@ -35,7 +35,7 @@ use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyList, PyString, PyTuple};
 use std::collections::hash_map::DefaultHasher;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::sync::{Arc, OnceLock};
 
@@ -185,6 +185,8 @@ struct Converter<'py> {
     py: Python<'py>,
     nan_ok: bool,
     none: Bound<'py, PyAny>,
+    /// Zones resolved so far, by name.
+    zones: HashMap<String, Bound<'py, PyAny>>,
 }
 
 /// Python `date` fields for days since the Unix epoch, if in `date`'s range
@@ -203,6 +205,7 @@ impl<'py> Converter<'py> {
             py,
             nan_ok,
             none: py.None().into_bound(py),
+            zones: HashMap::new(),
         }
     }
 
@@ -370,11 +373,39 @@ impl<'py> Converter<'py> {
         })
     }
 
+    /// The tzinfo pyarrow's `string_to_tzinfo` returns for `name`, looked up
+    /// once per call. `None` (declined) without pyarrow, or for a zone it
+    /// doesn't know (KeyError from zoneinfo and pytz) or can't parse
+    /// (ValueError).
+    fn zone(&mut self, name: &str) -> PyResult<Option<Bound<'py, PyAny>>> {
+        let py = self.py;
+        if let Some(zone) = self.zones.get(name) {
+            return Ok(Some(zone.clone()));
+        }
+        let to_tzinfo = match cached(py, &STRING_TO_TZINFO, "pyarrow.lib", &["string_to_tzinfo"]) {
+            Ok(f) => f,
+            Err(e) if e.is_instance_of::<PyImportError>(py) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        match to_tzinfo.call1((name,)) {
+            Ok(zone) => {
+                self.zones.insert(name.to_owned(), zone.clone());
+                Ok(Some(zone))
+            }
+            Err(e)
+                if e.is_instance_of::<PyKeyError>(py) || e.is_instance_of::<PyValueError>(py) =>
+            {
+                Ok(None)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Like pyarrow: a naive `datetime` for a timestamp without a time zone;
     /// otherwise the UTC instant converted with `astimezone` to the zone
     /// pyarrow's `string_to_tzinfo` returns for its name.
     fn timestamps(
-        &self,
+        &mut self,
         array: &dyn Array,
         values: &[i64],
         micros_per_unit: i64,
@@ -385,27 +416,10 @@ impl<'py> Converter<'py> {
         let datetime = cached(py, &DATETIME, "datetime", &["datetime"])?;
         let zone = match tz {
             None => None,
-            Some(name) => {
-                // Declined: no pyarrow, or a zone it doesn't know (KeyError
-                // from zoneinfo and pytz) or can't parse (ValueError).
-                let to_tzinfo =
-                    match cached(py, &STRING_TO_TZINFO, "pyarrow.lib", &["string_to_tzinfo"]) {
-                        Ok(f) => f,
-                        Err(e) if e.is_instance_of::<PyImportError>(py) => return Ok(false),
-                        Err(e) => return Err(e),
-                    };
-                let zone = match to_tzinfo.call1((name,)) {
-                    Ok(zone) => zone,
-                    Err(e)
-                        if e.is_instance_of::<PyKeyError>(py)
-                            || e.is_instance_of::<PyValueError>(py) =>
-                    {
-                        return Ok(false)
-                    }
-                    Err(e) => return Err(e),
-                };
-                Some((zone, cached(py, &UTC, "datetime", &["timezone", "utc"])?))
-            }
+            Some(name) => match self.zone(name)? {
+                Some(zone) => Some((zone, cached(py, &UTC, "datetime", &["timezone", "utc"])?)),
+                None => return Ok(false),
+            },
         };
         for (i, &value) in values.iter().enumerate() {
             if array.is_null(i) {
