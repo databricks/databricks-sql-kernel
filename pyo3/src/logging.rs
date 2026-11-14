@@ -75,7 +75,7 @@ use pyo3::prelude::*;
 use pyo3_log::{Caching, Logger, ResetHandle};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Logger target the kernel tags every event with. Maps to the Python
@@ -339,17 +339,28 @@ const LEVELS_PROBE: &str = "databricks.sql.kernel._levels_probe";
 ///
 /// `logging` clears every logger's `_cache` on `setLevel()` and
 /// `logging.disable()`. [`PythonLevels::read`] fills the probe logger's
-/// cache before it reads, so a still-filled cache means nothing changed.
-/// Errs towards `false` (do the full read).
+/// cache before it reads, so a still-filled cache, with as many loggers as
+/// that read saw, means nothing changed. Counting the loggers catches a new
+/// logger that comes with a level (e.g. from a `setLoggerClass()` class). A
+/// level assigned directly (`logger.level = ...`) clears no cache and is
+/// only picked up by [`reset_logging`]. Errs towards `false` (do the full
+/// read).
 fn levels_unchanged(py: Python<'_>) -> bool {
     let check = || -> PyResult<bool> {
-        let probe = py
-            .import("logging")?
-            .call_method1("getLogger", (LEVELS_PROBE,))?;
-        Ok(probe.getattr("_cache")?.len()? > 0)
+        let logging = py.import("logging")?;
+        let probe = logging.call_method1("getLogger", (LEVELS_PROBE,))?;
+        let loggers = logging
+            .getattr("root")?
+            .getattr("manager")?
+            .getattr("loggerDict")?
+            .len()?;
+        Ok(probe.getattr("_cache")?.len()? > 0 && loggers == LOGGERS_SEEN.load(Ordering::Relaxed))
     };
     check().unwrap_or(false)
 }
+
+/// Number of `loggerDict` entries the last [`PythonLevels::read`] saw.
+static LOGGERS_SEEN: AtomicUsize = AtomicUsize::new(0);
 
 struct PythonLevels {
     ticket: u64,
@@ -389,6 +400,7 @@ impl PythonLevels {
                 .import("builtins")?
                 .getattr("list")?
                 .call1((manager.getattr("loggerDict")?.call_method0("values")?,))?;
+            LOGGERS_SEEN.store(loggers.len()?, Ordering::Relaxed);
             for logger in loggers.try_iter()? {
                 let logger = logger?;
                 // `loggerDict` also holds `PlaceHolder`s for unnamed parents.
@@ -471,11 +483,24 @@ mod tests {
             run("logging.disable(logging.NOTSET)\nchild.setLevel(logging.NOTSET)\nlogging.root.setLevel(logging.NOTSET)");
             assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Trace);
 
-            // A new logger with no level of its own changes nothing.
+            // A new logger triggers a read; with no level of its own it changes
+            // nothing.
             run("logging.root.setLevel(logging.WARNING)");
             let before = PythonLevels::read(py).max_level;
             run("logging.getLogger('kernel_logging_test.other')");
+            assert!(!levels_unchanged(py), "a new logger is detected");
+            assert_eq!(PythonLevels::read(py).max_level, before);
             assert!(levels_unchanged(py));
+
+            // A logger class that sets its level in __init__ clears no cache;
+            // the new logger is still detected.
+            run("class Verbose(logging.Logger):\n    def __init__(self, name):\n        super().__init__(name)\n        self.level = logging.DEBUG\nlogging.setLoggerClass(Verbose)\nlogging.getLogger('kernel_logging_test.verbose')\nlogging.setLoggerClass(logging.Logger)");
+            assert!(
+                !levels_unchanged(py),
+                "a new logger with a level is detected"
+            );
+            assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Debug);
+            run("logging.getLogger('kernel_logging_test.verbose').setLevel(logging.NOTSET)");
             assert_eq!(PythonLevels::read(py).max_level, before);
 
             // dictConfig() disables existing loggers, the probe included. A
@@ -488,9 +513,11 @@ mod tests {
             run("child.disabled = False\nchild.setLevel(logging.NOTSET)");
 
             // After a failed install, init_logging() returns without reading.
-            *lock_state() = LogState::Failed;
+            let previous = std::mem::replace(&mut *lock_state(), LogState::Failed);
             let reads = NEXT_READ.load(Ordering::Relaxed);
-            assert!(!init_logging(py));
+            let installed = init_logging(py);
+            *lock_state() = previous;
+            assert!(!installed);
             assert_eq!(NEXT_READ.load(Ordering::Relaxed), reads);
         });
     }
