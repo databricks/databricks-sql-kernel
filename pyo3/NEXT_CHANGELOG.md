@@ -27,6 +27,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
   thread other than the main thread no longer re-acquires it every
   100 ms to check for signals that only the main thread can receive.
   This cuts GIL hand-offs per query when many threads share the GIL.
+- All sessions in a process share one tokio runtime instead of each
+  starting its own worker per CPU, so many concurrent sessions use far
+  fewer threads and less CPU per query.
 
 ### Updated
 
