@@ -223,7 +223,7 @@ pub(crate) struct SeaChunkLinkFetcher {
     prefetch_in_progress: AtomicBool,
     /// Tokio runtime handle for spawning prefetch tasks
     runtime_handle: tokio::runtime::Handle,
-    /// Lock for coordinating prefetch operations
+    /// Foreground misses must share pages already being prefetched.
     prefetch_lock: TokioMutex<()>,
     /// Next row offset for pagination (used by some backends)
     next_row_offset: AtomicI64,
@@ -721,10 +721,10 @@ impl SeaChunkLinkFetcher {
 
     /// Background prefetch loop - fetches links until caught up with window.
     async fn run_prefetch_loop(self: Arc<Self>) {
-        // Acquire the prefetch lock to prevent concurrent prefetch operations
-        let _guard = self.prefetch_lock.lock().await;
-
         loop {
+            // Release between pages so a waiting reader can use the page just fetched.
+            let _page = self.prefetch_lock.lock().await;
+
             // Check if we're done
             if self.all_links_fetched.load(Ordering::Acquire) {
                 debug!("Prefetch loop: all links fetched, stopping");
@@ -893,6 +893,14 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
         let fetcher = &self.inner;
 
         self.note_scheduled(start_chunk_index);
+
+        let _fallback = if !fetcher.all_links_fetched.load(Ordering::Acquire)
+            && start_chunk_index >= fetcher.next_server_fetch_index.load(Ordering::Acquire)
+        {
+            Some(fetcher.prefetch_lock.lock().await)
+        } else {
+            None
+        };
 
         // If we already have all links, return what we have from cache.
         // Walk contiguously from `start_chunk_index` until we hit a
@@ -1133,11 +1141,21 @@ mod tests {
     #[derive(Debug)]
     struct MockDatabricksClient {
         chunks: Vec<Vec<CloudFetchLink>>,
+        calls: std::sync::Mutex<Vec<i64>>,
+        page_started: tokio::sync::Notify,
+        blocked_pages: HashMap<i64, Arc<tokio::sync::Notify>>,
+        fail_first_page: Option<i64>,
     }
 
     impl MockDatabricksClient {
         fn new(chunks: Vec<Vec<CloudFetchLink>>) -> Self {
-            Self { chunks }
+            Self {
+                chunks,
+                calls: std::sync::Mutex::new(Vec::new()),
+                page_started: tokio::sync::Notify::new(),
+                blocked_pages: HashMap::new(),
+                fail_first_page: None,
+            }
         }
     }
 
@@ -1224,6 +1242,21 @@ mod tests {
             _row_offset: i64,
             _session_attribution: SessionAttribution,
         ) -> Result<ChunkLinkFetchResult> {
+            let first_call = {
+                let mut calls = self.calls.lock().unwrap();
+                let first = !calls.contains(&chunk_index);
+                calls.push(chunk_index);
+                first
+            };
+            if first_call {
+                if let Some(gate) = self.blocked_pages.get(&chunk_index) {
+                    self.page_started.notify_one();
+                    gate.notified().await;
+                }
+                if self.fail_first_page == Some(chunk_index) {
+                    return Err(Error::io().message("injected page fetch failure"));
+                }
+            }
             let index = chunk_index as usize;
             if index >= self.chunks.len() {
                 return Ok(ChunkLinkFetchResult::end_of_stream());
@@ -1471,6 +1504,64 @@ mod tests {
             handle.inner.current_consumer_index.load(Ordering::Acquire),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn foreground_miss_shares_current_page_without_waiting_for_lookahead() {
+        for fail_first in [false, true] {
+            let mut client = MockDatabricksClient::new(vec![
+                vec![create_test_link(0)],
+                vec![create_test_link(1)],
+                vec![create_test_link_terminal(2)],
+            ]);
+            let first_page = Arc::new(tokio::sync::Notify::new());
+            let next_page = Arc::new(tokio::sync::Notify::new());
+            client.blocked_pages.insert(1, Arc::clone(&first_page));
+            client.blocked_pages.insert(2, Arc::clone(&next_page));
+            client.fail_first_page = fail_first.then_some(1);
+            let client = Arc::new(client);
+            let fetcher = SeaChunkLinkFetcher::new(
+                Arc::clone(&client) as Arc<dyn Transport>,
+                "test-statement",
+                &[create_test_link(0)],
+                Some(3),
+                2,
+                tokio::runtime::Handle::current(),
+                SessionAttribution::Current,
+            );
+            let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+            let timeout = std::time::Duration::from_secs(5);
+            tokio::time::timeout(timeout, client.page_started.notified())
+                .await
+                .unwrap();
+            let mut foreground = Box::pin(handle.fetch_links(1, 0));
+            assert!(futures::poll!(foreground.as_mut()).is_pending());
+            assert_eq!(*client.calls.lock().unwrap(), vec![1]);
+
+            first_page.notify_one();
+            let result = tokio::time::timeout(timeout, foreground)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.links[0].chunk_index, 1);
+            if fail_first {
+                assert_eq!(*client.calls.lock().unwrap(), vec![1, 1]);
+            } else {
+                tokio::time::timeout(timeout, client.page_started.notified())
+                    .await
+                    .unwrap();
+                assert_eq!(*client.calls.lock().unwrap(), vec![1, 2]);
+                assert!(!handle.inner.has_link(2));
+                next_page.notify_one();
+                tokio::time::timeout(timeout, async {
+                    while handle.inner.prefetch_in_progress.load(Ordering::Acquire) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        }
     }
 
     #[tokio::test]
