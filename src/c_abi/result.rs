@@ -802,7 +802,7 @@ mod tests {
                         .unwrap();
                 stream.attach_volume(
                     marked,
-                    crate::volume::VolumeState::new(),
+                    crate::volume::VolumeState::new(Default::default()),
                     reqwest::Client::new(),
                 );
                 into_raw_result_stream(schema.clone(), stream)

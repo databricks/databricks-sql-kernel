@@ -98,6 +98,7 @@ pub(crate) struct SessionInner {
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
     storage_client: reqwest::Client,
+    storage_retry: RetryConfig,
     volume_states: std::sync::Mutex<Option<Vec<std::sync::Weak<crate::volume::VolumeState>>>>,
 
     /// Server-issued session identifier.
@@ -161,7 +162,7 @@ pub(crate) struct SessionInner {
 
 impl SessionInner {
     pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
-        let state = crate::volume::VolumeState::new();
+        let state = crate::volume::VolumeState::new(self.storage_retry.clone());
         let mut states = self.volume_states.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(states) = states.as_mut() {
             states.retain(|state| state.strong_count() != 0);
@@ -398,6 +399,7 @@ impl Session {
         //    it for OIDC discovery / token endpoint calls.
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
+        let storage_retry = retry_configs[&RequestCategory::Sea].clone();
         let http_client = Arc::new(
             DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
@@ -505,6 +507,7 @@ impl Session {
             inner: Arc::new(SessionInner {
                 transport,
                 storage_client,
+                storage_retry,
                 volume_states: std::sync::Mutex::new(Some(Vec::new())),
                 session_id: session_info.session_id,
                 config,

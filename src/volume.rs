@@ -14,6 +14,7 @@
 
 //! Explicit completion of server-authorized Volume file transfers.
 
+use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStrategy};
 use crate::kernel_error::{Error, LocalFileError, Result};
 use crate::result_stream::ResultBatch;
 use arrow_array::{Array, LargeStringArray, MapArray, StringArray, StringViewArray};
@@ -60,6 +61,7 @@ enum CommitState {
 /// The synchronous gate makes cancellation and local publication mutually exclusive.
 #[derive(Default)]
 pub(crate) struct VolumeState {
+    retry: RetryConfig,
     serial: tokio::sync::Mutex<()>,
     commit: Mutex<CommitState>,
     changed: Notify,
@@ -70,8 +72,11 @@ fn cancelled() -> Error {
 }
 
 impl VolumeState {
-    pub(crate) fn new() -> Arc<Self> {
-        Arc::new(Self::default())
+    pub(crate) fn new(retry: RetryConfig) -> Arc<Self> {
+        Arc::new(Self {
+            retry,
+            ..Self::default()
+        })
     }
 
     pub(crate) fn cached(&self) -> Option<Result<VolumeCompletion>> {
@@ -176,22 +181,74 @@ impl VolumeState {
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<VolumeCompletion> {
+        let input_request =
+            if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
+                let bytes = input_bytes.ok_or_else(|| invalid("Missing input stream"))?;
+                Some(
+                    client
+                        .put(&instruction.url)
+                        .headers(instruction.headers.clone())
+                        .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                        .body(bytes),
+                )
+            } else {
+                None
+            };
+        let started = std::time::Instant::now();
+        let mut attempt = 0;
+        loop {
+            let mut retry_after = None;
+            let error = match self
+                .transfer_once(
+                    &instruction,
+                    client,
+                    options,
+                    input_request.as_ref(),
+                    &mut retry_after,
+                )
+                .await
+            {
+                Ok(completion) => return Ok(completion),
+                Err(error) => error,
+            };
+            if !error.retryable || attempt >= self.retry.max_retries {
+                return Err(error.with_retryable(false));
+            }
+            let wait = calculate_backoff(&self.retry, attempt, retry_after.as_deref());
+            // Retry budgets govern recovery, not the duration of a healthy transfer.
+            if started.elapsed().saturating_add(wait) >= self.retry.overall_timeout {
+                return Err(error.with_retryable(false));
+            }
+            tokio::time::sleep(wait).await;
+            attempt += 1;
+        }
+    }
+
+    async fn transfer_once(
+        &self,
+        instruction: &Instruction,
+        client: &Client,
+        options: &VolumeOptions,
+        input_request: Option<&reqwest::RequestBuilder>,
+        retry_after: &mut Option<String>,
+    ) -> Result<VolumeCompletion> {
         let method = match instruction.operation.as_str() {
             "PUT" => Method::PUT,
             "GET" => Method::GET,
             "REMOVE" => Method::DELETE,
             _ => return Err(invalid("Unsupported Volume operation")),
         };
-        let mut request = client
-            .request(method, &instruction.url)
-            .headers(instruction.headers);
-        let local_path = if instruction.operation == "REMOVE" {
-            None
-        } else if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
-            let bytes = input_bytes.ok_or_else(|| invalid("Missing input stream"))?;
-            request = request
-                .header(reqwest::header::CONTENT_LENGTH, bytes.len())
-                .body(bytes);
+        let mut request = match input_request {
+            Some(request) => request
+                .try_clone()
+                .ok_or_else(|| invalid("Input bytes cannot be replayed"))?,
+            None => client
+                .request(method, &instruction.url)
+                .headers(instruction.headers.clone()),
+        };
+        let local_path = if instruction.operation == "REMOVE"
+            || (instruction.operation == "PUT" && instruction.local_file == "__input_stream__")
+        {
             None
         } else {
             let path = allowed_path(&instruction.local_file, &options.allowed_paths)?;
@@ -249,8 +306,6 @@ impl VolumeState {
             None
         };
 
-        // This client has workspace TLS/proxy/timeouts, but no workspace auth headers.
-        // A single attempt avoids replaying an upload after an ambiguous response.
         let mut response = request.send().await.map_err(storage_error)?;
         let status = response.status();
         if !status.is_success()
@@ -258,18 +313,27 @@ impl VolumeState {
                 && status.as_u16() == 404
                 && options.remove_not_found_is_success)
         {
-            return Err(Error::from_http_status(status.as_u16()).message(format!(
-                "Volume storage request failed: HTTP {}",
-                status.as_u16()
-            )));
+            *retry_after = response
+                .headers()
+                .get(reqwest::header::RETRY_AFTER)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_owned);
+            return Err(Error::from_http_status(status.as_u16())
+                .with_retryable(matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504))
+                .message(format!(
+                    "Volume storage request failed: HTTP {}",
+                    status.as_u16()
+                )));
         }
-        if let Some((temp, mut writer)) = destination.take() {
-            while let Some(bytes) = response.chunk().await.map_err(storage_error)? {
+        while let Some(bytes) = response.chunk().await.map_err(response_body_error)? {
+            if let Some((_, writer)) = destination.as_mut() {
                 writer
                     .write_all(&bytes)
                     .await
                     .map_err(|e| local_error(e, &instruction.local_file))?;
             }
+        }
+        if let Some((temp, mut writer)) = destination.take() {
             writer
                 .flush()
                 .await
@@ -292,12 +356,32 @@ fn invalid(message: &str) -> Error {
 }
 
 fn storage_error(error: reqwest::Error) -> Error {
+    // A file reader's failure is wrapped in a request error by the HTTP stack.
+    let source_body_failed = std::iter::successors(
+        Some(&error as &(dyn std::error::Error + 'static)),
+        |cause| cause.source(),
+    )
+    .any(|cause| {
+        cause
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_body)
+    });
+    let retryable = !source_body_failed
+        && RetryStrategy::for_request(RequestType::CloudFetchDownload, &RetryConfig::default())
+            .is_retryable_error(&error);
     Error::network_error()
-        .with_retryable(false)
+        .with_retryable(retryable)
         .message(format!(
             "Volume storage request failed: {}",
             error.without_url()
         ))
+}
+
+fn response_body_error(error: reqwest::Error) -> Error {
+    let retryable = error.is_body() || error.is_decode();
+    let mut error = storage_error(error);
+    error.retryable |= retryable;
+    error
 }
 
 fn local_error(error: std::io::Error, path: &str) -> Error {
@@ -516,6 +600,183 @@ mod tests {
         }
     }
 
+    fn transfer_state(max_retries: u32) -> Arc<VolumeState> {
+        VolumeState::new(RetryConfig {
+            max_retries,
+            min_wait: Duration::ZERO,
+            max_wait: Duration::ZERO,
+            ..Default::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn local_upload_read_errors_wrapped_as_request_errors_are_not_retried() {
+        let server = MockServer::start().await;
+        let body = reqwest::Body::wrap_stream(futures::stream::iter([Err::<Vec<u8>, _>(
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )]));
+        let error = Client::new()
+            .put(server.uri())
+            .body(body)
+            .send()
+            .await
+            .unwrap_err();
+        assert!(!storage_error(error).retryable);
+    }
+
+    #[tokio::test]
+    async fn transient_storage_statuses_replay_full_inputs_and_cache_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for (operation, stream) in [
+            ("PUT", false),
+            ("PUT", true),
+            ("GET", false),
+            ("REMOVE", false),
+        ] {
+            let server = MockServer::start().await;
+            let attempts = Arc::new(AtomicUsize::new(0));
+            let count = Arc::clone(&attempts);
+            Mock::given(method(if operation == "REMOVE" {
+                "DELETE"
+            } else {
+                operation
+            }))
+            .and(path("/object"))
+            .and(header("x-storage-token", "server-token"))
+            .respond_with(move |request: &wiremock::Request| {
+                if operation == "PUT" {
+                    assert_eq!(request.body, b"payload");
+                }
+                if let Some(status) =
+                    [408, 429, 500, 502, 503, 504].get(count.fetch_add(1, Ordering::SeqCst))
+                {
+                    ResponseTemplate::new(*status).insert_header("retry-after", "0")
+                } else {
+                    ResponseTemplate::new(200).set_body_bytes(b"payload")
+                }
+            })
+            .expect(7)
+            .mount(&server)
+            .await;
+            let dir = tempfile::tempdir().unwrap();
+            let file = dir.path().join("file");
+            std::fs::write(
+                &file,
+                if operation == "GET" {
+                    b"old".as_slice()
+                } else {
+                    b"payload"
+                },
+            )
+            .unwrap();
+            let local = if stream {
+                Path::new("__input_stream__")
+            } else {
+                &file
+            };
+            let batch = instruction(operation, &format!("{}/object", server.uri()), local);
+            let state = transfer_state(6);
+            let client = Client::new();
+            let options = options(dir.path());
+            assert_eq!(
+                state
+                    .complete(
+                        &batch,
+                        &client,
+                        &options,
+                        stream.then(|| b"payload".to_vec())
+                    )
+                    .await
+                    .unwrap(),
+                VolumeCompletion::Completed
+            );
+            assert_eq!(
+                state
+                    .complete(&batch, &client, &options, None)
+                    .await
+                    .unwrap(),
+                VolumeCompletion::Completed
+            );
+            assert_eq!(attempts.load(Ordering::SeqCst), 7);
+            assert_eq!(std::fs::read(file).unwrap(), b"payload");
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn permanent_statuses_and_retry_limits_preserve_terminal_errors() {
+        for (status, retries, budget, requests) in [
+            (400, 2, Duration::from_secs(10), 1),
+            (401, 2, Duration::from_secs(10), 1),
+            (403, 2, Duration::from_secs(10), 1),
+            (404, 2, Duration::from_secs(10), 1),
+            (501, 2, Duration::from_secs(10), 1),
+            (503, 0, Duration::from_secs(10), 1),
+            (503, 2, Duration::ZERO, 1),
+            (503, 2, Duration::from_secs(10), 3),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("DELETE"))
+                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0"))
+                .expect(requests)
+                .mount(&server)
+                .await;
+            let state = VolumeState::new(RetryConfig {
+                max_retries: retries,
+                overall_timeout: budget,
+                min_wait: Duration::ZERO,
+                max_wait: Duration::ZERO,
+                ..Default::default()
+            });
+            let batch = instruction(
+                "REMOVE",
+                &format!("{}?secret=hidden", server.uri()),
+                Path::new(""),
+            );
+            for _ in 0..2 {
+                let error = state
+                    .complete(&batch, &Client::new(), &VolumeOptions::default(), None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(error.http_status, Some(status));
+                assert!(!error.retryable);
+                assert!(!error.message.contains("secret"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_retry_backoff_without_another_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("DELETE"))
+            .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "30"))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let state = VolumeState::new(RetryConfig {
+            min_wait: Duration::from_secs(30),
+            max_wait: Duration::from_secs(30),
+            ..Default::default()
+        });
+        let batch = instruction("REMOVE", &server.uri(), Path::new(""));
+        let client = Client::new();
+        let options = VolumeOptions::default();
+        let complete = state.complete(&batch, &client, &options, None);
+        let cancel = async {
+            while server.received_requests().await.unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            state.cancel();
+        };
+        let (result, _) = tokio::time::timeout(Duration::from_secs(1), async {
+            tokio::join!(complete, cancel)
+        })
+        .await
+        .unwrap();
+        assert_eq!(result.unwrap_err().code, crate::ErrorCode::Cancelled);
+    }
+
     #[tokio::test]
     async fn stream_handshake_accepts_empty_bytes_once_and_keeps_success_after_cancel() {
         let server = MockServer::start().await;
@@ -533,7 +794,7 @@ mod tests {
             &format!("{}/object", server.uri()),
             Path::new("__input_stream__"),
         );
-        let state = VolumeState::new();
+        let state = transfer_state(0);
         let client = Client::new();
         assert_eq!(
             state
@@ -575,7 +836,7 @@ mod tests {
             .mount(&server)
             .await;
         let batch = instruction("PUT", &server.uri(), &source);
-        VolumeState::new()
+        transfer_state(0)
             .complete(&batch, &Client::new(), &options(dir.path()), None)
             .await
             .unwrap();
@@ -603,7 +864,7 @@ mod tests {
         let dest = dir.path().join("download");
         std::fs::write(&dest, b"old bytes").unwrap();
         let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
-        let completed = VolumeState::new();
+        let completed = transfer_state(0);
         completed
             .complete(&batch, &Client::new(), &options(dir.path()), None)
             .await
@@ -617,7 +878,7 @@ mod tests {
             VolumeCompletion::Completed
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
-        let state = VolumeState::new();
+        let state = transfer_state(0);
         let batch = instruction(
             "GET",
             &format!("{}/fail?secret=hidden", server.uri()),
@@ -653,7 +914,7 @@ mod tests {
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
         let strict = VolumeOptions::default();
         assert_eq!(
-            VolumeState::new()
+            transfer_state(0)
                 .complete(&batch, &Client::new(), &strict, None)
                 .await
                 .unwrap_err()
@@ -665,7 +926,7 @@ mod tests {
             ..strict
         };
         assert_eq!(
-            VolumeState::new()
+            transfer_state(0)
                 .complete(&batch, &Client::new(), &permissive, None)
                 .await
                 .unwrap(),
@@ -692,7 +953,7 @@ mod tests {
         let options = options(dir.path());
         let client = Client::new();
         for cancel in [false, true] {
-            let state = VolumeState::new();
+            let state = transfer_state(0);
             let mut future = Box::pin(state.complete(&batch, &client, &options, None));
             tokio::select! {
                 result = &mut future => panic!("unexpected early completion: {result:?}"),
@@ -725,33 +986,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn truncated_get_preserves_destination() {
+    async fn truncated_get_retries_from_clean_temp_and_preserves_destination_on_failure() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}", listener.local_addr().unwrap());
-        let peer = tokio::spawn(async move {
-            let (mut socket, _) = listener.accept().await.unwrap();
-            let mut request = [0; 2048];
-            assert!(socket.read(&mut request).await.unwrap() > 0);
-            socket
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort",
-                )
-                .await
-                .unwrap();
-        });
-        let dir = tempfile::tempdir().unwrap();
-        let dest = dir.path().join("download");
-        std::fs::write(&dest, b"old").unwrap();
-        let batch = instruction("GET", &url, &dest);
-        let error = VolumeState::new()
-            .complete(&batch, &Client::new(), &options(dir.path()), None)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, crate::ErrorCode::NetworkError);
-        assert_eq!(std::fs::read(&dest).unwrap(), b"old");
-        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-        peer.await.unwrap();
+        for retries in [0, 1] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                for attempt in 0..=retries {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = [0; 2048];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    let response = if attempt == 0 {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\nConnection: close\r\n\r\nshort"
+                            .as_slice()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 7\r\nConnection: close\r\n\r\ncorrect"
+                    };
+                    socket.write_all(response).await.unwrap();
+                }
+            });
+            let dir = tempfile::tempdir().unwrap();
+            let dest = dir.path().join("download");
+            std::fs::write(&dest, b"old").unwrap();
+            let batch = instruction("GET", &url, &dest);
+            let result = transfer_state(retries)
+                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .await;
+            if retries == 0 {
+                assert_eq!(result.unwrap_err().code, crate::ErrorCode::NetworkError);
+                assert_eq!(std::fs::read(&dest).unwrap(), b"old");
+            } else {
+                assert_eq!(result.unwrap(), VolumeCompletion::Completed);
+                assert_eq!(std::fs::read(&dest).unwrap(), b"correct");
+            }
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+            peer.await.unwrap();
+        }
     }
 
     #[cfg(any(unix, windows))]
@@ -804,7 +1074,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("missing");
         let batch = instruction("PUT", "http://127.0.0.1:1?secret=hidden", &source);
-        let error = VolumeState::new()
+        let error = transfer_state(0)
             .complete(&batch, &Client::new(), &options(dir.path()), None)
             .await
             .unwrap_err();

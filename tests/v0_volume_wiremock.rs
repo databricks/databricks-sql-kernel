@@ -176,6 +176,7 @@ async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_ou
         std::fs::write(&local, b"original").unwrap();
         let mut http = HttpConfig::default();
         http.request_timeout = Duration::from_millis(100);
+        http.overall_timeout = Duration::from_millis(200);
         let session = session_with_http(
             &server,
             response_with_batches(&server, true, local.to_str().unwrap(), operation, 1),
