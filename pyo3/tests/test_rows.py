@@ -17,9 +17,13 @@
 
 from __future__ import annotations
 
+import base64
 import datetime
+import json
 import random
+import threading
 from decimal import Decimal
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pyarrow as pa
 import pytest
@@ -228,6 +232,125 @@ def test_schema_keys_are_equal_for_equal_schemas():
     ):
         assert a != k.SchemaKey(other)
     assert a != object() and a != schema(metadata=meta)
+    assert a.__eq__(object()) is NotImplemented
+
+
+@pytest.fixture
+def local_session():
+    """A session on a local server whose every statement returns one inline
+    attachment holding three 2-row batches (ids 0-5)."""
+    schema = pa.schema([("id", pa.int64())])
+    buffer = pa.BufferOutputStream()
+    with pa.ipc.new_stream(buffer, schema) as writer:
+        for lo in (0, 2, 4):
+            writer.write_batch(pa.record_batch([pa.array([lo, lo + 1])], schema=schema))
+    response = {
+        "statement_id": "test-statement",
+        "status": {"state": "SUCCEEDED"},
+        "manifest": {
+            "format": "ARROW_STREAM",
+            "schema": {
+                "column_count": 1,
+                "columns": [{"name": "id", "type_name": "BIGINT", "type_text": "BIGINT", "position": 0}],
+            },
+            "total_chunk_count": 1,
+            "total_row_count": 6,
+        },
+        "result": {
+            "chunk_index": 0,
+            "row_offset": 0,
+            "row_count": 6,
+            "attachment": base64.b64encode(buffer.getvalue()).decode(),
+        },
+    }
+
+    class Handler(BaseHTTPRequestHandler):
+        def respond(self, body, realtime=False):
+            self.rfile.read(int(self.headers.get("Content-Length", 0)))
+            payload = json.dumps(body).encode()
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(payload)))
+            if realtime:
+                self.send_header("x-databricks-rt-session", "true")
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def do_POST(self):
+            if self.path.endswith("/sessions"):
+                self.respond({"session_id": "test-session"}, realtime=True)
+            else:
+                self.respond(response)
+
+        def do_GET(self):
+            self.respond(response)
+
+        def do_DELETE(self):
+            self.respond({})
+
+        def log_message(self, *_args):
+            pass
+
+    with ThreadingHTTPServer(("127.0.0.1", 0), Handler) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        session = k.Session(
+            host=f"http://127.0.0.1:{server.server_port}",
+            http_path="/sql/1.0/warehouses/test-wh",
+            access_token="test-token",
+            telemetry_enabled=False,
+        )
+        try:
+            yield session
+        finally:
+            session.close()
+            server.shutdown()
+
+
+def _handles(session):
+    """An ExecutedStatement and a ResultStream for the local statement."""
+    stmt = session.statement()
+    stmt.set_sql("SELECT id FROM range(6)")
+    yield stmt.execute()
+    stmt = session.statement()
+    stmt.set_sql("SELECT id FROM range(6)")
+    yield stmt.submit().await_result()
+
+
+def _ids(handle):
+    ids = []
+    while (batch := handle.fetch_next_batch()) is not None:
+        ids.extend(batch.column(0).to_pylist())
+    return ids
+
+
+@pytest.mark.parametrize("max_rows", [6, 100])
+def test_fetch_all_rows_reads_to_the_end(local_session, max_rows):
+    for handle in _handles(local_session):
+        assert handle.fetch_all_rows(max_rows) == [(i,) for i in range(6)]
+        assert handle.fetch_all_rows(max_rows) == []
+        assert handle.fetch_next_batch() is None
+        assert handle.fetch_all_arrow().num_rows == 0
+        handle.close()
+
+
+@pytest.mark.parametrize("max_rows", [0, 1, 3, 5])
+def test_declined_rows_are_returned_by_the_arrow_fetches(local_session, max_rows):
+    for handle in _handles(local_session):
+        assert handle.fetch_all_rows(max_rows) is None
+        # Asking again doesn't lose or repeat what the first call read.
+        assert handle.fetch_all_rows(max_rows) is None
+        assert _ids(handle) == list(range(6))
+        handle.close()
+    for handle in _handles(local_session):
+        assert handle.fetch_all_rows(max_rows) is None
+        assert handle.fetch_all_arrow().column(0).to_pylist() == list(range(6))
+        handle.close()
+
+
+def test_fetch_all_rows_after_an_arrow_fetch_returns_the_rest(local_session):
+    for handle in _handles(local_session):
+        assert handle.fetch_next_batch().column(0).to_pylist() == [0, 1]
+        assert handle.fetch_all_rows(4) == [(2,), (3,), (4,), (5,)]
+        handle.close()
 
 
 @live

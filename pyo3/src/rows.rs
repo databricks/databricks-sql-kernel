@@ -30,6 +30,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{Datelike, NaiveDate};
+use pyo3::exceptions::{PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyList, PyString, PyTuple};
@@ -317,9 +318,9 @@ impl<'py> Converter<'py> {
             }
             match value(i) {
                 Ok(Some(v)) => out.push(v),
-                // A failed Python constructor (e.g. a value out of range) is
-                // left for the caller's fallback to report as it does today.
-                Ok(None) | Err(_) => return Ok(false),
+                Ok(None) => return Ok(false),
+                Err(e) if out_of_range(self.py, &e) => return Ok(false),
+                Err(e) => return Err(e),
             }
         }
         Ok(true)
@@ -419,11 +420,19 @@ impl<'py> Converter<'py> {
             };
             match converted {
                 Ok(v) => out.push(v),
-                Err(_) => return Ok(false),
+                // E.g. a UTC instant near year 1 shifted into a western zone.
+                Err(e) if out_of_range(py, &e) => return Ok(false),
+                Err(e) => return Err(e),
             }
         }
         Ok(true)
     }
+}
+
+/// Whether `error` is a `date`/`datetime` range error, which the caller's
+/// fallback reports (or handles) as it does without this module.
+fn out_of_range(py: Python<'_>, error: &PyErr) -> bool {
+    error.is_instance_of::<PyOverflowError>(py) || error.is_instance_of::<PyValueError>(py)
 }
 
 /// Hashable stand-in for a result schema, equal to another key exactly when
@@ -464,11 +473,10 @@ impl SchemaKey {
         })
     }
 
-    fn __eq__(&self, other: &Bound<'_, PyAny>) -> bool {
-        other.cast::<SchemaKey>().is_ok_and(|other| {
-            let other = other.get();
-            Arc::ptr_eq(&self.schema, &other.schema) || self.schema == other.schema
-        })
+    /// `NotImplemented` (via the failed extraction) for other types.
+    fn __eq__(&self, other: &Bound<'_, Self>) -> bool {
+        let other = other.get();
+        Arc::ptr_eq(&self.schema, &other.schema) || self.schema == other.schema
     }
 
     fn __repr__(&self) -> String {
