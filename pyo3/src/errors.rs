@@ -161,7 +161,8 @@ pub(crate) fn to_py_err(py: Python<'_>, err: KError) -> PyErr {
         bound.setattr("local_path", local.map(|e| e.path.as_str()))?;
         Ok(())
     })() {
-        return error;
+        py_err.set_cause(py, Some(error));
+        return py_err;
     }
     py_err
 }

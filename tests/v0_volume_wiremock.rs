@@ -19,8 +19,8 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle, Session,
-    VolumeCompletion, VolumeOptions,
+    AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle, HttpConfig,
+    Session, VolumeCompletion, VolumeOptions,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -29,13 +29,14 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn response(server: &MockServer, marked: bool, local: &str) -> serde_json::Value {
-    response_with_batches(server, marked, local, 1)
+    response_with_batches(server, marked, local, "GET", 1)
 }
 
 fn response_with_batches(
     server: &MockServer,
     marked: bool,
     local: &str,
+    operation: &str,
     count: usize,
 ) -> serde_json::Value {
     let names = ["operation", "presignedUrl", "headers", "localFile"];
@@ -46,7 +47,7 @@ fn response_with_batches(
             .collect::<Vec<_>>(),
     ));
     let values = [
-        "GET".to_owned(),
+        operation.to_owned(),
         format!("{}/object", server.uri()),
         "{}".to_owned(),
         local.to_owned(),
@@ -86,7 +87,7 @@ async fn multiple_instruction_batches_fail_before_any_storage_request() {
     std::fs::write(&dest, b"original").unwrap();
     let session = session(
         &server,
-        response_with_batches(&server, true, dest.to_str().unwrap(), 2),
+        response_with_batches(&server, true, dest.to_str().unwrap(), "GET", 2),
     )
     .await;
     Mock::given(method("GET"))
@@ -117,6 +118,14 @@ async fn multiple_instruction_batches_fail_before_any_storage_request() {
 }
 
 async fn session(server: &MockServer, body: serde_json::Value) -> Session {
+    session_with_http(server, body, HttpConfig::default()).await
+}
+
+async fn session_with_http(
+    server: &MockServer,
+    body: serde_json::Value,
+    http: HttpConfig,
+) -> Session {
     Mock::given(method("POST"))
         .and(path("/api/2.0/sql/warehouses/wh/sessions"))
         .respond_with(
@@ -152,9 +161,73 @@ async fn session(server: &MockServer, body: serde_json::Value) -> Session {
             token: "workspace-token".into(),
             identity_federation_client_id: None,
         })
+        .http(http)
         .open()
         .await
         .unwrap()
+}
+
+#[tokio::test]
+async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_out() {
+    for operation in ["PUT", "GET"] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let local = dir.path().join("file");
+        std::fs::write(&local, b"original").unwrap();
+        let mut http = HttpConfig::default();
+        http.request_timeout = Duration::from_millis(100);
+        let session = session_with_http(
+            &server,
+            response_with_batches(&server, true, local.to_str().unwrap(), operation, 1),
+            http,
+        )
+        .await;
+        Mock::given(method(operation))
+            .and(path("/object"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_millis(300))
+                    .set_body_bytes(b"downloaded"),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let mut statement = session.statement();
+        statement.spec().sql("operation");
+        let mut executed = statement.execute().await.unwrap();
+        assert_eq!(
+            executed
+                .result_stream_mut()
+                .complete_volume_operation(
+                    &VolumeOptions {
+                        allowed_paths: vec![dir.path().to_owned()],
+                        ..Default::default()
+                    },
+                    None,
+                )
+                .await
+                .unwrap(),
+            VolumeCompletion::Completed
+        );
+        if operation == "PUT" {
+            let requests = server.received_requests().await.unwrap();
+            let upload = requests.iter().find(|r| r.url.path() == "/object").unwrap();
+            assert_eq!(upload.body, b"original");
+        } else {
+            assert_eq!(std::fs::read(&local).unwrap(), b"downloaded");
+        }
+        executed.close().await.unwrap();
+        Mock::given(method("POST"))
+            .and(path("/api/2.0/sql/statements"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let error = statement.execute().await.err().expect("RPC deadline");
+        assert_eq!(error.code, ErrorCode::NetworkError);
+        assert!(error.message.contains("timed out"), "{error}");
+        session.close().await.unwrap();
+    }
 }
 
 #[tokio::test]

@@ -479,7 +479,11 @@ impl DatabricksHttpClient {
         }
 
         // Follow redirects for normal traffic (reqwest's default policy).
-        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+        let client = Self::build_reqwest_client(
+            &config,
+            reqwest::redirect::Policy::default(),
+            Some(config.read_timeout),
+        )?;
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
@@ -514,15 +518,16 @@ impl DatabricksHttpClient {
     fn build_reqwest_client(
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
+        request_timeout: Option<Duration>,
     ) -> Result<Client> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
-            // `read_timeout` is a historical name; reqwest applies this as
-            // the total deadline from connect through response-body completion.
-            .timeout(config.read_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)
             .redirect(redirect);
+        if let Some(timeout) = request_timeout {
+            builder = builder.timeout(timeout);
+        }
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {
@@ -736,6 +741,11 @@ impl DatabricksHttpClient {
         &self.client
     }
 
+    /// Storage transfers can outlive SQL RPCs, so retain connection settings without their deadline.
+    pub(crate) fn storage_client(&self) -> Result<Client> {
+        Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::default(), None)
+    }
+
     /// Get the authorization header value.
     ///
     /// Returns an error if the auth provider has not been set via `set_auth_provider()`.
@@ -805,7 +815,11 @@ impl DatabricksHttpClient {
     /// `azure_tenant_id` (which skips discovery entirely). A single hop is
     /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
-        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let client = Self::build_reqwest_client(
+            &self.config,
+            reqwest::redirect::Policy::none(),
+            Some(self.config.read_timeout),
+        )?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
         })?;

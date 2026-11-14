@@ -403,6 +403,7 @@ impl Session {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?,
         );
+        let storage_client = http_client.storage_client()?;
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
@@ -503,7 +504,7 @@ impl Session {
         Ok(Session {
             inner: Arc::new(SessionInner {
                 transport,
-                storage_client: http_client.inner().clone(),
+                storage_client,
                 volume_states: std::sync::Mutex::new(Some(Vec::new())),
                 session_id: session_info.session_id,
                 config,
