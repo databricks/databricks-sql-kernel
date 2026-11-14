@@ -34,11 +34,12 @@
 //!  and available         we approach this boundary
 //! ```
 //!
-//! When a link is requested:
-//! 1. Return immediately from cache if available
-//! 2. Update consumer position tracking
-//! 3. Check if prefetch should be triggered (async, non-blocking)
-//! 4. Background task fetches links and caches them
+//! Link requests and download scheduling advance the consumer position to the
+//! highest chunk index seen and check whether to start non-blocking background
+//! prefetch, which fetches links and caches them ahead of downloads.
+//!
+//! Link requests return cached links immediately; on a miss they wait for any
+//! page already being prefetched before requesting it.
 
 use crate::client::{ChunkLinkFetchResult, SessionAttribution, Transport};
 use crate::kernel_error::{Error, Result};
@@ -66,7 +67,10 @@ use tokio::sync::Mutex as TokioMutex;
 /// Both parameters are passed to methods; implementations use the relevant one.
 #[async_trait]
 pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
-    // Cached links can outlive a fetch call, so scheduling must advance the prefetch horizon.
+    /// Cached links can outlive a fetch call, so scheduling must advance the prefetch horizon.
+    /// Prefetchers keep the highest `chunk_index` seen because calls may repeat or
+    /// arrive out of order. This synchronous hook runs inside the download scheduler
+    /// and must not block. Fetchers without prefetching may use the no-op default.
     fn note_scheduled(&self, _chunk_index: i64) {}
 
     /// Fetch the next batch of chunk links.
@@ -147,7 +151,7 @@ pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
 ///
 /// ## Prefetch Behavior
 ///
-/// When `fetch_links()` is called:
+/// When a download is scheduled or `fetch_links()` is called:
 /// 1. Consumer position is updated
 /// 2. If `next_server_fetch_index <= consumer_position + link_prefetch_window`,
 ///    a background prefetch task is spawned
@@ -215,7 +219,7 @@ pub(crate) struct SeaChunkLinkFetcher {
     /// avoid spinning, but the empty-with-has_more shape is a
     /// server bug worth surfacing in production logs.
     empty_with_has_more_warned: AtomicBool,
-    /// Current consumer position (highest chunk index requested)
+    /// Current consumer position (highest chunk index scheduled or requested)
     current_consumer_index: AtomicI64,
     /// Number of chunks to prefetch ahead of consumer position
     link_prefetch_window: i64,
