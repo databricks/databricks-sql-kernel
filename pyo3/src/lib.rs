@@ -76,6 +76,13 @@ fn reset_logging(py: Python<'_>) {
     logging::reset_logging(py);
 }
 
+/// The level below which kernel log records are dropped before reaching
+/// Python (`"WARN"`, `"DEBUG"`, ...). Private; for tests.
+#[pyfunction]
+fn _log_max_level() -> &'static str {
+    logging::max_level_name()
+}
+
 #[pymodule]
 fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("__version__", env!("CARGO_PKG_VERSION"))?;
@@ -90,6 +97,7 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<result_stream::ResultStream>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(_log_max_level, m)?)?;
 
     // Install the log bridge at module import so *any* consumer of the
     // bare wheel (the connector, integration tests, custom embedders)

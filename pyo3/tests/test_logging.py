@@ -53,15 +53,20 @@ def test_debug_set_after_import_reaches_python(caplog):
     # The bridge was installed at import, before this level was set.
     with caplog.at_level(logging.DEBUG, logger=KERNEL_LOGGER):
         _reject_session()
+        assert k._log_max_level() == "DEBUG"
     (record,) = _breadcrumbs(caplog)
     assert record.name == "databricks.sql.kernel.pyo3"
     assert record.levelno == logging.DEBUG
 
 
-def test_records_below_the_level_are_not_forwarded(caplog):
+def test_records_below_the_level_are_dropped_before_python(caplog):
     with caplog.at_level(logging.WARNING, logger=KERNEL_LOGGER):
         k.reset_logging()
+        # Below WARNING nothing is forwarded, so DEBUG records are dropped
+        # by `log`'s own level check instead of reaching pyo3_log.
+        assert k._log_max_level() == "WARN"
         _reject_session()
+        assert k._log_max_level() == "WARN"
     assert not _breadcrumbs(caplog)
 
 

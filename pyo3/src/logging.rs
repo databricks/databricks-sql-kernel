@@ -291,15 +291,43 @@ fn apply(levels: PythonLevels, reset: bool) {
         return;
     };
     let mut applied = APPLIED.lock().unwrap_or_else(|p| p.into_inner());
-    let (applied_ticket, applied_fingerprint) = *applied;
-    let mut changed = false;
-    if levels.ticket > applied_ticket {
-        changed = levels.fingerprint != applied_fingerprint;
-        *applied = (levels.ticket, levels.fingerprint);
-        log::set_max_level(levels.max_level);
+    let (set_level, clear_cache) = decide(&mut applied, &levels, reset);
+    if let Some(level) = set_level {
+        log::set_max_level(level);
     }
-    if reset || changed {
+    if clear_cache {
         handle.reset();
+    }
+}
+
+/// What [`apply`] does for `levels`, given the `(ticket, fingerprint)` of
+/// the last applied read (updated in place): the max level to set, if
+/// any, and whether to clear `pyo3_log`'s cache.
+fn decide(
+    applied: &mut (u64, u64),
+    levels: &PythonLevels,
+    reset: bool,
+) -> (Option<log::LevelFilter>, bool) {
+    let (applied_ticket, applied_fingerprint) = *applied;
+    if levels.ticket <= applied_ticket {
+        return (None, reset);
+    }
+    *applied = (levels.ticket, levels.fingerprint);
+    (
+        Some(levels.max_level),
+        reset || levels.fingerprint != applied_fingerprint,
+    )
+}
+
+/// The current `log::max_level`, for tests.
+pub(crate) fn max_level_name() -> &'static str {
+    match log::max_level() {
+        log::LevelFilter::Off => "OFF",
+        log::LevelFilter::Error => "ERROR",
+        log::LevelFilter::Warn => "WARN",
+        log::LevelFilter::Info => "INFO",
+        log::LevelFilter::Debug => "DEBUG",
+        log::LevelFilter::Trace => "TRACE",
     }
 }
 
@@ -343,10 +371,13 @@ impl PythonLevels {
         let read = || -> PyResult<Self> {
             let logging = py.import("logging")?;
             // Fill the probe's cache first, so a level changed during the read
-            // empties it again and the next refresh reads anew.
-            logging
-                .call_method1("getLogger", (LEVELS_PROBE,))?
-                .call_method1("isEnabledFor", (50,))?;
+            // empties it again and the next refresh reads anew. A disabled
+            // logger never fills its cache, and `dictConfig()` / `fileConfig()`
+            // disable existing loggers by default; the probe emits nothing, so
+            // re-enable it.
+            let probe = logging.call_method1("getLogger", (LEVELS_PROBE,))?;
+            probe.setattr("disabled", false)?;
+            probe.call_method1("isEnabledFor", (50,))?;
             let root = logging.getattr("root")?;
             let manager = root.getattr("manager")?;
             let logger_type = logging.getattr("Logger")?;
@@ -400,8 +431,8 @@ fn level_filter_for_python_threshold(threshold: i64) -> log::LevelFilter {
 #[cfg(test)]
 mod tests {
     use super::{
-        level_filter_for_python_threshold, levels_unchanged, mark_interpreter_exiting, ExitGuard,
-        PythonLevels, KERNEL_TARGET,
+        decide, level_filter_for_python_threshold, levels_unchanged, mark_interpreter_exiting,
+        ExitGuard, PythonLevels, KERNEL_TARGET,
     };
     use log::{LevelFilter, Log};
     use pyo3::prelude::*;
@@ -446,7 +477,52 @@ mod tests {
             run("logging.getLogger('kernel_logging_test.other')");
             assert!(levels_unchanged(py));
             assert_eq!(PythonLevels::read(py).max_level, before);
+
+            // dictConfig() disables existing loggers, the probe included. A
+            // disabled logger never refills its cache, so without re-enabling
+            // the probe every later read would look like a change.
+            run("import logging.config\nlogging.config.dictConfig({'version': 1})\nchild.setLevel(logging.INFO)");
+            assert!(!levels_unchanged(py), "setLevel after dictConfig");
+            assert_eq!(PythonLevels::read(py).max_level, LevelFilter::Info);
+            assert!(levels_unchanged(py), "the probe works after dictConfig");
+            run("child.disabled = False\nchild.setLevel(logging.NOTSET)");
         });
+    }
+
+    fn levels(ticket: u64, fingerprint: u64) -> PythonLevels {
+        PythonLevels {
+            ticket,
+            max_level: LevelFilter::Debug,
+            fingerprint,
+        }
+    }
+
+    #[test]
+    fn apply_sets_newer_reads_and_resets_on_change() {
+        let mut applied = (0, 0);
+        // First read: set the level; the fingerprint differs from the
+        // initial state, so the cache is cleared too.
+        assert_eq!(
+            decide(&mut applied, &levels(1, 7), false),
+            (Some(LevelFilter::Debug), true)
+        );
+        assert_eq!(applied, (1, 7));
+        // Same levels: set again, keep the cache.
+        assert_eq!(
+            decide(&mut applied, &levels(2, 7), false),
+            (Some(LevelFilter::Debug), false)
+        );
+        // reset_logging() always clears the cache.
+        assert_eq!(
+            decide(&mut applied, &levels(3, 7), true),
+            (Some(LevelFilter::Debug), true)
+        );
+        // A read that started before the applied one is dropped...
+        decide(&mut applied, &levels(5, 9), false);
+        assert_eq!(decide(&mut applied, &levels(4, 8), false), (None, false));
+        assert_eq!(applied, (5, 9));
+        // ...but an overtaken reset_logging() still clears the cache.
+        assert_eq!(decide(&mut applied, &levels(4, 8), true), (None, true));
     }
 
     #[test]
