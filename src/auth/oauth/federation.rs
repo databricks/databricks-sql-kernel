@@ -123,6 +123,16 @@ pub struct FederationProvider {
     /// coordination so concurrent callers on a rotated / expired token don't
     /// each mint a distinct server token (which SP-wide WIF would otherwise do).
     exchanging: AtomicBool,
+    /// The inner provider's last header and whether its token's issuer is
+    /// foreign. Keyed on the exact header, so the JWT is decoded once per
+    /// token rather than on every request, and a fresher token from the inner
+    /// provider is always checked again.
+    issuer_decision: RwLock<Option<IssuerDecision>>,
+}
+
+struct IssuerDecision {
+    header: String,
+    foreign: bool,
 }
 
 /// How long a follower sleeps between polls while the leader runs the exchange.
@@ -191,7 +201,26 @@ impl FederationProvider {
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
             exchanging: AtomicBool::new(false),
+            issuer_decision: RwLock::new(None),
         })
+    }
+
+    /// Whether the bearer token in `header` (`source_token`) needs exchange,
+    /// decided once per distinct header.
+    fn token_is_foreign(&self, header: &str, source_token: &str) -> bool {
+        if let Ok(slot) = self.issuer_decision.read() {
+            if let Some(decision) = slot.as_ref().filter(|d| d.header == header) {
+                return decision.foreign;
+            }
+        }
+        let foreign = jwt::issuer(source_token).is_some_and(|iss| self.issuer_is_foreign(&iss));
+        if let Ok(mut slot) = self.issuer_decision.write() {
+            *slot = Some(IssuerDecision {
+                header: header.to_string(),
+                foreign,
+            });
+        }
+        foreign
     }
 
     /// Whether a token with issuer `iss` needs exchange (i.e. it is foreign to
@@ -441,16 +470,15 @@ impl AuthProvider for FederationProvider {
             return Ok(header);
         };
 
-        // Re-check the issuer on every call (rather than trusting a cached
-        // decision) so a fresher in-house token from the inner provider is
-        // never shadowed by a stale exchange.
-        match jwt::issuer(source_token) {
-            Some(iss) if self.issuer_is_foreign(&iss) => {
-                let token = self.exchanged_or_original(source_token);
-                Ok(format!("Bearer {token}"))
-            }
+        // Check the issuer of every new token (rather than trusting a
+        // decision made for an earlier one) so a fresher in-house token from
+        // the inner provider is never shadowed by a stale exchange.
+        if self.token_is_foreign(&header, source_token) {
+            let token = self.exchanged_or_original(source_token);
+            Ok(format!("Bearer {token}"))
+        } else {
             // Not a JWT, or issued by this workspace: use as-is.
-            _ => Ok(header),
+            Ok(header)
         }
     }
 }
@@ -559,6 +587,7 @@ mod tests {
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
             exchanging: AtomicBool::new(false),
+            issuer_decision: RwLock::new(None),
         }
     }
 
@@ -584,6 +613,36 @@ mod tests {
     async fn issuer_other_host_is_foreign() {
         let p = provider_for("https://ws.cloud.databricks.com", "Bearer x");
         assert!(p.issuer_is_foreign("https://login.microsoftonline.com/tenant/v2.0"));
+    }
+
+    fn unsigned_jwt(iss: &str) -> String {
+        use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+        use base64::Engine;
+        let part = |v: serde_json::Value| URL_SAFE_NO_PAD.encode(v.to_string());
+        format!(
+            "{}.{}.sig",
+            part(serde_json::json!({"alg": "none"})),
+            part(serde_json::json!({ "iss": iss }))
+        )
+    }
+
+    /// The issuer decision is remembered per exact header: repeating a token
+    /// reuses it, and a different token is checked again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn issuer_decision_follows_the_current_token() {
+        let p = provider_for("https://ws.cloud.databricks.com", "Bearer x");
+        let in_house = unsigned_jwt("https://ws.cloud.databricks.com/oidc");
+        let foreign = unsigned_jwt("https://login.microsoftonline.com/tenant/v2.0");
+        let header = |t: &str| format!("Bearer {t}");
+
+        for _ in 0..2 {
+            assert!(!p.token_is_foreign(&header(&in_house), &in_house));
+        }
+        for _ in 0..2 {
+            assert!(p.token_is_foreign(&header(&foreign), &foreign));
+        }
+        assert!(!p.token_is_foreign(&header(&in_house), &in_house));
+        assert!(!p.token_is_foreign("Bearer opaque", "opaque"));
     }
 
     #[tokio::test(flavor = "multi_thread")]

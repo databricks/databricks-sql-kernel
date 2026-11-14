@@ -30,6 +30,7 @@ use crate::client::retry::{
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::types::sea::ServiceError;
+use reqwest::header::HeaderValue;
 use reqwest::{Client, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
@@ -386,6 +387,36 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
+    auth_value: AuthValueCache,
+}
+
+/// The last `Authorization` string from the provider and its validated header
+/// value, so an unchanged token is not re-validated and copied per request.
+/// `Debug` never prints the credential.
+#[derive(Default)]
+struct AuthValueCache(std::sync::Mutex<Option<(String, HeaderValue)>>);
+
+impl std::fmt::Debug for AuthValueCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthValueCache(<redacted>)")
+    }
+}
+
+impl AuthValueCache {
+    fn get_or_build(&self, header: String) -> Result<HeaderValue> {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((cached, value)) = slot.as_ref() {
+            if *cached == header {
+                return Ok(value.clone());
+            }
+        }
+        let mut value = HeaderValue::from_str(&header).map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        })?;
+        value.set_sensitive(true);
+        *slot = Some((header, value.clone()));
+        Ok(value)
+    }
 }
 
 impl DatabricksHttpClient {
@@ -502,6 +533,7 @@ impl DatabricksHttpClient {
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
+            auth_value: AuthValueCache::default(),
         })
     }
 
@@ -522,7 +554,11 @@ impl DatabricksHttpClient {
             .timeout(config.read_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)
-            .redirect(redirect);
+            .redirect(redirect)
+            // reqwest's default retry layer copies every request so it can
+            // replay HTTP/2 or HTTP/3 refusals, neither of which this client
+            // speaks; `execute_impl` does the kernel's retries.
+            .retry(reqwest::retry::never().max_retries_per_request(0));
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {
@@ -902,8 +938,8 @@ impl DatabricksHttpClient {
                 if !self.config.sea_response_compression_enabled {
                     req_builder = req_builder.header("Accept-Encoding", "identity");
                 }
-                let auth_header = self.auth_header()?;
-                req_builder = req_builder.header("Authorization", auth_header);
+                let auth_value = self.auth_value.get_or_build(self.auth_header()?)?;
+                req_builder = req_builder.header(reqwest::header::AUTHORIZATION, auth_value);
                 // Extra auth headers (Azure SP management-token pair). Empty for
                 // every other provider. Applied only on authenticated requests,
                 // never on the token/OIDC calls that use `execute_without_auth`.
@@ -1083,6 +1119,28 @@ mod tests {
 
     fn default_retry_configs() -> HashMap<RequestCategory, RetryConfig> {
         build_retry_configs(&RetryConfig::default(), &HashMap::new())
+    }
+
+    #[test]
+    fn auth_value_cache_reuses_the_value_until_the_header_changes() {
+        let cache = AuthValueCache::default();
+        let first = cache.get_or_build("Bearer one".to_string()).unwrap();
+        assert!(first.is_sensitive());
+        assert_eq!(first, "Bearer one");
+        assert_eq!(
+            cache.get_or_build("Bearer one".to_string()).unwrap(),
+            "Bearer one"
+        );
+        assert_eq!(
+            cache.get_or_build("Bearer two".to_string()).unwrap(),
+            "Bearer two"
+        );
+        assert!(cache.get_or_build("Bearer bad\nvalue".to_string()).is_err());
+        assert_eq!(
+            cache.get_or_build("Bearer two".to_string()).unwrap(),
+            "Bearer two"
+        );
+        assert!(!format!("{cache:?}").contains("two"));
     }
 
     #[test]
