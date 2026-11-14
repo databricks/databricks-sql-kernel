@@ -22,7 +22,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
 - All HTTP clients in a process share one DNS lookup per host at a time and
   reuse a successful answer for 30 s, so many sessions opening at once no
-  longer send one identical lookup each.
+  longer send one identical lookup each. A lookup still unanswered after 1 s
+  is tried again alongside (up to 3 attempts), and every waiting session gets
+  the first answer.
 
 ### Updated
 

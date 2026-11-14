@@ -22,8 +22,9 @@
 //! resolver runs one lookup per host at a time for the whole process and
 //! reuses a successful answer for [`TTL`]. Failures are shared with the
 //! callers already waiting on that lookup but are not cached. A lookup still
-//! unanswered after [`HEDGE`] is no longer joined: the next caller starts a
-//! fresh one, so one dropped query can't hold every new connection.
+//! unanswered after [`HEDGE`] gets another attempt, up to [`MAX_ATTEMPTS`],
+//! and the first answer reaches every caller waiting on it, so one dropped
+//! query doesn't hold the whole burst for glibc's retry.
 //!
 //! [`TTL`] is fixed: `getaddrinfo` doesn't report the record's own DNS TTL,
 //! so that is ignored. The answer is also not invalidated when connecting to
@@ -44,9 +45,11 @@ use tokio::sync::watch;
 /// How long a successful answer is reused. Matches the JVM's default
 /// positive-lookup TTL, so the JDBC driver's behaviour is the reference.
 const TTL: Duration = Duration::from_secs(30);
-/// How long new callers join an unanswered lookup before starting another;
-/// well under glibc's 5 s retry timeout.
+/// How long a lookup goes unanswered before another attempt starts; well
+/// under glibc's 5 s retry timeout.
 const HEDGE: Duration = Duration::from_secs(1);
+/// Attempts per lookup, started [`HEDGE`] apart while none has answered.
+const MAX_ATTEMPTS: usize = 3;
 /// Bound on distinct cached hosts (workspace + CloudFetch storage hosts).
 const MAX_HOSTS: usize = 256;
 
@@ -56,8 +59,8 @@ type Answer = (Result<Arc<[SocketAddr]>, Arc<io::Error>>, Instant);
 type Entry = watch::Receiver<Option<Answer>>;
 
 pub(crate) struct CachingResolver {
-    /// Each host's latest lookup and when it started.
-    entries: Mutex<HashMap<String, (Entry, Instant)>>,
+    /// Each host's latest lookup.
+    entries: Mutex<HashMap<String, Entry>>,
     ttl: Duration,
     hedge: Duration,
     lookup: Lookup,
@@ -84,22 +87,19 @@ impl CachingResolver {
         }
     }
 
-    /// The lookup to join for `host`: a recent one in flight, a fresh cached
-    /// answer, or a new lookup when the last one expired, failed or stalled.
+    /// The lookup to join for `host`: one in flight, a fresh cached answer, or
+    /// a new lookup when the last one expired or failed.
     fn entry(&self, host: &str) -> Entry {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = |(entry, started): &(Entry, Instant)| {
-            let in_flight = match &*entry.borrow() {
-                None => true,
-                Some((Ok(_), at)) => return at.elapsed() < self.ttl,
-                Some((Err(_), _)) => return false,
-            };
+        let usable = |entry: &Entry| match &*entry.borrow() {
             // An unanswered entry whose thread is gone will never be answered.
-            in_flight && started.elapsed() < self.hedge && entry.has_changed().is_ok()
+            None => entry.has_changed().is_ok(),
+            Some((Ok(_), at)) => at.elapsed() < self.ttl,
+            Some((Err(_), _)) => false,
         };
         if let Some(current) = entries.get(host) {
             if usable(current) {
-                return current.0.clone();
+                return current.clone();
             }
         }
         if entries.len() >= MAX_HOSTS {
@@ -109,24 +109,74 @@ impl CachingResolver {
             }
         }
         let entry = self.start_lookup(host);
-        entries.insert(host.to_owned(), (entry.clone(), Instant::now()));
+        entries.insert(host.to_owned(), entry.clone());
         entry
     }
 
-    /// Run the blocking lookup on its own thread, which publishes the answer
-    /// itself: waiters from other sessions depend on it, so it must not be
-    /// abandoned when the caller that started it is cancelled or its runtime
-    /// shuts down.
+    /// Run the lookup off the caller's runtime on a thread that publishes the
+    /// answer itself: waiters from other sessions depend on it, so it must not
+    /// be abandoned when the caller that started it is cancelled or its
+    /// runtime shuts down. While no attempt has answered, another starts every
+    /// `hedge`, and the first answer is published.
     fn start_lookup(&self, host: &str) -> Entry {
         let (tx, rx) = watch::channel(None);
-        let tx = Arc::new(tx);
-        let thread_tx = Arc::clone(&tx);
         let lookup = Arc::clone(&self.lookup);
+        let hedge = self.hedge;
         let host = host.to_owned();
         let spawned = std::thread::Builder::new()
             .name("dbx-sql-kernel-dns".to_owned())
             .spawn(move || {
-                let result = lookup(&host).and_then(|addrs| {
+                let result = first_answer(&lookup, &host, hedge);
+                tx.send_replace(Some((
+                    result.map(Arc::from).map_err(Arc::new),
+                    Instant::now(),
+                )));
+            });
+        match spawned {
+            Ok(_) => rx,
+            Err(e) => {
+                let (tx, rx) = watch::channel(None);
+                tx.send_replace(Some((Err(Arc::new(e)), Instant::now())));
+                rx
+            }
+        }
+    }
+}
+
+/// The first answer from up to [`MAX_ATTEMPTS`] attempts at `lookup(host)`,
+/// each on its own thread, started `hedge` apart while none has answered.
+fn first_answer(lookup: &Lookup, host: &str, hedge: Duration) -> io::Result<Vec<SocketAddr>> {
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    let mut done_tx = Some(done_tx);
+    let mut attempts = 0;
+    let mut spawn_error = None;
+    loop {
+        if let Some(sender) = done_tx.as_ref() {
+            let (sender, lookup, host) = (sender.clone(), Arc::clone(lookup), host.to_owned());
+            attempts += 1;
+            let spawned = std::thread::Builder::new()
+                .name("dbx-sql-kernel-dns".to_owned())
+                .spawn(move || {
+                    let _ = sender.send(lookup(&host));
+                });
+            if let Err(e) = spawned {
+                spawn_error = Some(e);
+                done_tx = None;
+            } else if attempts == MAX_ATTEMPTS {
+                // No more attempts: let the channel close once they all end.
+                done_tx = None;
+            }
+        }
+        let received = if done_tx.is_some() {
+            done_rx.recv_timeout(hedge)
+        } else {
+            done_rx
+                .recv()
+                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
+        };
+        match received {
+            Ok(result) => {
+                return result.and_then(|addrs| {
                     if addrs.is_empty() {
                         Err(io::Error::new(
                             io::ErrorKind::NotFound,
@@ -136,15 +186,14 @@ impl CachingResolver {
                         Ok(addrs)
                     }
                 });
-                thread_tx.send_replace(Some((
-                    result.map(Arc::from).map_err(Arc::new),
-                    Instant::now(),
-                )));
-            });
-        if let Err(e) = spawned {
-            tx.send_replace(Some((Err(Arc::new(e)), Instant::now())));
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(
+                    spawn_error.unwrap_or_else(|| io::Error::other("DNS lookup threads exited"))
+                );
+            }
         }
-        rx
     }
 }
 
@@ -339,37 +388,70 @@ mod tests {
         assert_eq!(firsts.len(), 3);
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn callers_after_the_hedge_window_start_a_new_lookup() {
+    type Release = Arc<(Mutex<bool>, std::sync::Condvar)>;
+
+    /// A lookup whose first `stalled` attempts block until released, like a
+    /// dropped query waiting for glibc's retry; later attempts answer at once.
+    fn stalling(stalled: usize) -> (Lookup, Arc<AtomicUsize>, Release) {
         let calls = Arc::new(AtomicUsize::new(0));
-        let c = Arc::clone(&calls);
+        let release: Release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let (c, rel) = (Arc::clone(&calls), Arc::clone(&release));
         let lookup: Lookup = Arc::new(move |_| {
-            // The first query stalls (a dropped packet); the retry is fast.
-            if c.fetch_add(1, Ordering::SeqCst) == 0 {
-                std::thread::sleep(Duration::from_millis(500));
+            if c.fetch_add(1, Ordering::SeqCst) < stalled {
+                let (released, wake) = &*rel;
+                let _released = wake
+                    .wait_while(released.lock().unwrap(), |done| !*done)
+                    .unwrap();
             }
             Ok(vec!["10.0.0.1:0".parse().unwrap()])
         });
+        (lookup, calls, release)
+    }
+
+    fn release(stall: &Release) {
+        *stall.0.lock().unwrap() = true;
+        stall.1.notify_all();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn callers_waiting_on_a_stalled_lookup_get_the_hedged_answer() {
+        // The first query never answers on its own; everyone already waiting
+        // on it is answered by the second attempt.
+        let (lookup, calls, stall) = stalling(1);
         let r = Arc::new(CachingResolver::new(TTL, Duration::from_millis(50), lookup));
-        let r1 = Arc::clone(&r);
-        let early = tokio::spawn(async move { resolve(&r1, "example.com").await });
-        tokio::time::sleep(Duration::from_millis(20)).await;
-        let joined = Instant::now();
-        let r2 = Arc::clone(&r);
-        let within_window = tokio::spawn(async move { resolve(&r2, "example.com").await });
-        tokio::time::sleep(Duration::from_millis(80)).await;
-        let started = Instant::now();
-        resolve(&r, "example.com").await.unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(300),
-            "not held by the stall"
-        );
+        let waiters: Vec<_> = (0..8)
+            .map(|_| {
+                let r = Arc::clone(&r);
+                tokio::spawn(async move { resolve(&r, "example.com").await })
+            })
+            .collect();
+        for waiter in waiters {
+            let addrs = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("held by the stalled query")
+                .unwrap()
+                .unwrap();
+            assert_eq!(addrs, vec!["10.0.0.1:0".parse().unwrap()]);
+        }
         assert_eq!(calls.load(Ordering::SeqCst), 2);
-        within_window.await.unwrap().unwrap();
-        assert!(
-            joined.elapsed() >= Duration::from_millis(400),
-            "joined the first lookup"
-        );
-        early.await.unwrap().unwrap();
+        release(&stall);
+    }
+
+    #[tokio::test]
+    async fn a_lookup_makes_at_most_max_attempts() {
+        let (lookup, calls, stall) = stalling(usize::MAX);
+        let r = Arc::new(CachingResolver::new(TTL, Duration::from_millis(10), lookup));
+        let r1 = Arc::clone(&r);
+        let pending = tokio::spawn(async move { resolve(&r1, "example.com").await });
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) < MAX_ATTEMPTS {
+            assert!(Instant::now() < deadline, "attempts didn't start");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        // Ten more hedge intervals pass without another attempt.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(calls.load(Ordering::SeqCst), MAX_ATTEMPTS);
+        release(&stall);
+        pending.await.unwrap().unwrap();
     }
 }
