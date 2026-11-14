@@ -25,6 +25,10 @@ pub(crate) enum TelemetryExportError {
     Serialization(#[from] serde_json::Error),
     #[error("telemetry export failed: {0}")]
     Export(String),
+    /// The endpoint rate-limited the export (HTTP 429 or 503). The batch was
+    /// not accepted and can be sent again later.
+    #[error("telemetry export throttled: {0}")]
+    Throttled(String),
 }
 
 pub(crate) trait TelemetryExporter: Send + Sync {
@@ -36,17 +40,13 @@ pub(crate) trait TelemetryExporter: Send + Sync {
 
 pub(super) async fn export_batch(
     exporter: Arc<dyn TelemetryExporter>,
-    batch: Vec<TelemetryFrontendLog>,
-) {
-    let request = match TelemetryRequest::from_logs(&batch) {
-        Ok(request) => request,
-        Err(e) => {
-            tracing::debug!(error = %e, "failed to serialize telemetry batch");
-            return;
-        }
-    };
+    batch: &[TelemetryFrontendLog],
+) -> TelemetryExportResult {
+    let request = TelemetryRequest::from_logs(batch).inspect_err(|e| {
+        tracing::debug!(error = %e, "failed to serialize telemetry batch");
+    })?;
 
-    if let Err(e) = exporter.export(request).await {
+    exporter.export(request).await.inspect_err(|e| {
         tracing::debug!(error = %e, "failed to export telemetry batch");
-    }
+    })
 }
