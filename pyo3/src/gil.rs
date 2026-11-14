@@ -24,7 +24,7 @@ use pyo3::sync::PyOnceLock;
 use pyo3::types::PyModule;
 use std::cell::Cell;
 use std::future::Future;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use tokio::runtime::Runtime;
 
@@ -40,8 +40,12 @@ thread_local! {
     static MAIN_THREAD: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
 }
 
+/// Whether `on_main_thread` may cache: only once forks are tracked.
+static CACHE_ENABLED: AtomicBool = AtomicBool::new(false);
+
 /// Recompute cached `on_main_thread` answers in forked children. Called
-/// once, at module import.
+/// once, at module import. Without it (registration failed), every call
+/// asks `threading`, as before caching.
 pub(crate) fn install_fork_handler() {
     #[cfg(unix)]
     {
@@ -51,10 +55,14 @@ pub(crate) fn install_fork_handler() {
         static INSTALL: std::sync::Once = std::sync::Once::new();
         // SAFETY: registers a handler that only bumps an atomic, which is
         // async-signal-safe as `fork()` requires of child handlers.
-        INSTALL.call_once(|| unsafe {
-            libc::pthread_atfork(None, None, Some(after_fork_in_child));
+        INSTALL.call_once(|| {
+            if unsafe { libc::pthread_atfork(None, None, Some(after_fork_in_child)) } == 0 {
+                CACHE_ENABLED.store(true, Ordering::Relaxed);
+            }
         });
     }
+    #[cfg(not(unix))]
+    CACHE_ENABLED.store(true, Ordering::Relaxed);
 }
 
 /// Whether the calling thread is Python's main thread, the only one that
@@ -68,8 +76,9 @@ pub(crate) fn install_fork_handler() {
 /// thread until the next one; asking `threading` costs a few Python calls
 /// under the GIL on every `execute()`.
 pub(crate) fn on_main_thread(py: Python<'_>) -> bool {
+    let cache = CACHE_ENABLED.load(Ordering::Relaxed);
     let generation = FORK_GENERATION.load(Ordering::Relaxed);
-    if let Some((cached_generation, main)) = MAIN_THREAD.get() {
+    if let (true, Some((cached_generation, main))) = (cache, MAIN_THREAD.get()) {
         if cached_generation == generation {
             return main;
         }
@@ -128,6 +137,8 @@ mod tests {
 
     #[test]
     fn main_thread_answer_is_cached_until_a_fork() {
+        super::install_fork_handler();
+        assert!(super::CACHE_ENABLED.load(Ordering::Relaxed));
         Python::initialize();
         // `threading` takes the thread that imports it first as the main
         // thread; the thread spawned below is never that one.
