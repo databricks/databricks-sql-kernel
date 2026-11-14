@@ -48,8 +48,13 @@ const TTL: Duration = Duration::from_secs(30);
 /// How long a lookup goes unanswered before another attempt starts; well
 /// under glibc's 5 s retry timeout.
 const HEDGE: Duration = Duration::from_secs(1);
-/// Attempts per lookup, started [`HEDGE`] apart while none has answered.
+/// Attempts per lookup, started [`HEDGE`] apart while none has succeeded
+/// (or at once when one fails).
 const MAX_ATTEMPTS: usize = 3;
+/// An unanswered lookup older than this is replaced. A lookup's own threads
+/// always answer well before; this covers an entry inherited across `fork()`,
+/// whose threads don't exist in the child.
+const STUCK_AFTER: Duration = Duration::from_secs(60);
 /// Bound on distinct cached hosts (workspace + CloudFetch storage hosts).
 const MAX_HOSTS: usize = 256;
 
@@ -59,8 +64,8 @@ type Answer = (Result<Arc<[SocketAddr]>, Arc<io::Error>>, Instant);
 type Entry = watch::Receiver<Option<Answer>>;
 
 pub(crate) struct CachingResolver {
-    /// Each host's latest lookup.
-    entries: Mutex<HashMap<String, Entry>>,
+    /// Each host's latest lookup and when it started.
+    entries: Mutex<HashMap<String, (Entry, Instant)>>,
     ttl: Duration,
     hedge: Duration,
     lookup: Lookup,
@@ -91,15 +96,15 @@ impl CachingResolver {
     /// a new lookup when the last one expired or failed.
     fn entry(&self, host: &str) -> Entry {
         let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
-        let usable = |entry: &Entry| match &*entry.borrow() {
+        let usable = |(entry, started): &(Entry, Instant)| match &*entry.borrow() {
             // An unanswered entry whose thread is gone will never be answered.
-            None => entry.has_changed().is_ok(),
+            None => entry.has_changed().is_ok() && started.elapsed() < STUCK_AFTER,
             Some((Ok(_), at)) => at.elapsed() < self.ttl,
             Some((Err(_), _)) => false,
         };
         if let Some(current) = entries.get(host) {
             if usable(current) {
-                return current.clone();
+                return current.0.clone();
             }
         }
         if entries.len() >= MAX_HOSTS {
@@ -109,15 +114,14 @@ impl CachingResolver {
             }
         }
         let entry = self.start_lookup(host);
-        entries.insert(host.to_owned(), entry.clone());
+        entries.insert(host.to_owned(), (entry.clone(), Instant::now()));
         entry
     }
 
     /// Run the lookup off the caller's runtime on a thread that publishes the
     /// answer itself: waiters from other sessions depend on it, so it must not
     /// be abandoned when the caller that started it is cancelled or its
-    /// runtime shuts down. While no attempt has answered, another starts every
-    /// `hedge`, and the first answer is published.
+    /// runtime shuts down. See [`first_answer`] for how attempts are made.
     fn start_lookup(&self, host: &str) -> Entry {
         let (tx, rx) = watch::channel(None);
         let lookup = Arc::clone(&self.lookup);
@@ -143,56 +147,53 @@ impl CachingResolver {
     }
 }
 
-/// The first answer from up to [`MAX_ATTEMPTS`] attempts at `lookup(host)`,
-/// each on its own thread, started `hedge` apart while none has answered.
+/// The first successful answer from up to [`MAX_ATTEMPTS`] attempts at
+/// `lookup(host)`, each on its own thread. Another attempt starts every
+/// `hedge` while none has succeeded, and at once when one fails: a fast
+/// failure (`EAI_AGAIN` from an overloaded stub) must not fail every waiter
+/// while another attempt may still succeed. The last error is returned only
+/// once every attempt has failed.
 fn first_answer(lookup: &Lookup, host: &str, hedge: Duration) -> io::Result<Vec<SocketAddr>> {
     let (done_tx, done_rx) = std::sync::mpsc::channel();
-    let mut done_tx = Some(done_tx);
-    let mut attempts = 0;
-    let mut spawn_error = None;
+    let (mut attempts, mut running) = (0, 0);
+    let mut last_error = None;
+    // Each pass starts an attempt while under the cap: the first, then one
+    // per `hedge` without a success, or one right after a failure.
     loop {
-        if let Some(sender) = done_tx.as_ref() {
-            let (sender, lookup, host) = (sender.clone(), Arc::clone(lookup), host.to_owned());
+        if attempts < MAX_ATTEMPTS {
             attempts += 1;
+            let (sender, lookup, host) = (done_tx.clone(), Arc::clone(lookup), host.to_owned());
             let spawned = std::thread::Builder::new()
                 .name("dbx-sql-kernel-dns".to_owned())
                 .spawn(move || {
-                    let _ = sender.send(lookup(&host));
+                    // Always report back, so the attempt is never waited on forever.
+                    let result =
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| lookup(&host)))
+                            .unwrap_or_else(|_| Err(io::Error::other("DNS lookup panicked")));
+                    let _ = sender.send(result);
                 });
-            if let Err(e) = spawned {
-                spawn_error = Some(e);
-                done_tx = None;
-            } else if attempts == MAX_ATTEMPTS {
-                // No more attempts: let the channel close once they all end.
-                done_tx = None;
+            match spawned {
+                Ok(_) => running += 1,
+                Err(e) => last_error = Some(e),
             }
         }
-        let received = if done_tx.is_some() {
-            done_rx.recv_timeout(hedge)
-        } else {
-            done_rx
-                .recv()
-                .map_err(|_| std::sync::mpsc::RecvTimeoutError::Disconnected)
-        };
-        match received {
+        if running == 0 {
+            if attempts < MAX_ATTEMPTS {
+                continue;
+            }
+            return Err(last_error.unwrap_or_else(|| io::Error::other("DNS lookup failed")));
+        }
+        match done_rx.recv_timeout(hedge) {
+            Ok(Ok(addrs)) if !addrs.is_empty() => return Ok(addrs),
             Ok(result) => {
-                return result.and_then(|addrs| {
-                    if addrs.is_empty() {
-                        Err(io::Error::new(
-                            io::ErrorKind::NotFound,
-                            "DNS lookup returned no addresses",
-                        ))
-                    } else {
-                        Ok(addrs)
-                    }
-                });
+                running -= 1;
+                last_error = Some(result.err().unwrap_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "DNS lookup returned no addresses")
+                }));
             }
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(
-                    spawn_error.unwrap_or_else(|| io::Error::other("DNS lookup threads exited"))
-                );
-            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            // The coordinator holds a sender, so the channel can't close.
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => unreachable!(),
         }
     }
 }
@@ -319,13 +320,69 @@ mod tests {
         for t in tasks {
             assert!(t.await.unwrap().unwrap_err().contains("boom"));
         }
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            MAX_ATTEMPTS,
+            "every attempt failed"
+        );
         assert!(resolve(&r, "example.com").await.is_err());
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            2,
+            2 * MAX_ATTEMPTS,
             "a failure is retried by the next caller"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_fast_failure_does_not_beat_an_attempt_that_succeeds() {
+        // The first attempt fails at once (EAI_AGAIN from an overloaded
+        // stub); the next one answers, and that is what every waiter gets.
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c = Arc::clone(&calls);
+        let lookup: Lookup = Arc::new(move |_| {
+            if c.fetch_add(1, Ordering::SeqCst) == 0 {
+                Err(io::Error::other("Temporary failure in name resolution"))
+            } else {
+                Ok(vec!["10.0.0.1:0".parse().unwrap()])
+            }
+        });
+        let r = Arc::new(CachingResolver::new(TTL, HEDGE, lookup));
+        let tasks: Vec<_> = (0..8)
+            .map(|_| {
+                let r = Arc::clone(&r);
+                tokio::spawn(async move { resolve(&r, "example.com").await })
+            })
+            .collect();
+        for t in tasks {
+            assert_eq!(
+                t.await.unwrap().unwrap(),
+                vec!["10.0.0.1:0".parse().unwrap()]
+            );
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn an_unanswered_entry_past_its_deadline_is_replaced() {
+        // After fork() the child keeps an in-flight entry whose lookup
+        // threads (and their senders' owners) don't exist there.
+        let (lookup, calls) = counting(Duration::ZERO, false);
+        let r = Arc::new(CachingResolver::new(TTL, HEDGE, lookup));
+        let (orphan_tx, orphan_rx) = watch::channel(None);
+        let long_ago = Instant::now()
+            .checked_sub(STUCK_AFTER + Duration::from_secs(1))
+            .expect("monotonic clock far enough from its origin");
+        r.entries
+            .lock()
+            .unwrap()
+            .insert("example.com".to_owned(), (orphan_rx, long_ago));
+        let addrs = tokio::time::timeout(Duration::from_secs(10), resolve(&r, "example.com"))
+            .await
+            .expect("waited on the orphaned entry")
+            .unwrap();
+        assert_eq!(addrs, vec!["10.0.0.1:0".parse().unwrap()]);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        drop(orphan_tx);
     }
 
     #[tokio::test]
@@ -346,7 +403,12 @@ mod tests {
             .unwrap();
         let r1 = Arc::clone(&r);
         first.spawn(async move { resolve(&r1, "example.com").await });
-        std::thread::sleep(Duration::from_millis(20));
+        // Shut down only once that task's lookup is running.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while calls.load(Ordering::SeqCst) == 0 {
+            assert!(Instant::now() < deadline, "the lookup never started");
+            std::thread::sleep(Duration::from_millis(1));
+        }
         first.shutdown_background();
 
         let second = tokio::runtime::Builder::new_current_thread()
