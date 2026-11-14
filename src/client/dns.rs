@@ -20,11 +20,11 @@
 //! stub resolvers (systemd-resolved drops the excess and glibc retries after
 //! its 5 s timeout), so a share of the opens stall for 5 s or more. This
 //! resolver runs one lookup per host at a time for the whole process and
-//! reuses a successful answer for [`TTL`]. Failures are shared with the
-//! callers already waiting on that lookup but are not cached. A lookup still
-//! unanswered after [`HEDGE`] gets another attempt, up to [`MAX_ATTEMPTS`],
-//! and the first answer reaches every caller waiting on it, so one dropped
-//! query doesn't hold the whole burst for glibc's retry.
+//! reuses a successful answer for [`TTL`]. A lookup that hasn't succeeded
+//! after [`HEDGE`], or whose attempt failed, gets another attempt, up to
+//! [`MAX_ATTEMPTS`]. The first successful answer reaches every caller waiting
+//! on it, so one dropped query doesn't hold the whole burst for glibc's retry.
+//! An error reaches them only when every attempt failed, and is not cached.
 //!
 //! [`TTL`] is fixed: `getaddrinfo` doesn't report the record's own DNS TTL,
 //! so that is ignored. The answer is also not invalidated when connecting to
