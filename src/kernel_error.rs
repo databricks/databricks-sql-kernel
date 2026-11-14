@@ -180,8 +180,8 @@ pub struct Error {
     /// 5-character SQLSTATE if the server returned one.
     pub sql_state: Option<String>,
 
-    /// Databricks-specific error identifier from the SEA
-    /// `ServiceError.error_code` envelope — a stable string slug like
+    /// Stable error identifier from the kernel or the SEA
+    /// `ServiceError.error_code` envelope, such as
     /// `STATEMENT_NOT_FOUND` or `WAREHOUSE_STOPPED` that wrappers can
     /// branch on to map to host-language exceptions (PySQL's
     /// `OperationalError` taxonomy, JDBC's `SQLException` subclasses).

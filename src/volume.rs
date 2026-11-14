@@ -319,6 +319,7 @@ impl VolumeState {
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             return Err(Error::from_http_status(status.as_u16())
+                .with_error_code("VOLUME_STORAGE_HTTP_ERROR")
                 .with_retryable(matches!(status.as_u16(), 408 | 429 | 500 | 502 | 503 | 504))
                 .message(format!(
                     "Volume storage request failed: HTTP {}",
@@ -739,6 +740,10 @@ mod tests {
                     .await
                     .unwrap_err();
                 assert_eq!(error.http_status, Some(status));
+                assert_eq!(
+                    error.error_code.as_deref(),
+                    Some("VOLUME_STORAGE_HTTP_ERROR")
+                );
                 assert!(!error.retryable);
                 assert!(!error.message.contains("secret"));
             }
