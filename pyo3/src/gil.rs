@@ -156,14 +156,14 @@ mod tests {
         // SAFETY: the child only reads an atomic and exits.
         match unsafe { libc::fork() } {
             0 => unsafe {
-                let bumped = FORK_GENERATION.load(Ordering::Relaxed) == before + 1;
+                // `>`: another test may bump the counter in parallel.
+                let bumped = FORK_GENERATION.load(Ordering::Relaxed) > before;
                 libc::_exit(if bumped { 0 } else { 1 })
             },
             pid => {
                 let mut status = 0;
                 assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
                 assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
-                assert!(FORK_GENERATION.load(Ordering::Relaxed) >= before);
             }
         }
     }
