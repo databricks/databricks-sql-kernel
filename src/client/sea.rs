@@ -102,7 +102,7 @@ struct ExecutionRequest {
 ///
 /// Used by the shared decoder [`SeaRestTransport::terminal_outcome`]
 /// so the sync polling loop and the async one-shot
-/// [`Transport::fetch_completed_result`] path produce identical
+/// [`Transport::completed_result`] materialisation produce identical
 /// outcomes (and identical errors) for `FAILED` / `CANCELLED` responses.
 enum StatementOutcome {
     /// Terminal success — `Succeeded` OR `Closed` (with or without inline
@@ -504,7 +504,7 @@ impl SeaRestTransport {
     /// Decode a single SEA `ExecuteResponse` into a terminal outcome.
     ///
     /// Shared by synchronous execution after it observes a raw terminal state and
-    /// [`Transport::fetch_completed_result`] (async one-shot fetch), so both paths
+    /// [`Transport::completed_result`] (async materialisation), so both paths
     /// produce identical errors for `FAILED` / `CANCELLED`.
     /// `CLOSED` (with or without result data) is a terminal success — JDBC
     /// parity; an empty `CLOSED` materialises an empty result downstream.
@@ -1436,14 +1436,11 @@ impl Transport for SeaRestTransport {
         }
     }
 
-    async fn fetch_completed_result(
+    async fn completed_result(
         &self,
-        statement_id: &str,
+        response: ExecuteResponse,
         session_attribution: SessionAttribution,
     ) -> Result<Option<ExecuteResult>> {
-        let response = self
-            .get_statement_status(statement_id, session_attribution)
-            .await?;
         match Self::terminal_outcome(response) {
             StatementOutcome::Done(r) => {
                 let reader_factory = self.reader_factory()?;

@@ -33,6 +33,7 @@ changes go in the root `NEXT_CHANGELOG.md`.
 - `Statement.execute()` remembers per thread whether it runs on the main
   thread (recomputed after `fork()`) instead of asking `threading` on every
   call.
+- Log records below every Python logger's level are now dropped before they reach the Python logging bridge, which cuts client CPU per query. Levels set before a `Session` is created take effect without `reset_logging()`.
 
 ### Updated
 

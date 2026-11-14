@@ -477,6 +477,8 @@ impl Session {
         telemetry_circuit_breaker_threshold: Option<u32>,
         telemetry_circuit_breaker_timeout_ms: Option<u64>,
     ) -> PyResult<Self> {
+        // Pick up logger levels set since the bridge was installed.
+        crate::logging::refresh_max_level(py);
         // Resolve auth_type. Explicit `auth_type` always wins. When
         // omitted, default to "pat" if `access_token` was passed
         // (back-compat for existing PAT callers). A bare

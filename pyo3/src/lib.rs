@@ -69,12 +69,13 @@ fn init_logging(py: Python<'_>) -> bool {
     logging::init_logging(py)
 }
 
-/// Clear cached logger levels so a Python-side logging reconfiguration
-/// applied *after* the first kernel log (e.g. raising
-/// `databricks.sql.kernel` to DEBUG mid-session) takes effect.
+/// Re-read the Python logger levels and clear cached ones so a Python-side
+/// logging reconfiguration applied *after* the first kernel log (e.g.
+/// raising `databricks.sql.kernel` to DEBUG mid-session) takes effect.
+/// Levels set before a `Session` is created apply without this call.
 #[pyfunction]
-fn reset_logging() {
-    logging::reset_logging();
+fn reset_logging(py: Python<'_>) {
+    logging::reset_logging(py);
 }
 
 #[pymodule]

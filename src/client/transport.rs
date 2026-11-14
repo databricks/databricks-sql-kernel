@@ -325,7 +325,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     /// `ExecutedAsyncStatement` immediately. Unlike
     /// [`Transport::execute_statement`], this never polls and never
     /// constructs a reader; callers fetch results later via
-    /// [`Transport::fetch_completed_result`].
+    /// [`Transport::completed_result`].
     ///
     /// **The implementation forces `params.wait_timeout = "0s"`**
     /// regardless of what the caller supplied — submit's contract
@@ -339,8 +339,7 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
         params: &ExecuteParams,
     ) -> Result<ExecuteResponse>;
 
-    /// Refresh status for an already-submitted statement and, if
-    /// terminal-and-succeeded, materialise the reader.
+    /// Materialise a reader from an observed terminal response.
     ///
     /// Returns:
     /// - `Ok(Some(ExecuteResult))` when the server reports
@@ -348,22 +347,21 @@ pub(crate) trait Transport: Send + Sync + std::fmt::Debug {
     ///   server emits for one-batch results).
     /// - `Ok(None)` when the server reports `Pending` / `Running` —
     ///   the caller should `status()` again later.
-    /// - `Err(...)` on `Failed` / `Cancelled` / true `Closed`-without-data
-    ///   with the same structured error
+    /// - `Err(...)` on `Failed` / `Cancelled` with the same structured error
     ///   `Transport::execute_statement`'s polling path produces.
     ///
     /// Used by `ExecutedAsyncStatement::fetch_result` and inside the
     /// `await_result` poll loop.
-    async fn fetch_completed_result(
+    async fn completed_result(
         &self,
-        statement_id: &str,
+        response: ExecuteResponse,
         session_attribution: SessionAttribution,
     ) -> Result<Option<ExecuteResult>>;
 
     /// One-shot status check for an in-flight statement. Returns the
     /// full `ExecuteResponse` (status + manifest + initial result, if
     /// any). Used by `ExecutedAsyncStatement::status` and the
-    /// `await_result` poll loop.
+    /// `await_result` poll loop, and `fetch_result`.
     async fn statement_status(
         &self,
         statement_id: &str,

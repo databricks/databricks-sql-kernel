@@ -235,7 +235,7 @@ def test_reader_preserves_session_and_maps_errors(failed, count):
                 assert (state, failure) == ("Succeeded", None)
                 streams = [reader.await_result(), reader.fetch_result()]
                 assert all(isinstance(stream, k.ResultStream) for stream in streams)
-            expected_reads = 4 if failed else 5
+            expected_reads = 4 if failed else 3
             assert [path for method, path in requests if method == "GET"] == [statement_path] * expected_reads
             owner.close()
             with pytest.raises(k.KernelError) as error:

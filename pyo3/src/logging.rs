@@ -42,20 +42,25 @@
 //! Kernel events fire on tokio worker threads with the GIL released
 //! (see `run_kernel!`). `pyo3_log` re-acquires the GIL per surviving
 //! record, so we must drop below-threshold events *before* that
-//! boundary. Two cheap gates do this: the global `log::max_level`
-//! (set by `pyo3_log` from the Python loggers' effective levels) and
-//! `pyo3_log`'s per-logger level cache. The customer's single knob
+//! boundary. Two cheap gates do this: the global `log::max_level`, set
+//! here to the most verbose level any Python logger accepts (see
+//! `PythonLevels`), and `pyo3_log`'s per-logger level cache. The
+//! first gate is an atomic compare inside the `log` and `tracing` macros,
+//! so a record (or span enter/exit) below every logger's level is dropped
+//! before it is built or reaches `pyo3_log`. The customer's single knob
 //! (`setLevel`) drives both — there is no separate Rust-side level
 //! argument.
 //!
 //! ## Reconfiguration
 //!
-//! `pyo3_log` caches logger objects and their levels on first use. If a
-//! customer changes levels *after* the first kernel log (e.g. raises a
-//! logger to DEBUG mid-session), call [`reset_logging`] to clear the
-//! cache so the new level takes effect. The connector calls this after
-//! it adjusts logging; most customers configure logging before
-//! connecting and never need it.
+//! The max level is recomputed at install, on every `Session`
+//! construction ([`refresh_max_level`], which also clears `pyo3_log`'s
+//! cache when a level changed) and by [`reset_logging`], so levels set
+//! before connecting take effect on their own. `pyo3_log` caches logger
+//! objects and their levels on first use. If a customer changes levels on
+//! an open session (e.g. raises a logger to DEBUG mid-session), call
+//! [`reset_logging`] to recompute the max level and clear the cache so
+//! the new level takes effect.
 //!
 //! ## Interpreter exit
 //!
@@ -68,7 +73,9 @@
 
 use pyo3::prelude::*;
 use pyo3_log::{Caching, Logger, ResetHandle};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Logger target the kernel tags every event with. Maps to the Python
@@ -208,12 +215,14 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
         .filter(log::LevelFilter::Trace)
         .filter_target(KERNEL_TARGET.to_owned(), log::LevelFilter::Trace);
 
-    // What `Logger::install()` does, but behind `ExitGuard`. `Trace` is the
-    // highest filter set above.
+    // What `Logger::install()` does, but behind `ExitGuard`, and with the max
+    // level taken from the Python loggers instead of the `Trace` filter above.
     let handle = logger.reset_handle();
     match log::set_boxed_logger(Box::new(ExitGuard(logger))) {
         Ok(()) => {
-            log::set_max_level(log::LevelFilter::Trace);
+            let levels = PythonLevels::read(py);
+            log::set_max_level(levels.max_level);
+            LEVELS_FINGERPRINT.store(levels.fingerprint, Ordering::Relaxed);
             // Best effort: without the hook, records still flow until exit.
             let _ = register_exit_hook(py);
             *state = LogState::Installed(handle);
@@ -232,20 +241,143 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
     }
 }
 
-/// Clear `pyo3_log`'s logger/level caches so a Python-side logging
-/// reconfiguration (e.g. a `setLevel` call after the first kernel log)
-/// takes effect. No-op if logging was never installed. Never panics.
-pub(crate) fn reset_logging() {
+/// Recompute the max level and clear `pyo3_log`'s logger/level caches so a
+/// Python-side logging reconfiguration (e.g. a `setLevel` call after the
+/// first kernel log) takes effect. No-op if logging was never installed.
+/// Never panics.
+pub(crate) fn reset_logging(py: Python<'_>) {
+    if !is_installed() {
+        return;
+    }
+    let levels = PythonLevels::read(py);
+    log::set_max_level(levels.max_level);
+    LEVELS_FINGERPRINT.store(levels.fingerprint, Ordering::Relaxed);
     if let LogState::Installed(handle) = &*lock_state() {
         handle.reset();
     }
 }
 
+/// Recompute the max level from the Python loggers. Called when a `Session`
+/// is created, so levels a customer sets before connecting apply without
+/// [`reset_logging`]. If any logger's level changed since the last read,
+/// `pyo3_log`'s cache is cleared too: a logger it cached at the old level
+/// would otherwise keep dropping newly enabled records. No-op if logging
+/// was never installed.
+pub(crate) fn refresh_max_level(py: Python<'_>) {
+    if !is_installed() {
+        return;
+    }
+    let levels = PythonLevels::read(py);
+    if LEVELS_FINGERPRINT.swap(levels.fingerprint, Ordering::Relaxed) != levels.fingerprint {
+        if let LogState::Installed(handle) = &*lock_state() {
+            handle.reset();
+        }
+    }
+    log::set_max_level(levels.max_level);
+}
+
+fn is_installed() -> bool {
+    matches!(*lock_state(), LogState::Installed(_))
+}
+
+/// Fingerprint of the Python logger levels last applied to `log::max_level`.
+static LEVELS_FINGERPRINT: AtomicU64 = AtomicU64::new(0);
+
+struct PythonLevels {
+    /// The most verbose `log` level any Python logger currently accepts.
+    max_level: log::LevelFilter,
+    /// Changes whenever a logger is added or its effective level changes.
+    fingerprint: u64,
+}
+
+impl PythonLevels {
+    /// Read the levels of the root logger and every existing logger. A
+    /// logger nobody has created yet inherits its nearest existing
+    /// ancestor's level, so these bound what `pyo3_log` could forward;
+    /// Python's `logging.disable()` raises the bound further. If the
+    /// loggers can't be read, falls back to `Trace` (forward everything to
+    /// `pyo3_log`, the previous behaviour).
+    fn read(py: Python<'_>) -> Self {
+        let read = || -> PyResult<Self> {
+            let logging = py.import("logging")?;
+            let root = logging.getattr("root")?;
+            let manager = root.getattr("manager")?;
+            let logger_type = logging.getattr("Logger")?;
+            let mut hasher = DefaultHasher::new();
+            let mut lowest: i64 = root.call_method0("getEffectiveLevel")?.extract()?;
+            lowest.hash(&mut hasher);
+            // Snapshot the values: another thread may create a logger meanwhile.
+            let loggers = py
+                .import("builtins")?
+                .getattr("list")?
+                .call1((manager.getattr("loggerDict")?.call_method0("values")?,))?;
+            for logger in loggers.try_iter()? {
+                let logger = logger?;
+                // `loggerDict` also holds `PlaceHolder`s for unnamed parents.
+                if logger.is_instance(&logger_type)? {
+                    let level: i64 = logger.call_method0("getEffectiveLevel")?.extract()?;
+                    (logger.as_ptr() as usize, level).hash(&mut hasher);
+                    lowest = lowest.min(level);
+                }
+            }
+            let disabled_up_to: i64 = manager.getattr("disable")?.extract()?;
+            disabled_up_to.hash(&mut hasher);
+            Ok(Self {
+                max_level: level_filter_for_python_threshold(lowest.max(disabled_up_to + 1)),
+                fingerprint: hasher.finish(),
+            })
+        };
+        read().unwrap_or(Self {
+            max_level: log::LevelFilter::Trace,
+            fingerprint: 0,
+        })
+    }
+}
+
+/// The most verbose `log` level whose Python level (as `pyo3_log` maps
+/// them: Trace 5, Debug 10, Info 20, Warn 30, Error 40) is at or above a
+/// Python logger threshold.
+fn level_filter_for_python_threshold(threshold: i64) -> log::LevelFilter {
+    match threshold {
+        t if t <= 5 => log::LevelFilter::Trace,
+        t if t <= 10 => log::LevelFilter::Debug,
+        t if t <= 20 => log::LevelFilter::Info,
+        t if t <= 30 => log::LevelFilter::Warn,
+        t if t <= 40 => log::LevelFilter::Error,
+        _ => log::LevelFilter::Off,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{mark_interpreter_exiting, ExitGuard, KERNEL_TARGET};
-    use log::Log;
+    use super::{
+        level_filter_for_python_threshold, mark_interpreter_exiting, ExitGuard, KERNEL_TARGET,
+    };
+    use log::{LevelFilter, Log};
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn python_thresholds_map_to_the_levels_pyo3_log_forwards() {
+        // pyo3_log maps Trace/Debug/Info/Warn/Error to Python 5/10/20/30/40.
+        for (threshold, expected) in [
+            (0, LevelFilter::Trace), // NOTSET on the root: everything
+            (5, LevelFilter::Trace),
+            (6, LevelFilter::Debug),
+            (10, LevelFilter::Debug), // DEBUG
+            (15, LevelFilter::Info),
+            (20, LevelFilter::Info), // INFO
+            (30, LevelFilter::Warn), // WARNING, the default
+            (40, LevelFilter::Error),
+            (41, LevelFilter::Off),
+            (51, LevelFilter::Off), // logging.disable(CRITICAL)
+        ] {
+            assert_eq!(
+                level_filter_for_python_threshold(threshold),
+                expected,
+                "threshold {threshold}"
+            );
+        }
+    }
 
     #[test]
     fn exit_guard_drops_records_once_interpreter_exits() {

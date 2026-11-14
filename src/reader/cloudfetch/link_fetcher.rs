@@ -1197,12 +1197,12 @@ mod tests {
             unimplemented!("execute_statement_direct not used by the link-fetcher mock")
         }
 
-        async fn fetch_completed_result(
+        async fn completed_result(
             &self,
-            _statement_id: &str,
+            _response: crate::client::ExecuteResponse,
             _session_attribution: crate::client::SessionAttribution,
         ) -> Result<Option<ExecuteResult>> {
-            unimplemented!("fetch_completed_result not used by the link-fetcher mock")
+            unimplemented!("completed_result not used by the link-fetcher mock")
         }
 
         async fn statement_status(
