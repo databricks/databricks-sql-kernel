@@ -220,7 +220,10 @@ impl VolumeState {
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(local_error(error, &instruction.local_file)),
             };
+            #[cfg(unix)]
             let mut builder = tempfile::Builder::new();
+            #[cfg(not(unix))]
+            let builder = tempfile::Builder::new();
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
