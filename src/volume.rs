@@ -327,8 +327,15 @@ impl VolumeState {
         if let Some(uploaded) = uploaded {
             let _ = uploaded.send(());
         }
-        let mut response =
-            storage_send(request, self.read_timeout, upload_complete, upload_error).await?;
+        let retry_timeout = instruction.operation != "PUT";
+        let mut response = storage_send(
+            request,
+            self.read_timeout,
+            retry_timeout,
+            upload_complete,
+            upload_error,
+        )
+        .await?;
         let status = response.status();
         if !status.is_success()
             && !(instruction.operation == "REMOVE"
@@ -348,7 +355,7 @@ impl VolumeState {
                     status.as_u16()
                 )));
         }
-        while let Some(bytes) = storage_read(self.read_timeout, async {
+        while let Some(bytes) = storage_read(self.read_timeout, retry_timeout, async {
             response.chunk().await.map_err(response_body_error)
         })
         .await?
@@ -413,6 +420,7 @@ fn invalid(message: &str) -> Error {
 async fn storage_send(
     request: reqwest::RequestBuilder,
     timeout: Option<std::time::Duration>,
+    retry_timeout: bool,
     upload_complete: oneshot::Receiver<()>,
     upload_error: Arc<Mutex<Option<Error>>>,
 ) -> Result<reqwest::Response> {
@@ -421,7 +429,7 @@ async fn storage_send(
     // Response inactivity starts after the upload, without a total transfer deadline.
     let response = tokio::select! {
         result = &mut send => result.map_err(storage_error),
-        _ = upload_complete => storage_read(timeout, async {
+        _ = upload_complete => storage_read(timeout, retry_timeout, async {
             send.await.map_err(storage_error)
         }).await,
     };
@@ -437,6 +445,7 @@ async fn storage_send(
 
 async fn storage_read<T>(
     timeout: Option<std::time::Duration>,
+    retry_timeout: bool,
     read: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
     match timeout {
@@ -445,7 +454,7 @@ async fn storage_read<T>(
             .unwrap_or_else(|_| {
                 Err(Error::network_error()
                     .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
-                    .with_retryable(true)
+                    .with_retryable(retry_timeout)
                     .message("Volume storage read timed out"))
             }),
         None => read.await,
@@ -741,6 +750,7 @@ mod tests {
                 .put(format!("{}/object?secret=hidden", server.uri()))
                 .body(body),
             None,
+            false,
             complete,
             captured,
         )
@@ -1132,51 +1142,57 @@ mod tests {
             ("GET", false),
             ("GET", true),
             ("PUT", false),
+            ("PUT", true),
             ("REMOVE", false),
         ] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
+            let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let received = Arc::clone(&requests);
             let peer = tokio::spawn(async move {
-                let (mut socket, _) = listener.accept().await.unwrap();
-                let mut request = Vec::new();
-                let mut byte = [0];
-                while !request.ends_with(b"\r\n\r\n") {
-                    socket.read_exact(&mut byte).await.unwrap();
-                    request.push(byte[0]);
+                loop {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    received.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    tokio::spawn(async move {
+                        let mut request = Vec::new();
+                        let mut byte = [0];
+                        while !request.ends_with(b"\r\n\r\n") {
+                            socket.read_exact(&mut byte).await.unwrap();
+                            request.push(byte[0]);
+                        }
+                        let size = String::from_utf8(request)
+                            .unwrap()
+                            .lines()
+                            .find_map(|line| {
+                                line.to_lowercase()
+                                    .strip_prefix("content-length:")
+                                    .map(|size| size.trim().parse::<usize>().unwrap())
+                            })
+                            .unwrap_or(0);
+                        socket.read_exact(&mut vec![0; size]).await.unwrap();
+                        if headers_sent {
+                            socket
+                                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
+                                .await
+                                .unwrap();
+                        }
+                        tokio::time::sleep(Duration::from_secs(5)).await;
+                    });
                 }
-                let size = String::from_utf8(request)
-                    .unwrap()
-                    .lines()
-                    .find_map(|line| {
-                        line.to_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(|size| size.trim().parse::<usize>().unwrap())
-                    })
-                    .unwrap_or(0);
-                socket.read_exact(&mut vec![0; size]).await.unwrap();
-                if headers_sent {
-                    socket
-                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\nshort")
-                        .await
-                        .unwrap();
-                }
-                tokio::time::sleep(Duration::from_secs(5)).await;
             });
             let dir = tempfile::tempdir().unwrap();
             let dest = dir.path().join("download");
             std::fs::write(&dest, b"old").unwrap();
             let state = VolumeState::new(
-                transfer_state(0).retry.clone(),
+                transfer_state(if operation == "PUT" { 1 } else { 0 })
+                    .retry
+                    .clone(),
                 Some(Duration::from_millis(150)),
             );
+            let batch = instruction(operation, &url, &dest);
             let error = tokio::time::timeout(
                 Duration::from_secs(2),
-                state.complete(
-                    &instruction(operation, &url, &dest),
-                    &Client::new(),
-                    &options(dir.path()),
-                    None,
-                ),
+                state.complete(&batch, &Client::new(), &options(dir.path()), None),
             )
             .await
             .unwrap()
@@ -1187,6 +1203,12 @@ mod tests {
                 Some("VOLUME_STORAGE_NETWORK_ERROR")
             );
             assert!(error.message.contains("read timed out"));
+            let repeated = state
+                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .await
+                .unwrap_err();
+            assert_eq!(repeated.message, error.message);
+            assert_eq!(requests.load(std::sync::atomic::Ordering::SeqCst), 1);
             assert_eq!(std::fs::read(&dest).unwrap(), b"old");
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
             peer.abort();
@@ -1252,6 +1274,7 @@ mod tests {
                 .header(reqwest::header::CONTENT_LENGTH, 5)
                 .body(body),
             Some(Duration::from_millis(150)),
+            false,
             complete,
             error,
         )
