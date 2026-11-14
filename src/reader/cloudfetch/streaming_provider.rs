@@ -820,6 +820,7 @@ impl StreamingCloudFetchProvider {
             // Increment counters
             let new_count = self.chunks_in_memory.fetch_add(1, Ordering::Release) + 1;
             self.next_download_index.fetch_add(1, Ordering::Release);
+            self.link_fetcher.note_scheduled(next_index);
 
             debug!(
                 "Scheduling download for chunk {}: chunks_in_memory={}/{}, consumer_at={}",
@@ -1728,6 +1729,7 @@ mod tests {
     struct MockLinkFetcher {
         links_by_index: HashMap<i64, CloudFetchLink>,
         total_chunks: i64,
+        scheduled: Mutex<Vec<i64>>,
     }
 
     impl MockLinkFetcher {
@@ -1740,12 +1742,17 @@ mod tests {
             Self {
                 links_by_index,
                 total_chunks,
+                scheduled: Mutex::new(Vec::new()),
             }
         }
     }
 
     #[async_trait::async_trait]
     impl ChunkLinkFetcher for MockLinkFetcher {
+        fn note_scheduled(&self, chunk_index: i64) {
+            self.scheduled.lock().unwrap().push(chunk_index);
+        }
+
         async fn fetch_links(
             &self,
             start_chunk_index: i64,
@@ -1816,6 +1823,81 @@ mod tests {
             http_headers: HashMap::new(),
             next_chunk_index: Some(chunk_index + 1),
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_downloads_notify_each_scheduled_chunk_in_order() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_ipc::writer::StreamWriter;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut fetcher = MockLinkFetcher::new(8);
+        for i in 0..8 {
+            let batch = make_batch(&[i as i32]);
+            let mut bytes = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            let route = format!("/chunk-{i}");
+            Mock::given(method("GET"))
+                .and(path(&route))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            fetcher.links_by_index.get_mut(&i).unwrap().url = format!("{}{route}", server.uri());
+        }
+        let fetcher = Arc::new(fetcher);
+        let client = DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            build_retry_configs(
+                &RetryConfig {
+                    max_retries: 0,
+                    ..RetryConfig::default()
+                },
+                &HashMap::new(),
+            ),
+        )
+        .unwrap();
+        let provider = StreamingCloudFetchProvider::new(
+            CloudFetchConfig {
+                max_chunks_in_memory: 2,
+                ..CloudFetchConfig::default()
+            },
+            fetcher.clone(),
+            Arc::new(ChunkDownloader::new(
+                Arc::new(client),
+                CompressionCodec::None,
+                0.1,
+            )),
+            Some(8),
+            tokio::runtime::Handle::current(),
+        );
+        let mut values = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(batch) = provider.next_batch().await.unwrap() {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                values.extend_from_slice(ids.values());
+                assert!(provider.chunks_in_memory.load(Ordering::Acquire) <= 2);
+            }
+        })
+        .await
+        .expect("all eight chunks must drain with a two-chunk window");
+        assert_eq!(values, (0..8).collect::<Vec<i32>>());
+        assert_eq!(
+            *fetcher.scheduled.lock().unwrap(),
+            (0..8).collect::<Vec<i64>>()
+        );
     }
 
     /// Regression (PECOBLR-4026): a panicking download task must surface as an

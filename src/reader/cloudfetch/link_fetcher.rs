@@ -66,6 +66,9 @@ use tokio::sync::Mutex as TokioMutex;
 /// Both parameters are passed to methods; implementations use the relevant one.
 #[async_trait]
 pub(crate) trait ChunkLinkFetcher: Send + Sync + std::fmt::Debug {
+    // Cached links can outlive a fetch call, so scheduling must advance the prefetch horizon.
+    fn note_scheduled(&self, _chunk_index: i64) {}
+
     /// Fetch the next batch of chunk links.
     ///
     /// # Parameters
@@ -875,6 +878,13 @@ impl SeaChunkLinkFetcherHandle {
 
 #[async_trait]
 impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
+    fn note_scheduled(&self, chunk_index: i64) {
+        self.inner
+            .current_consumer_index
+            .fetch_max(chunk_index, Ordering::Release);
+        self.inner.maybe_trigger_prefetch();
+    }
+
     async fn fetch_links(
         &self,
         start_chunk_index: i64,
@@ -882,13 +892,7 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
     ) -> Result<ChunkLinkFetchResult> {
         let fetcher = &self.inner;
 
-        // Update consumer position (highest chunk index requested)
-        fetcher
-            .current_consumer_index
-            .fetch_max(start_chunk_index, Ordering::Release);
-
-        // Trigger async prefetch if needed (non-blocking)
-        self.inner.maybe_trigger_prefetch();
+        self.note_scheduled(start_chunk_index);
 
         // If we already have all links, return what we have from cache.
         // Walk contiguously from `start_chunk_index` until we hit a
@@ -1432,6 +1436,41 @@ mod tests {
         assert_eq!(result.links[0].chunk_index, 2);
         assert!(!result.has_more);
         assert_eq!(result.next_chunk_index, None);
+    }
+
+    #[tokio::test]
+    async fn scheduled_cached_links_advance_bounded_prefetch() {
+        let pages: Vec<_> = (0..8).map(|i| vec![create_test_link(i)]).collect();
+        let initial: Vec<_> = (0..4).map(create_test_link).collect();
+        let fetcher = SeaChunkLinkFetcher::new(
+            Arc::new(MockDatabricksClient::new(pages)),
+            "test-statement",
+            &initial,
+            Some(8),
+            2,
+            tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
+        );
+        let handle = SeaChunkLinkFetcherHandle::new(fetcher);
+        assert!(!handle.inner.has_link(4));
+
+        handle.note_scheduled(2);
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while handle.inner.prefetch_in_progress.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("scheduling cached chunk 2 must prefetch the next page");
+
+        assert!(handle.inner.has_link(3));
+        assert!(handle.inner.has_link(4));
+        assert!(!handle.inner.has_link(5));
+        handle.note_scheduled(1);
+        assert_eq!(
+            handle.inner.current_consumer_index.load(Ordering::Acquire),
+            2
+        );
     }
 
     #[tokio::test]
