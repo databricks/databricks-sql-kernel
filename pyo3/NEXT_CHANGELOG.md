@@ -20,6 +20,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
   thread other than the main thread no longer re-acquires it every
   100 ms to check for signals that only the main thread can receive.
   This cuts GIL hand-offs per query when many threads share the GIL.
+- `Statement.execute()` remembers per thread whether it runs on the main
+  thread (recomputed after `fork()`) instead of asking `threading` on every
+  call.
 
 ### Updated
 

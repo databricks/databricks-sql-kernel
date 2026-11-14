@@ -97,3 +97,8 @@ chrono = "0.4"
 pyo3-log = "0.13"
 log = "0.4"
 tracing = "0.1"
+
+# `pthread_atfork`, to recompute the cached main-thread check in forked
+# children (`gil::install_fork_handler`).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

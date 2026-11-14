@@ -22,11 +22,40 @@
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::PyModule;
+use std::cell::Cell;
 use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, Waker};
 use tokio::runtime::Runtime;
 
 static THREADING: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
+
+/// Incremented in the child after each `fork()`, where the forking thread
+/// becomes the main thread, so answers cached before it are recomputed.
+static FORK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+thread_local! {
+    /// This thread's `on_main_thread` answer and the fork generation it was
+    /// computed in.
+    static MAIN_THREAD: Cell<Option<(u64, bool)>> = const { Cell::new(None) };
+}
+
+/// Recompute cached `on_main_thread` answers in forked children. Called
+/// once, at module import.
+pub(crate) fn install_fork_handler() {
+    #[cfg(unix)]
+    {
+        extern "C" fn after_fork_in_child() {
+            FORK_GENERATION.fetch_add(1, Ordering::Relaxed);
+        }
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        // SAFETY: registers a handler that only bumps an atomic, which is
+        // async-signal-safe as `fork()` requires of child handlers.
+        INSTALL.call_once(|| unsafe {
+            libc::pthread_atfork(None, None, Some(after_fork_in_child));
+        });
+    }
+}
 
 /// Whether the calling thread is Python's main thread, the only one that
 /// runs signal handlers. Errs towards `true` (a wrong `true` only keeps
@@ -35,7 +64,16 @@ static THREADING: PyOnceLock<Py<PyModule>> = PyOnceLock::new();
 /// Either id may match: `threading` refreshes the main thread's `ident`
 /// after `fork()` but not its `native_id`, while greenlet libraries
 /// (gevent, eventlet) patch `get_ident` but not the OS-level `native_id`.
+/// The answer only changes for a thread at `fork()`, so it is cached per
+/// thread until the next one; asking `threading` costs a few Python calls
+/// under the GIL on every `execute()`.
 pub(crate) fn on_main_thread(py: Python<'_>) -> bool {
+    let generation = FORK_GENERATION.load(Ordering::Relaxed);
+    if let Some((cached_generation, main)) = MAIN_THREAD.get() {
+        if cached_generation == generation {
+            return main;
+        }
+    }
     let check = || -> PyResult<bool> {
         let threading = THREADING
             .get_or_try_init(py, || py.import("threading").map(Bound::unbind))?
@@ -51,7 +89,13 @@ pub(crate) fn on_main_thread(py: Python<'_>) -> bool {
             .call_method0("get_native_id")?
             .eq(main.getattr("native_id")?)
     };
-    check().unwrap_or(true)
+    match check() {
+        Ok(main) => {
+            MAIN_THREAD.set(Some((generation, main)));
+            main
+        }
+        Err(_) => true,
+    }
 }
 
 /// Drive `fut` to completion, polling it once with the GIL held first and
@@ -77,9 +121,52 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::run_ready_first;
+    use super::{on_main_thread, run_ready_first, FORK_GENERATION, MAIN_THREAD};
     use pyo3::prelude::*;
+    use std::sync::atomic::Ordering;
     use std::time::Duration;
+
+    #[test]
+    fn main_thread_answer_is_cached_until_a_fork() {
+        Python::initialize();
+        // `threading` takes the thread that imports it first as the main
+        // thread; the thread spawned below is never that one.
+        Python::attach(|py| py.import("threading").map(drop)).unwrap();
+        std::thread::spawn(|| {
+            Python::attach(|py| {
+                assert!(!on_main_thread(py));
+                let (generation, main) = MAIN_THREAD.get().expect("cached");
+                assert!(!main);
+                // A stale answer from before a fork is recomputed.
+                MAIN_THREAD.set(Some((generation, true)));
+                assert!(on_main_thread(py));
+                FORK_GENERATION.fetch_add(1, Ordering::Relaxed);
+                assert!(!on_main_thread(py));
+            })
+        })
+        .join()
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forked_children_see_a_new_generation() {
+        super::install_fork_handler();
+        let before = FORK_GENERATION.load(Ordering::Relaxed);
+        // SAFETY: the child only reads an atomic and exits.
+        match unsafe { libc::fork() } {
+            0 => unsafe {
+                let bumped = FORK_GENERATION.load(Ordering::Relaxed) == before + 1;
+                libc::_exit(if bumped { 0 } else { 1 })
+            },
+            pid => {
+                let mut status = 0;
+                assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
+                assert!(libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0);
+                assert!(FORK_GENERATION.load(Ordering::Relaxed) >= before);
+            }
+        }
+    }
 
     fn runtime() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_multi_thread()
