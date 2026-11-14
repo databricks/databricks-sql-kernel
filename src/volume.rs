@@ -751,26 +751,29 @@ mod tests {
         peer.await.unwrap();
     }
 
-    #[cfg(unix)]
+    #[cfg(any(unix, windows))]
     #[test]
     fn symlinks_require_lexical_authority_and_resolved_target_in_any_allowed_root() {
-        use std::os::unix::fs::symlink;
+        #[cfg(unix)]
+        use std::os::unix::fs::{symlink as symlink_dir, symlink as symlink_file};
+        #[cfg(windows)]
+        use std::os::windows::fs::{symlink_dir, symlink_file};
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("root");
         let other = dir.path().join("other");
         std::fs::create_dir(&root).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(root.join("file"), b"ok").unwrap();
-        symlink(root.join("file"), root.join("inside")).unwrap();
-        symlink(other.join("missing"), root.join("escape")).unwrap();
-        symlink(&root, dir.path().join("alias")).unwrap();
+        symlink_file(root.join("file"), root.join("inside")).unwrap();
+        symlink_file(other.join("missing"), root.join("escape")).unwrap();
+        symlink_dir(&root, dir.path().join("alias")).unwrap();
         assert_eq!(
             allowed_path(
                 root.join("inside").to_str().unwrap(),
                 std::slice::from_ref(&root)
             )
             .unwrap(),
-            root.join("file")
+            root.join("file").canonicalize().unwrap()
         );
         assert!(allowed_path(
             root.join("escape").to_str().unwrap(),
@@ -783,7 +786,7 @@ mod tests {
                 &[root.clone(), other.clone()]
             )
             .unwrap(),
-            other.join("missing")
+            other.canonicalize().unwrap().join("missing")
         );
         assert!(allowed_path(
             dir.path().join("alias/file").to_str().unwrap(),

@@ -132,6 +132,10 @@ jobs:
         with:
           arch: x64
 
+      - name: Volume file and cancellation tests
+        shell: pwsh
+        run: cargo test --locked --lib volume::tests
+
       - name: Verify linker PDB
         shell: pwsh
         run: ./.github/scripts/check-release-debuginfo.ps1
