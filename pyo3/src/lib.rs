@@ -99,5 +99,6 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Records still only surface once a customer raises the relevant
     // logger's level, so this default-on install is silent until asked.
     logging::init_logging(m.py());
+    gil::install_fork_handler();
     Ok(())
 }
