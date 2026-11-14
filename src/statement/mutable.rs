@@ -404,7 +404,27 @@ impl Statement {
             // `wait_timeout` typically yields `Closed` on the inline-result
             // fast path.
             let already_closed = result.status.state == StatementState::Closed;
-            let closed = Arc::new(AtomicBool::new(already_closed));
+            // PROTOTYPE (KCPU_EARLY_CLOSE): the whole result is in this
+            // response, so close the server statement now, from the execute
+            // path (GIL released in the bindings), not when the caller drains.
+            let close_now = !already_closed
+                && result.result_complete
+                && crate::util::kcpu::early_close()
+                && !crate::util::kcpu::skip_close();
+            if close_now {
+                let transport = Arc::clone(self.session.transport());
+                let stmt_id = result.statement_id.clone();
+                self.session.runtime_handle().spawn(async move {
+                    if let Err(e) = transport.close_statement(&stmt_id).await {
+                        crate::klog::warn!(
+                            statement_id = %stmt_id,
+                            error = %e,
+                            "close_statement for a complete inline result failed"
+                        );
+                    }
+                });
+            }
+            let closed = Arc::new(AtomicBool::new(already_closed || close_now));
             self.last_statement_id = Some(result.statement_id.clone());
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));

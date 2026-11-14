@@ -129,6 +129,9 @@ pub(crate) struct ExecuteResult {
     /// `display_message` / etc. without a second GetStatementStatus
     /// round-trip.
     pub status: StatementStatus,
+    /// PROTOTYPE: the response carried the whole result inline (one chunk, no
+    /// links), so reading it needs nothing more from the server statement.
+    pub result_complete: bool,
 }
 
 impl std::fmt::Debug for ExecuteResult {

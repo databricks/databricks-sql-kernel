@@ -231,6 +231,9 @@ impl ExecutedStatement {
         if self.closed.swap(true, Ordering::AcqRel) {
             return;
         }
+        if crate::util::kcpu::skip_close() {
+            return; // PROTOTYPE diagnostic only: never close
+        }
         let transport = Arc::clone(self.session.transport());
         let runtime = self.session.runtime_handle().clone();
         let stmt_id = self.statement_id.clone();
@@ -359,6 +362,10 @@ impl ExecutedStatementHandle for ExecutedStatement {
         // `ExecutedStatementHandle` trait bound.
         async {
             self.valid.check()?;
+            // A closed statement already finished; there is nothing to cancel.
+            if crate::util::kcpu::early_close() && self.closed.load(Ordering::Acquire) {
+                return Ok(());
+            }
             self.session
                 .transport()
                 .cancel_statement(&self.statement_id)

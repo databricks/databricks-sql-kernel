@@ -30,7 +30,8 @@ use crate::client::retry::{
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
 use crate::types::sea::ServiceError;
-use reqwest::{Client, NoProxy, Proxy, Request, Response};
+use reqwest::header::{HeaderMap, HeaderValue};
+use reqwest::{Client, Method, NoProxy, Proxy, Request, Response};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
@@ -398,6 +399,25 @@ pub struct DatabricksHttpClient {
     config: HttpClientConfig,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
+    auth_value_cache: AuthValueCache,
+}
+
+/// Last `Authorization` string and its validated header value. `Debug` never
+/// prints the credential.
+#[derive(Default)]
+struct AuthValueCache(std::sync::Mutex<Option<(String, HeaderValue)>>);
+
+impl std::fmt::Debug for AuthValueCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("AuthValueCache(<redacted>)")
+    }
+}
+
+impl std::ops::Deref for AuthValueCache {
+    type Target = std::sync::Mutex<Option<(String, HeaderValue)>>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 impl DatabricksHttpClient {
@@ -514,6 +534,7 @@ impl DatabricksHttpClient {
             config,
             auth_provider: OnceLock::new(),
             retry_configs,
+            auth_value_cache: AuthValueCache::default(),
         })
     }
 
@@ -536,6 +557,9 @@ impl DatabricksHttpClient {
             .user_agent(&config.user_agent)
             .redirect(redirect)
             .dns_resolver(crate::client::dns::CachingResolver::shared());
+        if crate::util::kcpu::no_reqwest_retry() {
+            builder = builder.retry(reqwest::retry::never().max_retries_per_request(0));
+        }
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {
@@ -854,6 +878,71 @@ impl DatabricksHttpClient {
         provider.get_auth_header()
     }
 
+    /// PROTOTYPE: `Authorization` value, re-validated only when the provider's
+    /// header string changes.
+    fn auth_header_value(&self) -> Result<HeaderValue> {
+        let header = self.auth_header()?;
+        if crate::util::kcpu::auth_cache() {
+            if let Ok(cache) = self.auth_value_cache.lock() {
+                if let Some((cached, value)) = cache.as_ref() {
+                    if *cached == header {
+                        return Ok(value.clone());
+                    }
+                }
+            }
+        }
+        let mut value = HeaderValue::from_str(&header).map_err(|e| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        })?;
+        value.set_sensitive(true);
+        if crate::util::kcpu::auth_cache() {
+            if let Ok(mut cache) = self.auth_value_cache.lock() {
+                *cache = Some((header, value.clone()));
+            }
+        }
+        Ok(value)
+    }
+
+    /// PROTOTYPE: the per-attempt headers of `execute_impl`, added to a built
+    /// request in place (same order and skips as the builder path).
+    fn apply_lean_headers(&self, headers: &mut HeaderMap, with_auth: bool) -> Result<()> {
+        let bad = |e: &dyn std::fmt::Display| {
+            Error::invalid_argument().message(format!("Failed to build request: {e}"))
+        };
+        for (name, value) in &self.config.custom_headers {
+            let lname = name.to_ascii_lowercase();
+            if lname == "authorization" || lname == "x-databricks-org-id" {
+                continue;
+            }
+            if lname == "accept-encoding" && with_auth && !self.config.sea_response_compression_enabled
+            {
+                continue;
+            }
+            let name = reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| bad(&e))?;
+            let value = HeaderValue::try_from(value.as_str()).map_err(|e| bad(&e))?;
+            headers.append(name, value);
+        }
+        if with_auth {
+            if !self.config.sea_response_compression_enabled {
+                headers.append(
+                    reqwest::header::ACCEPT_ENCODING,
+                    HeaderValue::from_static("identity"),
+                );
+            }
+            headers.append(reqwest::header::AUTHORIZATION, self.auth_header_value()?);
+            for (name, value) in self.auth_extra_headers()? {
+                let name = reqwest::header::HeaderName::try_from(name.as_str()).map_err(|e| bad(&e))?;
+                let value = HeaderValue::try_from(value.as_str()).map_err(|e| bad(&e))?;
+                headers.append(name, value);
+            }
+        }
+        if let Some(ref org_id) = self.config.org_id {
+            let value = HeaderValue::try_from(org_id.as_str()).map_err(|e| bad(&e))?;
+            headers.append("x-databricks-org-id", value);
+        }
+        Ok(())
+    }
+
     /// Extra auth headers to attach alongside `Authorization` (e.g. the Azure SP
     /// management-token pair). Empty for every provider except the Azure SP one.
     /// Errors if the auth provider has not been set.
@@ -938,23 +1027,111 @@ impl DatabricksHttpClient {
 
         let mut attempts: u32 = 0;
 
+        // PROTOTYPE (KCPU_LEAN_EXEC): send the caller's request itself on the
+        // first attempt (headers added in place); keep one clone for retries.
+        let mut lean_first: Option<Request> = None;
+        let mut lean_spare: Option<Request> = None;
+        let lean = crate::util::kcpu::lean_exec();
+
         // Clone the request parts we need for retries
-        let method = request.method().clone();
-        let url = request.url().clone();
-        let headers = request.headers().clone();
+        let method = if lean { Method::GET } else { request.method().clone() };
+        let url = if lean { None } else { Some(request.url().clone()) };
+        let headers = if lean { HeaderMap::new() } else { request.headers().clone() };
         // Preserve any per-request timeout the caller set on the incoming
         // request (e.g. the CloudFetch download path caps each attempt at
         // the remaining chunk budget). Rebuilding the request per attempt
         // below would otherwise silently drop it and fall back to the
         // client-wide `.timeout()`, defeating the deadline (audit H05).
         let per_request_timeout = request.timeout().copied();
-        let body_bytes = request
-            .body()
-            .and_then(|b| b.as_bytes())
-            .map(|b| b.to_vec());
+        let body_bytes = if lean {
+            None
+        } else {
+            request
+                .body()
+                .and_then(|b| b.as_bytes())
+                .map(|b| b.to_vec())
+        };
+        if lean {
+            lean_first = Some(request);
+        }
 
         loop {
             attempts += 1;
+
+            if lean {
+                let mut req = match lean_first.take() {
+                    Some(req) => req,
+                    None => lean_spare
+                        .as_ref()
+                        .and_then(Request::try_clone)
+                        .ok_or_else(|| {
+                            Error::invalid_state().message("request body cannot be replayed")
+                        })?,
+                };
+                if attempts < max_attempts && lean_spare.is_none() {
+                    lean_spare = req.try_clone();
+                }
+                self.apply_lean_headers(req.headers_mut(), with_auth)?;
+                debug!(
+                    "{:?}: {} {} (attempt {}/{})",
+                    request_type,
+                    req.method(),
+                    req.url(),
+                    attempts,
+                    max_attempts
+                );
+                match self.client.execute(req).await {
+                    Ok(response) => {
+                        let status = response.status();
+                        if status.is_success() {
+                            return Ok(response);
+                        }
+                        let retry_after = response
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .map(|s| s.to_string());
+                        if strategy.is_retryable_status(status, retry_after.is_some())
+                            && attempts < max_attempts
+                        {
+                            let elapsed = start_time.elapsed();
+                            let wait = calculate_backoff(config, attempts, retry_after.as_deref());
+                            if elapsed + wait <= config.overall_timeout {
+                                sleep(wait).await;
+                                continue;
+                            }
+                        }
+                        let error_body = response.text().await.unwrap_or_default();
+                        return Err(http_error(
+                            status.as_u16(),
+                            &error_body,
+                            format_args!("HTTP {}", status.as_u16()),
+                        ));
+                    }
+                    Err(e) => {
+                        let mut causes = super::error_chain(&e)
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>();
+                        causes.dedup();
+                        let error_message = causes.join(": ");
+                        if strategy.is_retryable_error(&e) && attempts < max_attempts {
+                            let elapsed = start_time.elapsed();
+                            let wait = calculate_backoff(config, attempts, None);
+                            if elapsed + wait <= config.overall_timeout {
+                                sleep(wait).await;
+                                continue;
+                            }
+                        }
+                        return Err(Error::network_error()
+                            .with_retryable(!is_certificate_verification_failure(&e))
+                            .message(format!(
+                                "HTTP request failed after {} attempts: {}",
+                                attempts, error_message
+                            )));
+                    }
+                }
+            }
+            let url = url.clone().expect("legacy path keeps the url");
 
             // Build a fresh request for this attempt
             let mut req_builder = self.client.request(method.clone(), url.clone());

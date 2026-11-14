@@ -123,6 +123,11 @@ pub struct FederationProvider {
     /// coordination so concurrent callers on a rotated / expired token don't
     /// each mint a distinct server token (which SP-wide WIF would otherwise do).
     exchanging: AtomicBool,
+    /// PROTOTYPE (KCPU_AUTH_CACHE): the inner provider's last header and
+    /// whether its token's issuer is foreign, so an unchanged token is not
+    /// decoded again on every request. Keyed on the exact header string, so a
+    /// fresher token from the inner provider is always re-checked.
+    issuer_decision: RwLock<Option<(String, bool)>>,
 }
 
 /// How long a follower sleeps between polls while the leader runs the exchange.
@@ -191,7 +196,30 @@ impl FederationProvider {
             runtime_handle: RuntimeHandle::current(),
             cache: RwLock::new(None),
             exchanging: AtomicBool::new(false),
+            issuer_decision: RwLock::new(None),
         })
+    }
+
+    fn token_is_foreign(&self, header: &str, source_token: &str) -> bool {
+        let compute = || match jwt::issuer(source_token) {
+            Some(iss) => self.issuer_is_foreign(&iss),
+            None => false,
+        };
+        if !crate::util::kcpu::auth_cache() {
+            return compute();
+        }
+        if let Ok(cached) = self.issuer_decision.read() {
+            if let Some((h, foreign)) = cached.as_ref() {
+                if h == header {
+                    return *foreign;
+                }
+            }
+        }
+        let foreign = compute();
+        if let Ok(mut cached) = self.issuer_decision.write() {
+            *cached = Some((header.to_string(), foreign));
+        }
+        foreign
     }
 
     /// Whether a token with issuer `iss` needs exchange (i.e. it is foreign to
@@ -441,16 +469,15 @@ impl AuthProvider for FederationProvider {
             return Ok(header);
         };
 
-        // Re-check the issuer on every call (rather than trusting a cached
-        // decision) so a fresher in-house token from the inner provider is
-        // never shadowed by a stale exchange.
-        match jwt::issuer(source_token) {
-            Some(iss) if self.issuer_is_foreign(&iss) => {
-                let token = self.exchanged_or_original(source_token);
-                Ok(format!("Bearer {token}"))
-            }
+        // Re-check the issuer for every new token (rather than trusting a
+        // cached decision) so a fresher in-house token from the inner provider
+        // is never shadowed by a stale exchange.
+        if self.token_is_foreign(&header, source_token) {
+            let token = self.exchanged_or_original(source_token);
+            Ok(format!("Bearer {token}"))
+        } else {
             // Not a JWT, or issued by this workspace: use as-is.
-            _ => Ok(header),
+            Ok(header)
         }
     }
 }
