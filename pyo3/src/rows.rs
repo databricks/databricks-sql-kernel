@@ -30,7 +30,7 @@ use arrow_array::types::{
 use arrow_array::{Array, ArrowPrimitiveType, PrimitiveArray, RecordBatch};
 use arrow_schema::{DataType, Schema, TimeUnit};
 use chrono::{Datelike, NaiveDate};
-use pyo3::exceptions::{PyOverflowError, PyValueError};
+use pyo3::exceptions::{PyImportError, PyKeyError, PyOverflowError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::sync::PyOnceLock;
 use pyo3::types::{PyBool, PyBytes, PyFloat, PyList, PyString, PyTuple};
@@ -382,13 +382,23 @@ impl<'py> Converter<'py> {
         let zone = match tz {
             None => None,
             Some(name) => {
-                let Ok(to_tzinfo) =
-                    cached(py, &STRING_TO_TZINFO, "pyarrow.lib", &["string_to_tzinfo"])
-                else {
-                    return Ok(false);
-                };
-                let Ok(zone) = to_tzinfo.call1((name,)) else {
-                    return Ok(false);
+                // Declined: no pyarrow, or a zone it doesn't know (KeyError
+                // from zoneinfo and pytz) or can't parse (ValueError).
+                let to_tzinfo =
+                    match cached(py, &STRING_TO_TZINFO, "pyarrow.lib", &["string_to_tzinfo"]) {
+                        Ok(f) => f,
+                        Err(e) if e.is_instance_of::<PyImportError>(py) => return Ok(false),
+                        Err(e) => return Err(e),
+                    };
+                let zone = match to_tzinfo.call1((name,)) {
+                    Ok(zone) => zone,
+                    Err(e)
+                        if e.is_instance_of::<PyKeyError>(py)
+                            || e.is_instance_of::<PyValueError>(py) =>
+                    {
+                        return Ok(false)
+                    }
+                    Err(e) => return Err(e),
                 };
                 Some((zone, cached(py, &UTC, "datetime", &["timezone", "utc"])?))
             }
