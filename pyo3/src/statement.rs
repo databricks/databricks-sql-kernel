@@ -374,8 +374,35 @@ impl ExecutedStatement {
         if !self.rows_supported {
             return Ok(None);
         }
-        if !inner.exhausted {
-            let runtime = inner.runtime.clone();
+        let runtime = inner.runtime.clone();
+        // As in fetch_next_batch: take in-memory batches without a GIL
+        // hand-off, and release the GIL only to wait for one.
+        if !inner.exhausted && inner.exec.try_next_batch_is_cheap() {
+            let _context = runtime.enter();
+            let mut rows: usize = inner.pending.iter().map(RecordBatch::num_rows).sum();
+            while rows <= max_rows {
+                match inner.exec.try_next_batch().map_err(|e| to_py_err(py, e))? {
+                    TryNextBatch::Ready(ResultBatch::Arrow(rb)) => {
+                        rows += rb.num_rows();
+                        inner.pending.push_back(rb.clone());
+                    }
+                    TryNextBatch::Ready(_) => {
+                        return Err(to_py_err(
+                            py,
+                            KError::invalid_argument()
+                                .message("kernel returned a non-Arrow ResultBatch variant"),
+                        ))
+                    }
+                    TryNextBatch::End => {
+                        inner.exhausted = true;
+                        break;
+                    }
+                    _ => break,
+                }
+            }
+        }
+        let buffered: usize = inner.pending.iter().map(RecordBatch::num_rows).sum();
+        if !inner.exhausted && buffered <= max_rows {
             inner.exhausted = run_sync_kernel!(
                 py,
                 fetch::fill_exec(&runtime, &mut inner.exec, &mut inner.pending, max_rows)
