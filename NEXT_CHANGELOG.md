@@ -24,7 +24,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
   reuse a successful answer for 30 s, so many sessions opening at once no
   longer send one identical lookup each. A lookup that hasn't succeeded after
   1 s, or that failed, is tried again alongside (up to 3 attempts), and every
-  waiting session gets the first successful answer.
+  waiting session gets the first successful answer. A failure is reused for
+  2 s.
 
 ### Updated
 
