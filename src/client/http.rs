@@ -1240,6 +1240,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn clients_resolve_hosts_through_the_shared_dns_cache() {
+        use wiremock::matchers::any;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(any())
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let mut config = HttpClientConfig::default();
+        config.tls.enabled = Some(false);
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        // A name, not the mock's IP literal, so a resolver is consulted.
+        let url = format!("http://localhost:{}/", server.address().port());
+        client.inner().get(url).send().await.expect("request");
+        // Only clients built here write to the shared cache.
+        assert!(crate::client::dns::CachingResolver::shared().has_answer("localhost"));
+    }
+
+    #[tokio::test]
     async fn test_auth_header_after_set() {
         let config = HttpClientConfig::default();
         let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
