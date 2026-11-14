@@ -112,7 +112,25 @@ impl CachingResolver {
     /// The lookup to join for `host`: one in flight, a recent answer, or a new
     /// lookup when the last one expired.
     fn entry(&self, host: &str) -> Entry {
-        let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+        let (tx, rx) = {
+            let mut entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
+            match self.current_or_insert(&mut entries, host) {
+                Ok(current) => return current,
+                Err(new) => new,
+            }
+        };
+        // Spawned after the lock is released: every resolve takes that lock.
+        self.start_lookup(host, tx);
+        rx
+    }
+
+    /// The usable entry for `host`, or the sender and receiver of a new one
+    /// just inserted for it.
+    fn current_or_insert(
+        &self,
+        entries: &mut HashMap<String, Slot>,
+        host: &str,
+    ) -> Result<Entry, (watch::Sender<Option<Answer>>, Entry)> {
         let usable = |slot: &Slot| match &*slot.entry.borrow() {
             // An unanswered entry is joined only while something can still
             // answer it.
@@ -126,7 +144,7 @@ impl CachingResolver {
         };
         if let Some(current) = entries.get(host) {
             if usable(current) {
-                return current.entry.clone();
+                return Ok(current.entry.clone());
             }
         }
         if entries.len() >= MAX_HOSTS {
@@ -135,14 +153,14 @@ impl CachingResolver {
                 entries.clear();
             }
         }
-        let entry = self.start_lookup(host);
+        let (tx, rx) = watch::channel(None);
         let slot = Slot {
-            entry: entry.clone(),
+            entry: rx.clone(),
             started: Instant::now(),
             pid: std::process::id(),
         };
         entries.insert(host.to_owned(), slot);
-        entry
+        Err((tx, rx))
     }
 
     /// Whether `host` has a cached successful answer (tests only).
@@ -158,27 +176,23 @@ impl CachingResolver {
     /// answer itself: waiters from other sessions depend on it, so it must not
     /// be abandoned when the caller that started it is cancelled or its
     /// runtime shuts down. See [`first_answer`] for how attempts are made.
-    fn start_lookup(&self, host: &str) -> Entry {
-        let (tx, rx) = watch::channel(None);
+    fn start_lookup(&self, host: &str, tx: watch::Sender<Option<Answer>>) {
         let lookup = Arc::clone(&self.lookup);
         let (hedge, deadline) = (self.hedge, self.stuck_after);
         let host = host.to_owned();
+        let tx = Arc::new(tx);
+        let thread_tx = Arc::clone(&tx);
         let spawned = std::thread::Builder::new()
             .name("dbx-sql-kernel-dns".to_owned())
             .spawn(move || {
                 let result = first_answer(&lookup, &host, hedge, deadline);
-                tx.send_replace(Some((
+                thread_tx.send_replace(Some((
                     result.map(Arc::from).map_err(Arc::new),
                     Instant::now(),
                 )));
             });
-        match spawned {
-            Ok(_) => rx,
-            Err(e) => {
-                let (tx, rx) = watch::channel(None);
-                tx.send_replace(Some((Err(Arc::new(e)), Instant::now())));
-                rx
-            }
+        if let Err(e) = spawned {
+            tx.send_replace(Some((Err(Arc::new(e)), Instant::now())));
         }
     }
 }
@@ -235,6 +249,11 @@ fn first_answer(
         match done_rx.recv_timeout(hedge.min(left)) {
             Ok(Ok(addrs)) if !addrs.is_empty() => return Ok(addrs),
             Ok(result) => {
+                // Retried at once whatever the error: std reports every
+                // getaddrinfo failure as the same kind with gai_strerror's
+                // localized text, so a final NXDOMAIN can't be told from a
+                // transient EAI_AGAIN. A host that doesn't resolve costs
+                // MAX_ATTEMPTS queries per NEGATIVE_TTL rather than one.
                 running -= 1;
                 last_error = Some(result.err().unwrap_or_else(|| {
                     io::Error::new(io::ErrorKind::NotFound, "DNS lookup returned no addresses")
@@ -357,10 +376,10 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn failures_reach_current_waiters_and_are_reused_briefly() {
+    async fn failures_reach_current_waiters_and_are_reused() {
         let (lookup, calls) = counting(Duration::from_millis(50), true);
         let mut r = CachingResolver::new(TTL, HEDGE, lookup);
-        r.negative_ttl = Duration::from_millis(200);
+        r.negative_ttl = Duration::from_secs(60);
         let r = Arc::new(r);
         let tasks: Vec<_> = (0..16)
             .map(|_| {
@@ -382,13 +401,17 @@ mod tests {
             MAX_ATTEMPTS,
             "a recent failure is reused"
         );
-        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    #[tokio::test]
+    async fn expired_failures_are_looked_up_again() {
+        let (lookup, calls) = counting(Duration::ZERO, true);
+        let mut r = CachingResolver::new(TTL, HEDGE, lookup);
+        r.negative_ttl = Duration::ZERO;
+        let r = Arc::new(r);
         assert!(resolve(&r, "example.com").await.is_err());
-        assert_eq!(
-            calls.load(Ordering::SeqCst),
-            2 * MAX_ATTEMPTS,
-            "an expired failure is looked up again"
-        );
+        assert!(resolve(&r, "example.com").await.is_err());
+        assert_eq!(calls.load(Ordering::SeqCst), 2 * MAX_ATTEMPTS);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
