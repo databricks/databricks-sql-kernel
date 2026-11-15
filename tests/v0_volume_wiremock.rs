@@ -342,6 +342,7 @@ async fn owner_reader_and_repeated_materialization_share_one_completion() {
     stmt.spec().sql("operation");
     let owner = stmt.submit().await.unwrap();
     let reader = owner.reader().unwrap();
+    reader.fetch_result().await.unwrap().close();
     let mut first = reader.fetch_result().await.unwrap();
     let mut second = owner.fetch_result().await.unwrap();
     let options = VolumeOptions {

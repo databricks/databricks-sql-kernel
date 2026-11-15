@@ -536,9 +536,6 @@ pub unsafe extern "C" fn kernel_result_stream_close(
         return store_invalid_arg("kernel_result_stream_close: stream must not be null");
     }
     let inner = Box::from_raw(stream as *mut ResultStreamInner);
-    if let Some(volume) = &inner.volume {
-        volume.cancel();
-    }
     drop(inner);
     KernelStatusCode::Success
 }
@@ -794,17 +791,14 @@ mod tests {
         )
         .unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for marked in [false, true] {
+        for (marked, cancel) in [(false, false), (true, false), (true, true)] {
+            let volume = crate::volume::VolumeState::new(Default::default(), None);
             let stream = rt.block_on(async {
                 let mut stream =
                     ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
                         .await
                         .unwrap();
-                stream.attach_volume(
-                    marked,
-                    crate::volume::VolumeState::new(Default::default(), None),
-                    reqwest::Client::new(),
-                );
+                stream.attach_volume(marked, Arc::clone(&volume), reqwest::Client::new());
                 into_raw_result_stream(schema.clone(), stream)
             });
             let mut is_volume = !marked;
@@ -813,6 +807,11 @@ mod tests {
                 KernelStatusCode::Success
             );
             assert_eq!(is_volume, marked);
+            if marked && !cancel {
+                unsafe { kernel_result_stream_close(stream) };
+                assert!(volume.cached().is_none());
+                continue;
+            }
             let roots = CString::new("[]").unwrap();
             let mut status = -1;
             if marked {

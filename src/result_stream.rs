@@ -969,7 +969,6 @@ impl ResultStream {
     /// `Drop` performs the same cleanup (including the metadata guard's
     /// close) if `close` was never called explicitly.
     pub fn close(self) {
-        self.cancel_volume();
         // Drops `self` (and the wrapped reader / current batch / any
         // metadata close-guard). Background tasks owned by the reader
         // stop on `Drop`.
