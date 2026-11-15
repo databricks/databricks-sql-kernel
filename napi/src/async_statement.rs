@@ -855,8 +855,10 @@ mod tests {
         panic!("close RPC panicked")
     }
 
+    /// Covers `CloseRelease` on unwind only; a panic can't be injected into
+    /// the kernel close RPC, so `close()`'s use of the guard isn't driven here.
     #[tokio::test]
-    async fn close_release_runs_when_the_close_rpc_panics() {
+    async fn close_release_guard_releases_on_unwind() {
         let server = lease_server().await;
         let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
         let statement = connection
