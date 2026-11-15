@@ -31,7 +31,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle,
+    AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle,
     GeospatialResultRepresentation, HttpConfig, ResultBatch, ResultConfig, Session, TryNextBatch,
     TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
@@ -2386,6 +2386,84 @@ async fn polling_path_carries_terminal_status_not_initial() {
     );
     assert_eq!(exec.error_details_json(), Some(r#"{"errorClass":"NONE"}"#));
 
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_direct_populates_count_without_consuming_result() {
+    for (count, server_count, state) in [
+        (2, None, "CLOSED"),
+        (0, None, "SUCCEEDED"),
+        (2, Some(11), "SUCCEEDED"),
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let batch = int64_batch("num_affected_rows", vec![count]);
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-direct-count", &batch)).unwrap();
+        body["status"]["state"] = json!(state);
+        if let Some(value) = server_count {
+            body["status"]["num_modified_rows"] = json!(value);
+        }
+        mount_execute(&server, body.to_string()).await;
+
+        let session = open_session(&server).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql("UPDATE t SET x = x + 1");
+        let DirectStatement::Completed(mut exec) = stmt.execute_direct().await.unwrap() else {
+            panic!("inline result must return a completed statement");
+        };
+        let expected = server_count.unwrap_or(count);
+        assert_eq!(exec.num_modified_rows(), Some(expected));
+        let batches = drain(exec.result_stream_mut()).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].columns(), batch.columns());
+        assert_eq!(exec.num_modified_rows(), Some(expected));
+        exec.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn execute_direct_defers_dml_count_inference_error_to_fetch() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let chunk_path = "/api/2.0/sql/statements/stmt-direct-count-error/result/chunks/1";
+    let batch = int64_batch("num_affected_rows", vec![1]);
+    let mut body: serde_json::Value =
+        serde_json::from_str(&closed_inline_body("stmt-direct-count-error", &batch)).unwrap();
+    let empty_chunk = arrow_schema_ipc_bytes(&batch.schema());
+    body["manifest"]["total_chunk_count"] = json!(2);
+    body["result"]["attachment"] = json!(STANDARD.encode(&empty_chunk));
+    body["result"]["byte_count"] = json!(empty_chunk.len());
+    body["result"]["row_count"] = json!(0);
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path(chunk_path))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET value = 1");
+    let DirectStatement::Completed(mut exec) = stmt.execute_direct().await.expect("execute direct")
+    else {
+        panic!("terminal response must return a completed statement");
+    };
+
+    assert_eq!(exec.num_modified_rows(), None);
+    let error = exec
+        .result_stream_mut()
+        .next_batch()
+        .await
+        .expect_err("fetch must replay the inference error");
+    assert_eq!(error.code, ErrorCode::NotFound);
     exec.close().await.expect("close");
 }
 
