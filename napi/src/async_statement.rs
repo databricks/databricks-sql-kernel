@@ -60,6 +60,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, Weak};
+use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use arrow_schema::SchemaRef;
@@ -118,7 +119,16 @@ impl ResultSlot {
             stream.take();
             return;
         }
-        tokio::spawn(async move {
+        // May run from a drop outside any runtime (e.g. teardown), where
+        // `tokio::spawn` would panic. With no runtime at all, the next fetch
+        // or the handle's drop frees the stream instead.
+        let Some(handle) = Handle::try_current()
+            .ok()
+            .or_else(|| runtime::try_get_handle().cloned())
+        else {
+            return;
+        };
+        handle.spawn(async move {
             self.stream.lock().await.take();
         });
     }
@@ -848,6 +858,32 @@ mod tests {
             .expect_err("the close RPC must fail");
         assert!(statement.canceller.lock().unwrap().is_none());
         assert!(result.inner.stream.lock().await.is_none());
+        connection.close().await.expect("close session");
+    }
+
+    #[tokio::test]
+    async fn release_outside_a_runtime_does_not_panic() {
+        let server = lease_server().await;
+        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let statement = connection
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = statement.await_result().await.expect("await result");
+        let in_flight = result.inner.stream.lock().await;
+        let slot = Arc::clone(&result.inner);
+        std::thread::spawn(move || slot.release())
+            .join()
+            .expect("releasing a busy slot outside a runtime must not panic");
+        drop(in_flight);
+        let err = result
+            .fetch_next_batch()
+            .await
+            .err()
+            .expect("fetching after release must fail");
+        assert!(err.reason.contains("AsyncResultHandle already closed"));
+        assert!(result.inner.stream.lock().await.is_none());
+        statement.close().await.expect("close statement");
         connection.close().await.expect("close session");
     }
 
