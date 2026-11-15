@@ -22,7 +22,7 @@ use crate::client::retry::RequestType;
 use crate::client::DatabricksHttpClient;
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
-use crate::reader::cloudfetch::arrow_parser::parse_arrow_ipc;
+use crate::reader::cloudfetch::arrow_parser::parse_arrow_ipc_off_worker;
 use crate::types::cloudfetch::CloudFetchLink;
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
@@ -148,8 +148,8 @@ impl ChunkDownloader {
             );
         }
 
-        // Parse Arrow IPC data
-        let batches = parse_arrow_ipc(&bytes, self.compression)?;
+        // Parse Arrow IPC data (off the async workers when the chunk is large)
+        let batches = parse_arrow_ipc_off_worker(bytes, self.compression).await?;
 
         debug!(
             "Parsed chunk {}: {} batches, {} total rows",

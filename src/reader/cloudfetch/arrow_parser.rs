@@ -180,6 +180,28 @@ pub fn parse_arrow_ipc(data: &[u8], compression: CompressionCodec) -> Result<Vec
     Ok(batches)
 }
 
+/// Smallest encoded chunk that [`parse_arrow_ipc_off_worker`] decodes on the
+/// blocking pool. Below it, the thread hand-off costs more than the decode.
+const BLOCKING_DECODE_MIN_BYTES: usize = 256 * 1024;
+
+/// [`parse_arrow_ipc`] for a chunk a runtime task downloaded: a large chunk is
+/// decoded (and LZ4-decompressed) on tokio's blocking pool, so the runtime's
+/// worker threads keep driving I/O while it runs.
+pub(crate) async fn parse_arrow_ipc_off_worker<B>(
+    data: B,
+    compression: CompressionCodec,
+) -> Result<Vec<RecordBatch>>
+where
+    B: AsRef<[u8]> + Send + 'static,
+{
+    if data.as_ref().len() < BLOCKING_DECODE_MIN_BYTES {
+        return parse_arrow_ipc(data.as_ref(), compression);
+    }
+    tokio::task::spawn_blocking(move || parse_arrow_ipc(data.as_ref(), compression))
+        .await
+        .map_err(|e| Error::internal().message(format!("Arrow IPC decode task failed: {e}")))?
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

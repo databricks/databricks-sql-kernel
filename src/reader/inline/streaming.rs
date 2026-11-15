@@ -65,6 +65,7 @@
 use crate::client::InlineChunkFetchResult;
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, error};
+use crate::reader::cloudfetch::arrow_parser::parse_arrow_ipc_off_worker;
 use crate::reader::cloudfetch::parse_arrow_ipc;
 use crate::types::sea::CompressionCodec;
 use arrow_array::RecordBatch;
@@ -413,7 +414,7 @@ impl PrefetchTask {
             let chunk_index = self.next_chunk_index;
             let row_offset = self.next_row_offset;
 
-            let fetch_result = match self
+            let mut fetch_result = match self
                 .source
                 .get_inline_chunk(&self.statement_id, chunk_index, row_offset)
                 .await
@@ -451,27 +452,21 @@ impl PrefetchTask {
                 }
             }
 
-            // Decode synchronously. Arrow IPC parsing is fast and
-            // doing it here keeps the consumer hot-path zero-CPU.
-            //
-            // **Performance note:** on the current-thread tokio
-            // runtime, large LZ4-compressed chunks could starve
-            // the consumer task during decode. Today's perf
-            // measurements (per PR #67) show ~1-5 ms per 20 MB
-            // uncompressed Arrow IPC chunk — well inside the
-            // typical 10 ms responsiveness budget. If LZ4 push
-            // that into the tens-of-ms range, wrap this in
-            // `tokio::task::spawn_blocking` (the cost is one
-            // extra mpsc-channel-hop's worth of latency). Defer
-            // pending measurements that justify the complexity.
-            let batches = match parse_arrow_ipc(&fetch_result.bytes, self.compression) {
+            // Decode here, so the consumer hot path stays zero-CPU; a large
+            // chunk is decoded on the blocking pool so it doesn't hold one
+            // of the runtime's workers.
+            let encoded_len = fetch_result.bytes.len();
+            let batches = match parse_arrow_ipc_off_worker(
+                std::mem::take(&mut fetch_result.bytes),
+                self.compression,
+            )
+            .await
+            {
                 Ok(b) => b,
                 Err(e) => {
                     error!(
                         "inline prefetch: parse_arrow_ipc(chunk={}, bytes={}) failed: {}",
-                        chunk_index,
-                        fetch_result.bytes.len(),
-                        e
+                        chunk_index, encoded_len, e
                     );
                     let _ = self.tx.send(Err(e)).await;
                     return;
