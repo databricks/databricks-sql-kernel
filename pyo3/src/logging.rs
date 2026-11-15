@@ -188,15 +188,10 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
     if !matches!(*lock_state(), LogState::NotInstalled) {
         return false;
     }
-    // Read the levels without holding the install lock: the read runs Python
-    // code, during which another thread may take the GIL and then block on
-    // that lock.
-    let levels = PythonLevels::read(py);
-    let mut state = lock_state();
-    if !matches!(*state, LogState::NotInstalled) {
-        return false;
-    }
-
+    // Everything that runs Python code happens without holding the install
+    // lock: Python code can let another thread take the GIL, and that thread
+    // could then block on the lock while holding the GIL.
+    //
     // `LoggersAndLevels` caching: resolve each Python logger object and
     // its effective level once, then gate subsequent records cheaply
     // without re-entering Python. The default filter forwards every
@@ -210,12 +205,26 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
     // shutdown. We must NOT `expect()` it: an unwinding panic across the
     // pyo3/FFI boundary is undefined behavior and would tear down the
     // process over a non-essential feature. Treat it as a sticky failure.
-    let logger = match Logger::new(py, Caching::LoggersAndLevels) {
-        Ok(l) => l,
-        Err(_) => {
-            *state = LogState::Failed;
-            return false;
-        }
+    let logger = Logger::new(py, Caching::LoggersAndLevels);
+    let levels = PythonLevels::read(py);
+    if !install(logger, levels) {
+        return false;
+    }
+    // Best effort: without the hook, records still flow until exit.
+    let _ = register_exit_hook(py);
+    true
+}
+
+/// Install `logger` as the global `log` logger, under the install lock.
+/// Runs no Python code. Returns whether this call installed it.
+fn install(logger: PyResult<Logger>, levels: PythonLevels) -> bool {
+    let mut state = lock_state();
+    if !matches!(*state, LogState::NotInstalled) {
+        return false;
+    }
+    let Ok(logger) = logger else {
+        *state = LogState::Failed;
+        return false;
     };
     let logger = logger
         .filter(log::LevelFilter::Trace)
@@ -228,8 +237,6 @@ pub(crate) fn init_logging(py: Python<'_>) -> bool {
         Ok(()) => {
             let _ = RESET_HANDLE.set(handle);
             apply(levels, false);
-            // Best effort: without the hook, records still flow until exit.
-            let _ = register_exit_hook(py);
             *state = LogState::Installed;
             true
         }
