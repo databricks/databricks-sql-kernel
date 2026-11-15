@@ -453,11 +453,11 @@ pub struct ConnectionOptions {
     /// server) can now route a single connection through a proxy
     /// programmatically.
     pub proxy: Option<ProxyInput>,
-    /// Per-connection socket read timeout, in milliseconds. Caps how
-    /// long a single HTTP round-trip may block waiting on the server
-    /// before the request errors out. Maps onto the kernel
+    /// Per-connection HTTP request deadline, in milliseconds. Caps a single
+    /// request through response-body completion. Maps onto the kernel
     /// [`HttpConfig::request_timeout`] (the internal reqwest
-    /// `Client::timeout`).
+    /// `Client::timeout`). Does not bound Volume storage requests or configure
+    /// their inactivity limit. Storage connection setup has a separate timeout.
     ///
     /// Omitted ⇒ kernel default (120 000 ms / 120 s). Napi-rs
     /// serialises `u32` as JS `number`; the largest representable value
@@ -653,7 +653,7 @@ fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     if let Some(s) = options.retry_overall_timeout_secs {
         http.overall_timeout = std::time::Duration::from_secs(u64::from(s));
     }
-    // Per-connection socket read timeout. Maps onto the kernel's
+    // Per-connection request deadline. Maps onto the kernel's
     // `request_timeout` (the reqwest `Client::timeout`). Omitted ⇒ kernel
     // default (120 s).
     if let Some(ms) = options.socket_timeout_ms {

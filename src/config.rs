@@ -755,6 +755,7 @@ pub struct HttpConfig {
     /// Total timeout for one HTTP request, from connection start through
     /// response-body completion. A separate 30-second connection timeout also
     /// applies, so connection establishment is bounded by the shorter limit.
+    /// Does not bound Volume storage requests; use `storage_read_timeout` for inactivity.
     pub request_timeout: Duration,
 
     /// Inactivity limit for Volume GET/REMOVE response headers and each response-body read.

@@ -629,6 +629,7 @@ pub unsafe extern "C" fn kernel_session_config_set_sea_response_compression_enab
 /// Configure the total timeout for one HTTP request, from connection start
 /// through response-body completion. A separate 30-second connection timeout
 /// also applies, so connection establishment is bounded by the shorter limit.
+/// Does not bound Volume storage requests or configure their inactivity limit.
 /// `request_timeout_ms == 0` clears an earlier override and keeps the kernel
 /// default (120 seconds); a positive value overrides it.
 ///

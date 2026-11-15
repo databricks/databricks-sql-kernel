@@ -603,11 +603,11 @@ export interface ConnectionOptions {
    */
   proxy?: ProxyInput
   /**
-   * Per-connection socket read timeout, in milliseconds. Caps how
-   * long a single HTTP round-trip may block waiting on the server
-   * before the request errors out. Maps onto the kernel
+   * Per-connection HTTP request deadline, in milliseconds. Caps a single
+   * request through response-body completion. Maps onto the kernel
    * [`HttpConfig::request_timeout`] (the internal reqwest
-   * `Client::timeout`).
+   * `Client::timeout`). Does not bound Volume storage requests or configure
+   * their inactivity limit. Storage connection setup has a separate timeout.
    *
    * Omitted ⇒ kernel default (120 000 ms / 120 s). Napi-rs
    * serialises `u32` as JS `number`; the largest representable value
