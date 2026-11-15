@@ -545,11 +545,21 @@ fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
         ));
     }
     let resolved = resolve_existing_parent(&path, requested)?;
+    let mut root_error = None;
     for root in roots {
-        let root = resolve_existing_parent(&root, requested)?;
+        let root = match resolve_existing_parent(&root, &root.to_string_lossy()) {
+            Ok(root) => root,
+            Err(error) => {
+                root_error.get_or_insert(error);
+                continue;
+            }
+        };
         if within_root(&resolved, &root) {
             return Ok(resolved);
         }
+    }
+    if let Some(error) = root_error {
+        return Err(error);
     }
     Err(invalid(
         "Resolved local file path is outside the configured allowed roots",
@@ -1327,6 +1337,26 @@ mod tests {
             std::slice::from_ref(&root)
         )
         .is_err());
+        let looping_root = dir.path().join("loop");
+        symlink_dir(&looping_root, &looping_root).unwrap();
+        for roots in [
+            [looping_root.clone(), root.clone()],
+            [root.clone(), looping_root.clone()],
+        ] {
+            assert_eq!(
+                allowed_path(root.join("file").to_str().unwrap(), &roots).unwrap(),
+                root.join("file").canonicalize().unwrap()
+            );
+        }
+        let error = allowed_path(
+            root.join("escape").to_str().unwrap(),
+            &[looping_root.clone(), root.clone()],
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.local_error.unwrap().path,
+            looping_root.to_string_lossy()
+        );
         assert!(allowed_path(root.join("../other/missing").to_str().unwrap(), &[root]).is_err());
     }
 
