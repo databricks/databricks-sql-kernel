@@ -97,8 +97,8 @@ fn closed_err(what: &str) -> napi::Error {
 /// so the parent's `close()` can release it.
 struct ResultSlot {
     stream: Mutex<Option<ResultStream>>,
-    /// Set by the parent's `close()`. A fetch holding `stream` at that moment
-    /// drops it on return, so `close()` never waits for a fetch.
+    /// Set by the parent's `close()`; a fetch that locks `stream` afterwards
+    /// drops it and returns `InvalidStatementHandle`.
     closed: AtomicBool,
 }
 
@@ -110,11 +110,17 @@ impl ResultSlot {
         }
     }
 
-    fn release(&self) {
+    /// Drops the stream without waiting for an in-flight fetch: if one holds
+    /// it, a task drops it as soon as that fetch returns.
+    fn release(self: Arc<Self>) {
         self.closed.store(true, Ordering::Release);
         if let Ok(mut stream) = self.stream.try_lock() {
             stream.take();
+            return;
         }
+        tokio::spawn(async move {
+            self.stream.lock().await.take();
+        });
     }
 }
 
@@ -352,10 +358,11 @@ impl AsyncStatement {
             let slot = Arc::new(ResultSlot::new(stream));
             // Registered while `inner` is still held, so a `close()` queued
             // behind this call always sees the slot.
-            results
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .push(Arc::downgrade(&slot));
+            {
+                let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
+                results.retain(|slot| slot.strong_count() > 0);
+                results.push(Arc::downgrade(&slot));
+            }
             Ok(AsyncResultHandle {
                 inner: slot,
                 schema,
@@ -434,9 +441,10 @@ impl AsyncStatement {
                 .take();
             let slots =
                 std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
-            for slot in slots.iter().filter_map(Weak::upgrade) {
-                slot.release();
-            }
+            slots
+                .iter()
+                .filter_map(Weak::upgrade)
+                .for_each(ResultSlot::release);
             outcome
         })
         .await
@@ -536,21 +544,14 @@ impl AsyncResultHandle {
         let inner = Arc::clone(&self.inner);
         let schema = self.schema.clone();
         guarded(async move {
-            let outcome = {
-                let mut guard = inner.stream.lock().await;
-                if inner.closed.load(Ordering::Acquire) {
-                    guard.take();
-                }
-                match guard.as_mut() {
-                    Some(stream) => next_ipc_batch(stream, &schema).await,
-                    None => Err(closed_err("AsyncResultHandle")),
-                }
-            };
-            // The parent may have closed while this fetch held the stream.
+            let mut guard = inner.stream.lock().await;
             if inner.closed.load(Ordering::Acquire) {
-                inner.release();
+                guard.take();
             }
-            outcome
+            let stream = guard
+                .as_mut()
+                .ok_or_else(|| closed_err("AsyncResultHandle"))?;
+            next_ipc_batch(stream, &schema).await
         })
         .await
     }
@@ -785,12 +786,46 @@ mod tests {
             .expect("close must not wait for an in-flight fetch")
             .expect("close statement");
         drop(in_flight);
+        // Released once the fetch returns, without relying on another fetch.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while result.inner.stream.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream must be dropped once the in-flight fetch returns");
         let err = result
             .fetch_next_batch()
             .await
             .err()
             .expect("fetching after the parent closed must fail");
         assert!(err.reason.contains("AsyncResultHandle already closed"));
+        connection.close().await.expect("close session");
+    }
+
+    #[tokio::test]
+    async fn close_releases_session_when_the_close_rpc_fails() {
+        let server = lease_server().await;
+        Mock::given(method("DELETE"))
+            .and(path_regex(r"^/api/2\.0/sql/statements/.+"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(json!({
+                "error_code": "INVALID_PARAMETER_VALUE",
+                "message": "close failed",
+            })))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let statement = connection
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = statement.await_result().await.expect("await result");
+        statement
+            .close()
+            .await
+            .expect_err("the close RPC must fail");
+        assert!(statement.canceller.lock().unwrap().is_none());
         assert!(result.inner.stream.lock().await.is_none());
         connection.close().await.expect("close session");
     }
