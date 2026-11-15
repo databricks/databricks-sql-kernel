@@ -394,7 +394,7 @@ pub struct DatabricksHttpClient {
 /// value, so an unchanged token is not re-validated and copied per request.
 /// `Debug` never prints the credential.
 #[derive(Default)]
-struct AuthValueCache(std::sync::Mutex<Option<(String, HeaderValue)>>);
+struct AuthValueCache(std::sync::RwLock<Option<(String, HeaderValue)>>);
 
 impl std::fmt::Debug for AuthValueCache {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -404,8 +404,8 @@ impl std::fmt::Debug for AuthValueCache {
 
 impl AuthValueCache {
     fn get_or_build(&self, header: String) -> Result<HeaderValue> {
-        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((cached, value)) = slot.as_ref() {
+        // Requests sharing a token only read, so they don't wait on each other.
+        if let Some((cached, value)) = self.0.read().unwrap_or_else(|e| e.into_inner()).as_ref() {
             if *cached == header {
                 return Ok(value.clone());
             }
@@ -414,7 +414,7 @@ impl AuthValueCache {
             Error::invalid_argument().message(format!("Failed to build request: {e}"))
         })?;
         value.set_sensitive(true);
-        *slot = Some((header, value.clone()));
+        *self.0.write().unwrap_or_else(|e| e.into_inner()) = Some((header, value.clone()));
         Ok(value)
     }
 }
