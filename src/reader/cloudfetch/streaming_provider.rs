@@ -927,8 +927,9 @@ impl StreamingCloudFetchProvider {
         ))
     }
 
-    /// Download a single chunk with retry and link refresh on expiry,
-    /// bounded end-to-end by [`CloudFetchConfig::download_timeout`].
+    /// Download a single chunk with retry, refreshing the link when it expires
+    /// or storage refuses it (401/403/404), bounded end-to-end by
+    /// [`CloudFetchConfig::download_timeout`].
     async fn download_chunk_with_retry(
         chunk_index: i64,
         ctx: &DownloadCtx,
@@ -3273,8 +3274,8 @@ mod tests {
             )
             .await
         });
-        // On the single-threaded test runtime this sleep lets the waiter park on `done`.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // On the single-threaded test runtime one yield runs the waiter until it parks on `done`.
+        tokio::task::yield_now().await;
         assert!(
             !waiter.is_finished(),
             "the waiter must wait for the other refresh"
@@ -3288,6 +3289,38 @@ mod tests {
             chunks.get(&0).unwrap().link.as_ref().unwrap().url,
             rejected.url,
             "the rejected URL must be replaced"
+        );
+    }
+
+    #[tokio::test]
+    async fn refresh_skips_a_rejected_url_another_task_already_replaced() {
+        // Storage refused chunk 0's original URL, but another task has already
+        // cached a fresh one, so no refresh RPC is needed.
+        let rejected = create_test_link(0);
+        let replaced = RefreshCountingMock::fresh_link(0);
+        let chunks: Arc<DashMap<i64, ChunkEntry>> = Arc::new(DashMap::new());
+        chunks.insert(
+            0,
+            entry_with_state(replaced.clone(), ChunkState::Downloading),
+        );
+        let mock = RefreshCountingMock::new(1);
+        let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+
+        StreamingCloudFetchProvider::refresh_links_batch_replacing(
+            0,
+            Some(&rejected.url),
+            &fetcher,
+            &chunks,
+            &Arc::new(RefreshCoordinator::default()),
+            &CancellationToken::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(mock.refresh_calls.load(AtomicOrdering::SeqCst), 0);
+        assert_eq!(
+            chunks.get(&0).unwrap().link.as_ref().unwrap().url,
+            replaced.url
         );
     }
 
