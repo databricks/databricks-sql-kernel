@@ -1617,6 +1617,26 @@ mod tests {
                     .open(),
             )
             .unwrap();
+        let mut statement = Statement::new(
+            session.statement(),
+            session.metadata(),
+            Arc::clone(&runtime),
+            Arc::new(CancellationRegistry::default()),
+            false,
+        );
+        let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
+        assert_eq!(
+            statement.get_option_string(key.clone()).unwrap_err().status,
+            Status::NotFound
+        );
+        for value in [OptionValue::Int(1), OptionValue::String("[1]".into())] {
+            assert_eq!(
+                statement.set_option(key.clone(), value).unwrap_err().status,
+                Status::InvalidArguments
+            );
+        }
+        statement.set_option(key.clone(), "[]".into()).unwrap();
+        assert_eq!(statement.get_option_string(key.clone()).unwrap(), "[]");
         let mut transfers = 0;
         for mode in ["raw", "sync", "async", "await", "fetch", "bound", "update"] {
             let mut statement = Statement::new(
@@ -1627,20 +1647,8 @@ mod tests {
                 false,
             );
             statement.set_sql_query("operation ?, ?").unwrap();
-            let key = OptionStatement::Other(STAGING_ALLOWED_PATHS_OPTION.into());
-            assert_eq!(
-                statement.get_option_string(key.clone()).unwrap_err().status,
-                Status::NotFound
-            );
-            for value in [OptionValue::Int(1), OptionValue::String("[1]".into())] {
-                assert_eq!(
-                    statement.set_option(key.clone(), value).unwrap_err().status,
-                    Status::InvalidArguments
-                );
-            }
             if mode != "raw" {
                 statement.set_option(key.clone(), "[]".into()).unwrap();
-                assert_eq!(statement.get_option_string(key).unwrap(), "[]");
             }
             if mode == "async" {
                 statement

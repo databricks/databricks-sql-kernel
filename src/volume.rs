@@ -238,7 +238,6 @@ impl VolumeState {
         let mut request = client
             .request(method, &instruction.url)
             .headers(instruction.headers.clone());
-        let upload_error = Arc::new(Mutex::new(None));
         if let Some(bytes) = input {
             request = request
                 .header(reqwest::header::CONTENT_LENGTH, bytes.len())
@@ -249,29 +248,10 @@ impl VolumeState {
         {
             None
         } else {
-            let path = allowed_path(&instruction.local_file, &options.allowed_paths)?;
-            if instruction.operation == "PUT" {
-                let mut file = std::fs::File::open(&path)
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
-                let metadata = file
-                    .metadata()
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
-                if metadata.is_dir() {
-                    // Reading the opened directory retains the platform's filesystem cause.
-                    let error = std::io::Read::read(&mut file, &mut [0])
-                        .err()
-                        .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
-                    return Err(local_error(error, &instruction.local_file));
-                }
-                request = request
-                    .header(reqwest::header::CONTENT_LENGTH, metadata.len())
-                    .body(upload_body(
-                        tokio::fs::File::from_std(file),
-                        instruction.local_file.clone(),
-                        Arc::clone(&upload_error),
-                    ));
-            }
-            Some(path)
+            Some(allowed_path(
+                &instruction.local_file,
+                &options.allowed_paths,
+            )?)
         };
         let mut destination = if instruction.operation == "GET" {
             let path = local_path.as_ref().expect("GET path was checked");
@@ -315,13 +295,105 @@ impl VolumeState {
         };
 
         let retry_timeout = instruction.operation != "PUT";
-        let mut response = storage_send(
-            request,
-            self.read_timeout,
-            instruction.operation == "PUT",
-            upload_error,
-        )
-        .await?;
+        // File bodies must be reopened for redirects; reqwest can only clone owned bytes.
+        let mut request = request.build().map_err(storage_error)?;
+        let mut redirects = 0;
+        let mut response = loop {
+            let mut next = reqwest::RequestBuilder::from_parts(
+                client.clone(),
+                request.try_clone().expect("replayable request template"),
+            );
+            let upload_error = Arc::new(Mutex::new(None));
+            if request.method() == Method::PUT && input.is_none() {
+                let path = local_path.as_ref().expect("PUT path was checked");
+                let mut file = std::fs::File::open(path)
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                let metadata = file
+                    .metadata()
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                if metadata.is_dir() {
+                    // Reading the opened directory retains the platform's filesystem cause.
+                    let error = std::io::Read::read(&mut file, &mut [0])
+                        .err()
+                        .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
+                    return Err(local_error(error, &instruction.local_file));
+                }
+                next = next
+                    .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+                    .body(upload_body(
+                        tokio::fs::File::from_std(file),
+                        instruction.local_file.clone(),
+                        Arc::clone(&upload_error),
+                    ));
+            }
+            let response = storage_send(
+                next,
+                self.read_timeout,
+                request.method() == Method::PUT,
+                upload_error,
+            )
+            .await?;
+            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
+                break response;
+            }
+            let Some(url) = response
+                .headers()
+                .get(reqwest::header::LOCATION)
+                .and_then(|location| location.to_str().ok())
+                .and_then(|location| response.url().join(location).ok())
+            else {
+                break response;
+            };
+            if redirects == 10 || !matches!(url.scheme(), "http" | "https") {
+                return Err(Error::network_error()
+                    .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
+                    .with_retryable(false)
+                    .message(if redirects == 10 {
+                        "Volume storage redirect limit exceeded"
+                    } else {
+                        "Volume storage redirect URL must use HTTP or HTTPS"
+                    }));
+            }
+            redirects += 1;
+            let previous = response.url();
+            if url.host_str() != previous.host_str()
+                || url.port_or_known_default() != previous.port_or_known_default()
+            {
+                for name in [
+                    "authorization",
+                    "cookie",
+                    "cookie2",
+                    "proxy-authorization",
+                    "www-authenticate",
+                ] {
+                    request.headers_mut().remove(name);
+                }
+            }
+            if !(previous.scheme() == "https" && url.scheme() == "http") {
+                let mut referer = previous.clone();
+                let _ = referer.set_username("");
+                let _ = referer.set_password(None);
+                referer.set_fragment(None);
+                if let Ok(value) = referer.as_str().parse() {
+                    request
+                        .headers_mut()
+                        .insert(reqwest::header::REFERER, value);
+                }
+            }
+            if response.status() == reqwest::StatusCode::SEE_OTHER {
+                *request.method_mut() = Method::GET;
+                *request.body_mut() = None;
+                for name in [
+                    "content-type",
+                    "content-length",
+                    "content-encoding",
+                    "transfer-encoding",
+                ] {
+                    request.headers_mut().remove(name);
+                }
+            }
+            *request.url_mut() = url;
+        };
         let status = response.status();
         if !status.is_success()
             && !(instruction.operation == "REMOVE"
@@ -737,48 +809,152 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_put_replays_owned_bytes_on_redirect() {
-        for status in [307, 308] {
-            for payload in [b"".as_slice(), b"payload"] {
-                let server = MockServer::start().await;
-                Mock::given(method("PUT"))
-                    .and(path("/object"))
-                    .and(header("x-storage-token", "server-token"))
-                    .and(body_bytes(payload))
-                    .respond_with(
-                        ResponseTemplate::new(status)
-                            .insert_header("location", format!("{}/redirected", server.uri())),
-                    )
-                    .expect(1)
-                    .mount(&server)
-                    .await;
+    async fn put_replays_file_and_owned_bytes_on_redirect() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        for (status, stream, payload) in [
+            (200, false, vec![42; 128 * 1024]),
+            (307, false, vec![42; 128 * 1024]),
+            (308, false, vec![42; 128 * 1024]),
+            (307, true, vec![]),
+            (308, true, vec![]),
+            (307, true, b"payload".to_vec()),
+            (308, true, b"payload".to_vec()),
+        ] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(path("/object"))
+                .and(header("x-storage-token", "server-token"))
+                .and(body_bytes(payload.clone()))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("location", "/redirected"),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            if status != 200 {
                 Mock::given(method("PUT"))
                     .and(path("/redirected"))
                     .and(header("x-storage-token", "server-token"))
-                    .and(body_bytes(payload))
+                    .and(body_bytes(payload.clone()))
                     .respond_with(ResponseTemplate::new(200))
                     .expect(1)
                     .mount(&server)
                     .await;
-                let batch = instruction(
-                    "PUT",
-                    &format!("{}/object", server.uri()),
-                    Path::new("__input_stream__"),
-                );
-                assert_eq!(
-                    transfer_state(0)
-                        .complete(
-                            &batch,
-                            &Client::new(),
-                            &VolumeOptions::default(),
-                            Some(payload.to_vec()),
-                        )
-                        .await
-                        .unwrap(),
-                    VolumeCompletion::Completed
-                );
             }
+            std::fs::write(&source, &payload).unwrap();
+            let batch = instruction(
+                "PUT",
+                &format!("{}/object", server.uri()),
+                if stream {
+                    Path::new("__input_stream__")
+                } else {
+                    &source
+                },
+            );
+            assert_eq!(
+                transfer_state(0)
+                    .complete(
+                        &batch,
+                        &Client::builder()
+                            .redirect(reqwest::redirect::Policy::none())
+                            .build()
+                            .unwrap(),
+                        &options(dir.path()),
+                        stream.then_some(payload),
+                    )
+                    .await
+                    .unwrap(),
+                VolumeCompletion::Completed
+            );
+            assert!(server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .all(|request| !request.headers.contains_key("authorization")));
         }
+    }
+
+    #[tokio::test]
+    async fn redirects_strip_cross_host_credentials_and_share_a_hop_limit() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let server = MockServer::start().await;
+        let redirected = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"payload").unwrap();
+        Mock::given(method("PUT"))
+            .and(body_bytes(b"payload"))
+            .and(header("authorization", "storage-secret"))
+            .respond_with(ResponseTemplate::new(307).insert_header("location", redirected.uri()))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let count = Arc::new(AtomicUsize::new(0));
+        let attempts = Arc::clone(&count);
+        Mock::given(header("x-storage-token", "server-token"))
+            .respond_with(move |request: &wiremock::Request| {
+                for name in [
+                    "authorization",
+                    "cookie",
+                    "cookie2",
+                    "proxy-authorization",
+                    "www-authenticate",
+                ] {
+                    assert!(!request.headers.contains_key(name));
+                }
+                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
+                assert_eq!(request.method.as_str(), if first { "PUT" } else { "GET" });
+                assert_eq!(
+                    request.body,
+                    if first { b"payload".as_slice() } else { b"" }
+                );
+                if !first {
+                    assert!(!request.headers.contains_key("content-type"));
+                }
+                ResponseTemplate::new(if first { 303 } else { 308 }).insert_header("location", "/")
+            })
+            .expect(10)
+            .mount(&redirected)
+            .await;
+        let batch = instruction("PUT", &server.uri(), &source);
+        let mut instruction = Instruction::decode(&batch).unwrap();
+        for name in [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+        ] {
+            instruction.headers.insert(
+                reqwest::header::HeaderName::from_static(name),
+                "storage-secret".parse().unwrap(),
+            );
+        }
+        instruction.headers.insert(
+            reqwest::header::CONTENT_TYPE,
+            "application/octet-stream".parse().unwrap(),
+        );
+        let error = transfer_state(2)
+            .transfer(
+                instruction,
+                &Client::builder()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .build()
+                    .unwrap(),
+                &options(dir.path()),
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.error_code.as_deref(),
+            Some("VOLUME_STORAGE_NETWORK_ERROR")
+        );
+        assert!(!error.retryable);
+        assert_eq!(count.load(Ordering::SeqCst), 10);
+        assert!(!error.message.contains("storage-secret"));
     }
 
     #[tokio::test]
@@ -790,6 +966,12 @@ mod tests {
             ("GET", false),
             ("REMOVE", false),
         ] {
+            let statuses: &[u16] = if operation == "PUT" && !stream {
+                &[408, 429, 500, 502, 503, 504]
+            } else {
+                &[503]
+            };
+            let requests = statuses.len() as u64 + 1;
             let server = MockServer::start().await;
             let attempts = Arc::new(AtomicUsize::new(0));
             let count = Arc::clone(&attempts);
@@ -804,15 +986,13 @@ mod tests {
                 if operation == "PUT" {
                     assert_eq!(request.body, b"payload");
                 }
-                if let Some(status) =
-                    [408, 429, 500, 502, 503, 504].get(count.fetch_add(1, Ordering::SeqCst))
-                {
+                if let Some(status) = statuses.get(count.fetch_add(1, Ordering::SeqCst)) {
                     ResponseTemplate::new(*status).insert_header("retry-after", "0")
                 } else {
                     ResponseTemplate::new(200).set_body_bytes(b"payload")
                 }
             })
-            .expect(7)
+            .expect(requests)
             .mount(&server)
             .await;
             let dir = tempfile::tempdir().unwrap();
@@ -854,7 +1034,7 @@ mod tests {
                     .unwrap(),
                 VolumeCompletion::Completed
             );
-            assert_eq!(attempts.load(Ordering::SeqCst), 7);
+            assert_eq!(attempts.load(Ordering::SeqCst), requests as usize);
             assert_eq!(std::fs::read(file).unwrap(), b"payload");
             assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
         }
@@ -986,30 +1166,6 @@ mod tests {
                 .unwrap(),
             VolumeCompletion::Completed
         );
-    }
-
-    #[tokio::test]
-    async fn file_put_preserves_streamed_body_and_server_headers() {
-        let server = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        let bytes = vec![42; 128 * 1024];
-        std::fs::write(&source, &bytes).unwrap();
-        Mock::given(method("PUT"))
-            .and(body_bytes(bytes))
-            .and(header("x-storage-token", "server-token"))
-            .respond_with(ResponseTemplate::new(200))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let batch = instruction("PUT", &server.uri(), &source);
-        transfer_state(0)
-            .complete(&batch, &Client::new(), &options(dir.path()), None)
-            .await
-            .unwrap();
-        assert!(!server.received_requests().await.unwrap()[0]
-            .headers
-            .contains_key("authorization"));
     }
 
     #[tokio::test]

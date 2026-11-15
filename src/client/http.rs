@@ -747,7 +747,8 @@ impl DatabricksHttpClient {
         if let Some(timeout) = connect_timeout {
             config.connect_timeout = config.connect_timeout.min(timeout);
         }
-        Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), None)
+        // Volume completion reopens file bodies and applies one redirect budget across all hops.
+        Self::build_reqwest_client(&config, reqwest::redirect::Policy::none(), None)
     }
 
     /// Get the authorization header value.
