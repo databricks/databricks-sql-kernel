@@ -1177,6 +1177,7 @@ mod tests {
                     diagnostic_info: None,
                     error_details_json: None,
                 },
+                result_complete: false,
             })
         }
 
