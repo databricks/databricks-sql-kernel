@@ -2927,6 +2927,62 @@ async fn close_waits_for_the_early_close_only_before_the_stream_is_drained() {
     session.close().await.expect("session close");
 }
 
+/// If the close `execute()` started fails, an explicit `close()` sends it
+/// again and reports that close's outcome, so `Ok` means the statement is
+/// closed.
+#[tokio::test]
+async fn close_resends_a_failed_early_close() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    let batch = int64_batch("n", vec![1]);
+    mount_execute(&server, succeeded_inline_body("stmt-close-retry", &batch)).await;
+    // First DELETE: a non-retryable 400, so the HTTP layer gives up at once.
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-close-retry"))
+        .respond_with(
+            ResponseTemplate::new(400).set_body_string(
+                r#"{"error_code":"BAD_REQUEST","message":"transient close failure"}"#,
+            ),
+        )
+        .up_to_n_times(1)
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-close-retry"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 1 AS n");
+    let exec = stmt.execute().await.expect("execute");
+    exec.close()
+        .await
+        .expect("close() must succeed by sending the close again");
+
+    let closes =
+        wait_for_close_delete(&server, "stmt-close-retry", 2, Duration::from_secs(2)).await;
+    assert_eq!(
+        closes, 2,
+        "the failed early close must be sent again by close()"
+    );
+    drop(exec);
+    drop(stmt);
+    // Dropping the closed handle must not send a third close.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let closes =
+        wait_for_close_delete(&server, "stmt-close-retry", 3, Duration::from_millis(50)).await;
+    assert_eq!(
+        closes, 2,
+        "a successful close() must not be repeated on drop"
+    );
+    session.close().await.expect("session close");
+}
+
 // ─── Client query timeout ───────────────────────────────────────────
 
 #[tokio::test]

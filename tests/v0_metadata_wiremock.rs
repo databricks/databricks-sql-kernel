@@ -1984,14 +1984,18 @@ async fn primary_keys_rejects_invalid_current_namespace_and_closes_lookup() {
         let server = MockServer::start().await;
         mount_create_session(&server).await;
         mount_delete_session(&server).await;
+        // A statement id of its own: wiremock reuses servers across tests, and a
+        // late fire-and-forget close of another test's `stmt-test` can land here.
+        let statement_id = format!("stmt-namespace-{index}");
         mount_execute_expecting_sql(
             &server,
             "SELECT CURRENT_CATALOG(), CURRENT_SCHEMA()",
-            succeeded_inline_response_body(batch),
+            succeeded_inline_response_body(batch).replace("stmt-test", &statement_id),
         )
         .await;
+        let close_path = format!("/api/2.0/sql/statements/{statement_id}");
         Mock::given(method("DELETE"))
-            .and(path("/api/2.0/sql/statements/stmt-test"))
+            .and(path(close_path.as_str()))
             .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
             .expect(1)
             .mount(&server)
@@ -2021,11 +2025,17 @@ async fn primary_keys_rejects_invalid_current_namespace_and_closes_lookup() {
             "invalid namespace must not issue SHOW KEYS"
         );
         // A lookup that read to the end closes its statement fire-and-forget.
-        assert_eq!(
-            wait_for_close_delete(&server, 1, std::time::Duration::from_secs(2)).await,
-            1,
-            "namespace case {index}: the lookup statement must be closed"
-        );
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        while tokio::time::Instant::now() < deadline
+            && !server
+                .received_requests()
+                .await
+                .unwrap_or_default()
+                .iter()
+                .any(|r| r.method.as_str() == "DELETE" && r.url.path() == close_path)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         session.close().await.unwrap();
         server.verify().await;
     }

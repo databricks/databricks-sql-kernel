@@ -201,8 +201,8 @@ impl SessionInner {
     }
 
     /// `CloseStatement` for `statement_id` as a task on the session runtime.
-    /// A failure is logged; the server reclaims the statement when the session
-    /// closes. Dropping the handle leaves the close running.
+    /// A failure is logged and returned through the handle; dropping the
+    /// handle leaves the close running.
     pub(crate) fn spawn_close_statement(
         &self,
         statement_id: String,
@@ -214,8 +214,8 @@ impl SessionInner {
                 crate::klog::warn!(
                     statement_id = %statement_id,
                     error = %e,
-                    "fire-and-forget close_statement failed; \
-                     server-side resource reclaimed when the session closes"
+                    "background close_statement failed; an explicit close() sends it \
+                     again, otherwise the server reclaims the statement when the session closes"
                 );
             }
             result
