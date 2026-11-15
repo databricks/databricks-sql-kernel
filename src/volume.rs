@@ -23,7 +23,7 @@ use reqwest::{header::HeaderMap, Client, Method};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::{oneshot, Notify};
+use tokio::sync::Notify;
 use tokio_util::io::ReaderStream;
 
 /// Local file authorization and driver-specific storage response policy.
@@ -239,16 +239,12 @@ impl VolumeState {
             .request(method, &instruction.url)
             .headers(instruction.headers.clone());
         let upload_error = Arc::new(Mutex::new(None));
-        let (uploaded, upload_complete) = oneshot::channel();
-        let mut uploaded = Some(uploaded);
         if let Some(bytes) = input {
             request = request
                 .header(reqwest::header::CONTENT_LENGTH, bytes.len())
                 .body(upload_body(
                     std::io::Cursor::new(Arc::clone(bytes)),
-                    bytes.len() as u64,
                     instruction.local_file.clone(),
-                    uploaded.take().unwrap(),
                     Arc::clone(&upload_error),
                 ));
         }
@@ -275,9 +271,7 @@ impl VolumeState {
                     .header(reqwest::header::CONTENT_LENGTH, metadata.len())
                     .body(upload_body(
                         tokio::fs::File::from_std(file),
-                        metadata.len(),
                         instruction.local_file.clone(),
-                        uploaded.take().unwrap(),
                         Arc::clone(&upload_error),
                     ));
             }
@@ -324,15 +318,11 @@ impl VolumeState {
             None
         };
 
-        if let Some(uploaded) = uploaded {
-            let _ = uploaded.send(());
-        }
         let retry_timeout = instruction.operation != "PUT";
         let mut response = storage_send(
             request,
             self.read_timeout,
-            retry_timeout,
-            upload_complete,
+            instruction.operation == "PUT",
             upload_error,
         )
         .await?;
@@ -387,30 +377,13 @@ impl VolumeState {
 
 fn upload_body(
     reader: impl tokio::io::AsyncRead + Unpin + Send + 'static,
-    mut remaining: u64,
     path: String,
-    uploaded: oneshot::Sender<()>,
     error: Arc<Mutex<Option<Error>>>,
 ) -> reqwest::Body {
-    let mut uploaded = Some(uploaded);
-    if remaining == 0 {
-        let _ = uploaded.take().unwrap().send(());
-    }
-    reqwest::Body::wrap_stream(
-        ReaderStream::new(reader)
-            .inspect_ok(move |bytes| {
-                remaining = remaining.saturating_sub(bytes.len() as u64);
-                if remaining == 0 {
-                    if let Some(uploaded) = uploaded.take() {
-                        let _ = uploaded.send(());
-                    }
-                }
-            })
-            .map_err(move |cause| {
-                *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
-                std::io::Error::other("Volume upload source could not be read")
-            }),
-    )
+    reqwest::Body::wrap_stream(ReaderStream::new(reader).map_err(move |cause| {
+        *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
+        std::io::Error::other("Volume upload source could not be read")
+    }))
 }
 
 fn invalid(message: &str) -> Error {
@@ -420,18 +393,15 @@ fn invalid(message: &str) -> Error {
 async fn storage_send(
     request: reqwest::RequestBuilder,
     timeout: Option<std::time::Duration>,
-    retry_timeout: bool,
-    upload_complete: oneshot::Receiver<()>,
+    upload: bool,
     upload_error: Arc<Mutex<Option<Error>>>,
 ) -> Result<reqwest::Response> {
-    let send = request.send();
-    tokio::pin!(send);
-    // Response inactivity starts after the upload, without a total transfer deadline.
-    let response = tokio::select! {
-        result = &mut send => result.map_err(storage_error),
-        _ = upload_complete => storage_read(timeout, retry_timeout, async {
-            send.await.map_err(storage_error)
-        }).await,
+    let send = async { request.send().await.map_err(storage_error) };
+    let response = if upload {
+        // Request-body production does not establish that transport buffers have flushed.
+        send.await
+    } else {
+        storage_read(timeout, true, send).await
     };
     if let Some(error) = upload_error
         .lock()
@@ -737,12 +707,9 @@ mod tests {
         let cause = std::fs::File::open(&source).unwrap_err();
         let os_code = cause.raw_os_error();
         let captured = Arc::new(Mutex::new(None));
-        let (uploaded, complete) = oneshot::channel();
         let body = upload_body(
             FailedRead(Some(cause)),
-            1,
             source.to_str().unwrap().into(),
-            uploaded,
             Arc::clone(&captured),
         );
         let error = storage_send(
@@ -750,8 +717,7 @@ mod tests {
                 .put(format!("{}/object?secret=hidden", server.uri()))
                 .body(body),
             None,
-            false,
-            complete,
+            true,
             captured,
         )
         .await
@@ -1141,7 +1107,6 @@ mod tests {
         for (operation, headers_sent) in [
             ("GET", false),
             ("GET", true),
-            ("PUT", false),
             ("PUT", true),
             ("REMOVE", false),
         ] {
@@ -1216,7 +1181,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn response_inactivity_resets_on_progress_and_allows_progressing_uploads() {
+    async fn get_inactivity_resets_on_progress_and_put_has_no_header_deadline() {
         use tokio::io::AsyncReadExt;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
@@ -1254,7 +1219,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PUT"))
             .and(body_bytes(b"xxxxx"))
-            .respond_with(ResponseTemplate::new(200))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_millis(300)))
             .expect(1)
             .mount(&server)
             .await;
@@ -1265,17 +1230,15 @@ mod tests {
                 writer.write_all(b"x").await.unwrap();
             }
         });
-        let (uploaded, complete) = oneshot::channel();
         let error = Arc::new(Mutex::new(None));
-        let body = upload_body(reader, 5, "input".into(), uploaded, Arc::clone(&error));
+        let body = upload_body(reader, "input".into(), Arc::clone(&error));
         storage_send(
             Client::new()
                 .put(server.uri())
                 .header(reqwest::header::CONTENT_LENGTH, 5)
                 .body(body),
             Some(Duration::from_millis(150)),
-            false,
-            complete,
+            true,
             error,
         )
         .await

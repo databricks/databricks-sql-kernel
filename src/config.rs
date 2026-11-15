@@ -757,9 +757,9 @@ pub struct HttpConfig {
     /// applies, so connection establishment is bounded by the shorter limit.
     pub request_timeout: Duration,
 
-    /// Inactivity limit for Volume response headers after upload and each body read.
+    /// Inactivity limit for Volume GET/REMOVE response headers and each response-body read.
     /// Separate from the SQL request deadline so progressing transfers can finish.
-    /// Also caps connection establishment.
+    /// Also caps connection establishment; PUT response headers have no deadline.
     pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.
