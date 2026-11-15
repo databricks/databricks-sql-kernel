@@ -56,12 +56,16 @@ pub(crate) fn shared() -> std::io::Result<Arc<KernelRuntime>> {
     if let Some(runtime) = installed(&lock_slot(), pid) {
         return Ok(runtime);
     }
-    let built = Arc::new(KernelRuntime::new(
-        Builder::new_multi_thread()
-            .enable_all()
-            .thread_name("dbx-sql-kernel")
-            .build()?,
-    ));
+    let mut builder = Builder::new_multi_thread();
+    builder.enable_all().thread_name("dbx-sql-kernel");
+    if let Some(workers) = worker_threads(
+        std::env::var(WORKER_THREADS_ENV).ok().as_deref(),
+        std::env::var_os("TOKIO_WORKER_THREADS").is_some(),
+        std::thread::available_parallelism().map_or(1, usize::from),
+    ) {
+        builder.worker_threads(workers);
+    }
+    let built = Arc::new(KernelRuntime::new(builder.build()?));
     let mut slot = lock_slot();
     // Another thread may have installed one meanwhile; ours, still idle,
     // is dropped after the lock is released.
@@ -72,6 +76,32 @@ pub(crate) fn shared() -> std::io::Result<Arc<KernelRuntime>> {
         std::mem::forget(inherited);
     }
     Ok(built)
+}
+
+/// Overrides the shared runtime's worker thread count (a positive integer).
+const WORKER_THREADS_ENV: &str = "DATABRICKS_SQL_KERNEL_WORKER_THREADS";
+
+/// Default worker threads for the shared runtime. The workers drive HTTP I/O
+/// for every session in the process; large result chunks are decoded on the
+/// blocking pool. With one worker per CPU, a worker woke and slept again for
+/// nearly every request (futex, epoll and work stealing), and with hundreds
+/// of sessions sending small queries that cost more CPU than the I/O itself.
+const DEFAULT_WORKER_THREADS: usize = 2;
+
+/// Worker count to set on the runtime builder: `override_value` if it is a
+/// positive integer; none (tokio's own default) when `TOKIO_WORKER_THREADS`
+/// is set; otherwise [`DEFAULT_WORKER_THREADS`], at most one per CPU.
+fn worker_threads(override_value: Option<&str>, tokio_env_set: bool, cpus: usize) -> Option<usize> {
+    if let Some(n) = override_value
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        return Some(n);
+    }
+    if tokio_env_set {
+        return None;
+    }
+    Some(DEFAULT_WORKER_THREADS.min(cpus.max(1)))
 }
 
 /// Upper bound on how long an explicit `close()` waits for the runtime to
@@ -212,5 +242,24 @@ mod tests {
             "release() of the shared runtime",
         );
         assert!(still_running, "shared runtime stopped after release()");
+    }
+
+    #[test]
+    fn worker_threads_default_override_and_tokio_env() {
+        use super::{worker_threads, DEFAULT_WORKER_THREADS};
+        assert_eq!(
+            worker_threads(None, false, 16),
+            Some(DEFAULT_WORKER_THREADS)
+        );
+        assert_eq!(worker_threads(None, false, 1), Some(1));
+        assert_eq!(worker_threads(Some("8"), false, 16), Some(8));
+        assert_eq!(worker_threads(Some(" 3 "), true, 16), Some(3));
+        // Unset or invalid override: tokio's own env var wins, else the default.
+        assert_eq!(worker_threads(None, true, 16), None);
+        assert_eq!(
+            worker_threads(Some("0"), false, 16),
+            Some(DEFAULT_WORKER_THREADS)
+        );
+        assert_eq!(worker_threads(Some("many"), true, 16), None);
     }
 }
