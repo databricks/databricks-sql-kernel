@@ -835,6 +835,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fetch_after_close_fails_before_the_release_task_runs() {
+        let server = lease_server().await;
+        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let statement = connection
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = statement.await_result().await.expect("await result");
+        let in_flight = result.inner.stream.lock().await;
+        statement.close().await.expect("close statement");
+        drop(in_flight);
+        // The current-thread runtime hasn't polled the spawned release yet,
+        // so only the closed flag makes this fetch fail.
+        let err = result
+            .fetch_next_batch()
+            .await
+            .err()
+            .expect("fetching after the parent closed must fail");
+        assert!(err.reason.contains("AsyncResultHandle already closed"));
+        assert!(result.inner.stream.lock().await.is_none());
+        connection.close().await.expect("close session");
+    }
+
+    #[tokio::test]
     async fn close_releases_session_when_the_close_rpc_fails() {
         let server = lease_server().await;
         Mock::given(method("DELETE"))
