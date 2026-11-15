@@ -242,11 +242,7 @@ impl VolumeState {
         if let Some(bytes) = input {
             request = request
                 .header(reqwest::header::CONTENT_LENGTH, bytes.len())
-                .body(upload_body(
-                    std::io::Cursor::new(Arc::clone(bytes)),
-                    instruction.local_file.clone(),
-                    Arc::clone(&upload_error),
-                ));
+                .body(bytes.to_vec());
         }
         let local_path = if instruction.operation == "REMOVE"
             || (instruction.operation == "PUT" && instruction.local_file == "__input_stream__")
@@ -738,6 +734,51 @@ mod tests {
         assert_eq!(local.raw_os_error, os_code);
         assert_eq!(local.path, source.to_str().unwrap());
         assert!(!error.message.contains("hidden"));
+    }
+
+    #[tokio::test]
+    async fn stream_put_replays_owned_bytes_on_redirect() {
+        for status in [307, 308] {
+            for payload in [b"".as_slice(), b"payload"] {
+                let server = MockServer::start().await;
+                Mock::given(method("PUT"))
+                    .and(path("/object"))
+                    .and(header("x-storage-token", "server-token"))
+                    .and(body_bytes(payload))
+                    .respond_with(
+                        ResponseTemplate::new(status)
+                            .insert_header("location", format!("{}/redirected", server.uri())),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                Mock::given(method("PUT"))
+                    .and(path("/redirected"))
+                    .and(header("x-storage-token", "server-token"))
+                    .and(body_bytes(payload))
+                    .respond_with(ResponseTemplate::new(200))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let batch = instruction(
+                    "PUT",
+                    &format!("{}/object", server.uri()),
+                    Path::new("__input_stream__"),
+                );
+                assert_eq!(
+                    transfer_state(0)
+                        .complete(
+                            &batch,
+                            &Client::new(),
+                            &VolumeOptions::default(),
+                            Some(payload.to_vec()),
+                        )
+                        .await
+                        .unwrap(),
+                    VolumeCompletion::Completed
+                );
+            }
+        }
     }
 
     #[tokio::test]
