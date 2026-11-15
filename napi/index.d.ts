@@ -853,6 +853,10 @@ export declare class AsyncStatement {
    * closed-handle short-circuit and returns `Ok(())` without
    * re-attempting the wire call. The kernel's own `Drop`
    * fire-and-forget retry runs once in the background.
+   *
+   * Closing also invalidates the `AsyncResultHandle`s returned by
+   * `awaitResult()`: their `fetchNextBatch()` then rejects with
+   * `InvalidStatementHandle`, so finish fetching first.
    */
   close(): Promise<void>
 }
@@ -887,6 +891,8 @@ export declare class AsyncResultHandle {
    * message), suitable for handing to `apache-arrow`'s
    * `RecordBatchReader`. Byte-identical to the sync
    * `Statement.fetchNextBatch()` payload for the same query.
+   * Rejects with `KernelError(InvalidStatementHandle)` once the
+   * parent `AsyncStatement` has been closed.
    */
   fetchNextBatch(): Promise<ArrowBatch | null>
   /**

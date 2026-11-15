@@ -124,6 +124,30 @@ impl ResultSlot {
     }
 }
 
+/// Drops `AsyncStatement::close()`'s canceller and result streams on scope
+/// exit, including unwind.
+struct CloseRelease {
+    canceller: Arc<std::sync::Mutex<Option<AsyncStatementCanceller>>>,
+    results: Arc<std::sync::Mutex<Vec<Weak<ResultSlot>>>>,
+}
+
+impl Drop for CloseRelease {
+    fn drop(&mut self) {
+        let canceller = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        drop(canceller);
+        let slots =
+            std::mem::take(&mut *self.results.lock().unwrap_or_else(PoisonError::into_inner));
+        slots
+            .iter()
+            .filter_map(Weak::upgrade)
+            .for_each(ResultSlot::release);
+    }
+}
+
 /// Inner state for the JS-visible `AsyncStatement` wrapper. Same
 /// shape rationale as `StatementInner` in `statement.rs`: we hold
 /// the parent kernel `Statement` alive so its `Drop` (which
@@ -410,6 +434,10 @@ impl AsyncStatement {
     /// closed-handle short-circuit and returns `Ok(())` without
     /// re-attempting the wire call. The kernel's own `Drop`
     /// fire-and-forget retry runs once in the background.
+    ///
+    /// Closing also invalidates the `AsyncResultHandle`s returned by
+    /// `awaitResult()`: their `fetchNextBatch()` then rejects with
+    /// `InvalidStatementHandle`, so finish fetching first.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -428,23 +456,14 @@ impl AsyncStatement {
             // lock-free `cancel()` short-circuits to InvalidStatementHandle
             // rather than firing a wire cancel on a closing statement.
             closed.store(true, Ordering::Release);
+            // Release everything that holds the session when this scope
+            // ends, even if the close RPC fails or panics: JS may keep this
+            // object (and its result handles) reachable long after close.
+            let _release = CloseRelease { canceller, results };
             let outcome = ExecutedAsyncStatement::close(&mut inner_state.executed_async)
                 .await
                 .map_err(napi_err_from_kernel);
-            // Release everything that holds the session, even if the
-            // close RPC failed: JS may keep this object (and its result
-            // handles) reachable long after close.
             drop(inner_state);
-            canceller
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .take();
-            let slots =
-                std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
-            slots
-                .iter()
-                .filter_map(Weak::upgrade)
-                .for_each(ResultSlot::release);
             outcome
         })
         .await
@@ -539,6 +558,8 @@ impl AsyncResultHandle {
     /// message), suitable for handing to `apache-arrow`'s
     /// `RecordBatchReader`. Byte-identical to the sync
     /// `Statement.fetchNextBatch()` payload for the same query.
+    /// Rejects with `KernelError(InvalidStatementHandle)` once the
+    /// parent `AsyncStatement` has been closed.
     #[napi]
     pub async fn fetch_next_batch(&self) -> napi::Result<Option<ArrowBatch>> {
         let inner = Arc::clone(&self.inner);
@@ -827,6 +848,45 @@ mod tests {
             .expect_err("the close RPC must fail");
         assert!(statement.canceller.lock().unwrap().is_none());
         assert!(result.inner.stream.lock().await.is_none());
+        connection.close().await.expect("close session");
+    }
+
+    fn panicking_close_rpc() -> napi::Result<()> {
+        panic!("close RPC panicked")
+    }
+
+    #[tokio::test]
+    async fn close_release_runs_when_the_close_rpc_panics() {
+        let server = lease_server().await;
+        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let statement = connection
+            .submit_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("submit");
+        let result = statement.await_result().await.expect("await result");
+        // A busy slot makes the release spawn its task during the unwind.
+        let in_flight = result.inner.stream.lock().await;
+        let release = CloseRelease {
+            canceller: Arc::clone(&statement.canceller),
+            results: Arc::clone(&statement.results),
+        };
+        let err = guarded(async move {
+            let _release = release;
+            panicking_close_rpc()
+        })
+        .await
+        .expect_err("the panic must surface as an error");
+        assert!(err.reason.contains("close RPC panicked"));
+        assert!(statement.canceller.lock().unwrap().is_none());
+        drop(in_flight);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while result.inner.stream.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the stream must be dropped after a panicking close");
+        statement.close().await.expect("close statement");
         connection.close().await.expect("close session");
     }
 }
