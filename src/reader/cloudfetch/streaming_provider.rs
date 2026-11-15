@@ -1149,13 +1149,15 @@ impl StreamingCloudFetchProvider {
                     // first refusal refreshes at once; if a refreshed URL is refused
                     // too, fall through to the backoff below before refreshing again.
                     if let Some(status @ (401 | 403 | 404)) = e.http_status {
-                        debug!(
-                            "Chunk {} download got HTTP {}; refreshing the link before retry",
-                            chunk_index, status,
-                        );
                         rejected_url = Some(link.url.clone());
                         if !refused_before {
                             refused_before = true;
+                            // Later refusals are logged by the retry warning below.
+                            warn!(
+                                "Chunk {} download refused with HTTP {} (attempt {}/{}): {}, \
+                                 refreshing the link",
+                                chunk_index, status, attempts, ctx.max_retries, e
+                            );
                             continue;
                         }
                     }
