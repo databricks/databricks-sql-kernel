@@ -369,7 +369,9 @@ impl VolumeState {
                     request.headers_mut().remove(name);
                 }
             }
-            if !(previous.scheme() == "https" && url.scheme() == "http") {
+            if previous.scheme() == "https" && url.scheme() == "http" {
+                request.headers_mut().remove(reqwest::header::REFERER);
+            } else {
                 let mut referer = previous.clone();
                 let _ = referer.set_username("");
                 let _ = referer.set_password(None);
@@ -809,23 +811,34 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn put_replays_file_and_owned_bytes_on_redirect() {
+    async fn transfers_follow_redirects_and_replay_file_and_owned_inputs() {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
-        for (status, stream, payload) in [
-            (200, false, vec![42; 128 * 1024]),
-            (307, false, vec![42; 128 * 1024]),
-            (308, false, vec![42; 128 * 1024]),
-            (307, true, vec![]),
-            (308, true, vec![]),
-            (307, true, b"payload".to_vec()),
-            (308, true, b"payload".to_vec()),
+        for (operation, status, stream, payload) in [
+            ("PUT", 200, false, vec![42; 128 * 1024]),
+            ("PUT", 307, false, vec![42; 128 * 1024]),
+            ("PUT", 308, false, vec![42; 128 * 1024]),
+            ("PUT", 307, true, vec![]),
+            ("PUT", 308, true, vec![]),
+            ("PUT", 307, true, b"payload".to_vec()),
+            ("PUT", 308, true, b"payload".to_vec()),
+            ("GET", 307, false, b"downloaded".to_vec()),
+            ("REMOVE", 302, false, vec![]),
         ] {
             let server = MockServer::start().await;
-            Mock::given(method("PUT"))
+            let verb = if operation == "REMOVE" {
+                "DELETE"
+            } else {
+                operation
+            };
+            Mock::given(method(verb))
                 .and(path("/object"))
                 .and(header("x-storage-token", "server-token"))
-                .and(body_bytes(payload.clone()))
+                .and(body_bytes(if operation == "PUT" {
+                    payload.clone()
+                } else {
+                    vec![]
+                }))
                 .respond_with(
                     ResponseTemplate::new(status).insert_header("location", "/redirected"),
                 )
@@ -833,18 +846,30 @@ mod tests {
                 .mount(&server)
                 .await;
             if status != 200 {
-                Mock::given(method("PUT"))
+                Mock::given(method(verb))
                     .and(path("/redirected"))
                     .and(header("x-storage-token", "server-token"))
-                    .and(body_bytes(payload.clone()))
-                    .respond_with(ResponseTemplate::new(200))
+                    .and(body_bytes(if operation == "PUT" {
+                        payload.clone()
+                    } else {
+                        vec![]
+                    }))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
                     .expect(1)
                     .mount(&server)
                     .await;
             }
-            std::fs::write(&source, &payload).unwrap();
+            std::fs::write(
+                &source,
+                if operation == "GET" {
+                    b"old".as_slice()
+                } else {
+                    &payload
+                },
+            )
+            .unwrap();
             let batch = instruction(
-                "PUT",
+                operation,
                 &format!("{}/object", server.uri()),
                 if stream {
                     Path::new("__input_stream__")
@@ -861,12 +886,15 @@ mod tests {
                             .build()
                             .unwrap(),
                         &options(dir.path()),
-                        stream.then_some(payload),
+                        stream.then(|| payload.clone()),
                     )
                     .await
                     .unwrap(),
                 VolumeCompletion::Completed
             );
+            if operation == "GET" {
+                assert_eq!(std::fs::read(&source).unwrap(), payload);
+            }
             assert!(server
                 .received_requests()
                 .await
