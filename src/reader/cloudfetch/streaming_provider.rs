@@ -2253,6 +2253,91 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refused_url_with_failing_refresh_surfaces_the_refresh_error() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        // The refresh RPC retries transient errors itself, so an error it
+        // returns is final for this chunk: no further download of the refused URL.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(403))
+            .mount(&server)
+            .await;
+
+        #[derive(Debug)]
+        struct FailingFetcher {
+            refresh_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for FailingFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!()
+            }
+
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!()
+            }
+
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Err(Error::unavailable().message("refresh RPC down"))
+            }
+        }
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let fetcher = Arc::new(FailingFetcher {
+            refresh_calls: AtomicUsize::new(0),
+        });
+        let chunks = Arc::new(DashMap::new());
+        let original = CloudFetchLink {
+            url: format!("{}/chunk-0.arrow", server.uri()),
+            ..create_test_link(0)
+        };
+        chunks.insert(0, entry_with_state(original, ChunkState::Downloading));
+        let ctx = DownloadCtx {
+            downloader: Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            )),
+            link_fetcher: fetcher.clone(),
+            chunks,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            cancel_token: CancellationToken::new(),
+            statement_id: None,
+            metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+            max_retries: 3,
+            retry_delay: std::time::Duration::ZERO,
+            download_timeout: std::time::Duration::ZERO,
+        };
+
+        let error = StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx)
+            .await
+            .expect_err("a refused URL whose refresh fails must fail");
+        assert_eq!(error.message, "Link refresh RPC failed for chunk 0");
+        let cause = error.cause.expect("the refresh error is the cause");
+        assert_eq!(cause.message, "refresh RPC down");
+        assert_eq!(fetcher.refresh_calls.load(AtomicOrdering::SeqCst), 1);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
+
     // ─── End-to-end download deadline (issue #321 / audit H05) ───────────
     //
     // These tests exercise `download_chunk_with_retry`'s absolute
