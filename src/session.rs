@@ -408,7 +408,7 @@ impl Session {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?,
         );
-        let storage_client = http_client.storage_client()?;
+        let storage_client = http_client.storage_client(config.http.storage_read_timeout)?;
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.

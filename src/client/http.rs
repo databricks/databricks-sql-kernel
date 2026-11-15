@@ -742,8 +742,12 @@ impl DatabricksHttpClient {
     }
 
     /// Storage transfers can outlive SQL RPCs, so retain connection settings without their deadline.
-    pub(crate) fn storage_client(&self) -> Result<Client> {
-        Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::default(), None)
+    pub(crate) fn storage_client(&self, connect_timeout: Option<Duration>) -> Result<Client> {
+        let mut config = self.config.clone();
+        if let Some(timeout) = connect_timeout {
+            config.connect_timeout = config.connect_timeout.min(timeout);
+        }
+        Self::build_reqwest_client(&config, reqwest::redirect::Policy::default(), None)
     }
 
     /// Get the authorization header value.

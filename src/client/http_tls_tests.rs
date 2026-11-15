@@ -289,6 +289,54 @@ async fn expired_certificate_fails_once_with_certificate_cause() {
 }
 
 #[tokio::test]
+async fn storage_connection_timeout_preserves_unconfigured_limits() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let (shutdown, mut stopped) = oneshot::channel();
+    let server = tokio::spawn(async move {
+        let mut sockets = Vec::new();
+        loop {
+            tokio::select! {
+                _ = &mut stopped => return sockets.len(),
+                accepted = listener.accept() => sockets.push(accepted.unwrap().0),
+            }
+        }
+    });
+    let client = test_client(
+        HttpClientConfig {
+            connect_timeout: Duration::from_secs(2),
+            read_timeout: Duration::from_millis(10),
+            ..Default::default()
+        },
+        Duration::from_secs(10),
+    );
+    for timeout in [None, Some(Duration::from_millis(100))] {
+        let storage = client.storage_client(timeout).unwrap();
+        let result = tokio::time::timeout(
+            Duration::from_millis(500),
+            storage
+                .put(format!("https://{address}/object"))
+                .body("bytes")
+                .send(),
+        )
+        .await;
+        if timeout.is_some() {
+            let error = result
+                .expect("configured connection timeout must finish")
+                .unwrap_err();
+            assert!(error.is_connect() && error.is_timeout(), "{error}");
+        } else {
+            assert!(
+                result.is_err(),
+                "unconfigured storage must retain its limits"
+            );
+        }
+    }
+    shutdown.send(()).unwrap();
+    assert_eq!(server.await.unwrap(), 2);
+}
+
+#[tokio::test]
 async fn tls_handshake_timeout_still_retries() {
     for request_type in [RequestType::CreateSession, RequestType::ExecuteStatement] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

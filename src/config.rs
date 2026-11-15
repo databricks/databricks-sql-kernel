@@ -759,6 +759,7 @@ pub struct HttpConfig {
 
     /// Inactivity limit for Volume response headers after upload and each body read.
     /// Separate from the SQL request deadline so progressing transfers can finish.
+    /// Also caps connection establishment.
     pub storage_read_timeout: Option<Duration>,
 
     /// Maximum total time across retries for a single logical RPC.
