@@ -32,6 +32,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+const TELEMETRY_USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
+
 pub(crate) struct TelemetryRuntime {
     connection: Arc<dyn ConnectionTelemetry>,
 }
@@ -62,8 +64,8 @@ impl TelemetryRuntime {
                 .as_deref()
                 .and_then(|org_id| org_id.parse::<i64>().ok())
                 .unwrap_or_default(),
-            system_configuration: build_system_configuration(system_configuration),
-            connection_params: build_connection_params(connection, auth),
+            system_configuration: Arc::new(build_system_configuration(system_configuration)),
+            connection_params: Arc::new(build_connection_params(connection, auth)),
             auth_type: auth_type(auth),
         });
         let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
@@ -126,8 +128,8 @@ pub(crate) trait ConnectionTelemetry: Send + Sync {
 pub(crate) struct TelemetrySessionContext {
     pub session_id: String,
     pub workspace_id: i64,
-    pub system_configuration: DriverSystemConfiguration,
-    pub connection_params: DriverConnectionParameters,
+    pub system_configuration: Arc<DriverSystemConfiguration>,
+    pub connection_params: Arc<DriverConnectionParameters>,
     pub auth_type: String,
 }
 
@@ -179,19 +181,15 @@ impl RealConnectionTelemetry {
             frontend_log_event_id: format!("{}-{event_id}", self.session.session_id),
             context: Some(FrontendLogContext {
                 client_context: Some(TelemetryClientContext {
-                    user_agent: Some(format!(
-                        "{}/{}",
-                        env!("CARGO_PKG_NAME"),
-                        env!("CARGO_PKG_VERSION")
-                    )),
+                    user_agent: Some(TELEMETRY_USER_AGENT.to_string()),
                 }),
                 timestamp_millis: unix_time_millis(),
             }),
             entry: Some(FrontendLogEntry {
                 sql_driver_log: Some(OssSqlDriverTelemetryLog {
                     session_id: Some(self.session.session_id.clone()),
-                    system_configuration: Some(self.session.system_configuration.clone()),
-                    driver_connection_params: Some(self.session.connection_params.clone()),
+                    system_configuration: Some(Arc::clone(&self.session.system_configuration)),
+                    driver_connection_params: Some(Arc::clone(&self.session.connection_params)),
                     auth_type: Some(self.session.auth_type.clone()),
                     sql_operation: Some(SqlExecutionEvent {
                         operation_detail: Some(OperationDetail {
@@ -233,11 +231,7 @@ impl RealConnectionTelemetry {
             frontend_log_event_id: format!("{}-{event_id}", self.session.session_id),
             context: Some(FrontendLogContext {
                 client_context: Some(TelemetryClientContext {
-                    user_agent: Some(format!(
-                        "{}/{}",
-                        env!("CARGO_PKG_NAME"),
-                        env!("CARGO_PKG_VERSION")
-                    )),
+                    user_agent: Some(TELEMETRY_USER_AGENT.to_string()),
                 }),
                 timestamp_millis: unix_time_millis(),
             }),
@@ -245,8 +239,8 @@ impl RealConnectionTelemetry {
                 sql_driver_log: Some(OssSqlDriverTelemetryLog {
                     session_id: Some(self.session.session_id.clone()),
                     sql_statement_id: context.statement_id,
-                    system_configuration: Some(self.session.system_configuration.clone()),
-                    driver_connection_params: Some(self.session.connection_params.clone()),
+                    system_configuration: Some(Arc::clone(&self.session.system_configuration)),
+                    driver_connection_params: Some(Arc::clone(&self.session.connection_params)),
                     auth_type: Some(self.session.auth_type.clone()),
                     sql_operation: Some(SqlExecutionEvent {
                         statement_type: Some(context.statement_type),

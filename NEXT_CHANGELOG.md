@@ -20,6 +20,8 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- Telemetry events share their session's system configuration and connection
+  parameters instead of copying them into every statement event.
 
 ### Updated
 
