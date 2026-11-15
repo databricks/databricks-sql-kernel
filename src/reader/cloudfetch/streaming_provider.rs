@@ -2256,6 +2256,115 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_that_returns_the_same_url_clears_the_refusal() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_array::Int32Array;
+        use arrow_ipc::writer::StreamWriter;
+        use arrow_schema::{DataType, Field, Schema};
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(Int32Array::from(vec![1]))])
+            .unwrap();
+        let mut ipc_bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut ipc_bytes, &schema).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+
+        // 403, then a 500 (not a refusal), then success, all on the same URL.
+        let server = MockServer::start().await;
+        for status in [403, 500] {
+            Mock::given(method("GET"))
+                .respond_with(ResponseTemplate::new(status))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+        }
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(ipc_bytes))
+            .mount(&server)
+            .await;
+
+        #[derive(Debug)]
+        struct SameUrlFetcher {
+            url: String,
+            refresh_calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl ChunkLinkFetcher for SameUrlFetcher {
+            async fn fetch_links(&self, _: i64, _: i64) -> Result<ChunkLinkFetchResult> {
+                unreachable!()
+            }
+
+            async fn refetch_link(&self, _: i64, _: i64) -> Result<CloudFetchLink> {
+                unreachable!()
+            }
+
+            async fn refetch_links_from(&self, _: i64, _: i64) -> Result<Vec<CloudFetchLink>> {
+                self.refresh_calls.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(vec![CloudFetchLink {
+                    url: self.url.clone(),
+                    ..create_test_link(0)
+                }])
+            }
+        }
+
+        let retry = RetryConfig {
+            max_retries: 0,
+            ..RetryConfig::default()
+        };
+        let http_client = Arc::new(
+            DatabricksHttpClient::new(
+                HttpClientConfig::default(),
+                build_retry_configs(&retry, &HashMap::new()),
+            )
+            .unwrap(),
+        );
+        let url = format!("{}/chunk-0.arrow", server.uri());
+        let fetcher = Arc::new(SameUrlFetcher {
+            url: url.clone(),
+            refresh_calls: AtomicUsize::new(0),
+        });
+        let chunks = Arc::new(DashMap::new());
+        let original = CloudFetchLink {
+            url,
+            ..create_test_link(0)
+        };
+        chunks.insert(0, entry_with_state(original, ChunkState::Downloading));
+        let ctx = DownloadCtx {
+            downloader: Arc::new(ChunkDownloader::new(
+                http_client,
+                CompressionCodec::None,
+                0.1,
+            )),
+            link_fetcher: fetcher.clone(),
+            chunks,
+            refresh_coordinator: Arc::new(RefreshCoordinator::default()),
+            cancel_token: CancellationToken::new(),
+            statement_id: None,
+            metrics: Arc::new(CloudFetchMetrics::new(Some(1))),
+            max_retries: 5,
+            retry_delay: std::time::Duration::ZERO,
+            download_timeout: std::time::Duration::ZERO,
+        };
+
+        StreamingCloudFetchProvider::download_chunk_with_retry(0, &ctx)
+            .await
+            .expect("the third download succeeds");
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
+        // The refreshed URL is no longer treated as refused, so the 500 retry
+        // reuses it without a second refresh.
+        assert_eq!(fetcher.refresh_calls.load(AtomicOrdering::SeqCst), 1);
+    }
+
+    #[tokio::test]
     async fn refused_url_with_failing_refresh_surfaces_the_refresh_error() {
         use crate::client::retry::{build_retry_configs, RetryConfig};
         use crate::client::{DatabricksHttpClient, HttpClientConfig};
