@@ -38,8 +38,8 @@
 //! highest chunk index seen and check whether to start non-blocking background
 //! prefetch, which fetches links and caches them ahead of downloads.
 //!
-//! Link requests return cached links immediately; on a miss they wait for any
-//! page already being prefetched before requesting it.
+//! Link requests return cached links immediately. Cache misses join any in-flight
+//! page request and share its result, including errors.
 
 use crate::client::{ChunkLinkFetchResult, SessionAttribution, Transport};
 use crate::kernel_error::{Error, Result};
