@@ -933,7 +933,11 @@ impl DatabricksHttpClient {
 
             debug!(
                 "{:?}: {} {} (attempt {}/{})",
-                request_type, method, url, attempts, max_attempts
+                request_type,
+                method,
+                url.as_str().split('?').next().unwrap_or_default(),
+                attempts,
+                max_attempts
             );
 
             match self.client.execute(request).await {
@@ -1015,7 +1019,11 @@ impl DatabricksHttpClient {
                         format_args!("HTTP {}", status.as_u16()),
                     ));
                 }
-                Err(e) => {
+                Err(mut e) => {
+                    // reqwest's Display prints the request URL; a presigned URL's query is its credential.
+                    if let Some(url) = e.url_mut() {
+                        url.set_query(None);
+                    }
                     let mut causes = super::error_chain(&e)
                         .map(ToString::to_string)
                         .collect::<Vec<_>>();
