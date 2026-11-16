@@ -26,6 +26,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
+- Telemetry batches rejected with HTTP 429/503 are kept and sent again after a backoff instead of being dropped, at most 1,000 events per request (or one batch, if larger), and telemetry retries log at debug instead of warn. Flushes on session close never wait out the backoff.
 
 ---
 *Note: When making changes, please add your change under the appropriate

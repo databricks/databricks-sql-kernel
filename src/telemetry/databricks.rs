@@ -16,6 +16,7 @@ use super::exporter::{TelemetryExportError, TelemetryExportResult, TelemetryExpo
 use super::models::TelemetryRequest;
 use crate::client::retry::RequestType;
 use crate::client::DatabricksHttpClient;
+use crate::kernel_error::Error as KernelError;
 use reqwest::header::{HeaderValue, CONTENT_TYPE};
 use reqwest::{Body, Method, Request, Url};
 use std::future::Future;
@@ -70,8 +71,15 @@ impl TelemetryExporter for DatabricksTelemetryExporter {
                 .execute(request, RequestType::TelemetryExport)
                 .await
                 .map(|_| ())
-                .map_err(|e| TelemetryExportError::Export(e.to_string()))
+                .map_err(export_error)
         })
+    }
+}
+
+fn export_error(error: KernelError) -> TelemetryExportError {
+    match error.http_status {
+        Some(429 | 503) => TelemetryExportError::Throttled(error.to_string()),
+        _ => TelemetryExportError::Export(error.to_string()),
     }
 }
 
@@ -102,6 +110,7 @@ fn endpoint_url(host: &str, endpoint: TelemetryEndpoint) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     #[test]
     fn endpoint_url_normalizes_host_and_endpoint() {
@@ -115,6 +124,91 @@ mod tests {
         assert_eq!(
             endpoint_url("http://localhost:8080", TelemetryEndpoint::Unauthenticated),
             "http://localhost:8080/telemetry-unauth"
+        );
+    }
+
+    #[test]
+    fn rate_limit_statuses_classify_as_throttled() {
+        for status in [429, 503] {
+            assert!(matches!(
+                export_error(KernelError::from_http_status(status)),
+                TelemetryExportError::Throttled(_)
+            ));
+        }
+        for status in [400, 500] {
+            assert!(matches!(
+                export_error(KernelError::from_http_status(status)),
+                TelemetryExportError::Export(_)
+            ));
+        }
+        assert!(matches!(
+            export_error(KernelError::network_error()),
+            TelemetryExportError::Export(_)
+        ));
+    }
+
+    /// Export through a real `DatabricksHttpClient` (with its retry loop)
+    /// against a mock `/telemetry-ext` that always answers `status`.
+    async fn export_against(status: u16, overall_timeout: Duration) -> TelemetryExportResult {
+        use crate::auth::PersonalAccessToken;
+        use crate::client::retry::RetryConfigOverrides;
+        use crate::client::retry::{build_retry_configs, RequestCategory, RetryConfig};
+        use crate::client::HttpClientConfig;
+        use std::collections::HashMap;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/telemetry-ext"))
+            .respond_with(ResponseTemplate::new(status).insert_header("Retry-After", "1"))
+            .mount(&server)
+            .await;
+        let overrides = HashMap::from([(
+            RequestCategory::Telemetry,
+            RetryConfigOverrides {
+                min_wait: Some(Duration::from_millis(10)),
+                max_wait: Some(Duration::from_millis(10)),
+                overall_timeout: Some(overall_timeout),
+                max_retries: Some(2),
+                ..Default::default()
+            },
+        )]);
+        let client = DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            build_retry_configs(&RetryConfig::default(), &overrides),
+        )
+        .unwrap();
+        client.set_auth_provider(Arc::new(PersonalAccessToken::new("token".to_string())));
+        let exporter = DatabricksTelemetryExporter::new(
+            &server.uri(),
+            Arc::new(client),
+            TelemetryEndpoint::Authenticated,
+        );
+        exporter
+            .export(TelemetryRequest {
+                upload_time: 1,
+                proto_logs: vec!["{}".to_string()],
+            })
+            .await
+    }
+
+    #[tokio::test]
+    async fn rate_limited_export_through_retry_loop_is_throttled() {
+        for status in [429, 503] {
+            // Retries exhausted, and retry budget exceeded before a retry.
+            for budget in [Duration::from_secs(10), Duration::from_millis(1)] {
+                let result = export_against(status, budget).await;
+                assert!(
+                    matches!(result, Err(TelemetryExportError::Throttled(_))),
+                    "HTTP {status}, budget {budget:?}: {result:?}"
+                );
+            }
+        }
+        let result = export_against(500, Duration::from_secs(10)).await;
+        assert!(
+            matches!(result, Err(TelemetryExportError::Export(_))),
+            "{result:?}"
         );
     }
 
