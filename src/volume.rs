@@ -286,7 +286,8 @@ impl VolumeState {
                     .map_err(|e| local_error(e, &instruction.local_file))?;
             }
             let writer = tokio::fs::File::from_std(
-                temp.reopen()
+                temp.as_file()
+                    .try_clone()
                     .map_err(|e| local_error(e, &instruction.local_file))?,
             );
             Some((temp, writer))
@@ -725,6 +726,8 @@ mod tests {
     use arrow_array::builder::{MapBuilder, StringBuilder};
     use arrow_array::{ArrayRef, RecordBatch};
     use arrow_schema::{DataType, Field, Schema};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
     use std::time::Duration;
     use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -1214,6 +1217,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("download");
         std::fs::write(&dest, b"old bytes").unwrap();
+        #[cfg(unix)]
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o200)).unwrap();
         let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
         let completed = transfer_state(0);
         completed
@@ -1228,6 +1233,14 @@ mod tests {
                 .unwrap(),
             VolumeCompletion::Completed
         );
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+                0o200
+            );
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
         let state = transfer_state(0);
         let batch = instruction(
@@ -1251,6 +1264,23 @@ mod tests {
             Some(403)
         );
         assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o400)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&dest).is_err() {
+                let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
+                let error = transfer_state(0)
+                    .complete(&batch, &Client::new(), &options(dir.path()), None)
+                    .await
+                    .unwrap_err();
+                let local = error.local_error.unwrap();
+                assert_eq!(local.kind, "PermissionDenied");
+                assert_eq!(local.path, dest.to_string_lossy());
+                assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+                assert_eq!(server.received_requests().await.unwrap().len(), 2);
+            }
+            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }
 
