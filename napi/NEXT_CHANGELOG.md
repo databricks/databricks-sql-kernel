@@ -20,7 +20,7 @@ layout, or npm publishing. Pure-kernel changes go in the root
 
 ### Fixed
 
-- `AsyncStatement.close()` now releases its canceller and the result streams of its `AsyncResultHandle`s. These held the session until JS garbage collection, so a host's shared telemetry client, and its settings, outlived every closed session and were reused by the next one. Fetching from an `AsyncResultHandle` after its statement is closed now returns `InvalidStatementHandle`.
+- `AsyncStatement.close()` now releases its canceller and the result streams of its `AsyncResultHandle`s. These held the session until JS garbage collection, so a host's shared telemetry client, and its settings, outlived every closed session and were reused by the next one. Fetching from an `AsyncResultHandle` after its statement is closed now returns `InvalidStatementHandle`, unless a fetch was using the stream when `close()` ran.
 
 ---
 *Note: When making changes, please add your change under the appropriate

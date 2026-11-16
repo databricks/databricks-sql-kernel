@@ -52,15 +52,9 @@
 //! rather than queue behind it. The `Arc<Mutex<Option<…>>>` shape is
 //! otherwise the same as `Connection`/`Statement` so Drop's
 //! fire-and-forget cleanup behaves consistently.
-//!
-//! `close()` also releases the canceller and the result streams of the
-//! `AsyncResultHandle`s it produced. Both hold the kernel session, and with
-//! it the host's shared telemetry client, so leaving them to JS GC kept that
-//! client (and its configuration) alive after every session had closed.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, PoisonError, Weak};
-use tokio::runtime::Handle;
 use tokio::sync::Mutex;
 
 use arrow_schema::SchemaRef;
@@ -94,69 +88,8 @@ fn closed_err(what: &str) -> napi::Error {
 
 // ───────────────────────── AsyncStatement ─────────────────────────
 
-/// An `AsyncResultHandle`'s stream, shared with its parent `AsyncStatement`
-/// so the parent's `close()` can release it.
-struct ResultSlot {
-    stream: Mutex<Option<ResultStream>>,
-    /// Set by the parent's `close()`; a fetch that locks `stream` afterwards
-    /// drops it and returns `InvalidStatementHandle`.
-    closed: AtomicBool,
-}
-
-impl ResultSlot {
-    fn new(stream: ResultStream) -> Self {
-        Self {
-            stream: Mutex::new(Some(stream)),
-            closed: AtomicBool::new(false),
-        }
-    }
-
-    /// Drops the stream without waiting for an in-flight fetch: if one holds
-    /// it, a task drops it as soon as that fetch returns.
-    fn release(self: Arc<Self>) {
-        self.closed.store(true, Ordering::Release);
-        if let Ok(mut stream) = self.stream.try_lock() {
-            stream.take();
-            return;
-        }
-        // May run from a drop outside any runtime (e.g. teardown), where
-        // `tokio::spawn` would panic. With no runtime at all, the next fetch
-        // or the handle's drop frees the stream instead.
-        let Some(handle) = Handle::try_current()
-            .ok()
-            .or_else(|| runtime::try_get_handle().cloned())
-        else {
-            return;
-        };
-        handle.spawn(async move {
-            self.stream.lock().await.take();
-        });
-    }
-}
-
-/// Drops `AsyncStatement::close()`'s canceller and result streams on scope
-/// exit, including unwind.
-struct CloseRelease {
-    canceller: Arc<std::sync::Mutex<Option<AsyncStatementCanceller>>>,
-    results: Arc<std::sync::Mutex<Vec<Weak<ResultSlot>>>>,
-}
-
-impl Drop for CloseRelease {
-    fn drop(&mut self) {
-        let canceller = self
-            .canceller
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .take();
-        drop(canceller);
-        let slots =
-            std::mem::take(&mut *self.results.lock().unwrap_or_else(PoisonError::into_inner));
-        slots
-            .iter()
-            .filter_map(Weak::upgrade)
-            .for_each(ResultSlot::release);
-    }
-}
+/// An `AsyncResultHandle`'s stream, shared with its parent `AsyncStatement`.
+type ResultSlot = Mutex<Option<ResultStream>>;
 
 /// Inner state for the JS-visible `AsyncStatement` wrapper. Same
 /// shape rationale as `StatementInner` in `statement.rs`: we hold
@@ -200,12 +133,10 @@ pub struct AsyncStatement {
     /// construction and held **outside** `inner` so `cancel()` can fire
     /// a server-side cancel without contending for the mutex an
     /// in-flight `awaitResult()` holds. See the struct-level
-    /// concurrency note. A std mutex (never held across an `.await`) so
-    /// `close()` can drop it; `None` once closed.
+    /// concurrency note. Taken by `close()`: it holds the session.
     canceller: Arc<std::sync::Mutex<Option<AsyncStatementCanceller>>>,
-    /// Result slots of the `AsyncResultHandle`s returned by
-    /// `awaitResult()`, emptied by `close()`. Weak so a handle JS has
-    /// already dropped is not kept alive here.
+    /// Streams of the `AsyncResultHandle`s from `awaitResult()`, emptied
+    /// by `close()` because they also hold the session.
     results: Arc<std::sync::Mutex<Vec<Weak<ResultSlot>>>>,
     /// Lock-free mirror of "has `close()` taken `inner`". Set by
     /// `close()`; read by the lock-free `cancel()` so a cancel after an
@@ -240,7 +171,7 @@ impl AsyncStatement {
                 executed_async,
             }))),
             canceller: Arc::new(std::sync::Mutex::new(Some(canceller))),
-            results: Arc::new(std::sync::Mutex::new(Vec::new())),
+            results: Arc::default(),
             closed: Arc::new(AtomicBool::new(false)),
             statement_id,
         }
@@ -389,16 +320,14 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel)?;
             let statement_id = inner_state.executed_async.statement_id().to_owned();
             let schema = stream.schema();
-            let slot = Arc::new(ResultSlot::new(stream));
-            // Registered while `inner` is still held, so a `close()` queued
-            // behind this call always sees the slot.
-            {
-                let mut results = results.lock().unwrap_or_else(PoisonError::into_inner);
-                results.retain(|slot| slot.strong_count() > 0);
-                results.push(Arc::downgrade(&slot));
-            }
+            let stream = Arc::new(Mutex::new(Some(stream)));
+            // Registered while `inner` is held, so a queued `close()` sees it.
+            results
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(Arc::downgrade(&stream));
             Ok(AsyncResultHandle {
-                inner: slot,
+                inner: stream,
                 schema,
                 statement_id,
             })
@@ -444,10 +373,6 @@ impl AsyncStatement {
     /// closed-handle short-circuit and returns `Ok(())` without
     /// re-attempting the wire call. The kernel's own `Drop`
     /// fire-and-forget retry runs once in the background.
-    ///
-    /// Closing also invalidates the `AsyncResultHandle`s returned by
-    /// `awaitResult()`: their `fetchNextBatch()` then rejects with
-    /// `InvalidStatementHandle`, so finish fetching first.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -466,14 +391,23 @@ impl AsyncStatement {
             // lock-free `cancel()` short-circuits to InvalidStatementHandle
             // rather than firing a wire cancel on a closing statement.
             closed.store(true, Ordering::Release);
-            // Release everything that holds the session when this scope
-            // ends, even if the close RPC fails or panics: JS may keep this
-            // object (and its result handles) reachable long after close.
-            let _release = CloseRelease { canceller, results };
             let outcome = ExecutedAsyncStatement::close(&mut inner_state.executed_async)
                 .await
                 .map_err(napi_err_from_kernel);
-            drop(inner_state);
+            // Release what holds the session, so JS references to closed
+            // handles don't keep it (and the host's telemetry client) alive.
+            // A stream held by an in-flight fetch is left; close doesn't wait.
+            canceller
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            let slots =
+                std::mem::take(&mut *results.lock().unwrap_or_else(PoisonError::into_inner));
+            for slot in slots.iter().filter_map(Weak::upgrade) {
+                if let Ok(mut stream) = slot.try_lock() {
+                    stream.take();
+                }
+            }
             outcome
         })
         .await
@@ -517,39 +451,10 @@ impl Drop for AsyncStatement {
 /// post-close contract.
 #[napi]
 pub struct AsyncResultHandle {
-    /// Emptied when the parent `AsyncStatement` closes; fetching after
-    /// that returns `InvalidStatementHandle`.
+    /// Emptied by the parent's `close()`, unless a fetch holds it then.
     inner: Arc<ResultSlot>,
     schema: SchemaRef,
     statement_id: String,
-}
-
-/// Pull one batch from `stream` and encode it as an Arrow IPC payload.
-async fn next_ipc_batch(
-    stream: &mut ResultStream,
-    schema: &SchemaRef,
-) -> napi::Result<Option<ArrowBatch>> {
-    let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
-    let Some(batch) = maybe_batch else {
-        return Ok(None);
-    };
-    let record_batch = match batch {
-        ResultBatch::Arrow(rb) => rb,
-        _ => {
-            return Err(napi_err_from_kernel(
-                KernelError::invalid_argument().message(format!(
-                    "non-Arrow ResultBatch variant from kernel — \
-                     databricks-sea-native v{} cannot decode this batch \
-                     shape, upgrade the binding",
-                    env!("CARGO_PKG_VERSION"),
-                )),
-            ));
-        }
-    };
-    let bytes = encode_ipc_stream(schema, Some(record_batch))?;
-    Ok(Some(ArrowBatch {
-        ipc_bytes: bytes.into(),
-    }))
 }
 
 #[napi]
@@ -568,21 +473,36 @@ impl AsyncResultHandle {
     /// message), suitable for handing to `apache-arrow`'s
     /// `RecordBatchReader`. Byte-identical to the sync
     /// `Statement.fetchNextBatch()` payload for the same query.
-    /// Rejects with `KernelError(InvalidStatementHandle)` once the
-    /// parent `AsyncStatement` has been closed.
     #[napi]
     pub async fn fetch_next_batch(&self) -> napi::Result<Option<ArrowBatch>> {
         let inner = Arc::clone(&self.inner);
         let schema = self.schema.clone();
         guarded(async move {
-            let mut guard = inner.stream.lock().await;
-            if inner.closed.load(Ordering::Acquire) {
-                guard.take();
-            }
+            let mut guard = inner.lock().await;
             let stream = guard
                 .as_mut()
                 .ok_or_else(|| closed_err("AsyncResultHandle"))?;
-            next_ipc_batch(stream, &schema).await
+            let maybe_batch = stream.next_batch().await.map_err(napi_err_from_kernel)?;
+            let Some(batch) = maybe_batch else {
+                return Ok(None);
+            };
+            let record_batch = match batch {
+                ResultBatch::Arrow(rb) => rb,
+                _ => {
+                    return Err(napi_err_from_kernel(
+                        KernelError::invalid_argument().message(format!(
+                            "non-Arrow ResultBatch variant from kernel — \
+                             databricks-sea-native v{} cannot decode this batch \
+                             shape, upgrade the binding",
+                            env!("CARGO_PKG_VERSION"),
+                        )),
+                    ));
+                }
+            };
+            let bytes = encode_ipc_stream(&schema, Some(record_batch))?;
+            Ok(Some(ArrowBatch {
+                ipc_bytes: bytes.into(),
+            }))
         })
         .await
     }
@@ -811,50 +731,12 @@ mod tests {
             .expect("submit");
         let result = statement.await_result().await.expect("await result");
         // Hold the stream the way an in-flight `fetchNextBatch()` does.
-        let in_flight = result.inner.stream.lock().await;
+        let in_flight = result.inner.lock().await;
         tokio::time::timeout(Duration::from_secs(5), statement.close())
             .await
             .expect("close must not wait for an in-flight fetch")
             .expect("close statement");
         drop(in_flight);
-        // Released once the fetch returns, without relying on another fetch.
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while result.inner.stream.lock().await.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the stream must be dropped once the in-flight fetch returns");
-        let err = result
-            .fetch_next_batch()
-            .await
-            .err()
-            .expect("fetching after the parent closed must fail");
-        assert!(err.reason.contains("AsyncResultHandle already closed"));
-        connection.close().await.expect("close session");
-    }
-
-    #[tokio::test]
-    async fn fetch_after_close_fails_before_the_release_task_runs() {
-        let server = lease_server().await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
-        let statement = connection
-            .submit_statement("SELECT 1 AS n".into(), None)
-            .await
-            .expect("submit");
-        let result = statement.await_result().await.expect("await result");
-        let in_flight = result.inner.stream.lock().await;
-        statement.close().await.expect("close statement");
-        drop(in_flight);
-        // The current-thread runtime hasn't polled the spawned release yet,
-        // so only the closed flag makes this fetch fail.
-        let err = result
-            .fetch_next_batch()
-            .await
-            .err()
-            .expect("fetching after the parent closed must fail");
-        assert!(err.reason.contains("AsyncResultHandle already closed"));
-        assert!(result.inner.stream.lock().await.is_none());
         connection.close().await.expect("close session");
     }
 
@@ -881,74 +763,7 @@ mod tests {
             .await
             .expect_err("the close RPC must fail");
         assert!(statement.canceller.lock().unwrap().is_none());
-        assert!(result.inner.stream.lock().await.is_none());
-        connection.close().await.expect("close session");
-    }
-
-    #[tokio::test]
-    async fn release_outside_a_runtime_does_not_panic() {
-        let server = lease_server().await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
-        let statement = connection
-            .submit_statement("SELECT 1 AS n".into(), None)
-            .await
-            .expect("submit");
-        let result = statement.await_result().await.expect("await result");
-        let in_flight = result.inner.stream.lock().await;
-        let slot = Arc::clone(&result.inner);
-        std::thread::spawn(move || slot.release())
-            .join()
-            .expect("releasing a busy slot outside a runtime must not panic");
-        drop(in_flight);
-        let err = result
-            .fetch_next_batch()
-            .await
-            .err()
-            .expect("fetching after release must fail");
-        assert!(err.reason.contains("AsyncResultHandle already closed"));
-        assert!(result.inner.stream.lock().await.is_none());
-        statement.close().await.expect("close statement");
-        connection.close().await.expect("close session");
-    }
-
-    fn panicking_close_rpc() -> napi::Result<()> {
-        panic!("close RPC panicked")
-    }
-
-    /// Covers `CloseRelease` on unwind only; a panic can't be injected into
-    /// the kernel close RPC, so `close()`'s use of the guard isn't driven here.
-    #[tokio::test]
-    async fn close_release_guard_releases_on_unwind() {
-        let server = lease_server().await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
-        let statement = connection
-            .submit_statement("SELECT 1 AS n".into(), None)
-            .await
-            .expect("submit");
-        let result = statement.await_result().await.expect("await result");
-        // A busy slot makes the release spawn its task during the unwind.
-        let in_flight = result.inner.stream.lock().await;
-        let release = CloseRelease {
-            canceller: Arc::clone(&statement.canceller),
-            results: Arc::clone(&statement.results),
-        };
-        let err = guarded(async move {
-            let _release = release;
-            panicking_close_rpc()
-        })
-        .await
-        .expect_err("the panic must surface as an error");
-        assert!(err.reason.contains("close RPC panicked"));
-        assert!(statement.canceller.lock().unwrap().is_none());
-        drop(in_flight);
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while result.inner.stream.lock().await.is_some() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("the stream must be dropped after a panicking close");
-        statement.close().await.expect("close statement");
+        assert!(result.inner.lock().await.is_none());
         connection.close().await.expect("close session");
     }
 }
