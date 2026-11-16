@@ -399,10 +399,10 @@ impl VolumeState {
             *request.url_mut() = url;
         };
         let status = response.status();
-        if !status.is_success()
-            && !(instruction.operation == "REMOVE"
+        if !(status.is_success()
+            || (instruction.operation == "REMOVE"
                 && status.as_u16() == 404
-                && options.remove_not_found_is_success)
+                && options.remove_not_found_is_success))
         {
             *retry_after = response
                 .headers()

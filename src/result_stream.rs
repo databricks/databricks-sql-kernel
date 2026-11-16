@@ -694,7 +694,11 @@ impl ResultStream {
                         .expect("Volume completion retains its reader")
                         .next_batch()
                         .await
-                        .map_err(|error| state.fail(error))?
+                        .map_err(|error| {
+                            let error = state.fail(error);
+                            self.finalize_telemetry(Some(&error));
+                            error
+                        })?
                     {
                         Some(batch) if batch.num_rows() != 0 => {
                             return Err(state.fail(

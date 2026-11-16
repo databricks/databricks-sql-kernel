@@ -292,12 +292,12 @@ fn duration_millis(duration: Duration) -> i64 {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
-    use crate::reader::test_utils::ErrorReader;
+    use crate::reader::test_utils::{BatchThenErrorReader, ErrorReader};
     use crate::reader::{ResultReader, ResultReaderMetrics};
     use crate::result_stream::ResultStream;
     use crate::telemetry::models::OperationType;
     use crate::telemetry::runtime::{ConnectionTelemetry, TelemetrySessionContext};
-    use arrow_array::RecordBatch;
+    use arrow_array::{RecordBatch, RecordBatchOptions};
     use arrow_schema::Schema;
     use async_trait::async_trait;
     use std::future::Future;
@@ -368,43 +368,84 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn peek_first_batch_error_finalizes_statement_with_error_before_drop() {
-        let connection = Arc::new(CapturingConnectionTelemetry::default());
-        let telemetry = StatementTelemetry::new(
-            connection.clone(),
-            StatementType::Sql,
-            OperationType::ExecuteStatement,
-        );
-        let reader = ErrorReader {
-            schema: Arc::new(Schema::empty()),
-        };
-        let mut stream = ResultStream::from_reader(Box::new(reader))
-            .await
-            .expect("schema succeeds");
-        stream.attach_telemetry(telemetry);
+    async fn reader_errors_finalize_statement_with_error_before_drop() {
+        for (volume, message) in [
+            (false, "simulated read error"),
+            (true, "simulated read error after first batch"),
+        ] {
+            let connection = Arc::new(CapturingConnectionTelemetry::default());
+            let telemetry = StatementTelemetry::new(
+                connection.clone(),
+                StatementType::Sql,
+                OperationType::ExecuteStatement,
+            );
+            let schema = Arc::new(Schema::empty());
+            let reader: Box<dyn ResultReader> = if volume {
+                Box::new(BatchThenErrorReader {
+                    batch: Some(
+                        RecordBatch::try_new_with_options(
+                            schema.clone(),
+                            vec![],
+                            &RecordBatchOptions::new().with_row_count(Some(1)),
+                        )
+                        .expect("one-row batch"),
+                    ),
+                    schema,
+                })
+            } else {
+                Box::new(ErrorReader { schema })
+            };
+            let mut stream = ResultStream::from_reader(reader)
+                .await
+                .expect("schema succeeds");
+            stream.attach_telemetry(telemetry);
 
-        let error = match stream.peek_first_batch().await {
-            Ok(_) => panic!("peek should surface reader error"),
-            Err(error) => error,
-        };
-        assert_eq!(error.code, ErrorCode::Internal);
+            let error = if volume {
+                stream.attach_volume(
+                    true,
+                    crate::volume::VolumeState::new(Default::default(), None),
+                    reqwest::Client::new(),
+                );
+                stream
+                    .complete_volume_operation(&Default::default(), None)
+                    .await
+                    .expect_err("instruction drain should surface reader error")
+            } else {
+                stream
+                    .peek_first_batch()
+                    .await
+                    .map(|_| ())
+                    .expect_err("peek should surface reader error")
+            };
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.message, message);
+            let events_before_drop = connection
+                .statement_events
+                .lock()
+                .expect("events mutex")
+                .len();
+            assert_eq!(
+                events_before_drop, 1,
+                "reader error must finalize before Drop"
+            );
 
-        drop(stream);
+            drop(stream);
 
-        let events = connection.statement_events.lock().expect("events mutex");
-        assert_eq!(
-            events.len(),
-            1,
-            "peek error should finalize once; Drop must not overwrite it with success"
-        );
-        let event = &events[0];
-        assert_eq!(event.context.statement_type, StatementType::Sql);
-        assert_eq!(event.error_code, Some(ErrorCode::Internal));
-        assert_eq!(event.error_message.as_deref(), Some("simulated read error"));
-        assert!(
-            event.context.consumption_latency.is_some(),
-            "failed consumption should still record result-consumption latency"
-        );
+            let events = connection.statement_events.lock().expect("events mutex");
+            assert_eq!(
+                events.len(),
+                1,
+                "reader error should finalize once; Drop must not overwrite it with success"
+            );
+            let event = &events[0];
+            assert_eq!(event.context.statement_type, StatementType::Sql);
+            assert_eq!(event.error_code, Some(ErrorCode::Internal));
+            assert_eq!(event.error_message.as_deref(), Some(message));
+            assert!(
+                event.context.consumption_latency.is_some(),
+                "failed consumption should still record result-consumption latency"
+            );
+        }
     }
 
     #[tokio::test]
