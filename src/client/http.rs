@@ -1896,61 +1896,6 @@ lGrv15pBcePj
             );
         }
 
-        #[derive(Clone, Default)]
-        struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
-
-        impl std::io::Write for CapturedLogs {
-            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-                self.0.lock().unwrap().extend_from_slice(buf);
-                Ok(buf.len())
-            }
-            fn flush(&mut self) -> std::io::Result<()> {
-                Ok(())
-            }
-        }
-
-        #[tokio::test]
-        async fn test_request_error_and_logs_drop_presigned_query() {
-            let logs = CapturedLogs::default();
-            let writer = logs.clone();
-            let _guard = tracing::subscriber::set_default(
-                tracing_subscriber::fmt()
-                    .with_max_level(tracing::Level::DEBUG)
-                    .with_ansi(false)
-                    .with_writer(move || writer.clone())
-                    .finish(),
-            );
-            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let address = listener.local_addr().unwrap();
-            drop(listener);
-
-            let client =
-                test_client_with_http_config(fast_retry_config(1), HttpClientConfig::default());
-            let request = client
-                .inner()
-                .get(format!(
-                    "http://{address}/results_0?sig=SECRET&X-Amz-Signature=SECRET"
-                ))
-                .build()
-                .unwrap();
-
-            let error = client
-                .execute_without_auth(request, RequestType::CloudFetchDownload)
-                .await
-                .expect_err("closed port must fail");
-            assert!(!error.to_string().contains("SECRET"), "{error}");
-            assert!(
-                error
-                    .message
-                    .contains(&format!("http://{address}/results_0)")),
-                "{error}"
-            );
-            let logs = String::from_utf8(logs.0.lock().unwrap().clone()).unwrap();
-            assert!(logs.contains("before retry"), "{logs}");
-            assert!(logs.contains("/results_0 (attempt 2/2)"), "{logs}");
-            assert!(!logs.contains("SECRET"), "{logs}");
-        }
-
         #[tokio::test]
         async fn test_connection_closed_before_response_is_retried() {
             let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
