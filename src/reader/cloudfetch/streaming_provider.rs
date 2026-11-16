@@ -445,7 +445,12 @@ impl StreamingCloudFetchProvider {
         // Fetch initial batch of links (should be instant if cached by link fetcher)
         debug!("Initializing provider: fetching initial links");
 
-        match self.link_fetcher.fetch_links(0, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return,
+            result = self.link_fetcher.fetch_links(0, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 // Store fetched links
                 for link in result.links {
@@ -514,6 +519,9 @@ impl StreamingCloudFetchProvider {
         if self.release_downloaded_chunk(chunk_index) {
             // Schedule more downloads
             self.schedule_downloads().await;
+            if self.cancel_token.is_cancelled() {
+                return Err(Error::invalid_state().message("Operation cancelled"));
+            }
 
             // Return first batch from buffer
             if let Some(batch) = self.take_buffered_batch() {
@@ -688,7 +696,12 @@ impl StreamingCloudFetchProvider {
     ///
     /// Returns whether the requested `start_index` is now available in the map.
     async fn fetch_and_store_links(&self, start_index: i64) -> bool {
-        match self.link_fetcher.fetch_links(start_index, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return false,
+            result = self.link_fetcher.fetch_links(start_index, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 for link in result.links {
                     let chunk_index = link.chunk_index;
@@ -1730,6 +1743,7 @@ mod tests {
         links_by_index: HashMap<i64, CloudFetchLink>,
         total_chunks: i64,
         scheduled: Mutex<Vec<i64>>,
+        fetch_gate: Option<Arc<Notify>>,
     }
 
     impl MockLinkFetcher {
@@ -1743,6 +1757,7 @@ mod tests {
                 links_by_index,
                 total_chunks,
                 scheduled: Mutex::new(Vec::new()),
+                fetch_gate: None,
             }
         }
     }
@@ -1758,6 +1773,9 @@ mod tests {
             start_chunk_index: i64,
             _start_row_offset: i64,
         ) -> Result<ChunkLinkFetchResult> {
+            if let Some(gate) = &self.fetch_gate {
+                gate.notified().await;
+            }
             if start_chunk_index >= self.total_chunks {
                 return Ok(ChunkLinkFetchResult::end_of_stream());
             }
@@ -1822,6 +1840,57 @@ mod tests {
             expiration: chrono::Utc::now() + chrono::Duration::hours(1),
             http_headers: HashMap::new(),
             next_chunk_index: Some(chunk_index + 1),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_interrupts_link_fetch_during_refill_and_initialization() {
+        for initial in [false, true] {
+            let mut fetcher = MockLinkFetcher::new(2);
+            fetcher.fetch_gate = Some(Arc::new(Notify::new()));
+            let chunks = Arc::new(DashMap::new());
+            let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+            chunks.insert(
+                0,
+                ChunkEntry {
+                    link: Some(create_test_link(0)),
+                    state: ChunkState::Downloaded,
+                    batches: Some(vec![batch]),
+                    ..ChunkEntry::with_link(create_test_link(0))
+                },
+            );
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                Arc::new(fetcher),
+                noop_downloader(),
+                chunks,
+                false,
+            );
+            provider.chunks_in_memory.store(1, Ordering::Release);
+            provider.next_download_index.store(1, Ordering::Release);
+            if initial {
+                let mut initialize = Box::pin(provider.initialize());
+                assert!(futures::poll!(initialize.as_mut()).is_pending());
+                provider.cancel();
+                tokio::time::timeout(NO_HANG, initialize).await.unwrap();
+            } else {
+                let mut read = Box::pin(provider.next_batch());
+                assert!(futures::poll!(read.as_mut()).is_pending());
+                assert_eq!(provider.current_chunk_index.load(Ordering::Acquire), 1);
+                provider.cancel();
+                assert!(tokio::time::timeout(NO_HANG, read)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .message
+                    .contains("cancel"));
+            }
+            assert!(provider.terminal_error().is_none());
+            assert!(provider
+                .next_batch()
+                .await
+                .unwrap_err()
+                .message
+                .contains("cancel"));
         }
     }
 

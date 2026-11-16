@@ -48,8 +48,8 @@ use crate::types::cloudfetch::CloudFetchLink;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::Arc;
-use tokio::sync::Mutex as TokioMutex;
+use std::sync::{Arc, Mutex};
+use tokio::sync::watch;
 
 /// Statement-scoped abstraction for fetching chunk links.
 ///
@@ -227,8 +227,8 @@ pub(crate) struct SeaChunkLinkFetcher {
     prefetch_in_progress: AtomicBool,
     /// Tokio runtime handle for spawning prefetch tasks
     runtime_handle: tokio::runtime::Handle,
-    /// Foreground misses must share pages already being prefetched.
-    prefetch_lock: TokioMutex<()>,
+    /// Joiners share each attempt's error instead of starting another retry budget.
+    page_fetch: Mutex<Option<watch::Receiver<Option<Result<bool>>>>>,
     /// Next row offset for pagination (used by some backends)
     next_row_offset: AtomicI64,
 }
@@ -456,7 +456,7 @@ impl SeaChunkLinkFetcher {
             link_prefetch_window,
             prefetch_in_progress: AtomicBool::new(false),
             runtime_handle,
-            prefetch_lock: TokioMutex::new(()),
+            page_fetch: Mutex::new(None),
             next_row_offset: AtomicI64::new(next_row_offset),
         };
         if fallback_used {
@@ -730,9 +730,6 @@ impl SeaChunkLinkFetcher {
     /// Background prefetch loop - fetches links until caught up with window.
     async fn run_prefetch_loop(self: Arc<Self>) {
         loop {
-            // Release between pages so a waiting reader can use the page just fetched.
-            let _page = self.prefetch_lock.lock().await;
-
             // Check if we're done
             if self.all_links_fetched.load(Ordering::Acquire) {
                 debug!("Prefetch loop: all links fetched, stopping");
@@ -749,7 +746,6 @@ impl SeaChunkLinkFetcher {
                     "Prefetch loop: caught up (server_fetch={} > target={}), stopping",
                     server_fetch_idx, target_index
                 );
-                drop(_page);
                 self.release_caught_up_prefetch();
                 return;
             }
@@ -761,90 +757,11 @@ impl SeaChunkLinkFetcher {
                 server_fetch_idx, row_offset
             );
 
-            match self
-                .client
-                .get_result_chunks(
-                    &self.statement_id,
-                    server_fetch_idx,
-                    row_offset,
-                    self.session_attribution,
-                )
-                .await
-            {
-                Ok(result) => {
-                    // Cache the new links.
-                    for link in &result.links {
-                        self.links.insert(link.chunk_index, link.clone());
-                    }
-
-                    // The continuation signal comes from
-                    // `decode_continuation`: prefer the per-link
-                    // `next_chunk_index` (bounded SEA API
-                    // contract); fall back to `total_chunk_count`
-                    // only when the server hasn't rolled out the
-                    // new field. Forward progress is guarded —
-                    // `fetch_max` and a separate
-                    // `max(chunk_index+1)` floor prevent a
-                    // non-monotonic server response from driving
-                    // `next_server_fetch_index` backwards.
-                    //
-                    // Setting `all_links_fetched = true` here just
-                    // stops the prefetch loop; in-flight chunk
-                    // downloads continue independently.
-                    if let Some(last_link) = result.links.last() {
-                        let last_chunk_index = last_link.chunk_index;
-                        let links_count = result.links.len();
-                        let advance_to = self.apply_continuation(last_link, "prefetch loop");
-                        if self.all_links_fetched.load(Ordering::Acquire) {
-                            debug!("Prefetch loop: end-of-stream on link {}", last_chunk_index,);
-                            break;
-                        }
-                        debug!(
-                            "Prefetch loop: fetched {} links (last chunk {}), \
-                             next_server_fetch={}",
-                            links_count, last_chunk_index, advance_to,
-                        );
-                    } else if !result.has_more {
-                        // Defensive: server returned no links and
-                        // signalled no more. Treat as end-of-stream
-                        // for link discovery.
-                        debug!("Prefetch loop: empty response with has_more=false");
-                        self.all_links_fetched.store(true, Ordering::Release);
-                        break;
-                    } else {
-                        // Empty batch but `has_more` is true. Force
-                        // forward progress so the loop can't spin
-                        // re-issuing the same RPC. Two strategies:
-                        // 1. If the server gave us a
-                        //    `next_chunk_index` hint, use it.
-                        // 2. Otherwise bump past
-                        //    `server_fetch_idx` ourselves.
-                        // Either way, on the next iteration we'll
-                        // ask for a *different* chunk index, which
-                        // breaks the loop. If the server keeps
-                        // returning empty-with-has_more, that's a
-                        // server bug we surface via the
-                        // `current_consumer_index` heuristic in
-                        // streaming_provider (consumer never
-                        // advances → chunks_in_memory stays full
-                        // → prefetch pauses) AND via the
-                        // `empty_with_has_more_warned` one-shot.
-                        let advance_to = result
-                            .next_chunk_index
-                            .unwrap_or_else(|| server_fetch_idx.saturating_add(1));
-                        self.next_server_fetch_index
-                            .fetch_max(advance_to, Ordering::Release);
-                        self.warn_empty_with_has_more(
-                            "prefetch loop",
-                            server_fetch_idx,
-                            advance_to,
-                        );
-                        break;
-                    }
-                }
+            match self.fetch_page(server_fetch_idx, row_offset).await {
+                Ok(true) => {}
+                Ok(false) => break,
                 Err(e) => {
                     error!("Prefetch loop: failed to fetch links: {}", e);
-                    // Don't propagate error - let the main fetch_links handle it
                     break;
                 }
             }
@@ -852,6 +769,71 @@ impl SeaChunkLinkFetcher {
 
         // Release prefetch flag
         self.prefetch_in_progress.store(false, Ordering::SeqCst);
+    }
+
+    async fn fetch_page(self: &Arc<Self>, chunk_index: i64, row_offset: i64) -> Result<bool> {
+        let mut completion = {
+            let mut in_flight = self.page_fetch.lock().unwrap();
+            if self.all_links_fetched.load(Ordering::Acquire)
+                || chunk_index < self.next_server_fetch_index.load(Ordering::Acquire)
+            {
+                return Ok(true);
+            }
+            if let Some(completion) = in_flight.as_ref() {
+                completion.clone()
+            } else {
+                let (sender, completion) = watch::channel(None);
+                *in_flight = Some(completion.clone());
+                let fetcher = Arc::clone(self);
+                // A cancelled waiter must not abandon the attempt or strand other joiners.
+                self.runtime_handle.spawn(async move {
+                    let result = fetcher
+                        .fetch_page_from_server(chunk_index, row_offset)
+                        .await;
+                    let mut in_flight = fetcher.page_fetch.lock().unwrap();
+                    sender.send_replace(Some(result));
+                    *in_flight = None;
+                });
+                completion
+            }
+        };
+        loop {
+            if let Some(result) = completion.borrow().clone() {
+                return result;
+            }
+            completion.changed().await.map_err(|_| {
+                Error::invalid_state().message("Link page fetch ended without a result")
+            })?;
+        }
+    }
+
+    async fn fetch_page_from_server(&self, chunk_index: i64, row_offset: i64) -> Result<bool> {
+        let result = self
+            .client
+            .get_result_chunks(
+                &self.statement_id,
+                chunk_index,
+                row_offset,
+                self.session_attribution,
+            )
+            .await?;
+        for link in &result.links {
+            self.links.insert(link.chunk_index, link.clone());
+        }
+        if let Some(last_link) = result.links.last() {
+            self.apply_continuation(last_link, "page fetch");
+        } else if !result.has_more {
+            self.all_links_fetched.store(true, Ordering::Release);
+        } else {
+            // Empty pages must advance so later attempts cannot spin on the same request.
+            let advance_to = result
+                .next_chunk_index
+                .unwrap_or_else(|| chunk_index.saturating_add(1));
+            self.next_server_fetch_index
+                .fetch_max(advance_to, Ordering::Release);
+            self.warn_empty_with_has_more("page fetch", chunk_index, advance_to);
+        }
+        Ok(!result.links.is_empty())
     }
 }
 
@@ -904,13 +886,16 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
 
         self.note_scheduled(start_chunk_index);
 
-        let _fallback = if !fetcher.all_links_fetched.load(Ordering::Acquire)
+        while !fetcher.all_links_fetched.load(Ordering::Acquire)
             && start_chunk_index >= fetcher.next_server_fetch_index.load(Ordering::Acquire)
         {
-            Some(fetcher.prefetch_lock.lock().await)
-        } else {
-            None
-        };
+            if !fetcher
+                .fetch_page(start_chunk_index, start_row_offset)
+                .await?
+            {
+                break;
+            }
+        }
 
         // If we already have all links, return what we have from cache.
         // Walk contiguously from `start_chunk_index` until we hit a
@@ -963,73 +948,10 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             });
         }
 
-        // Fetch from server (synchronous fallback if prefetch hasn't caught up)
-        debug!(
-            "SeaChunkLinkFetcher: cache miss for chunk {}, fetching synchronously",
-            start_chunk_index
-        );
-        let result = fetcher
-            .client
-            .get_result_chunks(
-                &fetcher.statement_id,
-                start_chunk_index,
-                start_row_offset,
-                fetcher.session_attribution,
-            )
-            .await?;
-
-        // Cache the new links.
-        for link in &result.links {
-            fetcher.links.insert(link.chunk_index, link.clone());
-        }
-
-        // Advance via the shared `apply_continuation` helper so
-        // prefetch-loop and sync-fallback share the same bridge
-        // logic for the total_chunk_count rollout, the same
-        // forward-progress clamp, and the same one-shot warnings.
-        let next_chunk_index = match result.links.last() {
-            Some(last_link) => {
-                let advance_to = fetcher.apply_continuation(last_link, "sync fallback");
-                if fetcher.all_links_fetched.load(Ordering::Acquire) {
-                    None
-                } else {
-                    Some(advance_to)
-                }
-            }
-            None => {
-                // Empty response. Honour the server's has_more
-                // signal AND defend against an empty-with-has_more
-                // spin: force forward progress on
-                // next_server_fetch_index so the next call asks
-                // for a different chunk index. The server is
-                // expected to either yield links or signal
-                // end-of-stream — a perpetual "I have more but
-                // here are zero links" loop is a server bug we
-                // refuse to amplify into an infinite local retry.
-                if !result.has_more {
-                    fetcher.all_links_fetched.store(true, Ordering::Release);
-                } else {
-                    let advance_to = result
-                        .next_chunk_index
-                        .unwrap_or_else(|| start_chunk_index.saturating_add(1));
-                    fetcher
-                        .next_server_fetch_index
-                        .fetch_max(advance_to, Ordering::Release);
-                    fetcher.warn_empty_with_has_more(
-                        "sync fallback",
-                        start_chunk_index,
-                        advance_to,
-                    );
-                }
-                None
-            }
-        };
-
-        let has_more = !fetcher.all_links_fetched.load(Ordering::Acquire);
         Ok(ChunkLinkFetchResult {
-            links: result.links,
-            has_more,
-            next_chunk_index: if has_more { next_chunk_index } else { None },
+            links: Vec::new(),
+            has_more: !fetcher.all_links_fetched.load(Ordering::Acquire),
+            next_chunk_index: Some(fetcher.next_server_fetch_index.load(Ordering::Acquire)),
             next_row_offset: Some(fetcher.next_row_offset.load(Ordering::Acquire)),
         })
     }
@@ -1264,7 +1186,9 @@ mod tests {
                     gate.notified().await;
                 }
                 if self.fail_first_page == Some(chunk_index) {
-                    return Err(Error::io().message("injected page fetch failure"));
+                    return Err(Error::io()
+                        .message("injected page fetch failure")
+                        .with_sql_state("08001"));
                 }
             }
             let index = chunk_index as usize;
@@ -1563,15 +1487,41 @@ mod tests {
             assert!(futures::poll!(foreground.as_mut()).is_pending());
             assert_eq!(*client.calls.lock().unwrap(), vec![1]);
 
+            let mut other_reader = Box::pin(handle.fetch_links(1, 0));
+            assert!(futures::poll!(other_reader.as_mut()).is_pending());
+            let mut dropped_reader = Box::pin(handle.fetch_links(1, 0));
+            assert!(futures::poll!(dropped_reader.as_mut()).is_pending());
+            drop(dropped_reader);
             first_page.notify_one();
-            let result = tokio::time::timeout(timeout, foreground)
-                .await
-                .unwrap()
-                .unwrap();
-            assert_eq!(result.links[0].chunk_index, 1);
+            let result = tokio::time::timeout(timeout, foreground).await.unwrap();
+            let other_result = tokio::time::timeout(timeout, other_reader).await.unwrap();
             if fail_first {
-                assert_eq!(*client.calls.lock().unwrap(), vec![1, 1]);
+                for result in [result, other_result] {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.message, "injected page fetch failure");
+                    assert_eq!(error.sql_state.as_deref(), Some("08001"));
+                }
+                assert_eq!(*client.calls.lock().unwrap(), vec![1]);
+                // A later request can retry after the joined attempt has failed.
+                let retry = tokio::time::timeout(timeout, handle.fetch_links(1, 0))
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retry.links[0].chunk_index, 1);
+                assert_eq!(
+                    client
+                        .calls
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|&&i| i == 1)
+                        .count(),
+                    2
+                );
+                next_page.notify_one();
             } else {
+                assert_eq!(result.unwrap().links[0].chunk_index, 1);
+                assert_eq!(other_result.unwrap().links[0].chunk_index, 1);
                 tokio::time::timeout(timeout, client.page_started.notified())
                     .await
                     .unwrap();
