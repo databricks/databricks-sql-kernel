@@ -312,25 +312,23 @@ async fn storage_connection_timeout_preserves_unconfigured_limits() {
     );
     for timeout in [None, Some(Duration::from_millis(100))] {
         let storage = client.storage_client(timeout).unwrap();
+        let deadline = if timeout.is_some() {
+            Duration::from_millis(500)
+        } else {
+            Duration::from_secs(3)
+        };
         let result = tokio::time::timeout(
-            Duration::from_millis(500),
+            deadline,
             storage
                 .put(format!("https://{address}/object"))
                 .body("bytes")
                 .send(),
         )
         .await;
-        if timeout.is_some() {
-            let error = result
-                .expect("configured connection timeout must finish")
-                .unwrap_err();
-            assert!(error.is_connect() && error.is_timeout(), "{error}");
-        } else {
-            assert!(
-                result.is_err(),
-                "unconfigured storage must retain its limits"
-            );
-        }
+        let error = result
+            .expect("storage connection timeout must finish")
+            .unwrap_err();
+        assert!(error.is_connect() && error.is_timeout(), "{error}");
     }
     shutdown.send(()).unwrap();
     assert_eq!(server.await.unwrap(), 2);

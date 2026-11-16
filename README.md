@@ -75,6 +75,10 @@ result can omit completion. Complete the operation before reading its instructio
 rows. The PyO3 `ExecutedStatement` and `ResultStream` classes expose
 `is_volume_operation` and `complete_volume_operation`.
 
+Local filesystem setup and download publication are synchronous. Cancellation
+cannot interrupt a blocked filesystem call and can wait for the atomic rename
+that publishes a completed GET.
+
 A PUT instruction with `localFile == "__input_stream__"` returns
 `NeedsInputStream` until owned input bytes are supplied. An empty byte buffer is a
 valid upload. Other statements do not request or consume input bytes.
