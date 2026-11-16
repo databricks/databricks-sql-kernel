@@ -825,7 +825,7 @@ impl SeaChunkLinkFetcher {
         } else if !result.has_more {
             self.all_links_fetched.store(true, Ordering::Release);
         } else {
-            // Empty pages must advance so later attempts cannot spin on the same request.
+            // Retrying here could loop forever on a non-advancing continuation.
             let advance_to = result
                 .next_chunk_index
                 .unwrap_or_else(|| chunk_index.saturating_add(1));
@@ -1502,7 +1502,6 @@ mod tests {
                     assert_eq!(error.sql_state.as_deref(), Some("08001"));
                 }
                 assert_eq!(*client.calls.lock().unwrap(), vec![1]);
-                // A later request can retry after the joined attempt has failed.
                 let retry = tokio::time::timeout(timeout, handle.fetch_links(1, 0))
                     .await
                     .unwrap()
