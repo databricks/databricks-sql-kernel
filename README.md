@@ -71,8 +71,9 @@ and security vulnerabilities should be reported according to
 `ResultStream::complete_volume_operation` completes server-marked SQL PUT, GET,
 and REMOVE instructions. Pass `VolumeOptions` with the local roots authorized for
 PUT and GET. Completion preserves the instruction rows; callers that want the raw
-result can omit completion. The PyO3 `ExecutedStatement` and `ResultStream`
-classes expose `is_volume_operation` and `complete_volume_operation`.
+result can omit completion. Complete the operation before reading its instruction
+rows. The PyO3 `ExecutedStatement` and `ResultStream` classes expose
+`is_volume_operation` and `complete_volume_operation`.
 
 A PUT instruction with `localFile == "__input_stream__"` returns
 `NeedsInputStream` until owned input bytes are supplied. An empty byte buffer is a
