@@ -854,9 +854,8 @@ export declare class AsyncStatement {
    * re-attempting the wire call. The kernel's own `Drop`
    * fire-and-forget retry runs once in the background.
    *
-   * Also invalidates the handles `awaitResult()` returned: their
-   * `fetchNextBatch()` then rejects with `InvalidStatementHandle`,
-   * unless a fetch was in progress when `close()` ran.
+   * Also invalidates the handles `awaitResult()` returned. An operation
+   * already in flight may finish before its handle is cleared.
    */
   close(): Promise<void>
 }

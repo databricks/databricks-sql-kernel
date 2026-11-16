@@ -377,9 +377,8 @@ impl AsyncStatement {
     /// re-attempting the wire call. The kernel's own `Drop`
     /// fire-and-forget retry runs once in the background.
     ///
-    /// Also invalidates the handles `awaitResult()` returned: their
-    /// `fetchNextBatch()` then rejects with `InvalidStatementHandle`,
-    /// unless a fetch was in progress when `close()` ran.
+    /// Also invalidates the handles `awaitResult()` returned. An operation
+    /// already in flight may finish before its handle is cleared.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         self.canceller.cancel_volume_operation();
@@ -404,7 +403,7 @@ impl AsyncStatement {
                 .map_err(napi_err_from_kernel);
             // Release what holds the session, so JS references to closed
             // handles don't keep it (and the host's telemetry client) alive.
-            // A stream held by an in-flight fetch is left; close doesn't wait.
+            // Queue busy slots so close need not wait for an in-flight operation.
             canceller
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -414,6 +413,11 @@ impl AsyncStatement {
             for slot in slots.iter().filter_map(Weak::upgrade) {
                 if let Ok(mut stream) = slot.try_lock() {
                     stream.take();
+                } else {
+                    let slot = Arc::clone(&slot);
+                    tokio::spawn(async move {
+                        slot.lock().await.take();
+                    });
                 }
             }
             outcome
@@ -460,7 +464,7 @@ impl Drop for AsyncStatement {
 /// post-close contract.
 #[napi]
 pub struct AsyncResultHandle {
-    /// Emptied by the parent's `close()`, unless a fetch holds it then.
+    /// Emptied after parent close once any in-flight operation releases it.
     inner: Arc<ResultSlot>,
     schema: SchemaRef,
     statement_id: String,
@@ -775,15 +779,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn close_does_not_wait_for_an_in_flight_fetch() {
+    async fn close_releases_session_after_an_in_flight_result() {
         let server = lease_server().await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let connection = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
         let statement = connection
             .submit_statement("SELECT 1 AS n".into(), None)
             .await
             .expect("submit");
         let result = statement.await_result().await.expect("await result");
-        // Hold the stream the way an in-flight `fetchNextBatch()` does.
+        // Both fetching and Volume completion hold the result slot throughout I/O.
         let in_flight = result.inner.lock().await;
         tokio::time::timeout(Duration::from_secs(5), statement.close())
             .await
@@ -791,6 +795,20 @@ mod tests {
             .expect("close statement");
         drop(in_flight);
         connection.close().await.expect("close session");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while result.inner.lock().await.is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closed result must release its session after the operation finishes");
+
+        let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(exports_for(&server, SECOND_SESSION).await, 0);
+        second.close().await.expect("close second session");
+        assert!(exports_for(&server, SECOND_SESSION).await > 0);
+        drop((statement, result));
     }
 
     #[tokio::test]
