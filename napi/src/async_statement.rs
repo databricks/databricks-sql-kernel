@@ -373,6 +373,10 @@ impl AsyncStatement {
     /// closed-handle short-circuit and returns `Ok(())` without
     /// re-attempting the wire call. The kernel's own `Drop`
     /// fire-and-forget retry runs once in the background.
+    ///
+    /// Also invalidates the handles `awaitResult()` returned: their
+    /// `fetchNextBatch()` then rejects with `InvalidStatementHandle`,
+    /// unless a fetch was in progress when `close()` ran.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
         let inner = Arc::clone(&self.inner);
@@ -473,6 +477,8 @@ impl AsyncResultHandle {
     /// message), suitable for handing to `apache-arrow`'s
     /// `RecordBatchReader`. Byte-identical to the sync
     /// `Statement.fetchNextBatch()` payload for the same query.
+    /// Rejects with `KernelError(InvalidStatementHandle)` after the
+    /// parent `AsyncStatement` is closed (see `AsyncStatement.close()`).
     #[napi]
     pub async fn fetch_next_batch(&self) -> napi::Result<Option<ArrowBatch>> {
         let inner = Arc::clone(&self.inner);
