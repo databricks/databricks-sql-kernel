@@ -376,6 +376,7 @@ impl VolumeState {
                 let mut referer = previous.clone();
                 let _ = referer.set_username("");
                 let _ = referer.set_password(None);
+                referer.set_query(None);
                 referer.set_fragment(None);
                 if let Ok(value) = referer.as_str().parse() {
                     request
@@ -918,7 +919,10 @@ mod tests {
         Mock::given(method("PUT"))
             .and(body_bytes(b"payload"))
             .and(header("authorization", "storage-secret"))
-            .respond_with(ResponseTemplate::new(307).insert_header("location", redirected.uri()))
+            .respond_with(ResponseTemplate::new(307).insert_header(
+                "location",
+                format!("{}/?signature=redirect-secret", redirected.uri()),
+            ))
             .expect(1)
             .mount(&server)
             .await;
@@ -935,6 +939,10 @@ mod tests {
                 ] {
                     assert!(!request.headers.contains_key(name));
                 }
+                let referer =
+                    reqwest::Url::parse(request.headers.get("referer").unwrap().to_str().unwrap())
+                        .unwrap();
+                assert!(referer.query().is_none());
                 let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
                 assert_eq!(request.method.as_str(), if first { "PUT" } else { "GET" });
                 assert_eq!(
@@ -949,7 +957,11 @@ mod tests {
             .expect(10)
             .mount(&redirected)
             .await;
-        let batch = instruction("PUT", &server.uri(), &source);
+        let batch = instruction(
+            "PUT",
+            &format!("{}/?signature=source-secret", server.uri()),
+            &source,
+        );
         let mut instruction = Instruction::decode(&batch).unwrap();
         for name in [
             "authorization",
