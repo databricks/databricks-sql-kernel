@@ -26,6 +26,7 @@ changes go in their respective binding's NEXT_CHANGELOG.
 ### Fixed
 
 - `Session::open` authenticates once before resolving feature flags. A failed OAuth token request now fails the open immediately instead of being sent a second time by CreateSession.
+- A timed-out or reset CloudFetch download no longer writes the presigned URL's signature (`sig=`, `X-Amz-Signature`) to the log or the returned error. The request URL in those messages now ends at the path, and debug request lines stop at `?`.
 
 ---
 *Note: When making changes, please add your change under the appropriate
