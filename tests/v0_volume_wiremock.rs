@@ -20,7 +20,7 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
     AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle, HttpConfig,
-    Session, VolumeCompletion, VolumeOptions,
+    ResultBatch, Session, VolumeCompletion, VolumeOptions,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 fn response(server: &MockServer, marked: bool, local: &str) -> serde_json::Value {
-    response_with_batches(server, marked, local, "GET", 1)
+    response_with_batches(server, marked, local, "GET", &[1])
 }
 
 fn response_with_batches(
@@ -37,7 +37,7 @@ fn response_with_batches(
     marked: bool,
     local: &str,
     operation: &str,
-    count: usize,
+    batch_rows: &[usize],
 ) -> serde_json::Value {
     let names = ["operation", "presignedUrl", "headers", "localFile"];
     let schema = Arc::new(Schema::new(
@@ -63,11 +63,12 @@ fn response_with_batches(
     let mut ipc = Vec::new();
     {
         let mut writer = StreamWriter::try_new(&mut ipc, &batch.schema()).unwrap();
-        for _ in 0..count {
-            writer.write(&batch).unwrap();
+        for &rows in batch_rows {
+            writer.write(&batch.slice(0, rows)).unwrap();
         }
         writer.finish().unwrap();
     }
+    let count: usize = batch_rows.iter().sum();
     json!({
         "statement_id": "volume-stmt", "status": {"state": "CLOSED"},
         "manifest": {
@@ -80,41 +81,61 @@ fn response_with_batches(
 }
 
 #[tokio::test]
-async fn multiple_instruction_batches_fail_before_any_storage_request() {
-    let server = MockServer::start().await;
-    let dir = tempfile::tempdir().unwrap();
-    let dest = dir.path().join("download");
-    std::fs::write(&dest, b"original").unwrap();
-    let session = session(
-        &server,
-        response_with_batches(&server, true, dest.to_str().unwrap(), "GET", 2),
-    )
-    .await;
-    Mock::given(method("GET"))
-        .and(path("/object"))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(b"replacement"))
-        .expect(0)
-        .mount(&server)
+async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
+    for (batch_rows, valid) in [(&[1, 1][..], false), (&[0, 0, 1, 0][..], true)] {
+        let server = MockServer::start().await;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("download");
+        std::fs::write(&dest, b"original").unwrap();
+        let session = session(
+            &server,
+            response_with_batches(&server, true, dest.to_str().unwrap(), "GET", batch_rows),
+        )
         .await;
-    let mut statement = session.statement();
-    statement.spec().sql("operation");
-    let mut executed = statement.execute().await.unwrap();
-    let options = VolumeOptions {
-        allowed_paths: vec![dir.path().to_owned()],
-        ..Default::default()
-    };
-    for _ in 0..2 {
-        let error = executed
-            .result_stream_mut()
-            .complete_volume_operation(&options, None)
-            .await
-            .unwrap_err();
-        assert_eq!(error.code, ErrorCode::InvalidArgument);
-        assert_eq!(error.message, "Expected one Volume instruction row");
+        Mock::given(method("GET"))
+            .and(path("/object"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(b"replacement"))
+            .expect(if valid { 1 } else { 0 })
+            .mount(&server)
+            .await;
+        let mut statement = session.statement();
+        statement.spec().sql("operation");
+        let mut executed = statement.execute().await.unwrap();
+        let options = VolumeOptions {
+            allowed_paths: vec![dir.path().to_owned()],
+            ..Default::default()
+        };
+        for _ in 0..2 {
+            let result = executed
+                .result_stream_mut()
+                .complete_volume_operation(&options, None)
+                .await;
+            if valid {
+                assert_eq!(result.unwrap(), VolumeCompletion::Completed);
+            } else {
+                let error = result.unwrap_err();
+                assert_eq!(error.code, ErrorCode::InvalidArgument);
+                assert_eq!(error.message, "Expected one Volume instruction row");
+            }
+        }
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            if valid {
+                b"replacement".as_slice()
+            } else {
+                b"original".as_slice()
+            }
+        );
+        if valid {
+            let ResultBatch::Arrow(batch) = executed.next_batch().await.unwrap().unwrap() else {
+                panic!("expected Arrow instruction batch");
+            };
+            assert_eq!(batch.num_rows(), 1);
+            assert!(executed.next_batch().await.unwrap().is_none());
+        }
+        executed.close().await.unwrap();
+        session.close().await.unwrap();
     }
-    assert_eq!(std::fs::read(&dest).unwrap(), b"original");
-    executed.close().await.unwrap();
-    session.close().await.unwrap();
 }
 
 async fn session(server: &MockServer, body: serde_json::Value) -> Session {
@@ -179,7 +200,7 @@ async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_ou
         http.overall_timeout = Duration::from_millis(200);
         let session = session_with_http(
             &server,
-            response_with_batches(&server, true, local.to_str().unwrap(), operation, 1),
+            response_with_batches(&server, true, local.to_str().unwrap(), operation, &[1]),
             http,
         )
         .await;
@@ -373,7 +394,7 @@ async fn cancellation_and_session_close_interrupt_instruction_or_storage_after_s
         let held_path = if instruction_page {
             body["manifest"]["total_chunk_count"] = json!(2);
             body["result"]["next_chunk_index"] = json!(1);
-            let mut next = response_with_batches(&server, true, dest.to_str().unwrap(), "GET", 0)
+            let mut next = response_with_batches(&server, true, dest.to_str().unwrap(), "GET", &[])
                 ["result"]
                 .clone();
             next["chunk_index"] = json!(1);

@@ -676,16 +676,21 @@ impl ResultStream {
             biased;
             error = state.cancellation() => Err(error),
             result = async {
-                let batch = self
-                    .peek_first_batch()
-                    .await
-                    .map_err(|error| state.fail(error))?
-                    .ok_or_else(|| {
-                        state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
-                    })?;
-                let ResultBatch::Arrow(batch) = batch;
-                let batch = ResultBatch::Arrow(batch.clone());
-                // The first batch stays buffered for callers; later batches must not
+                let batch = loop {
+                    let batch = self
+                        .peek_first_batch()
+                        .await
+                        .map_err(|error| state.fail(error))?
+                        .ok_or_else(|| {
+                            state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
+                        })?;
+                    let ResultBatch::Arrow(batch) = batch;
+                    if batch.num_rows() != 0 {
+                        break ResultBatch::Arrow(batch.clone());
+                    }
+                    self.prefetched = None;
+                };
+                // The instruction stays buffered for callers; later batches must not
                 // authorize a partial transfer of a multi-row instruction result.
                 while !self.exhausted {
                     match self
@@ -870,14 +875,11 @@ impl ResultStream {
         }
     }
 
-    /// Non-consuming peek at the **first** batch of the stream.
+    /// Non-consuming peek at the next buffered batch.
     ///
-    /// Buffers the first batch or error so the caller's next read observes
-    /// the same outcome. Returns `None` for an empty
-    /// stream. Only valid before any `next_batch`/`peek_first_batch` has
-    /// run (it no-ops if a batch is already current or buffered), which is
-    /// the only context it's used in: deriving a DML row-count off the
-    /// terminal result at statement-construction time.
+    /// Pulls a batch or error when none is current or buffered and the reader is not
+    /// exhausted. A subsequent [`next_batch`](Self::next_batch) still returns
+    /// the buffered outcome.
     pub(crate) async fn peek_first_batch(&mut self) -> Result<Option<&ResultBatch>> {
         if self.prefetched.is_none() && self.current.is_none() && !self.exhausted {
             let reader = self
