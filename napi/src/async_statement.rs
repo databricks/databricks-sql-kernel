@@ -712,7 +712,7 @@ mod tests {
     /// their statements are closed, even while JS still references the closed
     /// handles. Otherwise the next session on the host reuses it and ignores
     /// its own telemetry settings.
-    async fn next_session_gets_its_own_telemetry_client(fetch_result: bool) {
+    async fn next_session_gets_its_own_telemetry_client(fetch_result: bool, sync_statement: bool) {
         let server = lease_server().await;
         // Batch size 1: this client exports every event at once.
         let first = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
@@ -726,6 +726,16 @@ mod tests {
             None
         };
         statement.close().await.expect("close statement");
+        let sync_statement = if sync_statement {
+            let statement = first
+                .execute_statement("SELECT 1 AS n".into(), None)
+                .await
+                .expect("execute");
+            statement.close().await.expect("close sync statement");
+            Some(statement)
+        } else {
+            None
+        };
         first.close().await.expect("close first session");
 
         let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
@@ -750,17 +760,18 @@ mod tests {
             assert!(err.reason.contains("AsyncResultHandle already closed"));
         }
         // Dropped only now, as JS GC would.
-        drop((statement, result));
+        drop((statement, result, sync_statement));
     }
 
     #[tokio::test]
     async fn close_releases_session_held_by_canceller() {
-        next_session_gets_its_own_telemetry_client(false).await;
+        next_session_gets_its_own_telemetry_client(false, false).await;
+        next_session_gets_its_own_telemetry_client(false, true).await;
     }
 
     #[tokio::test]
     async fn close_releases_session_held_by_result_handles() {
-        next_session_gets_its_own_telemetry_client(true).await;
+        next_session_gets_its_own_telemetry_client(true, false).await;
     }
 
     #[tokio::test]
@@ -794,7 +805,7 @@ mod tests {
             .with_priority(1)
             .mount(&server)
             .await;
-        let connection = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        let connection = telemetry_connection(&server, 1, Duration::from_millis(100)).await;
         let statement = connection
             .submit_statement("SELECT 1 AS n".into(), None)
             .await
@@ -806,6 +817,20 @@ mod tests {
             .expect_err("the close RPC must fail");
         assert!(statement.canceller.lock().unwrap().is_none());
         assert!(result.inner.lock().await.is_none());
+        let sync_statement = connection
+            .execute_statement("SELECT 1 AS n".into(), None)
+            .await
+            .expect("execute");
+        sync_statement
+            .close()
+            .await
+            .expect_err("the close RPC must fail");
+        sync_statement.close().await.expect("close is terminal");
         connection.close().await.expect("close session");
+        let second = telemetry_connection(&server, 1_000, Duration::from_secs(300)).await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(exports_for(&server, SECOND_SESSION).await, 0);
+        second.close().await.expect("close second session");
+        drop(sync_statement);
     }
 }

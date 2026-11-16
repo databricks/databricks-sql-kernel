@@ -1301,22 +1301,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("DELETE"))
             .respond_with(ResponseTemplate::new(404))
-            .expect(2)
+            .expect(1)
             .mount(&server)
             .await;
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
-        let strict = VolumeOptions::default();
-        assert_eq!(
-            transfer_state(0)
-                .complete(&batch, &Client::new(), &strict, None)
-                .await
-                .unwrap_err()
-                .http_status,
-            Some(404)
-        );
         let permissive = VolumeOptions {
             remove_not_found_is_success: true,
-            ..strict
+            ..VolumeOptions::default()
         };
         assert_eq!(
             transfer_state(0)

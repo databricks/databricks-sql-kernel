@@ -30,7 +30,7 @@
 //!   server logs which key on the same id.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use tokio::sync::Mutex;
 
 use arrow_schema::SchemaRef;
@@ -132,7 +132,7 @@ pub struct Statement {
     /// queries driven through `Metadata`).
     statement_id: String,
     is_volume_operation: bool,
-    canceller: Option<StatementCanceller>,
+    canceller: StdMutex<Option<StatementCanceller>>,
     /// Set to `true` when `fetchNextBatch` observes the natural end of
     /// the stream (`None`). `cancel()` short-circuits to `Ok(())` when
     /// this is set, matching the JDBC `Statement.cancel()` no-op-after-
@@ -156,7 +156,7 @@ impl Statement {
         let schema = executed.schema();
         let statement_id = executed.statement_id().to_owned();
         let is_volume_operation = executed.result_stream().is_volume_operation();
-        let canceller = Some(parent.canceller());
+        let canceller = StdMutex::new(Some(parent.canceller()));
         Self {
             inner: Arc::new(Mutex::new(Some(AnyInner::Executed(Box::new(
                 StatementInner {
@@ -189,7 +189,7 @@ impl Statement {
             schema,
             statement_id: String::new(),
             is_volume_operation: false,
-            canceller: None,
+            canceller: StdMutex::new(None),
             finished: Arc::new(AtomicBool::new(false)),
         }
     }
@@ -458,7 +458,12 @@ impl Statement {
     /// has been explicitly `close()`d.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
-        if let Some(canceller) = &self.canceller {
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
             canceller.cancel_volume_operation();
         }
         // Idempotent against natural completion.
@@ -520,7 +525,12 @@ impl Statement {
     /// resource to release).
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
-        if let Some(canceller) = &self.canceller {
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             canceller.cancel_volume_operation();
         }
         let inner = Arc::clone(&self.inner);
@@ -549,7 +559,12 @@ impl Statement {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        if let Some(canceller) = &self.canceller {
+        if let Some(canceller) = self
+            .canceller
+            .get_mut()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+        {
             canceller.cancel_volume_operation();
         }
         // Best-effort cleanup: schedule a drop of the kernel handle on
@@ -841,7 +856,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)), // "already closed"
             schema: make_schema(),
             is_volume_operation: false,
-            canceller: None,
+            canceller: StdMutex::new(None),
             statement_id: "stmt-survives-close".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -858,7 +873,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             schema: schema.clone(),
             is_volume_operation: false,
-            canceller: None,
+            canceller: StdMutex::new(None),
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -879,7 +894,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)),
             schema: make_schema(),
             is_volume_operation: false,
-            canceller: None,
+            canceller: StdMutex::new(None),
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(false)),
         };
@@ -897,7 +912,7 @@ mod tests {
             inner: Arc::new(Mutex::new(None)), // closed
             schema: make_schema(),
             is_volume_operation: false,
-            canceller: None,
+            canceller: StdMutex::new(None),
             statement_id: "x".to_owned(),
             finished: Arc::new(AtomicBool::new(true)),
         };
