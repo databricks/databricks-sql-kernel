@@ -355,7 +355,6 @@ impl AsyncStatement {
     /// `InvalidStatementHandle`.
     #[napi]
     pub async fn cancel(&self) -> napi::Result<()> {
-        self.canceller.cancel_volume_operation();
         if self.closed.load(Ordering::Acquire) {
             return Err(closed_err("AsyncStatement"));
         }
@@ -367,6 +366,7 @@ impl AsyncStatement {
         let Some(canceller) = canceller else {
             return Err(closed_err("AsyncStatement"));
         };
+        canceller.cancel_volume_operation();
         guarded(async move { canceller.cancel().await.map_err(napi_err_from_kernel) }).await
     }
 
@@ -381,7 +381,14 @@ impl AsyncStatement {
     /// already in flight may finish before its handle is cleared.
     #[napi]
     pub async fn close(&self) -> napi::Result<()> {
-        self.canceller.cancel_volume_operation();
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            canceller.cancel_volume_operation();
+        }
         let inner = Arc::clone(&self.inner);
         let closed = Arc::clone(&self.closed);
         let canceller = Arc::clone(&self.canceller);
@@ -428,7 +435,14 @@ impl AsyncStatement {
 
 impl Drop for AsyncStatement {
     fn drop(&mut self) {
-        self.canceller.cancel_volume_operation();
+        if let Some(canceller) = self
+            .canceller
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_ref()
+        {
+            canceller.cancel_volume_operation();
+        }
         // Best-effort cleanup — same shape as `Connection::Drop`.
         // JS callers needing a guaranteed close-with-error-surface
         // call `close()` explicitly.

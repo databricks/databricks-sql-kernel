@@ -404,7 +404,11 @@ mod tests {
                 stream.attach_volume(
                     true,
                     crate::volume::VolumeState::new(Default::default(), None),
-                    reqwest::Client::new(),
+                    Arc::new(
+                        crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                            .unwrap()
+                            .storage_client(None),
+                    ),
                 );
                 stream
                     .complete_volume_operation(&Default::default(), None)

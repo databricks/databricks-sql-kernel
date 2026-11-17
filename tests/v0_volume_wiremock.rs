@@ -20,7 +20,7 @@ use arrow_schema::{DataType, Field, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
     AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle, HttpConfig,
-    ResultBatch, Session, VolumeCompletion, VolumeOptions,
+    ResultBatch, Session, TryNextBatch, VolumeCompletion, VolumeOptions,
 };
 use serde_json::json;
 use std::sync::Arc;
@@ -126,13 +126,19 @@ async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
                 b"original".as_slice()
             }
         );
-        if valid {
+        let TryNextBatch::Ready(ResultBatch::Arrow(batch)) =
+            executed.result_stream_mut().try_next_batch().unwrap()
+        else {
+            panic!("expected buffered instruction batch");
+        };
+        assert_eq!(batch.num_rows(), 1);
+        if !valid {
             let ResultBatch::Arrow(batch) = executed.next_batch().await.unwrap().unwrap() else {
-                panic!("expected Arrow instruction batch");
+                panic!("expected retained extra instruction batch");
             };
             assert_eq!(batch.num_rows(), 1);
-            assert!(executed.next_batch().await.unwrap().is_none());
         }
+        assert!(executed.next_batch().await.unwrap().is_none());
         executed.close().await.unwrap();
         session.close().await.unwrap();
     }

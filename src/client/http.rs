@@ -388,6 +388,27 @@ pub struct DatabricksHttpClient {
     retry_configs: HashMap<RequestCategory, RetryConfig>,
 }
 
+pub(crate) struct StorageClient {
+    config: HttpClientConfig,
+    client: OnceLock<Result<Client>>,
+}
+
+impl StorageClient {
+    pub(crate) fn get(&self) -> Result<&Client> {
+        self.client
+            .get_or_init(|| {
+                // File replay uses one redirect budget across all hops.
+                DatabricksHttpClient::build_reqwest_client(
+                    &self.config,
+                    reqwest::redirect::Policy::none(),
+                    None,
+                )
+            })
+            .as_ref()
+            .map_err(Clone::clone)
+    }
+}
+
 impl DatabricksHttpClient {
     /// Creates a new HTTP client with the given configuration and per-category retry configs.
     ///
@@ -742,13 +763,15 @@ impl DatabricksHttpClient {
     }
 
     /// Storage transfers can outlive SQL RPCs, so retain connection settings without their deadline.
-    pub(crate) fn storage_client(&self, connect_timeout: Option<Duration>) -> Result<Client> {
+    pub(crate) fn storage_client(&self, connect_timeout: Option<Duration>) -> StorageClient {
         let mut config = self.config.clone();
         if let Some(timeout) = connect_timeout {
             config.connect_timeout = config.connect_timeout.min(timeout);
         }
-        // Volume completion reopens file bodies and applies one redirect budget across all hops.
-        Self::build_reqwest_client(&config, reqwest::redirect::Policy::none(), None)
+        StorageClient {
+            config,
+            client: OnceLock::new(),
+        }
     }
 
     /// Get the authorization header value.
@@ -1583,8 +1606,19 @@ lGrv15pBcePj
 
         let mut config = HttpClientConfig::default();
         config.tls.trusted_certificate_path = Some(tmp.path().to_string_lossy().to_string());
-        let client = DatabricksHttpClient::new(config, default_retry_configs());
-        assert!(client.is_ok());
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        let storage = client.storage_client(None);
+        assert!(storage.client.get().is_none());
+        std::fs::write(tmp.path(), "not a certificate").unwrap();
+        let error = storage.get().unwrap_err();
+        assert!(error.message.contains("Invalid PEM certificate"), "{error}");
+        std::fs::write(tmp.path(), TEST_CA_CERT_PEM).unwrap();
+        assert_eq!(storage.get().unwrap_err().message, error.message);
+
+        let storage = client.storage_client(None);
+        let first = storage.get().unwrap();
+        std::fs::write(tmp.path(), "not a certificate").unwrap();
+        assert!(std::ptr::eq(first, storage.get().unwrap()));
     }
 
     #[test]

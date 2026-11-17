@@ -798,7 +798,15 @@ mod tests {
                     ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
                         .await
                         .unwrap();
-                stream.attach_volume(marked, Arc::clone(&volume), reqwest::Client::new());
+                stream.attach_volume(
+                    marked,
+                    Arc::clone(&volume),
+                    Arc::new(
+                        crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                            .unwrap()
+                            .storage_client(None),
+                    ),
+                );
                 into_raw_result_stream(schema.clone(), stream)
             });
             let mut is_volume = !marked;

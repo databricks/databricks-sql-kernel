@@ -451,10 +451,12 @@ fn upload_body(
     path: String,
     error: Arc<Mutex<Option<Error>>>,
 ) -> reqwest::Body {
-    reqwest::Body::wrap_stream(ReaderStream::new(reader).map_err(move |cause| {
-        *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
-        std::io::Error::other("Volume upload source could not be read")
-    }))
+    reqwest::Body::wrap_stream(ReaderStream::with_capacity(reader, 256 * 1024).map_err(
+        move |cause| {
+            *error.lock().unwrap_or_else(|e| e.into_inner()) = Some(local_error(cause, &path));
+            std::io::Error::other("Volume upload source could not be read")
+        },
+    ))
 }
 
 fn invalid(message: &str) -> Error {
@@ -516,12 +518,17 @@ fn storage_error(error: reqwest::Error) -> Error {
     let retryable = !source_body_failed
         && RetryStrategy::for_request(RequestType::CloudFetchDownload, &RetryConfig::default())
             .is_retryable_error(&error);
+    let error = error.without_url();
+    let mut causes = crate::client::error_chain(&error)
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    causes.dedup();
     Error::network_error()
         .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
         .with_retryable(retryable)
         .message(format!(
             "Volume storage request failed: {}",
-            error.without_url()
+            causes.join(": ")
         ))
 }
 
@@ -533,7 +540,17 @@ fn response_body_error(error: reqwest::Error) -> Error {
 }
 
 fn local_error(error: std::io::Error, path: &str) -> Error {
-    let mut result = Error::io().message(format!("{error}: {path}"));
+    let mut result = match error.kind() {
+        std::io::ErrorKind::NotFound => Error::not_found(),
+        std::io::ErrorKind::PermissionDenied => Error::permission_denied(),
+        std::io::ErrorKind::InvalidInput
+        | std::io::ErrorKind::IsADirectory
+        | std::io::ErrorKind::NotADirectory => Error::invalid_argument(),
+        _ => Error::io(),
+    }
+    .with_error_code("VOLUME_LOCAL_FILE_ERROR")
+    .with_sql_state("HY000")
+    .message(format!("{error}: {path}"));
     result.local_error = Some(Box::new(LocalFileError {
         raw_os_error: error.raw_os_error(),
         kind: format!("{:?}", error.kind()),
@@ -806,7 +823,8 @@ mod tests {
         .await
         .unwrap_err();
         assert!(!error.retryable);
-        assert_eq!(error.code, crate::ErrorCode::Internal);
+        assert_eq!(error.code, crate::ErrorCode::NotFound);
+        assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
         let local = error.local_error.unwrap();
         assert_eq!(local.raw_os_error, os_code);
         assert_eq!(local.path, source.to_str().unwrap());
@@ -818,8 +836,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("source");
         for (operation, status, stream, payload) in [
-            ("PUT", 307, false, vec![42; 128 * 1024]),
-            ("PUT", 308, false, vec![42; 128 * 1024]),
+            ("PUT", 307, false, vec![42; 512 * 1024 + 17]),
+            ("PUT", 308, false, vec![42; 512 * 1024 + 17]),
             ("PUT", 307, true, vec![]),
             ("PUT", 307, true, b"payload".to_vec()),
             ("PUT", 308, true, b"payload".to_vec()),
@@ -1280,6 +1298,8 @@ mod tests {
                     .complete(&batch, &Client::new(), &options(dir.path()), None)
                     .await
                     .unwrap_err();
+                assert_eq!(error.code, crate::ErrorCode::PermissionDenied);
+                assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
                 let local = error.local_error.unwrap();
                 assert_eq!(local.kind, "PermissionDenied");
                 assert_eq!(local.path, dest.to_string_lossy());
@@ -1617,14 +1637,23 @@ mod tests {
     async fn local_errors_retain_os_code_and_requested_filename() {
         let dir = tempfile::tempdir().unwrap();
         let server = MockServer::start().await;
-        for (source, kind) in [
-            (dir.path().join("missing"), "NotFound"),
+        for (source, kind, code) in [
+            (
+                dir.path().join("missing"),
+                "NotFound",
+                crate::ErrorCode::NotFound,
+            ),
             (
                 dir.path().to_owned(),
                 if cfg!(windows) {
                     "PermissionDenied"
                 } else {
                     "IsADirectory"
+                },
+                if cfg!(windows) {
+                    crate::ErrorCode::PermissionDenied
+                } else {
+                    crate::ErrorCode::InvalidArgument
                 },
             ),
         ] {
@@ -1638,6 +1667,10 @@ mod tests {
                 .complete(&batch, &Client::new(), &options(dir.path()), None)
                 .await
                 .unwrap_err();
+            assert_eq!(error.code, code);
+            assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
+            assert_eq!(error.sql_state.as_deref(), Some("HY000"));
+            assert!(!error.retryable);
             let local = error.local_error.as_ref().unwrap();
             assert_eq!(local.kind, kind);
             assert!(local.raw_os_error.is_some());
@@ -1656,6 +1689,59 @@ mod tests {
             );
         }
         assert!(server.received_requests().await.unwrap().is_empty());
+        for (kind, code) in [
+            (
+                std::io::ErrorKind::PermissionDenied,
+                crate::ErrorCode::PermissionDenied,
+            ),
+            (
+                std::io::ErrorKind::InvalidInput,
+                crate::ErrorCode::InvalidArgument,
+            ),
+            (
+                std::io::ErrorKind::NotADirectory,
+                crate::ErrorCode::InvalidArgument,
+            ),
+            (std::io::ErrorKind::Other, crate::ErrorCode::Internal),
+        ] {
+            let error = local_error(std::io::Error::from(kind), "requested");
+            assert_eq!(error.code, code);
+            assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
+            assert_eq!(error.sql_state.as_deref(), Some("HY000"));
+            assert!(!error.retryable);
+            let local = error.local_error.unwrap();
+            assert_eq!(local.kind, format!("{kind:?}"));
+            assert_eq!(local.path, "requested");
+        }
+    }
+
+    #[tokio::test]
+    async fn storage_network_errors_preserve_causes_without_signed_urls() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let url = format!("http://{address}/object?secret=hidden");
+        let error = Client::builder()
+            .no_proxy()
+            .build()
+            .unwrap()
+            .get(&url)
+            .send()
+            .await
+            .unwrap_err();
+        let mapped = storage_error(error);
+        assert_eq!(mapped.code, crate::ErrorCode::NetworkError);
+        assert_eq!(
+            mapped.error_code.as_deref(),
+            Some("VOLUME_STORAGE_NETWORK_ERROR")
+        );
+        assert!(mapped.retryable);
+        assert!(
+            mapped.message.to_ascii_lowercase().contains("refused"),
+            "{mapped}"
+        );
+        assert!(!mapped.message.contains(&address.to_string()), "{mapped}");
+        assert!(!mapped.message.contains("hidden"), "{mapped}");
     }
 
     #[test]

@@ -97,7 +97,7 @@ pub(crate) struct SessionInner {
     /// behind the trait object; future variants slot in via
     /// `TransportMode`.
     transport: Arc<dyn Transport>,
-    storage_client: reqwest::Client,
+    storage_client: Arc<crate::client::http::StorageClient>,
     storage_retry: RetryConfig,
     volume_states: std::sync::Mutex<Option<Vec<std::sync::Weak<crate::volume::VolumeState>>>>,
 
@@ -188,8 +188,8 @@ impl SessionInner {
         }
     }
 
-    pub(crate) fn storage_client(&self) -> reqwest::Client {
-        self.storage_client.clone()
+    pub(crate) fn storage_client(&self) -> Arc<crate::client::http::StorageClient> {
+        Arc::clone(&self.storage_client)
     }
 
     /// Crate-internal accessor for the session's transport. Used by
@@ -408,7 +408,7 @@ impl Session {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?,
         );
-        let storage_client = http_client.storage_client(config.http.storage_read_timeout)?;
+        let storage_client = Arc::new(http_client.storage_client(config.http.storage_read_timeout));
 
         // 2. Auth provider — async because OAuth flows hit the OIDC
         //    discovery endpoint.
