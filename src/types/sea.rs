@@ -354,8 +354,9 @@ pub struct StatementParameter {
     /// `:name`-style markers and `ordinal` should be `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
-    /// 1-based position of the parameter in the SQL statement. When
-    /// `Some`, the SQL uses `?` markers and `name` should be `None`.
+    /// Position of the parameter: zero-based within native parameter sets,
+    /// one-based for ordinary execution. When `Some`, the SQL uses `?`
+    /// markers and `name` should be `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ordinal: Option<i32>,
     /// Databricks SQL type name (e.g., "INT", "STRING", "DOUBLE", "TIMESTAMP").
@@ -377,6 +378,11 @@ pub struct QueryTag {
     pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct StatementParameterSet {
+    pub parameters: Vec<StatementParameter>,
 }
 
 /// Request body for statement execution.
@@ -410,6 +416,9 @@ pub struct ExecuteStatementRequest {
     /// Positional parameters for parameterized queries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<StatementParameter>,
+    /// Ordered native batch bindings, mutually exclusive with `parameters`.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub parameter_sets: Vec<StatementParameterSet>,
     /// Per-statement query tags, emitted as the native SEA `query_tags`
     /// array (`[{key, value}]`). Empty → omitted from the request body.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -426,6 +435,7 @@ pub struct ExecuteParams {
     pub row_limit: Option<i64>,
     /// Parameters for parameterized query execution.
     pub parameters: Vec<StatementParameter>,
+    pub parameter_sets: Vec<StatementParameterSet>,
     /// Per-statement query tags, forwarded to the SEA request's native
     /// `query_tags` array. Derived from `StatementSpec.statement_conf
     /// ["query_tags"]` in `build_execute_params`.
@@ -598,6 +608,7 @@ mod tests {
             row_limit: None,
             result_compression: None,
             parameters: vec![],
+            parameter_sets: vec![],
             query_tags: vec![],
         };
 
@@ -625,6 +636,7 @@ mod tests {
             row_limit: None,
             result_compression: None,
             parameters: vec![],
+            parameter_sets: vec![],
             query_tags: vec![
                 QueryTag {
                     key: "team".to_string(),

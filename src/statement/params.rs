@@ -529,7 +529,8 @@ fn typed_value_to_sea_payload(value: &TypedValue) -> Result<SeaPayload> {
 /// Convert a positional [`TypedValue`] binding to a SEA
 /// [`StatementParameter`].
 ///
-/// `ordinal` is 1-based on the wire. Direct conversion — no
+/// `ordinal` is the wire ordinal: zero-based for native parameter sets,
+/// one-based for ordinary execution. Direct conversion — no
 /// Arrow round-trip. Returns `Err(InvalidArgument)` for variants
 /// the SEA wire protocol does not accept (today: `Binary`).
 pub(crate) fn typed_value_to_sea_parameter(

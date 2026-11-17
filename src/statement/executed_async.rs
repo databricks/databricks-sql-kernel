@@ -223,6 +223,7 @@ pub struct ExecutedAsyncStatement {
     latest_status: Arc<std::sync::Mutex<crate::types::sea::StatementStatus>>,
     /// Take-once ownership avoids retaining raw payloads after reader construction.
     pending_result: std::sync::Mutex<Option<ExecuteResponse>>,
+    parameter_set_count: usize,
     statement_telemetry: StatementTelemetry,
     /// Set once result materialisation hands success finalization to
     /// the returned `ResultStream`.
@@ -335,6 +336,7 @@ impl ExecutedAsyncStatement {
             session_attribution: SessionAttribution::Current,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             pending_result: std::sync::Mutex::new(None),
+            parameter_set_count: 0,
             statement_telemetry,
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline,
@@ -342,6 +344,11 @@ impl ExecutedAsyncStatement {
             client_timeout_expired: AtomicBool::new(false),
             terminal_observed: AtomicBool::new(initial_terminal),
         }
+    }
+
+    pub(crate) fn with_parameter_set_count(mut self, count: usize) -> Self {
+        self.parameter_set_count = count;
+        self
     }
 
     /// Crate-internal constructor for a **non-owning** (read-only
@@ -395,6 +402,7 @@ impl ExecutedAsyncStatement {
             session_attribution,
             latest_status: Arc::new(std::sync::Mutex::new(initial_status)),
             pending_result: std::sync::Mutex::new(None),
+            parameter_set_count: 0,
             statement_telemetry: StatementTelemetry::noop(),
             result_stream_owns_success_telemetry: AtomicBool::new(false),
             client_deadline: None,
@@ -421,7 +429,8 @@ impl ExecutedAsyncStatement {
                 Arc::clone(&self.owner_released),
                 self.session_attribution,
                 status,
-            ),
+            )
+            .with_parameter_set_count(self.parameter_set_count),
         })
     }
 
@@ -940,13 +949,23 @@ impl ExecutedAsyncStatement {
                 if result.status.state == crate::types::sea::StatementState::Closed {
                     self.closed.store(true, Ordering::Release);
                 }
+                let result = crate::statement::dml_count::decode_parameter_batch(
+                    result,
+                    self.parameter_set_count,
+                )
+                .await?;
+                if self.parameter_set_count != 0 {
+                    if let Ok(mut status) = self.latest_status.lock() {
+                        status.num_modified_rows = result.status.num_modified_rows;
+                    }
+                }
                 let mut stream = ResultStream::from_reader(result.reader).await?;
                 stream.attach_telemetry(self.statement_telemetry.clone());
                 // SEA carries no row count on the async status either; for a
                 // DML the count rides in the result set. Derive it once
                 // (non-consuming) and record it onto the latest status so
                 // `num_modified_rows()` matches the sync path / Thrift.
-                if self.num_modified_rows().is_none() {
+                if self.parameter_set_count == 0 && self.num_modified_rows().is_none() {
                     if let Some(n) =
                         crate::statement::dml_count::read_dml_affected_rows(&mut stream).await?
                     {

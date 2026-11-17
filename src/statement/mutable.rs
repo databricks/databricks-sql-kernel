@@ -62,10 +62,13 @@ use crate::session::SessionInner;
 use crate::statement::executed::ExecutedStatement;
 use crate::statement::executed_async::ExecutedAsyncStatement;
 use crate::statement::params::{named_typed_value_to_sea_parameter, typed_value_to_sea_parameter};
-use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec};
+use crate::statement::spec::{deserialize_query_tags, ResultFormat, StatementSpec, TypedValue};
 use crate::statement::validity::ValidityFlag;
 use crate::telemetry::{OperationType, StatementTelemetry, StatementType};
-use crate::types::sea::{ExecuteParams, QueryTag, StatementState};
+use crate::types::sea::{
+    ExecuteParams, QueryTag, StatementParameter, StatementParameterSet, StatementState,
+};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -142,24 +145,6 @@ fn build_execute_params(
     if spec.result_format != ResultFormat::Arrow {
         return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
     }
-    // Positional and named parameters are mutually exclusive: the SEA
-    // server rejects a mixed `parameters` array with
-    // `INVALID_PARAMETER_MARKER_VALUE.MISSING_NAME` (a `BAD_REQUEST`).
-    // Reject at bind time in the kernel so every binding (napi, pyo3,
-    // direct Rust) gets the same InvalidArgument before the wire,
-    // rather than an opaque server round-trip failure.
-    if !spec.positional_params.is_empty() && !spec.named_params.is_empty() {
-        return Err(Error::invalid_argument()
-            .message("positional and named parameters are mutually exclusive; pass only one"));
-    }
-    // raw_params (the C-ABI host-marshalled path) is mutually exclusive with the
-    // TypedValue paths — a host uses one binding style per statement.
-    if !spec.raw_params.is_empty()
-        && (!spec.positional_params.is_empty() || !spec.named_params.is_empty())
-    {
-        return Err(Error::invalid_argument()
-            .message("raw parameters cannot be mixed with positional/named TypedValue params"));
-    }
     let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
     let mut exec_params = ExecuteParams {
         wait_timeout,
@@ -167,36 +152,27 @@ fn build_execute_params(
         row_limit: spec.row_limit,
         ..ExecuteParams::default()
     };
-    for (i, value) in spec.positional_params.iter().enumerate() {
-        exec_params
-            .parameters
-            .push(typed_value_to_sea_parameter((i + 1) as i32, value)?);
-    }
-    for (name, value) in spec.named_params.iter() {
-        exec_params
-            .parameters
-            .push(named_typed_value_to_sea_parameter(name.clone(), value)?);
-    }
-    // Raw (host-marshalled) params: emit verbatim. Positional entries (name
-    // None) get a 1-based ordinal in push order; named entries pass through.
-    // Positional and named raw params are mutually exclusive for the same reason
-    // TypedValue ones are (the SEA server rejects a mixed markers array).
-    {
-        let has_named_raw = spec.raw_params.iter().any(|p| p.name.is_some());
-        let has_pos_raw = spec.raw_params.iter().any(|p| p.name.is_none());
-        if has_named_raw && has_pos_raw {
-            return Err(Error::invalid_argument().message(
-                "positional and named raw parameters are mutually exclusive; pass only one",
-            ));
+    if spec.parameter_sets.is_empty() {
+        exec_params.parameters = build_parameters(
+            &spec.positional_params,
+            &spec.named_params,
+            &spec.raw_params,
+            1,
+        )?;
+    } else {
+        if !spec.positional_params.is_empty()
+            || !spec.named_params.is_empty()
+            || !spec.raw_params.is_empty()
+        {
+            return Err(Error::invalid_argument()
+                .message("scalar parameters and native parameter sets are mutually exclusive"));
         }
-        let mut ordinal = 0i32;
-        for p in spec.raw_params.iter() {
-            let mut param = p.clone();
-            if param.name.is_none() {
-                ordinal += 1;
-                param.ordinal = Some(ordinal);
-            }
-            exec_params.parameters.push(param);
+        // A row cap could truncate the count result without limiting inserted rows.
+        exec_params.row_limit = None;
+        for set in &spec.parameter_sets {
+            exec_params.parameter_sets.push(StatementParameterSet {
+                parameters: build_parameters(&set.positional, &set.named, &set.raw, 0)?,
+            });
         }
     }
     // Per-statement query tags: both `Statement::query_tags` and a raw
@@ -209,6 +185,48 @@ fn build_execute_params(
             .collect();
     }
     Ok((sql, exec_params))
+}
+
+fn build_parameters(
+    positional: &[TypedValue],
+    named: &HashMap<String, TypedValue>,
+    raw: &[StatementParameter],
+    ordinal_base: i32,
+) -> Result<Vec<StatementParameter>> {
+    if !positional.is_empty() && !named.is_empty() {
+        return Err(Error::invalid_argument()
+            .message("positional and named parameters are mutually exclusive; pass only one"));
+    }
+    if !raw.is_empty() && (!positional.is_empty() || !named.is_empty()) {
+        return Err(Error::invalid_argument()
+            .message("raw parameters cannot be mixed with positional/named TypedValue params"));
+    }
+    let has_named_raw = raw.iter().any(|p| p.name.is_some());
+    if has_named_raw && raw.iter().any(|p| p.name.is_none()) {
+        return Err(Error::invalid_argument()
+            .message("positional and named raw parameters are mutually exclusive; pass only one"));
+    }
+    let ordinal = |i: usize| {
+        i32::try_from(i)
+            .ok()
+            .and_then(|i| i.checked_add(ordinal_base))
+            .ok_or_else(|| Error::invalid_argument().message("parameter ordinal exceeds i32"))
+    };
+    let mut parameters = Vec::with_capacity(positional.len() + named.len() + raw.len());
+    for (i, value) in positional.iter().enumerate() {
+        parameters.push(typed_value_to_sea_parameter(ordinal(i)?, value)?);
+    }
+    for (name, value) in named {
+        parameters.push(named_typed_value_to_sea_parameter(name.clone(), value)?);
+    }
+    for (i, p) in raw.iter().enumerate() {
+        let mut param = p.clone();
+        if param.name.is_none() {
+            param.ordinal = Some(ordinal(i)?);
+        }
+        parameters.push(param);
+    }
+    Ok(parameters)
 }
 
 /// Lifecycle owner for a single statement spec.
@@ -349,7 +367,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             let (sql, mut exec_params) = self.prepare_for_dispatch(None)?;
 
@@ -409,6 +427,12 @@ impl Statement {
             self.last_valid = Some(valid.clone());
             self.last_closed = Some(Arc::clone(&closed));
 
+            let is_batch = !exec_params.parameter_sets.is_empty();
+            let result = crate::statement::dml_count::decode_parameter_batch(
+                result,
+                exec_params.parameter_sets.len(),
+            )
+            .await?;
             let mut result_stream = ResultStream::from_reader(result.reader).await?;
             result_stream.attach_telemetry(telemetry_for_body.clone());
             // SEA puts no row count on the status envelope; for a DML it
@@ -417,7 +441,7 @@ impl Statement {
             // result (non-consuming — the count row still reaches the
             // caller's fetch) so `num_modified_rows()` matches Thrift.
             let mut status = result.status;
-            if status.num_modified_rows.is_none() {
+            if !is_batch && status.num_modified_rows.is_none() {
                 status.num_modified_rows =
                     crate::statement::dml_count::read_dml_affected_rows(&mut result_stream).await?;
             }
@@ -433,7 +457,11 @@ impl Statement {
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            if !self.spec.parameter_sets.is_empty() {
+                error.retryable = false;
+                self.invalidate_prior().await;
+            }
             telemetry.finalize(Some(error));
         }
         result
@@ -476,7 +504,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatementAsync);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             let (sql, exec_params) = self.prepare_for_dispatch(Some("0s"))?;
 
@@ -549,11 +577,16 @@ impl Statement {
                 response.status,
                 telemetry_for_body,
                 timeout,
-            ))
+            )
+            .with_parameter_set_count(exec_params.parameter_sets.len()))
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            if !self.spec.parameter_sets.is_empty() {
+                error.retryable = false;
+                self.invalidate_prior().await;
+            }
             telemetry.finalize(Some(error));
         }
         result
@@ -593,7 +626,7 @@ impl Statement {
         self.reset_inflight_slot();
         let telemetry = self.statement_telemetry(OperationType::ExecuteStatement);
         let telemetry_for_body = telemetry.clone();
-        let result = async {
+        let mut result = async {
             self.invalidate_prior().await;
             // `prepare_for_dispatch(None)` leaves `wait_timeout` / `on_wait_timeout`
             // UNSET, so `execute_statement_direct` sends ExecuteStatement with no
@@ -644,10 +677,16 @@ impl Statement {
                     self.last_statement_id = Some(result.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
+                    let is_batch = !exec_params.parameter_sets.is_empty();
+                    let result = crate::statement::dml_count::decode_parameter_batch(
+                        result,
+                        exec_params.parameter_sets.len(),
+                    )
+                    .await?;
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
                     result_stream.attach_telemetry(telemetry_for_body.clone());
                     let mut status = result.status;
-                    if status.num_modified_rows.is_none() {
+                    if !is_batch && status.num_modified_rows.is_none() {
                         // Optional count reads must not turn a successful write into an execute error.
                         if let Ok(count) =
                             crate::statement::dml_count::read_dml_affected_rows(&mut result_stream)
@@ -677,21 +716,28 @@ impl Statement {
                     self.last_statement_id = Some(resp.statement_id.clone());
                     self.last_valid = Some(valid.clone());
                     self.last_closed = Some(Arc::clone(&closed));
-                    Ok(DirectStatement::Running(ExecutedAsyncStatement::new(
-                        Arc::clone(&self.session),
-                        resp.statement_id,
-                        valid,
-                        closed,
-                        resp.status,
-                        telemetry_for_body,
-                        ExecutionTimeout::Default,
-                    )))
+                    Ok(DirectStatement::Running(
+                        ExecutedAsyncStatement::new(
+                            Arc::clone(&self.session),
+                            resp.statement_id,
+                            valid,
+                            closed,
+                            resp.status,
+                            telemetry_for_body,
+                            ExecutionTimeout::Default,
+                        )
+                        .with_parameter_set_count(exec_params.parameter_sets.len()),
+                    ))
                 }
             }
         }
         .instrument(span)
         .await;
-        if let Err(error) = &result {
+        if let Err(error) = &mut result {
+            if !self.spec.parameter_sets.is_empty() {
+                error.retryable = false;
+                self.invalidate_prior().await;
+            }
             telemetry.finalize(Some(error));
         }
         result
@@ -1285,5 +1331,41 @@ mod tests {
             params.parameters[1].value.is_none(),
             "VOID/None must be SQL NULL, distinct from an empty string"
         );
+    }
+    #[test]
+    fn native_batch_rejects_mixed_bindings_and_preserves_snapshots() {
+        let mut spec = StatementSpec::new();
+        spec.sql("INSERT INTO t VALUES (?)");
+        spec.param_raw(None, "BIGINT", Some("1".into()));
+        spec.param(1, TypedValue::Int64(2)).unwrap();
+        spec.add_parameter_set();
+        assert!(build_execute_params(&spec, None)
+            .unwrap_err()
+            .message
+            .contains("raw parameters"));
+        spec.sql("INSERT INTO t VALUES (?)");
+        spec.param(1, TypedValue::Int64(1))
+            .unwrap()
+            .add_parameter_set();
+        spec.param_raw(None, "BIGINT", Some("2".into()));
+        assert!(build_execute_params(&spec, None)
+            .unwrap_err()
+            .message
+            .contains("mutually exclusive"));
+        spec.add_parameter_set();
+        let cloned = spec.clone();
+        spec.sql("SELECT 1");
+        assert!(build_execute_params(&spec, None)
+            .unwrap()
+            .1
+            .parameter_sets
+            .is_empty());
+        let sets = build_execute_params(&cloned, None)
+            .unwrap()
+            .1
+            .parameter_sets;
+        assert_eq!(sets.len(), 2);
+        assert_eq!(sets[0].parameters[0].value.as_deref(), Some("1"));
+        assert_eq!(sets[1].parameters[0].value.as_deref(), Some("2"));
     }
 }

@@ -34,13 +34,113 @@
 //! caller's fetch exactly as it does on the Thrift path — this only adds
 //! the status value, it does not change which rows are returned.
 
-use crate::kernel_error::Result;
+use crate::client::transport::ExecuteResult;
+use crate::kernel_error::{Error, Result};
+use crate::reader::InMemoryReader;
 use crate::result_stream::{ResultBatch, ResultStream};
 use crate::types::sea::ResultManifest;
 use arrow_array::cast::AsArray;
 use arrow_array::types::{Int16Type, Int32Type, Int64Type, Int8Type};
 use arrow_array::Array;
 use arrow_schema::DataType;
+
+/// Decode native batch counts without expanding repeated rows. Preserve the
+/// count result for fetching; a decoding failure must never resubmit the write.
+pub(crate) async fn decode_parameter_batch(
+    mut result: ExecuteResult,
+    parameter_set_count: usize,
+) -> Result<ExecuteResult> {
+    if parameter_set_count == 0 {
+        return Ok(result);
+    }
+    let decoded = async {
+        result.status.num_modified_rows = None;
+        let schema = result.reader.schema().await?;
+        if schema.fields().is_empty() {
+            return Ok(());
+        }
+        let affected = schema
+            .index_of(AFFECTED_ROWS_COLUMN)
+            .map_err(|_| malformed_batch_count("missing num_affected_rows"))?;
+        let inserted = schema.index_of("num_inserted_rows").ok();
+        let repeat = schema.index_of("repeat").ok();
+        let mut represented = 0usize;
+        let mut total = Some(0i64);
+        let mut batches = Vec::new();
+        while let Some(batch) = result.reader.next_batch().await? {
+            if batch.schema().fields() != schema.fields() {
+                return Err(malformed_batch_count("inconsistent count schema"));
+            }
+            for row in 0..batch.num_rows() {
+                let repetitions = match repeat {
+                    Some(i) => batch_count_value(batch.column(i).as_ref(), row)?
+                        .filter(|n| *n > 0)
+                        .ok_or_else(|| malformed_batch_count("repeat must be positive"))?,
+                    None => 1,
+                };
+                represented = usize::try_from(repetitions)
+                    .ok()
+                    .and_then(|n| represented.checked_add(n))
+                    .filter(|n| *n <= parameter_set_count)
+                    .ok_or_else(|| malformed_batch_count("too many parameter-set counts"))?;
+                let count = batch_affected_value(batch.column(affected).as_ref(), row)?;
+                if let Some(i) = inserted {
+                    batch_affected_value(batch.column(i).as_ref(), row)?;
+                }
+                total = match (total, count) {
+                    (Some(sum), Some(n)) => Some(
+                        n.checked_mul(repetitions)
+                            .and_then(|n| sum.checked_add(n))
+                            .ok_or_else(|| malformed_batch_count("affected count overflow"))?,
+                    ),
+                    _ => None,
+                };
+            }
+            batches.push(batch);
+        }
+        if represented != 0 && represented != parameter_set_count {
+            return Err(malformed_batch_count("missing parameter-set counts"));
+        }
+        result.status.num_modified_rows = if represented == 0 { None } else { total };
+        result.reader = Box::new(InMemoryReader::new(schema, batches));
+        Ok(())
+    }
+    .await;
+    decoded.map_err(|error: Error| {
+        error
+            .with_query_id(&result.statement_id)
+            .with_retryable(false)
+    })?;
+    Ok(result)
+}
+
+fn malformed_batch_count(detail: &str) -> Error {
+    Error::data_loss().message(format!(
+        "Native parameter batch succeeded but its counts could not be decoded: {detail}. Rows may already be committed",
+    ))
+}
+
+fn batch_affected_value(column: &dyn Array, row: usize) -> Result<Option<i64>> {
+    match batch_count_value(column, row)? {
+        // SUCCESS_NO_INFO means execution succeeded without a precise count.
+        None | Some(-2) => Ok(None),
+        Some(n) if n >= 0 => Ok(Some(n)),
+        _ => Err(malformed_batch_count("invalid negative affected count")),
+    }
+}
+
+fn batch_count_value(column: &dyn Array, row: usize) -> Result<Option<i64>> {
+    if column.is_null(row) {
+        return Ok(None);
+    }
+    Ok(Some(match column.data_type() {
+        DataType::Int64 => column.as_primitive::<Int64Type>().value(row),
+        DataType::Int32 => column.as_primitive::<Int32Type>().value(row) as i64,
+        DataType::Int16 => column.as_primitive::<Int16Type>().value(row) as i64,
+        DataType::Int8 => column.as_primitive::<Int8Type>().value(row) as i64,
+        _ => return Err(malformed_batch_count("count must be an integer")),
+    }))
+}
 
 /// The exact set of column names a SEA DML count result is built from.
 const DML_COUNT_COLUMNS: [&str; 4] = [

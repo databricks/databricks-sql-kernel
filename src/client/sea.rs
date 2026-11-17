@@ -167,6 +167,20 @@ fn timeout_query_id(params: &ExecuteParams) -> Option<String> {
     })
 }
 
+fn batch_response_decode_error(mut error: Error, body: &[u8]) -> Error {
+    // Attachment decoding can fail before the full response exposes its query id.
+    #[derive(serde::Deserialize)]
+    struct Context {
+        statement_id: Option<String>,
+    }
+    if let Ok(context) = serde_json::from_slice::<Context>(body) {
+        if let Some(id) = context.statement_id {
+            error = error.with_query_id(id);
+        }
+    }
+    error
+}
+
 /// SEA client for the Databricks SQL Statement Execution API.
 ///
 /// This client implements the `Transport` trait using REST endpoints.
@@ -678,6 +692,7 @@ impl SeaRestTransport {
             row_limit: params.row_limit,
             result_compression: Some("LZ4_FRAME".to_string()),
             parameters: params.parameters.clone(),
+            parameter_sets: params.parameter_sets.clone(),
             query_tags: params.query_tags.clone(),
         };
 
@@ -729,13 +744,24 @@ impl SeaRestTransport {
             .await
             .map_err(|e| Error::network_error().message(format!("Failed to read response: {e}")))?;
 
-        let sea_response: StatementExecutionResponse =
-            serde_json::from_slice(&body).map_err(|e| {
-                Error::data_loss().message(format!(
+        let sea_response: Result<StatementExecutionResponse> = serde_json::from_slice(&body)
+            .map_err(|e| {
+                let error = Error::data_loss().message(format!(
                     "Failed to parse execute response: {e} - body: {}",
                     String::from_utf8_lossy(&body)
-                ))
-            })?;
+                ));
+                if params.parameter_sets.is_empty() {
+                    error
+                } else {
+                    batch_response_decode_error(error, &body)
+                }
+            });
+        if let Err(error) = &sea_response {
+            if let Some(id) = error.query_id.as_deref() {
+                self.close_orphaned_statement(id, "response_decode").await;
+            }
+        }
+        let sea_response = sea_response?;
 
         self.observe_session_version(sea_response.status.session_version);
 
