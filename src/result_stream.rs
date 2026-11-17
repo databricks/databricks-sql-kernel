@@ -467,7 +467,7 @@ pub struct ResultStream {
     /// until the next call to `next_batch` replaces it.
     current: Option<ResultBatch>,
 
-    /// DML inspection and Volume validation must preserve rows and read errors for callers.
+    /// Buffered outcomes retained for subsequent reads after inspection.
     prefetched: Prefetched<ResultBatch>,
 
     /// Row cursor inside [`current`](Self::current). Reset to `0`
