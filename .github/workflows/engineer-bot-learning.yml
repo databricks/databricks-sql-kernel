@@ -1,11 +1,8 @@
 # Engineer Bot — learning (retrospective) extraction, DAILY.
 #
-# Once a day the bot sweeps every PR merged in an adaptive look-back window (plus
-# engineer-bot author runs in that window), decides whether there is a DURABLE,
-# reusable engineering learning, and — if so — opens/updates a single rolling PR
-# appending a dated section to this repo's learning log
-# (.claude/knowledge/learning-log.md). Human-gated by design: it NEVER commits the
-# canonical log directly; the entry lands as a reviewable PR.
+# Once a day the bot extracts durable learnings into a new journal file and
+# distills them into lessons.md in a rolling PR. The legacy learning log is frozen;
+# a human reviews every learning PR.
 #
 # The window is an ISO adaptive cursor: `since` defaults to the start time of the
 # last successful run, falling back to `--window-hours` (24) on the first run or
@@ -51,7 +48,7 @@ on:
         default: '24'
 
 permissions:
-  contents: write        # open the learning-log PR
+  contents: write        # push the journal/lessons PR
   pull-requests: write
   actions: read          # Track B lists author runs + downloads their logs via the
                          # App token; without actions:read that step 403s and fails
