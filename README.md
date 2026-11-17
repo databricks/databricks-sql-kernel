@@ -90,6 +90,9 @@ rejected. This is stricter than the lexical-only checks in existing Python and
 Node.js Thrift transfer paths. An allowed root's symlink alias does not authorize
 additional lexical paths.
 
+Paths are normalized lexically before symlink resolution. Allowed-root validation
+assumes path components remain unchanged between validation and file access.
+
 GET replaces the destination only after a complete download. Transfer failures
 and cancellation before publication preserve the destination's existing bytes.
 Repeated completion on the same execution reuses its outcome, including errors.
