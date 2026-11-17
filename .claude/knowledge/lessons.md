@@ -4,7 +4,7 @@
 
 ## Public API and bindings
 - L-0001 (4×, #250 #184 #372): Preserve public Rust compatibility: non-exhaustive structs need external builders, public enums need fallback arms, and breaking 1.x type changes require a major release.
-- L-0002 (2×, #246 #83 #248): At FFI boundaries, define empty versus absent explicitly. Validate coupled config values together before mutating state, and test null/empty inputs.
+- L-0002 (2×, #246 #248): At FFI boundaries, define empty versus absent explicitly. Validate coupled config values together before mutating state, and test null/empty inputs.
 - L-0003 (2×, #247 #361): napi Rust identifiers determine published TypeScript names; choose cross-binding spelling before release and sync generated index.d.ts when Rust docs or defaults change.
 - L-0004 (1×, #262): Use napi u32 for JS-number duration/size options, widen inside Rust, and document its range; u64/usize expose BigInt and differ from Python/C.
 - L-0005 (2×, #373 #379): Audit C headers, PyO3 and napi together when kernel contracts or validation change. Update each wrapper or explicitly document intentional differences.
@@ -52,7 +52,7 @@
 
 ## Async lifecycle and FFI
 - L-0043 (4×, #261 #299 #300): Provide best-effort Drop cleanup as well as explicit close. Recover poisoned cleanup locks and retain identifiers after failed close RPCs so idempotent cleanup can retry.
-- L-0044 (2×, #277 #276): At the C ABI, copy !Send pointer inputs before spawning futures on owned runtime workers; block foreign caller threads on a channel, never Runtime::block_on.
+- L-0044 (2×, #277): At the C ABI, copy !Send pointer inputs before spawning futures on owned runtime workers; block foreign caller threads on a channel, never Runtime::block_on.
 - L-0045 (1×, #277): Pin a host-loaded module while detached runtime threads can execute its code, and check/log module-pin failure rather than silently allowing unsafe unload.
 - L-0046 (2×, #297 #413): Store an appropriate runtime Handle instead of using ambient tokio::spawn from bindings/Drop. Process-shared objects need a process-lifetime runtime, not a session runtime.
 - L-0047 (3×, #326 #329 #413): Build every kernel runtime with util::runtime stack sizing: preserve a larger host RUST_MIN_STACK while applying the 2 MiB floor. Cache successful shared-runtime creation, not failure.
