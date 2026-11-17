@@ -836,6 +836,13 @@ impl SeaChunkLinkFetcher {
         }
         if let Some(last_link) = result.links.last() {
             self.apply_continuation(last_link, "page fetch");
+            if !self.all_links_fetched.load(Ordering::Acquire)
+                && self.next_server_fetch_index.load(Ordering::Acquire) <= chunk_index
+            {
+                return Err(Error::invalid_state().message(format!(
+                    "Link page did not advance past chunk {chunk_index}"
+                )));
+            }
         } else if !result.has_more {
             self.all_links_fetched.store(true, Ordering::Release);
         } else {
@@ -953,18 +960,18 @@ impl ChunkLinkFetcher for SeaChunkLinkFetcherHandle {
             // `i` is now either `server_fetch_index` (no holes) or
             // the first missing chunk_index — in either case it's
             // where the next continuation should pick up.
-            let has_more = !fetcher.all_links_fetched.load(Ordering::Acquire);
+            // A final page can arrive after this prefix was bounded.
             return Ok(ChunkLinkFetchResult {
                 links,
-                has_more,
-                next_chunk_index: if has_more { Some(i) } else { None },
+                has_more: true,
+                next_chunk_index: Some(i),
                 next_row_offset: None,
             });
         }
 
         Ok(ChunkLinkFetchResult {
             links: Vec::new(),
-            has_more: !fetcher.all_links_fetched.load(Ordering::Acquire),
+            has_more: true,
             next_chunk_index: Some(fetcher.next_server_fetch_index.load(Ordering::Acquire)),
             next_row_offset: Some(fetcher.next_row_offset.load(Ordering::Acquire)),
         })
@@ -1597,6 +1604,38 @@ mod tests {
             assert!(!result.has_more);
             assert_eq!(*client.calls.lock().unwrap(), vec![1, 0, 2]);
         }
+    }
+
+    #[tokio::test]
+    async fn nonadvancing_nonempty_page_returns_shared_error() {
+        let mut client =
+            MockDatabricksClient::new(vec![vec![create_test_link(0)], vec![create_test_link(0)]]);
+        let page = Arc::new(tokio::sync::Notify::new());
+        client.blocked_pages.insert(1, Arc::clone(&page));
+        let client = Arc::new(client);
+        let handle = SeaChunkLinkFetcherHandle::new(SeaChunkLinkFetcher::new(
+            Arc::clone(&client) as Arc<dyn Transport>,
+            "test-statement",
+            &[create_test_link(0)],
+            Some(2),
+            2,
+            tokio::runtime::Handle::current(),
+            SessionAttribution::Current,
+        ));
+        let timeout = std::time::Duration::from_secs(5);
+        tokio::time::timeout(timeout, client.page_started.notified())
+            .await
+            .unwrap();
+        let mut foreground = Box::pin(handle.fetch_links(1, 0));
+        assert!(futures::poll!(foreground.as_mut()).is_pending());
+        page.notify_one();
+        let error = tokio::time::timeout(timeout, foreground)
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, crate::kernel_error::ErrorCode::InvalidArgument);
+        assert_eq!(error.message, "Link page did not advance past chunk 1");
+        assert_eq!(*client.calls.lock().unwrap(), vec![1]);
     }
 
     #[tokio::test]
