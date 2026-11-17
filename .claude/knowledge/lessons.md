@@ -75,7 +75,7 @@
 
 ## Arrow results and metadata
 - L-0064 (2×, #301 #373): Empty catalog/pattern semantics vary by metadata operation; test short-circuit ordering and avoid turning an empty request into catalog=None (all catalogs). GetFunctions accepts meaningful empty catalogs.
-- L-0065 (3×, #291 #353 #393): Verify identifier matching and metadata flags per operation against Databricks Thrift, including native/fallback paths; neither vanilla HiveServer2 nor blanket case-folding is authoritative.
+- L-0065 (3×, #291 #353 #393): Client-side catalog/schema/table identifier filters use eq_ignore_ascii_case; table_types filters are case-sensitive. Preserve Databricks Thrift type-info flags, including CASE_SENSITIVE: STRING=true, CHAR/VARCHAR=false.
 - L-0066 (1×, #355): Translate JDBC patterns separately from SQL literal escaping; translate wildcards first and escape exactly once where the result enters SQL.
 - L-0067 (3×, #355 #364): Normalize native metadata values per operation/schema, not bare column names or position alone. Native GetColumns ordinals need +1; SHOW fallback is already one-based.
 - L-0068 (2×, #369 #381): In metadata fallback reshapes, preserve optional server columns when present and tolerate missing/uncastable ones as null; test native, fallback and empty-result schemas.
