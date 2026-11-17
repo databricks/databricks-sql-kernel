@@ -91,6 +91,35 @@ impl ResultReader for ErrorReader {
     }
 }
 
+/// Prevents repeated reader errors from masking a lost buffered error.
+pub struct ErrorThenEndReader {
+    pub schema: SchemaRef,
+    pub error_pending: bool,
+}
+
+#[async_trait]
+impl ResultReader for ErrorThenEndReader {
+    async fn schema(&self) -> Result<SchemaRef> {
+        Ok(self.schema.clone())
+    }
+
+    async fn next_batch(&mut self) -> Result<Option<RecordBatch>> {
+        if std::mem::take(&mut self.error_pending) {
+            Err(Error::io().message("simulated one-shot read error"))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn try_next_batch(&mut self) -> Result<crate::reader::TryNextBatch> {
+        if std::mem::take(&mut self.error_pending) {
+            Err(Error::io().message("simulated one-shot read error"))
+        } else {
+            Ok(crate::reader::TryNextBatch::End)
+        }
+    }
+}
+
 /// A reader that yields one successful batch, then errors on the
 /// next `next_batch()` call. Used to exercise iterator
 /// implementations' error-after-data path (i.e. that `Some(Err(...))`
