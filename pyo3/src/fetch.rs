@@ -23,10 +23,39 @@
 use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
-use databricks_sql_kernel::{Error, ExecutedStatement, Result, ResultBatch, ResultStream};
+use databricks_sql_kernel::{
+    Error, ExecutedStatement, Result, ResultBatch, ResultStream, TryNextBatch,
+};
 use pyo3::prelude::*;
 use std::sync::Arc;
 use tokio::runtime::Runtime;
+
+pub(crate) enum BatchRead {
+    Ready(RecordBatch),
+    Pending,
+    End,
+}
+
+fn own_batch(read: TryNextBatch<'_>) -> Result<BatchRead> {
+    match read {
+        TryNextBatch::Ready(ResultBatch::Arrow(batch)) => Ok(BatchRead::Ready(batch.clone())),
+        TryNextBatch::Ready(_) => {
+            Err(Error::invalid_argument()
+                .message("kernel returned a non-Arrow ResultBatch variant"))
+        }
+        TryNextBatch::Pending => Ok(BatchRead::Pending),
+        TryNextBatch::End => Ok(BatchRead::End),
+        _ => Err(Error::invalid_argument().message("kernel returned an unknown batch-read state")),
+    }
+}
+
+pub(crate) fn try_next_batch(stream: &mut ResultStream) -> Result<BatchRead> {
+    own_batch(stream.try_next_batch()?)
+}
+
+pub(crate) fn try_next_batch_exec(exec: &mut ExecutedStatement) -> Result<BatchRead> {
+    own_batch(exec.try_next_batch()?)
+}
 
 /// Pull the next batch from the kernel stream and return it as an
 /// owned `RecordBatch`, or `None` if the stream is exhausted.
