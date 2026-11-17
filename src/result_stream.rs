@@ -673,56 +673,57 @@ impl ResultStream {
         let Some((state, client)) = self.volume.clone() else {
             return Ok(crate::volume::VolumeCompletion::NotVolume);
         };
-        if let Some(result) = state.cached() {
-            return result;
-        }
-        tokio::select! {
-            biased;
-            error = state.cancellation() => Err(error),
-            result = async {
-                let batch = loop {
-                    let batch = self
-                        .peek_first_batch()
-                        .await
-                        .map_err(|error| state.fail(error))?
-                        .ok_or_else(|| {
-                            state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
-                        })?;
-                    let ResultBatch::Arrow(batch) = batch;
-                    if batch.num_rows() != 0 {
-                        break ResultBatch::Arrow(batch.clone());
-                    }
-                    self.prefetched.pop_front();
-                };
-                // The instruction stays buffered for callers; later batches must not
-                // authorize a partial transfer of a multi-row instruction result.
-                while !self.exhausted {
-                    match self
-                        .reader
-                        .as_mut()
-                        .expect("Volume completion retains its reader")
-                        .next_batch()
-                        .await
-                        .map_err(|error| {
-                            let error = state.fail(error);
-                            self.finalize_telemetry(Some(&error));
-                            error
-                        })?
-                    {
-                        Some(batch) if batch.num_rows() != 0 => {
-                            self.prefetched.push_back(Ok(ResultBatch::Arrow(batch)));
-                            return Err(state.fail(
-                                Error::invalid_argument().message("Expected one Volume instruction row"),
-                            ));
+        let result = if let Some(result) = state.cached() {
+            result
+        } else {
+            tokio::select! {
+                biased;
+                error = state.cancellation() => Err(error),
+                result = async {
+                    let batch = loop {
+                        let batch = self
+                            .peek_first_batch()
+                            .await
+                            .map_err(|error| state.fail(error))?
+                            .ok_or_else(|| {
+                                state.fail(Error::invalid_argument().message("Missing Volume instruction row"))
+                            })?;
+                        let ResultBatch::Arrow(batch) = batch;
+                        if batch.num_rows() != 0 {
+                            break ResultBatch::Arrow(batch.clone());
                         }
-                        Some(_) => {}
-                        None => self.exhausted = true,
+                        self.prefetched.pop_front();
+                    };
+                    // The instruction stays buffered for callers; later batches must not
+                    // authorize a partial transfer of a multi-row instruction result.
+                    while !self.exhausted {
+                        match self
+                            .reader
+                            .as_mut()
+                            .expect("Volume completion retains its reader")
+                            .next_batch()
+                            .await
+                            .map_err(|error| state.fail(error))?
+                        {
+                            Some(batch) if batch.num_rows() != 0 => {
+                                self.prefetched.push_back(Ok(ResultBatch::Arrow(batch)));
+                                return Err(state.fail(
+                                    Error::invalid_argument().message("Expected one Volume instruction row"),
+                                ));
+                            }
+                            Some(_) => {}
+                            None => self.exhausted = true,
+                        }
                     }
-                }
-                let client = client.get().map_err(|error| state.fail(error))?;
-                state.complete(&batch, client, options, input_bytes).await
-            } => result,
+                    let client = client.get().map_err(|error| state.fail(error))?;
+                    state.complete(&batch, client, options, input_bytes).await
+                } => result,
+            }
+        };
+        if let Err(error) = &result {
+            self.finalize_telemetry(Some(error));
         }
+        result
     }
 
     pub(crate) fn volume_state(&self) -> Option<Arc<crate::volume::VolumeState>> {

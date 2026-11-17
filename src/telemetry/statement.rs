@@ -292,7 +292,9 @@ fn duration_millis(duration: Duration) -> i64 {
 mod tests {
     use super::*;
     use crate::kernel_error::ErrorCode;
-    use crate::reader::test_utils::{BatchThenErrorReader, ErrorReader};
+    use crate::reader::test_utils::{
+        BatchThenErrorReader, BlockingReader, ErrorReader, MockReader,
+    };
     use crate::reader::{ResultReader, ResultReaderMetrics};
     use crate::result_stream::ResultStream;
     use crate::telemetry::models::OperationType;
@@ -368,10 +370,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reader_errors_finalize_statement_with_error_before_drop() {
-        for (volume, message) in [
-            (false, "simulated read error"),
-            (true, "simulated read error after first batch"),
+    async fn result_errors_finalize_statement_with_error_before_drop() {
+        enum Case {
+            Reader,
+            VolumeReader,
+            Instruction,
+            Cancellation,
+            CachedCancellation,
+        }
+        for case in [
+            Case::Reader,
+            Case::VolumeReader,
+            Case::Instruction,
+            Case::Cancellation,
+            Case::CachedCancellation,
         ] {
             let connection = Arc::new(CapturingConnectionTelemetry::default());
             let telemetry = StatementTelemetry::new(
@@ -380,40 +392,90 @@ mod tests {
                 OperationType::ExecuteStatement,
             );
             let schema = Arc::new(Schema::empty());
-            let reader: Box<dyn ResultReader> = if volume {
-                Box::new(BatchThenErrorReader {
-                    batch: Some(
-                        RecordBatch::try_new_with_options(
-                            schema.clone(),
-                            vec![],
-                            &RecordBatchOptions::new().with_row_count(Some(1)),
-                        )
-                        .expect("one-row batch"),
-                    ),
-                    schema,
-                })
-            } else {
-                Box::new(ErrorReader { schema })
+            let batch = RecordBatch::try_new_with_options(
+                schema.clone(),
+                vec![],
+                &RecordBatchOptions::new().with_row_count(Some(1)),
+            )
+            .expect("one-row batch");
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let (reader, code, message): (Box<dyn ResultReader>, _, _) = match case {
+                Case::Reader => (
+                    Box::new(ErrorReader { schema }),
+                    ErrorCode::Internal,
+                    "simulated read error",
+                ),
+                Case::VolumeReader => (
+                    Box::new(BatchThenErrorReader {
+                        batch: Some(batch),
+                        schema,
+                    }),
+                    ErrorCode::Internal,
+                    "simulated read error after first batch",
+                ),
+                Case::Instruction => (
+                    Box::new(MockReader::new(vec![batch])),
+                    ErrorCode::InvalidArgument,
+                    "Missing Volume instruction column",
+                ),
+                Case::Cancellation => (
+                    Box::new(BlockingReader {
+                        schema,
+                        entered: entered.clone(),
+                        release: Arc::new(tokio::sync::Notify::new()),
+                    }),
+                    ErrorCode::Cancelled,
+                    "Volume transfer was cancelled",
+                ),
+                Case::CachedCancellation => (
+                    Box::new(MockReader::new(vec![batch])),
+                    ErrorCode::Cancelled,
+                    "Volume transfer was cancelled",
+                ),
             };
             let mut stream = ResultStream::from_reader(reader)
                 .await
                 .expect("schema succeeds");
             stream.attach_telemetry(telemetry);
 
-            let error = if volume {
+            let error = if !matches!(case, Case::Reader) {
+                let state = crate::volume::VolumeState::new(Default::default(), None);
                 stream.attach_volume(
                     true,
-                    crate::volume::VolumeState::new(Default::default(), None),
+                    state.clone(),
                     Arc::new(
                         crate::client::DatabricksHttpClient::with_default_retry(Default::default())
                             .unwrap()
                             .storage_client(None),
                     ),
                 );
-                stream
-                    .complete_volume_operation(&Default::default(), None)
+                if matches!(case, Case::CachedCancellation) {
+                    state.cancel();
+                }
+                let options = Default::default();
+                let completion = stream.complete_volume_operation(&options, None);
+                let result = if matches!(case, Case::Cancellation) {
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        tokio::join!(completion, async {
+                            entered.notified().await;
+                            state.cancel();
+                        })
+                        .0
+                    })
                     .await
-                    .expect_err("instruction drain should surface reader error")
+                    .expect("cancellation must interrupt the blocked reader")
+                } else {
+                    completion.await
+                };
+                let error =
+                    result.expect_err("Volume completion should surface the terminal error");
+                let cached = stream
+                    .complete_volume_operation(&options, None)
+                    .await
+                    .unwrap_err();
+                assert_eq!(cached.code, error.code);
+                assert_eq!(cached.message, error.message);
+                error
             } else {
                 stream
                     .peek_first_batch()
@@ -421,7 +483,7 @@ mod tests {
                     .map(|_| ())
                     .expect_err("peek should surface reader error")
             };
-            assert_eq!(error.code, ErrorCode::Internal);
+            assert_eq!(error.code, code);
             assert_eq!(error.message, message);
             let events_before_drop = connection
                 .statement_events
@@ -430,7 +492,7 @@ mod tests {
                 .len();
             assert_eq!(
                 events_before_drop, 1,
-                "reader error must finalize before Drop"
+                "terminal error must finalize before Drop"
             );
 
             drop(stream);
@@ -439,11 +501,11 @@ mod tests {
             assert_eq!(
                 events.len(),
                 1,
-                "reader error should finalize once; Drop must not overwrite it with success"
+                "terminal error should finalize once; Drop must not overwrite it with success"
             );
             let event = &events[0];
             assert_eq!(event.context.statement_type, StatementType::Sql);
-            assert_eq!(event.error_code, Some(ErrorCode::Internal));
+            assert_eq!(event.error_code, Some(code));
             assert_eq!(event.error_message.as_deref(), Some(message));
             assert!(
                 event.context.consumption_latency.is_some(),
