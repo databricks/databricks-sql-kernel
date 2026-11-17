@@ -54,8 +54,9 @@
  *   `KernelStatusCode_InvalidStatementHandle`. Don't hold two live
  *   executed handles from one statement.
  * - **A result stream borrows its executed handle.** Closing the executed
- *   handle invalidates any stream obtained from it: subsequent stream
- *   calls return `InvalidStatementHandle` (a defined error, not UB).
+ *   handle invalidates any stream obtained from it: schema access, fetching
+ *   and Volume completion return `InvalidStatementHandle` (a defined error,
+ *   not UB). The cached Volume marker remains readable until stream close.
  * - **Close is awaited.** `kernel_session_close` waits for the server-side
  *   delete to complete and flushes close-session telemetry before returning.
  *   If close fails, the kernel still schedules best-effort cleanup when the
@@ -978,6 +979,7 @@ KernelStatusCode kernel_result_stream_get_schema(kernel_result_stream_t* stream,
  * The detached result-stream canceller can interrupt completion. */
 KernelStatusCode kernel_executed_statement_is_volume_operation(
     const kernel_executed_statement_t* exec, bool* out);
+/* The cached marker does not establish whether the executed owner is valid. */
 KernelStatusCode kernel_result_stream_is_volume_operation(
     const kernel_result_stream_t* stream, bool* out);
 KernelStatusCode kernel_result_stream_complete_volume_operation(

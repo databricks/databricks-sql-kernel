@@ -655,7 +655,8 @@ pub unsafe extern "C" fn kernel_result_stream_canceller_free(
     })
 }
 
-/// Read whether this stream has authority to complete a Volume instruction.
+/// Read the Volume marker captured when this stream was created.
+/// Success does not establish whether the executed owner is valid.
 /// # Safety
 /// `stream` must be live and `out` must be writable.
 #[no_mangle]
