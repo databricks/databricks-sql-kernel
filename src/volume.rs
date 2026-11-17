@@ -356,33 +356,7 @@ impl VolumeState {
             }
             redirects += 1;
             let previous = response.url();
-            if url.host_str() != previous.host_str()
-                || url.port_or_known_default() != previous.port_or_known_default()
-            {
-                for name in [
-                    "authorization",
-                    "cookie",
-                    "cookie2",
-                    "proxy-authorization",
-                    "www-authenticate",
-                ] {
-                    request.headers_mut().remove(name);
-                }
-            }
-            if previous.scheme() == "https" && url.scheme() == "http" {
-                request.headers_mut().remove(reqwest::header::REFERER);
-            } else {
-                let mut referer = previous.clone();
-                let _ = referer.set_username("");
-                let _ = referer.set_password(None);
-                referer.set_query(None);
-                referer.set_fragment(None);
-                if let Ok(value) = referer.as_str().parse() {
-                    request
-                        .headers_mut()
-                        .insert(reqwest::header::REFERER, value);
-                }
-            }
+            redirect_headers(request.headers_mut(), previous, &url);
             if response.status() == reqwest::StatusCode::SEE_OTHER {
                 *request.method_mut() = Method::GET;
                 *request.body_mut() = None;
@@ -443,6 +417,35 @@ impl VolumeState {
             *gate = CommitState::Finished(Box::new(Ok(VolumeCompletion::Completed)));
         }
         Ok(VolumeCompletion::Completed)
+    }
+}
+
+fn redirect_headers(headers: &mut HeaderMap, previous: &reqwest::Url, next: &reqwest::Url) {
+    if next.scheme() != previous.scheme()
+        || next.host_str() != previous.host_str()
+        || next.port_or_known_default() != previous.port_or_known_default()
+    {
+        for name in [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+        ] {
+            headers.remove(name);
+        }
+    }
+    if previous.scheme() == "https" && next.scheme() == "http" {
+        headers.remove(reqwest::header::REFERER);
+    } else {
+        let mut referer = previous.clone();
+        let _ = referer.set_username("");
+        let _ = referer.set_password(None);
+        referer.set_query(None);
+        referer.set_fragment(None);
+        if let Ok(value) = referer.as_str().parse() {
+            headers.insert(reqwest::header::REFERER, value);
+        }
     }
 }
 
@@ -922,8 +925,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn redirects_strip_cross_host_credentials_and_share_a_hop_limit() {
+    async fn redirects_strip_cross_origin_credentials_and_share_a_hop_limit() {
         use std::sync::atomic::{AtomicUsize, Ordering};
+        let sensitive = [
+            "authorization",
+            "cookie",
+            "cookie2",
+            "proxy-authorization",
+            "www-authenticate",
+        ];
+        let previous =
+            reqwest::Url::parse("https://storage.invalid:8443/a?signature=secret").unwrap();
+        for scheme in ["https", "http"] {
+            let next = reqwest::Url::parse(&format!("{scheme}://storage.invalid:8443/b")).unwrap();
+            let mut headers = HeaderMap::new();
+            for name in sensitive {
+                headers.insert(
+                    reqwest::header::HeaderName::from_static(name),
+                    "storage-secret".parse().unwrap(),
+                );
+            }
+            headers.insert("x-storage-token", "server-token".parse().unwrap());
+            redirect_headers(&mut headers, &previous, &next);
+            let same_origin = scheme == "https";
+            for name in sensitive {
+                assert_eq!(headers.contains_key(name), same_origin, "{scheme}: {name}");
+            }
+            assert_eq!(headers["x-storage-token"], "server-token");
+            assert_eq!(headers.contains_key(reqwest::header::REFERER), same_origin);
+            if same_origin {
+                assert_eq!(
+                    headers[reqwest::header::REFERER],
+                    "https://storage.invalid:8443/a"
+                );
+            }
+        }
         let server = MockServer::start().await;
         let redirected = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
@@ -943,13 +979,7 @@ mod tests {
         let attempts = Arc::clone(&count);
         Mock::given(header("x-storage-token", "server-token"))
             .respond_with(move |request: &wiremock::Request| {
-                for name in [
-                    "authorization",
-                    "cookie",
-                    "cookie2",
-                    "proxy-authorization",
-                    "www-authenticate",
-                ] {
+                for name in sensitive {
                     assert!(!request.headers.contains_key(name));
                 }
                 let referer =
@@ -976,13 +1006,7 @@ mod tests {
             &source,
         );
         let mut instruction = Instruction::decode(&batch).unwrap();
-        for name in [
-            "authorization",
-            "cookie",
-            "cookie2",
-            "proxy-authorization",
-            "www-authenticate",
-        ] {
+        for name in sensitive {
             instruction.headers.insert(
                 reqwest::header::HeaderName::from_static(name),
                 "storage-secret".parse().unwrap(),
