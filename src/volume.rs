@@ -186,8 +186,7 @@ impl VolumeState {
     ) -> Result<VolumeCompletion> {
         let input =
             if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
-                let bytes = input_bytes.ok_or_else(|| invalid("Missing input stream"))?;
-                Some(Arc::<[u8]>::from(bytes))
+                Some(input_bytes.ok_or_else(|| invalid("Missing input stream"))?)
             } else {
                 None
             };
@@ -200,7 +199,7 @@ impl VolumeState {
                     &instruction,
                     client,
                     options,
-                    input.as_ref(),
+                    input.as_deref(),
                     &mut retry_after,
                 )
                 .await
@@ -226,7 +225,7 @@ impl VolumeState {
         instruction: &Instruction,
         client: &Client,
         options: &VolumeOptions,
-        input: Option<&Arc<[u8]>>,
+        input: Option<&[u8]>,
         retry_after: &mut Option<String>,
     ) -> Result<VolumeCompletion> {
         let method = match instruction.operation.as_str() {
