@@ -239,7 +239,10 @@ impl VolumeState {
             .headers(instruction.headers.clone());
         if let Some(bytes) = input {
             request = request
-                .header(reqwest::header::CONTENT_LENGTH, bytes.len())
+                .headers(HeaderMap::from_iter([(
+                    reqwest::header::CONTENT_LENGTH,
+                    bytes.len().into(),
+                )]))
                 .body(bytes.to_vec());
         }
         let local_path = if instruction.operation == "REMOVE"
@@ -319,7 +322,10 @@ impl VolumeState {
                     return Err(local_error(error, &instruction.local_file));
                 }
                 next = next
-                    .header(reqwest::header::CONTENT_LENGTH, metadata.len())
+                    .headers(HeaderMap::from_iter([(
+                        reqwest::header::CONTENT_LENGTH,
+                        metadata.len().into(),
+                    )]))
                     .body(upload_body(
                         tokio::fs::File::from_std(file),
                         instruction.local_file.clone(),
@@ -921,6 +927,79 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|request| !request.headers.contains_key("authorization")));
+        }
+
+        // Hyper normalizes duplicate lengths before Wiremock can inspect them.
+        use tokio::io::AsyncReadExt;
+        for stream in [false, true] {
+            let payload = b"payload";
+            std::fs::write(&source, payload).unwrap();
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let url = format!("http://{}/object", listener.local_addr().unwrap());
+            let peer = tokio::spawn(async move {
+                for hop in 0..2 {
+                    let (mut socket, _) = listener.accept().await.unwrap();
+                    let mut request = Vec::new();
+                    let mut byte = [0];
+                    while !request.ends_with(b"\r\n\r\n") {
+                        socket.read_exact(&mut byte).await.unwrap();
+                        request.push(byte[0]);
+                    }
+                    let lengths = String::from_utf8(request)
+                        .unwrap()
+                        .lines()
+                        .filter_map(|line| {
+                            line.to_ascii_lowercase()
+                                .strip_prefix("content-length:")
+                                .map(|value| value.trim().to_owned())
+                        })
+                        .collect::<Vec<_>>();
+                    assert_eq!(lengths, [payload.len().to_string()]);
+                    let mut body = vec![0; payload.len()];
+                    socket.read_exact(&mut body).await.unwrap();
+                    assert_eq!(body, payload);
+                    let response = if hop == 0 {
+                        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
+                    } else {
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    };
+                    socket.write_all(response).await.unwrap();
+                }
+            });
+            let batch = instruction(
+                "PUT",
+                &url,
+                if stream {
+                    Path::new("__input_stream__")
+                } else {
+                    &source
+                },
+            );
+            let mut upload = Instruction::decode(&batch).unwrap();
+            upload
+                .headers
+                .insert(reqwest::header::CONTENT_LENGTH, payload.len().into());
+            let client = Client::builder()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            assert_eq!(
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    transfer_state(0).transfer_once(
+                        &upload,
+                        &client,
+                        &options(dir.path()),
+                        stream.then_some(payload.as_slice()),
+                        &mut None
+                    ),
+                )
+                .await
+                .unwrap()
+                .unwrap(),
+                VolumeCompletion::Completed,
+            );
+            peer.await.unwrap();
         }
     }
 
