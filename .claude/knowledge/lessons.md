@@ -31,7 +31,7 @@
 - L-0024 (2×, #361 #454): Never echo result contents or credentialed URLs in errors/logs. Strip URL query/userinfo and parser value text; assert distinctive secret substrings are absent from both outputs.
 
 ## HTTP and protocol
-- L-0025 (2×, #184 #196 #303): Select CloudFetch through per-statement SEA disposition/ResultConfig, never can_cloud_download session_conf; the server can accept session creation then reject the first execute.
+- L-0025 (1×, #436): CloudFetch opt-out sets can_cloud_download=false at session creation, deduplicating caller casing variants; execution still uses INLINE_OR_EXTERNAL_LINKS. Test unsupported-server failures instead of restoring old disposition-only behavior.
 - L-0026 (2×, #303 #436): Preserve case-sensitive dotted spark.* keys verbatim. When synthesizing a case-insensitive session key, remove all caller casing variants before inserting it.
 - L-0027 (1×, #255 #266): Use the server universe proto as wire-model authority; sibling drivers can drift. Verify each field type and exact JSON encoding against it.
 - L-0028 (1×, #261): Reuse the shared reqwest client and connection pool; constructing Client::new per request wastes TLS/pool state and can panic on TLS initialization.
