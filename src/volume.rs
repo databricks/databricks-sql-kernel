@@ -605,11 +605,20 @@ fn normalize(path: &Path) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn resolve_existing_parent(path: &Path, requested: &str) -> Result<PathBuf> {
+const MAX_SYMLINK_RESOLUTIONS: u8 = 40;
+
+fn resolve_existing_parent(
+    path: &Path,
+    requested: &str,
+    remaining_symlinks: u8,
+) -> Result<PathBuf> {
     match path.canonicalize() {
         Ok(path) => Ok(path),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+                if remaining_symlinks == 0 {
+                    return Err(local_error(error, requested));
+                }
                 let target = std::fs::read_link(path).map_err(|e| local_error(e, requested))?;
                 let target = if target.is_absolute() {
                     target
@@ -618,13 +627,17 @@ fn resolve_existing_parent(path: &Path, requested: &str) -> Result<PathBuf> {
                         .ok_or_else(|| invalid("Invalid local path"))?
                         .join(target)
                 };
-                return resolve_existing_parent(&normalize(&target)?, requested);
+                return resolve_existing_parent(
+                    &normalize(&target)?,
+                    requested,
+                    remaining_symlinks - 1,
+                );
             }
             let parent = path.parent().ok_or_else(|| local_error(error, requested))?;
             let name = path
                 .file_name()
                 .ok_or_else(|| invalid("Invalid local path"))?;
-            Ok(resolve_existing_parent(parent, requested)?.join(name))
+            Ok(resolve_existing_parent(parent, requested, remaining_symlinks)?.join(name))
         }
         Err(error) => Err(local_error(error, requested)),
     }
@@ -662,10 +675,14 @@ fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
             "Local file path is outside the configured allowed roots",
         ));
     }
-    let resolved = resolve_existing_parent(&path, requested)?;
+    let resolved = resolve_existing_parent(&path, requested, MAX_SYMLINK_RESOLUTIONS)?;
     let mut root_error = None;
     for root in roots {
-        let root = match resolve_existing_parent(&root, &root.to_string_lossy()) {
+        let root = match resolve_existing_parent(
+            &root,
+            &root.to_string_lossy(),
+            MAX_SYMLINK_RESOLUTIONS,
+        ) {
             Ok(root) => root,
             Err(error) => {
                 root_error.get_or_insert(error);
@@ -1791,6 +1808,22 @@ mod tests {
             error.local_error.unwrap().path,
             looping_root.to_string_lossy()
         );
+        symlink_dir(&other, root.join("link")).unwrap();
+        for (name, suffix) in [("cycle", ""), ("nested", "missing")] {
+            let cycle = root.join(name);
+            let target = Path::new("link").join("..").join(name).join(suffix);
+            symlink_file(target, &cycle).unwrap();
+            let requested = cycle.to_str().unwrap();
+            let error = allowed_path(requested, std::slice::from_ref(&root)).unwrap_err();
+            let local = error.local_error.unwrap();
+            assert_eq!(local.path, requested);
+            #[cfg(unix)]
+            {
+                assert_eq!(error.code, crate::ErrorCode::NotFound);
+                assert_eq!(local.kind, "NotFound");
+                assert_eq!(local.raw_os_error, Some(2));
+            }
+        }
         assert!(allowed_path(root.join("../other/missing").to_str().unwrap(), &[root]).is_err());
     }
 
