@@ -3840,6 +3840,53 @@ async fn native_batch_direct_and_async_use_aggregate_counts() {
         assert_eq!(attached.num_modified_rows(), None);
         assert_eq!(native_batch_requests(&server).await.len(), 1);
     }
+
+    for (last_count, expected) in [(4, Some(6)), (-2, None)] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let first = native_batch_counts(vec![Some(2)], None);
+        let last = native_batch_counts(vec![Some(last_count)], None);
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("batch-paged", &first)).unwrap();
+        body["manifest"]["total_chunk_count"] = json!(2);
+        body["manifest"]["total_row_count"] = json!(2);
+        body["result"]["next_chunk_index"] = json!(1);
+        mount_execute(&server, running_body("batch-paged")).await;
+        mount_status(&server, "batch-paged", body.to_string()).await;
+        Mock::given(method("GET"))
+            .and(path("/api/2.0/sql/statements/batch-paged/result/chunks/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "chunk_index": 1, "row_offset": 1, "row_count": 1,
+                "attachment": STANDARD.encode(arrow_ipc_bytes(&last)),
+            })))
+            .mount(&server)
+            .await;
+        let session = open_session(&server).await;
+        let mut statement = session.statement();
+        statement.spec().sql("INSERT INTO t VALUES (?)");
+        for value in [11, 29] {
+            statement
+                .spec()
+                .param(1, TypedValue::Int64(value))
+                .unwrap()
+                .add_parameter_set();
+        }
+        let executed = statement.submit().await.unwrap();
+        executed.status().await.unwrap();
+        assert_eq!(executed.num_modified_rows(), None);
+        let _stream = executed.await_result().await.unwrap();
+        assert_eq!(executed.num_modified_rows(), expected);
+        assert_eq!(
+            executed.reader().unwrap().num_modified_rows().unwrap(),
+            expected
+        );
+        executed.status().await.unwrap();
+        assert_eq!(executed.num_modified_rows(), expected);
+        let _stream = executed.fetch_result().await.unwrap();
+        assert_eq!(executed.num_modified_rows(), expected);
+        assert_eq!(native_batch_requests(&server).await.len(), 1);
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
