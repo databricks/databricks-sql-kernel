@@ -790,7 +790,8 @@ pub struct HttpConfig {
     /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
     pub retry_max_retries: u32,
 
-    /// Extra HTTP headers to send on every request. Lets wrappers
+    /// Extra HTTP headers to send on warehouse and OAuth requests, not
+    /// presigned CloudFetch downloads. Lets wrappers
     /// forward caller-supplied headers (the connector's `http_headers`,
     /// which also carries the composed `User-Agent`) onto the kernel's
     /// HTTP stack.

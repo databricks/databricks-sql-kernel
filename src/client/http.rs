@@ -285,7 +285,8 @@ pub struct HttpClientConfig {
     /// Databricks organization ID for multi-tenant workspace routing.
     /// When set, sent as the `x-databricks-org-id` header on all authenticated requests.
     pub org_id: Option<String>,
-    /// Extra headers applied to every request, before the kernel's own
+    /// Extra headers applied to requests other than presigned CloudFetch
+    /// downloads, before the kernel's own
     /// `Authorization` / `x-databricks-org-id` (which are added last and
     /// therefore win). A caller `User-Agent` here is folded into the
     /// effective UA at construction (it **replaces** the base UA, then is
@@ -864,34 +865,32 @@ impl DatabricksHttpClient {
             // client's effective UA in `new()` (a caller UA replaces the
             // base, which then becomes reqwest's default UA header).
             //
-            // Note: this loop runs for BOTH `execute` and
-            // `execute_without_auth`, so custom headers (and the effective
-            // User-Agent) also ride OAuth token-endpoint requests. This
-            // is intentional and matches the Thrift connector, where
-            // `setCustomHeaders` applies to every request on the
-            // transport, IdP calls included.
-            for (name, value) in &self.config.custom_headers {
-                let lname = name.to_ascii_lowercase();
-                if lname == "authorization" || lname == "x-databricks-org-id" {
-                    warn!(
-                        header = %name,
-                        "ignoring caller-supplied custom header; this name is \
+            // Custom headers still apply to OAuth requests through
+            // `execute_without_auth`, but not presigned storage downloads.
+            if request_type != RequestType::CloudFetchDownload {
+                for (name, value) in &self.config.custom_headers {
+                    let lname = name.to_ascii_lowercase();
+                    if lname == "authorization" || lname == "x-databricks-org-id" {
+                        warn!(
+                            header = %name,
+                            "ignoring caller-supplied custom header; this name is \
                          managed by the kernel and cannot be overridden"
-                    );
-                    continue;
-                }
-                if lname == "accept-encoding"
-                    && with_auth
-                    && !self.config.sea_response_compression_enabled
-                {
-                    warn!(
-                        header = %name,
-                        "ignoring caller-supplied Accept-Encoding header because SEA response \
+                        );
+                        continue;
+                    }
+                    if lname == "accept-encoding"
+                        && with_auth
+                        && !self.config.sea_response_compression_enabled
+                    {
+                        warn!(
+                            header = %name,
+                            "ignoring caller-supplied Accept-Encoding header because SEA response \
                          compression is disabled"
-                    );
-                    continue;
+                        );
+                        continue;
+                    }
+                    req_builder = req_builder.header(name, value);
                 }
-                req_builder = req_builder.header(name, value);
             }
 
             for (name, value) in headers.iter() {
@@ -1203,6 +1202,77 @@ mod tests {
         // If the matchers above didn't all match, wiremock returns the
         // default 404 and the status assert fails — so a 200 confirms
         // custom header + caller UA present AND auth = real-token.
+    }
+
+    #[tokio::test]
+    async fn test_custom_headers_exclude_cloudfetch_but_preserve_link_headers() {
+        use wiremock::matchers::method;
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let config = HttpClientConfig {
+            custom_headers: vec![
+                (
+                    "X-Databricks-Driver-Test".to_string(),
+                    "custom-header-sentinel".to_string(),
+                ),
+                (
+                    "x-storage-header".to_string(),
+                    "connection-value".to_string(),
+                ),
+            ],
+            ..HttpClientConfig::default()
+        };
+        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
+        client.set_auth_provider(Arc::new(PersonalAccessToken::new("real-token".to_string())));
+
+        for request_type in [
+            RequestType::CreateSession,
+            RequestType::CloseSession,
+            RequestType::ExecuteStatement,
+            RequestType::ExecuteMetadataQuery,
+            RequestType::GetStatementStatus,
+            RequestType::CancelStatement,
+            RequestType::CloseStatement,
+            RequestType::GetResultChunks,
+            RequestType::TelemetryExport,
+            RequestType::AuthTokenRequest,
+            RequestType::AuthDiscovery,
+            RequestType::CloudFetchDownload,
+        ] {
+            let mut request = client.inner().get(server.uri());
+            if request_type == RequestType::CloudFetchDownload {
+                request = request.header("x-storage-header", "link-value");
+            }
+            let request = request.build().unwrap();
+            let response = match request_type.category() {
+                RequestCategory::Auth | RequestCategory::CloudFetch => {
+                    client.execute_without_auth(request, request_type).await
+                }
+                _ => client.execute(request, request_type).await,
+            }
+            .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+            let requests = server.received_requests().await.unwrap();
+            let headers = &requests.last().unwrap().headers;
+            if request_type == RequestType::CloudFetchDownload {
+                assert!(!headers.contains_key("x-databricks-driver-test"));
+                assert!(!headers.contains_key("authorization"));
+                assert_eq!(headers.get_all("x-storage-header").iter().count(), 1);
+                assert_eq!(headers["x-storage-header"], "link-value");
+            } else {
+                assert_eq!(
+                    headers["x-databricks-driver-test"],
+                    "custom-header-sentinel"
+                );
+            }
+        }
     }
 
     #[tokio::test]
