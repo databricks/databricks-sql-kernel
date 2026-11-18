@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -70,10 +71,12 @@ pub(crate) struct OssSqlDriverTelemetryLog {
     pub session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sql_statement_id: Option<String>,
+    /// Shared with the session and every other event it emits.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub system_configuration: Option<DriverSystemConfiguration>,
+    pub system_configuration: Option<Arc<DriverSystemConfiguration>>,
+    /// Shared with the session and every other event it emits.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub driver_connection_params: Option<DriverConnectionParameters>,
+    pub driver_connection_params: Option<Arc<DriverConnectionParameters>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub auth_type: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -447,7 +450,7 @@ mod tests {
         let log = OssSqlDriverTelemetryLog {
             session_id: Some("session-1".to_string()),
             sql_statement_id: Some("statement-1".to_string()),
-            system_configuration: Some(DriverSystemConfiguration {
+            system_configuration: Some(Arc::new(DriverSystemConfiguration {
                 driver_version: Some("0.2.1".to_string()),
                 runtime_name: Some("rust".to_string()),
                 runtime_version: Some("1.0".to_string()),
@@ -460,8 +463,8 @@ mod tests {
                 locale_name: Some("en_US".to_string()),
                 char_set_encoding: Some("UTF-8".to_string()),
                 process_name: Some("cargo".to_string()),
-            }),
-            driver_connection_params: Some(DriverConnectionParameters {
+            })),
+            driver_connection_params: Some(Arc::new(DriverConnectionParameters {
                 http_path: Some("/sql/1.0/warehouses/abc".to_string()),
                 mode: Some(DriverMode::Sea),
                 host_info: Some(HostDetails {
@@ -475,7 +478,7 @@ mod tests {
                 async_poll_interval_millis: Some(1000),
                 auto_commit: Some(true),
                 ..Default::default()
-            }),
+            })),
             auth_type: Some("pat".to_string()),
             vol_operation: Some(VolumeOperationEvent {
                 volume_operation_type: Some(VolumeOperationType::List),
