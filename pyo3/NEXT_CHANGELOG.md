@@ -12,6 +12,13 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ## [Unreleased]
 
 ### Added
+- `ExecutedStatement.fetch_all_rows(max_rows, nan_ok=False)` (and the same
+  on `ResultStream`) returns all remaining rows as tuples of Python values,
+  equal to what pyarrow's `to_pylist()` returns, when there are at most
+  `max_rows` of them and every column type is supported; otherwise it
+  returns `None` and the Arrow fetches return the batches it read.
+  `schema_key()` returns a `SchemaKey` that compares equal for equal result
+  schemas. Together they let callers handle small results without pyarrow.
 
 ### Changed
 

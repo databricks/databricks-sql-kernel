@@ -23,7 +23,9 @@ use crate::errors::to_py_err;
 use crate::executed_async::ExecutedAsyncStatement;
 use crate::fetch;
 use crate::params::parse_typed_value;
+use crate::rows::{self, SchemaKey};
 use crate::runtime::KernelRuntime;
+use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
 use arrow_schema::Schema;
 use databricks_sql_kernel::{
@@ -31,7 +33,8 @@ use databricks_sql_kernel::{
     Statement as KStatement, StatementCanceller as KStatementCanceller,
 };
 use pyo3::prelude::*;
-use std::collections::HashMap;
+use pyo3::types::PyList;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 /// Python-facing mutable statement.
@@ -293,12 +296,17 @@ pub(crate) struct ExecutedStatement {
     /// survives `close()`, like `statement_id` / `schema`. The connector
     /// surfaces this as `cursor.rowcount`.
     num_modified_rows: Option<i64>,
+    /// Whether `fetch_all_rows` converts every column type of `schema`.
+    rows_supported: bool,
 }
 
 struct ExecutedInner {
     exec: KExecutedStatement,
     runtime: Arc<KernelRuntime>,
     exhausted: bool,
+    /// Batches `fetch_all_rows` pulled but didn't convert; served first by
+    /// the Arrow fetches.
+    pending: VecDeque<RecordBatch>,
 }
 
 impl ExecutedStatement {
@@ -308,12 +316,14 @@ impl ExecutedStatement {
         let num_modified_rows = exec.num_modified_rows();
         Self {
             statement_id,
+            rows_supported: rows::schema_is_supported(&schema),
             schema,
             num_modified_rows,
             inner: Some(ExecutedInner {
                 exec,
                 runtime,
                 exhausted: false,
+                pending: VecDeque::new(),
             }),
         }
     }
@@ -341,10 +351,56 @@ impl ExecutedStatement {
         self.schema.as_ref().to_pyarrow(py)
     }
 
+    /// A `SchemaKey` equal to another statement's when their result schemas
+    /// are equal, for caching what is derived from a schema without
+    /// building a `pyarrow.Schema`. Available even after `close()`.
+    fn schema_key(&self) -> SchemaKey {
+        SchemaKey::new(self.schema.clone())
+    }
+
+    /// All remaining rows as a list of tuples of Python values, if there
+    /// are at most `max_rows` of them and every column has a type converted
+    /// here; otherwise `None`, and the next Arrow fetch returns the batches
+    /// this call pulled. Values are what pyarrow's `to_pylist()` returns.
+    /// NaN floats return `None` unless `nan_ok`. Only a time-zone-aware
+    /// timestamp column uses pyarrow, for its `string_to_tzinfo`.
+    #[pyo3(signature = (max_rows, nan_ok = false))]
+    fn fetch_all_rows<'py>(
+        &mut self,
+        py: Python<'py>,
+        max_rows: i64,
+        nan_ok: bool,
+    ) -> PyResult<Option<Bound<'py, PyList>>> {
+        let max_rows = rows::max_rows(py, max_rows)?;
+        let inner = alive_mut!(self, "ExecutedStatement");
+        if !self.rows_supported {
+            return Ok(None);
+        }
+        // No GIL hand-off when an earlier call already read more than fits.
+        if !inner.exhausted && rows::pending_rows(&inner.pending) <= max_rows {
+            let runtime = inner.runtime.clone();
+            inner.exhausted = run_sync_kernel!(
+                py,
+                fetch::fill_exec(&runtime, &mut inner.exec, &mut inner.pending, max_rows)
+            )?;
+        }
+        rows::take_rows(
+            py,
+            &self.schema,
+            inner.exhausted,
+            &mut inner.pending,
+            max_rows,
+            nan_ok,
+        )
+    }
+
     /// Pull the next batch as a `pyarrow.RecordBatch`, or `None` if
     /// the stream is exhausted.
     fn fetch_next_batch<'py>(&mut self, py: Python<'py>) -> PyResult<Option<Bound<'py, PyAny>>> {
         let inner = alive_mut!(self, "ExecutedStatement");
+        if let Some(batch) = inner.pending.pop_front() {
+            return Ok(Some(batch.to_pyarrow(py)?));
+        }
         if inner.exhausted {
             return Ok(None);
         }
@@ -365,9 +421,15 @@ impl ExecutedStatement {
     /// Drain the full result and return a single `pyarrow.Table`.
     fn fetch_all_arrow<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let inner = alive_mut!(self, "ExecutedStatement");
-        let runtime = inner.runtime.clone();
-        let batches = run_sync_kernel!(py, fetch::drain_exec(&runtime, &mut inner.exec))?;
-        inner.exhausted = true;
+        if !inner.exhausted {
+            let runtime = inner.runtime.clone();
+            // Read through `pending`, so a failed read loses no batch.
+            inner.exhausted = run_sync_kernel!(
+                py,
+                fetch::fill_exec(&runtime, &mut inner.exec, &mut inner.pending, usize::MAX)
+            )?;
+        }
+        let batches: Vec<RecordBatch> = inner.pending.drain(..).collect();
         fetch::batches_to_pyarrow_table(py, &self.schema, batches)
     }
 
