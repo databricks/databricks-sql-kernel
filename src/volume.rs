@@ -257,13 +257,9 @@ impl VolumeState {
         };
         let mut destination = if instruction.operation == "GET" {
             let path = local_path.as_ref().expect("GET path was checked");
-            // Match normal write permissions even though publication uses replacement.
-            let permissions = match std::fs::OpenOptions::new().write(true).open(path) {
-                Ok(file) => Some(
-                    file.metadata()
-                        .map_err(|e| local_error(e, &instruction.local_file))?
-                        .permissions(),
-                ),
+            // Replacement must still honor the destination's write permissions.
+            let existing = match std::fs::OpenOptions::new().write(true).open(path) {
+                Ok(file) => Some(file),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
                 Err(error) => return Err(local_error(error, &instruction.local_file)),
             };
@@ -276,23 +272,39 @@ impl VolumeState {
                 use std::os::unix::fs::PermissionsExt;
                 builder.permissions(std::fs::Permissions::from_mode(0o666));
             }
-            let temp = builder
-                .tempfile_in(
-                    path.parent()
-                        .ok_or_else(|| invalid("Missing destination parent"))?,
-                )
-                .map_err(|e| local_error(e, &instruction.local_file))?;
-            if let Some(permissions) = permissions {
-                temp.as_file()
-                    .set_permissions(permissions)
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
-            }
+            let (temp, in_place) = match builder.tempfile_in(
+                path.parent()
+                    .ok_or_else(|| invalid("Missing destination parent"))?,
+            ) {
+                Ok(temp) => {
+                    if let Some(file) = existing {
+                        temp.as_file()
+                            .set_permissions(
+                                file.metadata()
+                                    .map_err(|e| local_error(e, &instruction.local_file))?
+                                    .permissions(),
+                            )
+                            .map_err(|e| local_error(e, &instruction.local_file))?;
+                    }
+                    (temp, None)
+                }
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::PermissionDenied
+                        && existing.is_some() =>
+                {
+                    // An existing file may be writable without permission to replace its entry.
+                    let temp = tempfile::NamedTempFile::new()
+                        .map_err(|e| local_error(e, &instruction.local_file))?;
+                    (temp, existing)
+                }
+                Err(error) => return Err(local_error(error, &instruction.local_file)),
+            };
             let writer = tokio::fs::File::from_std(
                 temp.as_file()
                     .try_clone()
                     .map_err(|e| local_error(e, &instruction.local_file))?,
             );
-            Some((temp, writer))
+            Some((temp, writer, in_place))
         } else {
             None
         };
@@ -401,14 +413,14 @@ impl VolumeState {
         })
         .await?
         {
-            if let Some((_, writer)) = destination.as_mut() {
+            if let Some((_, writer, _)) = destination.as_mut() {
                 writer
                     .write_all(&bytes)
                     .await
                     .map_err(|e| local_error(e, &instruction.local_file))?;
             }
         }
-        if let Some((temp, mut writer)) = destination.take() {
+        if let Some((mut temp, mut writer, in_place)) = destination.take() {
             writer
                 .flush()
                 .await
@@ -418,8 +430,17 @@ impl VolumeState {
             if let CommitState::Finished(result) = &*gate {
                 return result.as_ref().clone();
             }
-            temp.persist(local_path.as_ref().expect("GET destination"))
-                .map_err(|e| local_error(e.error, &instruction.local_file))?;
+            if let Some(mut file) = in_place {
+                std::io::Seek::rewind(temp.as_file_mut())
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                let length = std::io::copy(temp.as_file_mut(), &mut file)
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                file.set_len(length)
+                    .map_err(|e| local_error(e, &instruction.local_file))?;
+            } else {
+                temp.persist(local_path.as_ref().expect("GET destination"))
+                    .map_err(|e| local_error(e.error, &instruction.local_file))?;
+            }
             *gate = CommitState::Finished(Box::new(Ok(VolumeCompletion::Completed)));
         }
         Ok(VolumeCompletion::Completed)
@@ -1370,6 +1391,39 @@ mod tests {
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
         }
         assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+        #[cfg(unix)]
+        {
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o500)).unwrap();
+            if tempfile::tempfile_in(dir.path())
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+            {
+                std::fs::write(&dest, b"old bytes with a longer tail").unwrap();
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o200)).unwrap();
+                Mock::given(method("GET"))
+                    .and(path("/in-place"))
+                    .respond_with(ResponseTemplate::new(200).set_body_bytes(b"new bytes"))
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                let batch = instruction("GET", &format!("{}/in-place", server.uri()), &dest);
+                let state = transfer_state(0);
+                assert_eq!(
+                    state
+                        .complete(&batch, &Client::new(), &options(dir.path()), None)
+                        .await
+                        .unwrap(),
+                    VolumeCompletion::Completed
+                );
+                assert_eq!(
+                    std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777,
+                    0o200
+                );
+                std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+                assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+            }
+        }
+        #[cfg(unix)]
+        let requests = server.received_requests().await.unwrap().len();
         let state = transfer_state(0);
         let batch = instruction(
             "GET",
@@ -1407,9 +1461,13 @@ mod tests {
                 assert_eq!(local.kind, "PermissionDenied");
                 assert_eq!(local.path, dest.to_string_lossy());
                 assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
-                assert_eq!(server.received_requests().await.unwrap().len(), 2);
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    requests + 1
+                );
             }
             std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         }
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
     }

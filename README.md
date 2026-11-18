@@ -76,8 +76,8 @@ rows. The PyO3 `ExecutedStatement` and `ResultStream` classes expose
 `is_volume_operation` and `complete_volume_operation`.
 
 Local filesystem setup and download publication are synchronous. Cancellation
-cannot interrupt a blocked filesystem call and can wait for the atomic rename
-that publishes a completed GET.
+cannot interrupt a blocked filesystem call and can wait for publication of a
+completed GET.
 
 A PUT instruction with `localFile == "__input_stream__"` returns
 `NeedsInputStream` until owned input bytes are supplied. An empty byte buffer is a
@@ -93,7 +93,11 @@ additional lexical paths.
 Paths are normalized lexically before symlink resolution. Allowed-root validation
 assumes path components remain unchanged between validation and file access.
 
-GET replaces the destination only after a complete download. Transfer failures
+GET stages the complete download before publishing it. When the destination
+directory permits temporary-file creation, publication atomically replaces the
+destination. Otherwise, an existing writable file can be updated in place using
+private storage in the system temporary directory. That final write is not
+atomic and a local write failure can leave partial contents. Download failures
 and cancellation before publication preserve the destination's existing bytes.
 Repeated completion on the same execution reuses its outcome, including errors.
 
