@@ -39,12 +39,16 @@ pub(crate) enum BatchRead {
     End,
 }
 
+fn own_arrow_batch(batch: &ResultBatch) -> Result<RecordBatch> {
+    match batch {
+        ResultBatch::Arrow(batch) => Ok(batch.clone()),
+        _ => Err(Error::invalid_state().message("kernel returned a non-Arrow ResultBatch variant")),
+    }
+}
+
 fn own_batch(read: TryNextBatch<'_>) -> Result<BatchRead> {
     match read {
-        TryNextBatch::Ready(ResultBatch::Arrow(batch)) => Ok(BatchRead::Ready(batch.clone())),
-        TryNextBatch::Ready(_) => {
-            Err(Error::invalid_state().message("kernel returned a non-Arrow ResultBatch variant"))
-        }
+        TryNextBatch::Ready(batch) => own_arrow_batch(batch).map(BatchRead::Ready),
         TryNextBatch::Pending => Ok(BatchRead::Pending),
         TryNextBatch::End => Ok(BatchRead::End),
         _ => Err(Error::invalid_state().message("kernel returned an unknown batch-read state")),
@@ -82,29 +86,15 @@ pub(crate) fn next_batch(
     runtime: &Runtime,
     stream: &mut ResultStream,
 ) -> Result<Option<RecordBatch>> {
-    runtime.block_on(async {
-        match stream.next_batch().await? {
-            Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
-            Some(_) => Err(Error::invalid_argument()
-                .message("kernel returned a non-Arrow ResultBatch variant")),
-            None => Ok(None),
-        }
-    })
+    runtime.block_on(async { stream.next_batch().await?.map(own_arrow_batch).transpose() })
 }
 
 /// Drain the kernel stream and collect every remaining batch.
 pub(crate) fn drain(runtime: &Runtime, stream: &mut ResultStream) -> Result<Vec<RecordBatch>> {
     runtime.block_on(async {
         let mut out = Vec::new();
-        loop {
-            match stream.next_batch().await? {
-                Some(ResultBatch::Arrow(rb)) => out.push(rb.clone()),
-                Some(_) => {
-                    return Err(Error::invalid_argument()
-                        .message("kernel returned a non-Arrow ResultBatch variant"));
-                }
-                None => break,
-            }
+        while let Some(batch) = stream.next_batch().await? {
+            out.push(own_arrow_batch(batch)?);
         }
         Ok(out)
     })
@@ -117,14 +107,7 @@ pub(crate) fn next_batch_exec(
     runtime: &Runtime,
     exec: &mut ExecutedStatement,
 ) -> Result<Option<RecordBatch>> {
-    runtime.block_on(async {
-        match exec.next_batch().await? {
-            Some(ResultBatch::Arrow(rb)) => Ok(Some(rb.clone())),
-            Some(_) => Err(Error::invalid_argument()
-                .message("kernel returned a non-Arrow ResultBatch variant")),
-            None => Ok(None),
-        }
-    })
+    runtime.block_on(async { exec.next_batch().await?.map(own_arrow_batch).transpose() })
 }
 
 /// Like [`drain`], but drives the `ExecutedStatement` so auto-close-on-
@@ -136,15 +119,8 @@ pub(crate) fn drain_exec(
 ) -> Result<Vec<RecordBatch>> {
     runtime.block_on(async {
         let mut out = Vec::new();
-        loop {
-            match exec.next_batch().await? {
-                Some(ResultBatch::Arrow(rb)) => out.push(rb.clone()),
-                Some(_) => {
-                    return Err(Error::invalid_argument()
-                        .message("kernel returned a non-Arrow ResultBatch variant"));
-                }
-                None => break,
-            }
+        while let Some(batch) = exec.next_batch().await? {
+            out.push(own_arrow_batch(batch)?);
         }
         Ok(out)
     })

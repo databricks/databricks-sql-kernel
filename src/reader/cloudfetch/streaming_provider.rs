@@ -3105,6 +3105,87 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refresh_skip_logs_release_chunk_guard() {
+        use tracing_subscriber::prelude::*;
+
+        struct CheckLogLock {
+            chunks: Arc<DashMap<i64, ChunkEntry>>,
+            logged: Arc<AtomicBool>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckLogLock {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                event.record(
+                    &mut |field: &tracing::field::Field, value: &dyn std::fmt::Debug| {
+                        if field.name() != "message" {
+                            return;
+                        }
+                        let message = format!("{value:?}");
+                        if message.starts_with("Concurrent refresh delivered")
+                            || message.contains("skipped after claim")
+                        {
+                            assert!(
+                                self.chunks.try_get_mut(&0).is_present(),
+                                "refresh log callback must be able to write the chunk: {message}"
+                            );
+                            self.logged.store(true, Ordering::Release);
+                        }
+                    },
+                );
+            }
+        }
+
+        for contended in [false, true] {
+            let chunks = Arc::new(DashMap::new());
+            let link = if contended {
+                expired_link(0)
+            } else {
+                create_test_link(0)
+            };
+            chunks.insert(0, entry_with_state(link, ChunkState::UrlFetched));
+            let mock = RefreshCountingMock::new(1);
+            let fetcher: Arc<dyn ChunkLinkFetcher> = mock.clone();
+            let coordinator = Arc::new(RefreshCoordinator::default());
+            coordinator.in_progress.store(contended, Ordering::Release);
+            let cancel = CancellationToken::new();
+            let logged = Arc::new(AtomicBool::new(false));
+            let subscriber = tracing_subscriber::registry().with(CheckLogLock {
+                chunks: Arc::clone(&chunks),
+                logged: Arc::clone(&logged),
+            });
+            let _guard = tracing::subscriber::set_default(subscriber);
+
+            let mut refresh = Box::pin(StreamingCloudFetchProvider::refresh_links_batch(
+                0,
+                &fetcher,
+                &chunks,
+                &coordinator,
+                &cancel,
+                None,
+            ));
+            if contended {
+                assert!(futures::poll!(refresh.as_mut()).is_pending());
+                chunks.insert(
+                    0,
+                    entry_with_state(create_test_link(0), ChunkState::UrlFetched),
+                );
+                coordinator.in_progress.store(false, Ordering::Release);
+                coordinator.done.notify_waiters();
+            }
+            tokio::time::timeout(NO_HANG, refresh)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(logged.load(Ordering::Acquire), "contended={contended}");
+            assert_eq!(mock.refresh_calls.load(AtomicOrdering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
     async fn refresh_batch_disjoint_window_loser_retries_claim() {
         // Loser-of-claim disjoint-window gap (round-3 follow-up):
         // when Task A wins the CAS and refreshes a window that
