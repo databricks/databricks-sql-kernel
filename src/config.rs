@@ -750,6 +750,7 @@ impl std::fmt::Debug for AuthConfig {
 pub struct HttpConfig {
     /// Negotiate HTTP/2 for HTTPS requests, with HTTP/1.1 fallback.
     /// Defaults to `true`. Set to `false` to use HTTP/1.1 only.
+    /// A configured proxy forces HTTP/1.1 for every request on the client.
     pub http2_enabled: bool,
 
     /// Whether authenticated SEA requests may negotiate HTTP response compression.

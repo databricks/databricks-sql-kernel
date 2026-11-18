@@ -518,7 +518,7 @@ export interface ConnectionOptions {
    * Whether SEA API responses may use HTTP compression. Defaults to false.
    */
   seaResponseCompressionEnabled?: boolean
-  /** Negotiate HTTP/2 over HTTPS by default. Set false to use HTTP/1.1 only. */
+  /** Negotiate HTTP/2 over HTTPS by default. False or a configured proxy forces HTTP/1.1. */
   enableHttp2?: boolean
   /**
    * Retry/backoff tuning — all optional. An unset field keeps the kernel's

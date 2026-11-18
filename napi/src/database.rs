@@ -388,7 +388,7 @@ pub struct ConnectionOptions {
     /// Whether SEA API responses may use HTTP compression. Defaults to false.
     pub sea_response_compression_enabled: Option<bool>,
 
-    /// Negotiate HTTP/2 over HTTPS by default. Set false to use HTTP/1.1 only.
+    /// Negotiate HTTP/2 over HTTPS by default. False or a configured proxy forces HTTP/1.1.
     pub enable_http2: Option<bool>,
 
     /// Retry/backoff tuning — all optional. An unset field keeps the kernel's

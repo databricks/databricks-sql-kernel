@@ -16,7 +16,9 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
+- HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default when no
+  proxy is configured. Explicit or environment proxy configuration forces
+  HTTP/1.1 for the entire client. Set
   `HttpConfig.http2_enabled` to `false`, or use
   `kernel_session_config_set_http2_enabled(config, false)`, to force HTTP/1.1.
   Rust ADBC exposes `adbc.databricks.http.http2_enabled`.

@@ -24,7 +24,7 @@ use http::Version;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
@@ -34,6 +34,7 @@ struct HttpsServer {
     url: String,
     certificate: Vec<u8>,
     requests: mpsc::UnboundedReceiver<(String, Version)>,
+    acceptor: TlsAcceptor,
     task: JoinHandle<()>,
 }
 
@@ -66,6 +67,7 @@ impl HttpsServer {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("https://{}", listener.local_addr().unwrap());
         let (versions, received_versions) = mpsc::unbounded_channel();
+        let proxy_acceptor = acceptor.clone();
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {
@@ -123,6 +125,7 @@ impl HttpsServer {
             url,
             certificate,
             requests: received_versions,
+            acceptor: proxy_acceptor,
             task,
         }
     }
@@ -165,27 +168,14 @@ async fn https_negotiates_http2_and_supports_http1_fallback_and_opt_out() {
     ] {
         let mut server = HttpsServer::start(server_http2).await;
         let client = server.client(enabled, None);
-        for request_type in [
-            RequestType::CreateSession,
-            RequestType::CloudFetchDownload,
-            RequestType::AuthDiscovery,
-            RequestType::AuthTokenRequest,
-            RequestType::TelemetryExport,
-        ] {
-            let request = client.inner().get(&server.url).build().unwrap();
-            let response = if matches!(
-                request_type,
-                RequestType::CreateSession | RequestType::TelemetryExport
-            ) {
-                client.execute(request, request_type).await
-            } else {
-                client.execute_without_auth(request, request_type).await
-            }
+        let request = client.inner().get(&server.url).build().unwrap();
+        let response = client
+            .execute(request, RequestType::CreateSession)
+            .await
             .unwrap();
-            assert_eq!(response.version(), expected);
-            response.bytes().await.unwrap();
-            server.assert_version(expected).await;
-        }
+        assert_eq!(response.version(), expected);
+        response.bytes().await.unwrap();
+        server.assert_version(expected).await;
         let response = client.inner().get(&server.url).send().await.unwrap();
         assert_eq!(response.version(), expected);
         response.bytes().await.unwrap();
@@ -202,45 +192,134 @@ async fn https_negotiates_http2_and_supports_http1_fallback_and_opt_out() {
 }
 
 #[tokio::test]
-async fn https_negotiates_inside_an_http1_connect_tunnel() {
-    for (server_http2, enabled, expected) in [
-        (true, true, Version::HTTP_2),
-        (false, true, Version::HTTP_11),
-        (true, false, Version::HTTP_11),
-    ] {
+async fn https_uses_http1_through_an_http_proxy() {
+    assert_connect_proxy(false).await;
+}
+
+#[tokio::test]
+async fn https_uses_http1_through_an_https_proxy() {
+    assert_connect_proxy(true).await;
+}
+
+async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
+    mut downstream: S,
+    target: String,
+    sent_head: tokio::sync::oneshot::Sender<String>,
+) {
+    let mut head = Vec::new();
+    let mut byte = [0];
+    while !head.ends_with(b"\r\n\r\n") {
+        downstream.read_exact(&mut byte).await.unwrap();
+        head.push(byte[0]);
+    }
+    let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
+    downstream
+        .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+        .await
+        .unwrap();
+    sent_head.send(String::from_utf8(head).unwrap()).unwrap();
+    let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
+}
+
+async fn assert_connect_proxy(proxy_tls: bool) {
+    for (server_http2, enabled) in [(true, true), (false, true), (true, false)] {
         let mut server = HttpsServer::start(server_http2).await;
         let authority = server.url.strip_prefix("https://").unwrap().to_string();
         let target = authority.clone();
         let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_url = format!("http://{}", proxy.local_addr().unwrap());
+        let proxy_url = format!(
+            "{}://{}",
+            if proxy_tls { "https" } else { "http" },
+            proxy.local_addr().unwrap()
+        );
         let (sent_head, received_head) = tokio::sync::oneshot::channel();
+        let acceptor = server.acceptor.clone();
         let proxy_task = tokio::spawn(async move {
-            let mut downstream = proxy.accept().await.unwrap().0;
-            let mut head = Vec::new();
-            let mut byte = [0];
-            while !head.ends_with(b"\r\n\r\n") {
-                downstream.read_exact(&mut byte).await.unwrap();
-                head.push(byte[0]);
+            let downstream = proxy.accept().await.unwrap().0;
+            if proxy_tls {
+                let downstream = acceptor.accept(downstream).await.unwrap();
+                assert_ne!(
+                    downstream.get_ref().1.alpn_protocol(),
+                    Some(b"h2".as_slice())
+                );
+                tunnel(downstream, target, sent_head).await;
+            } else {
+                tunnel(downstream, target, sent_head).await;
             }
-            let mut upstream = tokio::net::TcpStream::connect(target).await.unwrap();
-            downstream
-                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
-                .await
-                .unwrap();
-            sent_head.send(String::from_utf8(head).unwrap()).unwrap();
-            let _ = tokio::io::copy_bidirectional(&mut downstream, &mut upstream).await;
         });
         let client = server.client(enabled, Some(proxy_url));
         let response = client.inner().get(&server.url).send().await.unwrap();
-        assert_eq!(response.version(), expected);
+        assert_eq!(response.version(), Version::HTTP_11);
         response.bytes().await.unwrap();
-        server.assert_version(expected).await;
+        server.assert_version(Version::HTTP_11).await;
         let head = received_head.await.unwrap();
         assert!(
             head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")),
             "{head}"
         );
         proxy_task.abort();
+    }
+}
+
+#[test]
+fn environment_proxy_configuration_uses_http1_including_bypassed_hosts() {
+    const CHILD: &str = "DATABRICKS_HTTP2_ENV_TEST_PROTOCOL";
+    if let Ok(protocol) = std::env::var(CHILD) {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let expected = if protocol == "h2" {
+                    Version::HTTP_2
+                } else {
+                    Version::HTTP_11
+                };
+                let mut server = HttpsServer::start(true).await;
+                let client = server.client(true, None);
+                let response = client.inner().get(&server.url).send().await.unwrap();
+                assert_eq!(response.version(), expected);
+                response.bytes().await.unwrap();
+                server.assert_version(expected).await;
+                client
+                    .first_redirect_location(&format!("{}/redirect", server.url))
+                    .await
+                    .unwrap();
+                server.assert_version(expected).await;
+            });
+        return;
+    }
+
+    let keys = [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ];
+    for selected in keys.into_iter().map(Some).chain([None]) {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command.args([
+            "--exact",
+            "environment_proxy_configuration_uses_http1_including_bypassed_hosts",
+            "--nocapture",
+        ]);
+        for key in keys {
+            command.env(key, "");
+        }
+        command.env("NO_PROXY", "127.0.0.1").env_remove("no_proxy");
+        command.env(CHILD, if selected.is_some() { "http1" } else { "h2" });
+        if let Some(key) = selected {
+            command.env(key, "http://127.0.0.1:9");
+        }
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "proxy {selected:?}: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 }
 

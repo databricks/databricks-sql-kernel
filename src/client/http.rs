@@ -267,7 +267,7 @@ impl TlsConfig {
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
-    /// Negotiate HTTP/2 over TLS. When false, use HTTP/1.1 only.
+    /// Negotiate HTTP/2 over TLS without a proxy. False or a configured proxy uses HTTP/1.1.
     pub http2_enabled: bool,
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     pub sea_response_compression_enabled: bool,
@@ -528,7 +528,20 @@ impl DatabricksHttpClient {
             .user_agent(&config.user_agent)
             .redirect(redirect);
 
-        if !config.http2_enabled {
+        let proxy_configured = config.proxy.url.is_some()
+            || [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+
+        // CONNECT tunneling requires HTTP/1.1 on the proxy connection.
+        if !config.http2_enabled || proxy_configured {
             builder = builder.http1_only();
         }
 

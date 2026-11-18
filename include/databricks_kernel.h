@@ -362,7 +362,7 @@ KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* co
                                                          const char* name, const char* value);
 
 /* Negotiate HTTP/2 for all HTTPS requests, with HTTP/1.1 fallback.
- * Enabled by default. Set enabled to false to use HTTP/1.1 only. */
+ * Enabled by default. False or a configured proxy forces HTTP/1.1. */
 KernelStatusCode kernel_session_config_set_http2_enabled(
     KernelSessionConfig* config, bool enabled);
 
