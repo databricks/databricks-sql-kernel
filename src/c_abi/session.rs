@@ -147,8 +147,9 @@ pub struct KernelSessionConfig {
     /// TLS relaxations / custom trust (populated by the `..._set_tls_*`
     /// setters). Defaults to the kernel's strict validation.
     tls: TlsSpec,
-    /// Extra HTTP headers sent on every request (accumulated by
-    /// `..._set_custom_header`, one `(name, value)` pair per call).
+    /// Extra HTTP headers for SEA, telemetry, feature flags and M2M/OIDC,
+    /// not presigned CloudFetch downloads. User-Agent remains client-wide.
+    /// Accumulated by `..._set_custom_header`, one pair per call.
     custom_headers: Vec<(String, String)>,
     /// Whether authenticated SEA responses may use HTTP compression.
     sea_response_compression_enabled: bool,
@@ -589,9 +590,10 @@ pub unsafe extern "C" fn kernel_session_config_set_oauth_scopes(
     })
 }
 
-/// Append one HTTP header sent on every request (e.g. a partner-supplied
-/// `X-…` header). Call once per header; order is preserved. Both `name`
-/// and `value` are required. Maps to the kernel's `custom_headers`.
+/// Append one custom HTTP header for SEA, telemetry, feature-flag and M2M/OIDC
+/// requests, not presigned CloudFetch downloads. A caller `User-Agent` replaces
+/// the client-wide UA, including downloads. Call once per header; order is
+/// preserved. Both `name` and `value` are required. Maps to `custom_headers`.
 ///
 /// # Safety
 /// `config` must be a live config handle; `name` / `value` must be

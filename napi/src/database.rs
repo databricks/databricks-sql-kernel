@@ -362,9 +362,10 @@ pub struct ConnectionOptions {
     /// kernel's TLS backends supply a PKCS#8 key (`BEGIN PRIVATE KEY`).
     /// Maps onto the kernel [`TlsConfig::client_key_pem`].
     pub client_key_pem: Option<Buffer>,
-    /// Extra HTTP headers to send on every request — the route for
-    /// caller-supplied headers (the NodeJS driver's `customHeaders` and
-    /// the composed `User-Agent`). Maps onto the kernel
+    /// Extra HTTP headers for SEA, telemetry, feature-flag and M2M/OIDC
+    /// requests, excluding presigned CloudFetch downloads. A caller
+    /// `User-Agent` replaces the client-wide UA, including downloads.
+    /// Maps the NodeJS driver's `customHeaders` onto the kernel
     /// [`HttpConfig::custom_headers`].
     ///
     /// An **ordered list** of `(name, value)` pairs, mirroring the kernel

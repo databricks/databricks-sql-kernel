@@ -356,8 +356,10 @@ KernelStatusCode kernel_session_config_set_session_conf(KernelSessionConfig* con
 KernelStatusCode kernel_session_config_set_enable_geospatial_support(
     KernelSessionConfig* config, bool enabled);
 
-/* Append one HTTP header sent on every request. Call once per header
- * (order preserved); `name` and `value` are both required. */
+/* Append one custom HTTP header for SEA, telemetry, feature-flag and M2M/OIDC
+ * requests, not presigned CloudFetch downloads. A caller User-Agent replaces
+ * the client-wide UA, including downloads. Call once per header (order
+ * preserved); `name` and `value` are both required. */
 KernelStatusCode kernel_session_config_set_custom_header(KernelSessionConfig* config,
                                                          const char* name, const char* value);
 

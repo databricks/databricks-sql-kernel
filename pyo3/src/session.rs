@@ -326,12 +326,12 @@ impl Session {
     /// `max_connections` sets the maximum idle connections retained per host.
     /// Unset keeps the kernel default (100); zero is rejected.
     ///
-    /// `http_headers` is a list of `(name, value)` pairs sent on every
-    /// request — used to forward the connector's caller headers (which
-    /// also carry the composed `User-Agent`). The kernel applies them
-    /// before its own `Authorization` / `x-databricks-org-id` headers,
-    /// which always take precedence; a caller header for either of those
-    /// names is ignored.
+    /// `http_headers` is a list of `(name, value)` pairs for SEA, telemetry,
+    /// feature-flag and M2M/OIDC requests, not presigned CloudFetch downloads.
+    /// A caller `User-Agent` replaces the client-wide UA, including downloads.
+    /// Other entries precede the kernel's own `Authorization` /
+    /// `x-databricks-org-id` headers, which always take precedence;
+    /// a caller header for either reserved name is ignored.
     ///
     /// `session_conf` is the server-bound session configuration map
     /// — passed through to SEA `session_confs` verbatim. Use for
@@ -556,10 +556,9 @@ impl Session {
         // wrappers can pass an intuitive total. `retry_max_attempts = 0`
         // or `1` both mean "one attempt, no retries".
         //
-        // `http_headers` are extra headers sent on every request (the
-        // connector forwards its `http_headers`, which also carries the
-        // composed `User-Agent`). The kernel applies them before its own
-        // `Authorization` / `x-databricks-org-id`, which always win.
+        // `http_headers` apply to SEA, telemetry, feature flags and M2M/OIDC,
+        // not presigned CloudFetch downloads. A caller User-Agent stays
+        // client-wide. Kernel Authorization/org-id take precedence.
         let http_config = build_http_config(
             sea_response_compression_enabled,
             request_timeout_secs,

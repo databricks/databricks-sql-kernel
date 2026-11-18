@@ -283,14 +283,16 @@ pub struct HttpClientConfig {
     /// TLS configuration.
     pub tls: TlsConfig,
     /// Databricks organization ID for multi-tenant workspace routing.
-    /// When set, sent as the `x-databricks-org-id` header on all authenticated requests.
+    /// When set, added as `x-databricks-org-id` on `execute` /
+    /// `execute_without_auth` and feature-flag requests, including
+    /// presigned CloudFetch downloads.
     pub org_id: Option<String>,
-    /// Extra headers applied to requests other than presigned CloudFetch
-    /// downloads, before the kernel's own
-    /// `Authorization` / `x-databricks-org-id` (which are added last and
-    /// therefore win). A caller `User-Agent` here is folded into the
-    /// effective UA at construction (it **replaces** the base UA, then is
-    /// removed from this list). Populated from
+    /// Extra headers applied by `execute` / `execute_without_auth`
+    /// (SEA, telemetry, M2M/OIDC auth) and the feature-flag GET, except
+    /// presigned CloudFetch downloads. The kernel's own `Authorization` /
+    /// `x-databricks-org-id` take precedence. A caller `User-Agent` instead
+    /// replaces the client-wide UA, including downloads, and is removed
+    /// from this list at construction. Populated from
     /// [`crate::config::HttpConfig::custom_headers`]; see its docs for
     /// the full precedence / reserved-name rules.
     pub custom_headers: Vec<(String, String)>,
@@ -865,8 +867,8 @@ impl DatabricksHttpClient {
             // client's effective UA in `new()` (a caller UA replaces the
             // base, which then becomes reqwest's default UA header).
             //
-            // Custom headers still apply to OAuth requests through
-            // `execute_without_auth`, but not presigned storage downloads.
+            // M2M token/OIDC requests through `execute_without_auth` retain
+            // these headers; presigned downloads do not. UA is client-wide.
             if request_type != RequestType::CloudFetchDownload {
                 for (name, value) in &self.config.custom_headers {
                     let lname = name.to_ascii_lowercase();
@@ -1263,7 +1265,6 @@ mod tests {
             let headers = &requests.last().unwrap().headers;
             if request_type == RequestType::CloudFetchDownload {
                 assert!(!headers.contains_key("x-databricks-driver-test"));
-                assert!(!headers.contains_key("authorization"));
                 assert_eq!(headers.get_all("x-storage-header").iter().count(), 1);
                 assert_eq!(headers["x-storage-header"], "link-value");
             } else {

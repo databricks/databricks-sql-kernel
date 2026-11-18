@@ -254,8 +254,63 @@ mod tests {
         assert_eq!(downloader.speed_threshold_mbps, 0.1);
     }
 
-    // Note: Full download tests require mocking the HTTP layer
-    // Integration tests should be added in a separate test module
+    #[tokio::test]
+    async fn test_download_excludes_connection_headers_and_preserves_link_headers() {
+        use arrow_ipc::writer::StreamWriter;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let batch = make_batch(0, 2);
+        let mut bytes = Vec::new();
+        {
+            let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+            writer.write(&batch).unwrap();
+            writer.finish().unwrap();
+        }
+        let byte_count = bytes.len() as i64;
+        Mock::given(method("GET"))
+            .and(path("/chunk"))
+            .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let http_client = Arc::new(
+            DatabricksHttpClient::with_default_retry(HttpClientConfig {
+                custom_headers: vec![
+                    (
+                        "X-Databricks-Driver-Test".to_string(),
+                        "custom-header-sentinel".to_string(),
+                    ),
+                    ("User-Agent".to_string(), "MyConnector/1.0".to_string()),
+                ],
+                ..HttpClientConfig::default()
+            })
+            .unwrap(),
+        );
+        let downloader = ChunkDownloader::new(http_client, CompressionCodec::None, 0.0);
+        let link = CloudFetchLink {
+            url: format!("{}/chunk", server.uri()),
+            row_count: 2,
+            byte_count,
+            http_headers: HashMap::from([(
+                "x-storage-header".to_string(),
+                "link-value".to_string(),
+            )]),
+            ..create_test_link()
+        };
+
+        let batches = downloader.download(&link, None).await.unwrap();
+        assert_eq!(batches, vec![batch]);
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1);
+        let headers = &requests[0].headers;
+        assert!(!headers.contains_key("x-databricks-driver-test"));
+        assert_eq!(headers.get_all("x-storage-header").iter().count(), 1);
+        assert_eq!(headers["x-storage-header"], "link-value");
+        assert_eq!(headers["user-agent"], "MyConnector/1.0");
+    }
 
     use arrow_array::Int32Array;
     use arrow_schema::{DataType, Field, Schema};

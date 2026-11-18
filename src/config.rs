@@ -790,11 +790,10 @@ pub struct HttpConfig {
     /// map it as `retry_max_retries = max(0, total_attempts - 1)`.
     pub retry_max_retries: u32,
 
-    /// Extra HTTP headers to send on warehouse and OAuth requests, not
-    /// presigned CloudFetch downloads. Lets wrappers
-    /// forward caller-supplied headers (the connector's `http_headers`,
-    /// which also carries the composed `User-Agent`) onto the kernel's
-    /// HTTP stack.
+    /// Extra HTTP headers applied by `execute` / `execute_without_auth`
+    /// (SEA, telemetry, M2M/OIDC auth) and the feature-flag GET, except
+    /// presigned CloudFetch downloads. A caller `User-Agent` becomes the
+    /// client-wide UA and is sent everywhere.
     ///
     /// **`Authorization` / `x-databricks-org-id` are reserved:** a
     /// caller entry for either name is **silently dropped (with a
