@@ -481,6 +481,21 @@ impl DatabricksHttpClient {
             })?;
         }
 
+        // Resolve the protocol before telemetry clients can be shared across sessions.
+        let proxy_configured = config.proxy.url.is_some()
+            || [
+                "HTTP_PROXY",
+                "http_proxy",
+                "HTTPS_PROXY",
+                "https_proxy",
+                "ALL_PROXY",
+                "all_proxy",
+            ]
+            .iter()
+            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
+
+        config.http2_enabled &= !proxy_configured;
+
         // Follow redirects for normal traffic (reqwest's default policy).
         let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
 
@@ -528,20 +543,7 @@ impl DatabricksHttpClient {
             .user_agent(&config.user_agent)
             .redirect(redirect);
 
-        let proxy_configured = config.proxy.url.is_some()
-            || [
-                "HTTP_PROXY",
-                "http_proxy",
-                "HTTPS_PROXY",
-                "https_proxy",
-                "ALL_PROXY",
-                "all_proxy",
-            ]
-            .iter()
-            .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
-
-        // CONNECT tunneling requires HTTP/1.1 on the proxy connection.
-        if !config.http2_enabled || proxy_configured {
+        if !config.http2_enabled {
             builder = builder.http1_only();
         }
 

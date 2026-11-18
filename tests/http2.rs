@@ -18,7 +18,7 @@ use databricks_sql_kernel::client::{
     build_retry_configs, DatabricksHttpClient, HttpClientConfig, RequestType, RetryConfig,
 };
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, HttpConfig, Session, TelemetryConfig, TlsConfig,
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, Session, TelemetryConfig, TlsConfig,
 };
 use http::Version;
 use rustls::pki_types::PrivatePkcs8KeyDer;
@@ -358,50 +358,62 @@ async fn session_http2_default_and_opt_out_reach_the_https_connection() {
 
 #[tokio::test]
 async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host() {
-    let mut server = HttpsServer::start(true).await;
-    let mut sessions = Vec::new();
-    for enabled in [true, false] {
-        let mut http = HttpConfig::default();
-        http.http2_enabled = enabled;
-        http.retry_max_retries = 0;
-        http.overall_timeout = Duration::from_secs(5);
-        let mut tls = TlsConfig::default();
-        tls.custom_ca_cert = Some(server.certificate.clone());
-        let mut telemetry = TelemetryConfig::default();
-        telemetry.enabled = Some(true);
-        telemetry.flush_interval = Duration::from_secs(3600);
-        sessions.push(
-            Session::builder()
-                .connection(ConnectionConfig::new(&server.url, "test-warehouse"))
-                .auth(AuthConfig::Pat {
-                    token: "test-token".into(),
-                    identity_federation_client_id: None,
-                })
-                .http(http)
-                .tls(tls)
-                .telemetry(telemetry)
-                .open()
-                .await
-                .unwrap(),
+    for configurations in [
+        [(true, false), (false, false)],
+        [(true, false), (true, true)],
+        [(true, true), (true, false)],
+    ] {
+        let mut server = HttpsServer::start(true).await;
+        let mut sessions = Vec::new();
+        for (enabled, proxied) in configurations {
+            let mut http = HttpConfig::default();
+            http.http2_enabled = enabled;
+            http.retry_max_retries = 0;
+            http.overall_timeout = Duration::from_secs(5);
+            let mut tls = TlsConfig::default();
+            tls.custom_ca_cert = Some(server.certificate.clone());
+            let mut proxy = ProxyConfig::default();
+            if proxied {
+                proxy.url = Some("http://127.0.0.1:9".into());
+                proxy.bypass_hosts = Some("127.0.0.1".into());
+            }
+            let mut telemetry = TelemetryConfig::default();
+            telemetry.enabled = Some(true);
+            telemetry.flush_interval = Duration::from_secs(3600);
+            sessions.push(
+                Session::builder()
+                    .connection(ConnectionConfig::new(&server.url, "test-warehouse"))
+                    .auth(AuthConfig::Pat {
+                        token: "test-token".into(),
+                        identity_federation_client_id: None,
+                    })
+                    .http(http)
+                    .proxy(proxy)
+                    .tls(tls)
+                    .telemetry(telemetry)
+                    .open()
+                    .await
+                    .unwrap(),
+            );
+        }
+        for session in sessions.into_iter().rev() {
+            session.close().await.unwrap();
+        }
+        let mut telemetry_versions = Vec::new();
+        while let Ok((path, version)) = server.requests.try_recv() {
+            if path.starts_with("/telemetry") {
+                telemetry_versions.push(version);
+            }
+        }
+        assert!(
+            telemetry_versions.contains(&Version::HTTP_11),
+            "{telemetry_versions:?}"
+        );
+        assert!(
+            telemetry_versions.contains(&Version::HTTP_2),
+            "{telemetry_versions:?}"
         );
     }
-    for session in sessions.into_iter().rev() {
-        session.close().await.unwrap();
-    }
-    let mut telemetry_versions = Vec::new();
-    while let Ok((path, version)) = server.requests.try_recv() {
-        if path.starts_with("/telemetry") {
-            telemetry_versions.push(version);
-        }
-    }
-    assert!(
-        telemetry_versions.contains(&Version::HTTP_11),
-        "{telemetry_versions:?}"
-    );
-    assert!(
-        telemetry_versions.contains(&Version::HTTP_2),
-        "{telemetry_versions:?}"
-    );
 }
 
 #[test]
