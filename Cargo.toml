@@ -59,7 +59,8 @@ arrow-ipc = "59"
 # (which `native-tls` pulls in on Linux) collides with Node's symbols at
 # module load time and segfaults the process before any Rust code runs.
 # `rustls` is pure Rust + ring and avoids the conflict entirely.
-reqwest = { version = "0.12", default-features = false, features = ["json", "gzip", "stream"] }
+# 0.12.23: first release with `ClientBuilder::retry` (see `client/http.rs`).
+reqwest = { version = "0.12.23", default-features = false, features = ["json", "gzip", "stream"] }
 native-tls = { version = "0.2", optional = true }
 rustls = { version = "0.23.41", optional = true, default-features = false, features = ["ring", "std", "tls12"] }
 # Enforce TLS dependency minimums for consumers with their own lockfiles.

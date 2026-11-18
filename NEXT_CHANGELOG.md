@@ -20,6 +20,10 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
+- Each HTTP request costs less CPU: the client no longer copies every request
+  for HTTP/2 retries it cannot make, and an unchanged token's `Authorization`
+  value (and, with token federation, its issuer check) is reused instead of
+  being rebuilt per request.
 
 ### Updated
 
