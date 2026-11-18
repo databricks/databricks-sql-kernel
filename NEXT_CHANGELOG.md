@@ -16,10 +16,6 @@ changes go in their respective binding's NEXT_CHANGELOG.
 
 ### Changed
 
-- **Breaking (Rust API):** `client::HttpClientConfig` gains `http2_enabled`.
-  Struct literals must set the field or use `..Default::default()` to enable
-  HTTP/2 negotiation by default.
-
 - HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default when no
   proxy is configured. Explicit or environment proxy configuration forces
   HTTP/1.1 for the entire client. Set

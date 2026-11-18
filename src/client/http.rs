@@ -267,8 +267,6 @@ impl TlsConfig {
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
-    /// Negotiate HTTP/2 over TLS without a proxy. False or a configured proxy uses HTTP/1.1.
-    pub http2_enabled: bool,
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     pub sea_response_compression_enabled: bool,
     /// Connection timeout duration.
@@ -300,7 +298,6 @@ pub struct HttpClientConfig {
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
-            http2_enabled: true,
             sea_response_compression_enabled: false,
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
@@ -387,6 +384,7 @@ fn build_mtls_identity(cert_pem: &[u8], key_pem: &[u8]) -> Result<reqwest::Ident
 pub struct DatabricksHttpClient {
     client: Client,
     config: HttpClientConfig,
+    http2_enabled: bool,
     auth_provider: OnceLock<Arc<dyn AuthProvider>>,
     retry_configs: HashMap<RequestCategory, RetryConfig>,
 }
@@ -398,8 +396,16 @@ impl DatabricksHttpClient {
     /// calling `execute()`. Use `execute_without_auth()` for requests that
     /// don't need authentication (e.g., OAuth token endpoint calls).
     pub fn new(
+        config: HttpClientConfig,
+        retry_configs: HashMap<RequestCategory, RetryConfig>,
+    ) -> Result<Self> {
+        Self::new_with_http2(config, retry_configs, true)
+    }
+
+    pub(crate) fn new_with_http2(
         mut config: HttpClientConfig,
         retry_configs: HashMap<RequestCategory, RetryConfig>,
+        http2_enabled: bool,
     ) -> Result<Self> {
         // Fold any caller-supplied `User-Agent` custom header into the
         // effective UA, and remove it from `custom_headers` so it isn't
@@ -481,7 +487,7 @@ impl DatabricksHttpClient {
             })?;
         }
 
-        // Resolve the protocol before telemetry clients can be shared across sessions.
+        // Keep proxy TLS compatible with reqwest's HTTP/1.1 CONNECT handshake.
         let proxy_configured = config.proxy.url.is_some()
             || [
                 "HTTP_PROXY",
@@ -494,10 +500,14 @@ impl DatabricksHttpClient {
             .iter()
             .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()));
 
-        config.http2_enabled &= !proxy_configured;
+        let http2_enabled = http2_enabled && !proxy_configured;
 
         // Follow redirects for normal traffic (reqwest's default policy).
-        let client = Self::build_reqwest_client(&config, reqwest::redirect::Policy::default())?;
+        let client = Self::build_reqwest_client(
+            &config,
+            http2_enabled,
+            reqwest::redirect::Policy::default(),
+        )?;
 
         // Surface which TLS backend was compiled in so oncall debugging
         // a handshake / unknown-CA report can tell at a glance whether
@@ -512,13 +522,13 @@ impl DatabricksHttpClient {
             } else {
                 "native-tls"
             },
-            http2_enabled = config.http2_enabled,
-            "DatabricksHttpClient initialised"
+            http2_enabled, "DatabricksHttpClient initialised"
         );
 
         Ok(Self {
             client,
             config,
+            http2_enabled,
             auth_provider: OnceLock::new(),
             retry_configs,
         })
@@ -532,6 +542,7 @@ impl DatabricksHttpClient {
     /// and user-agent configuration.
     fn build_reqwest_client(
         config: &HttpClientConfig,
+        http2_enabled: bool,
         redirect: reqwest::redirect::Policy,
     ) -> Result<Client> {
         let mut builder = Client::builder()
@@ -543,7 +554,7 @@ impl DatabricksHttpClient {
             .user_agent(&config.user_agent)
             .redirect(redirect);
 
-        if !config.http2_enabled {
+        if !http2_enabled {
             builder = builder.http1_only();
         }
 
@@ -754,6 +765,10 @@ impl DatabricksHttpClient {
         &self.config
     }
 
+    pub(crate) fn http2_enabled(&self) -> bool {
+        self.http2_enabled
+    }
+
     /// Returns the underlying reqwest client for building requests.
     pub fn inner(&self) -> &Client {
         &self.client
@@ -828,7 +843,11 @@ impl DatabricksHttpClient {
     /// `azure_tenant_id` (which skips discovery entirely). A single hop is
     /// sufficient for discovery, so no retry is attempted here.
     pub async fn first_redirect_location(&self, url: &str) -> Result<Option<String>> {
-        let client = Self::build_reqwest_client(&self.config, reqwest::redirect::Policy::none())?;
+        let client = Self::build_reqwest_client(
+            &self.config,
+            self.http2_enabled,
+            reqwest::redirect::Policy::none(),
+        )?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
         })?;
@@ -1107,6 +1126,10 @@ impl DatabricksHttpClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "http2_tests.rs"]
+mod http2_tests;
 
 #[cfg(test)]
 #[path = "http_tls_tests.rs"]

@@ -125,17 +125,14 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 
 ## `HttpConfig` — HTTP client (optional)
 
-The `http2_enabled` setting applies to all kernel-owned HTTPS requests: authentication and
-discovery, SQL requests, result downloads, feature flags, and telemetry. TLS
-negotiates the protocol with each peer when no proxy is configured. An explicit
-HTTP/HTTPS proxy URL or a nonempty `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`
-(or lowercase equivalent) forces HTTP/1.1 for the entire client. Proxy bypass
-rules still select which destinations use the proxy; bypassed destinations also
-use HTTP/1.1 on that client.
+`http2_enabled` covers all kernel HTTPS traffic, including authentication,
+SQL, result downloads and telemetry. An explicit proxy URL or nonempty
+`HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY` (including lowercase variants) forces
+HTTP/1.1, including destinations that bypass the proxy.
 
 | Field | Description | Default |
 |-------|-------------|---------|
-| `http2_enabled` | Negotiate HTTP/2 for HTTPS with HTTP/1.1 fallback when no proxy is configured. `false` or a configured proxy forces HTTP/1.1. | `true` |
+| `http2_enabled` | HTTP/2 with HTTP/1.1 fallback; `false` forces HTTP/1.1. | `true` |
 | `request_timeout` | Per-request timeout (connect + body). | `120s` |
 | `overall_timeout` | Maximum total time across retries for one logical RPC. | `900s` |
 | `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |

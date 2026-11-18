@@ -238,6 +238,3 @@ jobs:
 
       - name: Test client behavior (tls-rustls)
         run: "cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --lib client::"
-
-      - name: Test HTTP protocol negotiation (tls-rustls)
-        run: cargo test -p databricks-sql-kernel --no-default-features --features tls-rustls --test http2

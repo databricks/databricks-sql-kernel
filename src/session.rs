@@ -368,7 +368,12 @@ impl Session {
         let http_client_config = build_http_client_config(&config, org_id);
         let retry_configs = build_retry_configs_for_session(&config);
         let http_client = Arc::new(
-            DatabricksHttpClient::new(http_client_config, retry_configs).map_err(|e| {
+            DatabricksHttpClient::new_with_http2(
+                http_client_config,
+                retry_configs,
+                config.http.http2_enabled,
+            )
+            .map_err(|e| {
                 Error::network_error().message(format!("Failed to construct HTTP client: {e}"))
             })?,
         );
@@ -1080,7 +1085,6 @@ fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
 /// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
     HttpClientConfig {
-        http2_enabled: config.http.http2_enabled,
         sea_response_compression_enabled: config.http.sea_response_compression_enabled,
         connect_timeout: Duration::from_secs(30),
         // The historical internal `read_timeout` field is passed to reqwest's

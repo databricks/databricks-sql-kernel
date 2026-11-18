@@ -69,11 +69,9 @@ Canonical `adbc.databricks.*` names take precedence over compatibility aliases.
 
 ## HTTP transport
 
-HTTPS requests negotiate HTTP/2 by default, with HTTP/1.1 fallback when the
-peer does not support HTTP/2. Set `adbc.databricks.http.http2_enabled` to `false`
-to force HTTP/1.1 for all kernel-owned HTTPS requests, including authentication,
-query requests, result downloads, and telemetry. Configured proxies force
-HTTP/1.1 for the entire kernel client.
+HTTPS requests negotiate HTTP/2 with HTTP/1.1 fallback by default. Set
+`adbc.databricks.http.http2_enabled` to `false` to force HTTP/1.1 for all kernel
+HTTPS traffic. Configured proxies force HTTP/1.1, including bypassed destinations.
 
 ## Authentication
 

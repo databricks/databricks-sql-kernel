@@ -12,14 +12,15 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use bytes::Bytes;
-use databricks_sql_kernel::auth::PersonalAccessToken;
-use databricks_sql_kernel::client::{
+use crate::auth::PersonalAccessToken;
+use crate::client::{
     build_retry_configs, DatabricksHttpClient, HttpClientConfig, RequestType, RetryConfig,
 };
-use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, Session, TelemetryConfig, TlsConfig,
+use crate::{
+    AuthConfig, ConnectionConfig, HttpConfig, ProxyConfig, Session, SessionBuilder,
+    TelemetryConfig, TlsConfig,
 };
+use bytes::Bytes;
 use http::Version;
 use rustls::pki_types::PrivatePkcs8KeyDer;
 use std::sync::Arc;
@@ -29,6 +30,16 @@ use tokio::net::TcpListener;
 use tokio::sync::mpsc;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_rustls::TlsAcceptor;
+
+const PROXY_VARIABLES: [&str; 6] = [
+    "HTTP_PROXY",
+    "http_proxy",
+    "HTTPS_PROXY",
+    "https_proxy",
+    "ALL_PROXY",
+    "all_proxy",
+];
+const CHILD_TEST: &str = "DATABRICKS_HTTP2_TEST";
 
 struct HttpsServer {
     url: String,
@@ -140,7 +151,6 @@ impl HttpsServer {
 
     fn client(&self, enabled: bool, proxy: Option<String>) -> DatabricksHttpClient {
         let mut config = HttpClientConfig {
-            http2_enabled: enabled,
             read_timeout: Duration::from_secs(5),
             ..HttpClientConfig::default()
         };
@@ -151,32 +161,56 @@ impl HttpsServer {
             overall_timeout: Duration::from_secs(5),
             ..RetryConfig::default()
         };
-        let client =
-            DatabricksHttpClient::new(config, build_retry_configs(&retries, &Default::default()))
-                .unwrap();
+        let client = DatabricksHttpClient::new_with_http2(
+            config,
+            build_retry_configs(&retries, &Default::default()),
+            enabled,
+        )
+        .unwrap();
         client.set_auth_provider(Arc::new(PersonalAccessToken::new("test-token")));
         client
     }
+
+    fn session_builder(&self, enabled: Option<bool>) -> SessionBuilder {
+        let mut http = HttpConfig {
+            overall_timeout: Duration::from_secs(5),
+            retry_max_retries: 0,
+            ..HttpConfig::default()
+        };
+        if let Some(enabled) = enabled {
+            http.http2_enabled = enabled;
+        }
+        let tls = TlsConfig {
+            custom_ca_cert: Some(self.certificate.clone()),
+            ..TlsConfig::default()
+        };
+        Session::builder()
+            .connection(ConnectionConfig::new(&self.url, "test-warehouse"))
+            .auth(AuthConfig::Pat {
+                token: "test-token".into(),
+                identity_federation_client_id: None,
+            })
+            .http(http)
+            .tls(tls)
+    }
 }
 
-fn run_without_proxy_environment(test_name: &str) -> bool {
-    const CHILD: &str = "DATABRICKS_HTTP2_DIRECT_TEST";
-    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+fn run_with_proxy_environment(test_name: &str, proxy_variable: Option<&str>) -> bool {
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
         return false;
     }
+    let qualified_name = format!("client::http::http2_tests::{test_name}");
     let mut command = std::process::Command::new(std::env::current_exe().unwrap());
     command
-        .args(["--exact", test_name, "--nocapture"])
-        .env(CHILD, test_name);
-    for key in [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ] {
-        command.env_remove(key);
+        .args(["--exact", &qualified_name, "--nocapture"])
+        .env(CHILD_TEST, test_name)
+        .env("NO_PROXY", "127.0.0.1")
+        .env_remove("no_proxy");
+    for key in PROXY_VARIABLES {
+        command.env(key, "");
+    }
+    if let Some(key) = proxy_variable {
+        command.env(key, "http://127.0.0.1:9");
     }
     let output = command.output().unwrap();
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -189,9 +223,10 @@ fn run_without_proxy_environment(test_name: &str) -> bool {
 }
 
 #[tokio::test]
-async fn https_negotiates_http2_and_supports_http1_fallback_and_opt_out() {
-    if run_without_proxy_environment(
-        "https_negotiates_http2_and_supports_http1_fallback_and_opt_out",
+async fn https_negotiates_http2_with_http1_fallback_and_opt_out() {
+    if run_with_proxy_environment(
+        "https_negotiates_http2_with_http1_fallback_and_opt_out",
+        None,
     ) {
         return;
     }
@@ -207,10 +242,6 @@ async fn https_negotiates_http2_and_supports_http1_fallback_and_opt_out() {
             .execute(request, RequestType::CreateSession)
             .await
             .unwrap();
-        assert_eq!(response.version(), expected);
-        response.bytes().await.unwrap();
-        server.assert_version(expected).await;
-        let response = client.inner().get(&server.url).send().await.unwrap();
         assert_eq!(response.version(), expected);
         response.bytes().await.unwrap();
         server.assert_version(expected).await;
@@ -256,61 +287,62 @@ async fn tunnel<S: AsyncRead + AsyncWrite + Unpin>(
 }
 
 async fn assert_connect_proxy(proxy_tls: bool) {
-    for (server_http2, enabled) in [(true, true), (false, true), (true, false)] {
-        let mut server = HttpsServer::start(server_http2).await;
-        let authority = server.url.strip_prefix("https://").unwrap().to_string();
-        let target = authority.clone();
-        let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let proxy_url = format!(
-            "{}://{}",
-            if proxy_tls { "https" } else { "http" },
-            proxy.local_addr().unwrap()
-        );
-        let (sent_head, received_head) = tokio::sync::oneshot::channel();
-        let acceptor = server.acceptor.clone();
-        let proxy_task = tokio::spawn(async move {
-            let downstream = proxy.accept().await.unwrap().0;
-            if proxy_tls {
-                let downstream = acceptor.accept(downstream).await.unwrap();
-                assert_ne!(
-                    downstream.get_ref().1.alpn_protocol(),
-                    Some(b"h2".as_slice())
-                );
-                tunnel(downstream, target, sent_head).await;
-            } else {
-                tunnel(downstream, target, sent_head).await;
-            }
-        });
-        let client = server.client(enabled, Some(proxy_url));
-        let response = client.inner().get(&server.url).send().await.unwrap();
-        assert_eq!(response.version(), Version::HTTP_11);
-        response.bytes().await.unwrap();
-        server.assert_version(Version::HTTP_11).await;
-        let head = tokio::time::timeout(Duration::from_secs(5), received_head)
-            .await
-            .expect("proxy did not receive CONNECT")
-            .unwrap();
-        assert!(
-            head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")),
-            "{head}"
-        );
-        proxy_task.abort();
-    }
+    let mut server = HttpsServer::start(true).await;
+    let authority = server.url.strip_prefix("https://").unwrap().to_string();
+    let target = authority.clone();
+    let proxy = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let proxy_url = format!(
+        "{}://{}",
+        if proxy_tls { "https" } else { "http" },
+        proxy.local_addr().unwrap()
+    );
+    let (sent_head, received_head) = tokio::sync::oneshot::channel();
+    let acceptor = server.acceptor.clone();
+    let proxy_task = tokio::spawn(async move {
+        let downstream = proxy.accept().await.unwrap().0;
+        if proxy_tls {
+            let downstream = acceptor.accept(downstream).await.unwrap();
+            assert_ne!(
+                downstream.get_ref().1.alpn_protocol(),
+                Some(b"h2".as_slice())
+            );
+            tunnel(downstream, target, sent_head).await;
+        } else {
+            tunnel(downstream, target, sent_head).await;
+        }
+    });
+    let client = server.client(true, Some(proxy_url));
+    let response = client.inner().get(&server.url).send().await.unwrap();
+    assert_eq!(response.version(), Version::HTTP_11);
+    response.bytes().await.unwrap();
+    server.assert_version(Version::HTTP_11).await;
+    let head = tokio::time::timeout(Duration::from_secs(5), received_head)
+        .await
+        .expect("proxy did not receive CONNECT")
+        .unwrap();
+    assert!(
+        head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")),
+        "{head}"
+    );
+    proxy_task.abort();
 }
 
 #[test]
-fn environment_proxy_configuration_uses_http1_including_bypassed_hosts() {
-    const CHILD: &str = "DATABRICKS_HTTP2_ENV_TEST_PROTOCOL";
-    if let Ok(protocol) = std::env::var(CHILD) {
+fn proxy_environment_uses_http1_for_bypassed_hosts() {
+    let test_name = "proxy_environment_uses_http1_for_bypassed_hosts";
+    if std::env::var(CHILD_TEST).as_deref() == Ok(test_name) {
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap()
             .block_on(async {
-                let expected = if protocol == "h2" {
-                    Version::HTTP_2
-                } else {
+                let expected = if PROXY_VARIABLES
+                    .iter()
+                    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
+                {
                     Version::HTTP_11
+                } else {
+                    Version::HTTP_2
                 };
                 let mut server = HttpsServer::start(true).await;
                 let client = server.client(true, None);
@@ -327,66 +359,20 @@ fn environment_proxy_configuration_uses_http1_including_bypassed_hosts() {
         return;
     }
 
-    let keys = [
-        "HTTP_PROXY",
-        "http_proxy",
-        "HTTPS_PROXY",
-        "https_proxy",
-        "ALL_PROXY",
-        "all_proxy",
-    ];
-    for selected in keys.into_iter().map(Some).chain([None]) {
-        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
-        command.args([
-            "--exact",
-            "environment_proxy_configuration_uses_http1_including_bypassed_hosts",
-            "--nocapture",
-        ]);
-        for key in keys {
-            command.env(key, "");
-        }
-        command.env("NO_PROXY", "127.0.0.1").env_remove("no_proxy");
-        command.env(CHILD, if selected.is_some() { "http1" } else { "h2" });
-        if let Some(key) = selected {
-            command.env(key, "http://127.0.0.1:9");
-        }
-        let output = command.output().unwrap();
-        assert!(
-            output.status.success(),
-            "proxy {selected:?}: {}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+    for selected in PROXY_VARIABLES.into_iter().map(Some).chain([None]) {
+        assert!(run_with_proxy_environment(test_name, selected));
     }
 }
 
 #[tokio::test]
-async fn session_http2_default_and_opt_out_reach_the_https_connection() {
-    if run_without_proxy_environment("session_http2_default_and_opt_out_reach_the_https_connection")
-    {
+async fn session_preserves_http2_default_and_opt_out() {
+    if run_with_proxy_environment("session_preserves_http2_default_and_opt_out", None) {
         return;
     }
-    for enabled in [true, false] {
+    for enabled in [None, Some(true), Some(false)] {
         let mut server = HttpsServer::start(true).await;
-        let mut http = HttpConfig::default();
-        assert!(http.http2_enabled);
-        http.http2_enabled = enabled;
-        http.overall_timeout = Duration::from_secs(5);
-        http.retry_max_retries = 0;
-        let mut tls = TlsConfig::default();
-        tls.custom_ca_cert = Some(server.certificate.clone());
-        let session = Session::builder()
-            .connection(ConnectionConfig::new(&server.url, "test-warehouse"))
-            .auth(AuthConfig::Pat {
-                token: "test-token".into(),
-                identity_federation_client_id: None,
-            })
-            .http(http)
-            .tls(tls)
-            .open()
-            .await
-            .unwrap();
-        let expected = if enabled {
+        let session = server.session_builder(enabled).open().await.unwrap();
+        let expected = if enabled.unwrap_or(true) {
             Version::HTTP_2
         } else {
             Version::HTTP_11
@@ -398,10 +384,8 @@ async fn session_http2_default_and_opt_out_reach_the_https_connection() {
 }
 
 #[tokio::test]
-async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host() {
-    if run_without_proxy_environment(
-        "telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host",
-    ) {
+async fn telemetry_separates_protocols_on_the_same_host() {
+    if run_with_proxy_environment("telemetry_separates_protocols_on_the_same_host", None) {
         return;
     }
     for configurations in [
@@ -412,30 +396,20 @@ async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host
         let mut server = HttpsServer::start(true).await;
         let mut sessions = Vec::new();
         for (enabled, proxied) in configurations {
-            let mut http = HttpConfig::default();
-            http.http2_enabled = enabled;
-            http.retry_max_retries = 0;
-            http.overall_timeout = Duration::from_secs(5);
-            let mut tls = TlsConfig::default();
-            tls.custom_ca_cert = Some(server.certificate.clone());
             let mut proxy = ProxyConfig::default();
             if proxied {
                 proxy.url = Some("http://127.0.0.1:9".into());
                 proxy.bypass_hosts = Some("127.0.0.1".into());
             }
-            let mut telemetry = TelemetryConfig::default();
-            telemetry.enabled = Some(true);
-            telemetry.flush_interval = Duration::from_secs(3600);
+            let telemetry = TelemetryConfig {
+                enabled: Some(true),
+                flush_interval: Duration::from_secs(3600),
+                ..TelemetryConfig::default()
+            };
             sessions.push(
-                Session::builder()
-                    .connection(ConnectionConfig::new(&server.url, "test-warehouse"))
-                    .auth(AuthConfig::Pat {
-                        token: "test-token".into(),
-                        identity_federation_client_id: None,
-                    })
-                    .http(http)
+                server
+                    .session_builder(Some(enabled))
                     .proxy(proxy)
-                    .tls(tls)
                     .telemetry(telemetry)
                     .open()
                     .await
@@ -463,12 +437,12 @@ async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host
 }
 
 #[test]
-fn c_abi_http2_default_and_opt_out_reach_the_https_connection() {
-    if run_without_proxy_environment("c_abi_http2_default_and_opt_out_reach_the_https_connection") {
+fn c_abi_preserves_http2_default_and_opt_out() {
+    if run_with_proxy_environment("c_abi_preserves_http2_default_and_opt_out", None) {
         return;
     }
-    use databricks_sql_kernel::c_abi::session::*;
-    use databricks_sql_kernel::c_abi::KernelStatusCode;
+    use crate::c_abi::session::*;
+    use crate::c_abi::KernelStatusCode;
     use std::ffi::CString;
     use std::ptr;
 
