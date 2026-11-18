@@ -14,6 +14,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ### Added
 
 ### Changed
+- All sessions in a process share one tokio runtime instead of each
+  starting its own worker per CPU, so many concurrent sessions use far
+  fewer threads and less CPU per query.
 
 ### Updated
 

@@ -14,11 +14,11 @@
 
 //! `Session` — Python class wrapping the kernel's `Session`.
 //!
-//! Owns a multi-thread tokio runtime per session (one tokio worker
-//! pool drives all I/O for this session). The runtime handle is
-//! cloned into child `Statement` / `ExecutedStatement` objects so
-//! they `block_on` the same pool without keeping the `Session`
-//! pyclass alive longer than the user keeps a reference.
+//! Sessions share one process-wide multi-thread tokio runtime (see
+//! `runtime::shared`). The runtime handle is cloned into child
+//! `Statement` / `ExecutedStatement` objects so they `block_on` the
+//! same pool without keeping the `Session` pyclass alive longer than
+//! the user keeps a reference.
 
 use crate::auth::{build_auth_config, OAuthParams};
 use crate::executed_async::ExecutedAsyncStatement;
@@ -29,7 +29,6 @@ use databricks_sql_kernel::{GeospatialResultRepresentation, Session as KSession}
 use pyo3::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
-use tokio::runtime::Builder;
 
 /// Python-facing session handle.
 ///
@@ -603,20 +602,9 @@ impl Session {
             None
         };
 
-        // One tokio runtime per session. Multi-thread so CloudFetch
-        // chunk downloads can overlap with the main poll loop. Worker
-        // count left to tokio's default (logical CPU count).
-        let runtime = Arc::new(KernelRuntime::new(
-            Builder::new_multi_thread()
-                .enable_all()
-                .thread_name("dbx-sql-kernel")
-                .build()
-                .map_err(|e| {
-                    pyo3::exceptions::PyRuntimeError::new_err(format!(
-                        "failed to build tokio runtime: {e}"
-                    ))
-                })?,
-        ));
+        let runtime = crate::runtime::shared().map_err(|e| {
+            pyo3::exceptions::PyRuntimeError::new_err(format!("failed to build tokio runtime: {e}"))
+        })?;
 
         // `Session::open` is async and grabs the current tokio handle.
         // Drive it on the runtime; the macro detaches the GIL for the
