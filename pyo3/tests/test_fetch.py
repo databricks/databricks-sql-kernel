@@ -189,10 +189,11 @@ def test_buffered_fetch_closes_once_after_exhaustion(sql_api, batches):
         observed.append(batch.column(0).to_pylist())
     assert observed == batches
     assert result.fetch_next_batch() is None
+    assert sql_api.statement_closed.wait(5)
+    assert Counter(sql_api.requests)["DELETE", sql_api.statement_path] == 1
     result.close()
     result.close()
     statement.close()
-    assert sql_api.statement_closed.wait(5)
     assert Counter(sql_api.requests)["DELETE", sql_api.statement_path] == 1
     assert result.arrow_schema() == schema
     with pytest.raises(k.KernelError, match="closed"):
