@@ -19,6 +19,9 @@
 //! `ResultStream` directly). Both call `next_batch` on the kernel
 //! stream and clone the Arrow `RecordBatch` out from under the
 //! borrow so the result can cross the GIL boundary as an owned value.
+//!
+//! A nonblocking probe holds the GIL through kernel post-processing, so large
+//! batches requiring column rewrites can delay other Python threads.
 
 use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
@@ -54,6 +57,20 @@ pub(crate) fn try_next_batch(stream: &mut ResultStream) -> Result<BatchRead> {
 
 pub(crate) fn try_next_batch_exec(exec: &mut ExecutedStatement) -> Result<BatchRead> {
     own_batch(exec.try_next_batch()?)
+}
+
+pub(crate) fn read_batch(
+    py: Python<'_>,
+    read: Result<BatchRead>,
+    pending: impl FnOnce() -> Result<Option<RecordBatch>> + pyo3::marker::Ungil,
+) -> PyResult<Option<RecordBatch>> {
+    match read.map_err(|error| crate::errors::to_py_err(py, error))? {
+        BatchRead::Ready(batch) => Ok(Some(batch)),
+        BatchRead::End => Ok(None),
+        BatchRead::Pending => py
+            .detach(pending)
+            .map_err(|error| crate::errors::to_py_err(py, error)),
+    }
 }
 
 /// Pull the next batch from the kernel stream and return it as an
@@ -149,4 +166,37 @@ pub(crate) fn batches_to_pyarrow_table<'py>(
     let pa = py.import("pyarrow")?;
     pa.getattr("Table")?
         .call_method1("from_batches", (py_batches, py_schema))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn only_pending_reads_enter_the_runtime() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let entries = AtomicUsize::new(0);
+        let pending = || {
+            entries.fetch_add(1, Ordering::Relaxed);
+            runtime.block_on(async { Ok(None) })
+        };
+        Python::initialize();
+        Python::attach(|py| {
+            let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+            let ready = read_batch(py, Ok(BatchRead::Ready(batch.clone())), pending).unwrap();
+            assert_eq!(ready, Some(batch));
+            assert!(read_batch(py, Ok(BatchRead::End), pending)
+                .unwrap()
+                .is_none());
+            assert_eq!(entries.load(Ordering::Relaxed), 0);
+
+            assert!(read_batch(py, Ok(BatchRead::Pending), pending)
+                .unwrap()
+                .is_none());
+            assert_eq!(entries.load(Ordering::Relaxed), 1);
+        });
+    }
 }

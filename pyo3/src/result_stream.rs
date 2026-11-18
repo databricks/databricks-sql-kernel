@@ -76,16 +76,9 @@ impl ResultStream {
         if inner.exhausted {
             return Ok(None);
         }
-        let batch = match fetch::try_next_batch(&mut inner.stream)
-            .map_err(|error| crate::errors::to_py_err(py, error))?
-        {
-            fetch::BatchRead::Ready(batch) => Some(batch),
-            fetch::BatchRead::End => None,
-            fetch::BatchRead::Pending => {
-                let runtime = inner.runtime.clone();
-                run_sync_kernel!(py, fetch::next_batch(&runtime, &mut inner.stream))?
-            }
-        };
+        let batch = fetch::read_batch(py, fetch::try_next_batch(&mut inner.stream), || {
+            fetch::next_batch(&inner.runtime, &mut inner.stream)
+        })?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {

@@ -348,16 +348,9 @@ impl ExecutedStatement {
         if inner.exhausted {
             return Ok(None);
         }
-        let batch = match fetch::try_next_batch_exec(&mut inner.exec)
-            .map_err(|error| crate::errors::to_py_err(py, error))?
-        {
-            fetch::BatchRead::Ready(batch) => Some(batch),
-            fetch::BatchRead::End => None,
-            fetch::BatchRead::Pending => {
-                let runtime = inner.runtime.clone();
-                run_sync_kernel!(py, fetch::next_batch_exec(&runtime, &mut inner.exec))?
-            }
-        };
+        let batch = fetch::read_batch(py, fetch::try_next_batch_exec(&mut inner.exec), || {
+            fetch::next_batch_exec(&inner.runtime, &mut inner.exec)
+        })?;
         match batch {
             Some(b) => Ok(Some(b.to_pyarrow(py)?)),
             None => {
