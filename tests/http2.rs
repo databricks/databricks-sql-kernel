@@ -286,7 +286,10 @@ async fn assert_connect_proxy(proxy_tls: bool) {
         assert_eq!(response.version(), Version::HTTP_11);
         response.bytes().await.unwrap();
         server.assert_version(Version::HTTP_11).await;
-        let head = received_head.await.unwrap();
+        let head = tokio::time::timeout(Duration::from_secs(5), received_head)
+            .await
+            .expect("proxy did not receive CONNECT")
+            .unwrap();
         assert!(
             head.starts_with(&format!("CONNECT {authority} HTTP/1.1\r\n")),
             "{head}"
