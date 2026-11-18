@@ -159,8 +159,42 @@ impl HttpsServer {
     }
 }
 
+fn run_without_proxy_environment(test_name: &str) -> bool {
+    const CHILD: &str = "DATABRICKS_HTTP2_DIRECT_TEST";
+    if std::env::var(CHILD).as_deref() == Ok(test_name) {
+        return false;
+    }
+    let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", test_name, "--nocapture"])
+        .env(CHILD, test_name);
+    for key in [
+        "HTTP_PROXY",
+        "http_proxy",
+        "HTTPS_PROXY",
+        "https_proxy",
+        "ALL_PROXY",
+        "all_proxy",
+    ] {
+        command.env_remove(key);
+    }
+    let output = command.output().unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success() && stdout.contains("1 passed; 0 failed"),
+        "{test_name}: {stdout}{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    true
+}
+
 #[tokio::test]
 async fn https_negotiates_http2_and_supports_http1_fallback_and_opt_out() {
+    if run_without_proxy_environment(
+        "https_negotiates_http2_and_supports_http1_fallback_and_opt_out",
+    ) {
+        return;
+    }
     for (server_http2, enabled, expected) in [
         (true, true, Version::HTTP_2),
         (false, true, Version::HTTP_11),
@@ -325,6 +359,10 @@ fn environment_proxy_configuration_uses_http1_including_bypassed_hosts() {
 
 #[tokio::test]
 async fn session_http2_default_and_opt_out_reach_the_https_connection() {
+    if run_without_proxy_environment("session_http2_default_and_opt_out_reach_the_https_connection")
+    {
+        return;
+    }
     for enabled in [true, false] {
         let mut server = HttpsServer::start(true).await;
         let mut http = HttpConfig::default();
@@ -358,6 +396,11 @@ async fn session_http2_default_and_opt_out_reach_the_https_connection() {
 
 #[tokio::test]
 async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host() {
+    if run_without_proxy_environment(
+        "telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host",
+    ) {
+        return;
+    }
     for configurations in [
         [(true, false), (false, false)],
         [(true, false), (true, true)],
@@ -418,6 +461,9 @@ async fn telemetry_respects_each_sessions_http_protocol_setting_on_the_same_host
 
 #[test]
 fn c_abi_http2_default_and_opt_out_reach_the_https_connection() {
+    if run_without_proxy_environment("c_abi_http2_default_and_opt_out_reach_the_https_connection") {
+        return;
+    }
     use databricks_sql_kernel::c_abi::session::*;
     use databricks_sql_kernel::c_abi::KernelStatusCode;
     use std::ffi::CString;

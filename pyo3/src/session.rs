@@ -161,6 +161,7 @@ fn build_http_config(
     retry_max_attempts: Option<u32>,
     retry_overall_timeout_secs: Option<u64>,
     http_headers: Option<Vec<(String, String)>>,
+    enable_http2: Option<bool>,
 ) -> PyResult<Option<databricks_sql_kernel::HttpConfig>> {
     // Zero means "keep the kernel default", matching the C ABI setter. Use a
     // float because databricks-sql-python's existing `_socket_timeout` accepts
@@ -199,12 +200,16 @@ fn build_http_config(
         && retry_max_attempts.is_none()
         && retry_overall_timeout_secs.is_none()
         && !has_http_headers
+        && enable_http2.is_none()
     {
         return Ok(None);
     }
 
     let mut http = databricks_sql_kernel::HttpConfig::default();
     http.sea_response_compression_enabled = sea_response_compression_enabled;
+    if let Some(enabled) = enable_http2 {
+        http.http2_enabled = enabled;
+    }
     if let Some(timeout) = request_timeout {
         http.request_timeout = timeout;
     }
@@ -545,8 +550,8 @@ impl Session {
             None
         };
 
-        // Build an HttpConfig only when the caller tuned the request timeout,
-        // retry/backoff, or supplied custom headers; otherwise leave the
+        // Build an HttpConfig only when the caller tuned transport options,
+        // compression, retry/backoff, or custom headers; otherwise leave the
         // builder on its defaults (120s request timeout,
         // 1s/60s/5-retries, no extra headers).
         //
@@ -562,7 +567,7 @@ impl Session {
         // connector forwards its `http_headers`, which also carries the
         // composed `User-Agent`). The kernel applies them before its own
         // `Authorization` / `x-databricks-org-id`, which always win.
-        let mut http_config = build_http_config(
+        let http_config = build_http_config(
             sea_response_compression_enabled,
             request_timeout_secs,
             max_connections,
@@ -571,12 +576,8 @@ impl Session {
             retry_max_attempts,
             retry_overall_timeout_secs,
             http_headers,
+            enable_http2,
         )?;
-        if let Some(enabled) = enable_http2 {
-            http_config
-                .get_or_insert_with(databricks_sql_kernel::HttpConfig::default)
-                .http2_enabled = enabled;
-        }
 
         let driver_system_configuration = build_driver_system_configuration(
             driver_name,
@@ -859,20 +860,32 @@ mod send_sync_tests {
     }
 
     #[test]
+    fn http2_kwarg_maps_to_http_config() {
+        for enabled in [None, Some(true), Some(false)] {
+            let http = build_http_config(false, None, None, None, None, None, None, None, enabled)
+                .unwrap();
+            match enabled {
+                None => assert!(http.is_none()),
+                Some(enabled) => assert_eq!(http.unwrap().http2_enabled, enabled),
+            }
+        }
+    }
+
+    #[test]
     fn request_timeout_kwarg_maps_to_http_config() {
         let default = databricks_sql_kernel::HttpConfig::default();
         assert!(
-            build_http_config(false, None, None, None, None, None, None, None)
+            build_http_config(false, None, None, None, None, None, None, None, None)
                 .unwrap()
                 .is_none()
         );
         assert!(
-            build_http_config(false, Some(0.0), None, None, None, None, None, None)
+            build_http_config(false, Some(0.0), None, None, None, None, None, None, None)
                 .unwrap()
                 .is_none()
         );
 
-        let http = build_http_config(false, Some(0.5), None, None, None, None, None, None)
+        let http = build_http_config(false, Some(0.5), None, None, None, None, None, None, None)
             .unwrap()
             .expect("positive request timeout should build an HTTP config");
         assert_eq!(http.request_timeout, std::time::Duration::from_millis(500));
@@ -888,40 +901,64 @@ mod send_sync_tests {
             None,
             None,
             None,
+            None,
+            None,
+        )
+        .is_err());
+        let http = build_http_config(
+            false,
+            Some(one_ns),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .unwrap()
+        .expect("one-nanosecond request timeout should be accepted");
+        assert_eq!(http.request_timeout, std::time::Duration::from_nanos(1));
+
+        assert!(
+            build_http_config(false, Some(-1.0), None, None, None, None, None, None, None).is_err()
+        );
+        assert!(build_http_config(
+            false,
+            Some(f64::NAN),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
             None
         )
         .is_err());
-        let http = build_http_config(false, Some(one_ns), None, None, None, None, None, None)
-            .unwrap()
-            .expect("one-nanosecond request timeout should be accepted");
-        assert_eq!(http.request_timeout, std::time::Duration::from_nanos(1));
-
-        assert!(build_http_config(false, Some(-1.0), None, None, None, None, None, None).is_err());
-        assert!(
-            build_http_config(false, Some(f64::NAN), None, None, None, None, None, None).is_err()
-        );
     }
 
     #[test]
     fn max_connections_kwarg_maps_to_http_config() {
         let default = databricks_sql_kernel::HttpConfig::default();
-        let http = build_http_config(false, None, Some(17), None, None, None, None, None)
+        let http = build_http_config(false, None, Some(17), None, None, None, None, None, None)
             .unwrap()
             .expect("max connections should build an HTTP config");
         assert_eq!(http.pool_max_idle_per_host, 17);
         assert_eq!(http.request_timeout, default.request_timeout);
 
-        assert!(build_http_config(false, None, Some(0), None, None, None, None, None).is_err());
+        assert!(
+            build_http_config(false, None, Some(0), None, None, None, None, None, None).is_err()
+        );
     }
 
     #[test]
     fn sea_response_compression_kwarg_maps_to_http_config() {
         assert!(
-            build_http_config(false, None, None, None, None, None, None, None)
+            build_http_config(false, None, None, None, None, None, None, None, None)
                 .unwrap()
                 .is_none()
         );
-        let http = build_http_config(true, None, None, None, None, None, None, None)
+        let http = build_http_config(true, None, None, None, None, None, None, None, None)
             .unwrap()
             .expect("enabling SEA response compression should build an HTTP config");
         assert!(http.sea_response_compression_enabled);
