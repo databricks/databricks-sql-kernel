@@ -376,6 +376,7 @@ impl Session {
         tls_client_cert=None,
         tls_client_key=None,
         sea_response_compression_enabled=false,
+        enable_http2=None,
         request_timeout_secs=None,
         max_connections=None,
         retry_min_wait_secs=None,
@@ -443,6 +444,7 @@ impl Session {
         tls_client_cert: Option<Vec<u8>>,
         tls_client_key: Option<Vec<u8>>,
         sea_response_compression_enabled: bool,
+        enable_http2: Option<bool>,
         request_timeout_secs: Option<f64>,
         max_connections: Option<usize>,
         retry_min_wait_secs: Option<u64>,
@@ -560,7 +562,7 @@ impl Session {
         // connector forwards its `http_headers`, which also carries the
         // composed `User-Agent`). The kernel applies them before its own
         // `Authorization` / `x-databricks-org-id`, which always win.
-        let http_config = build_http_config(
+        let mut http_config = build_http_config(
             sea_response_compression_enabled,
             request_timeout_secs,
             max_connections,
@@ -570,6 +572,11 @@ impl Session {
             retry_overall_timeout_secs,
             http_headers,
         )?;
+        if let Some(enabled) = enable_http2 {
+            http_config
+                .get_or_insert_with(databricks_sql_kernel::HttpConfig::default)
+                .http2_enabled = enabled;
+        }
 
         let driver_system_configuration = build_driver_system_configuration(
             driver_name,

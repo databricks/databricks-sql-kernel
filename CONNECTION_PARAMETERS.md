@@ -125,8 +125,14 @@ until implemented) and `External` (a caller-supplied `TokenProvider`).
 
 ## `HttpConfig` — HTTP client (optional)
 
+The `http2_enabled` setting applies to all kernel-owned HTTPS requests: authentication and
+discovery, SQL requests, result downloads, feature flags, and telemetry. TLS
+negotiates the protocol with each peer. An HTTP proxy can use HTTP/1.1 for
+CONNECT while the HTTPS connection inside the tunnel negotiates HTTP/2.
+
 | Field | Description | Default |
 |-------|-------------|---------|
+| `http2_enabled` | Negotiate HTTP/2 for HTTPS with HTTP/1.1 fallback. Set `false` to force HTTP/1.1. | `true` |
 | `request_timeout` | Per-request timeout (connect + body). | `120s` |
 | `overall_timeout` | Maximum total time across retries for one logical RPC. | `900s` |
 | `pool_max_idle_per_host` | Connection-pool size (max idle warm sockets per host). Raise for bursty concurrent workloads. | `100` |

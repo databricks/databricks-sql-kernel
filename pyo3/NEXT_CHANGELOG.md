@@ -13,6 +13,9 @@ changes go in the root `NEXT_CHANGELOG.md`.
 
 ### Added
 
+- `Session(enable_http2=False)` forces HTTP/1.1 for HTTPS requests. By default,
+  connections negotiate HTTP/2 with HTTP/1.1 fallback.
+
 ### Changed
 
 ### Updated

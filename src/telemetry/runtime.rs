@@ -15,7 +15,7 @@
 use super::circuit_breaker::maybe_wrap_exporter;
 use super::databricks::{DatabricksTelemetryExporter, TelemetryEndpoint};
 use super::exporter::TelemetryExporter;
-use super::manager::{TelemetryClientLease, TelemetryClientManager};
+use super::manager::{TelemetryClientKey, TelemetryClientLease, TelemetryClientManager};
 use super::models::{
     unix_time_millis, DriverAuthFlow, DriverAuthMech, DriverConnectionParameters, DriverErrorInfo,
     DriverMode, DriverSystemConfiguration, FrontendLogContext, FrontendLogEntry, HostDetails,
@@ -66,13 +66,11 @@ impl TelemetryRuntime {
             connection_params: build_connection_params(connection, auth),
             auth_type: auth_type(auth),
         });
+        let key = TelemetryClientKey::new(&connection.host, http_client.config().http2_enabled);
         let (exporter, bypass_cache) = exporter_for_config(config, connection, http_client);
-        let Some(lease) = TelemetryClientManager::global().get_or_create(
-            &connection.host,
-            config,
-            exporter,
-            bypass_cache,
-        ) else {
+        let Some(lease) =
+            TelemetryClientManager::global().get_or_create(&key, config, exporter, bypass_cache)
+        else {
             return Self::disabled();
         };
 

@@ -388,6 +388,9 @@ pub struct ConnectionOptions {
     /// Whether SEA API responses may use HTTP compression. Defaults to false.
     pub sea_response_compression_enabled: Option<bool>,
 
+    /// Negotiate HTTP/2 over HTTPS by default. Set false to use HTTP/1.1 only.
+    pub enable_http2: Option<bool>,
+
     /// Retry/backoff tuning — all optional. An unset field keeps the kernel's
     /// built-in policy (1s/60s exponential backoff, 6 total attempts, 900s
     /// budget). Mirrors the pyo3 binding's `retry_*` kwargs so the Node.js
@@ -624,6 +627,9 @@ fn build_tls_config(options: &ConnectionOptions) -> TlsConfig {
 /// strings.
 fn build_http_config(options: &mut ConnectionOptions) -> HttpConfig {
     let mut http = HttpConfig::default();
+    if let Some(enabled) = options.enable_http2 {
+        http.http2_enabled = enabled;
+    }
     http.sea_response_compression_enabled =
         options.sea_response_compression_enabled.unwrap_or(false);
     http.pool_max_idle_per_host = options
@@ -955,6 +961,7 @@ mod tests {
             client_key_pem: None,
             custom_headers: None,
             sea_response_compression_enabled: None,
+            enable_http2: None,
             retry_min_wait_secs: None,
             retry_max_wait_secs: None,
             retry_max_attempts: None,
@@ -1572,6 +1579,18 @@ mod tests {
         assert_eq!(http.custom_headers.len(), 2);
         assert_eq!(http.custom_headers[0].1, "Caller/1.0");
         assert_eq!(http.custom_headers[1].1, "Connector/2.0");
+    }
+
+    #[test]
+    fn http2_option_preserves_default_and_opt_out() {
+        for enabled in [None, Some(true), Some(false)] {
+            let mut options = base();
+            options.enable_http2 = enabled;
+            assert_eq!(
+                build_http_config(&mut options).http2_enabled,
+                enabled.unwrap_or(true)
+            );
+        }
     }
 
     #[test]

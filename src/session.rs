@@ -1080,6 +1080,7 @@ fn validate_mtls_endpoint_scheme(config: &SessionConfig) -> Result<()> {
 /// [`HttpTlsConfig`] via [`HttpTlsConfig::from_public`].
 fn build_http_client_config(config: &SessionConfig, org_id: Option<String>) -> HttpClientConfig {
     HttpClientConfig {
+        http2_enabled: config.http.http2_enabled,
         sea_response_compression_enabled: config.http.sea_response_compression_enabled,
         connect_timeout: Duration::from_secs(30),
         // The historical internal `read_timeout` field is passed to reqwest's

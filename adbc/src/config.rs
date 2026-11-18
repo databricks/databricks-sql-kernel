@@ -399,6 +399,7 @@ impl DatabaseConfig {
 
     fn set_http(&mut self, key: &str, value: OptionValue) -> Result<()> {
         match key {
+            "adbc.databricks.http.http2_enabled" => self.http.http2_enabled = boolean(value, key)?,
             "adbc.databricks.http.request_timeout_ms" => {
                 self.http.request_timeout = duration(value, key, false)?
             }
@@ -1689,6 +1690,19 @@ mod tests {
                 assert_eq!(error.status, Status::InvalidArguments, "{key}: {value:?}");
                 assert!(error.message.contains(key), "{key}: {value:?}");
             }
+        }
+    }
+
+    #[test]
+    fn http2_default_and_opt_out_reach_kernel_config() {
+        let mut config = DatabaseConfig::default();
+        set(&mut config, HOST, "https://example.databricks.com");
+        set(&mut config, HTTP_PATH, "/sql/1.0/warehouses/warehouse-id");
+        set(&mut config, ACCESS_TOKEN, "sentinel-token");
+        assert!(config.resolve().unwrap().http.http2_enabled);
+        for enabled in [false, true] {
+            set(&mut config, "adbc.databricks.http.http2_enabled", enabled);
+            assert_eq!(config.resolve().unwrap().http.http2_enabled, enabled);
         }
     }
 

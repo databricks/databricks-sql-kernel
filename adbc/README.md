@@ -67,6 +67,13 @@ Exactly one of `adbc.databricks.http_path` and
 parameter in the HTTP path when the workspace connection details include one.
 Canonical `adbc.databricks.*` names take precedence over compatibility aliases.
 
+## HTTP transport
+
+HTTPS requests negotiate HTTP/2 by default, with HTTP/1.1 fallback when the
+peer does not support HTTP/2. Set `adbc.databricks.http.http2_enabled` to `false`
+to force HTTP/1.1 for all kernel-owned HTTPS requests, including authentication,
+query requests, result downloads, and telemetry.
+
 ## Authentication
 
 Set `adbc.databricks.auth.type` to one of `pat`, `oauth_m2m`, `oauth_u2m`,
@@ -98,7 +105,7 @@ The main database option families are:
 | Namespace | `adbc.databricks.catalog`, `adbc.databricks.schema` |
 | Attribution | `adbc.databricks.user_agent_entry` |
 | Session | `adbc.databricks.session_conf.<name>`, `adbc.databricks.ssp_ansi_mode`, `adbc.databricks.ssp_timezone`, `adbc.databricks.query_tags` |
-| HTTP | request/overall timeouts, idle pool size, retry limits/backoff, response compression, JSON custom headers |
+| HTTP | HTTP/2 negotiation, request/overall timeouts, idle pool size, retry limits/backoff, response compression, JSON custom headers |
 | Proxy | URL, username, password, bypass hosts |
 | TLS/mTLS | CA file or PEM, client certificate/key file or PEM, self-signed and hostname-verification controls |
 | Logging | filter and file |

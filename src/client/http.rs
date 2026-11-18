@@ -267,6 +267,8 @@ impl TlsConfig {
 /// Configuration for the HTTP client.
 #[derive(Debug, Clone)]
 pub struct HttpClientConfig {
+    /// Negotiate HTTP/2 over TLS. When false, use HTTP/1.1 only.
+    pub http2_enabled: bool,
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     pub sea_response_compression_enabled: bool,
     /// Connection timeout duration.
@@ -298,6 +300,7 @@ pub struct HttpClientConfig {
 impl Default for HttpClientConfig {
     fn default() -> Self {
         Self {
+            http2_enabled: true,
             sea_response_compression_enabled: false,
             connect_timeout: Duration::from_secs(30),
             read_timeout: Duration::from_secs(60),
@@ -494,6 +497,7 @@ impl DatabricksHttpClient {
             } else {
                 "native-tls"
             },
+            http2_enabled = config.http2_enabled,
             "DatabricksHttpClient initialised"
         );
 
@@ -523,6 +527,10 @@ impl DatabricksHttpClient {
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)
             .redirect(redirect);
+
+        if !config.http2_enabled {
+            builder = builder.http1_only();
+        }
 
         // Apply TLS configuration
         if config.tls.enabled == Some(false) {
@@ -942,6 +950,12 @@ impl DatabricksHttpClient {
 
             match self.client.execute(request).await {
                 Ok(response) => {
+                    debug!(
+                        request_type = ?request_type,
+                        host = ?response.url().host_str(),
+                        http_version = ?response.version(),
+                        "received HTTP response"
+                    );
                     let status = response.status();
 
                     if status.is_success() {

@@ -152,6 +152,7 @@ pub struct KernelSessionConfig {
     custom_headers: Vec<(String, String)>,
     /// Whether authenticated SEA responses may use HTTP compression.
     sea_response_compression_enabled: bool,
+    http2_enabled: Option<bool>,
     /// Total request timeout (populated by `..._set_request_timeout`). `None`
     /// keeps [`HttpConfig::default`]'s 120-second timeout.
     request_timeout: Option<Duration>,
@@ -288,6 +289,7 @@ pub unsafe extern "C" fn kernel_session_config_new(
         tls: TlsSpec::default(),
         custom_headers: Vec::new(),
         sea_response_compression_enabled: false,
+        http2_enabled: None,
         request_timeout: None,
         max_connections: None,
         retry: None,
@@ -606,6 +608,22 @@ pub unsafe extern "C" fn kernel_session_config_set_custom_header(
         let name = required_str(name, "header name")?;
         let value = required_str(value, "header value")?;
         c.custom_headers.push((name, value));
+        Ok(())
+    })
+}
+
+/// Negotiate HTTP/2 for HTTPS requests by default, with HTTP/1.1 fallback.
+/// Set `enabled` to `false` to use HTTP/1.1 only.
+///
+/// # Safety
+/// `config` must be a live config handle.
+#[no_mangle]
+pub unsafe extern "C" fn kernel_session_config_set_http2_enabled(
+    config: *mut KernelSessionConfig,
+    enabled: bool,
+) -> KernelStatusCode {
+    set_on_config(config, |c| {
+        c.http2_enabled = Some(enabled);
         Ok(())
     })
 }
@@ -1651,6 +1669,7 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
         tls,
         custom_headers,
         sea_response_compression_enabled,
+        http2_enabled,
         request_timeout,
         max_connections,
         retry,
@@ -1717,17 +1736,22 @@ fn build_session(config: KernelSessionConfig) -> Result<Session, KernelStatusCod
             // full `HttpConfig::default()` applies untouched.
             if !custom_headers.is_empty()
                 || sea_response_compression_enabled
+                || http2_enabled.is_some()
                 || request_timeout.is_some()
                 || max_connections.is_some()
                 || retry.is_some()
             {
-                builder = builder.http(merge_http_config(
+                let mut http = merge_http_config(
                     custom_headers,
                     sea_response_compression_enabled,
                     request_timeout,
                     max_connections,
                     retry,
-                ));
+                );
+                if let Some(enabled) = http2_enabled {
+                    http.http2_enabled = enabled;
+                }
+                builder = builder.http(http);
             }
 
             // Programmatic proxy (env-var behaviour preserved when unset).

@@ -748,6 +748,10 @@ impl std::fmt::Debug for AuthConfig {
 #[non_exhaustive]
 #[derive(Debug, Clone)]
 pub struct HttpConfig {
+    /// Negotiate HTTP/2 for HTTPS requests, with HTTP/1.1 fallback.
+    /// Defaults to `true`. Set to `false` to use HTTP/1.1 only.
+    pub http2_enabled: bool,
+
     /// Whether authenticated SEA requests may negotiate HTTP response compression.
     /// Defaults to `false` because inline Arrow results are already LZ4-compressed.
     pub sea_response_compression_enabled: bool,
@@ -834,6 +838,7 @@ pub struct HttpConfig {
 impl Default for HttpConfig {
     fn default() -> Self {
         Self {
+            http2_enabled: true,
             sea_response_compression_enabled: false,
             request_timeout: Duration::from_secs(120),
             overall_timeout: Duration::from_secs(900),
