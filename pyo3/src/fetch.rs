@@ -40,12 +40,11 @@ fn own_batch(read: TryNextBatch<'_>) -> Result<BatchRead> {
     match read {
         TryNextBatch::Ready(ResultBatch::Arrow(batch)) => Ok(BatchRead::Ready(batch.clone())),
         TryNextBatch::Ready(_) => {
-            Err(Error::invalid_argument()
-                .message("kernel returned a non-Arrow ResultBatch variant"))
+            Err(Error::invalid_state().message("kernel returned a non-Arrow ResultBatch variant"))
         }
         TryNextBatch::Pending => Ok(BatchRead::Pending),
         TryNextBatch::End => Ok(BatchRead::End),
-        _ => Err(Error::invalid_argument().message("kernel returned an unknown batch-read state")),
+        _ => Err(Error::invalid_state().message("kernel returned an unknown batch-read state")),
     }
 }
 

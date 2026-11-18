@@ -673,18 +673,23 @@ impl StreamingCloudFetchProvider {
     /// blocked in `wait_for_chunk` is released, not just one — a
     /// terminal failure must not leave sibling waiters stuck.
     fn set_terminal_error(&self, error: Error) {
-        {
+        let first = {
             let mut slot = self.terminal_error.lock().unwrap();
             if slot.is_none() {
-                error!("CloudFetch provider entering terminal error state: {error}");
-                *slot = Some(error);
+                *slot = Some(error.clone());
+                true
+            } else {
+                false
             }
-            // else: keep the first error; drop this one.
-        }
+        };
         // Wake all current waiters so they observe the terminal state.
         // A waiter that registers *after* this checks `terminal_error`
         // on entry, so it never misses the signal.
         self.chunk_state_changed.notify_waiters();
+        // Host log callbacks can acquire locks held by result consumers.
+        if first {
+            error!("CloudFetch provider entering terminal error state: {error}");
+        }
     }
 
     /// Return a clone of the terminal link-fetch error, if one is set.
@@ -1376,6 +1381,7 @@ impl StreamingCloudFetchProvider {
                         .as_ref()
                         .is_some_and(|prev| *prev != link.url);
                     if url_changed || !link.is_expired() {
+                        drop(entry);
                         debug!(
                             statement_id = %sid,
                             "Concurrent refresh delivered a {} link for chunk {}; \
@@ -1426,6 +1432,7 @@ impl StreamingCloudFetchProvider {
                     .as_ref()
                     .is_some_and(|prev| *prev != link.url);
                 if url_changed || !link.is_expired() {
+                    drop(entry);
                     debug!(
                         statement_id = %sid,
                         "Batched refresh for chunk {} skipped after claim — \
@@ -4243,11 +4250,36 @@ mod tests {
     /// failure does not overwrite the originally-persisted error.
     #[tokio::test]
     async fn first_terminal_error_wins() {
+        use tracing_subscriber::prelude::*;
+
+        struct CheckLogLock {
+            provider: Arc<StreamingCloudFetchProvider>,
+            logged: Arc<AtomicBool>,
+        }
+
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CheckLogLock {
+            fn on_event(
+                &self,
+                _: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                assert!(self.provider.terminal_error.try_lock().is_ok());
+                self.logged.store(true, Ordering::Release);
+            }
+        }
+
         let fetcher = FailingLinkFetcher::new(4, 2, 0);
         let provider = provider_with_failing_fetcher(fetcher, Some(4));
+        let logged = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(CheckLogLock {
+            provider: Arc::clone(&provider),
+            logged: Arc::clone(&logged),
+        });
+        let _guard = tracing::subscriber::set_default(subscriber);
 
         provider.set_terminal_error(Error::io().message("first error"));
         provider.set_terminal_error(Error::io().message("second error"));
+        assert!(logged.load(Ordering::Acquire));
 
         let stored = provider
             .terminal_error()
