@@ -1,6 +1,6 @@
 # Lessons
 
-<!-- distilled-through: none -->
+<!-- distilled-through: 2026-11-18 -->
 
 ## Public API and bindings
 - L-0001 (4×, #250 #184 #372): Preserve public Rust compatibility: non-exhaustive structs need external builders, public enums need fallback arms, and breaking 1.x type changes require a major release.
