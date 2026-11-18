@@ -67,12 +67,20 @@ fn init_logging(py: Python<'_>) -> bool {
     logging::init_logging(py)
 }
 
-/// Clear cached logger levels so a Python-side logging reconfiguration
-/// applied *after* the first kernel log (e.g. raising
-/// `databricks.sql.kernel` to DEBUG mid-session) takes effect.
+/// Re-read the Python logger levels and clear cached ones so a Python-side
+/// logging reconfiguration applied *after* the first kernel log (e.g.
+/// raising `databricks.sql.kernel` to DEBUG mid-session) takes effect.
+/// Levels set before a `Session` is created apply without this call.
 #[pyfunction]
-fn reset_logging() {
-    logging::reset_logging();
+fn reset_logging(py: Python<'_>) {
+    logging::reset_logging(py);
+}
+
+/// The level below which kernel log records are dropped before reaching
+/// Python (`"WARN"`, `"DEBUG"`, ...). Private; for tests.
+#[pyfunction]
+fn _log_max_level() -> &'static str {
+    logging::max_level_name()
 }
 
 #[pymodule]
@@ -89,6 +97,7 @@ fn databricks_sql_kernel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<result_stream::ResultStream>()?;
     m.add_function(wrap_pyfunction!(init_logging, m)?)?;
     m.add_function(wrap_pyfunction!(reset_logging, m)?)?;
+    m.add_function(wrap_pyfunction!(_log_max_level, m)?)?;
 
     // Install the log bridge at module import so *any* consumer of the
     // bare wheel (the connector, integration tests, custom embedders)

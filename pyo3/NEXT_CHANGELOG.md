@@ -14,6 +14,7 @@ changes go in the root `NEXT_CHANGELOG.md`.
 ### Added
 
 ### Changed
+- Log records below every Python logger's level are now dropped before they reach the Python logging bridge, which cuts client CPU per query. Levels set before a `Session` is created take effect without `reset_logging()`. A level raised while a session is open applies from the next `Session` or `reset_logging()` call, for every logger (before, loggers that had not logged yet picked it up on their own). A level assigned directly (`logger.level = ...`) instead of with `setLevel()` needs `reset_logging()`.
 
 ### Updated
 
