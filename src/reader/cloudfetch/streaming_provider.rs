@@ -106,6 +106,11 @@ fn flush_pending(schema: &SchemaRef, pending: &mut Vec<RecordBatch>) -> Result<R
 /// - Parallel downloads with memory-bounded concurrency
 /// - Proper ordering of result batches
 /// - Error propagation and cancellation
+///
+/// Python callers can hold the GIL while `try_next_batch` takes the batch-buffer
+/// and terminal-error mutexes or chunk-map shard locks. Holders must release
+/// these guards before logging or invoking callbacks that can acquire the GIL,
+/// to avoid deadlocking those readers.
 pub struct StreamingCloudFetchProvider {
     // Dependencies (injected)
     link_fetcher: Arc<dyn ChunkLinkFetcher>,

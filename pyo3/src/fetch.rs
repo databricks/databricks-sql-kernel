@@ -22,6 +22,10 @@
 //!
 //! A nonblocking probe holds the GIL through kernel post-processing, so large
 //! batches requiring column rewrites can delay other Python threads.
+//!
+//! CloudFetch probes also take ordinary locks. Their holders must release
+//! guards before logging or invoking host callbacks that can acquire the GIL,
+//! to avoid deadlocking a Python caller waiting for the same lock.
 
 use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
