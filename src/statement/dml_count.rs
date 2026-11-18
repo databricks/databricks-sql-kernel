@@ -67,8 +67,15 @@ pub(crate) async fn decode_parameter_batch(
         let mut represented = 0usize;
         let mut total = Some(0i64);
         let mut batches = Vec::new();
-        while let Some(batch) = result.reader.next_batch().await? {
-            if batch.schema().fields() != schema.fields() {
+        while let Some(mut batch) = result.reader.next_batch().await? {
+            let actual_schema = batch.schema();
+            let compatible = actual_schema.fields().len() == schema.fields().len()
+                && actual_schema
+                    .fields()
+                    .iter()
+                    .zip(schema.fields())
+                    .all(|(a, b)| a.name() == b.name() && a.data_type() == b.data_type());
+            if !compatible {
                 return Err(malformed_batch_count("inconsistent count schema"));
             }
             for row in 0..batch.num_rows() {
@@ -96,13 +103,20 @@ pub(crate) async fn decode_parameter_batch(
                     _ => None,
                 };
             }
+            if actual_schema.fields() != schema.fields() {
+                batch = arrow_array::RecordBatch::try_new(schema.clone(), batch.columns().to_vec())
+                    .map_err(|error| {
+                        malformed_batch_count(&format!("inconsistent count nullability: {error}"))
+                    })?;
+            }
             batches.push(batch);
         }
         if represented != 0 && represented != parameter_set_count {
             return Err(malformed_batch_count("missing parameter-set counts"));
         }
         result.status.num_modified_rows = if represented == 0 { None } else { total };
-        result.reader = Box::new(InMemoryReader::new(schema, batches));
+        let metrics = result.reader.metrics();
+        result.reader = Box::new(InMemoryReader::new(schema, batches).with_metrics(metrics));
         Ok(())
     }
     .await;
@@ -224,10 +238,65 @@ pub(crate) async fn read_dml_affected_rows(stream: &mut ResultStream) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::reader::InMemoryReader;
+    use crate::reader::{InMemoryReader, ResultReaderMetrics};
+    use crate::telemetry::ExecutionResultFormat;
     use arrow_array::{ArrayRef, Int64Array, RecordBatch, StringArray};
     use arrow_schema::{Field, Schema};
     use std::sync::Arc;
+
+    #[tokio::test]
+    async fn batch_counts_preserve_metrics_and_accept_nullable_schema_metadata() {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            AFFECTED_ROWS_COLUMN,
+            DataType::Int64,
+            true,
+        )]));
+        let batch_schema = Arc::new(Schema::new(vec![Field::new(
+            AFFECTED_ROWS_COLUMN,
+            DataType::Int64,
+            false,
+        )
+        .with_metadata(std::collections::HashMap::from([(
+            "source".into(),
+            "count".into(),
+        )]))]));
+        let batch =
+            RecordBatch::try_new(batch_schema, vec![Arc::new(Int64Array::from(vec![2, 3]))])
+                .unwrap();
+        let metrics = ResultReaderMetrics {
+            total_chunks_present: Some(1),
+            total_chunks_iterated: Some(1),
+            sum_chunks_download_time: Some(std::time::Duration::from_millis(7)),
+            ..Default::default()
+        };
+        let result = ExecuteResult {
+            statement_id: "batch-metrics".into(),
+            reader: Box::new(
+                InMemoryReader::new(schema.clone(), vec![batch.clone()])
+                    .with_metrics(Some(metrics)),
+            ),
+            manifest: None,
+            telemetry_result_format: ExecutionResultFormat::InlineArrow,
+            telemetry_is_compressed: false,
+            status: serde_json::from_str(r#"{"state":"SUCCEEDED"}"#).unwrap(),
+        };
+        let mut result = decode_parameter_batch(result, 2).await.unwrap();
+        assert_eq!(result.status.num_modified_rows, Some(5));
+        let retained = result.reader.metrics().expect("source metrics retained");
+        assert_eq!(retained.total_chunks_present, metrics.total_chunks_present);
+        assert_eq!(
+            retained.total_chunks_iterated,
+            metrics.total_chunks_iterated
+        );
+        assert_eq!(
+            retained.sum_chunks_download_time,
+            metrics.sum_chunks_download_time
+        );
+        let retained_batch = result.reader.next_batch().await.unwrap().unwrap();
+        assert_eq!(retained_batch.schema(), schema);
+        assert_eq!(retained_batch.columns(), batch.columns());
+        assert!(result.reader.next_batch().await.unwrap().is_none());
+    }
 
     /// Build a single-batch `ResultStream` from `(name, Int64 values)` columns.
     async fn count_stream(cols: &[(&str, &[i64])]) -> ResultStream {

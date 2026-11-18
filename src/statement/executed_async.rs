@@ -536,12 +536,15 @@ impl ExecutedAsyncStatement {
     /// the handle's accessor surface keeps working).
     fn record_latest_status(
         &self,
-        fresh: crate::types::sea::StatementStatus,
+        mut fresh: crate::types::sea::StatementStatus,
         response: Option<ExecuteResponse>,
     ) {
         // Payload before metadata keeps concurrent publications from mixing observations.
         let pending = self.pending_result.lock().ok();
         if let Ok(mut guard) = self.latest_status.lock() {
+            if self.parameter_set_count != 0 && fresh.num_modified_rows.is_none() {
+                fresh.num_modified_rows = guard.num_modified_rows;
+            }
             *guard = fresh;
         }
         if let Some(mut pending) = pending {

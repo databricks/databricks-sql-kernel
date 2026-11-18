@@ -3415,6 +3415,41 @@ async fn native_batch_requests(server: &MockServer) -> Vec<serde_json::Value> {
         .collect()
 }
 
+#[test]
+fn scalar_execution_types_preserve_exhaustive_construction() {
+    use databricks_sql_kernel::types::{ExecuteParams, ExecuteStatementRequest};
+    let params = ExecuteParams {
+        catalog: None,
+        schema: None,
+        wait_timeout: None,
+        on_wait_timeout: None,
+        row_limit: None,
+        parameters: vec![],
+        query_tags: vec![],
+        inflight_id_observer: None,
+    };
+    let request = ExecuteStatementRequest {
+        warehouse_id: None,
+        statement: "SELECT 1".into(),
+        session_id: None,
+        session_version: None,
+        catalog: params.catalog,
+        schema: params.schema,
+        disposition: "INLINE_OR_EXTERNAL_LINKS".into(),
+        format: "ARROW_STREAM".into(),
+        wait_timeout: params.wait_timeout,
+        on_wait_timeout: params.on_wait_timeout,
+        row_limit: params.row_limit,
+        result_compression: None,
+        parameters: params.parameters,
+        query_tags: params.query_tags,
+    };
+    assert!(serde_json::to_value(request)
+        .unwrap()
+        .get("parameter_sets")
+        .is_none());
+}
+
 #[tokio::test]
 async fn native_batch_preserves_order_and_resets_bindings() {
     let server = MockServer::start().await;
@@ -3567,6 +3602,58 @@ async fn native_batch_decodes_repeated_unknown_and_malformed_counts_without_repl
         }
         assert_eq!(native_batch_requests(&server).await.len(), 1);
     }
+}
+
+#[tokio::test]
+async fn native_batch_accepts_count_nullability_after_empty_leading_chunk() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let counts = int64_batch("num_affected_rows", vec![1, 1]);
+    let metadata = HashMap::from([
+        ("databricks.type_name".into(), "BIGINT".into()),
+        ("databricks.type_text".into(), "BIGINT".into()),
+        ("Spark:DataType:SqlName".into(), "BIGINT".into()),
+    ]);
+    let advertised = Schema::new(vec![
+        Field::new("num_affected_rows", DataType::Int64, true).with_metadata(metadata)
+    ]);
+    let initial = arrow_schema_ipc_bytes(&advertised);
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("batch-schema", &counts)).unwrap();
+    body["manifest"]["arrow_schema"] = json!(STANDARD.encode(&initial));
+    body["manifest"]["total_chunk_count"] = json!(2);
+    body["result"]["attachment"] = json!(STANDARD.encode(&initial));
+    body["result"]["byte_count"] = json!(initial.len());
+    body["result"]["row_count"] = json!(0);
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/batch-schema/result/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk_index": 1, "row_offset": 0, "row_count": 2,
+            "attachment": STANDARD.encode(arrow_ipc_bytes(&counts)),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let session = open_session(&server).await;
+    let mut statement = session.statement();
+    statement.spec().sql("INSERT INTO t VALUES (?)");
+    for value in [11, 29] {
+        statement
+            .spec()
+            .param(1, TypedValue::Int64(value))
+            .unwrap()
+            .add_parameter_set();
+    }
+    let mut executed = statement.execute().await.unwrap();
+    assert_eq!(executed.num_modified_rows(), Some(2));
+    let batches = drain(executed.result_stream_mut()).await;
+    assert_eq!(batches.len(), 1);
+    assert_eq!(batches[0].columns(), counts.columns());
+    assert_eq!(batches[0].schema().as_ref(), &advertised);
+    assert_eq!(native_batch_requests(&server).await.len(), 1);
 }
 
 #[tokio::test]
@@ -3743,7 +3830,14 @@ async fn native_batch_direct_and_async_use_aggregate_counts() {
             let exec = stmt.submit().await.unwrap();
             let _stream = exec.await_result().await.unwrap();
             assert_eq!(exec.num_modified_rows(), Some(6));
+            exec.status().await.unwrap();
+            assert_eq!(exec.num_modified_rows(), Some(6));
+            let _stream = exec.fetch_result().await.unwrap();
+            assert_eq!(exec.num_modified_rows(), Some(6));
         }
+        let attached = session.attach_async_statement("batch-async").await.unwrap();
+        let _stream = attached.await_result().await.unwrap();
+        assert_eq!(attached.num_modified_rows(), None);
         assert_eq!(native_batch_requests(&server).await.len(), 1);
     }
 }

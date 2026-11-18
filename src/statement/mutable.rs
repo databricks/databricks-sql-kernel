@@ -54,6 +54,7 @@
 //! stale handle short-circuits locally — no network round-trip. See
 //! `crate::statement::validity` for the flag implementation.
 
+use crate::client::transport::ExecutionParams;
 use crate::client::{DirectOutcome, ExecutionTimeout};
 use crate::kernel_error::{Error, Result};
 use crate::klog::{debug, warn};
@@ -124,7 +125,7 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
     }
 }
 
-/// Build the `(sql, ExecuteParams)` dispatch pair from a statement spec.
+/// Build the `(sql, ExecutionParams)` dispatch pair from a statement spec.
 ///
 /// Pure — borrows `spec`, touches no `Session` — so the spec → wire-params
 /// mapping (row_limit, the resolved wait/on-wait pair, and **1-based**
@@ -134,7 +135,7 @@ fn resolve_wait_timeout(caller_wait_secs: Option<&str>) -> (Option<String>, Opti
 fn build_execute_params(
     spec: &StatementSpec,
     wait_timeout_secs: Option<&str>,
-) -> Result<(String, ExecuteParams)> {
+) -> Result<(String, ExecutionParams)> {
     let sql = spec
         .sql
         .as_deref()
@@ -146,14 +147,17 @@ fn build_execute_params(
         return Err(Error::invalid_argument().message("v0 supports ResultFormat::Arrow only"));
     }
     let (wait_timeout, on_wait_timeout) = resolve_wait_timeout(wait_timeout_secs);
-    let mut exec_params = ExecuteParams {
-        wait_timeout,
-        on_wait_timeout,
-        row_limit: spec.row_limit,
-        ..ExecuteParams::default()
+    let mut exec_params = ExecutionParams {
+        scalar: ExecuteParams {
+            wait_timeout,
+            on_wait_timeout,
+            row_limit: spec.row_limit,
+            ..ExecuteParams::default()
+        },
+        parameter_sets: Vec::new(),
     };
     if spec.parameter_sets.is_empty() {
-        exec_params.parameters = build_parameters(
+        exec_params.scalar.parameters = build_parameters(
             &spec.positional_params,
             &spec.named_params,
             &spec.raw_params,
@@ -168,7 +172,7 @@ fn build_execute_params(
                 .message("scalar parameters and native parameter sets are mutually exclusive"));
         }
         // A row cap could truncate the count result without limiting inserted rows.
-        exec_params.row_limit = None;
+        exec_params.scalar.row_limit = None;
         for set in &spec.parameter_sets {
             exec_params.parameter_sets.push(StatementParameterSet {
                 parameters: build_parameters(&set.positional, &set.named, &set.raw, 0)?,
@@ -179,7 +183,7 @@ fn build_execute_params(
     // `statement_conf["query_tags"]` land in the serialized conf string;
     // the SEA wire wants the native `[{key, value}]` array, so convert here.
     if let Some(serialized) = spec.statement_conf.get("query_tags") {
-        exec_params.query_tags = deserialize_query_tags(serialized)
+        exec_params.scalar.query_tags = deserialize_query_tags(serialized)
             .into_iter()
             .map(|(key, value)| QueryTag { key, value })
             .collect();
@@ -383,7 +387,7 @@ impl Statement {
             // `StatementCanceller` can cancel a still-running query. The
             // slot was already cleared at method entry, so set the observer
             // now.
-            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+            exec_params.scalar.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             // SeaRestTransport::execute_statement polls to completion
             // (10s server-side wait_timeout, then GetStatementStatus
@@ -642,7 +646,7 @@ impl Statement {
                 Arc::clone(&self.inflight_id),
             );
             let guard = cancel_state.guard();
-            exec_params.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
+            exec_params.scalar.inflight_id_observer = Some(Arc::clone(&self.inflight_id));
 
             let outcome = match self
                 .session
@@ -784,7 +788,7 @@ impl Statement {
         .await
     }
 
-    /// Shared spec-validation + `ExecuteParams` builder used by both
+    /// Shared spec-validation + `ExecutionParams` builder used by both
     /// [`execute`](Self::execute) and [`submit`](Self::submit).
     ///
     /// `wait_timeout_secs`:
@@ -801,7 +805,7 @@ impl Statement {
     fn prepare_for_dispatch(
         &self,
         wait_timeout_secs: Option<&str>,
-    ) -> Result<(String, ExecuteParams)> {
+    ) -> Result<(String, ExecutionParams)> {
         build_execute_params(&self.spec, wait_timeout_secs)
     }
 
@@ -1083,19 +1087,19 @@ mod tests {
     #[test]
     fn build_execute_params_threads_row_limit_to_wire() {
         // Headline parity feature: spec.row_limit must reach
-        // ExecuteParams.row_limit. A regression dropping it would otherwise
+        // ExecutionParams.scalar.row_limit. A regression dropping it would otherwise
         // pass every other test (the seam this pins).
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1").row_limit(Some(100));
         let (sql, params) = build_execute_params(&spec, None).unwrap();
         assert_eq!(sql, "SELECT 1");
-        assert_eq!(params.row_limit, Some(100));
+        assert_eq!(params.scalar.row_limit, Some(100));
     }
 
     #[test]
     fn build_execute_params_threads_query_tags_to_wire_array() {
         // Per-statement query tags set via Statement::query_tags must reach
-        // ExecuteParams.query_tags as the native SEA {key, value} array (the
+        // ExecutionParams.scalar.query_tags as the native SEA {key, value} array (the
         // SEA request has no conf overlay). Regression guard for the seam
         // where statement_conf["query_tags"] is converted to the array.
         use std::collections::HashMap;
@@ -1108,6 +1112,7 @@ mod tests {
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
         let got: std::collections::HashSet<(String, Option<String>)> = params
+            .scalar
             .query_tags
             .iter()
             .map(|t| (t.key.clone(), t.value.clone()))
@@ -1126,7 +1131,7 @@ mod tests {
         let mut spec = StatementSpec::new();
         spec.sql("SELECT 1");
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
-        assert!(params.query_tags.is_empty());
+        assert!(params.scalar.query_tags.is_empty());
     }
 
     #[test]
@@ -1134,7 +1139,7 @@ mod tests {
         // The C ABI `kernel_statement_set_query_tags` stores the pre-serialized
         // wire string directly under `statement_conf["query_tags"]` (rather than
         // going through the typed `Statement::query_tags` builder). It must reach
-        // `ExecuteParams.query_tags` as the native array just the same — this is
+        // `ExecutionParams.scalar.query_tags` as the native array just the same — this is
         // the seam the C ABI relies on. Includes a bare key (None value) and an
         // escaped colon in a value.
         use std::collections::{HashMap, HashSet};
@@ -1147,6 +1152,7 @@ mod tests {
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
         let got: HashSet<(String, Option<String>)> = params
+            .scalar
             .query_tags
             .iter()
             .map(|t| (t.key.clone(), t.value.clone()))
@@ -1178,7 +1184,7 @@ mod tests {
         spec.statement_conf.remove("query_tags");
 
         let (_sql, params) = build_execute_params(&spec, None).unwrap();
-        assert!(params.query_tags.is_empty());
+        assert!(params.scalar.query_tags.is_empty());
     }
 
     #[test]
@@ -1188,11 +1194,11 @@ mod tests {
         spec.param(1, TypedValue::Bool(true)).unwrap();
         spec.param(2, TypedValue::Bool(false)).unwrap();
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters.len(), 2);
         // Positional binding is 1-based on the wire and carries no name.
-        assert_eq!(params.parameters[0].ordinal, Some(1));
-        assert_eq!(params.parameters[1].ordinal, Some(2));
-        assert!(params.parameters[0].name.is_none());
+        assert_eq!(params.scalar.parameters[0].ordinal, Some(1));
+        assert_eq!(params.scalar.parameters[1].ordinal, Some(2));
+        assert!(params.scalar.parameters[0].name.is_none());
     }
 
     #[test]
@@ -1201,9 +1207,9 @@ mod tests {
         spec.sql("SELECT :flag");
         spec.param_named("flag", TypedValue::Bool(true)).unwrap();
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 1);
-        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
-        assert!(params.parameters[0].ordinal.is_none());
+        assert_eq!(params.scalar.parameters.len(), 1);
+        assert_eq!(params.scalar.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.scalar.parameters[0].ordinal.is_none());
     }
 
     #[test]
@@ -1243,13 +1249,13 @@ mod tests {
         spec.param_raw(None, "BIGINT", Some("7".to_owned()));
         spec.param_raw(None, "STRING", Some("hi".to_owned()));
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
-        assert_eq!(params.parameters[0].ordinal, Some(1));
-        assert_eq!(params.parameters[0].param_type, "BIGINT");
-        assert_eq!(params.parameters[0].value.as_deref(), Some("7"));
-        assert!(params.parameters[0].name.is_none());
-        assert_eq!(params.parameters[1].ordinal, Some(2));
-        assert_eq!(params.parameters[1].value.as_deref(), Some("hi"));
+        assert_eq!(params.scalar.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters[0].ordinal, Some(1));
+        assert_eq!(params.scalar.parameters[0].param_type, "BIGINT");
+        assert_eq!(params.scalar.parameters[0].value.as_deref(), Some("7"));
+        assert!(params.scalar.parameters[0].name.is_none());
+        assert_eq!(params.scalar.parameters[1].ordinal, Some(2));
+        assert_eq!(params.scalar.parameters[1].value.as_deref(), Some("hi"));
     }
 
     #[test]
@@ -1261,12 +1267,12 @@ mod tests {
         spec.param_raw(Some("flag".to_owned()), "BOOLEAN", Some("true".to_owned()));
         spec.param_raw(Some("maybe".to_owned()), "VOID", None);
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
-        assert_eq!(params.parameters[0].name.as_deref(), Some("flag"));
-        assert!(params.parameters[0].ordinal.is_none());
-        assert_eq!(params.parameters[1].name.as_deref(), Some("maybe"));
-        assert_eq!(params.parameters[1].param_type, "VOID");
-        assert!(params.parameters[1].value.is_none());
+        assert_eq!(params.scalar.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters[0].name.as_deref(), Some("flag"));
+        assert!(params.scalar.parameters[0].ordinal.is_none());
+        assert_eq!(params.scalar.parameters[1].name.as_deref(), Some("maybe"));
+        assert_eq!(params.scalar.parameters[1].param_type, "VOID");
+        assert!(params.scalar.parameters[1].value.is_none());
     }
 
     #[test]
@@ -1321,14 +1327,14 @@ mod tests {
         spec.param_raw(None, "STRING", Some(String::new()));
         spec.param_raw(None, "VOID", None);
         let (_, params) = build_execute_params(&spec, None).unwrap();
-        assert_eq!(params.parameters.len(), 2);
+        assert_eq!(params.scalar.parameters.len(), 2);
         assert_eq!(
-            params.parameters[0].value.as_deref(),
+            params.scalar.parameters[0].value.as_deref(),
             Some(""),
             "empty-string value must stay a present empty value, not NULL"
         );
         assert!(
-            params.parameters[1].value.is_none(),
+            params.scalar.parameters[1].value.is_none(),
             "VOID/None must be SQL NULL, distinct from an empty string"
         );
     }

@@ -416,9 +416,6 @@ pub struct ExecuteStatementRequest {
     /// Positional parameters for parameterized queries.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub parameters: Vec<StatementParameter>,
-    /// Ordered native batch bindings, mutually exclusive with `parameters`.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub parameter_sets: Vec<StatementParameterSet>,
     /// Per-statement query tags, emitted as the native SEA `query_tags`
     /// array (`[{key, value}]`). Empty → omitted from the request body.
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -435,7 +432,6 @@ pub struct ExecuteParams {
     pub row_limit: Option<i64>,
     /// Parameters for parameterized query execution.
     pub parameters: Vec<StatementParameter>,
-    pub parameter_sets: Vec<StatementParameterSet>,
     /// Per-statement query tags, forwarded to the SEA request's native
     /// `query_tags` array. Derived from `StatementSpec.statement_conf
     /// ["query_tags"]` in `build_execute_params`.
@@ -608,7 +604,6 @@ mod tests {
             row_limit: None,
             result_compression: None,
             parameters: vec![],
-            parameter_sets: vec![],
             query_tags: vec![],
         };
 
@@ -636,7 +631,6 @@ mod tests {
             row_limit: None,
             result_compression: None,
             parameters: vec![],
-            parameter_sets: vec![],
             query_tags: vec![
                 QueryTag {
                     key: "team".to_string(),
