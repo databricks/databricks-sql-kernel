@@ -23,9 +23,8 @@
 //! A nonblocking probe holds the GIL through kernel post-processing, so large
 //! batches requiring column rewrites can delay other Python threads.
 //!
-//! CloudFetch probes also take ordinary locks. Their holders must release
-//! guards before logging or invoking host callbacks that can acquire the GIL,
-//! to avoid deadlocking a Python caller waiting for the same lock.
+//! Contended CloudFetch provider-state locks yield `Pending`, allowing the
+//! fallback to wait with the GIL released.
 
 use arrow_array::RecordBatch;
 use arrow_pyarrow::ToPyArrow;
@@ -178,5 +177,99 @@ mod tests {
                 .is_none());
             assert_eq!(entries.load(Ordering::Relaxed), 1);
         });
+    }
+
+    #[test]
+    fn real_result_handles_return_eof_without_runtime_entry() {
+        use pyo3::types::PyDict;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::{TcpListener, TcpStream};
+        use std::sync::atomic::AtomicBool;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&stopped);
+        let server = std::thread::spawn(move || {
+            let body = r#"{"session_id":"00000000-0000-0000-0000-000000000001","statement_id":"00000000-0000-0000-0000-000000000002","status":{"state":"SUCCEEDED"},"manifest":{"format":"ARROW_STREAM","schema":{"column_count":0,"columns":[]},"total_row_count":0,"total_chunk_count":0}}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for stream in listener.incoming() {
+                if stop.load(Ordering::Acquire) {
+                    break;
+                }
+                let mut stream = stream.unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(2)))
+                    .unwrap();
+                let mut request = BufReader::new(&mut stream);
+                let mut length = 0;
+                loop {
+                    let mut line = String::new();
+                    if request.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some((name, value)) = line.split_once(':') {
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap();
+                        }
+                    }
+                }
+                if request.read_exact(&mut vec![0; length]).is_ok() {
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
+        });
+        Python::initialize();
+        let checked = Python::attach(|py| -> PyResult<()> {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("host", format!("http://{address}"))?;
+            kwargs.set_item("http_path", "/sql/1.0/warehouses/0000000000000001")?;
+            kwargs.set_item("access_token", "test-token")?;
+            kwargs.set_item("telemetry_enabled", false)?;
+            kwargs.set_item("request_timeout_secs", 2)?;
+            kwargs.set_item("retry_max_attempts", 1)?;
+            let session = py
+                .get_type::<crate::session::Session>()
+                .call((), Some(&kwargs))?;
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            let mut checked = Ok(());
+            for asynchronous in [false, true] {
+                let statement = session.call_method0("statement")?;
+                statement.call_method1("set_sql", ("SELECT 1",))?;
+                let owner =
+                    statement.call_method0(if asynchronous { "submit" } else { "execute" })?;
+                let result = if asynchronous {
+                    owner.call_method0("await_result")?
+                } else {
+                    owner.clone()
+                };
+                // Tokio rejects nested block_on calls, exposing an unconditional
+                // runtime entry through either real Python result handle.
+                checked = runtime.block_on(async {
+                    assert!(result.call_method0("fetch_next_batch")?.is_none());
+                    Ok(())
+                });
+                result.call_method0("close")?;
+                if asynchronous {
+                    owner.call_method0("close")?;
+                }
+                statement.call_method0("close")?;
+                if checked.is_err() {
+                    break;
+                }
+            }
+            session.call_method0("close")?;
+            checked
+        });
+        stopped.store(true, Ordering::Release);
+        let _ = TcpStream::connect(address);
+        server.join().unwrap();
+        checked.unwrap();
     }
 }

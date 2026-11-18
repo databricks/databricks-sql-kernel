@@ -47,9 +47,10 @@
 //! Forwarding an enabled record also acquires the GIL.
 //!
 //! Events can originate on runtime workers or a Python caller holding
-//! the GIL during a buffered fetch. Workers must release locks shared
-//! with those callers before logging, regardless of Python log levels,
-//! so the worker and caller cannot wait on each other's locks.
+//! the GIL during a buffered fetch. Callers holding the GIL must avoid
+//! waiting for locks held by a logging worker, regardless of Python log
+//! levels. CloudFetch probes yield on contended provider-state locks
+//! so the fallback can wait with the GIL released.
 //!
 //! ## Reconfiguration
 //!
