@@ -20,10 +20,12 @@ changes go in their respective binding's NEXT_CHANGELOG.
   with an optional partner entry from `adbc.databricks.user_agent_entry`
   (`adbc.spark.user_agent_entry` is a compatibility alias). `User-Agent` in
   `adbc.databricks.http.headers` is now rejected; use the dedicated entry option.
-- `ClientCredentialsProvider`, `JwtClientCredentialsProvider` and
-  `AuthorizationCodeProvider` constructors take `&Arc<DatabricksHttpClient>`
-  and hold it weakly, matching `FederationProvider`. Callers must keep the
-  client alive for as long as they use the provider.
+- **Breaking (Rust API):** `ClientCredentialsProvider`,
+  `JwtClientCredentialsProvider` and `AuthorizationCodeProvider` constructors
+  take `&Arc<DatabricksHttpClient>` instead of `Arc<DatabricksHttpClient>` and
+  hold it weakly, matching `FederationProvider`. Callers must keep the client
+  alive for as long as they use the provider; a token fetch after the client is
+  dropped fails with `invalid_state`.
 
 ### Updated
 
