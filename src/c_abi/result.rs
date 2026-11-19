@@ -675,8 +675,7 @@ pub unsafe extern "C" fn kernel_result_stream_is_volume_operation(
 }
 
 /// Complete a marked instruction while preserving its result rows.
-/// `allowed_paths_json` is a JSON array of strings. Status is 0 (ordinary result),
-/// 1 (owned input bytes required) or 2 (completed). This API supplies no input bytes.
+/// `allowed_paths_json` is a JSON array of strings. This API supplies no input bytes.
 /// # Safety
 /// `stream` must be live with exclusive fetch access, `allowed_paths_json` must
 /// be NUL-terminated UTF-8, and `out_status` must be writable.
@@ -685,7 +684,7 @@ pub unsafe extern "C" fn kernel_result_stream_complete_volume_operation(
     stream: *mut kernel_result_stream_t,
     allowed_paths_json: *const std::ffi::c_char,
     remove_not_found_is_success: bool,
-    out_status: *mut i32,
+    out_status: *mut crate::VolumeCompletion,
 ) -> KernelStatusCode {
     catch_ffi(|| {
         if stream.is_null() || allowed_paths_json.is_null() || out_status.is_null() {
@@ -724,14 +723,7 @@ pub unsafe extern "C" fn kernel_result_stream_complete_volume_operation(
         };
         match result {
             Ok(status) => {
-                std::ptr::write(
-                    out_status,
-                    match status {
-                        crate::VolumeCompletion::NotVolume => 0,
-                        crate::VolumeCompletion::NeedsInputStream => 1,
-                        crate::VolumeCompletion::Completed => 2,
-                    },
-                );
+                std::ptr::write(out_status, status);
                 KernelStatusCode::Success
             }
             Err(code) => code,
@@ -772,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn volume_completion_keeps_raw_rows_and_observes_detached_cancel() {
+    fn volume_completion_observes_detached_cancel() {
         use crate::reader::test_utils::MockReader;
         use crate::result_stream::ResultStream;
         use arrow_array::StringArray;
@@ -792,84 +784,60 @@ mod tests {
         )
         .unwrap();
         let rt = tokio::runtime::Runtime::new().unwrap();
-        for (marked, cancel) in [(false, false), (true, false), (true, true)] {
-            let volume = crate::volume::VolumeState::new(Default::default(), None);
-            let stream = rt.block_on(async {
-                let mut stream =
-                    ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
-                        .await
-                        .unwrap();
-                stream.attach_volume(
-                    marked,
-                    Arc::clone(&volume),
-                    Arc::new(
-                        crate::client::DatabricksHttpClient::with_default_retry(Default::default())
-                            .unwrap()
-                            .storage_client(None),
-                    ),
-                );
-                into_raw_result_stream(schema.clone(), stream)
-            });
-            let mut is_volume = !marked;
-            assert_eq!(
-                unsafe { kernel_result_stream_is_volume_operation(stream, &mut is_volume) },
-                KernelStatusCode::Success
+        let volume = crate::volume::VolumeState::new(
+            Default::default(),
+            None,
+            Default::default(),
+            Default::default(),
+        );
+        let stream = rt.block_on(async {
+            let mut stream =
+                ResultStream::from_reader(Box::new(MockReader::new(vec![batch.clone()])))
+                    .await
+                    .unwrap();
+            stream.attach_volume(
+                true,
+                Arc::clone(&volume),
+                Arc::new(
+                    crate::client::DatabricksHttpClient::with_default_retry(Default::default())
+                        .unwrap()
+                        .storage_client(None),
+                ),
             );
-            assert_eq!(is_volume, marked);
-            if marked && !cancel {
-                unsafe { kernel_result_stream_close(stream) };
-                assert!(volume.cached().is_none());
-                continue;
-            }
-            let roots = CString::new("[]").unwrap();
-            let mut status = -1;
-            if marked {
-                let mut canceller = std::ptr::null_mut();
-                assert_eq!(
-                    unsafe { kernel_result_stream_canceller_new(stream, &mut canceller) },
-                    KernelStatusCode::Success
-                );
-                assert_eq!(
-                    unsafe { kernel_result_stream_canceller_cancel(canceller) },
-                    KernelStatusCode::Success
-                );
-                for _ in 0..2 {
-                    assert_eq!(
-                        unsafe {
-                            kernel_result_stream_complete_volume_operation(
-                                stream,
-                                roots.as_ptr(),
-                                false,
-                                &mut status,
-                            )
-                        },
-                        KernelStatusCode::Cancelled
-                    );
-                }
-                unsafe { kernel_result_stream_canceller_free(canceller) };
-            } else {
-                assert_eq!(
-                    unsafe {
-                        kernel_result_stream_complete_volume_operation(
-                            stream,
-                            roots.as_ptr(),
-                            false,
-                            &mut status,
-                        )
-                    },
-                    KernelStatusCode::Success
-                );
-                assert_eq!(status, 0);
-                let mut array = FFI_ArrowArray::empty();
-                let mut schema = FFI_ArrowSchema::empty();
-                assert_eq!(
-                    unsafe { kernel_result_stream_next_batch(stream, &mut array, &mut schema) },
-                    KernelStatusCode::Success
-                );
-                assert!(!array.is_released());
-            }
-            unsafe { kernel_result_stream_close(stream) };
+            into_raw_result_stream(schema.clone(), stream)
+        });
+        let mut is_volume = false;
+        assert_eq!(
+            unsafe { kernel_result_stream_is_volume_operation(stream, &mut is_volume) },
+            KernelStatusCode::Success
+        );
+        assert!(is_volume);
+        let roots = CString::new("[]").unwrap();
+        let mut status = crate::VolumeCompletion::NotVolume;
+        let mut canceller = std::ptr::null_mut();
+        assert_eq!(
+            unsafe { kernel_result_stream_canceller_new(stream, &mut canceller) },
+            KernelStatusCode::Success
+        );
+        assert_eq!(
+            unsafe { kernel_result_stream_canceller_cancel(canceller) },
+            KernelStatusCode::Success
+        );
+        for _ in 0..2 {
+            assert_eq!(
+                unsafe {
+                    kernel_result_stream_complete_volume_operation(
+                        stream,
+                        roots.as_ptr(),
+                        false,
+                        &mut status,
+                    )
+                },
+                KernelStatusCode::Cancelled
+            );
         }
+        unsafe { kernel_result_stream_canceller_free(canceller) };
+        unsafe { kernel_result_stream_close(stream) };
     }
 
     /// End-of-stream on an Owned stream returns `Success` with a

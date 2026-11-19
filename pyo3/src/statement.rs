@@ -334,7 +334,7 @@ impl ExecutedStatement {
         allowed_paths: Vec<String>,
         remove_not_found_is_success: bool,
         input_bytes: Option<Vec<u8>>,
-    ) -> PyResult<&'static str> {
+    ) -> PyResult<crate::result_stream::VolumeCompletion> {
         let inner = alive_mut!(self, "ExecutedStatement");
         let runtime = inner.runtime.clone();
         let options = databricks_sql_kernel::VolumeOptions {
@@ -347,7 +347,7 @@ impl ExecutedStatement {
             &runtime,
             stream.complete_volume_operation(&options, input_bytes)
         )?;
-        Ok(outcome.as_str())
+        Ok(outcome.into())
     }
 
     #[getter]

@@ -68,38 +68,13 @@ and security vulnerabilities should be reported according to
 
 ## Volume file operations
 
-`ResultStream::complete_volume_operation` completes server-marked SQL PUT, GET,
-and REMOVE instructions. Pass `VolumeOptions` with the local roots authorized for
-PUT and GET. Completion preserves the instruction rows; callers that want the raw
-result can omit completion. Complete the operation before reading its instruction
-rows. The PyO3 `ExecutedStatement` and `ResultStream` classes expose
-`is_volume_operation` and `complete_volume_operation`.
-
-Local filesystem setup and download publication are synchronous. Cancellation
-cannot interrupt a blocked filesystem call and can wait for publication of a
-completed GET.
-
-A PUT instruction with `localFile == "__input_stream__"` returns
-`NeedsInputStream` until owned input bytes are supplied. An empty byte buffer is a
-valid upload. Other statements do not request or consume input bytes.
-
-Local paths must satisfy both the lexical allowed-root check and a resolved-target
-check. Symlinks within the configured roots are permitted, including links between
-two authorized roots. Symlinks that resolve outside all authorized roots are
-rejected. This is stricter than the lexical-only checks in existing Python and
-Node.js Thrift transfer paths. An allowed root's symlink alias does not authorize
-additional lexical paths.
-
-Paths are normalized lexically before symlink resolution. Allowed-root validation
-assumes path components remain unchanged between validation and file access.
-
-GET stages the complete download before publishing it. When the destination
-directory permits temporary-file creation, publication atomically replaces the
-destination. Otherwise, an existing writable file can be updated in place using
-private storage in the system temporary directory. That final write is not
-atomic and a local write failure can leave partial contents. Download failures
-and cancellation before publication preserve the destination's existing bytes.
-Repeated completion on the same execution reuses its outcome, including errors.
+Call `ResultStream::complete_volume_operation` with `VolumeOptions` to complete
+server-marked PUT, GET and REMOVE instructions before reading their rows. Omit
+completion for raw results. File paths must satisfy the configured lexical and
+resolved roots. Stream PUT returns `NeedsInputStream` until owned bytes are supplied.
+Completion caches its outcome, including errors; owner/session close cancels pending
+work. See [`VolumeOptions`](https://docs.rs/databricks-sql-kernel/latest/databricks_sql_kernel/struct.VolumeOptions.html)
+for local file and transfer behavior.
 
 ## License
 

@@ -41,10 +41,8 @@
 //!   Aborted, Unimplemented, …) lands in a follow-on PR. External
 //!   `match` arms get a forced `_ =>` fallback — they keep compiling
 //!   when the enum grows.
-//! - `Error` **is not** `#[non_exhaustive]`, so adding public fields
-//!   breaks callers using struct literals or exhaustive patterns. Prefer
-//!   `Error::new(...).with_*(...)` and patterns with `..` to keep callers
-//!   independent of additional fields.
+//! - `Error` **is not** `#[non_exhaustive]`: wrappers use struct patterns
+//!   with `..` for logging and host-language exception mapping.
 
 #![allow(dead_code)]
 
@@ -167,8 +165,6 @@ impl ErrorCode {
 /// chain `with_*` setters. **Pattern-matching is supported** —
 /// wrappers writing a comprehensive logger or host-language exception
 /// adapter can do `let Error { code, message, sql_state, .. } = err;`.
-/// Adding public fields breaks callers using struct literals or exhaustive
-/// patterns; constructors and patterns with `..` avoid that coupling.
 #[derive(Debug, Clone)]
 pub struct Error {
     pub code: ErrorCode,
@@ -254,7 +250,7 @@ pub struct Error {
 #[derive(Debug, Clone)]
 pub struct LocalFileError {
     pub raw_os_error: Option<i32>,
-    pub kind: String,
+    pub kind: std::io::ErrorKind,
     pub path: String,
 }
 

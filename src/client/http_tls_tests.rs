@@ -312,7 +312,7 @@ async fn storage_connection_timeout_preserves_unconfigured_limits() {
     );
     for timeout in [None, Some(Duration::from_millis(100))] {
         let storage = client.storage_client(timeout);
-        let storage = storage.get().unwrap();
+        let storage = storage.get().await.unwrap();
         let deadline = if timeout.is_some() {
             Duration::from_millis(500)
         } else {

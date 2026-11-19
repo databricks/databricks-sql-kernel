@@ -99,7 +99,8 @@ pub(crate) struct SessionInner {
     transport: Arc<dyn Transport>,
     storage_client: Arc<crate::client::http::StorageClient>,
     storage_retry: RetryConfig,
-    volume_states: std::sync::Mutex<Option<Vec<std::sync::Weak<crate::volume::VolumeState>>>>,
+    volume_cancellation: tokio_util::sync::CancellationToken,
+    volume_publish: Arc<std::sync::Mutex<()>>,
 
     /// Server-issued session identifier.
     session_id: String,
@@ -162,30 +163,20 @@ pub(crate) struct SessionInner {
 
 impl SessionInner {
     pub(crate) fn new_volume_state(&self) -> Arc<crate::volume::VolumeState> {
-        let state = crate::volume::VolumeState::new(
+        crate::volume::VolumeState::new(
             self.storage_retry.clone(),
             self.config.http.storage_read_timeout,
-        );
-        let mut states = self.volume_states.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(states) = states.as_mut() {
-            states.retain(|state| state.strong_count() != 0);
-            states.push(Arc::downgrade(&state));
-        } else {
-            state.cancel();
-        }
-        state
+            self.volume_cancellation.child_token(),
+            Arc::clone(&self.volume_publish),
+        )
     }
 
     fn cancel_volume_operations(&self) {
-        let states = self
-            .volume_states
+        let _publish = self
+            .volume_publish
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
-            .unwrap_or_default();
-        for state in states.into_iter().filter_map(|state| state.upgrade()) {
-            state.cancel();
-        }
+            .unwrap_or_else(|e| e.into_inner());
+        self.volume_cancellation.cancel();
     }
 
     pub(crate) fn storage_client(&self) -> Arc<crate::client::http::StorageClient> {
@@ -511,7 +502,8 @@ impl Session {
                 transport,
                 storage_client,
                 storage_retry,
-                volume_states: std::sync::Mutex::new(Some(Vec::new())),
+                volume_cancellation: tokio_util::sync::CancellationToken::new(),
+                volume_publish: Default::default(),
                 session_id: session_info.session_id,
                 config,
                 runtime_handle,

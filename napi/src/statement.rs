@@ -208,7 +208,7 @@ impl Statement {
         &self,
         allowed_paths: Vec<String>,
         remove_not_found_is_success: Option<bool>,
-    ) -> napi::Result<String> {
+    ) -> napi::Result<crate::result::VolumeCompletion> {
         let options = VolumeOptions {
             allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
             remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
@@ -223,7 +223,7 @@ impl Statement {
             stream
                 .complete_volume_operation(&options, None)
                 .await
-                .map(|status| status.as_str().to_owned())
+                .map(crate::result::VolumeCompletion::from)
                 .map_err(napi_err_from_kernel)
         })
         .await
@@ -709,7 +709,7 @@ mod tests {
                         .complete_volume_operation(vec![], None)
                         .await
                         .unwrap(),
-                    "completed"
+                    crate::result::VolumeCompletion::Completed
                 );
                 let batch = result.fetch_next_batch().await.unwrap().unwrap();
                 owner.close().await.unwrap();
@@ -723,7 +723,7 @@ mod tests {
                         .complete_volume_operation(vec![], None)
                         .await
                         .unwrap(),
-                    "completed"
+                    crate::result::VolumeCompletion::Completed
                 );
                 let batch = result.fetch_next_batch().await.unwrap().unwrap();
                 result.close().await.unwrap();

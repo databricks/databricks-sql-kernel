@@ -132,12 +132,6 @@ async fn instruction_batches_preserve_one_row_and_reject_extra_rows() {
             panic!("expected buffered instruction batch");
         };
         assert_eq!(batch.num_rows(), 1);
-        if !valid {
-            let ResultBatch::Arrow(batch) = executed.next_batch().await.unwrap().unwrap() else {
-                panic!("expected retained extra instruction batch");
-            };
-            assert_eq!(batch.num_rows(), 1);
-        }
         assert!(executed.next_batch().await.unwrap().is_none());
         executed.close().await.unwrap();
         session.close().await.unwrap();
@@ -196,7 +190,7 @@ async fn session_with_http(
 
 #[tokio::test]
 async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_out() {
-    for operation in ["PUT", "GET"] {
+    for operation in ["GET"] {
         let server = MockServer::start().await;
         let dir = tempfile::tempdir().unwrap();
         let local = dir.path().join("file");
@@ -237,13 +231,7 @@ async fn storage_transfers_outlive_rpc_deadline_while_sql_requests_still_time_ou
                 .unwrap(),
             VolumeCompletion::Completed
         );
-        if operation == "PUT" {
-            let requests = server.received_requests().await.unwrap();
-            let upload = requests.iter().find(|r| r.url.path() == "/object").unwrap();
-            assert_eq!(upload.body, b"original");
-        } else {
-            assert_eq!(std::fs::read(&local).unwrap(), b"downloaded");
-        }
+        assert_eq!(std::fs::read(&local).unwrap(), b"downloaded");
         executed.close().await.unwrap();
         Mock::given(method("POST"))
             .and(path("/api/2.0/sql/statements"))

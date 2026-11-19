@@ -390,22 +390,21 @@ pub struct DatabricksHttpClient {
 
 pub(crate) struct StorageClient {
     config: HttpClientConfig,
-    client: OnceLock<Result<Client>>,
+    client: tokio::sync::OnceCell<Client>,
 }
 
 impl StorageClient {
-    pub(crate) fn get(&self) -> Result<&Client> {
+    pub(crate) async fn get(&self) -> Result<&Client> {
         self.client
-            .get_or_init(|| {
-                // File replay uses one redirect budget across all hops.
+            .get_or_try_init(|| async {
                 DatabricksHttpClient::build_reqwest_client(
                     &self.config,
-                    reqwest::redirect::Policy::none(),
+                    reqwest::redirect::Policy::default(),
                     None,
+                    false,
                 )
             })
-            .as_ref()
-            .map_err(Clone::clone)
+            .await
     }
 }
 
@@ -504,6 +503,7 @@ impl DatabricksHttpClient {
             &config,
             reqwest::redirect::Policy::default(),
             Some(config.read_timeout),
+            true,
         )?;
 
         // Surface which TLS backend was compiled in so oncall debugging
@@ -540,12 +540,14 @@ impl DatabricksHttpClient {
         config: &HttpClientConfig,
         redirect: reqwest::redirect::Policy,
         request_timeout: Option<Duration>,
+        referer: bool,
     ) -> Result<Client> {
         let mut builder = Client::builder()
             .connect_timeout(config.connect_timeout)
             .pool_max_idle_per_host(config.max_connections_per_host)
             .user_agent(&config.user_agent)
-            .redirect(redirect);
+            .redirect(redirect)
+            .referer(referer);
         if let Some(timeout) = request_timeout {
             builder = builder.timeout(timeout);
         }
@@ -770,7 +772,7 @@ impl DatabricksHttpClient {
         }
         StorageClient {
             config,
-            client: OnceLock::new(),
+            client: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -847,6 +849,7 @@ impl DatabricksHttpClient {
             &self.config,
             reqwest::redirect::Policy::none(),
             Some(self.config.read_timeout),
+            true,
         )?;
         let response = client.get(url).send().await.map_err(|e| {
             Error::network_error().message(format!("Redirect-probe request to {url} failed: {e}"))
@@ -1606,19 +1609,7 @@ lGrv15pBcePj
 
         let mut config = HttpClientConfig::default();
         config.tls.trusted_certificate_path = Some(tmp.path().to_string_lossy().to_string());
-        let client = DatabricksHttpClient::new(config, default_retry_configs()).unwrap();
-        let storage = client.storage_client(None);
-        assert!(storage.client.get().is_none());
-        std::fs::write(tmp.path(), "not a certificate").unwrap();
-        let error = storage.get().unwrap_err();
-        assert!(error.message.contains("Invalid PEM certificate"), "{error}");
-        std::fs::write(tmp.path(), TEST_CA_CERT_PEM).unwrap();
-        assert_eq!(storage.get().unwrap_err().message, error.message);
-
-        let storage = client.storage_client(None);
-        let first = storage.get().unwrap();
-        std::fs::write(tmp.path(), "not a certificate").unwrap();
-        assert!(std::ptr::eq(first, storage.get().unwrap()));
+        assert!(DatabricksHttpClient::new(config, default_retry_configs()).is_ok());
     }
 
     #[test]

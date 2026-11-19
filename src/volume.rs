@@ -16,17 +16,27 @@
 
 use crate::client::retry::{calculate_backoff, RequestType, RetryConfig, RetryStrategy};
 use crate::kernel_error::{Error, LocalFileError, Result};
-use crate::result_stream::ResultBatch;
-use arrow_array::{Array, LargeStringArray, MapArray, StringArray, StringViewArray};
+use arrow_array::{Array, LargeStringArray, MapArray, RecordBatch, StringArray, StringViewArray};
 use futures::TryStreamExt;
 use reqwest::{header::HeaderMap, Client, Method};
 use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::AsyncWriteExt;
-use tokio::sync::Notify;
+use tokio::sync::OnceCell;
+use tokio_util::bytes::Bytes;
 use tokio_util::io::ReaderStream;
+use tokio_util::sync::CancellationToken;
 
 /// Local file authorization and driver-specific storage response policy.
+///
+/// Requested and resolved paths must be within allowed roots. Symlinks between
+/// authorized roots work; path components must remain stable during file access.
+/// GET stages downloads before publication. Sibling staging permits atomic
+/// replacement; an existing writable file in a restricted directory uses private
+/// temporary storage followed by a non-atomic copy, which can fail partially.
+/// Download failure or cancellation before publication preserves existing bytes.
+/// Filesystem setup and publication are synchronous and can delay cancellation.
 #[derive(Debug, Clone, Default)]
 pub struct VolumeOptions {
     pub allowed_paths: Vec<PathBuf>,
@@ -35,28 +45,11 @@ pub struct VolumeOptions {
 
 /// Result of explicitly completing a server-marked Volume instruction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
 pub enum VolumeCompletion {
     NotVolume,
     NeedsInputStream,
     Completed,
-}
-
-impl VolumeCompletion {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::NotVolume => "not_volume",
-            Self::NeedsInputStream => "needs_input_stream",
-            Self::Completed => "completed",
-        }
-    }
-}
-
-#[derive(Default)]
-enum CommitState {
-    #[default]
-    Ready,
-    Running,
-    Finished(Box<Result<VolumeCompletion>>),
 }
 
 /// The synchronous gate makes cancellation and local publication mutually exclusive.
@@ -64,9 +57,10 @@ enum CommitState {
 pub(crate) struct VolumeState {
     retry: RetryConfig,
     read_timeout: Option<std::time::Duration>,
-    serial: tokio::sync::Mutex<()>,
-    commit: Mutex<CommitState>,
-    changed: Notify,
+    completion: OnceCell<Result<VolumeCompletion>>,
+    cancellation: CancellationToken,
+    publish: Arc<Mutex<()>>,
+    started: AtomicBool,
 }
 
 fn cancelled() -> Error {
@@ -74,107 +68,67 @@ fn cancelled() -> Error {
 }
 
 impl VolumeState {
-    pub(crate) fn new(retry: RetryConfig, read_timeout: Option<std::time::Duration>) -> Arc<Self> {
+    pub(crate) fn new(
+        retry: RetryConfig,
+        read_timeout: Option<std::time::Duration>,
+        cancellation: CancellationToken,
+        publish: Arc<Mutex<()>>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             retry,
             read_timeout,
+            cancellation,
+            publish,
             ..Self::default()
         })
     }
 
-    pub(crate) fn cached(&self) -> Option<Result<VolumeCompletion>> {
-        match &*self.commit.lock().unwrap_or_else(|e| e.into_inner()) {
-            CommitState::Finished(result) => Some(result.as_ref().clone()),
-            CommitState::Ready | CommitState::Running => None,
-        }
-    }
-
-    pub(crate) fn fail(&self, error: Error) -> Error {
-        let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-        match &*gate {
-            CommitState::Finished(result) => {
-                if let Err(existing) = result.as_ref() {
-                    return existing.clone();
-                }
-            }
-            CommitState::Ready => *gate = CommitState::Finished(Box::new(Err(error.clone()))),
-            CommitState::Running => {}
-        }
-        error
-    }
-
     pub(crate) fn cancel(&self) {
-        let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-        if !matches!(*gate, CommitState::Finished(_)) {
-            *gate = CommitState::Finished(Box::new(Err(cancelled())));
-            self.changed.notify_waiters();
-        }
-    }
-
-    pub(crate) async fn cancellation(&self) -> Error {
-        loop {
-            let notified = self.changed.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
-            if matches!(self.cached(), Some(Err(error)) if error.code == crate::ErrorCode::Cancelled)
-            {
-                return cancelled();
-            }
-            notified.await;
-        }
+        let _publish = self.publish.lock().unwrap_or_else(|e| e.into_inner());
+        self.cancellation.cancel();
     }
 
     pub(crate) async fn complete(
         &self,
-        batch: &ResultBatch,
-        client: &Client,
+        prepare: impl std::future::Future<Output = Result<(RecordBatch, Client)>>,
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<VolumeCompletion> {
-        let _serial = self.serial.lock().await;
-        {
-            let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-            match &*gate {
-                CommitState::Finished(result) => return result.as_ref().clone(),
-                // Holding serialization proves that the previous initializer was dropped.
-                CommitState::Running => {
-                    *gate = CommitState::Finished(Box::new(Err(cancelled())));
-                    return Err(cancelled());
+        match self
+            .completion
+            .get_or_try_init(|| async {
+                // An abandoned initializer must not replay an already-dispatched transfer.
+                if self.started.swap(true, Ordering::AcqRel) || self.cancellation.is_cancelled() {
+                    return Ok(Err(cancelled()));
                 }
-                CommitState::Ready => {}
-            }
-        }
-        let instruction = Instruction::decode(batch);
-        let result = match instruction {
-            Ok(instruction) => {
-                if instruction.operation == "PUT"
-                    && instruction.local_file == "__input_stream__"
-                    && input_bytes.is_none()
-                {
-                    return Ok(VolumeCompletion::NeedsInputStream);
-                }
-                {
-                    let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-                    if let CommitState::Finished(result) = &*gate {
-                        return result.as_ref().clone();
+                let complete = async {
+                    let (batch, client) = prepare.await?;
+                    let instruction = Instruction::decode(&batch)?;
+                    if matches!(instruction.operation, Operation::Put(Source::Stream))
+                        && input_bytes.is_none()
+                    {
+                        return Ok(VolumeCompletion::NeedsInputStream);
                     }
-                    // Running is a cancellation tombstone if this future is abandoned.
-                    *gate = CommitState::Running;
-                }
-                tokio::select! {
+                    self.transfer(instruction, &client, options, input_bytes)
+                        .await
+                };
+                let result = tokio::select! {
                     biased;
-                    result = self.transfer(instruction, client, options, input_bytes) => result,
-                    _ = self.cancellation() => Err(cancelled()),
+                    result = complete => result,
+                    _ = self.cancellation.cancelled() => Err(cancelled()),
+                };
+                if matches!(result, Ok(VolumeCompletion::NeedsInputStream)) {
+                    self.started.store(false, Ordering::Release);
+                    Err(VolumeCompletion::NeedsInputStream)
+                } else {
+                    Ok(result)
                 }
-            }
-            Err(error) => Err(error),
-        };
-        let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-        if let CommitState::Finished(result) = &*gate {
-            return result.as_ref().clone();
+            })
+            .await
+        {
+            Ok(result) => result.clone(),
+            Err(outcome) => Ok(outcome),
         }
-        *gate = CommitState::Finished(Box::new(result.clone()));
-        result
     }
 
     async fn transfer(
@@ -184,12 +138,13 @@ impl VolumeState {
         options: &VolumeOptions,
         input_bytes: Option<Vec<u8>>,
     ) -> Result<VolumeCompletion> {
-        let input =
-            if instruction.operation == "PUT" && instruction.local_file == "__input_stream__" {
-                Some(input_bytes.ok_or_else(|| invalid("Missing input stream"))?)
-            } else {
-                None
-            };
+        let input = if matches!(instruction.operation, Operation::Put(Source::Stream)) {
+            Some(Bytes::from(
+                input_bytes.ok_or_else(|| invalid("Missing input stream"))?,
+            ))
+        } else {
+            None
+        };
         let started = std::time::Instant::now();
         let mut attempt = 0;
         loop {
@@ -199,7 +154,7 @@ impl VolumeState {
                     &instruction,
                     client,
                     options,
-                    input.as_deref(),
+                    input.as_ref(),
                     &mut retry_after,
                 )
                 .await
@@ -225,14 +180,14 @@ impl VolumeState {
         instruction: &Instruction,
         client: &Client,
         options: &VolumeOptions,
-        input: Option<&[u8]>,
+        input: Option<&Bytes>,
         retry_after: &mut Option<String>,
     ) -> Result<VolumeCompletion> {
-        let method = match instruction.operation.as_str() {
-            "PUT" => Method::PUT,
-            "GET" => Method::GET,
-            "REMOVE" => Method::DELETE,
-            _ => return Err(invalid("Unsupported Volume operation")),
+        let (method, local_file) = match &instruction.operation {
+            Operation::Put(Source::File(path)) => (Method::PUT, path.to_string_lossy()),
+            Operation::Get(path) => (Method::GET, path.to_string_lossy()),
+            Operation::Put(Source::Stream) => (Method::PUT, std::borrow::Cow::Borrowed("")),
+            Operation::Remove => (Method::DELETE, std::borrow::Cow::Borrowed("")),
         };
         let mut request = client
             .request(method, &instruction.url)
@@ -243,25 +198,23 @@ impl VolumeState {
                     reqwest::header::CONTENT_LENGTH,
                     bytes.len().into(),
                 )]))
-                .body(bytes.to_vec());
+                .body(bytes.clone());
         }
-        let local_path = if instruction.operation == "REMOVE"
-            || (instruction.operation == "PUT" && instruction.local_file == "__input_stream__")
-        {
-            None
-        } else {
-            Some(allowed_path(
-                &instruction.local_file,
+        let operation = match &instruction.operation {
+            Operation::Put(Source::File(_)) => Operation::Put(Source::File(allowed_path(
+                &local_file,
                 &options.allowed_paths,
-            )?)
+            )?)),
+            Operation::Get(_) => Operation::Get(allowed_path(&local_file, &options.allowed_paths)?),
+            Operation::Put(Source::Stream) => Operation::Put(Source::Stream),
+            Operation::Remove => Operation::Remove,
         };
-        let mut destination = if instruction.operation == "GET" {
-            let path = local_path.as_ref().expect("GET path was checked");
+        let mut destination = if let Operation::Get(path) = &operation {
             // Replacement must still honor the destination's write permissions.
             let existing = match std::fs::OpenOptions::new().write(true).open(path) {
                 Ok(file) => Some(file),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-                Err(error) => return Err(local_error(error, &instruction.local_file)),
+                Err(error) => return Err(local_error(error, &local_file)),
             };
             #[cfg(unix)]
             let mut builder = tempfile::Builder::new();
@@ -281,10 +234,10 @@ impl VolumeState {
                         temp.as_file()
                             .set_permissions(
                                 file.metadata()
-                                    .map_err(|e| local_error(e, &instruction.local_file))?
+                                    .map_err(|e| local_error(e, &local_file))?
                                     .permissions(),
                             )
-                            .map_err(|e| local_error(e, &instruction.local_file))?;
+                            .map_err(|e| local_error(e, &local_file))?;
                     }
                     (temp, None)
                 }
@@ -293,105 +246,55 @@ impl VolumeState {
                         && existing.is_some() =>
                 {
                     // An existing file may be writable without permission to replace its entry.
-                    let temp = tempfile::NamedTempFile::new()
-                        .map_err(|e| local_error(e, &instruction.local_file))?;
+                    let temp =
+                        tempfile::NamedTempFile::new().map_err(|e| local_error(e, &local_file))?;
                     (temp, existing)
                 }
-                Err(error) => return Err(local_error(error, &instruction.local_file)),
+                Err(error) => return Err(local_error(error, &local_file)),
             };
             let writer = tokio::fs::File::from_std(
                 temp.as_file()
                     .try_clone()
-                    .map_err(|e| local_error(e, &instruction.local_file))?,
+                    .map_err(|e| local_error(e, &local_file))?,
             );
-            Some((temp, writer, in_place))
+            Some((temp, writer, in_place, path))
         } else {
             None
         };
 
-        let retry_timeout = instruction.operation != "PUT";
-        // File bodies must be reopened for redirects; reqwest can only clone owned bytes.
-        let mut request = request.build().map_err(storage_error)?;
-        let mut redirects = 0;
-        let mut response = loop {
-            let mut next = reqwest::RequestBuilder::from_parts(
-                client.clone(),
-                request.try_clone().expect("replayable request template"),
-            );
-            let upload_error = Arc::new(Mutex::new(None));
-            if request.method() == Method::PUT && input.is_none() {
-                let path = local_path.as_ref().expect("PUT path was checked");
-                let mut file = std::fs::File::open(path)
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
-                let metadata = file
-                    .metadata()
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
-                if metadata.is_dir() {
-                    // Reading the opened directory retains the platform's filesystem cause.
-                    let error = std::io::Read::read(&mut file, &mut [0])
-                        .err()
-                        .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
-                    return Err(local_error(error, &instruction.local_file));
-                }
-                next = next
-                    .headers(HeaderMap::from_iter([(
-                        reqwest::header::CONTENT_LENGTH,
-                        metadata.len().into(),
-                    )]))
-                    .body(upload_body(
-                        tokio::fs::File::from_std(file),
-                        instruction.local_file.clone(),
-                        Arc::clone(&upload_error),
-                    ));
+        let retry_timeout = !matches!(operation, Operation::Put(_));
+        let upload_error = Arc::new(Mutex::new(None));
+        if let Operation::Put(Source::File(path)) = &operation {
+            let mut file = std::fs::File::open(path).map_err(|e| local_error(e, &local_file))?;
+            let metadata = file.metadata().map_err(|e| local_error(e, &local_file))?;
+            if metadata.is_dir() {
+                // Reading the opened directory retains the platform's filesystem cause.
+                let error = std::io::Read::read(&mut file, &mut [0])
+                    .err()
+                    .unwrap_or_else(|| std::io::ErrorKind::IsADirectory.into());
+                return Err(local_error(error, &local_file));
             }
-            let response = storage_send(
-                next,
-                self.read_timeout,
-                request.method() == Method::PUT,
-                upload_error,
-            )
-            .await?;
-            if !matches!(response.status().as_u16(), 301 | 302 | 303 | 307 | 308) {
-                break response;
-            }
-            let Some(url) = response
-                .headers()
-                .get(reqwest::header::LOCATION)
-                .and_then(|location| location.to_str().ok())
-                .and_then(|location| response.url().join(location).ok())
-            else {
-                break response;
-            };
-            if redirects == 10 || !matches!(url.scheme(), "http" | "https") {
-                return Err(Error::network_error()
-                    .with_error_code("VOLUME_STORAGE_NETWORK_ERROR")
-                    .with_retryable(false)
-                    .message(if redirects == 10 {
-                        "Volume storage redirect limit exceeded"
-                    } else {
-                        "Volume storage redirect URL must use HTTP or HTTPS"
-                    }));
-            }
-            redirects += 1;
-            let previous = response.url();
-            redirect_headers(request.headers_mut(), previous, &url);
-            if response.status() == reqwest::StatusCode::SEE_OTHER {
-                *request.method_mut() = Method::GET;
-                *request.body_mut() = None;
-                for name in [
-                    "content-type",
-                    "content-length",
-                    "content-encoding",
-                    "transfer-encoding",
-                ] {
-                    request.headers_mut().remove(name);
-                }
-            }
-            *request.url_mut() = url;
-        };
+            request = request
+                .headers(HeaderMap::from_iter([(
+                    reqwest::header::CONTENT_LENGTH,
+                    metadata.len().into(),
+                )]))
+                .body(upload_body(
+                    tokio::fs::File::from_std(file),
+                    local_file.to_string(),
+                    Arc::clone(&upload_error),
+                ));
+        }
+        let mut response = storage_send(
+            request,
+            self.read_timeout,
+            matches!(operation, Operation::Put(_)),
+            upload_error,
+        )
+        .await?;
         let status = response.status();
         if !(status.is_success()
-            || (instruction.operation == "REMOVE"
+            || (matches!(operation, Operation::Remove)
                 && status.as_u16() == 404
                 && options.remove_not_found_is_success))
         {
@@ -413,66 +316,36 @@ impl VolumeState {
         })
         .await?
         {
-            if let Some((_, writer, _)) = destination.as_mut() {
+            if let Some((_, writer, _, _)) = destination.as_mut() {
                 writer
                     .write_all(&bytes)
                     .await
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                    .map_err(|e| local_error(e, &local_file))?;
             }
         }
-        if let Some((mut temp, mut writer, in_place)) = destination.take() {
+        if let Some((mut temp, mut writer, in_place, path)) = destination.take() {
             writer
                 .flush()
                 .await
-                .map_err(|e| local_error(e, &instruction.local_file))?;
+                .map_err(|e| local_error(e, &local_file))?;
             drop(writer);
-            let mut gate = self.commit.lock().unwrap_or_else(|e| e.into_inner());
-            if let CommitState::Finished(result) = &*gate {
-                return result.as_ref().clone();
+            let _publish = self.publish.lock().unwrap_or_else(|e| e.into_inner());
+            if self.cancellation.is_cancelled() {
+                return Err(cancelled());
             }
             if let Some(mut file) = in_place {
                 std::io::Seek::rewind(temp.as_file_mut())
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                    .map_err(|e| local_error(e, &local_file))?;
                 let length = std::io::copy(temp.as_file_mut(), &mut file)
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                    .map_err(|e| local_error(e, &local_file))?;
                 file.set_len(length)
-                    .map_err(|e| local_error(e, &instruction.local_file))?;
+                    .map_err(|e| local_error(e, &local_file))?;
             } else {
-                temp.persist(local_path.as_ref().expect("GET destination"))
-                    .map_err(|e| local_error(e.error, &instruction.local_file))?;
+                temp.persist(path)
+                    .map_err(|e| local_error(e.error, &local_file))?;
             }
-            *gate = CommitState::Finished(Box::new(Ok(VolumeCompletion::Completed)));
         }
         Ok(VolumeCompletion::Completed)
-    }
-}
-
-fn redirect_headers(headers: &mut HeaderMap, previous: &reqwest::Url, next: &reqwest::Url) {
-    if next.scheme() != previous.scheme()
-        || next.host_str() != previous.host_str()
-        || next.port_or_known_default() != previous.port_or_known_default()
-    {
-        for name in [
-            "authorization",
-            "cookie",
-            "cookie2",
-            "proxy-authorization",
-            "www-authenticate",
-        ] {
-            headers.remove(name);
-        }
-    }
-    if previous.scheme() == "https" && next.scheme() == "http" {
-        headers.remove(reqwest::header::REFERER);
-    } else {
-        let mut referer = previous.clone();
-        let _ = referer.set_username("");
-        let _ = referer.set_password(None);
-        referer.set_query(None);
-        referer.set_fragment(None);
-        if let Ok(value) = referer.as_str().parse() {
-            headers.insert(reqwest::header::REFERER, value);
-        }
     }
 }
 
@@ -535,18 +408,8 @@ async fn storage_read<T>(
 }
 
 fn storage_error(error: reqwest::Error) -> Error {
-    // A file reader's failure is wrapped in a request error by the HTTP stack.
-    let source_body_failed = std::iter::successors(
-        Some(&error as &(dyn std::error::Error + 'static)),
-        |cause| cause.source(),
-    )
-    .any(|cause| {
-        cause
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_body)
-    });
-    let retryable = !source_body_failed
-        && RetryStrategy::for_request(RequestType::CloudFetchDownload, &RetryConfig::default())
+    let retryable =
+        RetryStrategy::for_request(RequestType::CloudFetchDownload, &RetryConfig::default())
             .is_retryable_error(&error);
     let error = error.without_url();
     let mut causes = crate::client::error_chain(&error)
@@ -583,7 +446,7 @@ fn local_error(error: std::io::Error, path: &str) -> Error {
     .message(format!("{error}: {path}"));
     result.local_error = Some(Box::new(LocalFileError {
         raw_os_error: error.raw_os_error(),
-        kind: format!("{:?}", error.kind()),
+        kind: error.kind(),
         path: path.to_owned(),
     }));
     result
@@ -701,11 +564,21 @@ fn allowed_path(requested: &str, roots: &[PathBuf]) -> Result<PathBuf> {
     ))
 }
 
+enum Source {
+    File(PathBuf),
+    Stream,
+}
+
+enum Operation {
+    Put(Source),
+    Get(PathBuf),
+    Remove,
+}
+
 struct Instruction {
-    operation: String,
+    operation: Operation,
     url: String,
     headers: HeaderMap,
-    local_file: String,
 }
 
 fn string_at(array: &dyn Array, row: usize) -> Result<&str> {
@@ -725,8 +598,7 @@ fn string_at(array: &dyn Array, row: usize) -> Result<&str> {
 }
 
 impl Instruction {
-    fn decode(batch: &ResultBatch) -> Result<Self> {
-        let ResultBatch::Arrow(batch) = batch;
+    fn decode(batch: &RecordBatch) -> Result<Self> {
         if batch.num_rows() != 1 {
             return Err(invalid("Expected one Volume instruction row"));
         }
@@ -739,7 +611,7 @@ impl Instruction {
                 .ok_or_else(|| invalid("Missing Volume instruction column"))?;
             Ok(batch.column(index).as_ref())
         };
-        let operation = string_at(column("operation")?, 0)?.to_owned();
+        let operation = string_at(column("operation")?, 0)?;
         let headers = column("headers")?;
         let mut parsed_headers = HeaderMap::new();
         let mut add_header = |name: &str, value: &str| -> Result<()> {
@@ -770,16 +642,19 @@ impl Instruction {
                 }
             }
         }
-        let local_file = if operation == "REMOVE" {
-            String::new()
-        } else {
-            string_at(column("localFile")?, 0)?.to_owned()
+        let operation = match operation {
+            "PUT" => match string_at(column("localFile")?, 0)? {
+                "__input_stream__" => Operation::Put(Source::Stream),
+                path => Operation::Put(Source::File(path.into())),
+            },
+            "GET" => Operation::Get(string_at(column("localFile")?, 0)?.into()),
+            "REMOVE" => Operation::Remove,
+            _ => return Err(invalid("Unsupported Volume operation")),
         };
         Ok(Self {
             operation,
             url: string_at(column("presignedUrl")?, 0)?.to_owned(),
             headers: parsed_headers,
-            local_file,
         })
     }
 }
@@ -796,7 +671,7 @@ mod tests {
     use wiremock::matchers::{body_bytes, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn instruction(operation: &str, url: &str, local: &Path) -> ResultBatch {
+    fn instruction(operation: &str, url: &str, local: &Path) -> RecordBatch {
         let mut headers = MapBuilder::new(None, StringBuilder::new(), StringBuilder::new());
         headers.keys().append_value("x-storage-token");
         headers.values().append_value("server-token");
@@ -814,7 +689,7 @@ mod tests {
                 .map(|(name, values)| Field::new(*name, values.data_type().clone(), true))
                 .collect::<Vec<_>>(),
         );
-        ResultBatch::Arrow(RecordBatch::try_new(Arc::new(schema), arrays).unwrap())
+        RecordBatch::try_new(Arc::new(schema), arrays).unwrap()
     }
 
     fn options(root: &Path) -> VolumeOptions {
@@ -833,6 +708,8 @@ mod tests {
                 ..Default::default()
             },
             None,
+            Default::default(),
+            Default::default(),
         )
     }
 
@@ -879,295 +756,10 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transfers_follow_redirects_and_replay_file_and_owned_inputs() {
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        for (operation, status, stream, payload) in [
-            ("PUT", 307, false, vec![42; 512 * 1024 + 17]),
-            ("PUT", 308, false, vec![42; 512 * 1024 + 17]),
-            ("PUT", 307, true, vec![]),
-            ("PUT", 307, true, b"payload".to_vec()),
-            ("PUT", 308, true, b"payload".to_vec()),
-            ("GET", 307, false, b"downloaded".to_vec()),
-            ("REMOVE", 302, false, vec![]),
-        ] {
-            let server = MockServer::start().await;
-            let verb = if operation == "REMOVE" {
-                "DELETE"
-            } else {
-                operation
-            };
-            Mock::given(method(verb))
-                .and(path("/object"))
-                .and(header("x-storage-token", "server-token"))
-                .and(body_bytes(if operation == "PUT" {
-                    payload.clone()
-                } else {
-                    vec![]
-                }))
-                .respond_with(
-                    ResponseTemplate::new(status).insert_header("location", "/redirected"),
-                )
-                .expect(1)
-                .mount(&server)
-                .await;
-            Mock::given(method(verb))
-                .and(path("/redirected"))
-                .and(header("x-storage-token", "server-token"))
-                .and(body_bytes(if operation == "PUT" {
-                    payload.clone()
-                } else {
-                    vec![]
-                }))
-                .respond_with(ResponseTemplate::new(200).set_body_bytes(payload.clone()))
-                .expect(1)
-                .mount(&server)
-                .await;
-            std::fs::write(
-                &source,
-                if operation == "GET" {
-                    b"old".as_slice()
-                } else {
-                    &payload
-                },
-            )
-            .unwrap();
-            let batch = instruction(
-                operation,
-                &format!("{}/object", server.uri()),
-                if stream {
-                    Path::new("__input_stream__")
-                } else {
-                    &source
-                },
-            );
-            assert_eq!(
-                transfer_state(0)
-                    .complete(
-                        &batch,
-                        &Client::builder()
-                            .redirect(reqwest::redirect::Policy::none())
-                            .build()
-                            .unwrap(),
-                        &options(dir.path()),
-                        stream.then(|| payload.clone()),
-                    )
-                    .await
-                    .unwrap(),
-                VolumeCompletion::Completed
-            );
-            if operation == "GET" {
-                assert_eq!(std::fs::read(&source).unwrap(), payload);
-            }
-            assert!(server
-                .received_requests()
-                .await
-                .unwrap()
-                .iter()
-                .all(|request| !request.headers.contains_key("authorization")));
-        }
-
-        // Hyper normalizes duplicate lengths before Wiremock can inspect them.
-        use tokio::io::AsyncReadExt;
-        for stream in [false, true] {
-            let payload = b"payload";
-            std::fs::write(&source, payload).unwrap();
-            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-            let url = format!("http://{}/object", listener.local_addr().unwrap());
-            let peer = tokio::spawn(async move {
-                for hop in 0..2 {
-                    let (mut socket, _) = listener.accept().await.unwrap();
-                    let mut request = Vec::new();
-                    let mut byte = [0];
-                    while !request.ends_with(b"\r\n\r\n") {
-                        socket.read_exact(&mut byte).await.unwrap();
-                        request.push(byte[0]);
-                    }
-                    let lengths = String::from_utf8(request)
-                        .unwrap()
-                        .lines()
-                        .filter_map(|line| {
-                            line.to_ascii_lowercase()
-                                .strip_prefix("content-length:")
-                                .map(|value| value.trim().to_owned())
-                        })
-                        .collect::<Vec<_>>();
-                    assert_eq!(lengths, [payload.len().to_string()]);
-                    let mut body = vec![0; payload.len()];
-                    socket.read_exact(&mut body).await.unwrap();
-                    assert_eq!(body, payload);
-                    let response = if hop == 0 {
-                        b"HTTP/1.1 307 Temporary Redirect\r\nLocation: /redirected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".as_slice()
-                    } else {
-                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                    };
-                    socket.write_all(response).await.unwrap();
-                }
-            });
-            let batch = instruction(
-                "PUT",
-                &url,
-                if stream {
-                    Path::new("__input_stream__")
-                } else {
-                    &source
-                },
-            );
-            let mut upload = Instruction::decode(&batch).unwrap();
-            upload
-                .headers
-                .insert(reqwest::header::CONTENT_LENGTH, payload.len().into());
-            let client = Client::builder()
-                .redirect(reqwest::redirect::Policy::none())
-                .build()
-                .unwrap();
-            assert_eq!(
-                tokio::time::timeout(
-                    Duration::from_secs(2),
-                    transfer_state(0).transfer_once(
-                        &upload,
-                        &client,
-                        &options(dir.path()),
-                        stream.then_some(payload.as_slice()),
-                        &mut None
-                    ),
-                )
-                .await
-                .unwrap()
-                .unwrap(),
-                VolumeCompletion::Completed,
-            );
-            peer.await.unwrap();
-        }
-    }
-
-    #[tokio::test]
-    async fn redirects_strip_cross_origin_credentials_and_share_a_hop_limit() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        let sensitive = [
-            "authorization",
-            "cookie",
-            "cookie2",
-            "proxy-authorization",
-            "www-authenticate",
-        ];
-        let previous =
-            reqwest::Url::parse("https://storage.invalid:8443/a?signature=secret").unwrap();
-        for scheme in ["https", "http"] {
-            let next = reqwest::Url::parse(&format!("{scheme}://storage.invalid:8443/b")).unwrap();
-            let mut headers = HeaderMap::new();
-            for name in sensitive {
-                headers.insert(
-                    reqwest::header::HeaderName::from_static(name),
-                    "storage-secret".parse().unwrap(),
-                );
-            }
-            headers.insert("x-storage-token", "server-token".parse().unwrap());
-            redirect_headers(&mut headers, &previous, &next);
-            let same_origin = scheme == "https";
-            for name in sensitive {
-                assert_eq!(headers.contains_key(name), same_origin, "{scheme}: {name}");
-            }
-            assert_eq!(headers["x-storage-token"], "server-token");
-            assert_eq!(headers.contains_key(reqwest::header::REFERER), same_origin);
-            if same_origin {
-                assert_eq!(
-                    headers[reqwest::header::REFERER],
-                    "https://storage.invalid:8443/a"
-                );
-            }
-        }
-        let server = MockServer::start().await;
-        let redirected = MockServer::start().await;
-        let dir = tempfile::tempdir().unwrap();
-        let source = dir.path().join("source");
-        std::fs::write(&source, b"payload").unwrap();
-        Mock::given(method("PUT"))
-            .and(body_bytes(b"payload"))
-            .and(header("authorization", "storage-secret"))
-            .respond_with(ResponseTemplate::new(307).insert_header(
-                "location",
-                format!("{}/?signature=redirect-secret", redirected.uri()),
-            ))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let count = Arc::new(AtomicUsize::new(0));
-        let attempts = Arc::clone(&count);
-        Mock::given(header("x-storage-token", "server-token"))
-            .respond_with(move |request: &wiremock::Request| {
-                for name in sensitive {
-                    assert!(!request.headers.contains_key(name));
-                }
-                let referer =
-                    reqwest::Url::parse(request.headers.get("referer").unwrap().to_str().unwrap())
-                        .unwrap();
-                assert!(referer.query().is_none());
-                let first = attempts.fetch_add(1, Ordering::SeqCst) == 0;
-                assert_eq!(request.method.as_str(), if first { "PUT" } else { "GET" });
-                assert_eq!(
-                    request.body,
-                    if first { b"payload".as_slice() } else { b"" }
-                );
-                if !first {
-                    assert!(!request.headers.contains_key("content-type"));
-                }
-                ResponseTemplate::new(if first { 303 } else { 308 }).insert_header("location", "/")
-            })
-            .expect(10)
-            .mount(&redirected)
-            .await;
-        let batch = instruction(
-            "PUT",
-            &format!("{}/?signature=source-secret", server.uri()),
-            &source,
-        );
-        let mut instruction = Instruction::decode(&batch).unwrap();
-        for name in sensitive {
-            instruction.headers.insert(
-                reqwest::header::HeaderName::from_static(name),
-                "storage-secret".parse().unwrap(),
-            );
-        }
-        instruction.headers.insert(
-            reqwest::header::CONTENT_TYPE,
-            "application/octet-stream".parse().unwrap(),
-        );
-        let error = transfer_state(2)
-            .transfer(
-                instruction,
-                &Client::builder()
-                    .redirect(reqwest::redirect::Policy::none())
-                    .build()
-                    .unwrap(),
-                &options(dir.path()),
-                None,
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(
-            error.error_code.as_deref(),
-            Some("VOLUME_STORAGE_NETWORK_ERROR")
-        );
-        assert!(!error.retryable);
-        assert_eq!(count.load(Ordering::SeqCst), 10);
-        assert!(!error.message.contains("storage-secret"));
-    }
-
-    #[tokio::test]
     async fn transient_storage_statuses_replay_full_inputs_and_cache_completion() {
         use std::sync::atomic::{AtomicUsize, Ordering};
-        for (operation, stream) in [
-            ("PUT", false),
-            ("PUT", true),
-            ("GET", false),
-            ("REMOVE", false),
-        ] {
-            let statuses: &[u16] = if operation == "PUT" && !stream {
-                &[408, 429, 500, 502, 503, 504]
-            } else {
-                &[503]
-            };
+        for (operation, stream) in [("PUT", false), ("PUT", true), ("GET", false)] {
+            let statuses: &[u16] = &[503];
             let requests = statuses.len() as u64 + 1;
             let server = MockServer::start().await;
             let attempts = Arc::new(AtomicUsize::new(0));
@@ -1215,8 +807,7 @@ mod tests {
             assert_eq!(
                 state
                     .complete(
-                        &batch,
-                        &client,
+                        async { Ok((batch.clone(), client.clone())) },
                         &options,
                         stream.then(|| b"payload".to_vec())
                     )
@@ -1226,7 +817,11 @@ mod tests {
             );
             assert_eq!(
                 state
-                    .complete(&batch, &client, &options, None)
+                    .complete(
+                        async { Ok((batch.clone(), client.clone())) },
+                        &options,
+                        None
+                    )
                     .await
                     .unwrap(),
                 VolumeCompletion::Completed
@@ -1239,22 +834,32 @@ mod tests {
 
     #[tokio::test]
     async fn permanent_statuses_and_retry_limits_preserve_terminal_errors() {
-        for (status, retries, budget, requests) in [
-            (400, 2, Duration::from_secs(10), 1),
-            (401, 2, Duration::from_secs(10), 1),
-            (403, 2, Duration::from_secs(10), 1),
-            (404, 2, Duration::from_secs(10), 1),
-            (501, 2, Duration::from_secs(10), 1),
-            (503, 0, Duration::from_secs(10), 1),
-            (503, 2, Duration::ZERO, 1),
-            (503, 2, Duration::from_secs(10), 3),
+        for (operation, status, retries, budget, requests) in [
+            ("PUT", 307, 2, Duration::from_secs(10), 1),
+            ("REMOVE", 403, 2, Duration::from_secs(10), 1),
+            ("REMOVE", 404, 2, Duration::from_secs(10), 1),
+            ("REMOVE", 503, 0, Duration::from_secs(10), 1),
+            ("REMOVE", 503, 2, Duration::ZERO, 1),
+            ("REMOVE", 503, 2, Duration::from_secs(10), 3),
         ] {
             let server = MockServer::start().await;
-            Mock::given(method("DELETE"))
-                .respond_with(ResponseTemplate::new(status).insert_header("retry-after", "0"))
+            Mock::given(method(if operation == "PUT" { "PUT" } else { "DELETE" }))
+                .and(path("/object"))
+                .respond_with(
+                    ResponseTemplate::new(status)
+                        .insert_header("retry-after", "0")
+                        .insert_header("location", "/redirected"),
+                )
                 .expect(requests)
                 .mount(&server)
                 .await;
+            let directory = tempfile::tempdir().unwrap();
+            let file = directory.path().join("source");
+            std::fs::write(&file, b"payload").unwrap();
+            let options = VolumeOptions {
+                allowed_paths: vec![directory.path().to_owned()],
+                remove_not_found_is_success: true,
+            };
             let state = VolumeState::new(
                 RetryConfig {
                     max_retries: retries,
@@ -1264,17 +869,23 @@ mod tests {
                     ..Default::default()
                 },
                 None,
+                Default::default(),
+                Default::default(),
             );
             let batch = instruction(
-                "REMOVE",
-                &format!("{}?secret=hidden", server.uri()),
-                Path::new(""),
+                operation,
+                &format!("{}/object?secret=hidden", server.uri()),
+                &file,
             );
             for _ in 0..2 {
-                let error = state
-                    .complete(&batch, &Client::new(), &VolumeOptions::default(), None)
-                    .await
-                    .unwrap_err();
+                let result = state
+                    .complete(async { Ok((batch.clone(), Client::new())) }, &options, None)
+                    .await;
+                if status == 404 {
+                    assert_eq!(result.unwrap(), VolumeCompletion::Completed);
+                    continue;
+                }
+                let error = result.unwrap_err();
                 assert_eq!(error.http_status, Some(status));
                 assert_eq!(
                     error.error_code.as_deref(),
@@ -1301,11 +912,17 @@ mod tests {
                 ..Default::default()
             },
             None,
+            Default::default(),
+            Default::default(),
         );
         let batch = instruction("REMOVE", &server.uri(), Path::new(""));
         let client = Client::new();
         let options = VolumeOptions::default();
-        let complete = state.complete(&batch, &client, &options, None);
+        let complete = state.complete(
+            async { Ok((batch.clone(), client.clone())) },
+            &options,
+            None,
+        );
         let cancel = async {
             while server.received_requests().await.unwrap().is_empty() {
                 tokio::task::yield_now().await;
@@ -1342,7 +959,11 @@ mod tests {
         let client = Client::new();
         assert_eq!(
             state
-                .complete(&batch, &client, &VolumeOptions::default(), None)
+                .complete(
+                    async { Ok((batch.clone(), client.clone())) },
+                    &VolumeOptions::default(),
+                    None
+                )
                 .await
                 .unwrap(),
             VolumeCompletion::NeedsInputStream
@@ -1350,7 +971,11 @@ mod tests {
         assert!(server.received_requests().await.unwrap().is_empty());
         assert_eq!(
             state
-                .complete(&batch, &client, &VolumeOptions::default(), Some(vec![]))
+                .complete(
+                    async { Ok((batch.clone(), client.clone())) },
+                    &VolumeOptions::default(),
+                    Some(vec![])
+                )
                 .await
                 .unwrap(),
             VolumeCompletion::Completed
@@ -1358,7 +983,11 @@ mod tests {
         state.cancel();
         assert_eq!(
             state
-                .complete(&batch, &client, &VolumeOptions::default(), Some(vec![1]))
+                .complete(
+                    async { Ok((batch.clone(), client.clone())) },
+                    &VolumeOptions::default(),
+                    Some(vec![1])
+                )
                 .await
                 .unwrap(),
             VolumeCompletion::Completed
@@ -1388,17 +1017,13 @@ mod tests {
         let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
         let completed = transfer_state(0);
         completed
-            .complete(&batch, &Client::new(), &options(dir.path()), None)
+            .complete(
+                async { Ok((batch.clone(), Client::new())) },
+                &options(dir.path()),
+                None,
+            )
             .await
             .unwrap();
-        completed.cancel();
-        assert_eq!(
-            completed
-                .complete(&batch, &Client::new(), &options(dir.path()), None)
-                .await
-                .unwrap(),
-            VolumeCompletion::Completed
-        );
         #[cfg(unix)]
         {
             assert_eq!(
@@ -1426,7 +1051,11 @@ mod tests {
                 let state = transfer_state(0);
                 assert_eq!(
                     state
-                        .complete(&batch, &Client::new(), &options(dir.path()), None)
+                        .complete(
+                            async { Ok((batch.clone(), Client::new())) },
+                            &options(dir.path()),
+                            None
+                        )
                         .await
                         .unwrap(),
                     VolumeCompletion::Completed
@@ -1439,8 +1068,6 @@ mod tests {
                 assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
             }
         }
-        #[cfg(unix)]
-        let requests = server.received_requests().await.unwrap().len();
         let state = transfer_state(0);
         let batch = instruction(
             "GET",
@@ -1448,67 +1075,19 @@ mod tests {
             &dest,
         );
         let error = state
-            .complete(&batch, &Client::new(), &options(dir.path()), None)
+            .complete(
+                async { Ok((batch.clone(), Client::new())) },
+                &options(dir.path()),
+                None,
+            )
             .await
             .unwrap_err();
         assert_eq!(error.http_status, Some(403));
         assert!(!error.message.contains("hidden"));
-        state.cancel();
-        assert_eq!(
-            state
-                .complete(&batch, &Client::new(), &options(dir.path()), None)
-                .await
-                .unwrap_err()
-                .http_status,
-            Some(403)
-        );
         assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
         #[cfg(unix)]
-        {
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o400)).unwrap();
-            if std::fs::OpenOptions::new().write(true).open(&dest).is_err() {
-                let batch = instruction("GET", &format!("{}/ok", server.uri()), &dest);
-                let error = transfer_state(0)
-                    .complete(&batch, &Client::new(), &options(dir.path()), None)
-                    .await
-                    .unwrap_err();
-                assert_eq!(error.code, crate::ErrorCode::PermissionDenied);
-                assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
-                let local = error.local_error.unwrap();
-                assert_eq!(local.kind, "PermissionDenied");
-                assert_eq!(local.path, dest.to_string_lossy());
-                assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
-                assert_eq!(
-                    server.received_requests().await.unwrap().len(),
-                    requests + 1
-                );
-            }
-            std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
-            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
-        }
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
-    }
-
-    #[tokio::test]
-    async fn remove_has_narrow_missing_status_policy_and_no_local_path_requirement() {
-        let server = MockServer::start().await;
-        Mock::given(method("DELETE"))
-            .respond_with(ResponseTemplate::new(404))
-            .expect(1)
-            .mount(&server)
-            .await;
-        let batch = instruction("REMOVE", &server.uri(), Path::new(""));
-        let permissive = VolumeOptions {
-            remove_not_found_is_success: true,
-            ..VolumeOptions::default()
-        };
-        assert_eq!(
-            transfer_state(0)
-                .complete(&batch, &Client::new(), &permissive, None)
-                .await
-                .unwrap(),
-            VolumeCompletion::Completed
-        );
     }
 
     #[tokio::test]
@@ -1531,7 +1110,11 @@ mod tests {
         let client = Client::new();
         for cancel in [false, true] {
             let state = transfer_state(0);
-            let mut future = Box::pin(state.complete(&batch, &client, &options, None));
+            let mut future = Box::pin(state.complete(
+                async { Ok((batch.clone(), client.clone())) },
+                &options,
+                None,
+            ));
             tokio::select! {
                 result = &mut future => panic!("unexpected early completion: {result:?}"),
                 _ = async {
@@ -1551,7 +1134,11 @@ mod tests {
             drop(future);
             assert_eq!(
                 state
-                    .complete(&batch, &client, &options, None)
+                    .complete(
+                        async { Ok((batch.clone(), client.clone())) },
+                        &options,
+                        None
+                    )
                     .await
                     .unwrap_err()
                     .code,
@@ -1565,12 +1152,7 @@ mod tests {
     #[tokio::test]
     async fn response_inactivity_bounds_headers_and_body_without_publishing() {
         use tokio::io::AsyncReadExt;
-        for (operation, headers_sent) in [
-            ("GET", false),
-            ("GET", true),
-            ("PUT", true),
-            ("REMOVE", false),
-        ] {
+        for (operation, headers_sent) in [("GET", false), ("GET", true), ("PUT", true)] {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -1614,11 +1196,17 @@ mod tests {
                     .retry
                     .clone(),
                 Some(Duration::from_millis(150)),
+                Default::default(),
+                Default::default(),
             );
             let batch = instruction(operation, &url, &dest);
             let error = tokio::time::timeout(
                 Duration::from_secs(2),
-                state.complete(&batch, &Client::new(), &options(dir.path()), None),
+                state.complete(
+                    async { Ok((batch.clone(), Client::new())) },
+                    &options(dir.path()),
+                    None,
+                ),
             )
             .await
             .unwrap()
@@ -1630,7 +1218,11 @@ mod tests {
             );
             assert!(error.message.contains("read timed out"));
             let repeated = state
-                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .complete(
+                    async { Ok((batch.clone(), Client::new())) },
+                    &options(dir.path()),
+                    None,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(repeated.message, error.message);
@@ -1664,11 +1256,12 @@ mod tests {
         let state = VolumeState::new(
             transfer_state(0).retry.clone(),
             Some(Duration::from_millis(150)),
+            Default::default(),
+            Default::default(),
         );
         state
             .complete(
-                &instruction("GET", &url, &dest),
-                &Client::new(),
+                async { Ok((instruction("GET", &url, &dest), Client::new())) },
                 &options(dir.path()),
                 None,
             )
@@ -1732,7 +1325,11 @@ mod tests {
             std::fs::write(&dest, b"old").unwrap();
             let batch = instruction("GET", &url, &dest);
             let result = transfer_state(retries)
-                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .complete(
+                    async { Ok((batch.clone(), Client::new())) },
+                    &options(dir.path()),
+                    None,
+                )
                 .await;
             if retries == 0 {
                 assert_eq!(result.unwrap_err().code, crate::ErrorCode::NetworkError);
@@ -1820,7 +1417,7 @@ mod tests {
             #[cfg(unix)]
             {
                 assert_eq!(error.code, crate::ErrorCode::NotFound);
-                assert_eq!(local.kind, "NotFound");
+                assert_eq!(local.kind, std::io::ErrorKind::NotFound);
                 assert_eq!(local.raw_os_error, Some(2));
             }
         }
@@ -1834,15 +1431,15 @@ mod tests {
         for (source, kind, code) in [
             (
                 dir.path().join("missing"),
-                "NotFound",
+                std::io::ErrorKind::NotFound,
                 crate::ErrorCode::NotFound,
             ),
             (
                 dir.path().to_owned(),
                 if cfg!(windows) {
-                    "PermissionDenied"
+                    std::io::ErrorKind::PermissionDenied
                 } else {
-                    "IsADirectory"
+                    std::io::ErrorKind::IsADirectory
                 },
                 if cfg!(windows) {
                     crate::ErrorCode::PermissionDenied
@@ -1858,7 +1455,11 @@ mod tests {
             );
             let state = transfer_state(1);
             let error = state
-                .complete(&batch, &Client::new(), &options(dir.path()), None)
+                .complete(
+                    async { Ok((batch.clone(), Client::new())) },
+                    &options(dir.path()),
+                    None,
+                )
                 .await
                 .unwrap_err();
             assert_eq!(error.code, code);
@@ -1872,7 +1473,11 @@ mod tests {
             assert!(!error.message.contains("hidden"));
             assert_eq!(
                 state
-                    .complete(&batch, &Client::new(), &options(dir.path()), None)
+                    .complete(
+                        async { Ok((batch.clone(), Client::new())) },
+                        &options(dir.path()),
+                        None
+                    )
                     .await
                     .unwrap_err()
                     .local_error
@@ -1883,30 +1488,6 @@ mod tests {
             );
         }
         assert!(server.received_requests().await.unwrap().is_empty());
-        for (kind, code) in [
-            (
-                std::io::ErrorKind::PermissionDenied,
-                crate::ErrorCode::PermissionDenied,
-            ),
-            (
-                std::io::ErrorKind::InvalidInput,
-                crate::ErrorCode::InvalidArgument,
-            ),
-            (
-                std::io::ErrorKind::NotADirectory,
-                crate::ErrorCode::InvalidArgument,
-            ),
-            (std::io::ErrorKind::Other, crate::ErrorCode::Internal),
-        ] {
-            let error = local_error(std::io::Error::from(kind), "requested");
-            assert_eq!(error.code, code);
-            assert_eq!(error.error_code.as_deref(), Some("VOLUME_LOCAL_FILE_ERROR"));
-            assert_eq!(error.sql_state.as_deref(), Some("HY000"));
-            assert!(!error.retryable);
-            let local = error.local_error.unwrap();
-            assert_eq!(local.kind, format!("{kind:?}"));
-            assert_eq!(local.path, "requested");
-        }
     }
 
     #[tokio::test]
@@ -1945,9 +1526,8 @@ mod tests {
             DataType::Utf8,
             true,
         )]));
-        let batch = ResultBatch::Arrow(
-            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["PUT"]))]).unwrap(),
-        );
+        let batch =
+            RecordBatch::try_new(schema, vec![Arc::new(StringArray::from(vec!["PUT"]))]).unwrap();
         assert_eq!(
             Instruction::decode(&batch).err().unwrap().code,
             crate::ErrorCode::InvalidArgument

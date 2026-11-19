@@ -64,7 +64,7 @@ pub(crate) fn map_kernel_error(source: kernel::Error) -> Error {
         let details = mapped.details.get_or_insert_default();
         details.push((
             "databricks.local_error_kind".into(),
-            local.kind.into_bytes(),
+            format!("{:?}", local.kind).into_bytes(),
         ));
         details.push(("databricks.local_path".into(), local.path.into_bytes()));
         if let Some(errno) = local.raw_os_error {

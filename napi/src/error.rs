@@ -147,7 +147,10 @@ pub(crate) fn napi_err_from_kernel(e: KernelError) -> NapiError {
         if let Some(errno) = local.raw_os_error {
             obj.insert("localOsError".to_owned(), Value::from(errno));
         }
-        obj.insert("localErrorKind".to_owned(), Value::from(local.kind));
+        obj.insert(
+            "localErrorKind".to_owned(),
+            Value::from(format!("{:?}", local.kind)),
+        );
         obj.insert("localPath".to_owned(), Value::from(local.path));
     }
     // Thrift-parity extended status fields: surfaced on the napi
@@ -208,7 +211,7 @@ mod tests {
         let mut error = KernelError::not_found().message("missing local file");
         error.local_error = Some(Box::new(databricks_sql_kernel::LocalFileError {
             raw_os_error: Some(2),
-            kind: "NotFound".into(),
+            kind: std::io::ErrorKind::NotFound,
             path: "local-file".into(),
         }));
         let encoded = napi_err_from_kernel(error);

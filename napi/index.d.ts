@@ -879,7 +879,7 @@ export declare class AsyncStatement {
 export declare class AsyncResultHandle {
   get isVolumeOperation(): boolean
   /** Completes marked file transfers and retains the instruction rows. */
-  completeVolumeOperation(allowedPaths: Array<string>, removeNotFoundIsSuccess?: boolean | undefined | null): Promise<string>
+  completeVolumeOperation(allowedPaths: Array<string>, removeNotFoundIsSuccess?: boolean | undefined | null): Promise<VolumeCompletion>
   /**
    * Server-issued statement id. Cached at construction; readable
    * for log correlation. Matches the parent `AsyncStatement`'s
@@ -1176,7 +1176,7 @@ export declare class Connection {
 export declare class Statement {
   get isVolumeOperation(): boolean
   /** Completes marked file transfers and retains the instruction rows. */
-  completeVolumeOperation(allowedPaths: Array<string>, removeNotFoundIsSuccess?: boolean | undefined | null): Promise<string>
+  completeVolumeOperation(allowedPaths: Array<string>, removeNotFoundIsSuccess?: boolean | undefined | null): Promise<VolumeCompletion>
   /**
    * Server-issued statement id. Cached at construction; readable
    * even after `close()` so JS-side log lines can correlate against
@@ -1298,4 +1298,10 @@ export declare class Statement {
    * resource to release).
    */
   close(): Promise<void>
+}
+
+export const enum VolumeCompletion {
+  NotVolume = 'not_volume',
+  NeedsInputStream = 'needs_input_stream',
+  Completed = 'completed'
 }

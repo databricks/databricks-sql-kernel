@@ -56,7 +56,6 @@ pub struct KernelError {
 #[derive(Default)]
 struct LastError {
     local_os_error: i32,
-    local_kind: Option<CString>,
     local_path: Option<CString>,
     code: Option<crate::kernel_error::ErrorCode>,
     message: Option<CString>,
@@ -151,17 +150,6 @@ pub extern "C" fn kernel_get_last_error_code() -> *const c_char {
     })
 }
 
-/// Borrowed local error kind, or null. Valid until the next error-clearing call.
-#[no_mangle]
-pub extern "C" fn kernel_get_last_error_local_kind() -> *const c_char {
-    LAST_ERROR.with(|last| {
-        last.borrow()
-            .local_kind
-            .as_ref()
-            .map_or(std::ptr::null(), |s| s.as_ptr())
-    })
-}
-
 /// Borrowed requested local path, or null. Valid until the next error-clearing call.
 #[no_mangle]
 pub extern "C" fn kernel_get_last_error_local_path() -> *const c_char {
@@ -199,7 +187,6 @@ pub(crate) fn store_error(err: Error) {
                 .as_ref()
                 .and_then(|e| e.raw_os_error)
                 .unwrap_or(0),
-            local_kind: err.local_error.as_ref().map(|e| to_cstring_lossy(&e.kind)),
             local_path: err.local_error.as_ref().map(|e| to_cstring_lossy(&e.path)),
             code: Some(err.code),
             message: Some(to_cstring_lossy(&message)),
@@ -248,17 +235,11 @@ mod tests {
         let mut error = Error::not_found().message("missing local file");
         error.local_error = Some(Box::new(crate::kernel_error::LocalFileError {
             raw_os_error: Some(2),
-            kind: "NotFound".into(),
+            kind: std::io::ErrorKind::NotFound,
             path: "local-file".into(),
         }));
         store_error(error);
         assert_eq!(kernel_get_last_error_local_os_error(), 2);
-        assert_eq!(
-            unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_kind()) }
-                .to_str()
-                .unwrap(),
-            "NotFound"
-        );
         assert_eq!(
             unsafe { std::ffi::CStr::from_ptr(kernel_get_last_error_local_path()) }
                 .to_str()
@@ -268,7 +249,6 @@ mod tests {
         with_last_error(|error| assert!(error.is_some()));
         clear_error();
         assert_eq!(kernel_get_last_error_local_os_error(), 0);
-        assert!(kernel_get_last_error_local_kind().is_null());
         assert!(kernel_get_last_error_local_path().is_null());
     }
 

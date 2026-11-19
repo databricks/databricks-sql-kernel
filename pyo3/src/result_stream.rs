@@ -54,6 +54,24 @@ impl ResultStream {
     }
 }
 
+#[pyclass(eq, skip_from_py_object)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeCompletion {
+    NotVolume,
+    NeedsInputStream,
+    Completed,
+}
+
+impl From<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
+    fn from(value: databricks_sql_kernel::VolumeCompletion) -> Self {
+        match value {
+            databricks_sql_kernel::VolumeCompletion::NotVolume => Self::NotVolume,
+            databricks_sql_kernel::VolumeCompletion::NeedsInputStream => Self::NeedsInputStream,
+            databricks_sql_kernel::VolumeCompletion::Completed => Self::Completed,
+        }
+    }
+}
+
 #[pymethods]
 impl ResultStream {
     #[getter]
@@ -69,7 +87,7 @@ impl ResultStream {
         allowed_paths: Vec<String>,
         remove_not_found_is_success: bool,
         input_bytes: Option<Vec<u8>>,
-    ) -> PyResult<&'static str> {
+    ) -> PyResult<crate::result_stream::VolumeCompletion> {
         let inner = alive_mut!(self, "ResultStream");
         let runtime = inner.runtime.clone();
         let options = databricks_sql_kernel::VolumeOptions {
@@ -82,7 +100,7 @@ impl ResultStream {
             &runtime,
             stream.complete_volume_operation(&options, input_bytes)
         )?;
-        Ok(outcome.as_str())
+        Ok(outcome.into())
     }
 
     /// Result schema as a `pyarrow.Schema`. Available even after `close()`.

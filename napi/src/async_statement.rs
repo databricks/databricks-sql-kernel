@@ -498,7 +498,7 @@ impl AsyncResultHandle {
         &self,
         allowed_paths: Vec<String>,
         remove_not_found_is_success: Option<bool>,
-    ) -> napi::Result<String> {
+    ) -> napi::Result<crate::result::VolumeCompletion> {
         let options = VolumeOptions {
             allowed_paths: allowed_paths.into_iter().map(Into::into).collect(),
             remove_not_found_is_success: remove_not_found_is_success.unwrap_or(false),
@@ -511,7 +511,7 @@ impl AsyncResultHandle {
                 .ok_or_else(|| closed_err("AsyncResultHandle"))?
                 .complete_volume_operation(&options, None)
                 .await
-                .map(|status| status.as_str().to_owned())
+                .map(crate::result::VolumeCompletion::from)
                 .map_err(napi_err_from_kernel)
         })
         .await

@@ -94,6 +94,24 @@ pub(crate) fn encode_ipc_stream(
     Ok(buf)
 }
 
+#[napi(string_enum = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VolumeCompletion {
+    NotVolume,
+    NeedsInputStream,
+    Completed,
+}
+
+impl From<databricks_sql_kernel::VolumeCompletion> for VolumeCompletion {
+    fn from(value: databricks_sql_kernel::VolumeCompletion) -> Self {
+        match value {
+            databricks_sql_kernel::VolumeCompletion::NotVolume => Self::NotVolume,
+            databricks_sql_kernel::VolumeCompletion::NeedsInputStream => Self::NeedsInputStream,
+            databricks_sql_kernel::VolumeCompletion::Completed => Self::Completed,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
