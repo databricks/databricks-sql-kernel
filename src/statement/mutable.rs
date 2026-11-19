@@ -646,13 +646,23 @@ impl Statement {
                     self.last_closed = Some(Arc::clone(&closed));
                     let mut result_stream = ResultStream::from_reader(result.reader).await?;
                     result_stream.attach_telemetry(telemetry_for_body.clone());
+                    let mut status = result.status;
+                    if status.num_modified_rows.is_none() {
+                        // Optional count reads must not turn a successful write into an execute error.
+                        if let Ok(count) =
+                            crate::statement::dml_count::read_dml_affected_rows(&mut result_stream)
+                                .await
+                        {
+                            status.num_modified_rows = count;
+                        }
+                    }
                     let executed = ExecutedStatement::new(
                         Arc::clone(&self.session),
                         result.statement_id,
                         valid,
                         result_stream,
                         closed,
-                        result.status,
+                        status,
                     );
                     Ok(DirectStatement::Completed(executed))
                 }

@@ -31,7 +31,7 @@ use arrow_ipc::writer::StreamWriter;
 use arrow_schema::{DataType, Field, Fields, Schema};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use databricks_sql_kernel::{
-    AuthConfig, ConnectionConfig, ErrorCode, ExecutedStatementHandle,
+    AuthConfig, ConnectionConfig, DirectStatement, ErrorCode, ExecutedStatementHandle,
     GeospatialResultRepresentation, HttpConfig, ResultBatch, ResultConfig, Session, TryNextBatch,
     TypedValue, MAX_CLIENT_QUERY_TIMEOUT,
 };
@@ -40,7 +40,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use wiremock::matchers::{method, path};
+use wiremock::matchers::{method, path, query_param};
 use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
 
 // ─── Helpers ────────────────────────────────────────────────────────
@@ -1617,19 +1617,36 @@ async fn execute_with_cloudfetch_enabled_sends_inline_or_external_links_disposit
 }
 
 #[tokio::test]
-async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
-    // Regression test for issue #196. With cloudfetch_enabled=false the
-    // ExecuteStatement disposition must be INLINE — this is how the kernel
-    // (like the JDBC / Thrift reference drivers) disables cloud-fetch on
-    // SEA, NOT via a `can_cloud_download` session conf (which SEA rejects
-    // at ExecuteStatement with CONFIG_NOT_AVAILABLE). The server then
-    // serves results inline and the statement succeeds.
+async fn execute_with_cloudfetch_disabled_supports_paged_arrow_results() {
     let server = MockServer::start().await;
     mount_create_session(&server).await;
     mount_delete_session(&server).await;
     mount_close_any_statement(&server).await;
     let batch = int64_batch("n", vec![7]);
-    mount_execute(&server, succeeded_inline_body("stmt-cf-off", &batch)).await;
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-cf-off", &batch)).unwrap();
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_chunk_count");
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_row_count");
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off/result/chunks/1"))
+        .and(query_param("row_offset", "1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "chunk_index": 1,
+            "row_offset": 1,
+            "row_count": 1,
+            "attachment": STANDARD.encode(arrow_ipc_bytes(&int64_batch("n", vec![8]))),
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
 
     let mut result = ResultConfig::default();
     result.cloudfetch_enabled = false;
@@ -1641,6 +1658,7 @@ async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
         .await
         .expect("execute must succeed inline with cloudfetch disabled");
     let batches = drain(exec.result_stream_mut()).await;
+    assert_eq!(batches.len(), 2);
     assert_eq!(
         batches[0]
             .column(0)
@@ -1648,9 +1666,163 @@ async fn execute_with_cloudfetch_disabled_sends_inline_disposition() {
             .value(0),
         7
     );
+    assert_eq!(
+        batches[1]
+            .column(0)
+            .as_primitive::<arrow_array::types::Int64Type>()
+            .value(0),
+        8
+    );
     exec.close().await.expect("close");
 
-    assert_eq!(recorded_execute_disposition(&server).await, "INLINE");
+    assert_eq!(
+        recorded_execute_disposition(&server).await,
+        "INLINE_OR_EXTERNAL_LINKS",
+    );
+}
+
+#[tokio::test]
+async fn execute_with_cloudfetch_disabled_rejects_external_links_without_downloading() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    Mock::given(method("DELETE"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{}"))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let batch = int64_batch("n", vec![7]);
+    let mut body: serde_json::Value =
+        serde_json::from_str(&succeeded_inline_body("stmt-cf-off", &batch)).unwrap();
+    body["result"] = json!({"external_links": [{
+        "external_link": format!("{}/storage/chunk.arrow", server.uri()),
+        "chunk_index": 0, "row_offset": 0, "row_count": 1,
+        "byte_count": 100, "expiration": "2099-01-01T00:00:00Z",
+    }]});
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path("/storage/chunk.arrow"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let error = match stmt.execute().await {
+        Ok(_) => panic!("external links must be rejected when CloudFetch is disabled"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert!(
+        error.to_string().contains("CloudFetch is disabled"),
+        "{error}"
+    );
+    stmt.close().await.expect("close statement");
+    session.close().await.expect("close session");
+    assert_eq!(
+        wait_for_close_delete(&server, "stmt-cf-off", 1, Duration::from_secs(2)).await,
+        1,
+    );
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_rejects_continuation_links_without_exposing_them() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let mut body: serde_json::Value = serde_json::from_str(&succeeded_inline_body(
+        "stmt-cf-off",
+        &int64_batch("n", vec![7]),
+    ))
+    .unwrap();
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_chunk_count");
+    body["manifest"]
+        .as_object_mut()
+        .unwrap()
+        .remove("total_row_count");
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    let storage_link = format!(
+        "{}/storage/chunk.arrow?signature=private-value",
+        server.uri()
+    );
+    Mock::given(method("GET"))
+        .and(path("/api/2.0/sql/statements/stmt-cf-off/result/chunks/1"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "external_links": [{
+                "external_link": storage_link,
+                "chunk_index": 1, "row_offset": 1, "row_count": 1,
+                "byte_count": 100, "expiration": "2099-01-01T00:00:00Z",
+            }],
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/storage/chunk.arrow"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("SELECT 7 AS n");
+    let mut exec = stmt.execute().await.expect("initial inline response");
+    let error = loop {
+        match exec.result_stream_mut().next_batch().await {
+            Ok(Some(_)) => continue,
+            Ok(None) => panic!("continuation links must be rejected"),
+            Err(error) => break error,
+        }
+    };
+    assert_eq!(error.code, ErrorCode::DataLoss);
+    assert!(error.to_string().contains("missing `attachment`"));
+    assert!(!error.to_string().contains("private-value"));
+    assert!(!error.to_string().contains(&storage_link));
+    exec.close().await.expect("close statement");
+    session.close().await.expect("close session");
+}
+
+#[tokio::test]
+async fn cloudfetch_disabled_preserves_unsupported_server_error() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+    mount_close_any_statement(&server).await;
+    let mut body: serde_json::Value = serde_json::from_str(&failed_body(
+        "stmt-unsupported-inline",
+        "[CONFIG_NOT_AVAILABLE] Configuration can_cloud_download is not available",
+        "42K0I",
+    ))
+    .unwrap();
+    body["status"]["error"]["error_code"] = json!("CONFIG_NOT_AVAILABLE");
+    mount_execute(&server, body.to_string()).await;
+
+    let mut result = ResultConfig::default();
+    result.cloudfetch_enabled = false;
+    let session = open_session_with_result(&server, result).await;
+    let mut statement = session.statement();
+    statement.spec().sql("SELECT 1");
+    let error = match statement.execute().await {
+        Ok(_) => panic!("unsupported inline delivery must fail"),
+        Err(error) => error,
+    };
+    assert_eq!(error.code, ErrorCode::SqlError);
+    assert_eq!(error.sql_state.as_deref(), Some("42K0I"));
+    assert!(error.message.contains("CONFIG_NOT_AVAILABLE"), "{error}");
+    assert!(error.message.contains("can_cloud_download"), "{error}");
+    statement.close().await.expect("close statement");
+    session.close().await.expect("close session");
 }
 
 #[tokio::test]
@@ -2214,6 +2386,84 @@ async fn polling_path_carries_terminal_status_not_initial() {
     );
     assert_eq!(exec.error_details_json(), Some(r#"{"errorClass":"NONE"}"#));
 
+    exec.close().await.expect("close");
+}
+
+#[tokio::test]
+async fn execute_direct_populates_count_without_consuming_result() {
+    for (count, server_count, state) in [
+        (2, None, "CLOSED"),
+        (0, None, "SUCCEEDED"),
+        (2, Some(11), "SUCCEEDED"),
+    ] {
+        let server = MockServer::start().await;
+        mount_create_session(&server).await;
+        mount_delete_session(&server).await;
+        mount_close_any_statement(&server).await;
+        let batch = int64_batch("num_affected_rows", vec![count]);
+        let mut body: serde_json::Value =
+            serde_json::from_str(&succeeded_inline_body("stmt-direct-count", &batch)).unwrap();
+        body["status"]["state"] = json!(state);
+        if let Some(value) = server_count {
+            body["status"]["num_modified_rows"] = json!(value);
+        }
+        mount_execute(&server, body.to_string()).await;
+
+        let session = open_session(&server).await;
+        let mut stmt = session.statement();
+        stmt.spec().sql("UPDATE t SET x = x + 1");
+        let DirectStatement::Completed(mut exec) = stmt.execute_direct().await.unwrap() else {
+            panic!("inline result must return a completed statement");
+        };
+        let expected = server_count.unwrap_or(count);
+        assert_eq!(exec.num_modified_rows(), Some(expected));
+        let batches = drain(exec.result_stream_mut()).await;
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches[0].columns(), batch.columns());
+        assert_eq!(exec.num_modified_rows(), Some(expected));
+        exec.close().await.expect("close");
+    }
+}
+
+#[tokio::test]
+async fn execute_direct_defers_dml_count_inference_error_to_fetch() {
+    let server = MockServer::start().await;
+    mount_create_session(&server).await;
+    mount_delete_session(&server).await;
+
+    let chunk_path = "/api/2.0/sql/statements/stmt-direct-count-error/result/chunks/1";
+    let batch = int64_batch("num_affected_rows", vec![1]);
+    let mut body: serde_json::Value =
+        serde_json::from_str(&closed_inline_body("stmt-direct-count-error", &batch)).unwrap();
+    let empty_chunk = arrow_schema_ipc_bytes(&batch.schema());
+    body["manifest"]["total_chunk_count"] = json!(2);
+    body["result"]["attachment"] = json!(STANDARD.encode(&empty_chunk));
+    body["result"]["byte_count"] = json!(empty_chunk.len());
+    body["result"]["row_count"] = json!(0);
+    body["result"]["next_chunk_index"] = json!(1);
+    mount_execute(&server, body.to_string()).await;
+    Mock::given(method("GET"))
+        .and(path(chunk_path))
+        .respond_with(ResponseTemplate::new(404))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let session = open_session(&server).await;
+    let mut stmt = session.statement();
+    stmt.spec().sql("UPDATE t SET value = 1");
+    let DirectStatement::Completed(mut exec) = stmt.execute_direct().await.expect("execute direct")
+    else {
+        panic!("terminal response must return a completed statement");
+    };
+
+    assert_eq!(exec.num_modified_rows(), None);
+    let error = exec
+        .result_stream_mut()
+        .next_batch()
+        .await
+        .expect_err("fetch must replay the inference error");
+    assert_eq!(error.code, ErrorCode::NotFound);
     exec.close().await.expect("close");
 }
 

@@ -36,6 +36,19 @@ pub mod retry;
 pub mod sea;
 pub(crate) mod transport;
 
+fn error_chain<'a>(
+    error: &'a (dyn std::error::Error + 'static),
+) -> impl Iterator<Item = &'a (dyn std::error::Error + 'static)> {
+    std::iter::successors(Some(error), |error| {
+        // io::Error::source() skips its inner error, which can be a rustls error.
+        error
+            .downcast_ref::<std::io::Error>()
+            .and_then(std::io::Error::get_ref)
+            .map(|inner| inner as &(dyn std::error::Error + 'static))
+            .or_else(|| error.source())
+    })
+}
+
 // Public surface — kept stable for advanced wrappers that tune HTTP.
 pub use http::{DatabricksHttpClient, HttpClientConfig, ProxyConfig};
 pub use retry::{

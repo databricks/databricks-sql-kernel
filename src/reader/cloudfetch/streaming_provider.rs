@@ -20,7 +20,7 @@
 //! - Memory management via chunk limits
 //! - Consumer API via RecordBatchReader trait
 
-use crate::kernel_error::{Error, Result};
+use crate::kernel_error::{Error, ErrorCode, Result};
 use crate::klog::{debug, error, info, warn};
 use crate::reader::cloudfetch::chunk_downloader::ChunkDownloader;
 use crate::reader::cloudfetch::link_fetcher::ChunkLinkFetcher;
@@ -445,7 +445,12 @@ impl StreamingCloudFetchProvider {
         // Fetch initial batch of links (should be instant if cached by link fetcher)
         debug!("Initializing provider: fetching initial links");
 
-        match self.link_fetcher.fetch_links(0, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return,
+            result = self.link_fetcher.fetch_links(0, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 // Store fetched links
                 for link in result.links {
@@ -514,6 +519,9 @@ impl StreamingCloudFetchProvider {
         if self.release_downloaded_chunk(chunk_index) {
             // Schedule more downloads
             self.schedule_downloads().await;
+            if self.cancel_token.is_cancelled() {
+                return Err(Error::invalid_state().message("Operation cancelled"));
+            }
 
             // Return first batch from buffer
             if let Some(batch) = self.take_buffered_batch() {
@@ -688,7 +696,12 @@ impl StreamingCloudFetchProvider {
     ///
     /// Returns whether the requested `start_index` is now available in the map.
     async fn fetch_and_store_links(&self, start_index: i64) -> bool {
-        match self.link_fetcher.fetch_links(start_index, 0).await {
+        let result = tokio::select! {
+            biased;
+            _ = self.cancel_token.cancelled() => return false,
+            result = self.link_fetcher.fetch_links(start_index, 0) => result,
+        };
+        match result {
             Ok(result) => {
                 for link in result.links {
                     let chunk_index = link.chunk_index;
@@ -820,6 +833,7 @@ impl StreamingCloudFetchProvider {
             // Increment counters
             let new_count = self.chunks_in_memory.fetch_add(1, Ordering::Release) + 1;
             self.next_download_index.fetch_add(1, Ordering::Release);
+            self.link_fetcher.note_scheduled(next_index);
 
             debug!(
                 "Scheduling download for chunk {}: chunks_in_memory={}/{}, consumer_at={}",
@@ -1114,6 +1128,10 @@ impl StreamingCloudFetchProvider {
                     return Ok(batches);
                 }
                 Err(e) => {
+                    // Refreshing a signed URL cannot repair certificate verification failures.
+                    if e.code == ErrorCode::NetworkError && !e.retryable {
+                        return Err(e);
+                    }
                     // Every completed download failure consumes the hard attempt
                     // budget, even when its link became stale while in flight.
                     attempts += 1;
@@ -1724,6 +1742,8 @@ mod tests {
     struct MockLinkFetcher {
         links_by_index: HashMap<i64, CloudFetchLink>,
         total_chunks: i64,
+        scheduled: Mutex<Vec<i64>>,
+        fetch_gate: Option<Arc<Notify>>,
     }
 
     impl MockLinkFetcher {
@@ -1736,17 +1756,26 @@ mod tests {
             Self {
                 links_by_index,
                 total_chunks,
+                scheduled: Mutex::new(Vec::new()),
+                fetch_gate: None,
             }
         }
     }
 
     #[async_trait::async_trait]
     impl ChunkLinkFetcher for MockLinkFetcher {
+        fn note_scheduled(&self, chunk_index: i64) {
+            self.scheduled.lock().unwrap().push(chunk_index);
+        }
+
         async fn fetch_links(
             &self,
             start_chunk_index: i64,
             _start_row_offset: i64,
         ) -> Result<ChunkLinkFetchResult> {
+            if let Some(gate) = &self.fetch_gate {
+                gate.notified().await;
+            }
             if start_chunk_index >= self.total_chunks {
                 return Ok(ChunkLinkFetchResult::end_of_stream());
             }
@@ -1814,6 +1843,132 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn cancellation_interrupts_link_fetch_during_refill_and_initialization() {
+        for initial in [false, true] {
+            let mut fetcher = MockLinkFetcher::new(2);
+            fetcher.fetch_gate = Some(Arc::new(Notify::new()));
+            let chunks = Arc::new(DashMap::new());
+            let batch = RecordBatch::new_empty(Arc::new(Schema::empty()));
+            chunks.insert(
+                0,
+                ChunkEntry {
+                    link: Some(create_test_link(0)),
+                    state: ChunkState::Downloaded,
+                    batches: Some(vec![batch]),
+                    ..ChunkEntry::with_link(create_test_link(0))
+                },
+            );
+            let provider = StreamingCloudFetchProvider::for_test_with_chunks(
+                Arc::new(fetcher),
+                noop_downloader(),
+                chunks,
+                false,
+            );
+            provider.chunks_in_memory.store(1, Ordering::Release);
+            provider.next_download_index.store(1, Ordering::Release);
+            if initial {
+                let mut initialize = Box::pin(provider.initialize());
+                assert!(futures::poll!(initialize.as_mut()).is_pending());
+                provider.cancel();
+                tokio::time::timeout(NO_HANG, initialize).await.unwrap();
+            } else {
+                let mut read = Box::pin(provider.next_batch());
+                assert!(futures::poll!(read.as_mut()).is_pending());
+                assert_eq!(provider.current_chunk_index.load(Ordering::Acquire), 1);
+                provider.cancel();
+                assert!(tokio::time::timeout(NO_HANG, read)
+                    .await
+                    .unwrap()
+                    .unwrap_err()
+                    .message
+                    .contains("cancel"));
+            }
+            assert!(provider.terminal_error().is_none());
+            assert!(provider
+                .next_batch()
+                .await
+                .unwrap_err()
+                .message
+                .contains("cancel"));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_downloads_notify_each_scheduled_chunk_in_order() {
+        use crate::client::retry::{build_retry_configs, RetryConfig};
+        use crate::client::{DatabricksHttpClient, HttpClientConfig};
+        use crate::types::sea::CompressionCodec;
+        use arrow_ipc::writer::StreamWriter;
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let mut fetcher = MockLinkFetcher::new(8);
+        for i in 0..8 {
+            let batch = make_batch(&[i as i32]);
+            let mut bytes = Vec::new();
+            {
+                let mut writer = StreamWriter::try_new(&mut bytes, &batch.schema()).unwrap();
+                writer.write(&batch).unwrap();
+                writer.finish().unwrap();
+            }
+            let route = format!("/chunk-{i}");
+            Mock::given(method("GET"))
+                .and(path(&route))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(bytes))
+                .expect(1)
+                .mount(&server)
+                .await;
+            fetcher.links_by_index.get_mut(&i).unwrap().url = format!("{}{route}", server.uri());
+        }
+        let fetcher = Arc::new(fetcher);
+        let client = DatabricksHttpClient::new(
+            HttpClientConfig::default(),
+            build_retry_configs(
+                &RetryConfig {
+                    max_retries: 0,
+                    ..RetryConfig::default()
+                },
+                &HashMap::new(),
+            ),
+        )
+        .unwrap();
+        let provider = StreamingCloudFetchProvider::new(
+            CloudFetchConfig {
+                max_chunks_in_memory: 2,
+                ..CloudFetchConfig::default()
+            },
+            fetcher.clone(),
+            Arc::new(ChunkDownloader::new(
+                Arc::new(client),
+                CompressionCodec::None,
+                0.1,
+            )),
+            Some(8),
+            tokio::runtime::Handle::current(),
+        );
+        let mut values = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while let Some(batch) = provider.next_batch().await.unwrap() {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .unwrap();
+                values.extend_from_slice(ids.values());
+                assert!(provider.chunks_in_memory.load(Ordering::Acquire) <= 2);
+            }
+        })
+        .await
+        .expect("all eight chunks must drain with a two-chunk window");
+        assert_eq!(values, (0..8).collect::<Vec<i32>>());
+        assert_eq!(
+            *fetcher.scheduled.lock().unwrap(),
+            (0..8).collect::<Vec<i64>>()
+        );
+    }
+
     /// Regression (PECOBLR-4026): a panicking download task must surface as an
     /// error rather than being silently swallowed — a swallowed panic leaves the
     /// chunk stuck `Downloading` and wedges the stream forever. Verifies
@@ -1834,6 +1989,12 @@ mod tests {
 
     #[tokio::test]
     async fn persistent_download_failure_is_bounded_when_links_expire_in_flight() {
+        for status in [403, 500] {
+            assert_persistent_download_failure_is_bounded(status).await;
+        }
+    }
+
+    async fn assert_persistent_download_failure_is_bounded(status: u16) {
         use crate::client::retry::{build_retry_configs, RetryConfig};
         use crate::client::{DatabricksHttpClient, HttpClientConfig};
         use crate::types::cloudfetch::LINK_EXPIRY_BUFFER_SECS;
@@ -1848,7 +2009,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/chunk-0.arrow"))
-            .respond_with(ResponseTemplate::new(500).set_delay(RESPONSE_DELAY))
+            .respond_with(ResponseTemplate::new(status).set_delay(RESPONSE_DELAY))
             .mount(&server)
             .await;
 
@@ -1933,9 +2094,9 @@ mod tests {
         .await
         .expect("persistent failures must exhaust the download attempt budget");
 
-        let error = result.expect_err("persistent HTTP 500 must be terminal");
+        let error = result.expect_err("persistent HTTP failure must be terminal");
         assert!(
-            error.message.contains("HTTP 500"),
+            error.message.contains(&format!("HTTP {status}")),
             "unexpected error: {error}"
         );
         assert_eq!(
